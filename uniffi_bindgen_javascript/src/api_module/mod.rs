@@ -1198,15 +1198,68 @@ fn ts_lower_expr(
         // common/api.ts itself stays backend-agnostic.
         Type::Object {
             imp: ObjectImpl::CallbackTrait,
+            name,
             ..
         }
-        | Type::CallbackInterface { .. } => {
-            format!("{{ __uniffiCallback: true, object: {ident} }}")
+        | Type::CallbackInterface { name, .. } => {
+            let fallible_methods = callback_fallible_methods(ci, name);
+            if fallible_methods.is_empty() {
+                format!("{{ __uniffiCallback: true, object: {ident} }}")
+            } else {
+                let methods = fallible_methods
+                    .iter()
+                    .map(|(m, shape)| format!("\"{m}\": \"{shape}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{{ __uniffiCallback: true, object: {ident}, fallibleMethods: {{ {methods} }} }}"
+                )
+            }
         }
         // Opaque objects: pass the u32 handle stored on the JS wrapper.
         Type::Object { .. } => format!("{ident}.__uniffi.raw"),
         _ => ident.to_string(),
     }
+}
+
+fn callback_fallible_methods(ci: &ComponentInterface, name: &str) -> Vec<(String, &'static str)> {
+    let methods = ci
+        .object_definitions()
+        .iter()
+        .find(|obj| obj.name() == name && matches!(obj.imp(), ObjectImpl::CallbackTrait))
+        .map(|obj| obj.methods())
+        .or_else(|| {
+            ci.callback_interface_definitions()
+                .iter()
+                .find(|callback| callback.name() == name)
+                .map(|callback| callback.methods())
+        });
+    let mut out = methods
+        .into_iter()
+        .flatten()
+        .filter_map(|method| {
+            method.throws_type().map(|throws| {
+                let shape = match throws {
+                    Type::Enum { name, .. } => ci
+                        .enum_definitions()
+                        .iter()
+                        .find(|enum_| enum_.name() == name)
+                        .filter(|enum_| {
+                            enum_
+                                .variants()
+                                .iter()
+                                .all(|variant| variant.fields().is_empty())
+                        })
+                        .map(|_| "flat")
+                        .unwrap_or("shape"),
+                    _ => "shape",
+                };
+                (js_fn_name(method.name()), shape)
+            })
+        })
+        .collect::<Vec<_>>();
+    out.sort();
+    out
 }
 
 fn ts_lift_expr(
