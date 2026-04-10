@@ -161,6 +161,7 @@ impl FnMetadata {
 pub struct ConstructorMetadata {
     pub module_path: String,
     pub self_name: String,
+    pub self_type: Option<Type>,
     pub name: String,
     pub is_async: bool,
     pub inputs: Vec<FnParamMetadata>,

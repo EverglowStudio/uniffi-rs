@@ -254,11 +254,15 @@ impl<'a> MetadataReader<'a> {
         let (return_type, throws) = self.read_return_type()?;
         let docstring = self.read_optional_long_string()?;
 
-        return_type
+        let self_type = return_type
+            .clone()
             .filter(|t| {
                 matches!(
                     t,
-                    Type::Object { name, imp: ObjectImpl::Struct, .. } if name == &self_name
+                    Type::Object { name, imp: ObjectImpl::Struct, .. }
+                    | Type::Record { name, .. }
+                    | Type::Enum { name, .. }
+                        if name == &self_name
                 )
             })
             .context("Constructor return type must be Self or Arc<Self>")?;
@@ -266,6 +270,7 @@ impl<'a> MetadataReader<'a> {
         Ok(ConstructorMetadata {
             module_path,
             self_name,
+            self_type: Some(self_type),
             is_async,
             name,
             inputs,
