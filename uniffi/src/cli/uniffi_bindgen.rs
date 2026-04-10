@@ -2,10 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use super::javascript;
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::fmt;
-use super::javascript;
 use uniffi_bindgen::{
     bindings::{generate, python, GenerateOptions, TargetLanguage},
     pipeline::initial,
@@ -316,7 +316,7 @@ pub fn run_main() -> anyhow::Result<()> {
             )?;
         }
         Commands::Pipeline(args) => {
-            let mut paths = uniffi_bindgen::BindgenPaths::default();
+            let paths = uniffi_bindgen::BindgenPaths::default();
             #[cfg(feature = "cargo-metadata")]
             paths.add_cargo_metadata_layer(args.metadata_no_deps)?;
 
