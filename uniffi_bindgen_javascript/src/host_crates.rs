@@ -245,7 +245,13 @@ fn emit_napi(
          // final `.node` cdylib consumed by the generated `backend-napi.ts`.\n\n",
     );
     for crate_name in crate_names {
-        let rs_path = out_dir.join("node").join(format!("{crate_name}.rs"));
+        let node_rs_path = out_dir.join("node").join(format!("{crate_name}.rs"));
+        let electron_rs_path = out_dir.join("electron").join(format!("{crate_name}.rs"));
+        let rs_path = if node_rs_path.exists() {
+            node_rs_path
+        } else {
+            electron_rs_path
+        };
         let rel = relative_path(&src_dir, &rs_path);
         lib_rs.push_str(&format!("include!(\"{rel}\");\n"));
     }
