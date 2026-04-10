@@ -586,10 +586,18 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             .collect::<Vec<_>>()
             .join(", ");
         let ret_info = m.return_type().map(|t| classify(t, crate_ident));
-        let ret_ty = match &ret_info {
+        let success_ret_ty = match &ret_info {
             Some(Lowering::Native(s)) => s.clone(),
             Some(Lowering::Value { core_ty, .. }) => core_ty.clone(),
             _ => "()".to_string(),
+        };
+        let ret_ty = if let Some(error_ty) = m.throws_type() {
+            format!(
+                "Result<{success_ret_ty}, {}>",
+                core_ty_for(error_ty, crate_ident)
+            )
+        } else {
+            success_ret_ty
         };
         writeln!(
             out,
@@ -597,6 +605,15 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             if rust_args.is_empty() { "" } else { ", " }
         )
         .unwrap();
+        if m.throws_type().is_some() {
+            writeln!(
+                out,
+                "        panic!(\"uniffi wasm callback `{name}.{m_name}` with throws is not supported\")"
+            )
+            .unwrap();
+            writeln!(out, "    }}").unwrap();
+            continue;
+        }
         // Build a JS args array via explicit lift_expr — no serde.
         writeln!(out, "        let __args_arr = ::js_sys::Array::new();").unwrap();
         for (arg, (n, l)) in m.arguments().iter().zip(arg_info.iter()) {

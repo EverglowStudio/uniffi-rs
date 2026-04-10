@@ -172,8 +172,32 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
              return proto === Object.prototype || proto === null;\n\
          }}\n\
          \n\
-         function __uniffiNormalizeCallbackObject(obj) {{\n\
+         function __uniffiCallbackErrorPayload(error, shape) {{\n\
+             if (error !== null && typeof error === \"object\") {{\n\
+                 const raw = error;\n\
+                 if (shape === \"flat\") {{\n\
+                     if (typeof raw.variant === \"string\") return raw.variant;\n\
+                     if (typeof raw.tag === \"string\") return raw.tag;\n\
+                     if (typeof raw.type === \"string\") return raw.type;\n\
+                 }}\n\
+                 if (typeof raw.tag === \"string\" || typeof raw.type === \"string\") {{\n\
+                     return __uniffiLowerShape(raw);\n\
+                 }}\n\
+                 if (typeof raw.variant === \"string\") {{\n\
+                     const data = raw.data;\n\
+                     const payload = {{ tag: raw.variant }};\n\
+                     if (data !== null && typeof data === \"object\" && !Array.isArray(data)) {{\n\
+                         Object.assign(payload, data);\n\
+                     }}\n\
+                     return __uniffiLowerShape(payload);\n\
+                 }}\n\
+             }}\n\
+             throw error;\n\
+         }}\n\
+         \n\
+         function __uniffiNormalizeCallbackObject(obj, marker) {{\n\
              if (obj === null || typeof obj !== \"object\") return obj;\n\
+             const fallibleMethods = (marker && marker.fallibleMethods) || {{}};\n\
              const out = {{}};\n\
              const keys = Object.keys(obj);\n\
              for (let i = 0; i < keys.length; i++) {{\n\
@@ -184,7 +208,15 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
                          const callArgs = args.length >= 2 && (args[0] === null || args[0] === undefined || args[0] instanceof Error)\n\
                              ? args.slice(1)\n\
                              : args;\n\
-                         return __uniffiLowerShape(v(...callArgs));\n\
+                         const errorShape = fallibleMethods[k];\n\
+                         if (!errorShape) {{\n\
+                             return __uniffiLowerShape(v(...callArgs));\n\
+                         }}\n\
+                         try {{\n\
+                             return {{ ok: true, value: __uniffiLowerShape(v(...callArgs)) }};\n\
+                         }} catch (error) {{\n\
+                             return {{ ok: false, error: __uniffiCallbackErrorPayload(error, errorShape) }};\n\
+                         }}\n\
                      }};\n\
                  }} else {{\n\
                      out[k] = v;\n\
@@ -202,7 +234,7 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
                  return h;\n\
              }}\n\
              if (arg && typeof arg === \"object\" && arg.__uniffiCallback === true) {{\n\
-                 return __uniffiNormalizeCallbackObject(arg.object);\n\
+                 return __uniffiNormalizeCallbackObject(arg.object, arg);\n\
              }}\n\
              return arg;\n\
          }}\n\

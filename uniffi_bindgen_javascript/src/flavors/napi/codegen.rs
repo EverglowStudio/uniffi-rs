@@ -6,7 +6,7 @@
 //! async exports, and napi-specific surface generation.
 
 use anyhow::{bail, ensure, Result};
-use heck::{ToLowerCamelCase, ToSnakeCase};
+use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse2;
@@ -266,12 +266,6 @@ impl<'a> Generator<'a> {
                             object.name(),
                             method.name()
                         );
-                        ensure!(
-                            method.throws_type().is_none(),
-                            "callback trait method `{}`.{} must not throw",
-                            object.name(),
-                            method.name()
-                        );
                         for arg in method.arguments() {
                             self.ensure_type_supported(
                                 &arg.as_type(),
@@ -284,6 +278,13 @@ impl<'a> Generator<'a> {
                                 return_type,
                                 TypeUsage::CallbackReturn,
                                 "callback return",
+                            )?;
+                        }
+                        if let Some(throws_type) = method.throws_type() {
+                            self.ensure_type_supported(
+                                throws_type,
+                                TypeUsage::CallbackReturn,
+                                "callback error",
                             )?;
                         }
                     }
@@ -625,17 +626,23 @@ impl<'a> Generator<'a> {
         let needs_env = object
             .methods()
             .into_iter()
-            .any(|method| method.return_type().is_some());
+            .any(|method| method.return_type().is_some() || method.throws_type().is_some());
         let env_field = needs_env.then(|| quote!(env: usize,));
         let fields = object
             .methods()
             .into_iter()
-            .map(|method| self.render_callback_field(method))
+            .map(|method| self.render_callback_field(object, method))
             .collect::<Result<Vec<_>>>()?;
         let impl_methods = object
             .methods()
             .into_iter()
             .map(|method| self.render_callback_impl_method(object, method))
+            .collect::<Result<Vec<_>>>()?;
+        let result_structs = object
+            .methods()
+            .into_iter()
+            .filter(|method| method.throws_type().is_some())
+            .map(|method| self.render_callback_result_struct(object, method))
             .collect::<Result<Vec<_>>>()?;
         let from_napi = self.render_callback_from_napi_impl(object, needs_env)?;
         let core_path = self.core_type_path(object.as_type());
@@ -646,6 +653,8 @@ impl<'a> Generator<'a> {
                 #env_field
             }
 
+            #(#result_structs)*
+
             #from_napi
 
             impl #core_path for #ident {
@@ -654,10 +663,15 @@ impl<'a> Generator<'a> {
         })
     }
 
-    fn render_callback_field(&self, method: &Method) -> Result<TokenStream> {
+    fn render_callback_field(&self, object: &Object, method: &Method) -> Result<TokenStream> {
         let field_ident = rust_ident(method.name());
         let tsfn_args = self.callback_tsfn_args(method)?;
-        if let Some(return_type) = method.return_type() {
+        if method.throws_type().is_some() {
+            let result_ty = self.callback_result_ident(object, method);
+            Ok(quote! {
+                pub #field_ident: FunctionRef<#tsfn_args, #result_ty>
+            })
+        } else if let Some(return_type) = method.return_type() {
             let bridge_return_ty = self.bridge_return_type(return_type)?;
             Ok(quote! {
                 pub #field_ident: FunctionRef<#tsfn_args, #bridge_return_ty>
@@ -667,6 +681,33 @@ impl<'a> Generator<'a> {
                 pub #field_ident: ThreadsafeFunction<#tsfn_args>
             })
         }
+    }
+
+    fn render_callback_result_struct(
+        &self,
+        object: &Object,
+        method: &Method,
+    ) -> Result<TokenStream> {
+        let result_ident = self.callback_result_ident(object, method);
+        let error_ty = self.bridge_return_type(
+            method
+                .throws_type()
+                .expect("result structs are only rendered for fallible callbacks"),
+        )?;
+        let value_field = if let Some(return_type) = method.return_type() {
+            let value_ty = self.bridge_return_type(return_type)?;
+            quote!(pub value: Option<#value_ty>,)
+        } else {
+            quote!()
+        };
+        Ok(quote! {
+            #[napi(object)]
+            pub struct #result_ident {
+                pub ok: bool,
+                #value_field
+                pub error: Option<#error_ty>,
+            }
+        })
     }
 
     fn render_callback_impl_method(&self, object: &Object, method: &Method) -> Result<TokenStream> {
@@ -684,6 +725,64 @@ impl<'a> Generator<'a> {
             .collect::<Result<Vec<_>>>()?;
 
         let call_value = self.callback_call_value(method)?;
+        if let Some(throws_type) = method.throws_type() {
+            let return_ty = match method.return_type() {
+                Some(return_type) => self.core_callback_return_type(return_type)?,
+                None => quote!(()),
+            };
+            let error_ty = self.core_type_path(throws_type.clone());
+            let method_name = method.name().to_string();
+            let success = if let Some(return_type) = method.return_type() {
+                let lowered = self.lower_value_expr(quote!(__callback_return), return_type)?;
+                quote! {
+                    let __callback_return = __callback_result.value.unwrap_or_else(|| {
+                        panic!(
+                            "callback trait `{}`.{} returned ok without a value",
+                            #object_name,
+                            #method_name
+                        );
+                    });
+                    Ok(#lowered)
+                }
+            } else {
+                quote!(Ok(()))
+            };
+            let lowered_error = self.lower_value_expr(quote!(__callback_error), throws_type)?;
+            return Ok(quote! {
+                fn #method_ident(&self, #(#args),*) -> std::result::Result<#return_ty, #error_ty> {
+                    let __env = napi::bindgen_prelude::Env::from_raw(
+                        self.env as napi::bindgen_prelude::sys::napi_env,
+                    );
+                    let __callback_result = self.#method_ident.borrow_back(&__env).unwrap_or_else(|err| {
+                        panic!(
+                            "callback trait `{}`.{} failed to borrow JS function: {}",
+                            #object_name,
+                            #method_name,
+                            err
+                        );
+                    }).call(#call_value).unwrap_or_else(|err| {
+                        panic!(
+                            "callback trait `{}`.{} threw an unexpected JS error: {}",
+                            #object_name,
+                            #method_name,
+                            err
+                        );
+                    });
+                    if __callback_result.ok {
+                        #success
+                    } else {
+                        let __callback_error = __callback_result.error.unwrap_or_else(|| {
+                            panic!(
+                                "callback trait `{}`.{} returned err without a typed error",
+                                #object_name,
+                                #method_name
+                            );
+                        });
+                        Err(#lowered_error)
+                    }
+                }
+            });
+        }
         match method.return_type() {
             Some(return_type) => {
                 let return_ty = self.core_callback_return_type(return_type)?;
@@ -735,7 +834,7 @@ impl<'a> Generator<'a> {
             .map(|method| {
                 let field_ident = rust_ident(method.name());
                 let field_name = method.name().to_lower_camel_case();
-                let ty = self.callback_field_from_napi_type(method)?;
+                let ty = self.callback_field_from_napi_type(object, method)?;
                 Ok(quote! {
                     #field_ident: obj.get_named_property_unchecked::<#ty>(#field_name)?,
                 })
@@ -783,9 +882,16 @@ impl<'a> Generator<'a> {
         })
     }
 
-    fn callback_field_from_napi_type(&self, method: &Method) -> Result<TokenStream> {
+    fn callback_field_from_napi_type(
+        &self,
+        object: &Object,
+        method: &Method,
+    ) -> Result<TokenStream> {
         let tsfn_args = self.callback_tsfn_args(method)?;
-        if let Some(return_type) = method.return_type() {
+        if method.throws_type().is_some() {
+            let result_ty = self.callback_result_ident(object, method);
+            Ok(quote!(napi::bindgen_prelude::FunctionRef<#tsfn_args, #result_ty>))
+        } else if let Some(return_type) = method.return_type() {
             let bridge_return_ty = self.bridge_return_type(return_type)?;
             Ok(quote!(napi::bindgen_prelude::FunctionRef<#tsfn_args, #bridge_return_ty>))
         } else {
@@ -1539,6 +1645,14 @@ impl<'a> Generator<'a> {
             .expect("custom type module path should have a crate root");
         let root = rust_ident(crate_root);
         quote!(#root::UniFfiTag)
+    }
+
+    fn callback_result_ident(&self, object: &Object, method: &Method) -> syn::Ident {
+        format_ident!(
+            "__Uniffi{}{}CallbackResult",
+            object.name(),
+            method.name().to_upper_camel_case()
+        )
     }
 }
 
