@@ -4169,6 +4169,10 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
         "rich fixture should exercise #[napi(discriminant = \"type\")]"
     );
     assert!(
+        bridge.contains("string_enum"),
+        "rich fixture should exercise #[napi(string_enum)] for flat enums"
+    );
+    assert!(
         bridge.contains("ThreadsafeFunction"),
         "rich fixture should exercise ThreadsafeFunction"
     );

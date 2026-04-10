@@ -30,7 +30,9 @@ use camino::Utf8Path;
 use fs_err as fs;
 use heck::{ToLowerCamelCase, ToSnakeCase};
 use uniffi_bindgen::{
-    interface::{AsType, ComponentInterface, Enum, Function, Object, ObjectImpl, Record, Type},
+    interface::{
+        AsType, ComponentInterface, Enum, Function, Method, Object, ObjectImpl, Record, Type,
+    },
     Component,
 };
 
@@ -71,26 +73,43 @@ pub fn emit(common_dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()
 
 fn render_records(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("records");
-    let custom_names = ci
-        .record_definitions()
-        .iter()
-        .flat_map(|record| record.fields().iter())
-        .flat_map(|field| custom_type_names(&field.as_type(), config))
-        .collect::<BTreeSet<_>>();
-    if !custom_names.is_empty() {
+    let mut usage = Usage::default();
+    let mut has_sync = false;
+    let mut has_async = false;
+    for record in ci.record_definitions() {
+        for field in record.fields() {
+            usage.see(&field.as_type(), UsagePos::Arg, config);
+        }
+        for method in record.methods() {
+            if method.is_async() {
+                has_async = true;
+            } else {
+                has_sync = true;
+            }
+            usage.see(&record.as_type(), UsagePos::Arg, config);
+            for arg in method.arguments() {
+                usage.see(&arg.as_type(), UsagePos::Arg, config);
+            }
+            if let Some(ret) = method.return_type() {
+                usage.see(ret, UsagePos::Ret, config);
+            }
+        }
+    }
+    emit_value_module_imports(&mut out, ci, config, &usage, has_sync, has_async, "records");
+    if !usage.customs.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./custom-types.ts\";\n\n",
-            join_sorted(&custom_names.into_iter().collect::<Vec<_>>())
+            join_sorted(&usage.customs.iter().cloned().collect::<Vec<_>>())
         ));
     }
     for record in ci.record_definitions() {
-        out.push_str(&render_record(record, config));
+        out.push_str(&render_record(ci, record, config));
         out.push('\n');
     }
     out
 }
 
-fn render_record(record: &Record, config: &JsConfig) -> String {
+fn render_record(ci: &ComponentInterface, record: &Record, config: &JsConfig) -> String {
     let mut s = format!("export interface {} {{\n", record.name());
     for f in record.fields() {
         s.push_str(&format!(
@@ -100,6 +119,22 @@ fn render_record(record: &Record, config: &JsConfig) -> String {
         ));
     }
     s.push_str("}\n");
+    if !record.methods().is_empty() {
+        s.push_str(&format!(
+            "\nexport const {} = Object.freeze({{\n",
+            record.name()
+        ));
+        for method in record.methods() {
+            s.push_str(&render_value_method(
+                ci,
+                record.name(),
+                &record.as_type(),
+                method,
+                config,
+            ));
+        }
+        s.push_str("});\n");
+    }
     s
 }
 
@@ -109,18 +144,39 @@ fn render_record(record: &Record, config: &JsConfig) -> String {
 
 fn render_enums(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("enums");
-    let custom_names = ci
+    let mut usage = Usage::default();
+    let mut has_sync = false;
+    let mut has_async = false;
+    for enum_ in ci
         .enum_definitions()
         .iter()
         .filter(|e| !ci.is_name_used_as_error(e.name()))
-        .flat_map(|e| e.variants().iter())
-        .flat_map(|v| v.fields().iter())
-        .flat_map(|field| custom_type_names(&field.as_type(), config))
-        .collect::<BTreeSet<_>>();
-    if !custom_names.is_empty() {
+    {
+        for variant in enum_.variants() {
+            for field in variant.fields() {
+                usage.see(&field.as_type(), UsagePos::Arg, config);
+            }
+        }
+        for method in enum_.methods() {
+            if method.is_async() {
+                has_async = true;
+            } else {
+                has_sync = true;
+            }
+            usage.see(&enum_.as_type(), UsagePos::Arg, config);
+            for arg in method.arguments() {
+                usage.see(&arg.as_type(), UsagePos::Arg, config);
+            }
+            if let Some(ret) = method.return_type() {
+                usage.see(ret, UsagePos::Ret, config);
+            }
+        }
+    }
+    emit_value_module_imports(&mut out, ci, config, &usage, has_sync, has_async, "enums");
+    if !usage.customs.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./custom-types.ts\";\n\n",
-            join_sorted(&custom_names.into_iter().collect::<Vec<_>>())
+            join_sorted(&usage.customs.iter().cloned().collect::<Vec<_>>())
         ));
     }
     for e in ci.enum_definitions() {
@@ -128,7 +184,7 @@ fn render_enums(ci: &ComponentInterface, config: &JsConfig) -> String {
             // Error enums are emitted as classes in errors.ts instead.
             continue;
         }
-        out.push_str(&render_enum(e, config));
+        out.push_str(&render_enum(ci, e, config));
         out.push('\n');
     }
     out
@@ -187,7 +243,7 @@ fn render_custom_types(ci: &ComponentInterface, config: &JsConfig) -> String {
     out
 }
 
-fn render_enum(e: &Enum, config: &JsConfig) -> String {
+fn render_enum(ci: &ComponentInterface, e: &Enum, config: &JsConfig) -> String {
     let all_unit = e.variants().iter().all(|v| v.fields().is_empty());
     if all_unit {
         // Emit a const object + string-literal union instead of a TS
@@ -198,9 +254,30 @@ fn render_enum(e: &Enum, config: &JsConfig) -> String {
         for v in e.variants() {
             s.push_str(&format!("    {name}: \"{name}\",\n", name = v.name()));
         }
+        for method in e.methods() {
+            s.push_str(&render_value_method(
+                ci,
+                e.name(),
+                &e.as_type(),
+                method,
+                config,
+            ));
+        }
         s.push_str("} as const;\n");
+        let variants = e
+            .variants()
+            .iter()
+            .map(|v| {
+                format!(
+                    "typeof {name}.{variant}",
+                    name = e.name(),
+                    variant = v.name()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
         s.push_str(&format!(
-            "export type {name} = typeof {name}[keyof typeof {name}];\n",
+            "export type {name} = {variants};\n",
             name = e.name()
         ));
         return s;
@@ -225,7 +302,186 @@ fn render_enum(e: &Enum, config: &JsConfig) -> String {
             arms.push(format!("  | {{ tag: \"{}\"; {} }}", v.name(), fields));
         }
     }
-    format!("export type {} =\n{};\n", e.name(), arms.join("\n"))
+    let mut s = format!("export type {} =\n{};\n", e.name(), arms.join("\n"));
+    if !e.methods().is_empty() {
+        s.push_str(&format!("\nexport const {} = Object.freeze({{\n", e.name()));
+        for method in e.methods() {
+            s.push_str(&render_value_method(
+                ci,
+                e.name(),
+                &e.as_type(),
+                method,
+                config,
+            ));
+        }
+        s.push_str("});\n");
+    }
+    s
+}
+
+fn emit_value_module_imports(
+    out: &mut String,
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    usage: &Usage,
+    has_sync: bool,
+    has_async: bool,
+    local_module: &str,
+) {
+    let mut runtime = Vec::new();
+    if has_sync {
+        runtime.push("__call");
+    }
+    if has_async {
+        runtime.push("__callAsync");
+    }
+    if usage.needs_to_i64 {
+        runtime.push("toI64");
+    }
+    if usage.needs_to_u64 {
+        runtime.push("toU64");
+    }
+    if !runtime.is_empty() {
+        out.push_str(&format!(
+            "import {{ {} }} from \"./runtime.ts\";\n",
+            runtime.join(", ")
+        ));
+    }
+
+    let grouped = group_named_types(ci, &usage.named);
+    if local_module != "records" && !grouped.records.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./records.ts\";\n",
+            join_sorted(&grouped.records)
+        ));
+    }
+    if local_module != "enums" && !grouped.enums.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./enums.ts\";\n",
+            join_sorted(&grouped.enums)
+        ));
+    }
+    if !grouped.errors.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./errors.ts\";\n",
+            join_sorted(&grouped.errors)
+        ));
+    }
+    if !grouped.callbacks.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./callbacks.ts\";\n",
+            join_sorted(&grouped.callbacks)
+        ));
+    }
+
+    let object_values = usage
+        .objects_in_ret
+        .iter()
+        .filter(|name| grouped.objects.contains(*name))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let object_types = grouped
+        .objects
+        .iter()
+        .filter(|name| !object_values.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !object_values.is_empty() {
+        out.push_str(&format!(
+            "import {{ {} }} from \"./objects.ts\";\n",
+            join_sorted(&object_values.into_iter().collect::<Vec<_>>())
+        ));
+    }
+    if !object_types.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./objects.ts\";\n",
+            join_sorted(&object_types)
+        ));
+    }
+
+    let helper_customs = value_type_custom_helpers(ci, config, local_module);
+    if !helper_customs.is_empty() {
+        let helpers = helper_customs
+            .iter()
+            .flat_map(|name| {
+                [
+                    format!("__uniffiLowerCustom{name}"),
+                    format!("__uniffiLiftCustom{name}"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "import {{ {} }} from \"./custom-types.ts\";\n",
+            join_sorted(&helpers)
+        ));
+    }
+
+    if has_sync || has_async || !usage.named.is_empty() || !helper_customs.is_empty() {
+        out.push('\n');
+    }
+}
+
+fn render_value_method(
+    ci: &ComponentInterface,
+    owner_name: &str,
+    owner_ty: &Type,
+    method: &Method,
+    config: &JsConfig,
+) -> String {
+    let js_name = js_fn_name(method.name());
+    let fn_name = format!(
+        "{}_{}",
+        owner_name.to_snake_case(),
+        method.name().to_snake_case()
+    );
+    let (arg_decls, arg_pass) = lowered_args(
+        ci,
+        config,
+        method.arguments().iter().map(|a| (a.name(), a.as_type())),
+    );
+    let self_pass = ts_lower_expr(ci, config, owner_ty, "self_", 0);
+    let pass = if arg_pass.is_empty() {
+        self_pass
+    } else {
+        format!("{self_pass}, {arg_pass}")
+    };
+    let decls = if arg_decls.is_empty() {
+        format!("self_: {}", ts_type(owner_ty, config))
+    } else {
+        format!("self_: {}, {arg_decls}", ts_type(owner_ty, config))
+    };
+    let ret_ty = method.return_type();
+    let ret_ts = ret_ty
+        .map(|t| ts_type(t, config))
+        .unwrap_or_else(|| "void".to_string());
+    let call_g = call_generic(ret_ty);
+    if method.is_async() {
+        if let Some(ret_ty) = ret_ty {
+            format!(
+                "    async {js_name}({decls}): Promise<{ret_ts}> {{\n        \
+                 const __ret = await __callAsync<{call_g}>(\"{fn_name}\", {pass});\n        \
+                 return {lift} as {ret_ts};\n    }},\n",
+                lift = ts_lift_expr(ci, config, ret_ty, "__ret", 0),
+            )
+        } else {
+            format!(
+                "    async {js_name}({decls}): Promise<void> {{\n        \
+                 await __callAsync<void>(\"{fn_name}\", {pass});\n    }},\n"
+            )
+        }
+    } else if let Some(ret_ty) = ret_ty {
+        format!(
+            "    {js_name}({decls}): {ret_ts} {{\n        \
+             const __ret = __call<{call_g}>(\"{fn_name}\", {pass});\n        \
+             return {lift} as {ret_ts};\n    }},\n",
+            lift = ts_lift_expr(ci, config, ret_ty, "__ret", 0),
+        )
+    } else {
+        format!(
+            "    {js_name}({decls}): void {{\n        \
+             __call<void>(\"{fn_name}\", {pass});\n    }},\n"
+        )
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1108,9 +1364,9 @@ fn join_sorted(xs: &[String]) -> String {
 // public-types.ts
 // -----------------------------------------------------------------------
 
-/// Emit a type-only facade that re-exports every public type from the
-/// common API surface. Downstream UI code should import from this file
-/// instead of reaching into `records.ts` / `enums.ts` / … directly.
+/// Emit a stable facade that re-exports public contract types and the
+/// small number of type values needed to access static helpers
+/// (record/enum methods, object constructors).
 fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -1118,17 +1374,32 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
         out,
         "// AUTOGENERATED by uniffi_bindgen_javascript — do not edit.\n\
          //\n\
-         // Stable, type-only public contract for the `{}` component.\n\
-         // Import from this file to get all high-level types without\n\
+         // Stable public contract for the `{}` component.\n\
+         // Import from this file to get high-level types and type values without\n\
          // depending on implementation-detail modules.\n",
         ci.namespace()
     )
     .unwrap();
 
     // Records
+    let record_values: Vec<String> = ci
+        .record_definitions()
+        .iter()
+        .filter(|r| !r.methods().is_empty())
+        .map(|r| r.name().to_string())
+        .collect();
+    if !record_values.is_empty() {
+        writeln!(
+            out,
+            "export {{ {} }} from \"./records.ts\";",
+            join_sorted(&record_values)
+        )
+        .unwrap();
+    }
     let records: Vec<String> = ci
         .record_definitions()
         .iter()
+        .filter(|r| r.methods().is_empty())
         .map(|r| r.name().to_string())
         .collect();
     if !records.is_empty() {
@@ -1141,10 +1412,26 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
     }
 
     // Enums (non-error)
+    let enum_values: Vec<String> = ci
+        .enum_definitions()
+        .iter()
+        .filter(|e| !ci.is_name_used_as_error(e.name()))
+        .filter(|e| !e.methods().is_empty())
+        .map(|e| e.name().to_string())
+        .collect();
+    if !enum_values.is_empty() {
+        writeln!(
+            out,
+            "export {{ {} }} from \"./enums.ts\";",
+            join_sorted(&enum_values)
+        )
+        .unwrap();
+    }
     let enums: Vec<String> = ci
         .enum_definitions()
         .iter()
         .filter(|e| !ci.is_name_used_as_error(e.name()))
+        .filter(|e| e.methods().is_empty())
         .map(|e| e.name().to_string())
         .collect();
     if !enums.is_empty() {
@@ -1379,6 +1666,78 @@ fn object_custom_helpers(ci: &ComponentInterface, config: &JsConfig) -> BTreeSet
                 collect_public_customs(ci, config, ret, &mut names, &mut HashSet::new());
             }
         }
+    }
+    names
+}
+
+fn value_type_custom_helpers(
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    local_module: &str,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    match local_module {
+        "records" => {
+            for record in ci.record_definitions() {
+                if record.methods().is_empty() {
+                    continue;
+                }
+                collect_public_customs(
+                    ci,
+                    config,
+                    &record.as_type(),
+                    &mut names,
+                    &mut HashSet::new(),
+                );
+                for method in record.methods() {
+                    for arg in method.arguments() {
+                        collect_public_customs(
+                            ci,
+                            config,
+                            &arg.as_type(),
+                            &mut names,
+                            &mut HashSet::new(),
+                        );
+                    }
+                    if let Some(ret) = method.return_type() {
+                        collect_public_customs(ci, config, ret, &mut names, &mut HashSet::new());
+                    }
+                }
+            }
+        }
+        "enums" => {
+            for enum_ in ci
+                .enum_definitions()
+                .iter()
+                .filter(|e| !ci.is_name_used_as_error(e.name()))
+            {
+                if enum_.methods().is_empty() {
+                    continue;
+                }
+                collect_public_customs(
+                    ci,
+                    config,
+                    &enum_.as_type(),
+                    &mut names,
+                    &mut HashSet::new(),
+                );
+                for method in enum_.methods() {
+                    for arg in method.arguments() {
+                        collect_public_customs(
+                            ci,
+                            config,
+                            &arg.as_type(),
+                            &mut names,
+                            &mut HashSet::new(),
+                        );
+                    }
+                    if let Some(ret) = method.return_type() {
+                        collect_public_customs(ci, config, ret, &mut names, &mut HashSet::new());
+                    }
+                }
+            }
+        }
+        _ => {}
     }
     names
 }

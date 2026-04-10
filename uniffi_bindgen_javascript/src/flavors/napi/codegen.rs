@@ -204,25 +204,43 @@ impl<'a> Generator<'a> {
 
         for record in self.ci.record_definitions() {
             ensure!(
-                record.constructors().is_empty() && record.methods().is_empty(),
-                "record `{}` methods/constructors are not supported in the napi bridge yet",
+                record.constructors().is_empty(),
+                "record `{}` constructors are not supported in the napi bridge yet",
                 record.name()
             );
             for field in record.fields() {
                 self.ensure_type_supported(&field.as_type(), TypeUsage::Value, "record field")?;
             }
+            for method in record.methods() {
+                ensure!(
+                    !method.takes_self_by_arc(),
+                    "record `{}` method `{}` taking self by Arc is not supported in the napi bridge",
+                    record.name(),
+                    method.name()
+                );
+                self.validate_callable(method, "record method")?;
+            }
         }
 
         for enum_ in self.ci.enum_definitions() {
             ensure!(
-                enum_.constructors().is_empty() && enum_.methods().is_empty(),
-                "enum `{}` methods/constructors are not supported in the napi bridge yet",
+                enum_.constructors().is_empty(),
+                "enum `{}` constructors are not supported in the napi bridge yet",
                 enum_.name()
             );
             for variant in enum_.variants() {
                 for field in variant.fields() {
                     self.ensure_type_supported(&field.as_type(), TypeUsage::Value, "enum field")?;
                 }
+            }
+            for method in enum_.methods() {
+                ensure!(
+                    !method.takes_self_by_arc(),
+                    "enum `{}` method `{}` taking self by Arc is not supported in the napi bridge",
+                    enum_.name(),
+                    method.name()
+                );
+                self.validate_callable(method, "enum method")?;
             }
         }
 
@@ -386,6 +404,11 @@ impl<'a> Generator<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
         let core_path = self.core_type_path(record.as_type());
+        let methods = record
+            .methods()
+            .into_iter()
+            .map(|method| self.render_value_method(record.name(), &record.as_type(), method))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(quote! {
             #[napi(object)]
@@ -409,6 +432,8 @@ impl<'a> Generator<'a> {
                     }
                 }
             }
+
+            #(#methods)*
         })
     }
 
@@ -436,17 +461,21 @@ impl<'a> Generator<'a> {
             .map(|variant| self.render_from_core_variant(enum_, variant))
             .collect::<Result<Vec<_>>>()?;
         let core_path = self.core_type_path(enum_.as_type());
+        let methods = enum_
+            .methods()
+            .into_iter()
+            .map(|method| self.render_value_method(enum_.name(), &enum_.as_type(), method))
+            .collect::<Result<Vec<_>>>()?;
 
         // `discriminant = "type"` is only valid for tagged unions in
-        // napi-rs 3.x (variants carrying payload). For C-style enums
-        // (all unit variants), emit a plain `#[napi]` — otherwise the
-        // macro rejects the attribute with "unused #[napi] attribute"
-        // and the enum type is dropped from the expansion.
+        // napi-rs 3.x (variants carrying payload). For flat enums, emit
+        // a string enum so the raw addon surface matches common/enums.ts
+        // (`"North" | "South"`), not napi-rs' numeric C-enum default.
         let has_payload = enum_.variants().iter().any(|v| !v.fields().is_empty());
         let napi_attr = if has_payload {
             quote!(#[napi(discriminant = "type")])
         } else {
-            quote!(#[napi])
+            quote!(#[napi(string_enum)])
         };
 
         Ok(quote! {
@@ -471,6 +500,8 @@ impl<'a> Generator<'a> {
                     }
                 }
             }
+
+            #(#methods)*
         })
     }
 
@@ -855,6 +886,84 @@ impl<'a> Generator<'a> {
             Ok(quote! {
                 #[napi]
                 pub fn #fn_ident(#receiver_ident: ClassInstance<#object_ident>, #(#args),*) -> Result<#output_ty> {
+                    #body
+                }
+            })
+        }
+    }
+
+    fn render_value_method(
+        &self,
+        owner_name: &str,
+        owner_ty: &Type,
+        method: &Method,
+    ) -> Result<TokenStream> {
+        let function_name = format!(
+            "{}_{}",
+            owner_name.to_snake_case(),
+            method.name().to_snake_case()
+        );
+        let fn_ident = rust_ident(&function_name);
+        let self_ident = rust_ident("self_");
+        let self_bridge_ty = self.bridge_value_type(owner_ty)?;
+        let self_core_ty = self.core_type_path(owner_ty.clone());
+        let self_core = self.lower_value_expr(quote!(#self_ident), owner_ty)?;
+        let args = method
+            .arguments()
+            .into_iter()
+            .map(|arg| self.render_signature_arg(arg))
+            .collect::<Result<Vec<_>>>()?;
+        let lowered_arg_bindings = method
+            .arguments()
+            .into_iter()
+            .map(|arg| {
+                let arg_ident = rust_ident(arg.name());
+                let local_ident = rust_ident(&format!("__arg_{}", arg.name()));
+                let lowered = self.lower_arg_expr(arg_ident, &arg.as_type())?;
+                Ok(quote!(let #local_ident = #lowered;))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let call_args = method
+            .arguments()
+            .into_iter()
+            .map(|arg| {
+                let local_ident = rust_ident(&format!("__arg_{}", arg.name()));
+                if arg.by_ref() || matches!(arg.as_type(), Type::Record { .. } | Type::Enum { .. })
+                {
+                    quote!(&#local_ident)
+                } else {
+                    quote!(#local_ident)
+                }
+            })
+            .collect::<Vec<_>>();
+        let method_ident = rust_ident(method.name());
+        let call = quote!({
+            let __self: #self_core_ty = #self_core;
+            #(#lowered_arg_bindings)*
+            __self.#method_ident(#(#call_args),*)
+        });
+        let call = if method.is_async() {
+            quote!(#call.await)
+        } else {
+            call
+        };
+        let output_ty = match method.return_type() {
+            Some(return_type) => self.bridge_return_type(return_type)?,
+            None => quote!(()),
+        };
+        let body = self.render_result_body(call, method.return_type(), method.throws_type())?;
+
+        if method.is_async() {
+            Ok(quote! {
+                #[napi]
+                pub async fn #fn_ident(#self_ident: #self_bridge_ty, #(#args),*) -> Result<#output_ty> {
+                    #body
+                }
+            })
+        } else {
+            Ok(quote! {
+                #[napi]
+                pub fn #fn_ident(#self_ident: #self_bridge_ty, #(#args),*) -> Result<#output_ty> {
                     #body
                 }
             })

@@ -34,6 +34,19 @@ fn has_wasm32_target(cargo: &std::path::Path) -> bool {
     true
 }
 
+fn node_supports_strip_types(node: &std::path::Path) -> bool {
+    let Ok(output) = Command::new(node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg("console.log('ok')")
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+}
+
 fn build_uniffi_bindgen(root: &Utf8PathBuf, cargo: &std::path::Path) {
     let output = Command::new(cargo)
         .current_dir(root.as_std_path())
@@ -100,6 +113,100 @@ fn write_cli_build_fixture(root: &std::path::Path) -> Utf8PathBuf {
         src.join("lib.rs"),
         "pub fn add(a: u64, b: u64) -> u64 { a + b }\n\n\
          uniffi::include_scaffolding!(\"cli_build\");\n",
+    )
+    .unwrap();
+
+    Utf8PathBuf::from_path_buf(crate_dir.join("Cargo.toml")).unwrap()
+}
+
+fn write_value_type_method_fixture(root: &std::path::Path) -> Utf8PathBuf {
+    let crate_dir = root.join("value_type_method_fixture");
+    let src = crate_dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let workspace = workspace_root();
+    let uniffi_path = workspace.join("uniffi");
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        format!(
+            "[package]\n\
+             name = \"value-type-method-fixture\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2021\"\n\
+             publish = false\n\n\
+             [lib]\n\
+             name = \"value_type_method_fixture\"\n\
+             crate-type = [\"lib\", \"cdylib\"]\n\n\
+             [dependencies]\n\
+             uniffi = {{ path = \"{}\" }}\n\n\
+             [workspace]\n",
+            uniffi_path
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[uniffi::export]
+impl Point {
+    pub fn distance_to(&self, other: &Point) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    pub fn scale(&self, factor: f64) -> Point {
+        Point {
+            x: self.x * factor,
+            y: self.y * factor,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+
+#[uniffi::export]
+impl Direction {
+    pub fn opposite(&self) -> Direction {
+        match self {
+            Direction::North => Direction::South,
+            Direction::South => Direction::North,
+            Direction::East => Direction::West,
+            Direction::West => Direction::East,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum Shape {
+    Circle { radius: f64 },
+    Rectangle { width: f64, height: f64 },
+}
+
+#[uniffi::export]
+impl Shape {
+    pub fn area(&self) -> f64 {
+        match self {
+            Shape::Circle { radius } => std::f64::consts::PI * radius * radius,
+            Shape::Rectangle { width, height } => width * height,
+        }
+    }
+}
+
+uniffi::setup_scaffolding!();
+"#,
     )
     .unwrap();
 
@@ -191,6 +298,143 @@ fn cli_build_orchestrates_wasm_and_napi() {
     );
     assert_single_node_addon(out_dir.join("node"));
     assert_single_node_addon(out_dir.join("electron"));
+}
+
+#[test]
+fn cli_build_runs_value_type_methods() {
+    let Some(cargo) = which_tool("cargo") else {
+        eprintln!("SKIP cli_build_runs_value_type_methods: cargo unavailable");
+        return;
+    };
+    if !has_wasm32_target(&cargo) {
+        eprintln!(
+            "SKIP cli_build_runs_value_type_methods: wasm32-unknown-unknown target not installed"
+        );
+        return;
+    }
+    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
+        eprintln!("SKIP cli_build_runs_value_type_methods: wasm-bindgen CLI not found");
+        return;
+    };
+    let Some(node) = which_tool("node") else {
+        eprintln!("SKIP cli_build_runs_value_type_methods: node unavailable");
+        return;
+    };
+    if !node_supports_strip_types(&node) {
+        eprintln!(
+            "SKIP cli_build_runs_value_type_methods: node --experimental-strip-types unavailable"
+        );
+        return;
+    }
+
+    let root = workspace_root();
+    build_uniffi_bindgen(&root, &cargo);
+
+    let cli = root.join(if cfg!(windows) {
+        "target/debug/uniffi-bindgen.exe"
+    } else {
+        "target/debug/uniffi-bindgen"
+    });
+    assert!(cli.exists(), "expected built CLI at {cli}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let pkg_dir = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
+    let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target")).unwrap();
+    let manifest = write_value_type_method_fixture(tmp.path());
+
+    let output = Command::new(cli.as_std_path())
+        .current_dir(&root)
+        .arg("javascript")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest.as_str())
+        .arg("--out-dir")
+        .arg(out_dir.as_str())
+        .arg("--host-crates-dir")
+        .arg(host_dir.as_str())
+        .arg("--wasm-bindgen-out-dir")
+        .arg(pkg_dir.as_str())
+        .arg("--wasm-bindgen-bin")
+        .arg(
+            Utf8PathBuf::from_path_buf(wasm_bindgen.clone())
+                .unwrap()
+                .as_str(),
+        )
+        .arg("--target-dir")
+        .arg(target_dir.as_str())
+        .output()
+        .expect("failed to invoke uniffi-bindgen javascript build for value methods");
+    if !output.status.success() {
+        panic!(
+            "javascript build for value methods failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let records = std::fs::read_to_string(out_dir.join("common/records.ts")).unwrap();
+    assert!(
+        records.contains("export const Point = Object.freeze")
+            && records.contains("distanceTo(self_: Point")
+            && records.contains("scale(self_: Point"),
+        "records.ts should expose static value methods:\n{records}"
+    );
+    let enums = std::fs::read_to_string(out_dir.join("common/enums.ts")).unwrap();
+    assert!(
+        enums.contains("opposite(self_: Direction")
+            && enums.contains("area(self_: Shape")
+            && !enums.contains("keyof typeof Direction"),
+        "enums.ts should expose value methods without widening flat enum type to method values:\n{enums}"
+    );
+
+    let driver = tmp.path().join("value-method-driver.ts");
+    std::fs::write(
+        &driver,
+        r#"
+import { Direction, Point, Shape } from "./generated/node/index.ts";
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(label);
+}
+
+const origin = { x: 0, y: 0 };
+const point = { x: 3, y: 4 };
+assert(Point.distanceTo(point, origin) === 5, "Point.distanceTo");
+
+const scaled = Point.scale(point, 2);
+assert(scaled.x === 6 && scaled.y === 8, `Point.scale ${JSON.stringify(scaled)}`);
+
+assert(Direction.opposite(Direction.North) === Direction.South, "Direction.opposite");
+
+const circle = { tag: "Circle", radius: 1 };
+assert(Math.abs(Shape.area(circle) - Math.PI) < 0.000001, "Shape.area circle");
+const rect = { tag: "Rectangle", width: 3, height: 4 };
+assert(Shape.area(rect) === 12, "Shape.area rectangle");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+    let run = Command::new(node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver)
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run value method driver");
+    if !run.status.success() {
+        panic!(
+            "value method driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "value method driver did not print ok"
+    );
 }
 
 fn assert_single_node_addon(dir: Utf8PathBuf) {
