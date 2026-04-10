@@ -20,7 +20,9 @@
 //!   electron/  preload.cjs renderer.ts
 //! ```
 
-use anyhow::{bail, Result};
+use std::collections::BTreeMap;
+
+use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 use fs_err as fs;
 use uniffi_bindgen::{BindgenLoader, Component};
@@ -98,8 +100,13 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
         }
     }
     let cis = loader.load_cis(metadata)?;
-    let mut components: Vec<Component<JsConfig>> =
-        loader.load_components(cis, |_ci, _toml| Ok(JsConfig::default()))?;
+    let override_toml = load_override_toml(options.config_override.as_ref())?;
+    let mut components: Vec<Component<JsConfig>> = loader.load_components(cis, |_ci, mut toml| {
+        if let Some(override_toml) = &override_toml {
+            merge_toml(&mut toml, override_toml.clone());
+        }
+        JsConfig::from_root_toml(toml)
+    })?;
     for c in components.iter_mut() {
         c.ci.derive_ffi_funcs()?;
     }
@@ -158,4 +165,92 @@ fn emit_component(component: &Component<JsConfig>, options: &GenerateJsOptions) 
 /// Empty for now; add fields here only when they are part of the
 /// supported long-term JavaScript target configuration surface.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-pub struct JsConfig {}
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+pub struct JsConfig {
+    #[serde(alias = "custom_types", alias = "customTypes")]
+    pub custom_types: BTreeMap<String, CustomTypeConfig>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CustomTypeConfig {
+    pub imports: Vec<String>,
+    #[serde(alias = "type_name")]
+    pub type_name: Option<String>,
+    #[serde(alias = "lift")]
+    pub into_custom: String,
+    #[serde(alias = "lower")]
+    pub from_custom: String,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct RootConfig {
+    bindings: BindingsConfig,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct BindingsConfig {
+    javascript: JsConfig,
+}
+
+impl JsConfig {
+    fn from_root_toml(toml: toml::Value) -> Result<Self> {
+        let root: RootConfig = toml.try_into()?;
+        Ok(root.bindings.javascript)
+    }
+
+    pub fn custom_type(&self, name: &str) -> Option<&CustomTypeConfig> {
+        self.custom_types.get(name)
+    }
+}
+
+impl CustomTypeConfig {
+    pub fn public_type<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.type_name.as_deref().unwrap_or(fallback)
+    }
+
+    pub fn into_custom_expr(&self, builtin_expr: &str) -> String {
+        if self.into_custom.is_empty() {
+            builtin_expr.to_string()
+        } else {
+            self.into_custom.replace("{}", builtin_expr)
+        }
+    }
+
+    pub fn from_custom_expr(&self, custom_expr: &str) -> String {
+        if self.from_custom.is_empty() {
+            custom_expr.to_string()
+        } else {
+            self.from_custom.replace("{}", custom_expr)
+        }
+    }
+}
+
+fn load_override_toml(path: Option<&Utf8PathBuf>) -> Result<Option<toml::Value>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let text = fs::read_to_string(path).with_context(|| format!("reading config override {path}"))?;
+    let value =
+        toml::from_str(&text).with_context(|| format!("parsing config override {path}"))?;
+    Ok(Some(value))
+}
+
+fn merge_toml(into: &mut toml::Value, from: toml::Value) {
+    match (into, from) {
+        (toml::Value::Table(into), toml::Value::Table(from)) => {
+            for (key, value) in from {
+                match into.get_mut(&key) {
+                    Some(existing) => merge_toml(existing, value),
+                    None => {
+                        into.insert(key, value);
+                    }
+                }
+            }
+        }
+        (into, from) => *into = from,
+    }
+}
