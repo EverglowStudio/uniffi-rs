@@ -154,13 +154,8 @@ fn build_wasm(args: BuildWasmArgs) -> Result<()> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let core_meta = cargo_package_metadata(&manifest_path)?;
 
-    let mut build_core = cargo_build_command(
-        &args.cargo_bin,
-        &manifest_path,
-        &[],
-        args.release,
-        None,
-    );
+    let mut build_core =
+        cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
     run_command(
         &args.cargo_bin,
         &mut build_core,
@@ -209,7 +204,9 @@ fn build_wasm(args: BuildWasmArgs) -> Result<()> {
     if !wasm_manifest.exists() {
         bail!(
             "wasm host crate was not emitted at {}",
-            wasm_manifest.parent().unwrap_or_else(|| Utf8Path::new("<unknown>"))
+            wasm_manifest
+                .parent()
+                .unwrap_or_else(|| Utf8Path::new("<unknown>"))
         );
     }
 
@@ -268,7 +265,10 @@ fn cargo_build_command<'a>(
     current_dir: Option<&'a Utf8Path>,
 ) -> Command {
     let mut command = Command::new(cargo_bin);
-    command.arg("build").arg("--manifest-path").arg(manifest_path.as_str());
+    command
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest_path.as_str());
     if release {
         command.arg("--release");
     }
@@ -279,7 +279,12 @@ fn cargo_build_command<'a>(
     command
 }
 
-fn run_command(binary: &str, command: &mut Command, tool_name: &str, missing_hint: &str) -> Result<()> {
+fn run_command(
+    binary: &str,
+    command: &mut Command,
+    tool_name: &str,
+    missing_hint: &str,
+) -> Result<()> {
     let rendered = format!("{command:?}");
     let output = command.output().with_context(|| {
         format!("{tool_name} invocation failed while spawning `{binary}`. {missing_hint}")
@@ -295,7 +300,8 @@ fn run_command(binary: &str, command: &mut Command, tool_name: &str, missing_hin
 }
 
 fn canonicalize_or_keep(path: &Utf8Path) -> Utf8PathBuf {
-    path.canonicalize_utf8().unwrap_or_else(|_| path.to_path_buf())
+    path.canonicalize_utf8()
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 struct CargoPackageMetadata {
@@ -336,12 +342,12 @@ fn cargo_package_metadata(manifest_path: &Utf8Path) -> Result<CargoPackageMetada
                 .iter()
                 .find(|target| target.kind.iter().any(|kind| kind.to_string() == "lib"))
         })
-        .with_context(|| {
-            format!("package {} has no lib/cdylib target", package.name)
-        })?;
+        .with_context(|| format!("package {} has no lib/cdylib target", package.name))?;
     Ok(CargoPackageMetadata {
-        target_directory: Utf8PathBuf::from_path_buf(metadata.target_directory.clone().into_std_path_buf())
-            .map_err(|p| anyhow::anyhow!("cargo metadata target dir is not utf8: {}", p.display()))?,
+        target_directory: Utf8PathBuf::from_path_buf(
+            metadata.target_directory.clone().into_std_path_buf(),
+        )
+        .map_err(|p| anyhow::anyhow!("cargo metadata target dir is not utf8: {}", p.display()))?,
         lib_target_name: lib_target.name.clone(),
     })
 }

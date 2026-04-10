@@ -2,10 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use super::javascript;
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::fmt;
-use super::javascript;
 use uniffi_bindgen::{
     bindings::{generate, python, GenerateOptions, TargetLanguage},
     pipeline::initial,

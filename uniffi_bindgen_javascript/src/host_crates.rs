@@ -40,6 +40,21 @@ pub struct HostCrateOptions {
 pub struct CoreCrateMetadata {
     pub package_name: String,
     pub crate_dir: Utf8PathBuf,
+    pub uniffi_dep: UniffiDependency,
+}
+
+#[derive(Clone, Debug)]
+pub struct UniffiDependency {
+    pub base_dir: Utf8PathBuf,
+    pub version: Option<String>,
+    pub path: Option<String>,
+    pub git: Option<String>,
+    pub branch: Option<String>,
+    pub tag: Option<String>,
+    pub rev: Option<String>,
+    pub package: Option<String>,
+    pub default_features: Option<bool>,
+    pub features: Vec<String>,
 }
 
 pub fn load_metadata(manifest_path: &Utf8Path) -> Result<CoreCrateMetadata> {
@@ -53,6 +68,7 @@ pub fn load_metadata(manifest_path: &Utf8Path) -> Result<CoreCrateMetadata> {
         .and_then(|n| n.as_str())
         .with_context(|| format!("{manifest_path} missing [package].name"))?
         .to_string();
+    let uniffi_dep = resolve_uniffi_dependency(manifest_path, &value)?;
     let crate_dir = manifest_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -61,6 +77,7 @@ pub fn load_metadata(manifest_path: &Utf8Path) -> Result<CoreCrateMetadata> {
     Ok(CoreCrateMetadata {
         package_name,
         crate_dir,
+        uniffi_dep,
     })
 }
 
@@ -138,6 +155,7 @@ fn emit_wasm(
          \n\
          [dependencies]\n\
          {core_name} = {{ path = \"{rel_core}\" }}\n\
+         {uniffi_dep}\n\
          wasm-bindgen = \"=0.2.117\"\n\
          wasm-bindgen-futures = \"0.4\"\n\
          js-sys = \"0.3\"\n\
@@ -149,6 +167,7 @@ fn emit_wasm(
         package_name = package_name,
         core_name = meta.package_name,
         rel_core = rel_core,
+        uniffi_dep = render_uniffi_dependency(&meta.uniffi_dep, &crate_dir)?,
     );
     fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -198,6 +217,7 @@ fn emit_napi(
          \n\
          [dependencies]\n\
          {core_name} = {{ path = \"{rel_core}\" }}\n\
+         {uniffi_dep}\n\
          napi = {{ version = \"3.8.4\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }}\n\
          napi-derive = {{ version = \"3.5.3\", features = [\"type-def\"] }}\n\
          \n\
@@ -208,6 +228,7 @@ fn emit_napi(
         package_name = package_name,
         core_name = meta.package_name,
         rel_core = rel_core,
+        uniffi_dep = render_uniffi_dependency(&meta.uniffi_dep, &crate_dir)?,
     );
     fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -253,4 +274,135 @@ fn relative_path(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {
         result.push(".");
     }
     result
+}
+
+fn resolve_uniffi_dependency(manifest_path: &Utf8Path, value: &toml::Value) -> Result<UniffiDependency> {
+    let manifest_dir = manifest_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| Utf8PathBuf::from("."));
+    let dep = value
+        .get("dependencies")
+        .and_then(|deps| deps.get("uniffi"))
+        .with_context(|| format!("{manifest_path} missing [dependencies].uniffi"))?;
+    if dep
+        .get("workspace")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return resolve_workspace_uniffi_dependency(&manifest_dir);
+    }
+    parse_uniffi_dependency(dep, &manifest_dir)
+}
+
+fn resolve_workspace_uniffi_dependency(start_dir: &Utf8Path) -> Result<UniffiDependency> {
+    let mut current = Some(start_dir);
+    while let Some(dir) = current {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.exists() {
+            let text = fs::read_to_string(&manifest)
+                .with_context(|| format!("reading workspace manifest at {manifest}"))?;
+            let value: toml::Value =
+                toml::from_str(&text).with_context(|| format!("parsing {manifest}"))?;
+            if let Some(dep) = value
+                .get("workspace")
+                .and_then(|ws| ws.get("dependencies"))
+                .and_then(|deps| deps.get("uniffi"))
+            {
+                return parse_uniffi_dependency(dep, dir);
+            }
+        }
+        current = dir.parent();
+    }
+    bail!("could not resolve workspace dependency for `uniffi` starting from {start_dir}")
+}
+
+fn parse_uniffi_dependency(dep: &toml::Value, base_dir: &Utf8Path) -> Result<UniffiDependency> {
+    match dep {
+        toml::Value::String(version) => Ok(UniffiDependency {
+            base_dir: base_dir.to_path_buf(),
+            version: Some(version.clone()),
+            path: None,
+            git: None,
+            branch: None,
+            tag: None,
+            rev: None,
+            package: None,
+            default_features: None,
+            features: Vec::new(),
+        }),
+        toml::Value::Table(table) => Ok(UniffiDependency {
+            base_dir: base_dir.to_path_buf(),
+            version: table.get("version").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            path: table.get("path").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            git: table.get("git").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            branch: table.get("branch").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            tag: table.get("tag").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            rev: table.get("rev").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            package: table.get("package").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            default_features: table.get("default-features").and_then(|v| v.as_bool()),
+            features: table
+                .get("features")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        }),
+        _ => bail!("unsupported `uniffi` dependency form in Cargo.toml"),
+    }
+}
+
+fn render_uniffi_dependency(dep: &UniffiDependency, crate_dir: &Utf8Path) -> Result<String> {
+    let mut fields: Vec<(String, String)> = Vec::new();
+    if let Some(path) = &dep.path {
+        let abs = dep
+            .base_dir
+            .join(path)
+            .canonicalize_utf8()
+            .unwrap_or_else(|_| dep.base_dir.join(path));
+        let rel = relative_path(crate_dir, &abs);
+        fields.push(("path".into(), format!("\"{rel}\"")));
+    }
+    if let Some(version) = &dep.version {
+        fields.push(("version".into(), format!("\"{version}\"")));
+    }
+    if let Some(git) = &dep.git {
+        fields.push(("git".into(), format!("\"{git}\"")));
+    }
+    if let Some(branch) = &dep.branch {
+        fields.push(("branch".into(), format!("\"{branch}\"")));
+    }
+    if let Some(tag) = &dep.tag {
+        fields.push(("tag".into(), format!("\"{tag}\"")));
+    }
+    if let Some(rev) = &dep.rev {
+        fields.push(("rev".into(), format!("\"{rev}\"")));
+    }
+    if let Some(package) = &dep.package {
+        fields.push(("package".into(), format!("\"{package}\"")));
+    }
+    if let Some(default_features) = dep.default_features {
+        fields.push(("default-features".into(), default_features.to_string()));
+    }
+    if !dep.features.is_empty() {
+        let features = dep
+            .features
+            .iter()
+            .map(|feature| format!("\"{feature}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fields.push(("features".into(), format!("[{features}]")));
+    }
+    if fields.is_empty() {
+        bail!("resolved `uniffi` dependency has no renderable fields");
+    }
+    let fields = fields
+        .into_iter()
+        .map(|(key, value)| format!("{key} = {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!("uniffi = {{ {fields} }}"))
 }

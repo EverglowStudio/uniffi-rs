@@ -45,14 +45,23 @@ pub fn emit(common_dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()
     let config = &component.config;
 
     fs::write(common_dir.join("runtime.ts"), RUNTIME_TS)?;
-    fs::write(common_dir.join("custom-types.ts"), render_custom_types(ci, config))?;
+    fs::write(
+        common_dir.join("custom-types.ts"),
+        render_custom_types(ci, config),
+    )?;
     fs::write(common_dir.join("records.ts"), render_records(ci, config))?;
     fs::write(common_dir.join("enums.ts"), render_enums(ci, config))?;
     fs::write(common_dir.join("errors.ts"), render_errors(ci))?;
-    fs::write(common_dir.join("callbacks.ts"), render_callbacks(ci, config))?;
+    fs::write(
+        common_dir.join("callbacks.ts"),
+        render_callbacks(ci, config),
+    )?;
     fs::write(common_dir.join("objects.ts"), render_objects(ci, config))?;
     fs::write(common_dir.join("api.ts"), render_api(ci, config))?;
-    fs::write(common_dir.join("public-types.ts"), render_public_types(ci, config))?;
+    fs::write(
+        common_dir.join("public-types.ts"),
+        render_public_types(ci, config),
+    )?;
     Ok(())
 }
 
@@ -71,11 +80,7 @@ fn render_records(ci: &ComponentInterface, config: &JsConfig) -> String {
     if !custom_names.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./custom-types.ts\";\n\n",
-            join_sorted(
-                &custom_names
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            )
+            join_sorted(&custom_names.into_iter().collect::<Vec<_>>())
         ));
     }
     for record in ci.record_definitions() {
@@ -208,7 +213,13 @@ fn render_enum(e: &Enum, config: &JsConfig) -> String {
             let fields = v
                 .fields()
                 .iter()
-                .map(|f| format!("{}: {}", js_field_name(f.name()), ts_type(&f.as_type(), config)))
+                .map(|f| {
+                    format!(
+                        "{}: {}",
+                        js_field_name(f.name()),
+                        ts_type(&f.as_type(), config)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
             arms.push(format!("  | {{ tag: \"{}\"; {} }}", v.name(), fields));
@@ -263,11 +274,7 @@ fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
     if !custom_names.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./custom-types.ts\";\n\n",
-            join_sorted(
-                &custom_names
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            )
+            join_sorted(&custom_names.into_iter().collect::<Vec<_>>())
         ));
     }
     for obj in ci.object_definitions() {
@@ -404,10 +411,15 @@ fn render_objects(ci: &ComponentInterface, config: &JsConfig) -> String {
             join_sorted(&grouped.callbacks)
         ));
     }
-    if !grouped.customs.is_empty() {
+    let custom_type_imports = usage
+        .customs
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if !custom_type_imports.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./custom-types.ts\";\n",
-            join_sorted(&grouped.customs)
+            join_sorted(&custom_type_imports)
         ));
     }
     let helper_customs = object_custom_helpers(ci, config);
@@ -456,8 +468,11 @@ fn render_object_class(ci: &ComponentInterface, obj: &Object, config: &JsConfig)
     for c in obj.constructors() {
         let c_js = js_fn_name(c.name());
         let fn_name = format!("{snake}_{}", c.name().to_snake_case());
-        let (arg_decls, arg_pass) =
-            lowered_args(ci, config, c.arguments().iter().map(|a| (a.name(), a.as_type())));
+        let (arg_decls, arg_pass) = lowered_args(
+            ci,
+            config,
+            c.arguments().iter().map(|a| (a.name(), a.as_type())),
+        );
         let comma = if arg_pass.is_empty() { "" } else { ", " };
         if c.is_async() {
             s.push_str(&format!(
@@ -476,8 +491,11 @@ fn render_object_class(ci: &ComponentInterface, obj: &Object, config: &JsConfig)
     for m in obj.methods() {
         let m_js = js_fn_name(m.name());
         let fn_name = format!("{snake}_{}", m.name().to_snake_case());
-        let (arg_decls, arg_pass) =
-            lowered_args(ci, config, m.arguments().iter().map(|a| (a.name(), a.as_type())));
+        let (arg_decls, arg_pass) = lowered_args(
+            ci,
+            config,
+            m.arguments().iter().map(|a| (a.name(), a.as_type())),
+        );
         let comma_pass = if arg_pass.is_empty() { "" } else { ", " };
         let ret_ty = m.return_type();
         let ret_ts = match ret_ty {
@@ -651,10 +669,15 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
             join_sorted(&grouped.callbacks)
         ));
     }
-    if !grouped.customs.is_empty() {
+    let custom_type_imports = usage
+        .customs
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if !custom_type_imports.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./custom-types.ts\";\n",
-            join_sorted(&grouped.customs)
+            join_sorted(&custom_type_imports)
         ));
     }
     let helper_customs = function_custom_helpers(ci, config);
@@ -682,8 +705,11 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
 }
 
 fn render_free_function(ci: &ComponentInterface, config: &JsConfig, f: &Function) -> String {
-    let (arg_decls, arg_pass) =
-        lowered_args(ci, config, f.arguments().iter().map(|a| (a.name(), a.as_type())));
+    let (arg_decls, arg_pass) = lowered_args(
+        ci,
+        config,
+        f.arguments().iter().map(|a| (a.name(), a.as_type())),
+    );
     let ret_ty = f.return_type();
     let ret_ts = match ret_ty {
         Some(t) => ts_type(t, config),
@@ -821,7 +847,7 @@ fn ts_lower_expr(
                 ts_lower_expr(ci, config, builtin, &custom, depth + 1)
             }
             None => ts_lower_expr(ci, config, builtin, ident, depth + 1),
-        }
+        },
         // Callback traits / `with_foreign` traits are lowered as a
         // tagged marker. Each backend adapter intercepts the marker and
         // translates it into whatever its native layer wants:
@@ -860,7 +886,7 @@ fn ts_lift_expr(
         Type::Sequence { inner_type } => {
             let item = format!("__item{depth}");
             format!(
-                "{ident}.map(({item}) => {})",
+                "{ident}.map(({item}: any) => {})",
                 ts_lift_expr(ci, config, inner_type, &item, depth + 1)
             )
         }
@@ -1432,7 +1458,10 @@ fn ts_lower_enum(
     let mut cases = Vec::new();
     for variant in enum_.variants() {
         if variant.fields().is_empty() {
-            cases.push(format!("case \"{name}\": return {{ tag: \"{name}\" }};", name = variant.name()));
+            cases.push(format!(
+                "case \"{name}\": return {{ tag: \"{name}\" }};",
+                name = variant.name()
+            ));
             continue;
         }
         let fields = variant
@@ -1458,7 +1487,10 @@ fn ts_lower_enum(
             name = variant.name()
         ));
     }
-    format!("(() => {{ switch ({tag_expr}) {{ {} default: return {ident}; }} }})()", cases.join(" "))
+    format!(
+        "(() => {{ switch ({tag_expr}) {{ {} default: return {ident}; }} }})()",
+        cases.join(" ")
+    )
 }
 
 fn ts_lift_enum(
@@ -1480,7 +1512,10 @@ fn ts_lift_enum(
     let mut cases = Vec::new();
     for variant in enum_.variants() {
         if variant.fields().is_empty() {
-            cases.push(format!("case \"{name}\": return {{ tag: \"{name}\" }};", name = variant.name()));
+            cases.push(format!(
+                "case \"{name}\": return {{ tag: \"{name}\" }};",
+                name = variant.name()
+            ));
             continue;
         }
         let fields = variant
@@ -1506,5 +1541,8 @@ fn ts_lift_enum(
             name = variant.name()
         ));
     }
-    format!("(() => {{ switch ({tag_expr}) {{ {} default: return {ident}; }} }})()", cases.join(" "))
+    format!(
+        "(() => {{ switch ({tag_expr}) {{ {} default: return {ident}; }} }})()",
+        cases.join(" ")
+    )
 }
