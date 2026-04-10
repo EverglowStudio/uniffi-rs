@@ -3275,15 +3275,40 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
          \x20   pub left: u32,\n\
          \x20   pub right: u32,\n\
          }\n\n\
+         #[derive(Debug)]\n\
+         pub enum ProviderError {\n\
+         \x20   BadValue,\n\
+         }\n\n\
+         impl std::fmt::Display for ProviderError {\n\
+         \x20   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n\
+         \x20       match self {\n\
+         \x20           Self::BadValue => write!(f, \"BadValue\"),\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n\n\
+         impl std::error::Error for ProviderError {}\n\n\
          pub trait ValueProvider: Send + Sync {\n\
          \x20   fn get_value(&self) -> u32;\n\
          \x20   fn make_payload(&self) -> Payload;\n\
+         \x20   fn checked_value(&self, fail: bool) -> Result<u32, ProviderError>;\n\
+         \x20   fn checked_payload(&self, fail: bool) -> Result<Payload, ProviderError>;\n\
+         \x20   fn checked_void(&self, fail: bool) -> Result<(), ProviderError>;\n\
          }\n\n\
          pub fn invoke_value_provider_get_value(provider: std::sync::Arc<dyn ValueProvider>) -> u32 {\n\
          \x20   provider.get_value()\n\
          }\n\n\
          pub fn invoke_value_provider_make_payload(provider: std::sync::Arc<dyn ValueProvider>) -> Payload {\n\
          \x20   provider.make_payload()\n\
+         }\n\n\
+         pub fn invoke_value_provider_checked_value(provider: std::sync::Arc<dyn ValueProvider>, fail: bool) -> Result<u32, ProviderError> {\n\
+         \x20   provider.checked_value(fail)\n\
+         }\n\n\
+         pub fn invoke_value_provider_checked_payload(provider: std::sync::Arc<dyn ValueProvider>, fail: bool) -> Result<Payload, ProviderError> {\n\
+         \x20   provider.checked_payload(fail)\n\
+         }\n\n\
+         pub fn invoke_value_provider_checked_void(provider: std::sync::Arc<dyn ValueProvider>, fail: bool) -> Result<bool, ProviderError> {\n\
+         \x20   provider.checked_void(fail)?;\n\
+         \x20   Ok(true)\n\
          }\n",
     )
     .unwrap();
@@ -3296,15 +3321,32 @@ dictionary Payload {
   u32 right;
 };
 
+[Error]
+enum ProviderError {
+  "BadValue",
+};
+
 [Trait, WithForeign]
 interface ValueProvider {
   u32 get_value();
   Payload make_payload();
+  [Throws=ProviderError]
+  u32 checked_value(boolean fail);
+  [Throws=ProviderError]
+  Payload checked_payload(boolean fail);
+  [Throws=ProviderError]
+  void checked_void(boolean fail);
 };
 
 namespace callback_return {
   u32 invoke_value_provider_get_value(ValueProvider provider);
   Payload invoke_value_provider_make_payload(ValueProvider provider);
+  [Throws=ProviderError]
+  u32 invoke_value_provider_checked_value(ValueProvider provider, boolean fail);
+  [Throws=ProviderError]
+  Payload invoke_value_provider_checked_payload(ValueProvider provider, boolean fail);
+  [Throws=ProviderError]
+  boolean invoke_value_provider_checked_void(ValueProvider provider, boolean fail);
 };
 "#,
     )
@@ -4462,6 +4504,16 @@ exports.__state = state;
         &driver,
         r#"
 import { invokeValueProviderGetValue, invokeValueProviderMakePayload } from "./node/index.ts";
+import {
+    ProviderError,
+    invokeValueProviderCheckedPayload,
+    invokeValueProviderCheckedValue,
+    invokeValueProviderCheckedVoid,
+} from "./node/index.ts";
+import { UniffiError } from "./common/runtime.ts";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
 
 const provider = {
     getValue() {
@@ -4469,6 +4521,17 @@ const provider = {
     },
     makePayload() {
         return { left: 7, right: 11 };
+    },
+    checkedValue(fail: boolean) {
+        if (fail) throw new ProviderError("BadValue", "BadValue");
+        return 77;
+    },
+    checkedPayload(fail: boolean) {
+        if (fail) throw new ProviderError("BadValue", "BadValue");
+        return { left: 13, right: 17 };
+    },
+    checkedVoid(fail: boolean) {
+        if (fail) throw new ProviderError("BadValue", "BadValue");
     },
 };
 
@@ -4479,6 +4542,70 @@ if (scalar !== 42) {
 const payload = invokeValueProviderMakePayload(provider as any);
 if (payload.left !== 7 || payload.right !== 11) {
     throw new Error(`makePayload failed: ${JSON.stringify(payload)}`);
+}
+
+if (invokeValueProviderCheckedValue(provider as any, false) !== 77) {
+    throw new Error("checkedValue(false) failed");
+}
+const checkedPayload = invokeValueProviderCheckedPayload(provider as any, false);
+if (checkedPayload.left !== 13 || checkedPayload.right !== 17) {
+    throw new Error(`checkedPayload(false) failed: ${JSON.stringify(checkedPayload)}`);
+}
+if (invokeValueProviderCheckedVoid(provider as any, false) !== true) {
+    throw new Error("checkedVoid(false) failed");
+}
+
+for (const [label, fn] of [
+    ["checkedValue", () => invokeValueProviderCheckedValue(provider as any, true)],
+    ["checkedPayload", () => invokeValueProviderCheckedPayload(provider as any, true)],
+    ["checkedVoid", () => invokeValueProviderCheckedVoid(provider as any, true)],
+] as const) {
+    let threw = false;
+    try {
+        fn();
+    } catch (e) {
+        threw = true;
+        if (!(e instanceof UniffiError)) {
+            throw new Error(`${label} threw wrong type: ${e && (e as Error).message}`);
+        }
+        if (!String((e as Error).message).includes("BadValue")) {
+            throw new Error(`${label} threw wrong message: ${(e as Error).message}`);
+        }
+    }
+    if (!threw) throw new Error(`${label}(true) should throw`);
+}
+
+require("./electron/preload.cjs");
+const bridge = (globalThis as any).__uniffi__;
+if (!bridge || typeof bridge.dispatchSync !== "function") {
+    throw new Error("missing electron preload bridge");
+}
+const electronMarker = {
+    __uniffiCallback: true,
+    object: provider,
+    fallibleMethods: {
+        checkedValue: "flat",
+        checkedPayload: "flat",
+        checkedVoid: "flat",
+    },
+};
+let electronRes = bridge.dispatchSync({
+    kind: "call",
+    id: 1,
+    method: "invoke_value_provider_checked_value",
+    args: [electronMarker, false],
+});
+if (electronRes.kind !== "ok" || electronRes.value !== 77) {
+    throw new Error(`electron checked value failed: ${JSON.stringify(electronRes)}`);
+}
+electronRes = bridge.dispatchSync({
+    kind: "call",
+    id: 2,
+    method: "invoke_value_provider_checked_value",
+    args: [electronMarker, true],
+});
+if (electronRes.kind !== "err" || !String(electronRes.error?.message ?? "").includes("BadValue")) {
+    throw new Error(`electron checked value error failed: ${JSON.stringify(electronRes)}`);
 }
 
 console.log("ok");

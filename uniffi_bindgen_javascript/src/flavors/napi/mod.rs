@@ -71,8 +71,32 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
          \n\
          {enum_shape_helpers}\n\
          \n\
-         function __uniffiNormalizeCallbackObject(obj: unknown): unknown {{\n\
+         function __uniffiCallbackErrorPayload(error: unknown, shape: unknown): unknown {{\n\
+             if (error !== null && typeof error === \"object\") {{\n\
+                 const raw = error as Record<string, unknown>;\n\
+                 if (shape === \"flat\") {{\n\
+                     if (typeof raw.variant === \"string\") return raw.variant;\n\
+                     if (typeof raw.tag === \"string\") return raw.tag;\n\
+                     if (typeof raw.type === \"string\") return raw.type;\n\
+                 }}\n\
+                 if (typeof raw.tag === \"string\" || typeof raw.type === \"string\") {{\n\
+                     return __uniffiLowerShape(raw);\n\
+                 }}\n\
+                 if (typeof raw.variant === \"string\") {{\n\
+                     const data = raw.data;\n\
+                     const payload: Record<string, unknown> = {{ tag: raw.variant }};\n\
+                     if (data !== null && typeof data === \"object\" && !Array.isArray(data)) {{\n\
+                         Object.assign(payload, data as Record<string, unknown>);\n\
+                     }}\n\
+                     return __uniffiLowerShape(payload);\n\
+                 }}\n\
+             }}\n\
+             throw error;\n\
+         }}\n\
+         \n\
+         function __uniffiNormalizeCallbackObject(obj: unknown, marker?: {{ fallibleMethods?: Record<string, string> }}): unknown {{\n\
              if (obj === null || typeof obj !== \"object\") return obj;\n\
+             const fallibleMethods = marker?.fallibleMethods ?? {{}};\n\
              const out: Record<string, unknown> = {{}};\n\
              for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {{\n\
                  if (typeof v === \"function\") {{\n\
@@ -80,7 +104,16 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
                          const callArgs = args.length >= 2 && (args[0] === null || args[0] === undefined || args[0] instanceof Error)\n\
                              ? args.slice(1)\n\
                              : args;\n\
-                         return __uniffiLowerShape((v as (...a: unknown[]) => unknown)(...callArgs));\n\
+                         const fn = v as (...a: unknown[]) => unknown;\n\
+                         const errorShape = fallibleMethods[k];\n\
+                         if (!errorShape) {{\n\
+                             return __uniffiLowerShape(fn(...callArgs));\n\
+                         }}\n\
+                         try {{\n\
+                             return {{ ok: true, value: __uniffiLowerShape(fn(...callArgs)) }};\n\
+                         }} catch (error) {{\n\
+                             return {{ ok: false, error: __uniffiCallbackErrorPayload(error, errorShape) }};\n\
+                         }}\n\
                      }};\n\
                  }} else {{\n\
                      out[k] = v;\n\
@@ -100,7 +133,7 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
                  typeof a === \"object\" &&\n\
                  (a as {{ __uniffiCallback?: boolean }}).__uniffiCallback === true\n\
              ) {{\n\
-                 return __uniffiNormalizeCallbackObject((a as {{ object: unknown }}).object);\n\
+                 return __uniffiNormalizeCallbackObject((a as {{ object: unknown }}).object, a as {{ fallibleMethods?: Record<string, string> }});\n\
              }}\n\
              return a;\n\
          }};\n\

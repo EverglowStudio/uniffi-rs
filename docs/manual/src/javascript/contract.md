@@ -184,9 +184,14 @@ export interface <Name> { <method>(<args>): <Ret> | Promise<<Ret>>; }
   stable identifier or backend-native callback object, depending on the flavor.
 - Callback failures must be normalized through the same error model described
   above.
+- The napi/electron adapters support synchronous callbacks that return values
+  and callbacks that throw a declared UniFFI error. Internally the adapter
+  converts thrown typed JS errors into a backend envelope before Rust receives
+  the callback result.
 
 Support is flavor-dependent. For example, the wasm backend currently supports a
-smaller callback subset than the napi/electron path.
+smaller callback subset than the napi/electron path: fallible callback methods
+are rejected at runtime in the generated wasm shim.
 
 ## Async
 
@@ -288,6 +293,7 @@ fast rather than run with mixed assumptions.
 - `Map<K, V>` / `Set<T>` representation details
 - non-string keyed record-like structures
 - cancellation / `AbortSignal`
-- callback return-value serializability in Electron
+- async callback traits
+- wasm fallible callback traits
 
 These are future contract extensions rather than v1 guarantees.
