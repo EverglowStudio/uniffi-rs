@@ -164,6 +164,7 @@ impl FnMetadata {
 pub struct ConstructorMetadata {
     pub module_path: String,
     pub self_name: String,
+    pub self_type: Option<Type>,
     pub name: String,
     // Original name, if this was renamed
     pub orig_name: Option<String>,

@@ -40,6 +40,11 @@ impl APIConverter<ObjectMetadata> for weedle::InterfaceDefinition<'_> {
                         bail!("Duplicate interface member name: \"{}\"", cons.name)
                     }
                     cons.self_name = object_name.to_string();
+                    cons.self_type = Some(Type::Object {
+                        module_path: ci.module_path(),
+                        name: object_name.to_string(),
+                        imp: ObjectImpl::Struct,
+                    });
                     ci.items.insert(cons.into());
                 }
                 weedle::interface::InterfaceMember::Operation(t) => {

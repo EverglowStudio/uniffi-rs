@@ -126,6 +126,7 @@ impl APIConverter<ConstructorMetadata> for weedle::interface::ConstructorInterfa
             orig_name: None,
             // We don't know the name of the containing `Object` at this point, fill it in later.
             self_name: Default::default(),
+            self_type: None,
             is_async: attributes.is_async(),
             // Also fill in checksum_fn_name later, since it depends on object_name
             inputs: self.args.body.list.convert(ci)?,
