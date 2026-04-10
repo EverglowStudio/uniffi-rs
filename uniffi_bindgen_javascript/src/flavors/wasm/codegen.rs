@@ -28,9 +28,10 @@
 //!   `thread_local!`-stored `js_sys::Function`s. `Drop` releases the JS
 //!   registry slot.
 //!
-//! Anything still unsupported (timestamp/duration/custom/Map/Set) is
-//! emitted as a stub that throws `JsError` at runtime — never a silent
-//! skip.
+//! Anything still unsupported (custom/Map/Set) is emitted as a stub
+//! that throws `JsError` at runtime — never a silent skip. Timestamp
+//! and duration are covered with explicit `Date` / millisecond
+//! lowering and lifting.
 
 use std::fmt::Write;
 
@@ -97,6 +98,7 @@ pub fn render_wasm_rust(ci: &ComponentInterface) -> String {
     // Emit explicit `__lower_<name>` / `__lift_<name>` helpers for
     // every record and non-error enum.
     emit_value_helpers(&mut out, ci, &crate_ident);
+    emit_temporal_helpers(&mut out);
 
     if has_objects {
         emit_object_helpers(&mut out);
@@ -213,6 +215,88 @@ fn __uniffi_cb_release(handle: u32) {{
 "#
     )
     .unwrap();
+    writeln!(out).unwrap();
+}
+
+/// Emitted once for timestamp/duration lowering/lifting. Keeps
+/// chronological conversions explicit and serde-free.
+fn emit_temporal_helpers(out: &mut String) {
+    out.push_str(
+        r#"#[allow(dead_code)]
+fn __uniffi_lower_timestamp(__js: JsValue) -> Result<::std::time::SystemTime, JsError> {
+    let __date: ::js_sys::Date = __js.dyn_into().map_err(|_| JsError::new("expected Date"))?;
+    let __ms = __date.get_time();
+    if !__ms.is_finite() {
+        return Err(JsError::new("invalid Date"));
+    }
+    if __ms.abs() > 8.64e15 {
+        return Err(JsError::new("timestamp exceeds JS Date range"));
+    }
+    let __ms_i = __ms.trunc() as i64;
+    if __ms_i >= 0 {
+        ::std::time::UNIX_EPOCH
+            .checked_add(::std::time::Duration::from_millis(__ms_i as u64))
+            .ok_or_else(|| JsError::new("timestamp overflow"))
+    } else {
+        ::std::time::UNIX_EPOCH
+            .checked_sub(::std::time::Duration::from_millis((-__ms_i) as u64))
+            .ok_or_else(|| JsError::new("timestamp overflow"))
+    }
+}
+
+#[allow(dead_code)]
+fn __uniffi_lift_timestamp(__ts: ::std::time::SystemTime) -> Result<JsValue, JsError> {
+    let __ms = match __ts.duration_since(::std::time::UNIX_EPOCH) {
+        Ok(__delta) => {
+            (__delta.as_secs() as f64) * 1000.0 + (__delta.subsec_nanos() as f64) / 1_000_000.0
+        }
+        Err(__err) => {
+            let __delta = __err.duration();
+            -((__delta.as_secs() as f64) * 1000.0 + (__delta.subsec_nanos() as f64) / 1_000_000.0)
+        }
+    };
+    if !__ms.is_finite() || __ms.abs() > 8.64e15 {
+        return Err(JsError::new("timestamp exceeds JS Date range"));
+    }
+    Ok::<JsValue, JsError>(::js_sys::Date::new(&JsValue::from_f64(__ms)).into())
+}
+
+#[allow(dead_code)]
+fn __uniffi_lower_duration(__js: JsValue) -> Result<::std::time::Duration, JsError> {
+    let __ms = __js
+        .as_f64()
+        .ok_or_else(|| JsError::new("expected duration milliseconds number"))?;
+    if !__ms.is_finite() {
+        return Err(JsError::new("duration must be finite"));
+    }
+    if __ms < 0.0 {
+        return Err(JsError::new("duration must be non-negative"));
+    }
+    let __secs_f = (__ms / 1000.0).trunc();
+    if __secs_f > u64::MAX as f64 {
+        return Err(JsError::new("duration exceeds Rust range"));
+    }
+    let mut __secs = __secs_f as u64;
+    let mut __nanos = ((__ms % 1000.0) * 1_000_000.0).round() as u32;
+    if __nanos == 1_000_000_000 {
+        __nanos = 0;
+        __secs = __secs
+            .checked_add(1)
+            .ok_or_else(|| JsError::new("duration exceeds Rust range"))?;
+    }
+    Ok::<::std::time::Duration, JsError>(::std::time::Duration::new(__secs, __nanos))
+}
+
+#[allow(dead_code)]
+fn __uniffi_lift_duration(__dur: ::std::time::Duration) -> Result<JsValue, JsError> {
+    let __ms = (__dur.as_secs() as f64) * 1000.0 + (__dur.subsec_nanos() as f64) / 1_000_000.0;
+    if !__ms.is_finite() {
+        return Err(JsError::new("duration exceeds JS number range"));
+    }
+    Ok::<JsValue, JsError>(JsValue::from_f64(__ms))
+}
+"#,
+    );
     writeln!(out).unwrap();
 }
 
@@ -348,7 +432,7 @@ fn render_constructor(
         "    let __obj: Arc<_> = __Coerce({obj_expr}).__into_arc();"
     )
     .unwrap();
-    writeln!(out, "    Ok(__uniffi_{snake}_insert(__obj))").unwrap();
+    writeln!(out, "    Ok::<u32, JsError>(__uniffi_{snake}_insert(__obj))").unwrap();
     writeln!(out, "}}").unwrap();
 }
 
@@ -467,7 +551,12 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 Lowering::Native(_) | Lowering::Value { .. } => {
                     let ty = arg.as_type();
                     let lift = lift_expr(n, &ty, 0);
-                    writeln!(out, "        let _ = __args_arr.push(&{lift});").unwrap();
+                    writeln!(
+                        out,
+                        "        let __lifted_{n} = {lift};"
+                    )
+                    .unwrap();
+                    writeln!(out, "        let _ = __args_arr.push(&__lifted_{n});").unwrap();
                 }
                 _ => {
                     writeln!(out, "        let _ = __args_arr.push(&JsValue::NULL);").unwrap();
@@ -671,15 +760,16 @@ fn emit_return(out: &mut String, ret_info: &Option<Lowering>, bound: &str) {
     match ret_info {
         None => {
             writeln!(out, "    {bound};").unwrap();
-            writeln!(out, "    Ok(())").unwrap();
+            writeln!(out, "    Ok::<(), JsError>(())").unwrap();
         }
         Some(Lowering::Native(_)) => {
-            writeln!(out, "    Ok({bound})").unwrap();
+            writeln!(out, "    Ok::<_, JsError>({bound})").unwrap();
         }
         Some(Lowering::Value { ty, .. }) => {
             writeln!(out, "    let __ret_core = {bound};").unwrap();
-            let lift = lift_expr("__ret_core", ty, 0);
-            writeln!(out, "    Ok({lift})").unwrap();
+            let lift = lift_expr_result("__ret_core", ty, 0);
+            writeln!(out, "    let __ret_js = {lift}?;").unwrap();
+            writeln!(out, "    Ok::<JsValue, JsError>(__ret_js)").unwrap();
         }
         Some(Lowering::Object { snake, .. }) => {
             writeln!(
@@ -687,7 +777,7 @@ fn emit_return(out: &mut String, ret_info: &Option<Lowering>, bound: &str) {
                 "    let __obj: Arc<_> = __Coerce({bound}).__into_arc();"
             )
             .unwrap();
-            writeln!(out, "    Ok(__uniffi_{snake}_insert(__obj))").unwrap();
+            writeln!(out, "    Ok::<u32, JsError>(__uniffi_{snake}_insert(__obj))").unwrap();
         }
         Some(Lowering::Callback { .. }) => {
             writeln!(
@@ -790,8 +880,16 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
             let rust_ty = format!("dyn ::{crate_ident}::{name}");
             Callback { snake, rust_ty }
         }
-        Type::Map { .. } | Type::Timestamp | Type::Duration | Type::Custom { .. } => {
-            Unsupported("Map/Timestamp/Duration/Custom not supported in this pass".into())
+        Type::Timestamp => Value {
+            core_ty: "::std::time::SystemTime".into(),
+            ty: ty.clone(),
+        },
+        Type::Duration => Value {
+            core_ty: "::std::time::Duration".into(),
+            ty: ty.clone(),
+        },
+        Type::Map { .. } | Type::Custom { .. } => {
+            Unsupported("Map/Custom not supported in this pass".into())
         }
     }
 }
@@ -861,7 +959,7 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
         )
         .unwrap();
     }
-    writeln!(out, "    Ok({core} {{").unwrap();
+    writeln!(out, "    Ok::<{core}, JsError>({core} {{").unwrap();
     for f in r.fields() {
         writeln!(out, "        {n},", n = f.name()).unwrap();
     }
@@ -870,7 +968,7 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     writeln!(
         out,
         "#[allow(non_snake_case, dead_code)]\n\
-         fn __lift_{snake}(__c: {core}) -> JsValue {{"
+         fn __lift_{snake}(__c: {core}) -> Result<JsValue, JsError> {{"
     )
     .unwrap();
     writeln!(out, "    let __obj = ::js_sys::Object::new();").unwrap();
@@ -883,14 +981,14 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     .unwrap();
     for f in r.fields() {
         let key = lower_camel(f.name());
-        let lift = lift_expr(f.name(), &f.as_type(), 0);
+        let lift = lift_expr_result(f.name(), &f.as_type(), 0);
         writeln!(
             out,
-            "    let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"{key}\"), &{lift});"
+            "    let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"{key}\"), &({lift})?);"
         )
         .unwrap();
     }
-    writeln!(out, "    __obj.into()\n}}").unwrap();
+    writeln!(out, "    Ok::<JsValue, JsError>(__obj.into())\n}}").unwrap();
 }
 
 fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
@@ -932,7 +1030,11 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
     for v in e.variants() {
         let vname = v.name();
         if v.fields().is_empty() {
-            writeln!(out, "        \"{vname}\" => Ok({core}::{vname}),").unwrap();
+            writeln!(
+                out,
+                "        \"{vname}\" => Ok::<{core}, JsError>({core}::{vname}),"
+            )
+            .unwrap();
             continue;
         }
         writeln!(out, "        \"{vname}\" => {{").unwrap();
@@ -968,12 +1070,12 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
         if nameless {
             writeln!(
                 out,
-                "            Ok({core}::{vname}({args}))",
+                "            Ok::<{core}, JsError>({core}::{vname}({args}))",
                 args = binds.join(", ")
             )
             .unwrap();
         } else {
-            writeln!(out, "            Ok({core}::{vname} {{").unwrap();
+            writeln!(out, "            Ok::<{core}, JsError>({core}::{vname} {{").unwrap();
             for (bind, f) in binds.iter().zip(v.fields().iter()) {
                 writeln!(out, "                {fname}: {bind},", fname = f.name()).unwrap();
             }
@@ -991,7 +1093,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
     writeln!(
         out,
         "#[allow(non_snake_case, dead_code, unused_variables)]\n\
-         fn __lift_{snake}(__c: {core}) -> JsValue {{"
+         fn __lift_{snake}(__c: {core}) -> Result<JsValue, JsError> {{"
     )
     .unwrap();
     writeln!(out, "    match __c {{").unwrap();
@@ -1001,7 +1103,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
             if all_unit {
                 writeln!(
                     out,
-                    "        {core}::{vname} => JsValue::from_str(\"{vname}\"),"
+                    "        {core}::{vname} => Ok::<JsValue, JsError>(JsValue::from_str(\"{vname}\")),"
                 )
                 .unwrap();
             } else {
@@ -1010,7 +1112,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
                     "        {core}::{vname} => {{\n            \
                      let __obj = ::js_sys::Object::new();\n            \
                      let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"tag\"), &JsValue::from_str(\"{vname}\"));\n            \
-                     __obj.into()\n        \
+                    Ok::<JsValue, JsError>(__obj.into())\n        \
                      }},"
                 )
                 .unwrap();
@@ -1056,14 +1158,14 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
         .unwrap();
         for (bind, f) in binds.iter().zip(v.fields().iter()) {
             let key = lower_camel(bind);
-            let lift = lift_expr(bind, &f.as_type(), 0);
+            let lift = lift_expr_result(bind, &f.as_type(), 0);
             writeln!(
                 out,
-                "            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"{key}\"), &{lift});"
+                "            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"{key}\"), &({lift})?);"
             )
             .unwrap();
         }
-        writeln!(out, "            __obj.into()\n        }},").unwrap();
+        writeln!(out, "            Ok::<JsValue, JsError>(__obj.into())\n        }},").unwrap();
     }
     writeln!(out, "    }}\n}}").unwrap();
 }
@@ -1093,6 +1195,8 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
         Type::Bytes => format!(
             "{expr}.dyn_into::<::js_sys::Uint8Array>().map(|__u| __u.to_vec()).map_err(|_| JsError::new(\"expected Uint8Array\"))"
         ),
+        Type::Timestamp => timestamp_lower(expr),
+        Type::Duration => duration_lower(expr),
         Type::Record { name, .. } | Type::Enum { name, .. } => {
             let s = name.to_snake_case();
             format!("__lower_{s}({expr})")
@@ -1121,6 +1225,14 @@ fn num_lower(expr: &str, rust_ty: &str) -> String {
     )
 }
 
+fn timestamp_lower(expr: &str) -> String {
+    format!("__uniffi_lower_timestamp({expr})")
+}
+
+fn duration_lower(expr: &str) -> String {
+    format!("__uniffi_lower_duration({expr})")
+}
+
 /// Build a Rust expression of type `JsValue` that lifts the core value
 /// held in `expr` into a JS value. Infallible.
 fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
@@ -1138,6 +1250,8 @@ fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
         | Type::Float32
         | Type::Float64 => format!("JsValue::from_f64({expr} as f64)"),
         Type::Bytes => format!("JsValue::from(::js_sys::Uint8Array::from(&{expr}[..]))"),
+        Type::Timestamp => timestamp_lift_value(expr),
+        Type::Duration => duration_lift_value(expr),
         Type::Record { name, .. } | Type::Enum { name, .. } => {
             let s = name.to_snake_case();
             format!("__lift_{s}({expr})")
@@ -1156,6 +1270,56 @@ fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
         }
         _ => "JsValue::NULL".to_string(),
     }
+}
+
+/// Build a Rust expression of type `Result<JsValue, JsError>` that lifts
+/// the core value held in `expr` into a JS value. This is used at public
+/// return boundaries and for generated record/enum helpers where a
+/// `Date` overflow should surface as a thrown `JsError`.
+fn lift_expr_result(expr: &str, ty: &Type, depth: usize) -> String {
+    match ty {
+        Type::Timestamp => timestamp_lift_result(expr),
+        Type::Duration => duration_lift_result(expr),
+        Type::Record { name, .. } | Type::Enum { name, .. } => {
+            let s = name.to_snake_case();
+            format!("__lift_{s}({expr})")
+        }
+        Type::Optional { inner_type } => {
+            let bind = format!("__inner{depth}");
+            let inner = lift_expr_result(&bind, inner_type, depth + 1);
+            format!(
+                "match {expr} {{ Some({bind}) => {inner}, None => Ok::<JsValue, JsError>(JsValue::NULL) }}"
+            )
+        }
+        Type::Sequence { inner_type } => {
+            let bind = format!("__item{depth}");
+            let inner = lift_expr_result(&bind, inner_type, depth + 1);
+            format!(
+                "{{ let __arr{depth} = ::js_sys::Array::new(); for {bind} in {expr} {{ let _ = __arr{depth}.push(&({inner})?); }} Ok::<JsValue, JsError>(JsValue::from(__arr{depth})) }}"
+            )
+        }
+        _ => format!("Ok::<JsValue, JsError>({})", lift_expr(expr, ty, depth)),
+    }
+}
+
+fn timestamp_lift_value(expr: &str) -> String {
+    format!(
+        "match __uniffi_lift_timestamp({expr}) {{ Ok(__v) => __v, Err(__e) => panic!(\"uniffi wasm timestamp lift failed: {{:?}}\", __e) }}"
+    )
+}
+
+fn duration_lift_value(expr: &str) -> String {
+    format!(
+        "match __uniffi_lift_duration({expr}) {{ Ok(__v) => __v, Err(__e) => panic!(\"uniffi wasm duration lift failed: {{:?}}\", __e) }}"
+    )
+}
+
+fn timestamp_lift_result(expr: &str) -> String {
+    format!("__uniffi_lift_timestamp({expr})")
+}
+
+fn duration_lift_result(expr: &str) -> String {
+    format!("__uniffi_lift_duration({expr})")
 }
 
 /// Downstream core Rust type for a `Type`.
@@ -1178,6 +1342,8 @@ fn core_ty_for(ty: &Type, crate_ident: &str) -> String {
         Type::Boolean => "bool".into(),
         Type::String => "String".into(),
         Type::Bytes => "Vec<u8>".into(),
+        Type::Timestamp => "::std::time::SystemTime".into(),
+        Type::Duration => "::std::time::Duration".into(),
         Type::Record { name, .. } | Type::Enum { name, .. } => format!("::{crate_ident}::{name}"),
         Type::Optional { inner_type } => {
             format!("Option<{}>", core_ty_for(inner_type, crate_ident))

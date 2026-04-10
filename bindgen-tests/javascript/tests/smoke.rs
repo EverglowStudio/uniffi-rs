@@ -672,8 +672,9 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wasm-bindgen = "0.2"
+wasm-bindgen = "=0.2.117"
 wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 wasm_scalar = { path = "../biz" }
 "#,
     )
@@ -950,6 +951,158 @@ if (!threw) throw new Error("buy(rare) should have thrown");
 
 const ok = buy("common", 3);
 if (ok !== 30) throw new Error(`buy ok: ${ok}`);
+
+console.log("ok");
+"#,
+    });
+}
+
+/// Chronological builtins: `timestamp` -> `Date`, `duration` -> ms
+/// number. Exercises round-trip, arithmetic, optional handling and the
+/// two key error paths.
+#[test]
+fn runs_generated_wasm_shim_timestamp_duration() {
+    run_wasm_e2e(WasmE2eSpec {
+        name: "wasm_time",
+        udl: r#"
+[Error]
+enum ChronologicalError {
+  "TimeOverflow",
+  "TimeDiffError",
+};
+
+namespace wasm_time {
+  [Throws=ChronologicalError]
+  timestamp return_timestamp(timestamp a);
+  [Throws=ChronologicalError]
+  duration return_duration(duration a);
+  [Throws=ChronologicalError]
+  timestamp add(timestamp a, duration b);
+  [Throws=ChronologicalError]
+  duration diff(timestamp a, timestamp b);
+  boolean optional(timestamp? a, duration? b);
+  timestamp get_far_future_timestamp();
+};
+"#,
+        biz_deps: "",
+        shim_deps: "",
+        biz_lib: r#"
+use std::time::{Duration, SystemTime};
+
+#[derive(Debug)]
+pub enum ChronologicalError {
+    TimeOverflow,
+    TimeDiffError,
+}
+
+impl std::fmt::Display for ChronologicalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimeOverflow => write!(f, "TimeOverflow"),
+            Self::TimeDiffError => write!(f, "TimeDiffError"),
+        }
+    }
+}
+
+impl std::error::Error for ChronologicalError {}
+
+pub fn return_timestamp(a: SystemTime) -> Result<SystemTime, ChronologicalError> {
+    Ok(a)
+}
+
+pub fn return_duration(a: Duration) -> Result<Duration, ChronologicalError> {
+    Ok(a)
+}
+
+pub fn add(a: SystemTime, b: Duration) -> Result<SystemTime, ChronologicalError> {
+    a.checked_add(b).ok_or(ChronologicalError::TimeOverflow)
+}
+
+pub fn diff(a: SystemTime, b: SystemTime) -> Result<Duration, ChronologicalError> {
+    a.duration_since(b)
+        .map_err(|_| ChronologicalError::TimeDiffError)
+}
+
+pub fn optional(a: Option<SystemTime>, b: Option<Duration>) -> bool {
+    a.is_some() && b.is_some()
+}
+
+pub fn get_far_future_timestamp() -> SystemTime {
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(8_640_000_000_001))
+        .unwrap()
+}
+"#,
+        driver_ts: r#"
+import { createRequire } from "node:module";
+import { initBackend } from "./gen/browser/index.ts";
+import {
+    returnTimestamp,
+    returnDuration,
+    add,
+    diff,
+    optional,
+    getFarFutureTimestamp,
+} from "./gen/common/api.ts";
+import { UniffiError } from "./gen/common/runtime.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/wasm_time_shim.js");
+await initBackend(glue);
+
+const ts = new Date("2024-01-02T03:04:05.283Z");
+const tsRound = returnTimestamp(ts);
+if (!(tsRound instanceof Date) || tsRound.getTime() !== ts.getTime()) {
+    throw new Error(`timestamp round-trip failed: ${tsRound}`);
+}
+
+const dur = 1500.5;
+const durRound = returnDuration(dur);
+if (durRound !== dur) {
+    throw new Error(`duration round-trip failed: ${durRound}`);
+}
+
+const added = add(new Date(1000), 2000);
+if (!(added instanceof Date) || added.getTime() !== 3000) {
+    throw new Error(`timestamp + duration failed: ${added}`);
+}
+
+const delta = diff(new Date(3000), new Date(1000));
+if (delta !== 2000) {
+    throw new Error(`timestamp - timestamp failed: ${delta}`);
+}
+
+if (!optional(ts, dur)) throw new Error("optional(Some, Some) should be true");
+if (optional(null, dur)) throw new Error("optional(None, Some) should be false");
+if (optional(ts, null)) throw new Error("optional(Some, None) should be false");
+
+let threw = false;
+try {
+    returnDuration(-1);
+} catch (e) {
+    threw = true;
+    if (!(e instanceof UniffiError)) {
+        throw new Error(`bad duration threw wrong type: ${e && (e as Error).message}`);
+    }
+    if (!/duration.*negative/i.test((e as Error).message)) {
+        throw new Error(`bad duration message: ${(e as Error).message}`);
+    }
+}
+if (!threw) throw new Error("returnDuration(-1) should throw");
+
+threw = false;
+try {
+    getFarFutureTimestamp();
+} catch (e) {
+    threw = true;
+    if (!(e instanceof UniffiError)) {
+        throw new Error(`far future threw wrong type: ${e && (e as Error).message}`);
+    }
+    if (!(e as Error).message.includes("timestamp exceeds JS Date range")) {
+        throw new Error(`far future message: ${(e as Error).message}`);
+    }
+}
+if (!threw) throw new Error("getFarFutureTimestamp() should throw");
 
 console.log("ok");
 "#,
@@ -1334,7 +1487,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wasm-bindgen = "0.2"
+wasm-bindgen = "=0.2.117"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 {name} = {{ path = "../biz" }}
