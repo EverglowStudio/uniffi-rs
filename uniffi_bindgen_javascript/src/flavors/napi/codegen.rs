@@ -808,11 +808,15 @@ impl<'a> Generator<'a> {
         match ty {
             // u64/i64 cross the napi boundary as BigInt (JS `bigint`).
             // napi-rs does not impl FromNapiValue for u64, and i64 maps
-            // to JS `number` which loses precision.  BigInt is lossless.
+            // to JS `number` which loses precision. BigInt keeps the raw
+            // addon surface aligned with the public bigint-first contract.
             Type::UInt64 => Ok(quote!({
-                let (__sign, __val, _) = #ident.get_u64();
+                let (__sign, __val, __lossless) = #ident.get_u64();
                 if __sign && __val != 0 {
                     return Err(napi::Error::new(napi::Status::InvalidArg, "negative value cannot be converted to u64"));
+                }
+                if !__lossless {
+                    return Err(napi::Error::new(napi::Status::InvalidArg, "BigInt value does not fit into u64"));
                 }
                 __val
             })),
@@ -843,19 +847,25 @@ impl<'a> Generator<'a> {
             | Type::Float64
             | Type::Boolean
             | Type::String => Ok(expr),
-            // BigInt → u64: extract first word, reject negative.
+            // BigInt → u64: reject negative and out-of-range values.
             Type::UInt64 => Ok(quote!({
                 let __big = #expr;
-                let (__sign, __val, _) = __big.get_u64();
+                let (__sign, __val, __lossless) = __big.get_u64();
                 if __sign && __val != 0 {
                     return Err(napi::Error::new(napi::Status::InvalidArg, "negative value cannot be converted to u64"));
                 }
+                if !__lossless {
+                    return Err(napi::Error::new(napi::Status::InvalidArg, "BigInt value does not fit into u64"));
+                }
                 __val
             })),
-            // BigInt → i64: extract as signed.
+            // BigInt → i64: reject values outside the i64 range.
             Type::Int64 => Ok(quote!({
                 let __big = #expr;
-                let (__val, _) = __big.get_i64();
+                let (__val, __lossless) = __big.get_i64();
+                if !__lossless {
+                    return Err(napi::Error::new(napi::Status::InvalidArg, "BigInt value does not fit into i64"));
+                }
                 __val
             })),
             Type::Bytes => Ok(quote!(#expr.into())),
