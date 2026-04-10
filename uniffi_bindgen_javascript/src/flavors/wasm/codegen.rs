@@ -903,7 +903,26 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
                 type_debug(&other)
             )),
         },
-        Type::Map { .. } => Unsupported("Map not supported in this pass".into()),
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            if !matches!(key_type.as_ref(), Type::String) {
+                Unsupported("Map keys other than string are not supported in this pass".into())
+            } else {
+                match classify(value_type, crate_ident) {
+                    Native(_) | Value { .. } => Value {
+                        core_ty: core_ty_for(ty, crate_ident),
+                        ty: ty.clone(),
+                    },
+                    Unsupported(r) => Unsupported(format!("Map value: {r}")),
+                    value => Unsupported(format!(
+                        "Map<string, {}>: nested object/callback not supported",
+                        type_debug(&value)
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -1232,6 +1251,18 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
                 "{{ let __arr{depth}: ::js_sys::Array = {expr}.dyn_into().map_err(|_| JsError::new(\"expected array\"))?; let mut __out{depth} = ::std::vec::Vec::with_capacity(__arr{depth}.length() as usize); for __i{depth} in 0..__arr{depth}.length() {{ let {bind}: JsValue = __arr{depth}.get(__i{depth}); __out{depth}.push(({inner})?); }} Ok::<_, JsError>(__out{depth}) }}"
             )
         }
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            let key = format!("__key{depth}");
+            let value = format!("__value{depth}");
+            let key_lower = lower_expr(&key, key_type, depth + 1);
+            let value_lower = lower_expr(&value, value_type, depth + 1);
+            format!(
+                "{{ let __obj{depth}: ::js_sys::Object = {expr}.dyn_into().map_err(|_| JsError::new(\"expected object for map\"))?; let __keys{depth} = ::js_sys::Object::keys(&__obj{depth}); let mut __out{depth} = ::std::collections::HashMap::new(); for __i{depth} in 0..__keys{depth}.length() {{ let {key}: JsValue = __keys{depth}.get(__i{depth}); let {value}: JsValue = ::js_sys::Reflect::get(&__obj{depth}, &{key}).map_err(|_| JsError::new(\"reflect get map value failed\"))?; __out{depth}.insert(({key_lower})?, ({value_lower})?); }} Ok::<_, JsError>(__out{depth}) }}"
+            )
+        }
         Type::Custom {
             module_path,
             name,
@@ -1302,6 +1333,18 @@ fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
                 "{{ let __arr{depth} = ::js_sys::Array::new(); for {bind} in {expr} {{ let _ = __arr{depth}.push(&{inner}); }} JsValue::from(__arr{depth}) }}"
             )
         }
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            let key = format!("__key{depth}");
+            let value = format!("__value{depth}");
+            let key_lift = lift_expr(&key, key_type, depth + 1);
+            let value_lift = lift_expr(&value, value_type, depth + 1);
+            format!(
+                "{{ let __obj{depth} = ::js_sys::Object::new(); for ({key}, {value}) in {expr} {{ let _ = ::js_sys::Reflect::set(&__obj{depth}, &{key_lift}, &{value_lift}); }} JsValue::from(__obj{depth}) }}"
+            )
+        }
         Type::Custom {
             module_path,
             name,
@@ -1348,6 +1391,18 @@ fn lift_expr_result(expr: &str, ty: &Type, depth: usize) -> String {
             let inner = lift_expr_result(&bind, inner_type, depth + 1);
             format!(
                 "{{ let __arr{depth} = ::js_sys::Array::new(); for {bind} in {expr} {{ let _ = __arr{depth}.push(&({inner})?); }} Ok::<JsValue, JsError>(JsValue::from(__arr{depth})) }}"
+            )
+        }
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            let key = format!("__key{depth}");
+            let value = format!("__value{depth}");
+            let key_lift = lift_expr_result(&key, key_type, depth + 1);
+            let value_lift = lift_expr_result(&value, value_type, depth + 1);
+            format!(
+                "{{ let __obj{depth} = ::js_sys::Object::new(); for ({key}, {value}) in {expr} {{ let _ = ::js_sys::Reflect::set(&__obj{depth}, &({key_lift})?, &({value_lift})?); }} Ok::<JsValue, JsError>(JsValue::from(__obj{depth})) }}"
             )
         }
         Type::Custom {
@@ -1429,6 +1484,14 @@ fn core_ty_for(ty: &Type, crate_ident: &str) -> String {
         Type::Sequence { inner_type } => {
             format!("Vec<{}>", core_ty_for(inner_type, crate_ident))
         }
+        Type::Map {
+            key_type,
+            value_type,
+        } => format!(
+            "::std::collections::HashMap<{}, {}>",
+            core_ty_for(key_type, crate_ident),
+            core_ty_for(value_type, crate_ident)
+        ),
         Type::Custom { name, .. } => format!("::{crate_ident}::{name}"),
         _ => "::wasm_bindgen::JsValue".into(),
     }

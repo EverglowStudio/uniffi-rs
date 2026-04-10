@@ -961,6 +961,88 @@ console.log("ok");
     });
 }
 
+#[test]
+fn runs_generated_wasm_shim_map() {
+    run_wasm_e2e(WasmE2eSpec {
+        name: "wasm_map",
+        udl: r#"
+dictionary User {
+  string name;
+  u32 age;
+};
+
+namespace wasm_map {
+  record<string, u32> bump_counts(record<string, u32> input);
+  record<string, User> rename_users(record<string, User> input);
+};
+"#,
+        biz_deps: "",
+        shim_deps: "",
+        biz_lib: r#"
+use std::collections::HashMap;
+
+#[derive(Clone)]
+pub struct User {
+    pub name: String,
+    pub age: u32,
+}
+
+pub fn bump_counts(mut input: HashMap<String, u32>) -> HashMap<String, u32> {
+    for value in input.values_mut() {
+        *value += 1;
+    }
+    let total = input.values().copied().sum();
+    input.insert("total".into(), total);
+    input
+}
+
+pub fn rename_users(input: HashMap<String, User>) -> HashMap<String, User> {
+    input
+        .into_iter()
+        .map(|(key, user)| {
+            (
+                key,
+                User {
+                    name: format!("{}!", user.name),
+                    age: user.age + 1,
+                },
+            )
+        })
+        .collect()
+}
+"#,
+        driver_ts: r#"
+import { createRequire } from "node:module";
+import { initBackend } from "./gen/browser/index.ts";
+import { bumpCounts, renameUsers } from "./gen/common/api.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/wasm_map_shim.js");
+await initBackend(glue);
+
+const counts = bumpCounts({ a: 1, b: 2 }) as Record<string, number>;
+if (counts.a !== 2 || counts.b !== 3 || counts.total !== 5) {
+    throw new Error(`bumpCounts wrong: ${JSON.stringify(counts)}`);
+}
+
+const users = renameUsers({
+    ada: { name: "Ada", age: 36 },
+    bob: { name: "Bob", age: 41 },
+}) as Record<string, { name: string; age: number }>;
+if (users.ada.name !== "Ada!" || users.ada.age !== 37) {
+    throw new Error(`renameUsers ada wrong: ${JSON.stringify(users)}`);
+}
+if (users.bob.name !== "Bob!" || users.bob.age !== 42) {
+    throw new Error(`renameUsers bob wrong: ${JSON.stringify(users)}`);
+}
+
+console.log("ok");
+"#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
+    });
+}
+
 /// Chronological builtins: `timestamp` -> `Date`, `duration` -> ms
 /// number. Exercises round-trip, arithmetic, optional handling and the
 /// two key error paths.
