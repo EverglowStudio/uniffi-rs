@@ -101,12 +101,13 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
     }
     let cis = loader.load_cis(metadata)?;
     let override_toml = load_override_toml(options.config_override.as_ref())?;
-    let mut components: Vec<Component<JsConfig>> = loader.load_components(cis, |_ci, mut toml| {
-        if let Some(override_toml) = &override_toml {
-            merge_toml(&mut toml, override_toml.clone());
-        }
-        JsConfig::from_root_toml(toml)
-    })?;
+    let mut components: Vec<Component<JsConfig>> =
+        loader.load_components(cis, |_ci, mut toml| {
+            if let Some(override_toml) = &override_toml {
+                merge_toml(&mut toml, override_toml.clone());
+            }
+            JsConfig::from_root_toml(toml)
+        })?;
     for c in components.iter_mut() {
         c.ci.derive_ffi_funcs()?;
     }
@@ -233,9 +234,9 @@ fn load_override_toml(path: Option<&Utf8PathBuf>) -> Result<Option<toml::Value>>
     let Some(path) = path else {
         return Ok(None);
     };
-    let text = fs::read_to_string(path).with_context(|| format!("reading config override {path}"))?;
-    let value =
-        toml::from_str(&text).with_context(|| format!("parsing config override {path}"))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("reading config override {path}"))?;
+    let value = toml::from_str(&text).with_context(|| format!("parsing config override {path}"))?;
     Ok(Some(value))
 }
 

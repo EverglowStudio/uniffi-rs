@@ -432,7 +432,11 @@ fn render_constructor(
         "    let __obj: Arc<_> = __Coerce({obj_expr}).__into_arc();"
     )
     .unwrap();
-    writeln!(out, "    Ok::<u32, JsError>(__uniffi_{snake}_insert(__obj))").unwrap();
+    writeln!(
+        out,
+        "    Ok::<u32, JsError>(__uniffi_{snake}_insert(__obj))"
+    )
+    .unwrap();
     writeln!(out, "}}").unwrap();
 }
 
@@ -551,11 +555,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 Lowering::Native(_) | Lowering::Value { .. } => {
                     let ty = arg.as_type();
                     let lift = lift_expr(n, &ty, 0);
-                    writeln!(
-                        out,
-                        "        let __lifted_{n} = {lift};"
-                    )
-                    .unwrap();
+                    writeln!(out, "        let __lifted_{n} = {lift};").unwrap();
                     writeln!(out, "        let _ = __args_arr.push(&__lifted_{n});").unwrap();
                 }
                 _ => {
@@ -777,7 +777,11 @@ fn emit_return(out: &mut String, ret_info: &Option<Lowering>, bound: &str) {
                 "    let __obj: Arc<_> = __Coerce({bound}).__into_arc();"
             )
             .unwrap();
-            writeln!(out, "    Ok::<u32, JsError>(__uniffi_{snake}_insert(__obj))").unwrap();
+            writeln!(
+                out,
+                "    Ok::<u32, JsError>(__uniffi_{snake}_insert(__obj))"
+            )
+            .unwrap();
         }
         Some(Lowering::Callback { .. }) => {
             writeln!(
@@ -1174,7 +1178,11 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
             )
             .unwrap();
         }
-        writeln!(out, "            Ok::<JsValue, JsError>(__obj.into())\n        }},").unwrap();
+        writeln!(
+            out,
+            "            Ok::<JsValue, JsError>(__obj.into())\n        }},"
+        )
+        .unwrap();
     }
     writeln!(out, "    }}\n}}").unwrap();
 }
