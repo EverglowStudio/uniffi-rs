@@ -43,7 +43,7 @@ cargo-metadata = ["dep:cargo_metadata", "uniffi_bindgen?/cargo-metadata"]
 
 # Support for `uniffi_bindgen_main()`. Enable this feature for your
 # `uniffi-bindgen` binaries.
-cli = [ "bindgen", "dep:clap", "dep:camino", "dep:uniffi_bindgen_javascript" ]
+cli = [ "bindgen", "dep:clap", "dep:camino", "dep:cargo_metadata", "dep:uniffi_bindgen_javascript" ]
 # Support for running example/fixture tests for `uniffi-bindgen`.  You probably
 # don't need to enable this.
 bindgen-tests = [ "dep:uniffi_bindgen", "uniffi_bindgen?/bindgen-tests" ]
