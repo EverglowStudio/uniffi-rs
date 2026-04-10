@@ -28,7 +28,7 @@
 //!   `thread_local!`-stored `js_sys::Function`s. `Drop` releases the JS
 //!   registry slot.
 //!
-//! Anything still unsupported (custom/Map/Set) is emitted as a stub
+//! Anything still unsupported (Map/Set) is emitted as a stub
 //! that throws `JsError` at runtime — never a silent skip. Timestamp
 //! and duration are covered with explicit `Date` / millisecond
 //! lowering and lifting.
@@ -888,9 +888,18 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
             core_ty: "::std::time::Duration".into(),
             ty: ty.clone(),
         },
-        Type::Map { .. } | Type::Custom { .. } => {
-            Unsupported("Map/Custom not supported in this pass".into())
-        }
+        Type::Custom { name, builtin, .. } => match classify(builtin, crate_ident) {
+            Native(_) | Value { .. } => Value {
+                core_ty: format!("::{crate_ident}::{name}"),
+                ty: ty.clone(),
+            },
+            Unsupported(r) => Unsupported(format!("Custom<{r}>")),
+            other => Unsupported(format!(
+                "Custom<{}>: nested object/callback not supported",
+                type_debug(&other)
+            )),
+        },
+        Type::Map { .. } => Unsupported("Map not supported in this pass".into()),
     }
 }
 
@@ -1215,6 +1224,23 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
                 "{{ let __arr{depth}: ::js_sys::Array = {expr}.dyn_into().map_err(|_| JsError::new(\"expected array\"))?; let mut __out{depth} = ::std::vec::Vec::with_capacity(__arr{depth}.length() as usize); for __i{depth} in 0..__arr{depth}.length() {{ let {bind}: JsValue = __arr{depth}.get(__i{depth}); __out{depth}.push(({inner})?); }} Ok::<_, JsError>(__out{depth}) }}"
             )
         }
+        Type::Custom {
+            module_path,
+            name,
+            builtin,
+        } => {
+            let builtin_lower = lower_expr(expr, builtin, depth + 1);
+            let crate_ident = module_path
+                .split("::")
+                .next()
+                .expect("custom type module path should have a crate root");
+            let builtin_ty = core_ty_for(builtin, crate_ident);
+            let tag_ty = core_tag_path(module_path);
+            let custom_ty = format!("::{crate_ident}::{name}");
+            format!(
+                "Ok::<{custom_ty}, JsError>({{ let __builtin = ({builtin_lower})?; let __ffi = <{builtin_ty} as ::uniffi::Lower<{tag_ty}>>::lower(__builtin); <{custom_ty} as ::uniffi::Lift<{tag_ty}>>::try_lift(__ffi).expect(\"uniffi wasm custom type lift failed\") }})"
+            )
+        }
         _ => "Err::<_, JsError>(JsError::new(\"unsupported wasm value type in lower\"))".to_string(),
     }
 }
@@ -1268,6 +1294,24 @@ fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
                 "{{ let __arr{depth} = ::js_sys::Array::new(); for {bind} in {expr} {{ let _ = __arr{depth}.push(&{inner}); }} JsValue::from(__arr{depth}) }}"
             )
         }
+        Type::Custom {
+            module_path,
+            name,
+            builtin,
+        } => {
+            let tag_ty = core_tag_path(module_path);
+            let crate_ident = module_path
+                .split("::")
+                .next()
+                .expect("custom type module path should have a crate root");
+            let custom_ty = format!("::{crate_ident}::{name}");
+            let builtin_ty = core_ty_for(builtin, crate_ident);
+            let lifted = format!(
+                "{{ let __builtin = <{builtin_ty} as ::uniffi::Lift<{tag_ty}>>::try_lift(<{custom_ty} as ::uniffi::Lower<{tag_ty}>>::lower({expr})).expect(\"uniffi wasm custom type lift failed\"); {} }}",
+                lift_expr("__builtin", builtin, depth + 1)
+            );
+            lifted
+        }
         _ => "JsValue::NULL".to_string(),
     }
 }
@@ -1298,6 +1342,24 @@ fn lift_expr_result(expr: &str, ty: &Type, depth: usize) -> String {
                 "{{ let __arr{depth} = ::js_sys::Array::new(); for {bind} in {expr} {{ let _ = __arr{depth}.push(&({inner})?); }} Ok::<JsValue, JsError>(JsValue::from(__arr{depth})) }}"
             )
         }
+        Type::Custom {
+            module_path,
+            name,
+            builtin,
+        } => {
+            let crate_ident = module_path
+                .split("::")
+                .next()
+                .expect("custom type module path should have a crate root");
+            let builtin_ty = core_ty_for(builtin, crate_ident);
+            let tag_ty = core_tag_path(module_path);
+            let custom_ty = format!("::{crate_ident}::{name}");
+            let lowered = format!(
+                "{{ let __builtin = <{builtin_ty} as ::uniffi::Lift<{tag_ty}>>::try_lift(<{custom_ty} as ::uniffi::Lower<{tag_ty}>>::lower({expr})).expect(\"uniffi wasm custom type lift failed\"); {} }}",
+                lift_expr_result("__builtin", builtin, depth + 1)
+            );
+            lowered
+        }
         _ => format!("Ok::<JsValue, JsError>({})", lift_expr(expr, ty, depth)),
     }
 }
@@ -1320,6 +1382,14 @@ fn timestamp_lift_result(expr: &str) -> String {
 
 fn duration_lift_result(expr: &str) -> String {
     format!("__uniffi_lift_duration({expr})")
+}
+
+fn core_tag_path(module_path: &str) -> String {
+    let crate_ident = module_path
+        .split("::")
+        .next()
+        .expect("custom type module path should have a crate root");
+    format!("::{crate_ident}::UniFfiTag")
 }
 
 /// Downstream core Rust type for a `Type`.
@@ -1351,6 +1421,7 @@ fn core_ty_for(ty: &Type, crate_ident: &str) -> String {
         Type::Sequence { inner_type } => {
             format!("Vec<{}>", core_ty_for(inner_type, crate_ident))
         }
+        Type::Custom { name, .. } => format!("::{crate_ident}::{name}"),
         _ => "::wasm_bindgen::JsValue".into(),
     }
 }

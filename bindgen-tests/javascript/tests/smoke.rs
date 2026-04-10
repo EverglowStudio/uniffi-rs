@@ -17,6 +17,8 @@ use std::process::Command;
 use uniffi_bindgen::{BindgenLoader, BindgenPaths};
 use uniffi_bindgen_javascript::{generate, FlavorTarget, GenerateJsOptions};
 
+const EMPTY_GENERATED_FILES: &[(&str, &str)] = &[];
+
 fn workspace_root() -> Utf8PathBuf {
     let manifest = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest.join("../..").canonicalize_utf8().unwrap()
@@ -954,6 +956,8 @@ if (ok !== 30) throw new Error(`buy ok: ${ok}`);
 
 console.log("ok");
 "#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
     });
 }
 
@@ -1106,6 +1110,8 @@ if (!threw) throw new Error("getFarFutureTimestamp() should throw");
 
 console.log("ok");
 "#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
     });
 }
 
@@ -1164,6 +1170,8 @@ if (!threw) throw new Error("expected throw after dispose");
 
 console.log("ok");
 "#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
     });
 }
 
@@ -1219,6 +1227,8 @@ if (!threw) throw new Error("expected throw after dispose");
 
 console.log("ok");
 "#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
     });
 }
 
@@ -1293,6 +1303,8 @@ cn.dispose();
 
 console.log("ok");
 "#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
     });
 }
 
@@ -1351,7 +1363,230 @@ if (received[0] !== "start" || received[1] !== "progress" || received[2] !== "do
 
 console.log("ok");
 "#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
     });
+}
+
+#[test]
+fn runs_generated_wasm_shim_custom_types() {
+    run_wasm_e2e(WasmE2eSpec {
+        name: "wasm_custom",
+        udl: r#"
+[Custom]
+typedef string Email;
+
+dictionary Contact {
+  Email primary;
+  sequence<Email> aliases;
+};
+
+namespace wasm_custom {
+  Email normalize_email(Email value);
+  Contact normalize_contact(Contact value);
+  sequence<Email> normalize_many(sequence<Email> values);
+};
+"#,
+        biz_deps: "",
+        shim_deps: "",
+        biz_lib: r#"
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UniFfiTag;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Email(pub String);
+uniffi::custom_type!(Email, String, {
+    lower: |value| value.0,
+    try_lift: |value| Ok(Email(value)),
+});
+
+impl From<Email> for String {
+    fn from(value: Email) -> Self {
+        value.0
+    }
+}
+
+impl From<String> for Email {
+    fn from(value: String) -> Self {
+        Email(value)
+    }
+}
+
+#[derive(Clone)]
+pub struct Contact {
+    pub primary: Email,
+    pub aliases: Vec<Email>,
+}
+
+impl Contact {
+    fn normalize(self) -> Self {
+        Self {
+            primary: normalize_email(self.primary),
+            aliases: self.aliases.into_iter().map(normalize_email).collect(),
+        }
+    }
+}
+
+pub fn normalize_email(value: Email) -> Email {
+    Email(value.0.trim().to_ascii_lowercase())
+}
+
+pub fn normalize_contact(value: Contact) -> Contact {
+    value.normalize()
+}
+
+pub fn normalize_many(values: Vec<Email>) -> Vec<Email> {
+    values.into_iter().map(normalize_email).collect()
+}
+"#,
+        driver_ts: r#"
+import { createRequire } from "node:module";
+import { initBackend } from "./gen/browser/index.ts";
+import { normalizeEmail, normalizeContact, normalizeMany } from "./gen/common/api.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/wasm_custom_shim.js");
+await initBackend(glue);
+
+const one = normalizeEmail({ value: "  A@EXAMPLE.COM  " });
+if (one.value !== "a@example.com") throw new Error(`normalizeEmail=${JSON.stringify(one)}`);
+
+const contact = normalizeContact({
+  primary: { value: " ROOT@EXAMPLE.COM " },
+  aliases: [{ value: " Alias@One.Com " }, { value: "TWO@EXAMPLE.COM" }],
+});
+if (contact.primary.value !== "root@example.com") throw new Error(`contact.primary=${contact.primary.value}`);
+if (contact.aliases[0].value !== "alias@one.com" || contact.aliases[1].value !== "two@example.com") {
+  throw new Error(`contact.aliases=${JSON.stringify(contact.aliases)}`);
+}
+
+const many = normalizeMany([{ value: " X@Y.COM " }, { value: "Z@Q.COM" }]);
+if (many[0].value !== "x@y.com" || many[1].value !== "z@q.com") {
+  throw new Error(`normalizeMany=${JSON.stringify(many)}`);
+}
+
+console.log("ok");
+"#,
+        config_toml: Some(
+            r#"
+[bindings.javascript.customTypes.Email]
+typeName = "EmailAddress"
+imports = [
+  "type { EmailAddress } from \"./email.ts\"",
+  "{ emailAddressFromString, emailAddressToString } from \"./email.ts\"",
+]
+intoCustom = "emailAddressFromString({})"
+fromCustom = "emailAddressToString({})"
+"#,
+        ),
+        generated_files: &[(
+            "common/email.ts",
+            r#"
+export type EmailAddress = { value: string };
+export function emailAddressFromString(value: string): EmailAddress {
+  return { value };
+}
+export function emailAddressToString(value: EmailAddress): string {
+  return value.value;
+}
+"#,
+        )],
+    });
+}
+
+#[test]
+fn custom_types_wasm_static_contract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+    let (udl, config, _manifest) = write_custom_core_crate(tmp.path());
+
+    let gen_dir = root.join("generated-wasm");
+    std::fs::create_dir_all(&gen_dir).unwrap();
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: udl,
+            out_dir: gen_dir.clone(),
+            config_override: Some(config),
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: None,
+            flavors: vec![FlavorTarget::Wasm],
+        },
+    )
+    .expect("custom wasm generation should succeed");
+
+    std::fs::write(
+        gen_dir.join("common/email.ts"),
+        r#"
+export type EmailAddress = { value: string };
+export function emailAddressFromString(value: string): EmailAddress {
+  return { value };
+}
+export function emailAddressToString(value: EmailAddress): string {
+  return value.value;
+}
+"#,
+    )
+    .unwrap();
+
+    let api = std::fs::read_to_string(gen_dir.join("common/api.ts")).unwrap();
+    assert!(
+        api.contains("export type { Email } from \"./custom-types.ts\";"),
+        "api.ts should re-export the configured custom type alias:\n{api}"
+    );
+    assert!(
+        api.contains("import { __uniffiLiftCustomEmail, __uniffiLowerCustomEmail } from \"./custom-types.ts\";"),
+        "api.ts should import the custom-type helpers:\n{api}"
+    );
+    assert!(
+        !api.contains("EmailAddress"),
+        "api.ts should surface the UDL custom type name, not the underlying type name:\n{api}"
+    );
+
+    let public_types = std::fs::read_to_string(gen_dir.join("common/public-types.ts")).unwrap();
+    assert!(
+        public_types.contains("export type { Email } from \"./custom-types.ts\";"),
+        "public-types.ts should re-export the configured custom type alias:\n{public_types}"
+    );
+
+    let custom_types = std::fs::read_to_string(gen_dir.join("common/custom-types.ts")).unwrap();
+    for needle in [
+        "type { EmailAddress } from \"./email.ts\"",
+        "emailAddressFromString",
+        "emailAddressToString",
+        "export type Email = EmailAddress;",
+        "__uniffiLowerCustomEmail",
+        "__uniffiLiftCustomEmail",
+    ] {
+        assert!(
+            custom_types.contains(needle),
+            "custom-types.ts missing `{needle}`:\n{custom_types}"
+        );
+    }
+
+    let records = std::fs::read_to_string(gen_dir.join("common/records.ts")).unwrap();
+    assert!(
+        records.contains("import type { Email } from \"./custom-types.ts\";"),
+        "records.ts should import configured custom types when used in records:\n{records}"
+    );
+
+    let wasm_rs_path = std::fs::read_dir(gen_dir.join("browser"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
+        .expect("a .rs wasm shim should exist under browser/");
+    let wasm_rs = std::fs::read_to_string(&wasm_rs_path).unwrap();
+    assert!(
+        !wasm_rs.contains("serde::") && !wasm_rs.contains("serde_wasm_bindgen"),
+        "wasm shim must stay serde-free for custom types:\n{wasm_rs}"
+    );
+    assert!(
+        wasm_rs.contains("::uniffi::Lift") && wasm_rs.contains("::uniffi::Lower"),
+        "wasm shim should lower/lift custom types through builtin representation:\n{wasm_rs}"
+    );
 }
 
 /// Parameters for a full Path-A wasm e2e fixture. Shared by the scalar
@@ -1372,6 +1607,10 @@ struct WasmE2eSpec {
     shim_deps: &'static str,
     /// TypeScript driver executed under Node. Must print `ok`.
     driver_ts: &'static str,
+    /// Optional config override consumed by GenerateJsOptions.config_override.
+    config_toml: Option<&'static str>,
+    /// Extra files written into the generated tree before the driver runs.
+    generated_files: &'static [(&'static str, &'static str)],
 }
 
 /// Execute a Path-A wasm e2e run for the given spec. Skips gracefully
@@ -1405,6 +1644,10 @@ fn run_wasm_e2e(spec: WasmE2eSpec) {
     let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
     let name = spec.name;
     let shim_name = format!("{name}_shim");
+    let uniffi_dep = format!(
+        "uniffi = {{ path = {:?} }}",
+        workspace_root().join("uniffi").as_str()
+    );
 
     // biz crate skeleton first (needed for UDL loader).
     let biz = root.join("biz");
@@ -1423,9 +1666,12 @@ edition = "2021"
 crate-type = ["rlib"]
 
 [dependencies]
+{uniffi_dep}
 {extra}
 "#,
             extra = spec.biz_deps
+            ,
+            uniffi_dep = uniffi_dep
         ),
     )
     .unwrap();
@@ -1435,12 +1681,17 @@ crate-type = ["rlib"]
     let gen_dir = root.join("gen");
     std::fs::create_dir_all(&gen_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default());
+    let config_override = spec.config_toml.map(|toml| {
+        let path = root.join("uniffi.toml");
+        std::fs::write(&path, toml).unwrap();
+        path
+    });
     generate(
         &loader,
         GenerateJsOptions {
             source: udl_path.clone(),
             out_dir: gen_dir.clone(),
-            config_override: None,
+            config_override,
             crate_filter: None,
             metadata_no_deps: true,
             host_crates: None,
@@ -1490,13 +1741,23 @@ crate-type = ["cdylib"]
 wasm-bindgen = "=0.2.117"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
+{uniffi_dep}
 {name} = {{ path = "../biz" }}
 {extra}
 "#,
             extra = spec.shim_deps
+            ,
+            uniffi_dep = uniffi_dep
         ),
     )
     .unwrap();
+    for (path, contents) in spec.generated_files {
+        let full = gen_dir.join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(full, contents).unwrap();
+    }
     std::fs::write(
         root.join("Cargo.toml"),
         "[workspace]\nmembers = [\"biz\", \"shim\"]\nresolver = \"2\"\n",
@@ -2912,6 +3173,330 @@ fn generate_rich_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     host_dir
 }
 
+fn write_custom_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf, Utf8PathBuf) {
+    let core = root.join("custom-core");
+    std::fs::create_dir_all(core.join("src")).unwrap();
+    let uniffi_path = workspace_root().join("uniffi");
+    std::fs::write(
+        core.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "custom_js_core"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+uniffi = {{ path = {:?}, default-features = false }}
+"#,
+            uniffi_path.as_str()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        core.join("src/lib.rs"),
+        r#"
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UniFfiTag;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Email(pub String);
+uniffi::custom_type!(Email, String, {
+    lower: |value| value.0,
+    try_lift: |value| Ok(Email(value)),
+});
+
+impl From<Email> for String {
+    fn from(value: Email) -> Self {
+        value.0
+    }
+}
+
+impl From<String> for Email {
+    fn from(value: String) -> Self {
+        Email(value)
+    }
+}
+
+#[derive(Clone)]
+pub struct Contact {
+    pub primary: Email,
+    pub aliases: Vec<Email>,
+}
+
+impl Contact {
+    fn normalize(self) -> Self {
+        Self {
+            primary: normalize_email(self.primary),
+            aliases: self.aliases.into_iter().map(normalize_email).collect(),
+        }
+    }
+}
+
+pub fn normalize_email(value: Email) -> Email {
+    Email(value.0.trim().to_ascii_lowercase())
+}
+
+pub fn normalize_contact(value: Contact) -> Contact {
+    value.normalize()
+}
+
+pub fn normalize_many(values: Vec<Email>) -> Vec<Email> {
+    values.into_iter().map(normalize_email).collect()
+}
+"#,
+    )
+    .unwrap();
+    let udl = core.join("src/custom_js_core.udl");
+    std::fs::write(
+        &udl,
+        r#"
+[Custom]
+typedef string Email;
+
+dictionary Contact {
+  Email primary;
+  sequence<Email> aliases;
+};
+
+namespace custom_js_core {
+  Email normalize_email(Email value);
+  Contact normalize_contact(Contact value);
+  sequence<Email> normalize_many(sequence<Email> values);
+};
+"#,
+    )
+    .unwrap();
+    let config = root.join("uniffi.toml");
+    std::fs::write(
+        &config,
+        r#"
+[bindings.javascript.customTypes.Email]
+typeName = "EmailAddress"
+imports = [
+  "type { EmailAddress } from \"./email.ts\"",
+  "{ emailAddressFromString, emailAddressToString } from \"./email.ts\"",
+]
+intoCustom = "emailAddressFromString({})"
+fromCustom = "emailAddressToString({})"
+"#,
+    )
+    .unwrap();
+    (
+        Utf8PathBuf::from_path_buf(udl).unwrap(),
+        Utf8PathBuf::from_path_buf(config).unwrap(),
+        Utf8PathBuf::from_path_buf(core.join("Cargo.toml")).unwrap(),
+    )
+}
+
+fn generate_custom_napi_tree(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
+    let (udl, config, manifest) = write_custom_core_crate(root);
+    let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: udl,
+            out_dir: out_dir.clone(),
+            config_override: Some(config),
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: None,
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
+        },
+    )
+    .expect("custom napi generator run should succeed");
+    std::fs::write(
+        out_dir.join("common/email.ts"),
+        r#"
+export type EmailAddress = { value: string };
+export function emailAddressFromString(value: string): EmailAddress {
+  return { value };
+}
+export function emailAddressToString(value: EmailAddress): string {
+  return value.value;
+}
+"#,
+    )
+    .unwrap();
+    (out_dir, manifest)
+}
+
+fn build_custom_napi_addon(root: &std::path::Path, generated: &Utf8PathBuf, manifest: &Utf8PathBuf) -> Utf8PathBuf {
+    let shim = root.join("custom-napi-shim");
+    std::fs::create_dir_all(shim.join("src")).unwrap();
+    let uniffi_path = workspace_root().join("uniffi");
+    std::fs::write(
+        shim.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "custom_js_core_napi"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+custom_js_core = {{ path = {:?} }}
+uniffi = {{ path = {:?}, default-features = false }}
+napi = {{ version = "3.8.4", default-features = false, features = ["napi8", "tokio_rt"] }}
+napi-derive = {{ version = "3.5.3", features = ["type-def"] }}
+
+[build-dependencies]
+napi-build = "2.3.1"
+
+[workspace]
+"#,
+            manifest.parent().unwrap().as_str(),
+            uniffi_path.as_str()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        shim.join("build.rs"),
+        "extern crate napi_build;\nfn main() { napi_build::setup(); }\n",
+    )
+    .unwrap();
+    let bridge = std::fs::read_to_string(generated.join("node/custom_js_core.rs")).unwrap();
+    std::fs::write(shim.join("src/lib.rs"), bridge).unwrap();
+
+    let target_dir = root.join("cargo-target-custom-napi");
+    let output = run_cargo_build(
+        &Utf8PathBuf::from_path_buf(shim.join("Cargo.toml")).unwrap(),
+        &[],
+        &target_dir,
+    )
+    .expect("cargo should be available for custom napi build");
+    if !output.status.success() {
+        panic!(
+            "cargo build on custom napi shim failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    let dylib = target_dir
+        .join("debug")
+        .join(cdylib_filename("custom_js_core_napi"));
+    assert!(dylib.exists(), "expected built cdylib at {}", dylib.display());
+    let addon = generated.join("node/custom_js_core.node");
+    std::fs::copy(&dylib, &addon).unwrap();
+    addon
+}
+
+#[test]
+fn custom_types_emit_public_contract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (generated, _manifest) = generate_custom_napi_tree(tmp.path());
+
+    let custom_types = std::fs::read_to_string(generated.join("common/custom-types.ts")).unwrap();
+    assert!(
+        custom_types.contains("import type { EmailAddress } from \"./email.ts\";"),
+        "custom-types.ts should emit configured type import:\n{custom_types}"
+    );
+    assert!(
+        custom_types.contains("import { emailAddressFromString, emailAddressToString } from \"./email.ts\";"),
+        "custom-types.ts should emit configured value import:\n{custom_types}"
+    );
+    assert!(
+        custom_types.contains("export type Email = EmailAddress;"),
+        "custom-types.ts should alias Email to EmailAddress:\n{custom_types}"
+    );
+    assert!(
+        custom_types.contains("__uniffiLowerCustomEmail")
+            && custom_types.contains("__uniffiLiftCustomEmail"),
+        "custom-types.ts should emit lower/lift helpers:\n{custom_types}"
+    );
+
+    let api = std::fs::read_to_string(generated.join("common/api.ts")).unwrap();
+    assert!(
+        !api.contains("unknown /* custom:"),
+        "common/api.ts must not leave custom types as unknown:\n{api}"
+    );
+    assert!(
+        api.contains("export type { Email } from \"./custom-types.ts\";"),
+        "common/api.ts should re-export Email:\n{api}"
+    );
+    assert!(
+        api.contains("import { __uniffiLiftCustomEmail, __uniffiLowerCustomEmail } from \"./custom-types.ts\";"),
+        "common/api.ts should import the custom-type helpers:\n{api}"
+    );
+    let public_types = std::fs::read_to_string(generated.join("common/public-types.ts")).unwrap();
+    assert!(
+        public_types.contains("export type { Email } from \"./custom-types.ts\";"),
+        "public-types.ts should re-export Email:\n{public_types}"
+    );
+}
+
+#[test]
+fn generated_node_adapter_runs_custom_types_fixture() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP generated_node_adapter_runs_custom_types_fixture: node 22.6+ unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (generated, manifest) = generate_custom_napi_tree(tmp.path());
+    let _addon = build_custom_napi_addon(tmp.path(), &generated, &manifest);
+
+    let driver = generated.join("custom-driver.ts");
+    std::fs::write(
+        &driver,
+        r#"
+import { normalizeEmail, normalizeContact, normalizeMany } from "./node/index.ts";
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+const one = normalizeEmail({ value: "  A@EXAMPLE.COM  " });
+assert(one.value === "a@example.com", `normalizeEmail=${JSON.stringify(one)}`);
+
+const contact = normalizeContact({
+  primary: { value: " ROOT@EXAMPLE.COM " },
+  aliases: [{ value: " Alias@One.Com " }, { value: "TWO@EXAMPLE.COM" }],
+});
+assert(contact.primary.value === "root@example.com", `contact.primary=${contact.primary.value}`);
+assert(
+  contact.aliases[0].value === "alias@one.com" &&
+    contact.aliases[1].value === "two@example.com",
+  `contact.aliases=${JSON.stringify(contact.aliases)}`,
+);
+
+const many = normalizeMany([{ value: " X@Y.COM " }, { value: "Z@Q.COM" }]);
+assert(
+  many[0].value === "x@y.com" && many[1].value === "z@q.com",
+  `normalizeMany=${JSON.stringify(many)}`,
+);
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(&generated)
+        .output()
+        .expect("failed to invoke node for custom adapter driver");
+    if !output.status.success() {
+        panic!(
+            "custom node adapter driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "custom node adapter driver did not print ok"
+    );
+}
+
 #[test]
 fn host_crates_napi_compiles_enum_callback_async_fixture() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3118,6 +3703,234 @@ console.log("ok");
         String::from_utf8_lossy(&output.stdout).contains("ok"),
         "bigint driver did not print ok:\n{}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn custom_types_surface_and_raw_napi_execute() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP custom_types_surface_and_raw_napi_execute: node 22.6+ unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (generated, manifest) = generate_custom_napi_tree(tmp.path());
+    let addon = build_custom_napi_addon(tmp.path(), &generated, &manifest);
+
+    let public_types = std::fs::read_to_string(generated.join("common/public-types.ts")).unwrap();
+    assert!(
+        public_types.contains("export type { Email } from \"./custom-types.ts\";"),
+        "public-types.ts should re-export custom types:\n{public_types}"
+    );
+    let custom_types = std::fs::read_to_string(generated.join("common/custom-types.ts")).unwrap();
+    for needle in [
+        "type { EmailAddress } from \"./email.ts\"",
+        "emailAddressFromString",
+        "emailAddressToString",
+        "export type Email = EmailAddress;",
+        "__uniffiLowerCustomEmail",
+        "__uniffiLiftCustomEmail",
+    ] {
+        assert!(
+            custom_types.contains(needle),
+            "custom-types.ts missing `{needle}`:\n{custom_types}"
+        );
+    }
+    assert!(
+        !custom_types.contains("unknown /* custom"),
+        "custom-types.ts must not leave custom types as unknown:\n{custom_types}"
+    );
+    let bridge = std::fs::read_to_string(generated.join("node/custom_js_core.rs")).unwrap();
+    assert!(
+        bridge.contains("::uniffi::Lift") && bridge.contains("::uniffi::Lower"),
+        "napi bridge should use uniffi Lift/Lower for custom types:\n{bridge}"
+    );
+
+    let driver = tmp.path().join("raw-custom-addon.cjs");
+    std::fs::write(
+        &driver,
+        format!(
+            r#"
+const addon = require({addon:?});
+
+function eq(actual, expected, label) {{
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {{
+    throw new Error(`${{label}}: ${{JSON.stringify(actual)}} !== ${{JSON.stringify(expected)}}`);
+  }}
+}}
+
+eq(addon.normalizeEmail("  A@EXAMPLE.COM  "), "a@example.com", "normalizeEmail");
+eq(
+  addon.normalizeContact({{ primary: " ROOT@EXAMPLE.COM ", aliases: [" Alias@One.Com ", "TWO@EXAMPLE.COM"] }}),
+  {{ primary: "root@example.com", aliases: ["alias@one.com", "two@example.com"] }},
+  "normalizeContact",
+);
+eq(
+  addon.normalizeMany([" X@Y.COM ", "Z@Q.COM"]),
+  ["x@y.com", "z@q.com"],
+  "normalizeMany",
+);
+
+console.log("ok");
+"#,
+            addon = addon.as_str()
+        ),
+    )
+    .unwrap();
+    let output = Command::new(&node)
+        .arg(driver.as_path())
+        .output()
+        .expect("failed to run raw custom addon driver");
+    if !output.status.success() {
+        panic!(
+            "raw custom addon driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "raw custom addon driver did not print ok"
+    );
+}
+
+#[test]
+fn custom_types_generated_node_adapter_executes() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP custom_types_generated_node_adapter_executes: node 22.6+ unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (generated, manifest) = generate_custom_napi_tree(tmp.path());
+    let _addon = build_custom_napi_addon(tmp.path(), &generated, &manifest);
+
+    let driver = tmp.path().join("custom-node-driver.ts");
+    std::fs::write(
+        &driver,
+        r#"
+import * as api from "./generated/node/index.ts";
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+const one = api.normalizeEmail({ value: "  A@EXAMPLE.COM  " });
+assert(one.value === "a@example.com", `normalizeEmail=${JSON.stringify(one)}`);
+
+const contact = api.normalizeContact({
+  primary: { value: " ROOT@EXAMPLE.COM " },
+  aliases: [{ value: " Alias@One.Com " }, { value: "TWO@EXAMPLE.COM" }],
+});
+assert(contact.primary.value === "root@example.com", `primary=${contact.primary.value}`);
+assert(contact.aliases[0].value === "alias@one.com", `alias0=${contact.aliases[0].value}`);
+assert(contact.aliases[1].value === "two@example.com", `alias1=${contact.aliases[1].value}`);
+
+const many = api.normalizeMany([{ value: " X@Y.COM " }, { value: "Z@Q.COM" }]);
+assert(many[0].value === "x@y.com", `many0=${many[0].value}`);
+assert(many[1].value === "z@q.com", `many1=${many[1].value}`);
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run custom node adapter driver");
+    if !output.status.success() {
+        panic!(
+            "custom node adapter driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "custom node adapter driver did not print ok"
+    );
+}
+
+#[test]
+fn custom_types_generated_electron_renderer_executes() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP custom_types_generated_electron_renderer_executes: node 22.6+ unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (generated, manifest) = generate_custom_napi_tree(tmp.path());
+    let addon = build_custom_napi_addon(tmp.path(), &generated, &manifest);
+    std::fs::copy(&addon, generated.join("electron/custom_js_core.node")).unwrap();
+    let electron_stub = generated.join("electron/node_modules/electron");
+    std::fs::create_dir_all(&electron_stub).unwrap();
+    std::fs::write(
+        electron_stub.join("index.js"),
+        r#"exports.contextBridge = {
+  exposeInMainWorld(name, value) {
+    globalThis[name] = value;
+  },
+};
+"#,
+    )
+    .unwrap();
+
+    let driver = tmp.path().join("custom-electron-driver.ts");
+    std::fs::write(
+        &driver,
+        r#"
+import { createRequire } from "node:module";
+
+globalThis.window = globalThis;
+
+const require = createRequire(import.meta.url);
+require("./generated/electron/preload.cjs");
+const api = await import("./generated/electron/renderer.ts");
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+const one = api.normalizeEmail({ value: "  A@EXAMPLE.COM  " });
+assert(one.value === "a@example.com", `normalizeEmail=${JSON.stringify(one)}`);
+
+const contact = api.normalizeContact({
+  primary: { value: " ROOT@EXAMPLE.COM " },
+  aliases: [{ value: " Alias@One.Com " }, { value: "TWO@EXAMPLE.COM" }],
+});
+assert(contact.primary.value === "root@example.com", `primary=${contact.primary.value}`);
+assert(contact.aliases[0].value === "alias@one.com", `alias0=${contact.aliases[0].value}`);
+assert(contact.aliases[1].value === "two@example.com", `alias1=${contact.aliases[1].value}`);
+
+const many = api.normalizeMany([{ value: " X@Y.COM " }, { value: "Z@Q.COM" }]);
+assert(many[0].value === "x@y.com", `many0=${many[0].value}`);
+assert(many[1].value === "z@q.com", `many1=${many[1].value}`);
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run custom electron driver");
+    if !output.status.success() {
+        panic!(
+            "custom electron driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "custom electron driver did not print ok"
     );
 }
 

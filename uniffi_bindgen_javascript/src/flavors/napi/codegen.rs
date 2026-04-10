@@ -241,7 +241,9 @@ impl<'a> Generator<'a> {
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface type `{name}` is not supported directly")
             }
-            Type::Custom { name, .. } => bail!("custom type `{name}` is not supported yet"),
+            Type::Custom { builtin, .. } => {
+                self.ensure_type_supported(builtin, usage, label)
+            }
         }
     }
 
@@ -800,7 +802,7 @@ impl<'a> Generator<'a> {
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface `{name}` is not supported directly")
             }
-            Type::Custom { name, .. } => bail!("custom type `{name}` is not supported"),
+            Type::Custom { builtin, .. } => self.bridge_value_type(builtin),
         }
     }
 
@@ -899,7 +901,20 @@ impl<'a> Generator<'a> {
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface `{name}` is not supported directly")
             }
-            Type::Custom { name, .. } => bail!("custom type `{name}` is not supported"),
+            Type::Custom {
+                module_path, builtin, ..
+            } => {
+                let builtin_lower = self.lower_value_expr(expr, builtin)?;
+                let builtin_ty = self.bridge_value_type(builtin)?;
+                let custom_ty = self.core_type_path(ty.clone());
+                let tag_ty = self.core_tag_path(module_path);
+                Ok(quote!({
+                    let __builtin = { #builtin_lower };
+                    let __ffi = <#builtin_ty as ::uniffi::Lower<#tag_ty>>::lower(__builtin);
+                    <#custom_ty as ::uniffi::Lift<#tag_ty>>::try_lift(__ffi)
+                        .expect("uniffi napi custom type lift failed")
+                }))
+            }
         }
     }
 
@@ -953,7 +968,23 @@ impl<'a> Generator<'a> {
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface `{name}` cannot be returned directly")
             }
-            Type::Custom { name, .. } => bail!("custom type `{name}` is not supported"),
+            Type::Custom { module_path, .. } => {
+                let custom_ty = self.core_type_path(ty.clone());
+                let tag_ty = self.core_tag_path(module_path);
+                let builtin = match ty {
+                    Type::Custom { builtin, .. } => builtin.as_ref(),
+                    _ => unreachable!(),
+                };
+                let builtin_ty = self.bridge_value_type(builtin)?;
+                let builtin_value = quote!({
+                    let __builtin = <#builtin_ty as ::uniffi::Lift<#tag_ty>>::try_lift(
+                        <#custom_ty as ::uniffi::Lower<#tag_ty>>::lower(#expr),
+                    )
+                    .expect("uniffi napi custom type lift failed");
+                    __builtin
+                });
+                self.lift_value_expr(builtin_value, builtin)
+            }
         }
     }
 
@@ -1027,7 +1058,7 @@ impl<'a> Generator<'a> {
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface `{name}` ts type is not supported")
             }
-            Type::Custom { name, .. } => bail!("custom type `{name}` ts type is not supported"),
+            Type::Custom { name, .. } => Ok(name.to_string()),
         }
     }
 
@@ -1064,6 +1095,15 @@ impl<'a> Generator<'a> {
             }
             _ => unreachable!("core_type_path only supports named types"),
         }
+    }
+
+    fn core_tag_path(&self, module_path: &str) -> TokenStream {
+        let crate_root = module_path
+            .split("::")
+            .next()
+            .expect("custom type module path should have a crate root");
+        let root = rust_ident(crate_root);
+        quote!(#root::UniFfiTag)
     }
 }
 

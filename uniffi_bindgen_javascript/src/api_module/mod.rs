@@ -23,7 +23,7 @@
 //! expectations. Type names (records, enums, objects) stay in their
 //! native PascalCase.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use anyhow::Result;
 use camino::Utf8Path;
@@ -42,15 +42,17 @@ const RUNTIME_TS: &str =
 
 pub fn emit(common_dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()> {
     let ci = &component.ci;
+    let config = &component.config;
 
     fs::write(common_dir.join("runtime.ts"), RUNTIME_TS)?;
-    fs::write(common_dir.join("records.ts"), render_records(ci))?;
-    fs::write(common_dir.join("enums.ts"), render_enums(ci))?;
+    fs::write(common_dir.join("custom-types.ts"), render_custom_types(ci, config))?;
+    fs::write(common_dir.join("records.ts"), render_records(ci, config))?;
+    fs::write(common_dir.join("enums.ts"), render_enums(ci, config))?;
     fs::write(common_dir.join("errors.ts"), render_errors(ci))?;
-    fs::write(common_dir.join("callbacks.ts"), render_callbacks(ci))?;
-    fs::write(common_dir.join("objects.ts"), render_objects(ci))?;
-    fs::write(common_dir.join("api.ts"), render_api(ci))?;
-    fs::write(common_dir.join("public-types.ts"), render_public_types(ci))?;
+    fs::write(common_dir.join("callbacks.ts"), render_callbacks(ci, config))?;
+    fs::write(common_dir.join("objects.ts"), render_objects(ci, config))?;
+    fs::write(common_dir.join("api.ts"), render_api(ci, config))?;
+    fs::write(common_dir.join("public-types.ts"), render_public_types(ci, config))?;
     Ok(())
 }
 
@@ -58,22 +60,38 @@ pub fn emit(common_dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()
 // records.ts
 // -----------------------------------------------------------------------
 
-fn render_records(ci: &ComponentInterface) -> String {
+fn render_records(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("records");
+    let custom_names = ci
+        .record_definitions()
+        .iter()
+        .flat_map(|record| record.fields().iter())
+        .flat_map(|field| custom_type_names(&field.as_type(), config))
+        .collect::<BTreeSet<_>>();
+    if !custom_names.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./custom-types.ts\";\n\n",
+            join_sorted(
+                &custom_names
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            )
+        ));
+    }
     for record in ci.record_definitions() {
-        out.push_str(&render_record(record));
+        out.push_str(&render_record(record, config));
         out.push('\n');
     }
     out
 }
 
-fn render_record(record: &Record) -> String {
+fn render_record(record: &Record, config: &JsConfig) -> String {
     let mut s = format!("export interface {} {{\n", record.name());
     for f in record.fields() {
         s.push_str(&format!(
             "    {}: {};\n",
             js_field_name(f.name()),
-            ts_type(&f.as_type())
+            ts_type(&f.as_type(), config)
         ));
     }
     s.push_str("}\n");
@@ -84,20 +102,87 @@ fn render_record(record: &Record) -> String {
 // enums.ts
 // -----------------------------------------------------------------------
 
-fn render_enums(ci: &ComponentInterface) -> String {
+fn render_enums(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("enums");
+    let custom_names = ci
+        .enum_definitions()
+        .iter()
+        .filter(|e| !ci.is_name_used_as_error(e.name()))
+        .flat_map(|e| e.variants().iter())
+        .flat_map(|v| v.fields().iter())
+        .flat_map(|field| custom_type_names(&field.as_type(), config))
+        .collect::<BTreeSet<_>>();
+    if !custom_names.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./custom-types.ts\";\n\n",
+            join_sorted(&custom_names.into_iter().collect::<Vec<_>>())
+        ));
+    }
     for e in ci.enum_definitions() {
         if ci.is_name_used_as_error(e.name()) {
             // Error enums are emitted as classes in errors.ts instead.
             continue;
         }
-        out.push_str(&render_enum(e));
+        out.push_str(&render_enum(e, config));
         out.push('\n');
     }
     out
 }
 
-fn render_enum(e: &Enum) -> String {
+// -----------------------------------------------------------------------
+// custom-types.ts
+// -----------------------------------------------------------------------
+
+fn render_custom_types(ci: &ComponentInterface, config: &JsConfig) -> String {
+    use std::fmt::Write;
+
+    let mut out = header("custom-types");
+    let customs = all_custom_types(ci, config);
+
+    let mut emitted_imports = HashSet::new();
+    for (name, _) in &customs {
+        let Some(custom) = config.custom_type(name) else {
+            continue;
+        };
+        for import in &custom.imports {
+            let line = render_import_statement(import);
+            if emitted_imports.insert(line.clone()) {
+                writeln!(out, "{line}").unwrap();
+            }
+        }
+    }
+    if !emitted_imports.is_empty() {
+        out.push('\n');
+    }
+
+    for (name, builtin) in customs {
+        let builtin_ts = ts_type(&builtin, config);
+        let custom_cfg = config.custom_type(&name);
+        let public_ty = custom_cfg
+            .map(|cfg| cfg.public_type(&builtin_ts))
+            .unwrap_or(builtin_ts.as_str());
+        writeln!(out, "export type {name} = {public_ty};").unwrap();
+        let lower_expr = custom_cfg
+            .map(|cfg| cfg.from_custom_expr("value"))
+            .unwrap_or_else(|| "value".to_string());
+        let lift_expr = custom_cfg
+            .map(|cfg| cfg.into_custom_expr("value"))
+            .unwrap_or_else(|| "value".to_string());
+        writeln!(
+            out,
+            "export function __uniffiLowerCustom{name}(value: {name}): {builtin_ts} {{\n    return {lower_expr} as {builtin_ts};\n}}\n"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "export function __uniffiLiftCustom{name}(value: {builtin_ts}): {name} {{\n    return {lift_expr} as {name};\n}}\n"
+        )
+        .unwrap();
+    }
+    out
+}
+
+fn render_enum(e: &Enum, config: &JsConfig) -> String {
     let all_unit = e.variants().iter().all(|v| v.fields().is_empty());
     if all_unit {
         // Emit a const object + string-literal union instead of a TS
@@ -123,7 +208,7 @@ fn render_enum(e: &Enum) -> String {
             let fields = v
                 .fields()
                 .iter()
-                .map(|f| format!("{}: {}", js_field_name(f.name()), ts_type(&f.as_type())))
+                .map(|f| format!("{}: {}", js_field_name(f.name()), ts_type(&f.as_type(), config)))
                 .collect::<Vec<_>>()
                 .join("; ");
             arms.push(format!("  | {{ tag: \"{}\"; {} }}", v.name(), fields));
@@ -158,8 +243,33 @@ fn render_errors(ci: &ComponentInterface) -> String {
 // callbacks.ts
 // -----------------------------------------------------------------------
 
-fn render_callbacks(ci: &ComponentInterface) -> String {
+fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("callbacks");
+    let custom_names = ci
+        .object_definitions()
+        .iter()
+        .filter(|obj| matches!(obj.imp(), ObjectImpl::CallbackTrait))
+        .flat_map(|obj| obj.methods())
+        .flat_map(|method| {
+            method
+                .arguments()
+                .iter()
+                .map(|arg| arg.as_type())
+                .chain(method.return_type().into_iter().cloned())
+                .collect::<Vec<_>>()
+        })
+        .flat_map(|ty| custom_type_names(&ty, config))
+        .collect::<BTreeSet<_>>();
+    if !custom_names.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./custom-types.ts\";\n\n",
+            join_sorted(
+                &custom_names
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            )
+        ));
+    }
     for obj in ci.object_definitions() {
         if !matches!(obj.imp(), ObjectImpl::CallbackTrait) {
             continue;
@@ -169,11 +279,17 @@ fn render_callbacks(ci: &ComponentInterface) -> String {
             let args = m
                 .arguments()
                 .iter()
-                .map(|a| format!("{}: {}", js_field_name(a.name()), ts_type(&a.as_type())))
+                .map(|a| {
+                    format!(
+                        "{}: {}",
+                        js_field_name(a.name()),
+                        ts_type(&a.as_type(), config)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let ret = match m.return_type() {
-                Some(t) => ts_type(t),
+                Some(t) => ts_type(t, config),
                 None => "void".to_string(),
             };
             out.push_str(&format!(
@@ -192,7 +308,7 @@ fn render_callbacks(ci: &ComponentInterface) -> String {
 // objects.ts
 // -----------------------------------------------------------------------
 
-fn render_objects(ci: &ComponentInterface) -> String {
+fn render_objects(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("objects");
 
     // Collect every type referenced by constructors/methods so we can
@@ -214,7 +330,7 @@ fn render_objects(ci: &ComponentInterface) -> String {
                 has_sync = true;
             }
             for a in c.arguments() {
-                usage.see(&a.as_type(), UsagePos::Arg);
+                usage.see(&a.as_type(), UsagePos::Arg, config);
             }
         }
         for m in obj.methods() {
@@ -224,10 +340,10 @@ fn render_objects(ci: &ComponentInterface) -> String {
                 has_sync = true;
             }
             for a in m.arguments() {
-                usage.see(&a.as_type(), UsagePos::Arg);
+                usage.see(&a.as_type(), UsagePos::Arg, config);
             }
             if let Some(t) = m.return_type() {
-                usage.see(t, UsagePos::Ret);
+                usage.see(t, UsagePos::Ret, config);
             }
         }
     }
@@ -288,19 +404,41 @@ fn render_objects(ci: &ComponentInterface) -> String {
             join_sorted(&grouped.callbacks)
         ));
     }
+    if !grouped.customs.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./custom-types.ts\";\n",
+            join_sorted(&grouped.customs)
+        ));
+    }
+    let helper_customs = object_custom_helpers(ci, config);
+    if !helper_customs.is_empty() {
+        let helpers = helper_customs
+            .iter()
+            .flat_map(|name| {
+                [
+                    format!("__uniffiLowerCustom{name}"),
+                    format!("__uniffiLiftCustom{name}"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "import {{ {} }} from \"./custom-types.ts\";\n",
+            join_sorted(&helpers)
+        ));
+    }
     out.push('\n');
 
     for obj in ci.object_definitions() {
         if matches!(obj.imp(), ObjectImpl::CallbackTrait) {
             continue;
         }
-        out.push_str(&render_object_class(obj));
+        out.push_str(&render_object_class(ci, obj, config));
         out.push('\n');
     }
     out
 }
 
-fn render_object_class(obj: &Object) -> String {
+fn render_object_class(ci: &ComponentInterface, obj: &Object, config: &JsConfig) -> String {
     let name = obj.name();
     let snake = obj.name().to_snake_case();
     let drop_fn = format!("__uniffi_{snake}_object_free");
@@ -319,7 +457,7 @@ fn render_object_class(obj: &Object) -> String {
         let c_js = js_fn_name(c.name());
         let fn_name = format!("{snake}_{}", c.name().to_snake_case());
         let (arg_decls, arg_pass) =
-            lowered_args(c.arguments().iter().map(|a| (a.name(), a.as_type())));
+            lowered_args(ci, config, c.arguments().iter().map(|a| (a.name(), a.as_type())));
         let comma = if arg_pass.is_empty() { "" } else { ", " };
         if c.is_async() {
             s.push_str(&format!(
@@ -339,26 +477,42 @@ fn render_object_class(obj: &Object) -> String {
         let m_js = js_fn_name(m.name());
         let fn_name = format!("{snake}_{}", m.name().to_snake_case());
         let (arg_decls, arg_pass) =
-            lowered_args(m.arguments().iter().map(|a| (a.name(), a.as_type())));
+            lowered_args(ci, config, m.arguments().iter().map(|a| (a.name(), a.as_type())));
         let comma_pass = if arg_pass.is_empty() { "" } else { ", " };
         let ret_ty = m.return_type();
         let ret_ts = match ret_ty {
-            Some(t) => ts_type(t),
+            Some(t) => ts_type(t, config),
             None => "void".to_string(),
         };
-        let lift_open = ret_ty.map(|t| lift_open(t)).unwrap_or_default();
-        let lift_close = ret_ty.map(|t| lift_close(t)).unwrap_or_default();
         let call_g = call_generic(ret_ty);
         if m.is_async() {
-            s.push_str(&format!(
-                "    async {m_js}({arg_decls}): Promise<{ret_ts}> {{\n        \
-                 return {lift_open}(await __callAsync<{call_g}>(\"{fn_name}\", this.__uniffi.raw{comma_pass}{arg_pass})){lift_close} as {ret_ts};\n    }}\n",
-            ));
+            if let Some(ret_ty) = ret_ty {
+                s.push_str(&format!(
+                    "    async {m_js}({arg_decls}): Promise<{ret_ts}> {{\n        \
+                     const __ret = await __callAsync<{call_g}>(\"{fn_name}\", this.__uniffi.raw{comma_pass}{arg_pass});\n        \
+                     return {lift} as {ret_ts};\n    }}\n",
+                    lift = ts_lift_expr(ci, config, ret_ty, "__ret", 0),
+                ));
+            } else {
+                s.push_str(&format!(
+                    "    async {m_js}({arg_decls}): Promise<void> {{\n        \
+                     await __callAsync<void>(\"{fn_name}\", this.__uniffi.raw{comma_pass}{arg_pass});\n    }}\n"
+                ));
+            }
         } else {
-            s.push_str(&format!(
-                "    {m_js}({arg_decls}): {ret_ts} {{\n        \
-                 return {lift_open}__call<{call_g}>(\"{fn_name}\", this.__uniffi.raw{comma_pass}{arg_pass}){lift_close} as {ret_ts};\n    }}\n",
-            ));
+            if let Some(ret_ty) = ret_ty {
+                s.push_str(&format!(
+                    "    {m_js}({arg_decls}): {ret_ts} {{\n        \
+                     const __ret = __call<{call_g}>(\"{fn_name}\", this.__uniffi.raw{comma_pass}{arg_pass});\n        \
+                     return {lift} as {ret_ts};\n    }}\n",
+                    lift = ts_lift_expr(ci, config, ret_ty, "__ret", 0),
+                ));
+            } else {
+                s.push_str(&format!(
+                    "    {m_js}({arg_decls}): void {{\n        \
+                     __call<void>(\"{fn_name}\", this.__uniffi.raw{comma_pass}{arg_pass});\n    }}\n"
+                ));
+            }
         }
     }
     s.push_str(
@@ -373,15 +527,27 @@ fn render_object_class(obj: &Object) -> String {
 // api.ts — entry point re-exporting everything the app sees
 // -----------------------------------------------------------------------
 
-fn render_api(ci: &ComponentInterface) -> String {
+fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("api");
     out.push_str(
         "export * from \"./records.ts\";\n\
          export * from \"./enums.ts\";\n\
          export * from \"./errors.ts\";\n\
          export * from \"./callbacks.ts\";\n\
-         export * from \"./objects.ts\";\n\
-         export {\n    \
+         export * from \"./objects.ts\";\n",
+    );
+    let customs = all_custom_types(ci, config)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    if !customs.is_empty() {
+        out.push_str(&format!(
+            "export type {{ {} }} from \"./custom-types.ts\";\n",
+            join_sorted(&customs)
+        ));
+    }
+    out.push_str(
+        "export {\n    \
          UniffiError,\n    \
          UNIFFI_JS_CONTRACT_VERSION,\n    \
          __installBackend,\n\
@@ -398,10 +564,10 @@ fn render_api(ci: &ComponentInterface) -> String {
             has_sync = true;
         }
         for a in f.arguments() {
-            usage.see(&a.as_type(), UsagePos::Arg);
+            usage.see(&a.as_type(), UsagePos::Arg, config);
         }
         if let Some(t) = f.return_type() {
-            usage.see(t, UsagePos::Ret);
+            usage.see(t, UsagePos::Ret, config);
         }
     }
 
@@ -485,40 +651,83 @@ fn render_api(ci: &ComponentInterface) -> String {
             join_sorted(&grouped.callbacks)
         ));
     }
+    if !grouped.customs.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./custom-types.ts\";\n",
+            join_sorted(&grouped.customs)
+        ));
+    }
+    let helper_customs = function_custom_helpers(ci, config);
+    if !helper_customs.is_empty() {
+        let helpers = helper_customs
+            .iter()
+            .flat_map(|name| {
+                [
+                    format!("__uniffiLowerCustom{name}"),
+                    format!("__uniffiLiftCustom{name}"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "import {{ {} }} from \"./custom-types.ts\";\n",
+            join_sorted(&helpers)
+        ));
+    }
     out.push('\n');
     for f in ci.function_definitions() {
-        out.push_str(&render_free_function(&f));
+        out.push_str(&render_free_function(ci, config, &f));
         out.push('\n');
     }
     out
 }
 
-fn render_free_function(f: &Function) -> String {
-    let (arg_decls, arg_pass) = lowered_args(f.arguments().iter().map(|a| (a.name(), a.as_type())));
+fn render_free_function(ci: &ComponentInterface, config: &JsConfig, f: &Function) -> String {
+    let (arg_decls, arg_pass) =
+        lowered_args(ci, config, f.arguments().iter().map(|a| (a.name(), a.as_type())));
     let ret_ty = f.return_type();
     let ret_ts = match ret_ty {
-        Some(t) => ts_type(t),
+        Some(t) => ts_type(t, config),
         None => "void".to_string(),
     };
-    let lift_open = ret_ty.map(|t| lift_open(t)).unwrap_or_default();
-    let lift_close = ret_ty.map(|t| lift_close(t)).unwrap_or_default();
     let call_g = call_generic(ret_ty);
     let rust_name = f.name();
     let js_name = js_fn_name(rust_name);
     if f.is_async() {
-        format!(
-            "export async function {js_name}({arg_decls}): Promise<{ret_ts}> {{\n    \
-             return {lift_open}(await __callAsync<{call_g}>(\"{rust_name}\"{sep}{arg_pass})){lift_close} as {ret_ts};\n\
-             }}\n",
-            sep = if arg_pass.is_empty() { "" } else { ", " },
-        )
+        if let Some(ret_ty) = ret_ty {
+            format!(
+                "export async function {js_name}({arg_decls}): Promise<{ret_ts}> {{\n    \
+                 const __ret = await __callAsync<{call_g}>(\"{rust_name}\"{sep}{arg_pass});\n    \
+                 return {lift} as {ret_ts};\n\
+                 }}\n",
+                sep = if arg_pass.is_empty() { "" } else { ", " },
+                lift = ts_lift_expr(ci, config, ret_ty, "__ret", 0),
+            )
+        } else {
+            format!(
+                "export async function {js_name}({arg_decls}): Promise<void> {{\n    \
+                 await __callAsync<void>(\"{rust_name}\"{sep}{arg_pass});\n\
+                 }}\n",
+                sep = if arg_pass.is_empty() { "" } else { ", " },
+            )
+        }
     } else {
-        format!(
-            "export function {js_name}({arg_decls}): {ret_ts} {{\n    \
-             return {lift_open}__call<{call_g}>(\"{rust_name}\"{sep}{arg_pass}){lift_close} as {ret_ts};\n\
-             }}\n",
-            sep = if arg_pass.is_empty() { "" } else { ", " },
-        )
+        if let Some(ret_ty) = ret_ty {
+            format!(
+                "export function {js_name}({arg_decls}): {ret_ts} {{\n    \
+                 const __ret = __call<{call_g}>(\"{rust_name}\"{sep}{arg_pass});\n    \
+                 return {lift} as {ret_ts};\n\
+                 }}\n",
+                sep = if arg_pass.is_empty() { "" } else { ", " },
+                lift = ts_lift_expr(ci, config, ret_ty, "__ret", 0),
+            )
+        } else {
+            format!(
+                "export function {js_name}({arg_decls}): void {{\n    \
+                 __call<void>(\"{rust_name}\"{sep}{arg_pass});\n\
+                 }}\n",
+                sep = if arg_pass.is_empty() { "" } else { ", " },
+            )
+        }
     }
 }
 
@@ -542,10 +751,9 @@ fn js_field_name(rust: &str) -> String {
 }
 
 /// Returns `(decls, pass)` where `decls` is the comma-separated TS
-/// parameter list as seen by the caller (numbers for i64/u64) and `pass`
-/// is the argument-passing expression that lowers each value into what
-/// the backend expects (bigint for i64/u64).
-fn lowered_args<'a, I>(args: I) -> (String, String)
+/// parameter list as seen by the caller and `pass` lowers each value
+/// into what the backend expects.
+fn lowered_args<'a, I>(ci: &ComponentInterface, config: &JsConfig, args: I) -> (String, String)
 where
     I: IntoIterator<Item = (&'a str, Type)>,
 {
@@ -553,16 +761,67 @@ where
     let mut pass = Vec::new();
     for (raw_name, ty) in args {
         let js = js_field_name(raw_name);
-        decls.push(format!("{js}: {}", ts_type(&ty)));
-        pass.push(lower_expr(&ty, &js));
+        decls.push(format!("{js}: {}", ts_type(&ty, config)));
+        pass.push(ts_lower_expr(ci, config, &ty, &js, 0));
     }
     (decls.join(", "), pass.join(", "))
 }
 
-fn lower_expr(ty: &Type, ident: &str) -> String {
+fn ts_lower_expr(
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    ty: &Type,
+    ident: &str,
+    depth: usize,
+) -> String {
     match ty {
         Type::Int64 => format!("toI64({ident})"),
         Type::UInt64 => format!("toU64({ident})"),
+        Type::Optional { inner_type } => format!(
+            "({ident} == null ? {ident} : {})",
+            ts_lower_expr(ci, config, inner_type, ident, depth + 1)
+        ),
+        Type::Sequence { inner_type } => {
+            let item = format!("__item{depth}");
+            format!(
+                "{ident}.map(({item}) => {})",
+                ts_lower_expr(ci, config, inner_type, &item, depth + 1)
+            )
+        }
+        Type::Enum { name, .. } => ts_lower_enum(ci, config, name, ident, depth),
+        Type::Record { name, .. } => {
+            let record = ci
+                .record_definitions()
+                .iter()
+                .find(|record| record.name() == name)
+                .expect("record should resolve");
+            let fields = record
+                .fields()
+                .iter()
+                .map(|field| {
+                    let field_name = js_field_name(field.name());
+                    format!(
+                        "{field_name}: {}",
+                        ts_lower_expr(
+                            ci,
+                            config,
+                            &field.as_type(),
+                            &format!("{ident}.{field_name}"),
+                            depth + 1,
+                        )
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{ {fields} }}")
+        }
+        Type::Custom { name, builtin, .. } => match config.custom_type(name) {
+            Some(_) => {
+                let custom = format!("__uniffiLowerCustom{name}({ident})");
+                ts_lower_expr(ci, config, builtin, &custom, depth + 1)
+            }
+            None => ts_lower_expr(ci, config, builtin, ident, depth + 1),
+        }
         // Callback traits / `with_foreign` traits are lowered as a
         // tagged marker. Each backend adapter intercepts the marker and
         // translates it into whatever its native layer wants:
@@ -585,20 +844,62 @@ fn lower_expr(ty: &Type, ident: &str) -> String {
     }
 }
 
-fn lift_open(ty: &Type) -> String {
+fn ts_lift_expr(
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    ty: &Type,
+    ident: &str,
+    depth: usize,
+) -> String {
     match ty {
-        // i64/u64: the backend already returns `bigint`, so no wrapping.
-        Type::Int64 | Type::UInt64 => String::new(),
-        Type::Object { name, .. } => format!("{name}.__fromHandle("),
-        _ => String::new(),
-    }
-}
-
-fn lift_close(ty: &Type) -> String {
-    match ty {
-        Type::Int64 | Type::UInt64 => String::new(),
-        Type::Object { .. } => ")".to_string(),
-        _ => String::new(),
+        Type::Int64 | Type::UInt64 => ident.to_string(),
+        Type::Optional { inner_type } => format!(
+            "({ident} == null ? {ident} : {})",
+            ts_lift_expr(ci, config, inner_type, ident, depth + 1)
+        ),
+        Type::Sequence { inner_type } => {
+            let item = format!("__item{depth}");
+            format!(
+                "{ident}.map(({item}) => {})",
+                ts_lift_expr(ci, config, inner_type, &item, depth + 1)
+            )
+        }
+        Type::Enum { name, .. } => ts_lift_enum(ci, config, name, ident, depth),
+        Type::Record { name, .. } => {
+            let record = ci
+                .record_definitions()
+                .iter()
+                .find(|record| record.name() == name)
+                .expect("record should resolve");
+            let fields = record
+                .fields()
+                .iter()
+                .map(|field| {
+                    let field_name = js_field_name(field.name());
+                    format!(
+                        "{field_name}: {}",
+                        ts_lift_expr(
+                            ci,
+                            config,
+                            &field.as_type(),
+                            &format!("{ident}.{field_name}"),
+                            depth + 1,
+                        )
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{ {fields} }}")
+        }
+        Type::Custom { name, builtin, .. } => match config.custom_type(name) {
+            Some(_) => format!(
+                "__uniffiLiftCustom{name}({})",
+                ts_lift_expr(ci, config, builtin, ident, depth + 1)
+            ),
+            None => ts_lift_expr(ci, config, builtin, ident, depth + 1),
+        },
+        Type::Object { name, .. } => format!("{name}.__fromHandle({ident})"),
+        _ => ident.to_string(),
     }
 }
 
@@ -614,7 +915,7 @@ fn lift_close(ty: &Type) -> String {
 ///
 /// - `timestamp` -> `Date`
 /// - `duration` -> `number` milliseconds
-fn ts_type(ty: &Type) -> String {
+fn ts_type(ty: &Type, config: &JsConfig) -> String {
     match ty {
         Type::UInt8
         | Type::Int8
@@ -630,16 +931,23 @@ fn ts_type(ty: &Type) -> String {
         Type::Bytes => "Uint8Array".to_string(),
         Type::Record { name, .. } | Type::Enum { name, .. } => name.clone(),
         Type::Object { name, .. } => name.clone(),
-        Type::Optional { inner_type } => format!("{} | null", ts_type(inner_type)),
-        Type::Sequence { inner_type } => format!("Array<{}>", ts_type(inner_type)),
+        Type::Optional { inner_type } => format!("{} | null", ts_type(inner_type, config)),
+        Type::Sequence { inner_type } => format!("Array<{}>", ts_type(inner_type, config)),
         Type::Map {
             key_type,
             value_type,
-        } => format!("Record<{}, {}>", ts_type(key_type), ts_type(value_type)),
+        } => format!(
+            "Record<{}, {}>",
+            ts_type(key_type, config),
+            ts_type(value_type, config)
+        ),
         Type::Timestamp => "Date".to_string(),
         Type::Duration => "number".to_string(),
         Type::CallbackInterface { name, .. } => name.clone(),
-        Type::Custom { name, .. } => format!("unknown /* custom: {name} */"),
+        Type::Custom { name, builtin, .. } => config
+            .custom_type(name)
+            .map(|_| name.clone())
+            .unwrap_or_else(|| ts_type(builtin, config)),
     }
 }
 
@@ -648,7 +956,7 @@ fn ts_type(ty: &Type) -> String {
 fn call_generic(ty: Option<&Type>) -> &'static str {
     match ty {
         Some(Type::Int64 | Type::UInt64) => "bigint",
-        _ => "unknown",
+        _ => "any",
     }
 }
 
@@ -672,10 +980,11 @@ struct Usage {
     /// just the type) must be imported because `render_free_function`
     /// emits `{Name}.__fromHandle(...)`.
     objects_in_ret: BTreeSet<String>,
+    customs: BTreeSet<String>,
 }
 
 impl Usage {
-    fn see(&mut self, ty: &Type, pos: UsagePos) {
+    fn see(&mut self, ty: &Type, pos: UsagePos, config: &JsConfig) {
         match ty {
             Type::Int64 => {
                 if matches!(pos, UsagePos::Arg) {
@@ -708,15 +1017,21 @@ impl Usage {
             Type::Record { name, .. } | Type::Enum { name, .. } => {
                 self.named.insert(name.clone());
             }
+            Type::Custom { name, builtin, .. } => {
+                if config.custom_type(name).is_some() {
+                    self.customs.insert(name.clone());
+                }
+                self.see(builtin, pos, config);
+            }
             Type::Optional { inner_type } | Type::Sequence { inner_type } => {
-                self.see(inner_type, pos)
+                self.see(inner_type, pos, config)
             }
             Type::Map {
                 key_type,
                 value_type,
             } => {
-                self.see(key_type, pos);
-                self.see(value_type, pos);
+                self.see(key_type, pos, config);
+                self.see(value_type, pos, config);
             }
             _ => {}
         }
@@ -730,6 +1045,7 @@ struct GroupedNames {
     errors: Vec<String>,
     callbacks: Vec<String>,
     objects: Vec<String>,
+    customs: Vec<String>,
 }
 
 /// Classify a set of type names against the CI so we know which source
@@ -757,6 +1073,8 @@ fn group_named_types(ci: &ComponentInterface, names: &BTreeSet<String>) -> Group
             .any(|c| c.name() == n)
         {
             g.callbacks.push(n.clone());
+        } else if matches!(ci.get_type(n), Some(Type::Custom { .. })) {
+            g.customs.push(n.clone());
         }
     }
     g
@@ -775,7 +1093,7 @@ fn join_sorted(xs: &[String]) -> String {
 /// Emit a type-only facade that re-exports every public type from the
 /// common API surface. Downstream UI code should import from this file
 /// instead of reaching into `records.ts` / `enums.ts` / … directly.
-fn render_public_types(ci: &ComponentInterface) -> String {
+fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     writeln!(
@@ -875,6 +1193,19 @@ fn render_public_types(ci: &ComponentInterface) -> String {
         .unwrap();
     }
 
+    let customs: Vec<String> = all_custom_types(ci, config)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    if !customs.is_empty() {
+        writeln!(
+            out,
+            "export type {{ {} }} from \"./custom-types.ts\";",
+            join_sorted(&customs)
+        )
+        .unwrap();
+    }
+
     // Free functions — re-export from api.ts so downstream gets the
     // full public surface from one import.
     let fns: Vec<String> = ci
@@ -887,4 +1218,293 @@ fn render_public_types(ci: &ComponentInterface) -> String {
     }
 
     out
+}
+
+fn custom_type_names(ty: &Type, config: &JsConfig) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    collect_custom_type_names(ty, config, &mut names);
+    names.into_iter().collect()
+}
+
+fn collect_custom_type_names(ty: &Type, config: &JsConfig, names: &mut BTreeSet<String>) {
+    match ty {
+        Type::Custom { name, builtin, .. } => {
+            if config.custom_type(name).is_some() {
+                names.insert(name.clone());
+            }
+            collect_custom_type_names(builtin, config, names);
+        }
+        Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+            collect_custom_type_names(inner_type, config, names)
+        }
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            collect_custom_type_names(key_type, config, names);
+            collect_custom_type_names(value_type, config, names);
+        }
+        _ => {}
+    }
+}
+
+fn all_custom_types(ci: &ComponentInterface, config: &JsConfig) -> BTreeSet<(String, Type)> {
+    let mut customs = BTreeSet::new();
+    for record in ci.record_definitions() {
+        for field in record.fields() {
+            collect_custom_types(&field.as_type(), config, &mut customs);
+        }
+    }
+    for enum_ in ci.enum_definitions() {
+        for variant in enum_.variants() {
+            for field in variant.fields() {
+                collect_custom_types(&field.as_type(), config, &mut customs);
+            }
+        }
+    }
+    for object in ci.object_definitions() {
+        for constructor in object.constructors() {
+            for arg in constructor.arguments() {
+                collect_custom_types(&arg.as_type(), config, &mut customs);
+            }
+        }
+        for method in object.methods() {
+            for arg in method.arguments() {
+                collect_custom_types(&arg.as_type(), config, &mut customs);
+            }
+            if let Some(ret) = method.return_type() {
+                collect_custom_types(ret, config, &mut customs);
+            }
+        }
+    }
+    for callback in ci.callback_interface_definitions() {
+        for method in callback.methods() {
+            for arg in method.arguments() {
+                collect_custom_types(&arg.as_type(), config, &mut customs);
+            }
+            if let Some(ret) = method.return_type() {
+                collect_custom_types(ret, config, &mut customs);
+            }
+        }
+    }
+    for function in ci.function_definitions() {
+        for arg in function.arguments() {
+            collect_custom_types(&arg.as_type(), config, &mut customs);
+        }
+        if let Some(ret) = function.return_type() {
+            collect_custom_types(ret, config, &mut customs);
+        }
+    }
+    customs
+}
+
+fn collect_custom_types(ty: &Type, config: &JsConfig, customs: &mut BTreeSet<(String, Type)>) {
+    match ty {
+        Type::Custom { name, builtin, .. } => {
+            if config.custom_type(name).is_some() {
+                customs.insert((name.clone(), builtin.as_ref().clone()));
+            }
+            collect_custom_types(builtin, config, customs);
+        }
+        Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+            collect_custom_types(inner_type, config, customs)
+        }
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            collect_custom_types(key_type, config, customs);
+            collect_custom_types(value_type, config, customs);
+        }
+        _ => {}
+    }
+}
+
+fn render_import_statement(import: &str) -> String {
+    let trimmed = import.trim().trim_end_matches(';');
+    if trimmed.starts_with("import ") {
+        format!("{trimmed};")
+    } else {
+        format!("import {trimmed};")
+    }
+}
+
+fn function_custom_helpers(ci: &ComponentInterface, config: &JsConfig) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for function in ci.function_definitions() {
+        for arg in function.arguments() {
+            collect_public_customs(ci, config, &arg.as_type(), &mut names, &mut HashSet::new());
+        }
+        if let Some(ret) = function.return_type() {
+            collect_public_customs(ci, config, ret, &mut names, &mut HashSet::new());
+        }
+    }
+    names
+}
+
+fn object_custom_helpers(ci: &ComponentInterface, config: &JsConfig) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for object in ci.object_definitions() {
+        if matches!(object.imp(), ObjectImpl::CallbackTrait) {
+            continue;
+        }
+        for constructor in object.constructors() {
+            for arg in constructor.arguments() {
+                collect_public_customs(ci, config, &arg.as_type(), &mut names, &mut HashSet::new());
+            }
+        }
+        for method in object.methods() {
+            for arg in method.arguments() {
+                collect_public_customs(ci, config, &arg.as_type(), &mut names, &mut HashSet::new());
+            }
+            if let Some(ret) = method.return_type() {
+                collect_public_customs(ci, config, ret, &mut names, &mut HashSet::new());
+            }
+        }
+    }
+    names
+}
+
+fn collect_public_customs(
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    ty: &Type,
+    out: &mut BTreeSet<String>,
+    seen_named: &mut HashSet<String>,
+) {
+    match ty {
+        Type::Custom { name, builtin, .. } => {
+            if config.custom_type(name).is_some() {
+                out.insert(name.clone());
+            }
+            collect_public_customs(ci, config, builtin, out, seen_named);
+        }
+        Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+            collect_public_customs(ci, config, inner_type, out, seen_named)
+        }
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            collect_public_customs(ci, config, key_type, out, seen_named);
+            collect_public_customs(ci, config, value_type, out, seen_named);
+        }
+        Type::Record { name, .. } => {
+            if seen_named.insert(format!("record:{name}")) {
+                if let Some(record) = ci.record_definitions().iter().find(|r| r.name() == name) {
+                    for field in record.fields() {
+                        collect_public_customs(ci, config, &field.as_type(), out, seen_named);
+                    }
+                }
+            }
+        }
+        Type::Enum { name, .. } => {
+            if seen_named.insert(format!("enum:{name}")) {
+                if let Some(enum_) = ci.enum_definitions().iter().find(|e| e.name() == name) {
+                    for variant in enum_.variants() {
+                        for field in variant.fields() {
+                            collect_public_customs(ci, config, &field.as_type(), out, seen_named);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ts_lower_enum(
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    name: &str,
+    ident: &str,
+    depth: usize,
+) -> String {
+    let enum_ = ci
+        .enum_definitions()
+        .iter()
+        .find(|enum_| enum_.name() == name)
+        .expect("enum should resolve");
+    if enum_.variants().iter().all(|v| v.fields().is_empty()) {
+        return ident.to_string();
+    }
+    let tag_expr = format!("{ident}.tag");
+    let mut cases = Vec::new();
+    for variant in enum_.variants() {
+        if variant.fields().is_empty() {
+            cases.push(format!("case \"{name}\": return {{ tag: \"{name}\" }};", name = variant.name()));
+            continue;
+        }
+        let fields = variant
+            .fields()
+            .iter()
+            .map(|field| {
+                let field_name = js_field_name(field.name());
+                format!(
+                    "{field_name}: {}",
+                    ts_lower_expr(
+                        ci,
+                        config,
+                        &field.as_type(),
+                        &format!("{ident}.{field_name}"),
+                        depth + 1,
+                    )
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        cases.push(format!(
+            "case \"{name}\": return {{ tag: \"{name}\", {fields} }};",
+            name = variant.name()
+        ));
+    }
+    format!("(() => {{ switch ({tag_expr}) {{ {} default: return {ident}; }} }})()", cases.join(" "))
+}
+
+fn ts_lift_enum(
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    name: &str,
+    ident: &str,
+    depth: usize,
+) -> String {
+    let enum_ = ci
+        .enum_definitions()
+        .iter()
+        .find(|enum_| enum_.name() == name)
+        .expect("enum should resolve");
+    if enum_.variants().iter().all(|v| v.fields().is_empty()) {
+        return ident.to_string();
+    }
+    let tag_expr = format!("{ident}.tag");
+    let mut cases = Vec::new();
+    for variant in enum_.variants() {
+        if variant.fields().is_empty() {
+            cases.push(format!("case \"{name}\": return {{ tag: \"{name}\" }};", name = variant.name()));
+            continue;
+        }
+        let fields = variant
+            .fields()
+            .iter()
+            .map(|field| {
+                let field_name = js_field_name(field.name());
+                format!(
+                    "{field_name}: {}",
+                    ts_lift_expr(
+                        ci,
+                        config,
+                        &field.as_type(),
+                        &format!("{ident}.{field_name}"),
+                        depth + 1,
+                    )
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        cases.push(format!(
+            "case \"{name}\": return {{ tag: \"{name}\", {fields} }};",
+            name = variant.name()
+        ));
+    }
+    format!("(() => {{ switch ({tag_expr}) {{ {} default: return {ident}; }} }})()", cases.join(" "))
 }
