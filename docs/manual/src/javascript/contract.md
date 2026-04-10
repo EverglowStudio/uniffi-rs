@@ -67,6 +67,12 @@ export function <name>(<args>): Promise<<ReturnType>>; // async
 - Parameters are exposed as natural frontend types (`number`, `string`,
   `bigint`, arrays, plain objects, `Map`, `Set`, `Date`, and so on, as
   supported by the target flavor).
+- Chronological builtins use the browser-native conventions:
+  - `timestamp` is surfaced as `Date`
+  - `duration` is surfaced as a millisecond `number`
+  - `duration` values must be non-negative
+  - `timestamp` values must stay within the JavaScript `Date` range;
+    out-of-range values raise `UniffiError`
 - `i64`/`u64` parameters are declared as `bigint` and validated/lowered by
   `toI64` / `toU64`.
 - `toI64` / `toU64` accept:

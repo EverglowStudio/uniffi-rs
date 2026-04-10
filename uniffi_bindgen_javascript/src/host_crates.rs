@@ -138,7 +138,7 @@ fn emit_wasm(
          \n\
          [dependencies]\n\
          {core_name} = {{ path = \"{rel_core}\" }}\n\
-         wasm-bindgen = \"0.2\"\n\
+         wasm-bindgen = \"=0.2.117\"\n\
          wasm-bindgen-futures = \"0.4\"\n\
          js-sys = \"0.3\"\n\
          \n\

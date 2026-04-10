@@ -608,6 +608,12 @@ fn lift_close(ty: &Type) -> String {
 /// `Number.MAX_SAFE_INTEGER`. The generator inserts `toI64`/`toU64`
 /// coercions on the argument side; return values are already `bigint`
 /// from the backend and need no conversion.
+///
+/// Chronological builtins follow the existing JavaScript conventions used
+/// by `uniffi-bindgen-react-native`:
+///
+/// - `timestamp` -> `Date`
+/// - `duration` -> `number` milliseconds
 fn ts_type(ty: &Type) -> String {
     match ty {
         Type::UInt8
@@ -630,7 +636,8 @@ fn ts_type(ty: &Type) -> String {
             key_type,
             value_type,
         } => format!("Record<{}, {}>", ts_type(key_type), ts_type(value_type)),
-        Type::Timestamp | Type::Duration => "unknown /* timestamp/duration TBD */".to_string(),
+        Type::Timestamp => "Date".to_string(),
+        Type::Duration => "number".to_string(),
         Type::CallbackInterface { name, .. } => name.clone(),
         Type::Custom { name, .. } => format!("unknown /* custom: {name} */"),
     }
