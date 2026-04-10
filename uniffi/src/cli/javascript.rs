@@ -8,7 +8,7 @@ use cargo_metadata::MetadataCommand;
 use clap::{Args, Subcommand, ValueEnum};
 use std::process::Command;
 use uniffi_bindgen::{cargo_metadata::CrateConfigSupplier, BindgenLoader, BindgenPaths};
-use uniffi_bindgen_javascript::{generate, GenerateJsOptions, HostCrateOptions};
+use uniffi_bindgen_javascript::{generate, FlavorTarget, GenerateJsOptions, HostCrateOptions};
 
 #[derive(Args)]
 pub(crate) struct JavascriptArgs {
@@ -23,6 +23,9 @@ pub(crate) enum JavascriptCommands {
     /// This path targets downstream crates whose generated wasm host crate can
     /// directly call the Rust API described by the chosen UDL/library input.
     BuildWasm(BuildWasmArgs),
+
+    /// Build JavaScript + N-API bindings, emit/build the napi host crate, and copy `.node` addons.
+    BuildNapi(BuildNapiArgs),
 }
 
 #[derive(Clone, Args)]
@@ -88,6 +91,80 @@ pub(crate) struct BuildWasmArgs {
     metadata_no_deps: bool,
 }
 
+#[derive(Clone, Args)]
+pub(crate) struct BuildNapiArgs {
+    /// Downstream core crate Cargo.toml.
+    #[clap(long = "manifest-path")]
+    manifest_path: Utf8PathBuf,
+
+    /// Directory in which to write generated JavaScript files.
+    #[clap(long, short)]
+    out_dir: Utf8PathBuf,
+
+    /// Optional override for the library/cdylib path used for JS generation.
+    /// When omitted, the command builds the crate at --manifest-path and derives
+    /// the cdylib location from Cargo metadata.
+    #[clap(long = "library-path")]
+    library_path: Option<Utf8PathBuf>,
+
+    /// Optional UDL or source input passed directly to the JS generator.
+    /// When set, this overrides the built-library path for generation, but
+    /// the downstream core crate is still built as part of the orchestration.
+    #[clap(long)]
+    source: Option<Utf8PathBuf>,
+
+    /// Directory (default `rust_modules`) in which to emit the generated napi host crate.
+    #[clap(long = "host-crates-dir", default_value = "rust_modules")]
+    host_crates_dir: Utf8PathBuf,
+
+    /// N-API consumption form(s) to emit. Defaults to both node and electron.
+    #[clap(long = "flavor", value_enum)]
+    flavor: Vec<NapiBuildFlavorArg>,
+
+    /// Override the `cargo` binary to invoke.
+    #[clap(long = "cargo-bin", default_value = "cargo")]
+    cargo_bin: String,
+
+    /// Cargo target directory for the generated N-API host build.
+    #[clap(long = "target-dir")]
+    target_dir: Option<Utf8PathBuf>,
+
+    /// Build the downstream core crate and generated napi host crate in release mode.
+    #[clap(long)]
+    release: bool,
+
+    /// Do not try to format the generated bindings.
+    #[clap(long, short)]
+    no_format: bool,
+
+    /// Path to optional uniffi config file.
+    #[clap(long, short)]
+    config: Option<Utf8PathBuf>,
+
+    /// Optional crate filter passed through to the JS generator.
+    #[clap(long = "crate")]
+    crate_name: Option<String>,
+
+    /// Whether we should exclude dependencies when running cargo metadata.
+    #[clap(long)]
+    metadata_no_deps: bool,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum NapiBuildFlavorArg {
+    Napi,
+    Electron,
+}
+
+impl From<NapiBuildFlavorArg> for FlavorTarget {
+    fn from(value: NapiBuildFlavorArg) -> Self {
+        match value {
+            NapiBuildFlavorArg::Napi => FlavorTarget::Napi,
+            NapiBuildFlavorArg::Electron => FlavorTarget::Electron,
+        }
+    }
+}
+
 #[derive(Copy, Clone, ValueEnum)]
 enum WasmBindgenTargetArg {
     Web,
@@ -112,6 +189,7 @@ impl WasmBindgenTargetArg {
 pub(crate) fn run(args: JavascriptArgs) -> Result<()> {
     match args.command {
         JavascriptCommands::BuildWasm(args) => build_wasm(args),
+        JavascriptCommands::BuildNapi(args) => build_napi(args),
     }
 }
 
@@ -124,6 +202,7 @@ pub(crate) fn generate_js(
     metadata_no_deps: bool,
     no_format: bool,
     host_crates: Option<HostCrateOptions>,
+    flavors: Vec<FlavorTarget>,
 ) -> Result<()> {
     let mut paths = BindgenPaths::default();
     if let Some(cfg) = config.clone() {
@@ -147,7 +226,7 @@ pub(crate) fn generate_js(
             config_override: config,
             crate_filter: crate_name,
             metadata_no_deps,
-            flavors: vec![uniffi_bindgen_javascript::FlavorTarget::Wasm],
+            flavors,
             host_crates,
         },
     )?;
@@ -200,6 +279,7 @@ fn build_wasm(args: BuildWasmArgs) -> Result<()> {
             manifest_path: manifest_path.clone(),
             host_crates_dir: args.host_crates_dir.clone(),
         }),
+        vec![FlavorTarget::Wasm],
     )?;
 
     let host_root = if args.host_crates_dir.is_absolute() {
@@ -266,6 +346,125 @@ fn build_wasm(args: BuildWasmArgs) -> Result<()> {
     Ok(())
 }
 
+fn build_napi(args: BuildNapiArgs) -> Result<()> {
+    let manifest_path = canonicalize_or_keep(&args.manifest_path);
+    let core_meta = cargo_package_metadata(&manifest_path)?;
+
+    let mut build_core =
+        cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
+    run_command(
+        &args.cargo_bin,
+        &mut build_core,
+        "cargo",
+        "install Rust's cargo toolchain or pass --cargo-bin <path>",
+    )?;
+
+    let generation_source = if let Some(source) = &args.source {
+        canonicalize_or_keep(source)
+    } else {
+        let library_path = args
+            .library_path
+            .clone()
+            .map(|p| canonicalize_or_keep(&p))
+            .unwrap_or_else(|| core_meta.host_cdylib_path(args.release));
+        if !library_path.exists() {
+            bail!(
+                "built library not found at {}. Ensure the downstream crate declares a cdylib target, pass --library-path <path>, or pass --source <udl-or-library>",
+                library_path
+            );
+        }
+        library_path
+    };
+
+    let flavors = if args.flavor.is_empty() {
+        vec![FlavorTarget::Napi, FlavorTarget::Electron]
+    } else {
+        args.flavor
+            .iter()
+            .copied()
+            .map(FlavorTarget::from)
+            .collect()
+    };
+
+    generate_js(
+        &manifest_path,
+        generation_source,
+        args.out_dir.clone(),
+        args.config.clone(),
+        args.crate_name.clone(),
+        args.metadata_no_deps,
+        args.no_format,
+        Some(HostCrateOptions {
+            manifest_path: manifest_path.clone(),
+            host_crates_dir: args.host_crates_dir.clone(),
+        }),
+        flavors.clone(),
+    )?;
+
+    let host_root = if args.host_crates_dir.is_absolute() {
+        args.host_crates_dir.clone()
+    } else {
+        Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+            .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?
+            .join(&args.host_crates_dir)
+    };
+    let napi_manifest = host_root.join("napi/Cargo.toml");
+    if !napi_manifest.exists() {
+        bail!(
+            "napi host crate was not emitted at {}",
+            napi_manifest
+                .parent()
+                .unwrap_or_else(|| Utf8Path::new("<unknown>"))
+        );
+    }
+
+    let target_dir = args.target_dir.as_ref().map(resolve_cwd_path).transpose()?;
+    let mut build_napi_host =
+        cargo_build_command(&args.cargo_bin, &napi_manifest, &[], args.release, None);
+    if let Some(target_dir) = &target_dir {
+        build_napi_host.env("CARGO_TARGET_DIR", target_dir.as_str());
+    }
+    run_command(
+        &args.cargo_bin,
+        &mut build_napi_host,
+        "cargo",
+        "install Rust's cargo toolchain or pass --cargo-bin <path>",
+    )?;
+
+    let napi_meta = cargo_package_metadata(&napi_manifest)?;
+    let napi_artifact = if let Some(target_dir) = &target_dir {
+        napi_meta.host_cdylib_path_in(target_dir, args.release)
+    } else {
+        napi_meta.host_cdylib_path(args.release)
+    };
+    if !napi_artifact.exists() {
+        bail!(
+            "built napi artifact not found at {} after cargo build",
+            napi_artifact
+        );
+    }
+
+    for flavor in flavors {
+        let subdir = match flavor {
+            FlavorTarget::Napi => "node",
+            FlavorTarget::Electron => "electron",
+            FlavorTarget::Wasm => continue,
+        };
+        let flavor_dir = args.out_dir.join(subdir);
+        ensure_single_generated_rs(&flavor_dir)
+            .with_context(|| format!("finding generated Rust bridge in {flavor_dir}"))?;
+        let addon_stem = generated_addon_stem(&flavor_dir)
+            .with_context(|| format!("finding generated addon name in {flavor_dir}"))?;
+        let addon_path = flavor_dir.join(format!("{addon_stem}.node"));
+        std::fs::create_dir_all(&flavor_dir)
+            .with_context(|| format!("creating addon output dir {flavor_dir}"))?;
+        std::fs::copy(&napi_artifact, &addon_path)
+            .with_context(|| format!("copying built napi addon {napi_artifact} to {addon_path}"))?;
+    }
+
+    Ok(())
+}
+
 fn cargo_build_command<'a>(
     cargo_bin: &str,
     manifest_path: &'a Utf8Path,
@@ -313,6 +512,67 @@ fn canonicalize_or_keep(path: &Utf8Path) -> Utf8PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn resolve_cwd_path(path: &Utf8PathBuf) -> Result<Utf8PathBuf> {
+    if path.is_absolute() {
+        Ok(path.clone())
+    } else {
+        Ok(Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+            .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?
+            .join(path))
+    }
+}
+
+fn ensure_single_generated_rs(dir: &Utf8Path) -> Result<()> {
+    let mut stems = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {dir}"))? {
+        let entry = entry?;
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|p| anyhow::anyhow!("generated path is not utf8: {}", p.display()))?;
+        if path.extension() == Some("rs") {
+            let stem = path
+                .file_stem()
+                .with_context(|| format!("generated Rust bridge path has no stem: {path}"))?;
+            stems.push(stem.to_string());
+        }
+    }
+    match stems.as_slice() {
+        [_stem] => Ok(()),
+        [] => bail!("no generated Rust bridge (*.rs) found in {dir}"),
+        _ => bail!("multiple generated Rust bridges found in {dir}: {stems:?}"),
+    }
+}
+
+fn generated_addon_stem(dir: &Utf8Path) -> Result<String> {
+    for file_name in ["backend-napi.ts", "preload.cjs"] {
+        let path = dir.join(file_name);
+        if path.exists() {
+            let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+            if let Some(stem) = parse_node_addon_stem(&text) {
+                return Ok(stem);
+            }
+        }
+    }
+    bail!("no generated addon reference (*.node) found in {dir}")
+}
+
+fn parse_node_addon_stem(text: &str) -> Option<String> {
+    let marker = ".node";
+    for (idx, _) in text.match_indices(marker) {
+        let before = &text[..idx];
+        let Some(quote_idx) = before.rfind(['"', '\'']) else {
+            continue;
+        };
+        let raw = &text[quote_idx + 1..idx];
+        let Some(stem) = raw.rsplit(['/', '\\']).next() else {
+            continue;
+        };
+        if !stem.is_empty() {
+            return Some(stem.to_string());
+        }
+    }
+    None
+}
+
 struct CargoPackageMetadata {
     target_directory: Utf8PathBuf,
     lib_target_name: String,
@@ -320,7 +580,11 @@ struct CargoPackageMetadata {
 
 impl CargoPackageMetadata {
     fn host_cdylib_path(&self, release: bool) -> Utf8PathBuf {
-        self.target_directory
+        self.host_cdylib_path_in(&self.target_directory, release)
+    }
+
+    fn host_cdylib_path_in(&self, target_directory: &Utf8Path, release: bool) -> Utf8PathBuf {
+        target_directory
             .join(if release { "release" } else { "debug" })
             .join(host_cdylib_filename(&self.lib_target_name))
     }
