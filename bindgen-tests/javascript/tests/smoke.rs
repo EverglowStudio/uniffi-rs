@@ -1451,6 +1451,189 @@ console.log("ok");
 }
 
 #[test]
+fn runs_generated_wasm_shim_fallible_callback_trait() {
+    run_wasm_e2e(WasmE2eSpec {
+        name: "wasm_fallible_cb",
+        udl: r#"
+dictionary Payload {
+  u32 left;
+  u32 right;
+};
+
+[Error]
+enum ProviderError {
+  "BadValue",
+};
+
+callback interface ValueProvider {
+  u32 get_value();
+  Payload make_payload();
+  [Throws=ProviderError]
+  u32 checked_value(boolean fail);
+  [Throws=ProviderError]
+  Payload checked_payload(boolean fail);
+  [Throws=ProviderError]
+  void checked_void(boolean fail);
+};
+
+namespace wasm_fallible_cb {
+  u32 invoke_value_provider_get_value(ValueProvider provider);
+  Payload invoke_value_provider_make_payload(ValueProvider provider);
+  [Throws=ProviderError]
+  u32 invoke_value_provider_checked_value(ValueProvider provider, boolean fail);
+  [Throws=ProviderError]
+  Payload invoke_value_provider_checked_payload(ValueProvider provider, boolean fail);
+  [Throws=ProviderError]
+  boolean invoke_value_provider_checked_void(ValueProvider provider, boolean fail);
+};
+"#,
+        biz_deps: "",
+        shim_deps: "",
+        biz_lib: r#"
+use std::sync::Arc;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payload {
+    pub left: u32,
+    pub right: u32,
+}
+
+#[derive(Debug)]
+pub enum ProviderError {
+    BadValue,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadValue => write!(f, "BadValue"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+pub trait ValueProvider: Send + Sync {
+    fn get_value(&self) -> u32;
+    fn make_payload(&self) -> Payload;
+    fn checked_value(&self, fail: bool) -> Result<u32, ProviderError>;
+    fn checked_payload(&self, fail: bool) -> Result<Payload, ProviderError>;
+    fn checked_void(&self, fail: bool) -> Result<(), ProviderError>;
+}
+
+pub fn invoke_value_provider_get_value(provider: Arc<dyn ValueProvider>) -> u32 {
+    provider.get_value()
+}
+
+pub fn invoke_value_provider_make_payload(provider: Arc<dyn ValueProvider>) -> Payload {
+    provider.make_payload()
+}
+
+pub fn invoke_value_provider_checked_value(
+    provider: Arc<dyn ValueProvider>,
+    fail: bool,
+) -> Result<u32, ProviderError> {
+    provider.checked_value(fail)
+}
+
+pub fn invoke_value_provider_checked_payload(
+    provider: Arc<dyn ValueProvider>,
+    fail: bool,
+) -> Result<Payload, ProviderError> {
+    provider.checked_payload(fail)
+}
+
+pub fn invoke_value_provider_checked_void(
+    provider: Arc<dyn ValueProvider>,
+    fail: bool,
+) -> Result<bool, ProviderError> {
+    provider.checked_void(fail)?;
+    Ok(true)
+}
+"#,
+        driver_ts: r#"
+import { createRequire } from "node:module";
+import { initBackend } from "./gen/browser/index.ts";
+import {
+  ProviderError,
+  invokeValueProviderCheckedPayload,
+  invokeValueProviderCheckedValue,
+  invokeValueProviderCheckedVoid,
+  invokeValueProviderGetValue,
+  invokeValueProviderMakePayload,
+} from "./gen/common/api.ts";
+import { UniffiError } from "./gen/common/runtime.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/wasm_fallible_cb_shim.js");
+await initBackend(glue);
+
+const provider = {
+  getValue() {
+    return 42;
+  },
+  makePayload() {
+    return { left: 7, right: 11 };
+  },
+  checkedValue(fail: boolean) {
+    if (fail) throw new ProviderError("BadValue", "BadValue");
+    return 77;
+  },
+  checkedPayload(fail: boolean) {
+    if (fail) throw new ProviderError("BadValue", "BadValue");
+    return { left: 13, right: 17 };
+  },
+  checkedVoid(fail: boolean) {
+    if (fail) throw new ProviderError("BadValue", "BadValue");
+  },
+};
+
+if (invokeValueProviderGetValue(provider as any) !== 42) {
+  throw new Error("getValue failed");
+}
+const payload = invokeValueProviderMakePayload(provider as any);
+if (payload.left !== 7 || payload.right !== 11) {
+  throw new Error(`makePayload failed: ${JSON.stringify(payload)}`);
+}
+if (invokeValueProviderCheckedValue(provider as any, false) !== 77) {
+  throw new Error("checkedValue(false) failed");
+}
+const checkedPayload = invokeValueProviderCheckedPayload(provider as any, false);
+if (checkedPayload.left !== 13 || checkedPayload.right !== 17) {
+  throw new Error(`checkedPayload(false) failed: ${JSON.stringify(checkedPayload)}`);
+}
+if (invokeValueProviderCheckedVoid(provider as any, false) !== true) {
+  throw new Error("checkedVoid(false) failed");
+}
+
+for (const [label, fn] of [
+  ["checkedValue", () => invokeValueProviderCheckedValue(provider as any, true)],
+  ["checkedPayload", () => invokeValueProviderCheckedPayload(provider as any, true)],
+  ["checkedVoid", () => invokeValueProviderCheckedVoid(provider as any, true)],
+] as const) {
+  let threw = false;
+  try {
+    fn();
+  } catch (e) {
+    threw = true;
+    if (!(e instanceof UniffiError)) {
+      throw new Error(`${label} threw wrong type: ${e && (e as Error).message}`);
+    }
+    if (!String((e as Error).message).includes("BadValue")) {
+      throw new Error(`${label} threw wrong message: ${(e as Error).message}`);
+    }
+  }
+  if (!threw) throw new Error(`${label}(true) should throw`);
+}
+
+console.log("ok");
+"#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
+    });
+}
+
+#[test]
 fn runs_generated_wasm_shim_custom_types() {
     run_wasm_e2e(WasmE2eSpec {
         name: "wasm_custom",
