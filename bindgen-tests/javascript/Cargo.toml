@@ -1,0 +1,18 @@
+[package]
+name = "uniffi-bindgen-tests-javascript"
+version = "0.31.0"
+edition = "2021"
+publish = false
+
+# Smoke-test harness for the JavaScript target. It exercises generated
+# trees, host crates, and real runtime flows across node/wasm/electron
+# fixtures rather than relying only on static file assertions.
+
+[dependencies]
+anyhow = "1"
+camino = "1"
+uniffi_bindgen = { path = "../../uniffi_bindgen" }
+uniffi_bindgen_javascript = { path = "../../uniffi_bindgen_javascript" }
+
+[dev-dependencies]
+tempfile = "3"

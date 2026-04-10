@@ -12,6 +12,33 @@ use crate::{
     fnsig::{FnKind, FnSignature, ReceiverArg},
 };
 
+fn wrap_async_future_expr(rust_fn_call: TokenStream, ar: Option<&AsyncRuntime>) -> TokenStream {
+    match ar {
+        Some(AsyncRuntime::Tokio(_)) => {
+            quote! { ::uniffi::deps::async_compat::Compat::new(#rust_fn_call) }
+        }
+        None => {
+            #[cfg(feature = "default-async-runtime-tokio")]
+            {
+                quote! {{
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        ::uniffi::deps::async_compat::Compat::new(#rust_fn_call)
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        #rust_fn_call
+                    }
+                }}
+            }
+            #[cfg(not(feature = "default-async-runtime-tokio"))]
+            {
+                rust_fn_call
+            }
+        }
+    }
+}
+
 pub(super) fn gen_fn_scaffolding(
     sig: FnSignature,
     ar: Option<&AsyncRuntime>,
@@ -280,10 +307,7 @@ pub(super) fn gen_ffi_function(
             #scaffolding_fn_ffi_buffer_version
         }
     } else {
-        let mut future_expr = rust_fn_call;
-        if matches!(ar, Some(AsyncRuntime::Tokio(_))) {
-            future_expr = quote! { ::uniffi::deps::async_compat::Compat::new(#future_expr) }
-        }
+        let future_expr = wrap_async_future_expr(rust_fn_call, ar);
         let scaffolding_fn_ffi_buffer_version =
             ffi_buffer_scaffolding_fn(&ffi_ident, &quote! { ::uniffi::Handle}, &param_types, false);
 
@@ -312,6 +336,42 @@ pub(super) fn gen_ffi_function(
             #scaffolding_fn_ffi_buffer_version
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_async_future_expr;
+    use crate::export::AsyncRuntime;
+    use proc_macro2::Span;
+    use quote::quote;
+    use syn::LitStr;
+
+    #[test]
+    fn explicit_tokio_async_runtime_wraps_future() {
+        let runtime = AsyncRuntime::Tokio(LitStr::new("tokio", Span::call_site()));
+        let tokens = wrap_async_future_expr(quote! { call_me() }, Some(&runtime)).to_string();
+        assert!(tokens.contains("async_compat"));
+        assert!(tokens.contains("Compat"));
+        assert!(tokens.contains("call_me"));
+    }
+
+    #[cfg(feature = "default-async-runtime-tokio")]
+    #[test]
+    fn default_tokio_feature_wraps_non_wasm_only() {
+        let tokens = wrap_async_future_expr(quote! { call_me() }, None).to_string();
+        assert!(tokens.contains("async_compat"));
+        assert!(tokens.contains("target_arch"));
+        assert!(tokens.contains("wasm32"));
+        assert!(tokens.contains("call_me"));
+    }
+
+    #[cfg(not(feature = "default-async-runtime-tokio"))]
+    #[test]
+    fn without_feature_default_async_runtime_is_unchanged() {
+        let tokens = wrap_async_future_expr(quote! { call_me() }, None).to_string();
+        assert!(!tokens.contains("async_compat"));
+        assert_eq!(tokens, quote! { call_me() }.to_string());
+    }
 }
 
 #[cfg(feature = "scaffolding-ffi-buffer-fns")]

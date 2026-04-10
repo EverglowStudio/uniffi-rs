@@ -88,6 +88,9 @@ nav:
   - ./configuration.md
   - ./foreign_traits.md
 
+  - 'JavaScript':
+    - ./javascript/contract.md
+
   - 'Kotlin':
     - ./kotlin/configuration.md
     - ./kotlin/gradle.md
