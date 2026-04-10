@@ -26,16 +26,17 @@
 //! records, enums (incl. payload variants), errors-with-data, opaque
 //! objects (`Self` and `Arc<Self>` constructors, methods, free-function
 //! `Type::Object` args/returns, trait objects like `Arc<dyn Greeter>`),
-//! and synchronous `void`-returning callback-trait lowering (validated
-//! against `Logger` in `bindgen-tests/javascript/tests/smoke.rs`).
+//! timestamp / duration, and synchronous `void`-returning callback-trait
+//! lowering (validated against `Logger` in
+//! `bindgen-tests/javascript/tests/smoke.rs`).
 //!
 //! Still **not** covered: non-`void` / fallible / async callback-trait
-//! returns, timestamp / duration / custom types, `Map` / `Set`,
-//! cancellation. Unsupported shapes are emitted as runtime-throwing
-//! stubs (with the reason embedded in the thrown `JsError`) rather
-//! than being silently skipped, so the rest of the tree still builds
-//! and hitting an unsupported export is diagnosable at call time
-//! instead of at link time.
+//! returns, custom types, `Map` / `Set`, cancellation. Unsupported
+//! shapes are emitted as runtime-throwing stubs (with the reason
+//! embedded in the thrown `JsError`) rather than being silently
+//! skipped, so the rest of the tree still builds and hitting an
+//! unsupported export is diagnosable at call time instead of at link
+//! time.
 //!
 //! Downstream build prerequisite: any client crate with async UniFFI
 //! exports targeting wasm must enable `uniffi`'s
