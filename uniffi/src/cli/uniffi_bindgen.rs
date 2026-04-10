@@ -5,6 +5,7 @@
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::fmt;
+use super::javascript;
 use uniffi_bindgen::{
     bindings::{generate, python, GenerateOptions, TargetLanguage},
     pipeline::initial,
@@ -167,6 +168,9 @@ enum Commands {
 
     /// Inspect the bindings render pipeline
     Pipeline(PipelineArgs),
+
+    /// JavaScript-target-specific workflows
+    Javascript(javascript::JavascriptArgs),
 }
 
 #[derive(Args)]
@@ -296,6 +300,9 @@ pub fn run_main() -> anyhow::Result<()> {
                     },
                 )?;
             }
+        }
+        Commands::Javascript(args) => {
+            javascript::run(args)?;
         }
         Commands::Scaffolding {
             out_dir,
