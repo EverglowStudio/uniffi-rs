@@ -7,7 +7,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::MetadataCommand;
 use clap::{Args, Subcommand, ValueEnum};
 use std::process::Command;
-use uniffi_bindgen::{BindgenLoader, BindgenPaths};
+use uniffi_bindgen::{cargo_metadata::CrateConfigSupplier, BindgenLoader, BindgenPaths};
 use uniffi_bindgen_javascript::{generate, GenerateJsOptions, HostCrateOptions};
 
 #[derive(Args)]
@@ -116,6 +116,7 @@ pub(crate) fn run(args: JavascriptArgs) -> Result<()> {
 }
 
 pub(crate) fn generate_js(
+    manifest_path: &Utf8Path,
     source: Utf8PathBuf,
     out_dir: Utf8PathBuf,
     config: Option<Utf8PathBuf>,
@@ -128,8 +129,15 @@ pub(crate) fn generate_js(
     if let Some(cfg) = config.clone() {
         paths.add_config_override_layer(cfg);
     }
-    #[cfg(feature = "cargo-metadata")]
-    paths.add_cargo_metadata_layer(metadata_no_deps)?;
+    let mut cargo_metadata = MetadataCommand::new();
+    cargo_metadata.manifest_path(manifest_path.as_std_path());
+    if metadata_no_deps {
+        cargo_metadata.no_deps();
+    }
+    let metadata = cargo_metadata
+        .exec()
+        .with_context(|| format!("running cargo metadata for {manifest_path}"))?;
+    paths.add_layer(CrateConfigSupplier::from(metadata));
     let loader = BindgenLoader::new(paths);
     generate(
         &loader,
@@ -181,6 +189,7 @@ fn build_wasm(args: BuildWasmArgs) -> Result<()> {
     };
 
     generate_js(
+        &manifest_path,
         generation_source,
         args.out_dir.clone(),
         args.config.clone(),
