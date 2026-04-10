@@ -2833,12 +2833,17 @@ fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
         src.join("lib.rs"),
         "use std::sync::Arc;\n\n\
          pub trait Logger: Send + Sync { fn log(&self, msg: String); }\n\n\
+         pub struct Counter(i64);\n\n\
          pub enum JobState { Idle, Running, Done }\n\n\
          pub enum Event { Started, Finished { name: String } }\n\n\
+         impl Counter {\n\
+         \x20   pub fn with_initial(value: i64) -> Arc<Self> { Arc::new(Self(value)) }\n\
+         \x20   pub fn get(&self) -> i64 { self.0 }\n\
+         }\n\n\
          pub fn run_job(logger: Arc<dyn Logger>) { logger.log(\"x\".into()); }\n\
          pub fn current_job_state() -> JobState { JobState::Idle }\n\
          pub fn latest_event() -> Event { Event::Started }\n\
-         pub async fn slow_add(a: u32, b: u32) -> u32 { a + b }\n\
+         pub async fn slow_add(a: u32, b: u32, _delay_ms: u64) -> u32 { a + b }\n\
          pub fn roundtrip_u64(a: u64) -> u64 { a }\n\
          pub fn roundtrip_i64(a: i64) -> i64 { a }\n\
          pub async fn async_roundtrip_u64(a: u64) -> u64 { a }\n\
@@ -2851,6 +2856,10 @@ fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
         &udl,
         "[Trait, WithForeign]\n\
          interface Logger {\n    void log(string msg);\n};\n\n\
+         interface Counter {\n\
+         \x20   [Name=with_initial] constructor(i64 value);\n\
+         \x20   i64 get();\n\
+         };\n\n\
          enum JobState { \"Idle\", \"Running\", \"Done\" };\n\n\
          [Enum]\n\
          interface Event {\n\
@@ -2862,7 +2871,7 @@ fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
          \x20   JobState current_job_state();\n\
          \x20   Event latest_event();\n\
          \x20   [Async]\n\
-         \x20   u32 slow_add(u32 a, u32 b);\n\
+         \x20   u32 slow_add(u32 a, u32 b, u64 delay_ms);\n\
          \x20   u64 roundtrip_u64(u64 a);\n\
          \x20   i64 roundtrip_i64(i64 a);\n\
          \x20   [Async]\n\
@@ -3046,6 +3055,9 @@ expectBigint(raw.roundtripU64(18446744073709551615n), 18446744073709551615n, "ra
 expectBigint(raw.roundtripI64(9223372036854775807n), 9223372036854775807n, "raw roundtripI64 max");
 expectBigint(raw.roundtripI64(-9223372036854775808n), -9223372036854775808n, "raw roundtripI64 min");
 expectBigint(await raw.asyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "raw asyncRoundtripU64");
+const rawCounter = raw.counterWithInitial(3n);
+expectBigint(raw.counterGet(rawCounter), 3n, "raw counterGet");
+assert(await raw.slowAdd(20, 22, 300n) === 42, "raw slowAdd mixed args");
 expectThrow("raw u64 overflow", () => raw.roundtripU64(18446744073709551616n), /u64/i);
 expectThrow("raw i64 overflow", () => raw.roundtripI64(9223372036854775808n), /i64/i);
 expectThrow("raw i64 underflow", () => raw.roundtripI64(-9223372036854775809n), /i64/i);
@@ -3054,6 +3066,9 @@ const nodeApi = await import("./node/index.ts");
 expectBigint(nodeApi.roundtripU64(18446744073709551615n), 18446744073709551615n, "node api roundtripU64");
 expectBigint(nodeApi.roundtripI64(-9223372036854775808n), -9223372036854775808n, "node api roundtripI64");
 expectBigint(await nodeApi.asyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "node api asyncRoundtripU64");
+const nodeCounter = nodeApi.Counter.withInitial(3n);
+expectBigint(nodeCounter.get(), 3n, "node api counter.get");
+assert(await nodeApi.slowAdd(20, 22, 300n) === 42, "node api slowAdd mixed args");
 
 require("./electron/preload.cjs");
 const bridge = (globalThis as any).__uniffi__;
@@ -3064,10 +3079,19 @@ expectBigint(res.value, 18446744073709551615n, "electron sync roundtripU64");
 res = bridge.dispatchSync({ kind: "call", id: 2, method: "roundtrip_i64", args: [-9223372036854775808n] });
 assert(res.kind === "ok", `electron sync i64 response kind ${res.kind}`);
 expectBigint(res.value, -9223372036854775808n, "electron sync roundtripI64");
-const asyncRes = await bridge.dispatchAsync({ kind: "call", id: 3, method: "async_roundtrip_u64", args: [18446744073709551615n] });
+res = bridge.dispatchSync({ kind: "call", id: 3, method: "counter_with_initial", args: [3n] });
+assert(res.kind === "ok", `electron counter ctor kind ${res.kind}`);
+const counterHandle = res.value;
+res = bridge.dispatchSync({ kind: "call", id: 4, method: "counter_get", args: [counterHandle] });
+assert(res.kind === "ok", `electron counter get kind ${res.kind}`);
+expectBigint(res.value, 3n, "electron counterGet");
+const asyncRes = await bridge.dispatchAsync({ kind: "call", id: 5, method: "async_roundtrip_u64", args: [18446744073709551615n] });
 assert(asyncRes.kind === "ok", `electron async response kind ${asyncRes.kind}`);
 expectBigint(asyncRes.value, 18446744073709551615n, "electron async roundtripU64");
-const overflowRes = bridge.dispatchSync({ kind: "call", id: 4, method: "roundtrip_u64", args: [18446744073709551616n] });
+const slowAddRes = await bridge.dispatchAsync({ kind: "call", id: 6, method: "slow_add", args: [20, 22, 300n] });
+assert(slowAddRes.kind === "ok", `electron slow_add kind ${slowAddRes.kind}`);
+assert(slowAddRes.value === 42, `electron slow_add result ${slowAddRes.value}`);
+const overflowRes = bridge.dispatchSync({ kind: "call", id: 7, method: "roundtrip_u64", args: [18446744073709551616n] });
 assert(overflowRes.kind === "err", "electron overflow should error");
 assert(/u64/i.test(String(overflowRes.error?.message ?? "")), "electron overflow message");
 
