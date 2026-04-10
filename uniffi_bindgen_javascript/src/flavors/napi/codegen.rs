@@ -69,6 +69,113 @@ impl<'a> Generator<'a> {
                 Error::new(Status::GenericFailure, err.to_string())
             }
 
+            #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+            struct __UniffiTimestamp(pub ::std::time::SystemTime);
+
+            #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+            struct __UniffiDuration(pub ::std::time::Duration);
+
+            impl TypeName for __UniffiTimestamp {
+                fn type_name() -> &'static str {
+                    "Date"
+                }
+
+                fn value_type() -> ValueType {
+                    ValueType::Object
+                }
+            }
+
+            impl ValidateNapiValue for __UniffiTimestamp {}
+
+            impl FromNapiValue for __UniffiTimestamp {
+                unsafe fn from_napi_value(env: napi::sys::napi_env, napi_val: napi::sys::napi_value) -> Result<Self> {
+                    let mut ms = 0.0;
+                    napi::check_status!(unsafe { napi::sys::napi_get_date_value(env, napi_val, &mut ms) })?;
+                    if !ms.is_finite() {
+                        return Err(Error::new(Status::InvalidArg, "invalid Date"));
+                    }
+                    if ms.abs() > 8.64e15 {
+                        return Err(Error::new(Status::InvalidArg, "timestamp exceeds JS Date range"));
+                    }
+                    let ms_i = ms.trunc() as i64;
+                    let ts = if ms_i >= 0 {
+                        ::std::time::UNIX_EPOCH
+                            .checked_add(::std::time::Duration::from_millis(ms_i as u64))
+                            .ok_or_else(|| Error::new(Status::InvalidArg, "timestamp overflow"))?
+                    } else {
+                        ::std::time::UNIX_EPOCH
+                            .checked_sub(::std::time::Duration::from_millis((-ms_i) as u64))
+                            .ok_or_else(|| Error::new(Status::InvalidArg, "timestamp overflow"))?
+                    };
+                    Ok(Self(ts))
+                }
+            }
+
+            impl ToNapiValue for __UniffiTimestamp {
+                unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+                    let ms = match val.0.duration_since(::std::time::UNIX_EPOCH) {
+                        Ok(delta) => (delta.as_secs() as f64) * 1000.0 + (delta.subsec_nanos() as f64) / 1_000_000.0,
+                        Err(err) => {
+                            let delta = err.duration();
+                            -((delta.as_secs() as f64) * 1000.0 + (delta.subsec_nanos() as f64) / 1_000_000.0)
+                        }
+                    };
+                    if !ms.is_finite() || ms.abs() > 8.64e15 {
+                        return Err(Error::new(Status::InvalidArg, "timestamp exceeds JS Date range"));
+                    }
+                    let mut js_value = std::ptr::null_mut();
+                    napi::check_status!(unsafe { napi::sys::napi_create_date(env, ms, &mut js_value) })?;
+                    Ok(js_value)
+                }
+            }
+
+            impl TypeName for __UniffiDuration {
+                fn type_name() -> &'static str {
+                    "number"
+                }
+
+                fn value_type() -> ValueType {
+                    ValueType::Number
+                }
+            }
+
+            impl ValidateNapiValue for __UniffiDuration {}
+
+            impl FromNapiValue for __UniffiDuration {
+                unsafe fn from_napi_value(env: napi::sys::napi_env, napi_val: napi::sys::napi_value) -> Result<Self> {
+                    let ms = f64::from_napi_value(env, napi_val)?;
+                    if !ms.is_finite() {
+                        return Err(Error::new(Status::InvalidArg, "duration must be finite"));
+                    }
+                    if ms < 0.0 {
+                        return Err(Error::new(Status::InvalidArg, "duration must be non-negative"));
+                    }
+                    let secs_f = (ms / 1000.0).trunc();
+                    if secs_f > u64::MAX as f64 {
+                        return Err(Error::new(Status::InvalidArg, "duration exceeds Rust range"));
+                    }
+                    let mut secs = secs_f as u64;
+                    let mut nanos = ((ms % 1000.0) * 1_000_000.0).round() as u32;
+                    if nanos == 1_000_000_000 {
+                        nanos = 0;
+                        secs = secs
+                            .checked_add(1)
+                            .ok_or_else(|| Error::new(Status::InvalidArg, "duration exceeds Rust range"))?;
+                    }
+                    Ok(Self(::std::time::Duration::new(secs, nanos)))
+                }
+            }
+
+            impl ToNapiValue for __UniffiDuration {
+                unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+                    let ms = (val.0.as_secs() as f64) * 1000.0 + (val.0.subsec_nanos() as f64) / 1_000_000.0;
+                    if !ms.is_finite() || ms > 9_007_199_254_740_991.0 {
+                        return Err(Error::new(Status::InvalidArg, "duration exceeds JS number range"));
+                    }
+                    f64::to_napi_value(env, ms)
+                }
+            }
+
             #(#records)*
             #(#enums)*
             #(#objects)*
@@ -235,15 +342,11 @@ impl<'a> Generator<'a> {
                 self.ensure_type_supported(key_type, TypeUsage::Value, label)?;
                 self.ensure_type_supported(value_type, TypeUsage::Value, label)
             }
-            Type::Timestamp | Type::Duration => {
-                bail!("{label} type `{ty:?}` is not supported yet")
-            }
+            Type::Timestamp | Type::Duration => Ok(()),
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface type `{name}` is not supported directly")
             }
-            Type::Custom { builtin, .. } => {
-                self.ensure_type_supported(builtin, usage, label)
-            }
+            Type::Custom { builtin, .. } => self.ensure_type_supported(builtin, usage, label),
         }
     }
 
@@ -532,6 +635,7 @@ impl<'a> Generator<'a> {
         );
         let fn_ident = rust_ident(&function_name);
         let object_ident = rust_ident(object.name());
+        let object_ty = object.as_type();
         let core_path = self.core_type_path(object.as_type());
         let args = constructor
             .arguments()
@@ -554,8 +658,7 @@ impl<'a> Generator<'a> {
         } else {
             call
         };
-        let wrapped = quote!(#object_ident(#call));
-        let body = self.wrap_return_or_error(constructor.throws_type(), quote!(#wrapped));
+        let body = self.render_result_body(call, Some(&object_ty), constructor.throws_type())?;
 
         if constructor.is_async() {
             Ok(quote! {
@@ -612,12 +715,7 @@ impl<'a> Generator<'a> {
             Some(return_type) => self.bridge_return_type(return_type)?,
             None => quote!(()),
         };
-        let body = if let Some(return_type) = method.return_type() {
-            let lifted = self.lift_value_expr(call, return_type)?;
-            self.wrap_return_or_error(method.throws_type(), quote!(#lifted))
-        } else {
-            self.wrap_return_or_error(method.throws_type(), call)
-        };
+        let body = self.render_result_body(call, method.return_type(), method.throws_type())?;
 
         if method.is_async() {
             Ok(quote! {
@@ -662,12 +760,7 @@ impl<'a> Generator<'a> {
             Some(return_type) => self.bridge_return_type(return_type)?,
             None => quote!(()),
         };
-        let body = if let Some(return_type) = function.return_type() {
-            let lifted = self.lift_value_expr(call, return_type)?;
-            self.wrap_return_or_error(function.throws_type(), quote!(#lifted))
-        } else {
-            self.wrap_return_or_error(function.throws_type(), call)
-        };
+        let body = self.render_result_body(call, function.return_type(), function.throws_type())?;
 
         if function.is_async() {
             Ok(quote! {
@@ -692,15 +785,28 @@ impl<'a> Generator<'a> {
         Ok(quote!(#ident: #ty))
     }
 
-    fn wrap_return_or_error(&self, throws_type: Option<&Type>, body: TokenStream) -> TokenStream {
-        if throws_type.is_some() {
-            quote! {
-                #body.map_err(into_napi_error)
+    fn render_result_body(
+        &self,
+        call: TokenStream,
+        return_type: Option<&Type>,
+        throws_type: Option<&Type>,
+    ) -> Result<TokenStream> {
+        match (return_type, throws_type) {
+            (Some(return_type), Some(_)) => {
+                let lifted = self.lift_value_expr(quote!(value), return_type)?;
+                Ok(quote! {
+                    match #call {
+                        Ok(value) => Ok(#lifted),
+                        Err(err) => Err(into_napi_error(err)),
+                    }
+                })
             }
-        } else {
-            quote! {
-                Ok(#body)
+            (Some(return_type), None) => {
+                let lifted = self.lift_value_expr(call, return_type)?;
+                Ok(quote!(Ok(#lifted)))
             }
+            (None, Some(_)) => Ok(quote!(#call.map_err(into_napi_error))),
+            (None, None) => Ok(quote!(Ok(#call))),
         }
     }
 
@@ -798,7 +904,8 @@ impl<'a> Generator<'a> {
                 let value = self.bridge_value_type(value_type)?;
                 Ok(quote!(std::collections::HashMap<#key, #value>))
             }
-            Type::Timestamp | Type::Duration => bail!("timestamp/duration are not supported yet"),
+            Type::Timestamp => Ok(quote!(__UniffiTimestamp)),
+            Type::Duration => Ok(quote!(__UniffiDuration)),
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface `{name}` is not supported directly")
             }
@@ -897,12 +1004,15 @@ impl<'a> Generator<'a> {
                         .collect()
                 ))
             }
-            Type::Timestamp | Type::Duration => bail!("timestamp/duration are not supported"),
+            Type::Timestamp => Ok(quote!(#expr.0)),
+            Type::Duration => Ok(quote!(#expr.0)),
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface `{name}` is not supported directly")
             }
             Type::Custom {
-                module_path, builtin, ..
+                module_path,
+                builtin,
+                ..
             } => {
                 let builtin_lower = self.lower_value_expr(expr, builtin)?;
                 let builtin_ty = self.bridge_value_type(builtin)?;
@@ -964,7 +1074,8 @@ impl<'a> Generator<'a> {
                         .collect()
                 ))
             }
-            Type::Timestamp | Type::Duration => bail!("timestamp/duration are not supported"),
+            Type::Timestamp => Ok(quote!(__UniffiTimestamp(#expr))),
+            Type::Duration => Ok(quote!(__UniffiDuration(#expr))),
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface `{name}` cannot be returned directly")
             }
@@ -1054,7 +1165,8 @@ impl<'a> Generator<'a> {
                 self.ts_type(key_type)?,
                 self.ts_type(value_type)?
             )),
-            Type::Timestamp | Type::Duration => bail!("timestamp/duration are not supported"),
+            Type::Timestamp => Ok("Date".to_string()),
+            Type::Duration => Ok("number".to_string()),
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface `{name}` ts type is not supported")
             }
