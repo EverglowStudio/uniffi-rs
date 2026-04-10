@@ -14,9 +14,9 @@
 //!   no `serde` or `serde_wasm_bindgen` anywhere in the wasm link — not
 //!   on the downstream core crate, not in the generated shim, and not
 //!   in the auto-generated wasm host crate.
-//! - Error enums still propagate via `JsError::new(&format!("{e:?}"))`
-//!   because they only cross the boundary as exceptions, never as value
-//!   returns or arguments.
+//! - Error enums normally propagate via `JsError::new(&format!("{e:?}"))`.
+//!   When a callback-trait method declares `[Throws=...]`, the same explicit
+//!   enum lowering helpers are emitted for that callback error payload.
 //! - Opaque objects (struct + trait-interface) via per-object thread-local
 //!   registry. Constructors returning `Self` or `Arc<Self>` both work via
 //!   the `__Coerce` autoref-specialisation trick.
@@ -28,12 +28,11 @@
 //!   `thread_local!`-stored `js_sys::Function`s. `Drop` releases the JS
 //!   registry slot.
 //!
-//! Anything still unsupported (Map/Set) is emitted as a stub
-//! that throws `JsError` at runtime — never a silent skip. Timestamp
-//! and duration are covered with explicit `Date` / millisecond
-//! lowering and lifting.
+//! Anything still unsupported is emitted as a stub that throws `JsError` at
+//! runtime — never a silent skip. Timestamp and duration are covered with
+//! explicit `Date` / millisecond lowering and lifting.
 
-use std::fmt::Write;
+use std::{collections::BTreeSet, fmt::Write};
 
 use heck::ToSnakeCase;
 use uniffi_bindgen::interface::{
@@ -251,6 +250,19 @@ fn __uniffi_cb_invoke(handle: u32, method: &str, args: JsValue) -> JsValue {{
             &args,
         )
         .unwrap_or(JsValue::NULL)
+    }})
+}}
+
+fn __uniffi_cb_try_invoke(handle: u32, method: &str, args: JsValue) -> Result<JsValue, JsValue> {{
+    __UNIFFI_CB_INVOKE.with(|c| {{
+        let b = c.borrow();
+        let f = b.as_ref().expect("uniffi: callback invoker not installed");
+        f.call3(
+            &JsValue::NULL,
+            &JsValue::from_f64(handle as f64),
+            &JsValue::from_str(method),
+            &args,
+        )
     }})
 }}
 
@@ -605,15 +617,6 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             if rust_args.is_empty() { "" } else { ", " }
         )
         .unwrap();
-        if m.throws_type().is_some() {
-            writeln!(
-                out,
-                "        panic!(\"uniffi wasm callback `{name}.{m_name}` with throws is not supported\")"
-            )
-            .unwrap();
-            writeln!(out, "    }}").unwrap();
-            continue;
-        }
         // Build a JS args array via explicit lift_expr — no serde.
         writeln!(out, "        let __args_arr = ::js_sys::Array::new();").unwrap();
         for (arg, (n, l)) in m.arguments().iter().zip(arg_info.iter()) {
@@ -630,6 +633,60 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             }
         }
         writeln!(out, "        let __args: JsValue = __args_arr.into();").unwrap();
+        if let Some(error_ty) = m.throws_type() {
+            let error_lower = lower_expr("__error", error_ty, 0);
+            writeln!(
+                out,
+                "        let __ret = __uniffi_cb_try_invoke(self.handle, \"{}\", __args).unwrap_or_else(|__err| panic!(\"uniffi wasm callback `{name}.{m_name}` threw unexpected JS error: {{:?}}\", __err));",
+                lower_camel(m_name)
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "        let __ret_obj: ::js_sys::Object = __ret.dyn_into().unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` returned a non-object result envelope\"));"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "        let __ok_js = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"ok\")).unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` result envelope missing `ok`\"));"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "        let __ok = __ok_js.as_bool().unwrap_or_else(|| panic!(\"uniffi wasm callback `{name}.{m_name}` result envelope `ok` is not boolean\"));"
+            )
+            .unwrap();
+            writeln!(out, "        if __ok {{").unwrap();
+            if let Some(return_type) = m.return_type() {
+                let value_lower = lower_expr("__value", return_type, 0);
+                writeln!(
+                    out,
+                    "            let __value = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"value\")).unwrap_or(JsValue::UNDEFINED);"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "            Ok(({value_lower}).unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad success value: {{e:?}}\")))"
+                )
+                .unwrap();
+            } else {
+                writeln!(out, "            Ok(())").unwrap();
+            }
+            writeln!(out, "        }} else {{").unwrap();
+            writeln!(
+                out,
+                "            let __error = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"error\")).unwrap_or(JsValue::UNDEFINED);"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "            Err(({error_lower}).unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad error value: {{e:?}}\")))"
+            )
+            .unwrap();
+            writeln!(out, "        }}").unwrap();
+            writeln!(out, "    }}").unwrap();
+            continue;
+        }
         writeln!(
             out,
             "        let __ret = __uniffi_cb_invoke(self.handle, \"{}\", __args);",
@@ -1151,13 +1208,13 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
 // ---------------------------------------------------------------------
 
 /// Emit a `__lower_<snake>` and `__lift_<snake>` helper for each record
-/// and non-error enum. These translate between `JsValue` and downstream
-/// core types via `js_sys::Reflect` / `js_sys::Array` only. Error enums
-/// are skipped because they only ever cross as exceptions via
-/// `JsError::new(&format!("{e:?}"))`.
+/// and enum. These translate between `JsValue` and downstream core types
+/// via `js_sys::Reflect` / `js_sys::Array` only. Error enum helpers are
+/// needed when a callback-trait method declares `[Throws=...]`.
 fn emit_value_helpers(out: &mut String, ci: &ComponentInterface, crate_ident: &str) {
     let records = ci.record_definitions();
     let enums = ci.enum_definitions();
+    let callback_error_enums = callback_throws_error_names(ci);
     if records.is_empty() && enums.is_empty() {
         return;
     }
@@ -1170,12 +1227,29 @@ fn emit_value_helpers(out: &mut String, ci: &ComponentInterface, crate_ident: &s
         emit_record_helpers(out, r, crate_ident);
     }
     for e in enums {
-        if ci.is_name_used_as_error(e.name()) {
+        if ci.is_name_used_as_error(e.name()) && !callback_error_enums.contains(e.name()) {
             continue;
         }
         emit_enum_helpers(out, e, crate_ident);
     }
     writeln!(out).unwrap();
+}
+
+fn callback_throws_error_names(ci: &ComponentInterface) -> BTreeSet<String> {
+    ci.callback_interface_definitions()
+        .iter()
+        .flat_map(|callback| callback.methods())
+        .chain(
+            ci.object_definitions()
+                .iter()
+                .filter(|obj| matches!(obj.imp(), ObjectImpl::CallbackTrait))
+                .flat_map(|obj| obj.methods()),
+        )
+        .filter_map(|method| match method.throws_type() {
+            Some(Type::Enum { name, .. }) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {

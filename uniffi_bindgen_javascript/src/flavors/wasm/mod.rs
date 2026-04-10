@@ -27,16 +27,17 @@
 //! objects (`Self` and `Arc<Self>` constructors, methods, free-function
 //! `Type::Object` args/returns, trait objects like `Arc<dyn Greeter>`),
 //! timestamp / duration, and synchronous `void`-returning callback-trait
-//! lowering (validated against `Logger` in
+//! lowering, custom types, and string-key `Map` / `HashMap<String, V>`
+//! lowering (validated against `Logger` and dedicated custom/map fixtures in
 //! `bindgen-tests/javascript/tests/smoke.rs`).
 //!
-//! Still **not** covered: non-`void` / fallible / async callback-trait
-//! returns, custom types, `Map` / `Set`, cancellation. Unsupported
-//! shapes are emitted as runtime-throwing stubs (with the reason
-//! embedded in the thrown `JsError`) rather than being silently
-//! skipped, so the rest of the tree still builds and hitting an
-//! unsupported export is diagnosable at call time instead of at link
-//! time.
+//! Still **not** covered: async callback-trait methods, callback
+//! object/callback/custom args or returns, non-string-key maps, nested
+//! object/callback values in maps, `Set`, and cancellation. Unsupported shapes
+//! are emitted as runtime-throwing stubs (with the reason embedded in the
+//! thrown `JsError`) rather than being silently skipped, so the rest of the tree
+//! still builds and hitting an unsupported export is diagnosable at call time
+//! instead of at link time.
 //!
 //! Downstream build prerequisite: any client crate with async UniFFI
 //! exports targeting wasm must enable `uniffi`'s
@@ -136,6 +137,55 @@ export async function adaptWasmBindgenGlue(
         (g.__uniffi_set_cb_invoker as (i: unknown, r: unknown) => void)(invoke, release);
     }}
     const {{ registerCallback }} = await import("../common/runtime.ts");
+    const callbackErrorPayload = (error: unknown, shape: unknown): unknown => {{
+        if (error !== null && typeof error === "object") {{
+            const raw = error as Record<string, unknown>;
+            if (shape === "flat") {{
+                if (typeof raw.variant === "string") return raw.variant;
+                if (typeof raw.tag === "string") return raw.tag;
+                if (typeof raw.type === "string") return raw.type;
+            }}
+            if (typeof raw.tag === "string") return raw;
+            if (typeof raw.type === "string") {{
+                const {{ type, ...data }} = raw;
+                return {{ tag: type, ...data }};
+            }}
+            if (typeof raw.variant === "string") {{
+                const data = raw.data;
+                const payload: Record<string, unknown> = {{ tag: raw.variant }};
+                if (data !== null && typeof data === "object" && !Array.isArray(data)) {{
+                    Object.assign(payload, data as Record<string, unknown>);
+                }}
+                return payload;
+            }}
+        }}
+        throw error;
+    }};
+    const normalizeCallbackObject = (marker: {{
+        object: object;
+        fallibleMethods?: Record<string, string>;
+    }}): object => {{
+        const obj = marker.object as Record<string, unknown>;
+        const fallibleMethods = marker.fallibleMethods ?? {{}};
+        const out: Record<string, unknown> = {{}};
+        for (const [k, v] of Object.entries(obj)) {{
+            if (typeof v !== "function") {{
+                out[k] = v;
+                continue;
+            }}
+            out[k] = (...args: unknown[]) => {{
+                const fn = v as (...a: unknown[]) => unknown;
+                const errorShape = fallibleMethods[k];
+                if (!errorShape) return fn.apply(obj, args);
+                try {{
+                    return {{ ok: true, value: fn.apply(obj, args) }};
+                }} catch (error) {{
+                    return {{ ok: false, error: callbackErrorPayload(error, errorShape) }};
+                }}
+            }};
+        }}
+        return out;
+    }};
     const coerce = (a: unknown): unknown => {{
         if (
             a !== null &&
@@ -145,7 +195,10 @@ export async function adaptWasmBindgenGlue(
             // Tagged marker from common/api.ts — convert JS callback
             // object to a u32 handle the wasm-bindgen shim expects.
             return registerCallback(
-                (a as {{ object: object }}).object as object,
+                normalizeCallbackObject(a as {{
+                    object: object;
+                    fallibleMethods?: Record<string, string>;
+                }}),
             );
         }}
         return a;
