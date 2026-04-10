@@ -1343,6 +1343,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prettyplease"
+version = "0.2.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6837b9e10d61f45f987d50808f83d1ee3d206c66acf650c3e4ae2e1f6ddedf55"
+dependencies = [
+ "proc-macro2",
+ "syn",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1837,6 +1847,7 @@ dependencies = [
  "clap",
  "trybuild",
  "uniffi_bindgen",
+ "uniffi_bindgen_javascript",
  "uniffi_build",
  "uniffi_core",
  "uniffi_macros",
@@ -1909,6 +1920,17 @@ version = "0.31.0"
 dependencies = [
  "thiserror",
  "uniffi",
+]
+
+[[package]]
+name = "uniffi-bindgen-tests-javascript"
+version = "0.31.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "tempfile",
+ "uniffi_bindgen",
+ "uniffi_bindgen_javascript",
 ]
 
 [[package]]
@@ -2493,6 +2515,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniffi_bindgen_javascript"
+version = "0.31.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "fs-err",
+ "heck",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn",
+ "toml",
+ "uniffi_bindgen",
+ "uniffi_meta",
+]
+
+[[package]]
 name = "uniffi_build"
 version = "0.32.0"
 dependencies = [
@@ -2577,6 +2617,13 @@ dependencies = [
  "indexmap",
  "tempfile",
  "uniffi_internal_macros",
+]
+
+[[package]]
+name = "uniffi_runtime_javascript"
+version = "0.31.0"
+dependencies = [
+ "camino",
 ]
 
 [[package]]
