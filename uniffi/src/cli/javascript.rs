@@ -18,6 +18,13 @@ pub(crate) struct JavascriptArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum JavascriptCommands {
+    /// Build JavaScript bindings for browser wasm plus Node/Electron N-API.
+    ///
+    /// This is a convenience orchestration over `build-wasm` followed by
+    /// `build-napi`; the specialized subcommands remain available when a
+    /// downstream only needs one ABI.
+    Build(BuildArgs),
+
     /// Build JavaScript + wasm bindings, emit the wasm host crate, and run wasm-bindgen.
     ///
     /// This path targets downstream crates whose generated wasm host crate can
@@ -26,6 +33,116 @@ pub(crate) enum JavascriptCommands {
 
     /// Build JavaScript + N-API bindings, emit/build the napi host crate, and copy `.node` addons.
     BuildNapi(BuildNapiArgs),
+}
+
+#[derive(Clone, Args)]
+pub(crate) struct BuildArgs {
+    /// Downstream core crate Cargo.toml.
+    #[clap(long = "manifest-path")]
+    manifest_path: Utf8PathBuf,
+
+    /// Directory in which to write generated JavaScript files.
+    #[clap(long, short)]
+    out_dir: Utf8PathBuf,
+
+    /// Optional override for the library/cdylib path used for JS generation.
+    /// When omitted, the command builds the crate at --manifest-path and derives
+    /// the cdylib location from Cargo metadata.
+    #[clap(long = "library-path")]
+    library_path: Option<Utf8PathBuf>,
+
+    /// Optional UDL or source input passed directly to the JS generator.
+    /// When set, this overrides the built-library path for generation, but
+    /// the downstream core crate is still built as part of the orchestration.
+    #[clap(long)]
+    source: Option<Utf8PathBuf>,
+
+    /// Directory (default `rust_modules`) in which to emit the generated host crates.
+    #[clap(long = "host-crates-dir", default_value = "rust_modules")]
+    host_crates_dir: Utf8PathBuf,
+
+    /// Where to write the wasm-bindgen output tree. Defaults to `<out-dir>/browser/pkg`.
+    #[clap(long = "wasm-bindgen-out-dir")]
+    wasm_bindgen_out_dir: Option<Utf8PathBuf>,
+
+    /// wasm-bindgen output target.
+    #[clap(long = "wasm-bindgen-target", value_enum, default_value = "web")]
+    wasm_bindgen_target: WasmBindgenTargetArg,
+
+    /// N-API consumption form(s) to emit. Defaults to both node and electron.
+    #[clap(long = "napi-flavor", value_enum)]
+    napi_flavor: Vec<NapiBuildFlavorArg>,
+
+    /// Override the `cargo` binary to invoke.
+    #[clap(long = "cargo-bin", default_value = "cargo")]
+    cargo_bin: String,
+
+    /// Override the `wasm-bindgen` binary to invoke.
+    #[clap(long = "wasm-bindgen-bin", default_value = "wasm-bindgen")]
+    wasm_bindgen_bin: String,
+
+    /// Cargo target directory for the generated N-API host build.
+    #[clap(long = "target-dir")]
+    target_dir: Option<Utf8PathBuf>,
+
+    /// Build the downstream core crate and generated host crates in release mode.
+    #[clap(long)]
+    release: bool,
+
+    /// Do not try to format the generated bindings.
+    #[clap(long, short)]
+    no_format: bool,
+
+    /// Path to optional uniffi config file.
+    #[clap(long, short)]
+    config: Option<Utf8PathBuf>,
+
+    /// Optional crate filter passed through to the JS generator.
+    #[clap(long = "crate")]
+    crate_name: Option<String>,
+
+    /// Whether we should exclude dependencies when running cargo metadata.
+    #[clap(long)]
+    metadata_no_deps: bool,
+}
+
+impl BuildArgs {
+    fn wasm_args(&self) -> BuildWasmArgs {
+        BuildWasmArgs {
+            manifest_path: self.manifest_path.clone(),
+            out_dir: self.out_dir.clone(),
+            library_path: self.library_path.clone(),
+            source: self.source.clone(),
+            host_crates_dir: self.host_crates_dir.clone(),
+            wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
+            wasm_bindgen_target: self.wasm_bindgen_target,
+            cargo_bin: self.cargo_bin.clone(),
+            wasm_bindgen_bin: self.wasm_bindgen_bin.clone(),
+            release: self.release,
+            no_format: self.no_format,
+            config: self.config.clone(),
+            crate_name: self.crate_name.clone(),
+            metadata_no_deps: self.metadata_no_deps,
+        }
+    }
+
+    fn napi_args(&self) -> BuildNapiArgs {
+        BuildNapiArgs {
+            manifest_path: self.manifest_path.clone(),
+            out_dir: self.out_dir.clone(),
+            library_path: self.library_path.clone(),
+            source: self.source.clone(),
+            host_crates_dir: self.host_crates_dir.clone(),
+            flavor: self.napi_flavor.clone(),
+            cargo_bin: self.cargo_bin.clone(),
+            target_dir: self.target_dir.clone(),
+            release: self.release,
+            no_format: self.no_format,
+            config: self.config.clone(),
+            crate_name: self.crate_name.clone(),
+            metadata_no_deps: self.metadata_no_deps,
+        }
+    }
 }
 
 #[derive(Clone, Args)]
@@ -188,6 +305,7 @@ impl WasmBindgenTargetArg {
 
 pub(crate) fn run(args: JavascriptArgs) -> Result<()> {
     match args.command {
+        JavascriptCommands::Build(args) => build(args),
         JavascriptCommands::BuildWasm(args) => build_wasm(args),
         JavascriptCommands::BuildNapi(args) => build_napi(args),
     }
@@ -234,6 +352,12 @@ pub(crate) fn generate_js(
         // keep compatibility with existing GenerateJsOptions shape; formatting
         // is not yet a configurable concern for the JS target.
     }
+    Ok(())
+}
+
+fn build(args: BuildArgs) -> Result<()> {
+    build_wasm(args.wasm_args()).context("building JavaScript wasm target")?;
+    build_napi(args.napi_args()).context("building JavaScript N-API target")?;
     Ok(())
 }
 
