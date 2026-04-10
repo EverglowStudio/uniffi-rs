@@ -155,7 +155,7 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
                          const callArgs = args.length >= 2 && (args[0] === null || args[0] === undefined || args[0] instanceof Error)\n\
                              ? args.slice(1)\n\
                              : args;\n\
-                         return v(...callArgs);\n\
+                         return __uniffiLowerShape(v(...callArgs));\n\
                      }};\n\
                  }} else {{\n\
                      out[k] = v;\n\

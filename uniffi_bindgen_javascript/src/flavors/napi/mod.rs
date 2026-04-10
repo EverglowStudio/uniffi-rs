@@ -80,7 +80,7 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
                          const callArgs = args.length >= 2 && (args[0] === null || args[0] === undefined || args[0] instanceof Error)\n\
                              ? args.slice(1)\n\
                              : args;\n\
-                         return (v as (...a: unknown[]) => unknown)(...callArgs);\n\
+                         return __uniffiLowerShape((v as (...a: unknown[]) => unknown)(...callArgs));\n\
                      }};\n\
                  }} else {{\n\
                      out[k] = v;\n\

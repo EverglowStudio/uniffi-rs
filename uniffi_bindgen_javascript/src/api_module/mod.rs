@@ -411,11 +411,7 @@ fn render_objects(ci: &ComponentInterface, config: &JsConfig) -> String {
             join_sorted(&grouped.callbacks)
         ));
     }
-    let custom_type_imports = usage
-        .customs
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let custom_type_imports = usage.customs.iter().cloned().collect::<Vec<_>>();
     if !custom_type_imports.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./custom-types.ts\";\n",
@@ -669,11 +665,7 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
             join_sorted(&grouped.callbacks)
         ));
     }
-    let custom_type_imports = usage
-        .customs
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let custom_type_imports = usage.customs.iter().cloned().collect::<Vec<_>>();
     if !custom_type_imports.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./custom-types.ts\";\n",

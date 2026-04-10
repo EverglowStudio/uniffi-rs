@@ -40,7 +40,7 @@ pub struct HostCrateOptions {
 pub struct CoreCrateMetadata {
     pub package_name: String,
     pub crate_dir: Utf8PathBuf,
-    pub uniffi_dep: UniffiDependency,
+    pub uniffi_dep: Option<UniffiDependency>,
 }
 
 #[derive(Clone, Debug)]
@@ -155,7 +155,7 @@ fn emit_wasm(
          \n\
          [dependencies]\n\
          {core_name} = {{ path = \"{rel_core}\" }}\n\
-         {uniffi_dep}\n\
+         {uniffi_dep}\
          wasm-bindgen = \"=0.2.117\"\n\
          wasm-bindgen-futures = \"0.4\"\n\
          js-sys = \"0.3\"\n\
@@ -167,7 +167,7 @@ fn emit_wasm(
         package_name = package_name,
         core_name = meta.package_name,
         rel_core = rel_core,
-        uniffi_dep = render_uniffi_dependency(&meta.uniffi_dep, &crate_dir)?,
+        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &crate_dir)?,
     );
     fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -217,7 +217,7 @@ fn emit_napi(
          \n\
          [dependencies]\n\
          {core_name} = {{ path = \"{rel_core}\" }}\n\
-         {uniffi_dep}\n\
+         {uniffi_dep}\
          napi = {{ version = \"3.8.4\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }}\n\
          napi-derive = {{ version = \"3.5.3\", features = [\"type-def\"] }}\n\
          \n\
@@ -228,7 +228,7 @@ fn emit_napi(
         package_name = package_name,
         core_name = meta.package_name,
         rel_core = rel_core,
-        uniffi_dep = render_uniffi_dependency(&meta.uniffi_dep, &crate_dir)?,
+        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &crate_dir)?,
     );
     fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -276,23 +276,28 @@ fn relative_path(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {
     result
 }
 
-fn resolve_uniffi_dependency(manifest_path: &Utf8Path, value: &toml::Value) -> Result<UniffiDependency> {
+fn resolve_uniffi_dependency(
+    manifest_path: &Utf8Path,
+    value: &toml::Value,
+) -> Result<Option<UniffiDependency>> {
     let manifest_dir = manifest_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| Utf8PathBuf::from("."));
-    let dep = value
+    let Some(dep) = value
         .get("dependencies")
         .and_then(|deps| deps.get("uniffi"))
-        .with_context(|| format!("{manifest_path} missing [dependencies].uniffi"))?;
+    else {
+        return Ok(None);
+    };
     if dep
         .get("workspace")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        return resolve_workspace_uniffi_dependency(&manifest_dir);
+        return resolve_workspace_uniffi_dependency(&manifest_dir).map(Some);
     }
-    parse_uniffi_dependency(dep, &manifest_dir)
+    parse_uniffi_dependency(dep, &manifest_dir).map(Some)
 }
 
 fn resolve_workspace_uniffi_dependency(start_dir: &Utf8Path) -> Result<UniffiDependency> {
@@ -333,13 +338,34 @@ fn parse_uniffi_dependency(dep: &toml::Value, base_dir: &Utf8Path) -> Result<Uni
         }),
         toml::Value::Table(table) => Ok(UniffiDependency {
             base_dir: base_dir.to_path_buf(),
-            version: table.get("version").and_then(|v| v.as_str()).map(ToOwned::to_owned),
-            path: table.get("path").and_then(|v| v.as_str()).map(ToOwned::to_owned),
-            git: table.get("git").and_then(|v| v.as_str()).map(ToOwned::to_owned),
-            branch: table.get("branch").and_then(|v| v.as_str()).map(ToOwned::to_owned),
-            tag: table.get("tag").and_then(|v| v.as_str()).map(ToOwned::to_owned),
-            rev: table.get("rev").and_then(|v| v.as_str()).map(ToOwned::to_owned),
-            package: table.get("package").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            version: table
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            path: table
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            git: table
+                .get("git")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            branch: table
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            tag: table
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            rev: table
+                .get("rev")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            package: table
+                .get("package")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
             default_features: table.get("default-features").and_then(|v| v.as_bool()),
             features: table
                 .get("features")
@@ -355,7 +381,13 @@ fn parse_uniffi_dependency(dep: &toml::Value, base_dir: &Utf8Path) -> Result<Uni
     }
 }
 
-fn render_uniffi_dependency(dep: &UniffiDependency, crate_dir: &Utf8Path) -> Result<String> {
+fn render_uniffi_dependency(
+    dep: Option<&UniffiDependency>,
+    crate_dir: &Utf8Path,
+) -> Result<String> {
+    let Some(dep) = dep else {
+        return Ok(String::new());
+    };
     let mut fields: Vec<(String, String)> = Vec::new();
     if let Some(path) = &dep.path {
         let abs = dep
@@ -404,5 +436,5 @@ fn render_uniffi_dependency(dep: &UniffiDependency, crate_dir: &Utf8Path) -> Res
         .map(|(key, value)| format!("{key} = {value}"))
         .collect::<Vec<_>>()
         .join(", ");
-    Ok(format!("uniffi = {{ {fields} }}"))
+    Ok(format!("uniffi = {{ {fields} }}\n"))
 }

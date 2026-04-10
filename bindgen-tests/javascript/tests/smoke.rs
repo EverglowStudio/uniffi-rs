@@ -3171,6 +3171,93 @@ fn generate_rich_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     host_dir
 }
 
+fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
+    let core = root.join("callback_return_core");
+    let src = core.join("src");
+    let uniffi_path = workspace_root().join("uniffi");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        core.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"napi-callback-return-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
+             [lib]\nname = \"napi_callback_return_core\"\ncrate-type = [\"lib\"]\n\n\
+             [dependencies]\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\n",
+            uniffi_path.as_str()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "#[derive(Clone, Debug, PartialEq, Eq)]\n\
+         pub struct Payload {\n\
+         \x20   pub left: u32,\n\
+         \x20   pub right: u32,\n\
+         }\n\n\
+         pub trait ValueProvider: Send + Sync {\n\
+         \x20   fn get_value(&self) -> u32;\n\
+         \x20   fn make_payload(&self) -> Payload;\n\
+         }\n\n\
+         pub fn invoke_value_provider_get_value(provider: std::sync::Arc<dyn ValueProvider>) -> u32 {\n\
+         \x20   provider.get_value()\n\
+         }\n\n\
+         pub fn invoke_value_provider_make_payload(provider: std::sync::Arc<dyn ValueProvider>) -> Payload {\n\
+         \x20   provider.make_payload()\n\
+         }\n",
+    )
+    .unwrap();
+    let udl = core.join("src/callback_return.udl");
+    std::fs::write(
+        &udl,
+        r#"
+dictionary Payload {
+  u32 left;
+  u32 right;
+};
+
+[Trait, WithForeign]
+interface ValueProvider {
+  u32 get_value();
+  Payload make_payload();
+};
+
+namespace callback_return {
+  u32 invoke_value_provider_get_value(ValueProvider provider);
+  Payload invoke_value_provider_make_payload(ValueProvider provider);
+};
+"#,
+    )
+    .unwrap();
+    (
+        Utf8PathBuf::from_path_buf(udl).unwrap(),
+        Utf8PathBuf::from_path_buf(core.join("Cargo.toml")).unwrap(),
+    )
+}
+
+fn generate_callback_return_napi_host(root: &std::path::Path) -> Utf8PathBuf {
+    let (udl, manifest) = write_callback_return_core_crate(root);
+    let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: udl,
+            out_dir,
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: manifest,
+                host_crates_dir: host_dir.clone(),
+            }),
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
+        },
+    )
+    .expect("callback-return napi generator run should succeed");
+    host_dir
+}
+
 fn write_temporal_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
     let core = root.join("temporal_core");
     let src = core.join("src");
@@ -4189,6 +4276,147 @@ console.log("ok");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("ok"),
         "bigint driver did not print ok:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn host_crates_napi_runs_callback_return_fixture() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP host_crates_napi_runs_callback_return_fixture: node 22.6+ unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host_dir = generate_callback_return_napi_host(tmp.path());
+    let manifest = host_dir.join("napi/Cargo.toml");
+    let target_dir = tmp.path().join("cargo-target-callback-return");
+
+    let check = match run_cargo_check(&manifest, &[], &target_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP host_crates_napi_runs_callback_return_fixture: cargo unavailable: {e}");
+            return;
+        }
+    };
+    if !check.status.success() {
+        panic!(
+            "cargo check on callback-return napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr),
+        );
+    }
+
+    let build = match run_cargo_build(&manifest, &[], &target_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP host_crates_napi_runs_callback_return_fixture: cargo unavailable during build: {e}");
+            return;
+        }
+    };
+    if !build.status.success() {
+        panic!(
+            "cargo build on callback-return napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+        );
+    }
+
+    let lib_name = cdylib_filename("napi-callback-return-core-napi");
+    let built_lib = target_dir.join("debug").join(lib_name);
+    assert!(
+        built_lib.exists(),
+        "expected built callback-return cdylib at {}",
+        built_lib.display()
+    );
+
+    let generated = tmp.path().join("generated");
+    let node_addon = generated.join("node/callback_return.node");
+    std::fs::copy(&built_lib, &node_addon).unwrap();
+
+    let electron_dir = generated.join("electron");
+    let electron_addon = electron_dir.join("callback_return.node");
+    std::fs::copy(&built_lib, &electron_addon).unwrap();
+    let electron_stub = electron_dir.join("node_modules/electron");
+    std::fs::create_dir_all(&electron_stub).unwrap();
+    std::fs::write(
+        electron_stub.join("index.js"),
+        r#"const state = { api: null };
+exports.contextBridge = {
+  exposeInMainWorld(name, value) {
+    globalThis[name] = value;
+    state.api = value;
+  },
+};
+exports.__state = state;
+"#,
+    )
+    .unwrap();
+
+    let callbacks = std::fs::read_to_string(generated.join("common/callbacks.ts")).unwrap();
+    assert!(
+        callbacks.contains("interface ValueProvider")
+            && callbacks.contains("makePayload(): Payload"),
+        "common/callbacks.ts should expose a return-capable callback interface:\n{callbacks}"
+    );
+
+    let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
+    assert!(
+        preload.contains("__uniffiCallback"),
+        "electron preload must keep unwrapping callback markers for callback returns"
+    );
+    let renderer = std::fs::read_to_string(generated.join("electron/renderer.ts")).unwrap();
+    assert!(
+        renderer.contains("__installBackend"),
+        "electron renderer must still install the backend"
+    );
+
+    let driver = generated.join("callback-return-driver.ts");
+    std::fs::write(
+        &driver,
+        r#"
+import { invokeValueProviderGetValue, invokeValueProviderMakePayload } from "./node/index.ts";
+
+const provider = {
+    getValue() {
+        return 42;
+    },
+    makePayload() {
+        return { left: 7, right: 11 };
+    },
+};
+
+const scalar = invokeValueProviderGetValue(provider as any);
+if (scalar !== 42) {
+    throw new Error(`getValue failed: ${scalar}`);
+}
+const payload = invokeValueProviderMakePayload(provider as any);
+if (payload.left !== 7 || payload.right !== 11) {
+    throw new Error(`makePayload failed: ${JSON.stringify(payload)}`);
+}
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(&generated)
+        .output()
+        .expect("failed to run callback-return driver");
+    if !output.status.success() {
+        panic!(
+            "callback-return driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "callback-return driver did not print ok:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
 }

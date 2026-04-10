@@ -358,6 +358,7 @@ pub fn run_main() -> anyhow::Result<()> {
             )?;
         }
         Commands::Pipeline(args) => {
+            #[allow(unused_mut)]
             let mut paths = uniffi_bindgen::BindgenPaths::default();
             #[cfg(feature = "cargo-metadata")]
             paths.add_cargo_metadata_layer(uniffi_bindgen::CargoMetadataOptions {
