@@ -1,0 +1,18 @@
+[package]
+name = "uniffi_runtime_javascript"
+version = "0.31.0"
+description = "Bundled TypeScript runtime source consumed by uniffi_bindgen_javascript output"
+license = "MPL-2.0"
+edition = "2021"
+keywords = ["ffi", "bindgen", "javascript", "typescript", "runtime"]
+
+# This crate is primarily a delivery vehicle for the bundled TypeScript
+# runtime under `typescript/src/`. The Rust shell exposes the on-disk
+# location so the bindgen can copy or symlink the runtime into generated
+# output trees.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+camino = "1.0.8"

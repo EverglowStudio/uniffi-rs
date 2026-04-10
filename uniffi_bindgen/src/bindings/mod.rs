@@ -9,7 +9,7 @@
 
 use std::fs;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use camino::Utf8PathBuf;
 
 use crate::{BindgenLoader, BindgenPaths, GlobalConfig};
@@ -88,6 +88,13 @@ pub fn generate_with_bindgen_paths(
             TargetLanguage::Ruby => {
                 ruby::generate(&loader, options.clone())?;
             }
+            TargetLanguage::Javascript => {
+                bail!(
+                    "TargetLanguage::Javascript is dispatched by the CLI layer, \
+                     not by uniffi_bindgen::bindings::generate. \
+                     Call `uniffi_bindgen_javascript::generate` directly."
+                );
+            }
         }
     }
     Ok(())
@@ -130,4 +137,10 @@ pub enum TargetLanguage {
     Python,
     Ruby,
     Swift,
+    /// First-class JavaScript/TypeScript target (multi-flavor: wasm + napi,
+    /// with Electron preload/renderer). Implemented in the standalone
+    /// `uniffi_bindgen_javascript` crate; the dispatch is done by the CLI
+    /// layer rather than `generate_with_bindgen_paths` to avoid a circular
+    /// dependency between `uniffi_bindgen` and the JS bindgen crate.
+    Javascript,
 }

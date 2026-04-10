@@ -46,6 +46,12 @@ This code uses `asyncio` to drive the future to completion, while our exposed fu
 
 In Rust `Future` terminology this means the foreign bindings supply the "executor" - think event-loop, or async runtime. In this example it's `asyncio`. There's no requirement for a Rust event loop.
 
+This fork also exposes an optional Cargo feature named
+`default-async-runtime-tokio`. When enabled on the `uniffi` crate, plain
+`#[uniffi::export]` on async functions, methods, and constructors defaults to
+Tokio on non-`wasm32` targets when `async_runtime` is omitted. `wasm32`
+continues to use the no-runtime path.
+
 There are [some great API docs](https://docs.rs/uniffi_core/latest/uniffi_core/ffi/rustfuture/index.html) on the implementation that are well worth a read.
 
 ## Exporting async trait methods
