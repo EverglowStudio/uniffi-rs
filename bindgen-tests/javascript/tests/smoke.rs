@@ -1669,8 +1669,7 @@ crate-type = ["rlib"]
 {uniffi_dep}
 {extra}
 "#,
-            extra = spec.biz_deps
-            ,
+            extra = spec.biz_deps,
             uniffi_dep = uniffi_dep
         ),
     )
@@ -1745,8 +1744,7 @@ js-sys = "0.3"
 {name} = {{ path = "../biz" }}
 {extra}
 "#,
-            extra = spec.shim_deps
-            ,
+            extra = spec.shim_deps,
             uniffi_dep = uniffi_dep
         ),
     )
@@ -3173,6 +3171,231 @@ fn generate_rich_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     host_dir
 }
 
+fn write_temporal_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
+    let core = root.join("temporal_core");
+    let src = core.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        core.join("Cargo.toml"),
+        "[package]\nname = \"napi-temporal-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
+         [lib]\nname = \"napi_temporal_core\"\ncrate-type = [\"lib\"]\n\n\
+         [dependencies]\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "use std::time::{Duration, SystemTime};\n\n\
+         #[derive(Clone)]\n\
+         pub enum TimeEvent {\n\
+         \x20   Point { when: SystemTime },\n\
+         \x20   Gap { gap: Duration },\n\
+         }\n\n\
+         #[derive(Clone)]\n\
+         pub struct TimeBundle {\n\
+         \x20   pub start: SystemTime,\n\
+         \x20   pub gap: Duration,\n\
+         \x20   pub maybe_end: Option<SystemTime>,\n\
+         \x20   pub checkpoints: Vec<SystemTime>,\n\
+         \x20   pub segments: Vec<Duration>,\n\
+         \x20   pub event: TimeEvent,\n\
+         }\n\n\
+         #[derive(Debug)]\n\
+         pub enum ChronologicalError {\n\
+         \x20   TimeOverflow,\n\
+         \x20   TimeDiffError,\n\
+         }\n\n\
+         impl std::fmt::Display for ChronologicalError {\n\
+         \x20   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n\
+         \x20       match self {\n\
+         \x20           Self::TimeOverflow => write!(f, \"TimeOverflow\"),\n\
+         \x20           Self::TimeDiffError => write!(f, \"TimeDiffError\"),\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n\n\
+         impl std::error::Error for ChronologicalError {}\n\n\
+         pub fn return_timestamp(a: SystemTime) -> Result<SystemTime, ChronologicalError> {\n\
+         \x20   Ok(a)\n\
+         }\n\n\
+         pub fn return_duration(a: Duration) -> Result<Duration, ChronologicalError> {\n\
+         \x20   Ok(a)\n\
+         }\n\n\
+         pub fn add(a: SystemTime, b: Duration) -> Result<SystemTime, ChronologicalError> {\n\
+         \x20   a.checked_add(b).ok_or(ChronologicalError::TimeOverflow)\n\
+         }\n\n\
+         pub fn diff(a: SystemTime, b: SystemTime) -> Result<Duration, ChronologicalError> {\n\
+         \x20   a.duration_since(b).map_err(|_| ChronologicalError::TimeDiffError)\n\
+         }\n\n\
+         pub fn optional(a: Option<SystemTime>, b: Option<Duration>) -> bool {\n\
+         \x20   a.is_some() && b.is_some()\n\
+         }\n\n\
+         pub fn make_bundle(start: SystemTime, gap: Duration) -> TimeBundle {\n\
+         \x20   TimeBundle {\n\
+         \x20       start,\n\
+         \x20       gap,\n\
+         \x20       maybe_end: None,\n\
+         \x20       checkpoints: vec![start],\n\
+         \x20       segments: vec![gap],\n\
+         \x20       event: TimeEvent::Gap { gap },\n\
+         \x20   }\n\
+         }\n\n\
+         pub fn roundtrip_bundle(value: TimeBundle) -> TimeBundle {\n\
+         \x20   value\n\
+         }\n\n\
+         pub fn roundtrip_event(value: TimeEvent) -> TimeEvent {\n\
+         \x20   value\n\
+         }\n\n\
+         pub fn get_far_future_timestamp() -> SystemTime {\n\
+         \x20   SystemTime::UNIX_EPOCH\n\
+         \x20       .checked_add(Duration::from_secs(8_640_000_000_001))\n\
+         \x20       .unwrap()\n\
+         }\n",
+    )
+    .unwrap();
+    let udl = core.join("src/napi_temporal_core.udl");
+    std::fs::write(
+        &udl,
+        r#"
+[Error]
+enum ChronologicalError {
+  "TimeOverflow",
+  "TimeDiffError",
+};
+
+dictionary TimeBundle {
+  timestamp start;
+  duration gap;
+  timestamp? maybe_end;
+  sequence<timestamp> checkpoints;
+  sequence<duration> segments;
+  TimeEvent event;
+};
+
+[Enum]
+interface TimeEvent {
+  Point(timestamp when);
+  Gap(duration gap);
+};
+
+namespace napi_temporal_core {
+  [Throws=ChronologicalError]
+  timestamp return_timestamp(timestamp a);
+  [Throws=ChronologicalError]
+  duration return_duration(duration a);
+  [Throws=ChronologicalError]
+  timestamp add(timestamp a, duration b);
+  [Throws=ChronologicalError]
+  duration diff(timestamp a, timestamp b);
+  boolean optional(timestamp? a, duration? b);
+  TimeBundle make_bundle(timestamp start, duration gap);
+  TimeBundle roundtrip_bundle(TimeBundle value);
+  TimeEvent roundtrip_event(TimeEvent value);
+  timestamp get_far_future_timestamp();
+};
+"#,
+    )
+    .unwrap();
+    (
+        Utf8PathBuf::from_path_buf(udl).unwrap(),
+        Utf8PathBuf::from_path_buf(core.join("Cargo.toml")).unwrap(),
+    )
+}
+
+fn generate_temporal_napi_host(root: &std::path::Path) -> Utf8PathBuf {
+    let (udl, manifest) = write_temporal_core_crate(root);
+    let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: udl,
+            out_dir,
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: manifest,
+                host_crates_dir: host_dir.clone(),
+            }),
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
+        },
+    )
+    .expect("temporal napi generator run should succeed");
+    host_dir
+}
+
+#[allow(dead_code)]
+fn build_temporal_napi_addon(
+    root: &std::path::Path,
+    generated: &Utf8PathBuf,
+    manifest: &Utf8PathBuf,
+) -> Utf8PathBuf {
+    let shim = root.join("temporal-napi-shim");
+    std::fs::create_dir_all(shim.join("src")).unwrap();
+    let uniffi_path = workspace_root().join("uniffi");
+    std::fs::write(
+        shim.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "napi-temporal-core-napi"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi_temporal_core = {{ path = {:?} }}
+uniffi = {{ path = {:?}, default-features = false }}
+napi = {{ version = "3.8.4", default-features = false, features = ["napi8", "tokio_rt"] }}
+napi-derive = {{ version = "3.5.3", features = ["type-def"] }}
+
+[build-dependencies]
+napi-build = "2.3.1"
+
+[workspace]
+"#,
+            manifest.parent().unwrap().as_str(),
+            uniffi_path.as_str()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        shim.join("build.rs"),
+        "extern crate napi_build;\nfn main() { napi_build::setup(); }\n",
+    )
+    .unwrap();
+    let bridge = std::fs::read_to_string(generated.join("node/napi_temporal_core.rs")).unwrap();
+    std::fs::write(shim.join("src/lib.rs"), bridge).unwrap();
+
+    let target_dir = root.join("cargo-target-temporal-napi");
+    let output = run_cargo_build(
+        &Utf8PathBuf::from_path_buf(shim.join("Cargo.toml")).unwrap(),
+        &[],
+        &target_dir,
+    )
+    .expect("cargo should be available for temporal napi build");
+    if !output.status.success() {
+        panic!(
+            "cargo build on temporal napi shim failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    let dylib = target_dir
+        .join("debug")
+        .join(cdylib_filename("napi-temporal-core-napi"));
+    assert!(
+        dylib.exists(),
+        "expected built cdylib at {}",
+        dylib.display()
+    );
+    let addon = generated.join("node/napi_temporal_core.node");
+    std::fs::copy(&dylib, &addon).unwrap();
+    addon
+}
+
 fn write_custom_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf, Utf8PathBuf) {
     let core = root.join("custom-core");
     std::fs::create_dir_all(core.join("src")).unwrap();
@@ -3325,7 +3548,11 @@ export function emailAddressToString(value: EmailAddress): string {
     (out_dir, manifest)
 }
 
-fn build_custom_napi_addon(root: &std::path::Path, generated: &Utf8PathBuf, manifest: &Utf8PathBuf) -> Utf8PathBuf {
+fn build_custom_napi_addon(
+    root: &std::path::Path,
+    generated: &Utf8PathBuf,
+    manifest: &Utf8PathBuf,
+) -> Utf8PathBuf {
     let shim = root.join("custom-napi-shim");
     std::fs::create_dir_all(shim.join("src")).unwrap();
     let uniffi_path = workspace_root().join("uniffi");
@@ -3381,7 +3608,11 @@ napi-build = "2.3.1"
     let dylib = target_dir
         .join("debug")
         .join(cdylib_filename("custom_js_core_napi"));
-    assert!(dylib.exists(), "expected built cdylib at {}", dylib.display());
+    assert!(
+        dylib.exists(),
+        "expected built cdylib at {}",
+        dylib.display()
+    );
     let addon = generated.join("node/custom_js_core.node");
     std::fs::copy(&dylib, &addon).unwrap();
     addon
@@ -3398,7 +3629,9 @@ fn custom_types_emit_public_contract() {
         "custom-types.ts should emit configured type import:\n{custom_types}"
     );
     assert!(
-        custom_types.contains("import { emailAddressFromString, emailAddressToString } from \"./email.ts\";"),
+        custom_types.contains(
+            "import { emailAddressFromString, emailAddressToString } from \"./email.ts\";"
+        ),
         "custom-types.ts should emit configured value import:\n{custom_types}"
     );
     assert!(
@@ -3494,6 +3727,260 @@ console.log("ok");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("ok"),
         "custom node adapter driver did not print ok"
+    );
+}
+
+#[test]
+fn host_crates_napi_compiles_temporal_fixture() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host_dir = generate_temporal_napi_host(tmp.path());
+
+    let bridge = std::fs::read_to_string(
+        Utf8PathBuf::from_path_buf(tmp.path().join("generated/node/napi_temporal_core.rs"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        bridge.contains("__UniffiTimestamp") && bridge.contains("__UniffiDuration"),
+        "temporal napi bridge should emit explicit wrappers, got:\n{bridge}"
+    );
+    assert!(
+        !bridge.contains("timestamp/duration are not supported"),
+        "temporal napi bridge must not reject timestamp/duration anymore:\n{bridge}"
+    );
+
+    let manifest = host_dir.join("napi/Cargo.toml");
+    let target_dir = tmp.path().join("cargo-target-temporal-napi-check");
+    let output = match run_cargo_check(&manifest, &[], &target_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP host_crates_napi_compiles_temporal_fixture: cargo unavailable: {e}");
+            return;
+        }
+    };
+    if !output.status.success() {
+        panic!(
+            "cargo check on temporal napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let electron_preload =
+        std::fs::read_to_string(tmp.path().join("generated/electron/preload.cjs")).unwrap();
+    assert!(
+        !electron_preload.contains("unsupported"),
+        "electron preload should remain on the supported temporal path:\n{electron_preload}"
+    );
+}
+
+#[test]
+fn generated_node_adapter_runs_temporal_fixture() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP generated_node_adapter_runs_temporal_fixture: node 22.6+ unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host_dir = generate_temporal_napi_host(tmp.path());
+    let manifest = host_dir.join("napi/Cargo.toml");
+    let target_dir = tmp.path().join("cargo-target-temporal-napi-runtime");
+    let output = match run_cargo_build(&manifest, &[], &target_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP generated_node_adapter_runs_temporal_fixture: cargo unavailable: {e}");
+            return;
+        }
+    };
+    if !output.status.success() {
+        panic!(
+            "cargo build on temporal napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let lib_name = cdylib_filename("napi-temporal-core-napi");
+    let built_lib = target_dir.join("debug").join(lib_name);
+    assert!(
+        built_lib.exists(),
+        "expected built cdylib at {}",
+        built_lib.display()
+    );
+
+    let generated = tmp.path().join("generated");
+    let node_addon = generated.join("node/napi_temporal_core.node");
+    std::fs::copy(&built_lib, &node_addon).unwrap();
+
+    let electron_dir = generated.join("electron");
+    let electron_addon = electron_dir.join("napi_temporal_core.node");
+    std::fs::copy(&built_lib, &electron_addon).unwrap();
+
+    let electron_stub = electron_dir.join("node_modules/electron");
+    std::fs::create_dir_all(&electron_stub).unwrap();
+    std::fs::write(
+        electron_stub.join("index.js"),
+        r#"const state = { api: null };
+exports.contextBridge = {
+  exposeInMainWorld(name, value) {
+    globalThis[name] = value;
+    state.api = value;
+  },
+};
+exports.__state = state;
+"#,
+    )
+    .unwrap();
+
+    let driver = generated.join("temporal-driver.ts");
+    std::fs::write(
+        &driver,
+        r#"
+import {
+    returnTimestamp,
+    returnDuration,
+    add,
+    diff,
+    optional,
+    makeBundle,
+    roundtripBundle,
+    roundtripEvent,
+    getFarFutureTimestamp,
+} from "./node/index.ts";
+import { UniffiError } from "./common/runtime.ts";
+
+const ts = new Date("2024-01-02T03:04:05.283Z");
+const tsRound = returnTimestamp(ts);
+if (!(tsRound instanceof Date) || tsRound.getTime() !== ts.getTime()) {
+    throw new Error(`timestamp round-trip failed: ${tsRound}`);
+}
+
+const dur = 1500.5;
+const durRound = returnDuration(dur);
+if (durRound !== dur) {
+    throw new Error(`duration round-trip failed: ${durRound}`);
+}
+
+const added = add(new Date(1000), 2000);
+if (!(added instanceof Date) || added.getTime() !== 3000) {
+    throw new Error(`timestamp + duration failed: ${added}`);
+}
+
+const delta = diff(new Date(3000), new Date(1000));
+if (delta !== 2000) {
+    throw new Error(`timestamp - timestamp failed: ${delta}`);
+}
+
+if (!optional(ts, dur)) throw new Error("optional(Some, Some) should be true");
+if (optional(null, dur)) throw new Error("optional(None, Some) should be false");
+if (optional(ts, null)) throw new Error("optional(Some, None) should be false");
+
+const bundle = makeBundle(ts, dur);
+if (!(bundle.start instanceof Date) || bundle.start.getTime() !== ts.getTime()) {
+    throw new Error(`bundle.start failed: ${bundle.start}`);
+}
+if (bundle.maybe_end != null) {
+    throw new Error(`bundle.maybe_end should be nullish: ${bundle.maybe_end}`);
+}
+if (!(bundle.checkpoints[0] instanceof Date) || bundle.checkpoints[0].getTime() !== ts.getTime()) {
+    throw new Error(`bundle.checkpoints failed: ${bundle.checkpoints[0]}`);
+}
+if (bundle.segments[0] !== dur) {
+    throw new Error(`bundle.segments failed: ${bundle.segments[0]}`);
+}
+if (bundle.event.tag !== "Gap" || bundle.event.gap !== dur) {
+    throw new Error(`bundle.event failed: ${JSON.stringify(bundle.event)}`);
+}
+
+const bundleRound = roundtripBundle(bundle);
+if (bundleRound.event.tag !== "Gap" || bundleRound.event.gap !== dur) {
+    throw new Error(`bundle round-trip failed: ${JSON.stringify(bundleRound)}`);
+}
+if (bundleRound.checkpoints.length !== 1 || bundleRound.checkpoints[0].getTime() !== ts.getTime()) {
+    throw new Error(`bundle checkpoints round-trip failed: ${JSON.stringify(bundleRound.checkpoints)}`);
+}
+
+const eventRound = roundtripEvent({ tag: "Point", when: ts });
+if (eventRound.tag !== "Point" || !(eventRound.when instanceof Date) || eventRound.when.getTime() !== ts.getTime()) {
+    throw new Error(`enum payload round-trip failed: ${JSON.stringify(eventRound)}`);
+}
+
+let threw = false;
+try {
+    returnDuration(-1);
+} catch (e) {
+    threw = true;
+    if (!(e instanceof UniffiError)) {
+        throw new Error(`bad duration threw wrong type: ${e && (e as Error).message}`);
+    }
+    if (!/duration.*non-negative/i.test((e as Error).message)) {
+        throw new Error(`bad duration message: ${(e as Error).message}`);
+    }
+}
+if (!threw) throw new Error("returnDuration(-1) should throw");
+
+threw = false;
+try {
+    returnDuration(Number.POSITIVE_INFINITY);
+} catch (e) {
+    threw = true;
+    if (!(e instanceof UniffiError)) {
+        throw new Error(`non-finite duration threw wrong type: ${e && (e as Error).message}`);
+    }
+}
+if (!threw) throw new Error("returnDuration(Infinity) should throw");
+
+threw = false;
+try {
+    returnTimestamp(new Date(8.64e15 + 1));
+} catch (e) {
+    threw = true;
+    if (!(e instanceof UniffiError)) {
+        throw new Error(`bad timestamp threw wrong type: ${e && (e as Error).message}`);
+    }
+    const message = (e as Error).message;
+    if (!/invalid Date|timestamp exceeds JS Date range/i.test(message)) {
+        throw new Error(`bad timestamp message: ${message}`);
+    }
+}
+if (!threw) throw new Error("returnTimestamp(out of range) should throw");
+
+threw = false;
+try {
+    getFarFutureTimestamp();
+} catch (e) {
+    threw = true;
+    if (!(e instanceof UniffiError)) {
+        throw new Error(`far future threw wrong type: ${e && (e as Error).message}`);
+    }
+    if (!(e as Error).message.includes("timestamp exceeds JS Date range")) {
+        throw new Error(`far future message: ${(e as Error).message}`);
+    }
+}
+if (!threw) throw new Error("getFarFutureTimestamp() should throw");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(&generated)
+        .output()
+        .expect("failed to invoke node for temporal driver");
+    if !output.status.success() {
+        panic!(
+            "temporal node adapter driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "temporal node adapter driver did not print ok"
     );
 }
 
