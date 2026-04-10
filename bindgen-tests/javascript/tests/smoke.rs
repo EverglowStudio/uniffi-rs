@@ -118,23 +118,23 @@ fn emits_real_tree_for_all_flavors() {
         "common/api.ts should lower u64 args via toU64, got:\n{api}"
     );
 
-    // node/electron must emit the targeted bigint compatibility layer
-    // for the current napi addon surface.
+    // The raw napi addon surface is bigint-native, so node/electron
+    // adapters must not carry the old safe-integer compatibility layer.
     let napi_backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
     assert!(
-        napi_backend.contains("__uniffiInt64ArgKinds")
-            && napi_backend.contains("__uniffiInt64ReturnKinds")
-            && napi_backend.contains("__uniffiLowerInt64ForNapi")
-            && napi_backend.contains("__uniffiLiftInt64FromNapi"),
-        "node/backend-napi.ts must carry the bigint compat maps/helpers"
+        !napi_backend.contains("__uniffiInt64ArgKinds")
+            && !napi_backend.contains("__uniffiInt64ReturnKinds")
+            && !napi_backend.contains("__uniffiLowerInt64ForNapi")
+            && !napi_backend.contains("__uniffiLiftInt64FromNapi"),
+        "node/backend-napi.ts must not carry the old int64 compat layer"
     );
     let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
     assert!(
-        preload.contains("__uniffiInt64ArgKinds")
-            && preload.contains("__uniffiInt64ReturnKinds")
-            && preload.contains("__uniffiLowerInt64ForNapi")
-            && preload.contains("__uniffiLiftInt64FromNapi"),
-        "electron/preload.cjs must carry the bigint compat maps/helpers"
+        !preload.contains("__uniffiInt64ArgKinds")
+            && !preload.contains("__uniffiInt64ReturnKinds")
+            && !preload.contains("__uniffiLowerInt64ForNapi")
+            && !preload.contains("__uniffiLiftInt64FromNapi"),
+        "electron/preload.cjs must not carry the old int64 compat layer"
     );
 
     let errors = std::fs::read_to_string(out_dir.join("common/errors.ts")).unwrap();
@@ -1732,7 +1732,7 @@ crate-type = ["rlib"]
 }
 
 #[test]
-fn napi_electron_emit_int64_compat_maps() {
+fn napi_electron_do_not_emit_int64_compat_maps() {
     let tmp = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
     let biz = root.join("biz");
@@ -1789,13 +1789,10 @@ crate-type = ["rlib"]
         "__uniffiInt64ReturnKinds",
         "__uniffiLowerInt64ForNapi",
         "__uniffiLiftInt64FromNapi",
-        "\"counter_with_initial\": [\"i64\"]",
-        "\"counter_get\": \"i64\"",
-        "\"slow_add\": [null, null, \"u64\"]",
     ] {
         assert!(
-            backend_napi.contains(needle),
-            "node/backend-napi.ts missing `{needle}`:\n{backend_napi}"
+            !backend_napi.contains(needle),
+            "node/backend-napi.ts must not carry `{needle}`:\n{backend_napi}"
         );
     }
 
@@ -1805,15 +1802,125 @@ crate-type = ["rlib"]
         "__uniffiInt64ReturnKinds",
         "__uniffiLowerInt64ForNapi",
         "__uniffiLiftInt64FromNapi",
-        "\"counter_with_initial\": [\"i64\"]",
-        "\"counter_get\": \"i64\"",
-        "\"slow_add\": [null, null, \"u64\"]",
     ] {
         assert!(
-            preload.contains(needle),
-            "electron/preload.cjs missing `{needle}`:\n{preload}"
+            !preload.contains(needle),
+            "electron/preload.cjs must not carry `{needle}`:\n{preload}"
         );
     }
+}
+
+#[test]
+fn host_crates_napi_raw_addon_is_bigint_native() {
+    let Some(node) = which_node() else {
+        eprintln!("SKIP host_crates_napi_raw_addon_is_bigint_native: node unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host_dir = generate_rich_napi_host(tmp.path());
+    let manifest = host_dir.join("napi/Cargo.toml");
+    let target_dir = tmp.path().join("cargo-target-napi-raw");
+    let output = match run_cargo_build(&manifest, &[], &target_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP host_crates_napi_raw_addon_is_bigint_native: cargo unavailable: {e}");
+            return;
+        }
+    };
+    if !output.status.success() {
+        panic!(
+            "cargo build for raw napi addon failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let dylib = target_dir
+        .join("debug")
+        .join(cdylib_filename("napi-compat-core-napi"));
+    assert!(dylib.exists(), "expected raw cdylib at {}", dylib.display());
+    let addon = tmp.path().join("napi_compat.node");
+    std::fs::copy(&dylib, &addon).unwrap();
+
+    let driver = tmp.path().join("raw-addon-bigint.cjs");
+    std::fs::write(
+        &driver,
+        format!(
+            r#"
+const addon = require({addon:?});
+
+function expectBigint(label, value) {{
+  if (typeof value !== "bigint") {{
+    throw new Error(`${{label}}: expected bigint, got ${{typeof value}}`);
+  }}
+  return value;
+}}
+
+function expectThrow(label, fn_) {{
+  let threw = false;
+  try {{
+    fn_();
+  }} catch (e) {{
+    threw = true;
+    const msg = String((e && e.message) || e);
+    if (!/fit into|cannot be converted|BigInt value/i.test(msg)) {{
+      throw new Error(`${{label}}: unexpected error ${{msg}}`);
+    }}
+  }}
+  if (!threw) {{
+    throw new Error(`${{label}}: expected throw`);
+  }}
+}}
+
+const u64Max = 18446744073709551615n;
+const i64Min = -9223372036854775808n;
+const i64Max = 9223372036854775807n;
+
+if (expectBigint("roundtripU64", addon.roundtripU64(u64Max)) !== u64Max) {{
+  throw new Error("roundtripU64 failed");
+}}
+if (expectBigint("roundtripI64(min)", addon.roundtripI64(i64Min)) !== i64Min) {{
+  throw new Error("roundtripI64(min) failed");
+}}
+if (expectBigint("roundtripI64(max)", addon.roundtripI64(i64Max)) !== i64Max) {{
+  throw new Error("roundtripI64(max) failed");
+}}
+if (expectBigint("addU64", addon.addU64(9007199254740993n, 2n)) !== 9007199254740995n) {{
+  throw new Error("addU64 above safe integer failed");
+}}
+
+expectThrow("u64 overflow", () => addon.roundtripU64(18446744073709551616n));
+expectThrow("i64 overflow", () => addon.roundtripI64(9223372036854775808n));
+
+Promise.resolve(addon.asyncRoundtripU64(u64Max)).then((value) => {{
+  if (expectBigint("asyncRoundtripU64", value) !== u64Max) {{
+    throw new Error("asyncRoundtripU64 failed");
+  }}
+  console.log("ok");
+}}, (err) => {{
+  throw err;
+}});
+"#,
+            addon = addon.display().to_string(),
+        ),
+    )
+    .unwrap();
+    let output = Command::new(&node)
+        .arg(driver.as_path())
+        .output()
+        .expect("failed to run raw addon bigint driver");
+    if !output.status.success() {
+        panic!(
+            "raw addon bigint driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "raw addon bigint driver did not print ok"
+    );
 }
 
 #[test]
@@ -1833,7 +1940,7 @@ fn electron_preload_is_syntactically_valid_js() {
     let preload = out_dir.join("electron/preload.cjs");
     let output = Command::new(&node)
         .arg("--check")
-        .arg(preload.as_std_path())
+        .arg(preload.as_path())
         .output()
         .expect("failed to invoke node --check");
     if !output.status.success() {
@@ -1860,7 +1967,7 @@ fn napi_electron_translate_enum_tag_to_type() {
         "__uniffiLowerShape",
         "__uniffiLiftShape",
         "__uniffiIsPlainObject",
-        "args.map((a, i) =>",
+        "args.map((a) =>",
     ] {
         assert!(
             backend_napi.contains(needle),
@@ -1877,10 +1984,8 @@ fn napi_electron_translate_enum_tag_to_type() {
         "__uniffiLowerShape",
         "__uniffiLiftShape",
         "__uniffiIsPlainObject",
-        "__uniffiLowerInt64ForNapi",
-        "__uniffiLiftInt64FromNapi",
-        "__uniffiLowerShape(__uniffiLowerInt64ForNapi(resolveArg(a), argKinds[i] || null))",
-        "wrapResult(__uniffiLiftInt64FromNapi(__uniffiLiftShape(raw), retKind))",
+        "__uniffiLowerShape(resolveArg(a))",
+        "wrapResult(__uniffiLiftShape(raw))",
         "serializeError(__uniffiLiftShape(error))",
     ] {
         assert!(
@@ -1967,7 +2072,7 @@ console.log("ok");
     )
     .unwrap();
     let output = Command::new(&node)
-        .arg(driver.as_std_path())
+        .arg(driver.as_path())
         .output()
         .expect("failed to run enum-shape driver");
     if !output.status.success() {
@@ -2003,7 +2108,7 @@ fn electron_wrap_result_does_not_wrap_arrays_or_plain_values() {
     for needle in [
         "Array.isArray(value)",
         "ArrayBuffer.isView(value)",
-        "Object.getPrototypeOf(value)",
+        "__uniffiIsHostPlainObject(value)",
     ] {
         assert!(
             preload.contains(needle),
@@ -2120,7 +2225,7 @@ console.log("ok");
     )
     .unwrap();
     let output = Command::new(&node)
-        .arg(driver.as_std_path())
+        .arg(driver.as_path())
         .output()
         .expect("failed to run wrapResult driver");
     if !output.status.success() {
@@ -2305,6 +2410,30 @@ fn run_cargo_check(
         .env("CARGO_TARGET_DIR", target_dir)
         .env_remove("RUSTFLAGS");
     cmd.output()
+}
+
+fn run_cargo_build(
+    manifest: &Utf8PathBuf,
+    extra: &[&str],
+    target_dir: &std::path::Path,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "--manifest-path"])
+        .arg(manifest.as_std_path())
+        .args(extra)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env_remove("RUSTFLAGS");
+    cmd.output()
+}
+
+fn cdylib_filename(package_name: &str) -> String {
+    let base = package_name.replace('-', "_");
+    let ext = std::env::consts::DLL_EXTENSION;
+    if cfg!(target_os = "windows") {
+        format!("{base}.{ext}")
+    } else {
+        format!("lib{base}.{ext}")
+    }
 }
 
 #[test]
@@ -2593,11 +2722,15 @@ fn cli_build_wasm_orchestrates_arithmetic_fixture() {
         .map(|e| e.path())
         .collect::<Vec<_>>();
     assert!(
-        pkg_entries.iter().any(|p| p.extension().and_then(|e| e.to_str()) == Some("js")),
+        pkg_entries
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("js")),
         "wasm-bindgen output dir should contain a .js glue file: {pkg_entries:?}"
     );
     assert!(
-        pkg_entries.iter().any(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm")),
+        pkg_entries
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm")),
         "wasm-bindgen output dir should contain a .wasm artifact: {pkg_entries:?}"
     );
 }
@@ -2706,6 +2839,9 @@ fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
          pub fn current_job_state() -> JobState { JobState::Idle }\n\
          pub fn latest_event() -> Event { Event::Started }\n\
          pub async fn slow_add(a: u32, b: u32) -> u32 { a + b }\n\
+         pub fn roundtrip_u64(a: u64) -> u64 { a }\n\
+         pub fn roundtrip_i64(a: i64) -> i64 { a }\n\
+         pub async fn async_roundtrip_u64(a: u64) -> u64 { a }\n\
          pub fn add_u64(a: u64, b: u64) -> u64 { a.wrapping_add(b) }\n\
          pub fn negate_i64(a: i64) -> i64 { a.wrapping_neg() }\n",
     )
@@ -2727,6 +2863,10 @@ fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
          \x20   Event latest_event();\n\
          \x20   [Async]\n\
          \x20   u32 slow_add(u32 a, u32 b);\n\
+         \x20   u64 roundtrip_u64(u64 a);\n\
+         \x20   i64 roundtrip_i64(i64 a);\n\
+         \x20   [Async]\n\
+         \x20   u64 async_roundtrip_u64(u64 a);\n\
          \x20   u64 add_u64(u64 a, u64 b);\n\
          \x20   i64 negate_i64(i64 a);\n\
          };\n",
@@ -2756,7 +2896,7 @@ fn generate_rich_napi_host(root: &std::path::Path) -> Utf8PathBuf {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
             }),
-            flavors: vec![FlavorTarget::Napi],
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
     )
     .expect("rich napi generator run should succeed");
@@ -2813,6 +2953,148 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+}
+
+#[test]
+fn host_crates_napi_runs_bigint_fixture() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP host_crates_napi_runs_bigint_fixture: node 22.6+ unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host_dir = generate_rich_napi_host(tmp.path());
+    let manifest = host_dir.join("napi/Cargo.toml");
+    let target_dir = tmp.path().join("cargo-target-napi-runtime");
+    let output = match run_cargo_build(&manifest, &[], &target_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP host_crates_napi_runs_bigint_fixture: cargo unavailable: {e}");
+            return;
+        }
+    };
+    if !output.status.success() {
+        panic!(
+            "cargo build on rich napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let lib_name = cdylib_filename("napi-compat-core-napi");
+    let built_lib = target_dir.join("debug").join(lib_name);
+    assert!(
+        built_lib.exists(),
+        "expected built cdylib at {}",
+        built_lib.display()
+    );
+
+    let generated = tmp.path().join("generated");
+    let node_addon = generated.join("node/napi_compat.node");
+    std::fs::copy(&built_lib, &node_addon).unwrap();
+
+    let electron_dir = generated.join("electron");
+    let electron_addon = electron_dir.join("napi_compat.node");
+    std::fs::copy(&built_lib, &electron_addon).unwrap();
+    let electron_stub = electron_dir.join("node_modules/electron");
+    std::fs::create_dir_all(&electron_stub).unwrap();
+    std::fs::write(
+        electron_stub.join("index.js"),
+        r#"const state = { api: null };
+exports.contextBridge = {
+  exposeInMainWorld(name, value) {
+    globalThis[name] = value;
+    state.api = value;
+  },
+};
+exports.__state = state;
+"#,
+    )
+    .unwrap();
+
+    let driver = generated.join("bigint-driver.ts");
+    std::fs::write(
+        &driver,
+        r#"
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const raw = require("./node/napi_compat.node");
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+function expectBigint(value: unknown, expected: bigint, label: string): void {
+  assert(typeof value === "bigint", `${label}: expected bigint, got ${typeof value}`);
+  assert(value === expected, `${label}: expected ${expected}, got ${String(value)}`);
+}
+
+function expectThrow(label: string, fn: () => unknown, re: RegExp): void {
+  try {
+    fn();
+    throw new Error(`${label}: expected throw`);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (!re.test(message)) {
+      throw new Error(`${label}: unexpected error ${message}`);
+    }
+  }
+}
+
+expectBigint(raw.roundtripU64(18446744073709551615n), 18446744073709551615n, "raw roundtripU64");
+expectBigint(raw.roundtripI64(9223372036854775807n), 9223372036854775807n, "raw roundtripI64 max");
+expectBigint(raw.roundtripI64(-9223372036854775808n), -9223372036854775808n, "raw roundtripI64 min");
+expectBigint(await raw.asyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "raw asyncRoundtripU64");
+expectThrow("raw u64 overflow", () => raw.roundtripU64(18446744073709551616n), /u64/i);
+expectThrow("raw i64 overflow", () => raw.roundtripI64(9223372036854775808n), /i64/i);
+expectThrow("raw i64 underflow", () => raw.roundtripI64(-9223372036854775809n), /i64/i);
+
+const nodeApi = await import("./node/index.ts");
+expectBigint(nodeApi.roundtripU64(18446744073709551615n), 18446744073709551615n, "node api roundtripU64");
+expectBigint(nodeApi.roundtripI64(-9223372036854775808n), -9223372036854775808n, "node api roundtripI64");
+expectBigint(await nodeApi.asyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "node api asyncRoundtripU64");
+
+require("./electron/preload.cjs");
+const bridge = (globalThis as any).__uniffi__;
+assert(bridge && typeof bridge.dispatchSync === "function", "electron preload bridge");
+let res = bridge.dispatchSync({ kind: "call", id: 1, method: "roundtrip_u64", args: [18446744073709551615n] });
+assert(res.kind === "ok", `electron sync response kind ${res.kind}`);
+expectBigint(res.value, 18446744073709551615n, "electron sync roundtripU64");
+res = bridge.dispatchSync({ kind: "call", id: 2, method: "roundtrip_i64", args: [-9223372036854775808n] });
+assert(res.kind === "ok", `electron sync i64 response kind ${res.kind}`);
+expectBigint(res.value, -9223372036854775808n, "electron sync roundtripI64");
+const asyncRes = await bridge.dispatchAsync({ kind: "call", id: 3, method: "async_roundtrip_u64", args: [18446744073709551615n] });
+assert(asyncRes.kind === "ok", `electron async response kind ${asyncRes.kind}`);
+expectBigint(asyncRes.value, 18446744073709551615n, "electron async roundtripU64");
+const overflowRes = bridge.dispatchSync({ kind: "call", id: 4, method: "roundtrip_u64", args: [18446744073709551616n] });
+assert(overflowRes.kind === "err", "electron overflow should error");
+assert(/u64/i.test(String(overflowRes.error?.message ?? "")), "electron overflow message");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(&generated)
+        .output()
+        .expect("failed to run bigint driver");
+    if !output.status.success() {
+        panic!(
+            "bigint driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "bigint driver did not print ok:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 // ---------------------------------------------------------------------

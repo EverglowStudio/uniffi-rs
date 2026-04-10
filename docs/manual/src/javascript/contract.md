@@ -87,6 +87,9 @@ export function <name>(<args>): Promise<<ReturnType>>; // async
 - Return values are lifted back to natural frontend types.
 - `i64` / `u64` are returned as `bigint`; they must not be narrowed via
   `Number()`.
+- The generated Node/Electron adapters no longer carry a safe-integer
+  compatibility shim for 64-bit integers; the raw generated N-API addon
+  surface is bigint-native as well.
 - Errors are surfaced as `UniffiError` instances.
 
 ## Records
