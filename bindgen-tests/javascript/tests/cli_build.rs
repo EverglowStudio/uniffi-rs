@@ -155,6 +155,11 @@ pub struct Point {
 
 #[uniffi::export]
 impl Point {
+    #[uniffi::constructor]
+    pub fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+
     pub fn distance_to(&self, other: &Point) -> f64 {
         let dx = self.x - other.x;
         let dy = self.y - other.y;
@@ -179,6 +184,11 @@ pub enum Direction {
 
 #[uniffi::export]
 impl Direction {
+    #[uniffi::constructor]
+    pub fn south() -> Self {
+        Self::South
+    }
+
     pub fn opposite(&self) -> Direction {
         match self {
             Direction::North => Direction::South,
@@ -197,6 +207,11 @@ pub enum Shape {
 
 #[uniffi::export]
 impl Shape {
+    #[uniffi::constructor]
+    pub fn circle(radius: f64) -> Self {
+        Self::Circle { radius }
+    }
+
     pub fn area(&self) -> f64 {
         match self {
             Shape::Circle { radius } => std::f64::consts::PI * radius * radius,
@@ -377,16 +392,19 @@ fn cli_build_runs_value_type_methods() {
     let records = std::fs::read_to_string(out_dir.join("common/records.ts")).unwrap();
     assert!(
         records.contains("export const Point = Object.freeze")
+            && records.contains("new(x: number, y: number): Point")
             && records.contains("distanceTo(self_: Point")
             && records.contains("scale(self_: Point"),
-        "records.ts should expose static value methods:\n{records}"
+        "records.ts should expose static value constructors and methods:\n{records}"
     );
     let enums = std::fs::read_to_string(out_dir.join("common/enums.ts")).unwrap();
     assert!(
-        enums.contains("opposite(self_: Direction")
+        enums.contains("south(): Direction")
+            && enums.contains("opposite(self_: Direction")
+            && enums.contains("circle(radius: number): Shape")
             && enums.contains("area(self_: Shape")
             && !enums.contains("keyof typeof Direction"),
-        "enums.ts should expose value methods without widening flat enum type to method values:\n{enums}"
+        "enums.ts should expose value constructors/methods without widening flat enum type to helpers:\n{enums}"
     );
 
     let driver = tmp.path().join("value-method-driver.ts");
@@ -400,15 +418,16 @@ function assert(cond: boolean, label: string): void {
 }
 
 const origin = { x: 0, y: 0 };
-const point = { x: 3, y: 4 };
+const point = Point.new(3, 4);
 assert(Point.distanceTo(point, origin) === 5, "Point.distanceTo");
 
 const scaled = Point.scale(point, 2);
 assert(scaled.x === 6 && scaled.y === 8, `Point.scale ${JSON.stringify(scaled)}`);
 
 assert(Direction.opposite(Direction.North) === Direction.South, "Direction.opposite");
+assert(Direction.south() === Direction.South, "Direction.south");
 
-const circle = { tag: "Circle", radius: 1 };
+const circle = Shape.circle(1);
 assert(Math.abs(Shape.area(circle) - Math.PI) < 0.000001, "Shape.area circle");
 const rect = { tag: "Rectangle", width: 3, height: 4 };
 assert(Shape.area(rect) === 12, "Shape.area rectangle");

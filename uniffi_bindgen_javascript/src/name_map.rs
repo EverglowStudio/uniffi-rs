@@ -62,10 +62,14 @@ pub fn collect(ci: &ComponentInterface) -> Vec<(String, String)> {
         pairs.push((key.clone(), snake_to_camel(&key)));
     }
 
-    // Value-type methods — `api_module/mod.rs` emits
+    // Value-type constructors/methods — `api_module/mod.rs` emits
     // `{type_snake}_{member_snake}`.
     for record in ci.record_definitions() {
         let record_snake = record.name().to_snake_case();
+        for c in record.constructors() {
+            let key = format!("{record_snake}_{}", c.name().to_snake_case());
+            pairs.push((key.clone(), snake_to_camel(&key)));
+        }
         for m in record.methods() {
             let key = format!("{record_snake}_{}", m.name().to_snake_case());
             pairs.push((key.clone(), snake_to_camel(&key)));
@@ -76,6 +80,10 @@ pub fn collect(ci: &ComponentInterface) -> Vec<(String, String)> {
             continue;
         }
         let enum_snake = enum_.name().to_snake_case();
+        for c in enum_.constructors() {
+            let key = format!("{enum_snake}_{}", c.name().to_snake_case());
+            pairs.push((key.clone(), snake_to_camel(&key)));
+        }
         for m in enum_.methods() {
             let key = format!("{enum_snake}_{}", m.name().to_snake_case());
             pairs.push((key.clone(), snake_to_camel(&key)));

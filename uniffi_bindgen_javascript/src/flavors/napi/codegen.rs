@@ -203,13 +203,11 @@ impl<'a> Generator<'a> {
         }
 
         for record in self.ci.record_definitions() {
-            ensure!(
-                record.constructors().is_empty(),
-                "record `{}` constructors are not supported in the napi bridge yet",
-                record.name()
-            );
             for field in record.fields() {
                 self.ensure_type_supported(&field.as_type(), TypeUsage::Value, "record field")?;
+            }
+            for constructor in record.constructors() {
+                self.validate_callable(constructor, "record constructor")?;
             }
             for method in record.methods() {
                 ensure!(
@@ -223,15 +221,13 @@ impl<'a> Generator<'a> {
         }
 
         for enum_ in self.ci.enum_definitions() {
-            ensure!(
-                enum_.constructors().is_empty(),
-                "enum `{}` constructors are not supported in the napi bridge yet",
-                enum_.name()
-            );
             for variant in enum_.variants() {
                 for field in variant.fields() {
                     self.ensure_type_supported(&field.as_type(), TypeUsage::Value, "enum field")?;
                 }
+            }
+            for constructor in enum_.constructors() {
+                self.validate_callable(constructor, "enum constructor")?;
             }
             for method in enum_.methods() {
                 ensure!(
@@ -404,6 +400,13 @@ impl<'a> Generator<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
         let core_path = self.core_type_path(record.as_type());
+        let constructors = record
+            .constructors()
+            .into_iter()
+            .map(|constructor| {
+                self.render_value_constructor(record.name(), &record.as_type(), constructor)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let methods = record
             .methods()
             .into_iter()
@@ -433,6 +436,7 @@ impl<'a> Generator<'a> {
                 }
             }
 
+            #(#constructors)*
             #(#methods)*
         })
     }
@@ -461,6 +465,13 @@ impl<'a> Generator<'a> {
             .map(|variant| self.render_from_core_variant(enum_, variant))
             .collect::<Result<Vec<_>>>()?;
         let core_path = self.core_type_path(enum_.as_type());
+        let constructors = enum_
+            .constructors()
+            .into_iter()
+            .map(|constructor| {
+                self.render_value_constructor(enum_.name(), &enum_.as_type(), constructor)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let methods = enum_
             .methods()
             .into_iter()
@@ -501,6 +512,7 @@ impl<'a> Generator<'a> {
                 }
             }
 
+            #(#constructors)*
             #(#methods)*
         })
     }
@@ -964,6 +976,77 @@ impl<'a> Generator<'a> {
             Ok(quote! {
                 #[napi]
                 pub fn #fn_ident(#self_ident: #self_bridge_ty, #(#args),*) -> Result<#output_ty> {
+                    #body
+                }
+            })
+        }
+    }
+
+    fn render_value_constructor(
+        &self,
+        owner_name: &str,
+        owner_ty: &Type,
+        constructor: &Constructor,
+    ) -> Result<TokenStream> {
+        let function_name = format!(
+            "{}_{}",
+            owner_name.to_snake_case(),
+            constructor.name().to_snake_case()
+        );
+        let fn_ident = rust_ident(&function_name);
+        let output_ty = self.bridge_return_type(owner_ty)?;
+        let core_path = self.core_type_path(owner_ty.clone());
+        let args = constructor
+            .arguments()
+            .into_iter()
+            .map(|arg| self.render_signature_arg(arg))
+            .collect::<Result<Vec<_>>>()?;
+        let lowered_arg_bindings = constructor
+            .arguments()
+            .into_iter()
+            .map(|arg| {
+                let arg_ident = rust_ident(arg.name());
+                let local_ident = rust_ident(&format!("__arg_{}", arg.name()));
+                let lowered = self.lower_arg_expr(arg_ident, &arg.as_type())?;
+                Ok(quote!(let #local_ident = #lowered;))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let call_args = constructor
+            .arguments()
+            .into_iter()
+            .map(|arg| {
+                let local_ident = rust_ident(&format!("__arg_{}", arg.name()));
+                if arg.by_ref() || matches!(arg.as_type(), Type::Record { .. } | Type::Enum { .. })
+                {
+                    quote!(&#local_ident)
+                } else {
+                    quote!(#local_ident)
+                }
+            })
+            .collect::<Vec<_>>();
+        let core_fn_ident = rust_ident(constructor.name());
+        let call = quote!({
+            #(#lowered_arg_bindings)*
+            #core_path::#core_fn_ident(#(#call_args),*)
+        });
+        let call = if constructor.is_async() {
+            quote!(#call.await)
+        } else {
+            call
+        };
+        let body = self.render_result_body(call, Some(owner_ty), constructor.throws_type())?;
+
+        if constructor.is_async() {
+            Ok(quote! {
+                #[napi]
+                pub async fn #fn_ident(#(#args),*) -> Result<#output_ty> {
+                    #body
+                }
+            })
+        } else {
+            Ok(quote! {
+                #[napi]
+                pub fn #fn_ident(#(#args),*) -> Result<#output_ty> {
                     #body
                 }
             })

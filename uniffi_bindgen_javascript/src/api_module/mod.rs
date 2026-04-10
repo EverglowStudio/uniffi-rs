@@ -31,7 +31,8 @@ use fs_err as fs;
 use heck::{ToLowerCamelCase, ToSnakeCase};
 use uniffi_bindgen::{
     interface::{
-        AsType, ComponentInterface, Enum, Function, Method, Object, ObjectImpl, Record, Type,
+        AsType, ComponentInterface, Constructor, Enum, Function, Method, Object, ObjectImpl,
+        Record, Type,
     },
     Component,
 };
@@ -80,6 +81,17 @@ fn render_records(ci: &ComponentInterface, config: &JsConfig) -> String {
         for field in record.fields() {
             usage.see(&field.as_type(), UsagePos::Arg, config);
         }
+        for constructor in record.constructors() {
+            if constructor.is_async() {
+                has_async = true;
+            } else {
+                has_sync = true;
+            }
+            for arg in constructor.arguments() {
+                usage.see(&arg.as_type(), UsagePos::Arg, config);
+            }
+            usage.see(&record.as_type(), UsagePos::Ret, config);
+        }
         for method in record.methods() {
             if method.is_async() {
                 has_async = true;
@@ -119,11 +131,20 @@ fn render_record(ci: &ComponentInterface, record: &Record, config: &JsConfig) ->
         ));
     }
     s.push_str("}\n");
-    if !record.methods().is_empty() {
+    if !record.constructors().is_empty() || !record.methods().is_empty() {
         s.push_str(&format!(
             "\nexport const {} = Object.freeze({{\n",
             record.name()
         ));
+        for constructor in record.constructors() {
+            s.push_str(&render_value_constructor(
+                ci,
+                record.name(),
+                &record.as_type(),
+                constructor,
+                config,
+            ));
+        }
         for method in record.methods() {
             s.push_str(&render_value_method(
                 ci,
@@ -156,6 +177,17 @@ fn render_enums(ci: &ComponentInterface, config: &JsConfig) -> String {
             for field in variant.fields() {
                 usage.see(&field.as_type(), UsagePos::Arg, config);
             }
+        }
+        for constructor in enum_.constructors() {
+            if constructor.is_async() {
+                has_async = true;
+            } else {
+                has_sync = true;
+            }
+            for arg in constructor.arguments() {
+                usage.see(&arg.as_type(), UsagePos::Arg, config);
+            }
+            usage.see(&enum_.as_type(), UsagePos::Ret, config);
         }
         for method in enum_.methods() {
             if method.is_async() {
@@ -254,6 +286,15 @@ fn render_enum(ci: &ComponentInterface, e: &Enum, config: &JsConfig) -> String {
         for v in e.variants() {
             s.push_str(&format!("    {name}: \"{name}\",\n", name = v.name()));
         }
+        for constructor in e.constructors() {
+            s.push_str(&render_value_constructor(
+                ci,
+                e.name(),
+                &e.as_type(),
+                constructor,
+                config,
+            ));
+        }
         for method in e.methods() {
             s.push_str(&render_value_method(
                 ci,
@@ -303,8 +344,17 @@ fn render_enum(ci: &ComponentInterface, e: &Enum, config: &JsConfig) -> String {
         }
     }
     let mut s = format!("export type {} =\n{};\n", e.name(), arms.join("\n"));
-    if !e.methods().is_empty() {
+    if !e.constructors().is_empty() || !e.methods().is_empty() {
         s.push_str(&format!("\nexport const {} = Object.freeze({{\n", e.name()));
+        for constructor in e.constructors() {
+            s.push_str(&render_value_constructor(
+                ci,
+                e.name(),
+                &e.as_type(),
+                constructor,
+                config,
+            ));
+        }
         for method in e.methods() {
             s.push_str(&render_value_method(
                 ci,
@@ -480,6 +530,47 @@ fn render_value_method(
         format!(
             "    {js_name}({decls}): void {{\n        \
              __call<void>(\"{fn_name}\", {pass});\n    }},\n"
+        )
+    }
+}
+
+fn render_value_constructor(
+    ci: &ComponentInterface,
+    owner_name: &str,
+    owner_ty: &Type,
+    constructor: &Constructor,
+    config: &JsConfig,
+) -> String {
+    let js_name = js_fn_name(constructor.name());
+    let fn_name = format!(
+        "{}_{}",
+        owner_name.to_snake_case(),
+        constructor.name().to_snake_case()
+    );
+    let (arg_decls, arg_pass) = lowered_args(
+        ci,
+        config,
+        constructor
+            .arguments()
+            .iter()
+            .map(|a| (a.name(), a.as_type())),
+    );
+    let ret_ts = ts_type(owner_ty, config);
+    let call_g = call_generic(Some(owner_ty));
+    let sep = if arg_pass.is_empty() { "" } else { ", " };
+    if constructor.is_async() {
+        format!(
+            "    async {js_name}({arg_decls}): Promise<{ret_ts}> {{\n        \
+             const __ret = await __callAsync<{call_g}>(\"{fn_name}\"{sep}{arg_pass});\n        \
+             return {lift} as {ret_ts};\n    }},\n",
+            lift = ts_lift_expr(ci, config, owner_ty, "__ret", 0),
+        )
+    } else {
+        format!(
+            "    {js_name}({arg_decls}): {ret_ts} {{\n        \
+             const __ret = __call<{call_g}>(\"{fn_name}\"{sep}{arg_pass});\n        \
+             return {lift} as {ret_ts};\n    }},\n",
+            lift = ts_lift_expr(ci, config, owner_ty, "__ret", 0),
         )
     }
 }
@@ -1366,7 +1457,7 @@ fn join_sorted(xs: &[String]) -> String {
 
 /// Emit a stable facade that re-exports public contract types and the
 /// small number of type values needed to access static helpers
-/// (record/enum methods, object constructors).
+/// (record/enum constructors/methods, object constructors).
 fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -1385,7 +1476,7 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
     let record_values: Vec<String> = ci
         .record_definitions()
         .iter()
-        .filter(|r| !r.methods().is_empty())
+        .filter(|r| !r.constructors().is_empty() || !r.methods().is_empty())
         .map(|r| r.name().to_string())
         .collect();
     if !record_values.is_empty() {
@@ -1399,7 +1490,7 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
     let records: Vec<String> = ci
         .record_definitions()
         .iter()
-        .filter(|r| r.methods().is_empty())
+        .filter(|r| r.constructors().is_empty() && r.methods().is_empty())
         .map(|r| r.name().to_string())
         .collect();
     if !records.is_empty() {
@@ -1416,7 +1507,7 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
         .enum_definitions()
         .iter()
         .filter(|e| !ci.is_name_used_as_error(e.name()))
-        .filter(|e| !e.methods().is_empty())
+        .filter(|e| !e.constructors().is_empty() || !e.methods().is_empty())
         .map(|e| e.name().to_string())
         .collect();
     if !enum_values.is_empty() {
@@ -1431,7 +1522,7 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
         .enum_definitions()
         .iter()
         .filter(|e| !ci.is_name_used_as_error(e.name()))
-        .filter(|e| e.methods().is_empty())
+        .filter(|e| e.constructors().is_empty() && e.methods().is_empty())
         .map(|e| e.name().to_string())
         .collect();
     if !enums.is_empty() {
@@ -1559,11 +1650,39 @@ fn all_custom_types(ci: &ComponentInterface, config: &JsConfig) -> BTreeSet<(Str
         for field in record.fields() {
             collect_custom_types(&field.as_type(), config, &mut customs);
         }
+        for constructor in record.constructors() {
+            for arg in constructor.arguments() {
+                collect_custom_types(&arg.as_type(), config, &mut customs);
+            }
+        }
+        collect_custom_types(&record.as_type(), config, &mut customs);
+        for method in record.methods() {
+            for arg in method.arguments() {
+                collect_custom_types(&arg.as_type(), config, &mut customs);
+            }
+            if let Some(ret) = method.return_type() {
+                collect_custom_types(ret, config, &mut customs);
+            }
+        }
     }
     for enum_ in ci.enum_definitions() {
         for variant in enum_.variants() {
             for field in variant.fields() {
                 collect_custom_types(&field.as_type(), config, &mut customs);
+            }
+        }
+        for constructor in enum_.constructors() {
+            for arg in constructor.arguments() {
+                collect_custom_types(&arg.as_type(), config, &mut customs);
+            }
+        }
+        collect_custom_types(&enum_.as_type(), config, &mut customs);
+        for method in enum_.methods() {
+            for arg in method.arguments() {
+                collect_custom_types(&arg.as_type(), config, &mut customs);
+            }
+            if let Some(ret) = method.return_type() {
+                collect_custom_types(ret, config, &mut customs);
             }
         }
     }
@@ -1679,7 +1798,7 @@ fn value_type_custom_helpers(
     match local_module {
         "records" => {
             for record in ci.record_definitions() {
-                if record.methods().is_empty() {
+                if record.constructors().is_empty() && record.methods().is_empty() {
                     continue;
                 }
                 collect_public_customs(
@@ -1689,6 +1808,17 @@ fn value_type_custom_helpers(
                     &mut names,
                     &mut HashSet::new(),
                 );
+                for constructor in record.constructors() {
+                    for arg in constructor.arguments() {
+                        collect_public_customs(
+                            ci,
+                            config,
+                            &arg.as_type(),
+                            &mut names,
+                            &mut HashSet::new(),
+                        );
+                    }
+                }
                 for method in record.methods() {
                     for arg in method.arguments() {
                         collect_public_customs(
@@ -1711,7 +1841,7 @@ fn value_type_custom_helpers(
                 .iter()
                 .filter(|e| !ci.is_name_used_as_error(e.name()))
             {
-                if enum_.methods().is_empty() {
+                if enum_.constructors().is_empty() && enum_.methods().is_empty() {
                     continue;
                 }
                 collect_public_customs(
@@ -1721,6 +1851,17 @@ fn value_type_custom_helpers(
                     &mut names,
                     &mut HashSet::new(),
                 );
+                for constructor in enum_.constructors() {
+                    for arg in constructor.arguments() {
+                        collect_public_customs(
+                            ci,
+                            config,
+                            &arg.as_type(),
+                            &mut names,
+                            &mut HashSet::new(),
+                        );
+                    }
+                }
                 for method in enum_.methods() {
                     for arg in method.arguments() {
                         collect_public_customs(
