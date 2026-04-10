@@ -144,6 +144,35 @@ pub fn render_wasm_rust(ci: &ComponentInterface) -> String {
         );
     }
 
+    // Value-type methods for records and non-error enums.
+    for record in ci.record_definitions() {
+        for method in record.methods() {
+            render_value_method(
+                &mut out,
+                &crate_ident,
+                record.name(),
+                &record.as_type(),
+                method,
+            );
+            writeln!(out).unwrap();
+        }
+    }
+    for enum_ in ci.enum_definitions() {
+        if ci.is_name_used_as_error(enum_.name()) {
+            continue;
+        }
+        for method in enum_.methods() {
+            render_value_method(
+                &mut out,
+                &crate_ident,
+                enum_.name(),
+                &enum_.as_type(),
+                method,
+            );
+            writeln!(out).unwrap();
+        }
+    }
+
     // Free functions.
     for f in ci.function_definitions() {
         render_function(&mut out, &crate_ident, &f);
@@ -599,6 +628,86 @@ fn lower_camel(rust: &str) -> String {
     // and we only need the same mapping the api_module uses.
     use heck::ToLowerCamelCase;
     rust.to_lower_camel_case()
+}
+
+// ---------------------------------------------------------------------
+// Value-type methods
+// ---------------------------------------------------------------------
+
+fn render_value_method(
+    out: &mut String,
+    crate_ident: &str,
+    owner_name: &str,
+    owner_ty: &Type,
+    m: &Method,
+) {
+    let fn_name = format!(
+        "{}_{}",
+        owner_name.to_snake_case(),
+        m.name().to_snake_case()
+    );
+    let self_info = classify(owner_ty, crate_ident);
+    let arg_info: Vec<(String, Lowering)> = std::iter::once(("self_".to_string(), self_info))
+        .chain(
+            m.arguments()
+                .iter()
+                .map(|a| (a.name().to_string(), classify(&a.as_type(), crate_ident))),
+        )
+        .collect();
+    let ret_info = m.return_type().map(|t| classify(t, crate_ident));
+
+    if let Some(reason) = first_unsupported(&arg_info, &ret_info) {
+        let arg_params = arg_info
+            .iter()
+            .map(|(n, _)| format!("_{n}: JsValue"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let async_kw = if m.is_async() { "async " } else { "" };
+        writeln!(out, "#[wasm_bindgen]").unwrap();
+        writeln!(
+            out,
+            "pub {async_kw}fn {fn_name}({arg_params}) -> Result<JsValue, JsError> {{"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    Err(JsError::new(\"uniffi wasm: `{fn_name}` not yet lowered: {reason}\"))"
+        )
+        .unwrap();
+        writeln!(out, "}}").unwrap();
+        return;
+    }
+
+    let is_async = m.is_async();
+    let throws = m.throws_type().is_some();
+    let async_kw = if is_async { "async " } else { "" };
+    let call_await = if is_async { ".await" } else { "" };
+    let params = param_list(&arg_info);
+    let rust_ret = return_type(&ret_info, throws);
+
+    writeln!(out, "#[wasm_bindgen]").unwrap();
+    writeln!(out, "pub {async_kw}fn {fn_name}({params}) -> {rust_ret} {{").unwrap();
+    emit_arg_decoders(out, &arg_info);
+    let pass = m
+        .arguments()
+        .iter()
+        .map(|a| {
+            if a.by_ref() || matches!(a.as_type(), Type::Record { .. } | Type::Enum { .. }) {
+                format!("&{}", a.name())
+            } else {
+                a.name().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let call = format!("self_.{}({pass}){call_await}", m.name());
+    let bound = if throws {
+        format!("{call}.map_err(|e| JsError::new(&format!(\"{{e:?}}\")))?")
+    } else {
+        call
+    };
+    emit_return(out, &ret_info, &bound);
+    writeln!(out, "}}").unwrap();
 }
 
 // ---------------------------------------------------------------------

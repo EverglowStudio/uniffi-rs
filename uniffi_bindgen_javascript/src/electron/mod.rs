@@ -59,6 +59,25 @@ fn collect_async_keys(ci: &ComponentInterface) -> Vec<String> {
             keys.push(f.name().to_string());
         }
     }
+    for record in ci.record_definitions() {
+        let snake = record.name().to_snake_case();
+        for m in record.methods() {
+            if m.is_async() {
+                keys.push(format!("{snake}_{}", m.name().to_snake_case()));
+            }
+        }
+    }
+    for enum_ in ci.enum_definitions() {
+        if ci.is_name_used_as_error(enum_.name()) {
+            continue;
+        }
+        let snake = enum_.name().to_snake_case();
+        for m in enum_.methods() {
+            if m.is_async() {
+                keys.push(format!("{snake}_{}", m.name().to_snake_case()));
+            }
+        }
+    }
     for obj in ci.object_definitions() {
         let snake = obj.name().to_snake_case();
         for c in obj.constructors() {
