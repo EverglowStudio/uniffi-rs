@@ -96,11 +96,17 @@ export function <name>(<args>): Promise<<ReturnType>>; // async
 
 ```ts
 export interface <Name> { <field>: <Type>; ... }
+export const <Name> = Object.freeze({
+  <constructor>(<args>): <Name> { ... },
+  <method>(self_: <Name>, <args>): <Ret> { ... },
+});
 ```
 
 - Records are emitted as `interface`, not `class`.
 - They should stay freely cloneable and serializable as frontend data.
 - They must not hide native handles.
+- Record constructors and methods are exposed as static helpers on a companion
+  value with the same name. Methods take the record value as explicit `self_`.
 
 ## Enums
 
@@ -116,6 +122,15 @@ export type <Name> =
 
 The generated JS surface uses `tag` consistently even when a backend bridge
 internally needs a different discriminant (for example, `type` in `napi-rs`).
+
+Enum constructors and methods are exposed as static helpers on the enum value:
+
+```ts
+Shape.circle(3);
+Shape.area(shape);
+```
+
+Flat enum type aliases include only variant values, not helper functions.
 
 ## Errors
 

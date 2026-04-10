@@ -456,6 +456,8 @@ impl From<uniffi_meta::ConstructorMetadata> for Constructor {
     fn from(meta: uniffi_meta::ConstructorMetadata) -> Self {
         let ffi_name = meta.ffi_symbol_name();
         let checksum_fn_name = meta.checksum_symbol_name();
+        let module_path = meta.module_path.clone();
+        let self_name = meta.self_name.clone();
         let arguments = meta.inputs.into_iter().map(Into::into).collect();
 
         let ffi_func = FfiFunction {
@@ -463,11 +465,11 @@ impl From<uniffi_meta::ConstructorMetadata> for Constructor {
             is_async: meta.is_async,
             ..FfiFunction::default()
         };
-        let self_type = Type::Object {
-            module_path: meta.module_path.clone(),
-            name: meta.self_name.clone(),
+        let self_type = meta.self_type.unwrap_or_else(|| Type::Object {
+            module_path: module_path.clone(),
+            name: self_name.clone(),
             imp: ObjectImpl::Struct,
-        };
+        });
         Self {
             name: meta.name,
             object_name: meta.self_name,
