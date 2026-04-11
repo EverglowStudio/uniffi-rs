@@ -12,7 +12,7 @@ The design is informed by:
 - the shared TypeScript runtime layout in `uniffi_runtime_javascript`
 - the existing UniFFI type model and async semantics
 - the flavor-specific backends implemented by this fork (`wasm`, `napi`,
-  `electron`)
+  `electron`, and `harmony` / `ohos`)
 
 ## Layers
 
@@ -23,10 +23,10 @@ application code
 common/            high-level TS API shared by all flavors
    │   depends on helpers from uniffi_runtime_javascript
    ▼
-flavor adapter     backend-wasm.ts / backend-napi.ts / electron bridge
+flavor adapter     backend-wasm.ts / backend-napi.ts / backend-ohos.ts / electron bridge
    │
    ▼
-native Rust shim   wasm-bindgen / napi-rs
+native Rust shim   wasm-bindgen / napi-rs / ohos-rs
 ```
 
 Applications may import only the flavor entrypoints and the shared public
@@ -241,6 +241,8 @@ import * as core from "./generated/browser/index.web.ts";
 import * as core from "./generated/node";
 // or
 import * as core from "./generated/electron/renderer";
+// or
+import * as core from "./generated/harmony";
 ```
 
 ## Electron preload ↔ renderer message shape
@@ -335,6 +337,59 @@ The namespace-specific variable wins over the generic variable. Relative
 override paths are resolved from the current process working directory. If
 loading fails, the generated adapter reports the namespace, the chosen path,
 and a hint to run `uniffi-bindgen javascript build-napi` or set the override.
+
+## Harmony/OpenHarmony through ohos-rs
+
+The generated `harmony/index.ts` entrypoint is a Node-API consumption form for
+Harmony/OpenHarmony. It installs the backend synchronously on import and
+re-exports the same high-level `common/` API as the browser, Node, and Electron
+entrypoints.
+
+Harmony does **not** use Node's `.node` addon loader. The generated backend
+imports the raw native module through the Harmony native module specifier:
+
+```ts
+import * as native from "lib<namespace>.so";
+```
+
+The consuming Harmony application is responsible for declaring that native
+module in its `oh-package.json5`, for example:
+
+```json5
+{
+  "dependencies": {
+    "lib<namespace>.so": "file:./src/main/lib<namespace>"
+  }
+}
+```
+
+The generated OHOS host crate uses `ohos-rs` package names:
+
+```toml
+napi-ohos = { version = "1.1.6", default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive-ohos = { version = "1.1.6", features = ["type-def"] }
+napi-build-ohos = "1.1.6"
+```
+
+When `--ohos-rs-dir` is supplied to the CLI, the host crate uses local path
+dependencies to that checkout instead of crates.io versions.
+
+The CLI orchestration command is:
+
+```text
+uniffi-bindgen javascript build-ohos \
+  --manifest-path <core Cargo.toml> \
+  --out-dir <generated> \
+  --arch aarch \
+  --arch x64 \
+  [--release] \
+  [--ohos-rs-dir <path>]
+```
+
+The command emits `common/`, `harmony/`, and `rust_modules/ohos`, then invokes
+`ohrs build` against the generated host crate. The default architecture list is
+`aarch` and `x64`, matching the common `ohos-rs` aliases for `arm64-v8a` and
+`x86_64`.
 
 ## Versioning
 

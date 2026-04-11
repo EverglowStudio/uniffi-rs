@@ -25,6 +25,14 @@ pub fn render_napi_rust(ci: &ComponentInterface) -> Result<String> {
     Ok(prettyplease::unparse(&file))
 }
 
+pub fn render_ohos_rust(ci: &ComponentInterface) -> Result<String> {
+    let rust = render_napi_rust(ci)?;
+    Ok(rust
+        .replace("uniffi-bindgen-napi", "uniffi-bindgen-ohos")
+        .replace("use napi_derive::napi;", "use napi_derive_ohos::napi;")
+        .replace("napi::", "napi_ohos::"))
+}
+
 pub(crate) struct Generator<'a> {
     ci: &'a ComponentInterface,
 }
