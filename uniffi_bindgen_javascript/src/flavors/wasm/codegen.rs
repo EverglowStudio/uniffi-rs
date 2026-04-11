@@ -26,7 +26,8 @@
 //!   `u32`, and the shim wraps it in a generated `__Js<Name>` struct that
 //!   implements the biz trait by dispatching back to JS via a pair of
 //!   `thread_local!`-stored `js_sys::Function`s. `Drop` releases the JS
-//!   registry slot.
+//!   registry slot. Non-fallible async callback methods are supported by
+//!   generating `async fn` impls that await a `Promise` from JS.
 //!
 //! Anything still unsupported is emitted as a stub that throws `JsError` at
 //! runtime — never a silent skip. Timestamp and duration are covered with
@@ -573,9 +574,15 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
     )
     .unwrap();
     writeln!(out, "}}").unwrap();
+    let has_async_methods = methods.iter().any(|m| m.is_async());
+    if has_async_methods {
+        writeln!(out, "#[async_trait::async_trait(?Send)]").unwrap();
+    }
     writeln!(out, "impl ::{crate_ident}::{name} for __Js{name} {{").unwrap();
     for m in methods {
         let m_name = m.name();
+        let is_async = m.is_async();
+        let throws = m.throws_type().is_some();
         let arg_info: Vec<(String, Lowering)> = m
             .arguments()
             .iter()
@@ -611,12 +618,38 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
         } else {
             success_ret_ty
         };
-        writeln!(
-            out,
-            "    fn {m_name}(&self{}{rust_args}) -> {ret_ty} {{",
-            if rust_args.is_empty() { "" } else { ", " }
-        )
-        .unwrap();
+        if is_async {
+            writeln!(
+                out,
+                "    async fn {m_name}(&self{}{rust_args}) -> {ret_ty} {{",
+                if rust_args.is_empty() { "" } else { ", " }
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                out,
+                "    fn {m_name}(&self{}{rust_args}) -> {ret_ty} {{",
+                if rust_args.is_empty() { "" } else { ", " }
+            )
+            .unwrap();
+        }
+        if is_async && throws {
+            let unused_args = arg_info
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !unused_args.is_empty() {
+                writeln!(out, "        let _ = ({unused_args});").unwrap();
+            }
+            writeln!(
+                out,
+                "        panic!(\"uniffi wasm async fallible callback `{name}.{m_name}` is not supported\");"
+            )
+            .unwrap();
+            writeln!(out, "    }}").unwrap();
+            continue;
+        }
         // Build a JS args array via explicit lift_expr — no serde.
         writeln!(out, "        let __args_arr = ::js_sys::Array::new();").unwrap();
         for (arg, (n, l)) in m.arguments().iter().zip(arg_info.iter()) {
@@ -693,29 +726,66 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             writeln!(out, "    }}").unwrap();
             continue;
         }
-        writeln!(
-            out,
-            "        let __ret = __uniffi_cb_invoke(self.handle, \"{}\", __args);",
-            lower_camel(m_name)
-        )
-        .unwrap();
-        // Lift return via explicit lower_expr — no serde.
-        match &ret_info {
-            Some(Lowering::Native(_)) | Some(Lowering::Value { .. }) => {
-                let ty = m
-                    .return_type()
-                    .expect("ret_info Some implies return_type")
-                    .clone();
-                let lower = lower_expr("__ret", &ty, 0);
-                let return_ty = core_ty_for(&ty, crate_ident);
-                writeln!(
-                    out,
-                    "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad return: {{e:?}}\"))"
-                )
-                .unwrap();
+        if is_async {
+            writeln!(
+                out,
+                "        let __ret = __uniffi_cb_invoke(self.handle, \"{}\", __args);",
+                lower_camel(m_name)
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "        let __ret_promise: ::js_sys::Promise = if __ret.is_instance_of::<::js_sys::Promise>() {{ __ret.dyn_into().unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` returned an invalid Promise\")) }} else {{ ::js_sys::Promise::resolve(&__ret) }};"
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "        let __ret = ::wasm_bindgen_futures::JsFuture::from(__ret_promise).await.unwrap_or_else(|__err| panic!(\"uniffi wasm callback `{name}.{m_name}` async Promise rejected: {{:?}}\", __err));"
+            )
+            .unwrap();
+            match &ret_info {
+                Some(Lowering::Native(_)) | Some(Lowering::Value { .. }) => {
+                    let ty = m
+                        .return_type()
+                        .expect("ret_info Some implies return_type")
+                        .clone();
+                    let lower = lower_expr("__ret", &ty, 0);
+                    let return_ty = core_ty_for(&ty, crate_ident);
+                    writeln!(
+                        out,
+                        "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad async return: {{e:?}}\"))"
+                    )
+                    .unwrap();
+                }
+                Some(_) | None => {
+                    writeln!(out, "        let _ = __ret;").unwrap();
+                }
             }
-            Some(_) | None => {
-                writeln!(out, "        let _ = __ret;").unwrap();
+        } else {
+            writeln!(
+                out,
+                "        let __ret = __uniffi_cb_invoke(self.handle, \"{}\", __args);",
+                lower_camel(m_name)
+            )
+            .unwrap();
+            // Lift return via explicit lower_expr — no serde.
+            match &ret_info {
+                Some(Lowering::Native(_)) | Some(Lowering::Value { .. }) => {
+                    let ty = m
+                        .return_type()
+                        .expect("ret_info Some implies return_type")
+                        .clone();
+                    let lower = lower_expr("__ret", &ty, 0);
+                    let return_ty = core_ty_for(&ty, crate_ident);
+                    writeln!(
+                        out,
+                        "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad return: {{e:?}}\"))"
+                    )
+                    .unwrap();
+                }
+                Some(_) | None => {
+                    writeln!(out, "        let _ = __ret;").unwrap();
+                }
             }
         }
         writeln!(out, "    }}").unwrap();
