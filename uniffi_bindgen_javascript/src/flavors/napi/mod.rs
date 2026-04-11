@@ -94,10 +94,46 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
              throw error;\n\
          }}\n\
          \n\
-         function __uniffiNormalizeCallbackObject(obj: unknown, marker?: {{ fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean> }}): unknown {{\n\
+         const __uniffiReturnedCallbacks = new Map<number, Record<string, unknown>>();\n\
+         let __uniffiNextReturnedCallbackId = 1;\n\
+         \n\
+         function __uniffiDispatchReturnedCallback(...rawArgs: unknown[]): unknown {{\n\
+             const args = rawArgs.length >= 3 && (rawArgs[0] === null || rawArgs[0] === undefined || rawArgs[0] instanceof Error)\n\
+                 ? rawArgs.slice(1)\n\
+                 : rawArgs;\n\
+             const id = args[0];\n\
+             const method = args[1];\n\
+             if (typeof id !== \"number\" || typeof method !== \"string\") {{\n\
+                 throw new Error(\"invalid uniffi returned-callback dispatch arguments\");\n\
+             }}\n\
+             const obj = __uniffiReturnedCallbacks.get(id);\n\
+             if (!obj) {{\n\
+                 throw new Error(`uniffi returned callback ${{id}} is not available`);\n\
+             }}\n\
+             const fn = obj[method];\n\
+             if (typeof fn !== \"function\") {{\n\
+                 throw new Error(`uniffi returned callback ${{id}} has no method ${{method}}`);\n\
+             }}\n\
+             return (fn as (...a: unknown[]) => unknown)(...args.slice(2));\n\
+         }}\n\
+         \n\
+         function __uniffiStoreCallbackReturn(value: unknown): {{ id: number }} {{\n\
+             const marker = value !== null && typeof value === \"object\" && (value as {{ __uniffiCallback?: boolean }}).__uniffiCallback === true\n\
+                 ? value as {{ object: unknown, fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }}\n\
+                 : undefined;\n\
+             const obj = marker === undefined\n\
+                 ? __uniffiNormalizeCallbackObject(value)\n\
+                 : __uniffiNormalizeCallbackObject(marker.object, marker);\n\
+             const id = __uniffiNextReturnedCallbackId++;\n\
+             __uniffiReturnedCallbacks.set(id, obj as Record<string, unknown>);\n\
+             return {{ id }};\n\
+         }}\n\
+         \n\
+         function __uniffiNormalizeCallbackObject(obj: unknown, marker?: {{ fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }}): unknown {{\n\
              if (obj === null || typeof obj !== \"object\") return obj;\n\
              const fallibleMethods = marker?.fallibleMethods ?? {{}};\n\
              const asyncMethods = marker?.asyncMethods ?? {{}};\n\
+             const callbackReturnMethods = marker?.callbackReturnMethods ?? {{}};\n\
              const out: Record<string, unknown> = {{}};\n\
              for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {{\n\
                  if (typeof v === \"function\") {{\n\
@@ -108,15 +144,16 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
                          const fn = v as (...a: unknown[]) => unknown;\n\
                          const errorShape = fallibleMethods[k];\n\
                          const isAsync = asyncMethods[k] === true;\n\
+                         const returnsCallback = callbackReturnMethods[k] === true;\n\
                          if (!errorShape) {{\n\
                              if (isAsync) {{\n\
-                                 return Promise.resolve(fn(...callArgs)).then((value) => __uniffiLowerShape(value));\n\
+                                 return Promise.resolve(fn(...callArgs)).then((value) => returnsCallback ? __uniffiStoreCallbackReturn(value) : __uniffiLowerShape(value));\n\
                              }}\n\
                              return __uniffiLowerShape(fn(...callArgs));\n\
                          }}\n\
                          if (isAsync) {{\n\
                              return Promise.resolve(fn(...callArgs)).then(\n\
-                                 (value) => ({{ ok: true, value: __uniffiLowerShape(value) }}),\n\
+                                 (value) => ({{ ok: true, value: returnsCallback ? __uniffiStoreCallbackReturn(value) : __uniffiLowerShape(value) }}),\n\
                                  (error) => ({{ ok: false, error: __uniffiCallbackErrorPayload(error, errorShape) }}),\n\
                              );\n\
                          }}\n\
@@ -130,6 +167,7 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
                      out[k] = v;\n\
                  }}\n\
              }}\n\
+             out.__uniffiCallbackDispatcher = __uniffiDispatchReturnedCallback;\n\
              return out;\n\
          }}\n\
          \n\
@@ -144,7 +182,7 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
                  typeof a === \"object\" &&\n\
                  (a as {{ __uniffiCallback?: boolean }}).__uniffiCallback === true\n\
              ) {{\n\
-                 return __uniffiNormalizeCallbackObject((a as {{ object: unknown }}).object, a as {{ fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean> }});\n\
+                 return __uniffiNormalizeCallbackObject((a as {{ object: unknown }}).object, a as {{ fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }});\n\
              }}\n\
              return a;\n\
          }};\n\
