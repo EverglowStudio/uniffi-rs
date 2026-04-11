@@ -9,14 +9,14 @@
 //! helpers pure and ABI-agnostic so common API generation, Electron async
 //! dispatch, and N-API name mapping cannot drift.
 
-use heck::{ToLowerCamelCase, ToSnakeCase};
+use heck::ToSnakeCase;
 use uniffi_bindgen::{
     interface::{Constructor, Method},
     ComponentInterface,
 };
 
 pub fn snake_to_camel(snake: &str) -> String {
-    snake.to_snake_case().to_lower_camel_case()
+    crate::js_names::member_name(&snake.to_snake_case())
 }
 
 pub fn free_function_key(name: &str) -> String {

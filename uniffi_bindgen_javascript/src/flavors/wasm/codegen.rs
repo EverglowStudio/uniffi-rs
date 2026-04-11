@@ -685,7 +685,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             writeln!(
                 out,
                 "        let __ret = __uniffi_cb_invoke(self.handle, \"{}\", __args);",
-                lower_camel(m_name)
+                crate::js_names::method_name(m_name)
             )
             .unwrap();
             writeln!(
@@ -774,7 +774,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 writeln!(
                     out,
                     "        let __ret = __uniffi_cb_try_invoke(self.handle, \"{}\", __args).unwrap_or_else(|__err| panic!(\"uniffi wasm callback `{name}.{m_name}` threw unexpected JS error: {{:?}}\", __err));",
-                    lower_camel(m_name)
+                    crate::js_names::method_name(m_name)
                 )
                 .unwrap();
                 writeln!(
@@ -828,7 +828,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             writeln!(
                 out,
                 "        let __ret = __uniffi_cb_invoke(self.handle, \"{}\", __args);",
-                lower_camel(m_name)
+                crate::js_names::method_name(m_name)
             )
             .unwrap();
             // Lift return via explicit lower_expr — no serde.
@@ -870,13 +870,6 @@ fn callback_return_core_ty(ty: &Type, crate_ident: &str) -> String {
             unreachable!("unsupported callback return types are rejected before codegen")
         }
     }
-}
-
-fn lower_camel(rust: &str) -> String {
-    // tiny local snake→lowerCamel, since heck isn't imported here for it
-    // and we only need the same mapping the api_module uses.
-    use heck::ToLowerCamelCase;
-    rust.to_lower_camel_case()
 }
 
 // ---------------------------------------------------------------------
@@ -1407,7 +1400,7 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     )
     .unwrap();
     for f in r.fields() {
-        let key = lower_camel(f.name());
+        let key = crate::js_names::field_name(f.name());
         let field_ident = format!("__f_{}", f.name());
         writeln!(
             out,
@@ -1444,7 +1437,7 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     )
     .unwrap();
     for f in r.fields() {
-        let key = lower_camel(f.name());
+        let key = crate::js_names::field_name(f.name());
         let lift = lift_expr_result(f.name(), &f.as_type(), 0);
         writeln!(
             out,
@@ -1516,7 +1509,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
             })
             .collect();
         for (bind, f) in binds.iter().zip(v.fields().iter()) {
-            let key = lower_camel(bind);
+            let key = crate::js_names::field_name(bind);
             let field_ident = format!("__vf_{bind}");
             writeln!(
                 out,
@@ -1621,7 +1614,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
         )
         .unwrap();
         for (bind, f) in binds.iter().zip(v.fields().iter()) {
-            let key = lower_camel(bind);
+            let key = crate::js_names::field_name(bind);
             let lift = lift_expr_result(bind, &f.as_type(), 0);
             writeln!(
                 out,

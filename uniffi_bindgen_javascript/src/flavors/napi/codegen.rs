@@ -6,7 +6,7 @@
 //! async exports, and napi-specific surface generation.
 
 use anyhow::{bail, ensure, Result};
-use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
+use heck::{ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse2;
@@ -1363,7 +1363,7 @@ impl<'a> Generator<'a> {
             .into_iter()
             .map(|method| {
                 let field_ident = rust_ident(method.name());
-                let field_name = method.name().to_lower_camel_case();
+                let field_name = crate::js_names::method_name(method.name());
                 let ty = self.callback_field_from_napi_type(object, method)?;
                 Ok(quote! {
                     #field_ident: Some(obj.get_named_property_unchecked::<#ty>(#field_name)?),
@@ -2106,7 +2106,7 @@ impl<'a> Generator<'a> {
     }
 
     fn callback_registry_call_value(&self, method: &Method) -> Result<TokenStream> {
-        let method_name = method.name().to_lower_camel_case();
+        let method_name = crate::js_names::method_name(method.name());
         let args = method
             .arguments()
             .into_iter()
