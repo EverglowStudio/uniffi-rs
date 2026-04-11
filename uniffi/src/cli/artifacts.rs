@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::MetadataCommand;
 use clap::{Args, Subcommand, ValueEnum};
+use std::io::{Seek, Write};
 use std::process::Command;
 use uniffi_bindgen::bindings::{generate, GenerateOptions, TargetLanguage};
 
@@ -222,10 +223,6 @@ fn build(args: BuildArgs) -> Result<()> {
 }
 
 fn build_android(args: &BuildArgs) -> Result<()> {
-    if args.android_aar_out.is_some() {
-        bail!("--android-aar-out is not implemented yet; P3 currently builds jniLibs + Kotlin");
-    }
-
     let jni_libs_out = args
         .android_jni_libs_out
         .clone()
@@ -314,6 +311,20 @@ fn build_android(args: &BuildArgs) -> Result<()> {
 
     if let Some(kotlin_out) = &args.android_kotlin_out {
         copy_dir_contents(&kotlin_bindings_dir, kotlin_out)?;
+    }
+
+    if let Some(aar_out) = &args.android_aar_out {
+        let package_name = args
+            .android_package_name
+            .clone()
+            .unwrap_or_else(|| format!("uniffi.{}", meta.lib_target_name));
+        create_android_aar(
+            aar_out,
+            &args.out_dir.join("android/aar-root"),
+            &jni_libs_out,
+            &kotlin_bindings_dir,
+            &package_name,
+        )?;
     }
 
     Ok(())
@@ -902,6 +913,83 @@ fn copy_dir_contents_inner(from: &Utf8Path, to: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
+fn create_android_aar(
+    aar_out: &Utf8Path,
+    staging_dir: &Utf8Path,
+    jni_libs_dir: &Utf8Path,
+    kotlin_dir: &Utf8Path,
+    package_name: &str,
+) -> Result<()> {
+    if staging_dir.exists() {
+        std::fs::remove_dir_all(staging_dir)
+            .with_context(|| format!("removing stale AAR staging dir {staging_dir}"))?;
+    }
+    std::fs::create_dir_all(staging_dir)
+        .with_context(|| format!("creating AAR staging dir {staging_dir}"))?;
+    copy_dir_contents(jni_libs_dir, &staging_dir.join("jni"))?;
+    copy_dir_contents(kotlin_dir, &staging_dir.join("kotlin"))?;
+    std::fs::write(
+        staging_dir.join("AndroidManifest.xml"),
+        android_manifest(package_name),
+    )
+    .with_context(|| format!("writing AndroidManifest.xml in {staging_dir}"))?;
+    std::fs::write(staging_dir.join("R.txt"), "")
+        .with_context(|| format!("writing R.txt in {staging_dir}"))?;
+    std::fs::write(
+        staging_dir.join("proguard.txt"),
+        format!("-keep class {}.** {{ *; }}\n", package_name),
+    )
+    .with_context(|| format!("writing proguard.txt in {staging_dir}"))?;
+
+    if let Some(parent) = aar_out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating AAR output parent dir {parent}"))?;
+    }
+    let file = std::fs::File::create(aar_out).with_context(|| format!("creating {aar_out}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    add_dir_to_zip(&mut zip, staging_dir, staging_dir)?;
+    zip.finish()
+        .with_context(|| format!("finishing AAR archive {aar_out}"))?;
+    Ok(())
+}
+
+fn android_manifest(package_name: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"{package_name}\" />\n"
+    )
+}
+
+fn add_dir_to_zip<W: Write + Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    dir: &Utf8Path,
+    root: &Utf8Path,
+) -> Result<()> {
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {dir}"))? {
+        let entry = entry?;
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|p| anyhow::anyhow!("AAR staging path is not utf8: {}", p.display()))?;
+        let rel = path
+            .strip_prefix(root)
+            .with_context(|| format!("computing relative AAR path for {path}"))?
+            .to_string()
+            .replace('\\', "/");
+        if entry.file_type()?.is_dir() {
+            zip.add_directory(format!("{rel}/"), options)
+                .with_context(|| format!("adding AAR directory {rel}"))?;
+            add_dir_to_zip(zip, &path, root)?;
+        } else {
+            zip.start_file(&rel, options)
+                .with_context(|| format!("adding AAR file {rel}"))?;
+            let mut file = std::fs::File::open(&path).with_context(|| format!("opening {path}"))?;
+            std::io::copy(&mut file, zip).with_context(|| format!("zipping {path}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,5 +1119,10 @@ mod tests {
             android_sharedlib_path(&meta, "aarch64-linux-android", "debug"),
             Utf8PathBuf::from("/repo/target/aarch64-linux-android/debug/libuni_core.so")
         );
+    }
+
+    #[test]
+    fn renders_android_manifest() {
+        assert!(android_manifest("com.example.core").contains("package=\"com.example.core\""));
     }
 }
