@@ -582,7 +582,6 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
     for m in methods {
         let m_name = m.name();
         let is_async = m.is_async();
-        let throws = m.throws_type().is_some();
         let arg_info: Vec<(String, Lowering)> = m
             .arguments()
             .iter()
@@ -633,23 +632,6 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             )
             .unwrap();
         }
-        if is_async && throws {
-            let unused_args = arg_info
-                .iter()
-                .map(|(n, _)| n.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if !unused_args.is_empty() {
-                writeln!(out, "        let _ = ({unused_args});").unwrap();
-            }
-            writeln!(
-                out,
-                "        panic!(\"uniffi wasm async fallible callback `{name}.{m_name}` is not supported\");"
-            )
-            .unwrap();
-            writeln!(out, "    }}").unwrap();
-            continue;
-        }
         // Build a JS args array via explicit lift_expr — no serde.
         writeln!(out, "        let __args_arr = ::js_sys::Array::new();").unwrap();
         for (arg, (n, l)) in m.arguments().iter().zip(arg_info.iter()) {
@@ -670,62 +652,6 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             }
         }
         writeln!(out, "        let __args: JsValue = __args_arr.into();").unwrap();
-        if let Some(error_ty) = m.throws_type() {
-            let error_lower = lower_expr("__error", error_ty, 0);
-            writeln!(
-                out,
-                "        let __ret = __uniffi_cb_try_invoke(self.handle, \"{}\", __args).unwrap_or_else(|__err| panic!(\"uniffi wasm callback `{name}.{m_name}` threw unexpected JS error: {{:?}}\", __err));",
-                lower_camel(m_name)
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "        let __ret_obj: ::js_sys::Object = __ret.dyn_into().unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` returned a non-object result envelope\"));"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "        let __ok_js = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"ok\")).unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` result envelope missing `ok`\"));"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "        let __ok = __ok_js.as_bool().unwrap_or_else(|| panic!(\"uniffi wasm callback `{name}.{m_name}` result envelope `ok` is not boolean\"));"
-            )
-            .unwrap();
-            writeln!(out, "        if __ok {{").unwrap();
-            if let Some(return_type) = m.return_type() {
-                let value_lower = lower_expr("__value", return_type, 0);
-                let value_ty = core_ty_for(return_type, crate_ident);
-                writeln!(
-                    out,
-                    "            let __value = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"value\")).unwrap_or(JsValue::UNDEFINED);"
-                )
-                .unwrap();
-                writeln!(
-                    out,
-                    "            Ok((|| -> ::std::result::Result<{value_ty}, JsError> {{ {value_lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad success value: {{e:?}}\")))"
-                )
-                .unwrap();
-            } else {
-                writeln!(out, "            Ok(())").unwrap();
-            }
-            writeln!(out, "        }} else {{").unwrap();
-            writeln!(
-                out,
-                "            let __error = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"error\")).unwrap_or(JsValue::UNDEFINED);"
-            )
-            .unwrap();
-            let error_ty = core_ty_for(error_ty, crate_ident);
-            writeln!(
-                out,
-                "            Err((|| -> ::std::result::Result<{error_ty}, JsError> {{ {error_lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad error value: {{e:?}}\")))"
-            )
-            .unwrap();
-            writeln!(out, "        }}").unwrap();
-            writeln!(out, "    }}").unwrap();
-            continue;
-        }
         if is_async {
             writeln!(
                 out,
@@ -743,25 +669,130 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 "        let __ret = ::wasm_bindgen_futures::JsFuture::from(__ret_promise).await.unwrap_or_else(|__err| panic!(\"uniffi wasm callback `{name}.{m_name}` async Promise rejected: {{:?}}\", __err));"
             )
             .unwrap();
-            match &ret_info {
-                Some(Lowering::Native(_)) | Some(Lowering::Value { .. }) => {
-                    let ty = m
-                        .return_type()
-                        .expect("ret_info Some implies return_type")
-                        .clone();
-                    let lower = lower_expr("__ret", &ty, 0);
-                    let return_ty = core_ty_for(&ty, crate_ident);
+            if let Some(error_ty) = m.throws_type() {
+                let error_lower = lower_expr("__error", error_ty, 0);
+                writeln!(
+                    out,
+                    "        let __ret_obj: ::js_sys::Object = __ret.dyn_into().unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` returned a non-object result envelope\"));"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "        let __ok_js = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"ok\")).unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` result envelope missing `ok`\"));"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "        let __ok = __ok_js.as_bool().unwrap_or_else(|| panic!(\"uniffi wasm callback `{name}.{m_name}` result envelope `ok` is not boolean\"));"
+                )
+                .unwrap();
+                writeln!(out, "        if __ok {{").unwrap();
+                if let Some(return_type) = m.return_type() {
+                    let value_lower = lower_expr("__value", return_type, 0);
+                    let value_ty = core_ty_for(return_type, crate_ident);
                     writeln!(
                         out,
-                        "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad async return: {{e:?}}\"))"
+                        "            let __value = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"value\")).unwrap_or(JsValue::UNDEFINED);"
                     )
                     .unwrap();
+                    writeln!(
+                        out,
+                        "            Ok((|| -> ::std::result::Result<{value_ty}, JsError> {{ {value_lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad async success value: {{e:?}}\")))"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(out, "            Ok(())").unwrap();
                 }
-                Some(_) | None => {
-                    writeln!(out, "        let _ = __ret;").unwrap();
+                writeln!(out, "        }} else {{").unwrap();
+                writeln!(
+                    out,
+                    "            let __error = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"error\")).unwrap_or(JsValue::UNDEFINED);"
+                )
+                .unwrap();
+                let error_ty = core_ty_for(error_ty, crate_ident);
+                writeln!(
+                    out,
+                    "            Err((|| -> ::std::result::Result<{error_ty}, JsError> {{ {error_lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad async error value: {{e:?}}\")))"
+                )
+                .unwrap();
+                writeln!(out, "        }}").unwrap();
+            } else {
+                match &ret_info {
+                    Some(Lowering::Native(_)) | Some(Lowering::Value { .. }) => {
+                        let ty = m
+                            .return_type()
+                            .expect("ret_info Some implies return_type")
+                            .clone();
+                        let lower = lower_expr("__ret", &ty, 0);
+                        let return_ty = core_ty_for(&ty, crate_ident);
+                        writeln!(
+                            out,
+                            "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad async return: {{e:?}}\"))"
+                        )
+                        .unwrap();
+                    }
+                    Some(_) | None => {
+                        writeln!(out, "        let _ = __ret;").unwrap();
+                    }
                 }
             }
         } else {
+            if let Some(error_ty) = m.throws_type() {
+                let error_lower = lower_expr("__error", error_ty, 0);
+                writeln!(
+                    out,
+                    "        let __ret = __uniffi_cb_try_invoke(self.handle, \"{}\", __args).unwrap_or_else(|__err| panic!(\"uniffi wasm callback `{name}.{m_name}` threw unexpected JS error: {{:?}}\", __err));",
+                    lower_camel(m_name)
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "        let __ret_obj: ::js_sys::Object = __ret.dyn_into().unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` returned a non-object result envelope\"));"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "        let __ok_js = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"ok\")).unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` result envelope missing `ok`\"));"
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "        let __ok = __ok_js.as_bool().unwrap_or_else(|| panic!(\"uniffi wasm callback `{name}.{m_name}` result envelope `ok` is not boolean\"));"
+                )
+                .unwrap();
+                writeln!(out, "        if __ok {{").unwrap();
+                if let Some(return_type) = m.return_type() {
+                    let value_lower = lower_expr("__value", return_type, 0);
+                    let value_ty = core_ty_for(return_type, crate_ident);
+                    writeln!(
+                        out,
+                        "            let __value = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"value\")).unwrap_or(JsValue::UNDEFINED);"
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "            Ok((|| -> ::std::result::Result<{value_ty}, JsError> {{ {value_lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad success value: {{e:?}}\")))"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(out, "            Ok(())").unwrap();
+                }
+                writeln!(out, "        }} else {{").unwrap();
+                writeln!(
+                    out,
+                    "            let __error = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"error\")).unwrap_or(JsValue::UNDEFINED);"
+                )
+                .unwrap();
+                let error_ty = core_ty_for(error_ty, crate_ident);
+                writeln!(
+                    out,
+                    "            Err((|| -> ::std::result::Result<{error_ty}, JsError> {{ {error_lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad error value: {{e:?}}\")))"
+                )
+                .unwrap();
+                writeln!(out, "        }}").unwrap();
+                writeln!(out, "    }}").unwrap();
+                continue;
+            }
             writeln!(
                 out,
                 "        let __ret = __uniffi_cb_invoke(self.handle, \"{}\", __args);",
