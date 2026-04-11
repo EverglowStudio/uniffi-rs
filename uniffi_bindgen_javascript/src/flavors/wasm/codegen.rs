@@ -37,7 +37,7 @@
 //! runtime — never a silent skip. Timestamp and duration are covered with
 //! explicit `Date` / millisecond lowering and lifting.
 
-use std::{collections::BTreeSet, fmt::Write};
+use std::fmt::Write;
 
 use heck::ToSnakeCase;
 use uniffi_bindgen::interface::{
@@ -1369,7 +1369,7 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
 fn emit_value_helpers(out: &mut String, ci: &ComponentInterface, crate_ident: &str) {
     let records = ci.record_definitions();
     let enums = ci.enum_definitions();
-    let callback_error_enums = callback_throws_error_names(ci);
+    let callback_error_enums = crate::callback_metadata::callback_error_enum_names(ci);
     if records.is_empty() && enums.is_empty() {
         return;
     }
@@ -1388,23 +1388,6 @@ fn emit_value_helpers(out: &mut String, ci: &ComponentInterface, crate_ident: &s
         emit_enum_helpers(out, e, crate_ident);
     }
     writeln!(out).unwrap();
-}
-
-fn callback_throws_error_names(ci: &ComponentInterface) -> BTreeSet<String> {
-    ci.callback_interface_definitions()
-        .iter()
-        .flat_map(|callback| callback.methods())
-        .chain(
-            ci.object_definitions()
-                .iter()
-                .filter(|obj| matches!(obj.imp(), ObjectImpl::CallbackTrait))
-                .flat_map(|obj| obj.methods()),
-        )
-        .filter_map(|method| match method.throws_type() {
-            Some(Type::Enum { name, .. }) => Some(name.clone()),
-            _ => None,
-        })
-        .collect()
 }
 
 fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {

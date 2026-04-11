@@ -37,7 +37,7 @@ use uniffi_bindgen::{
     Component,
 };
 
-use crate::JsConfig;
+use crate::{callback_metadata, JsConfig};
 
 /// The shared runtime module, shipped verbatim into every generated tree.
 const RUNTIME_TS: &str =
@@ -1457,16 +1457,6 @@ fn ts_lower_expr(
     }
 }
 
-fn is_callback_return_type(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Object {
-            imp: ObjectImpl::CallbackTrait,
-            ..
-        } | Type::CallbackInterface { .. }
-    )
-}
-
 fn callback_async_methods(ci: &ComponentInterface, name: &str) -> Vec<String> {
     let methods = ci
         .object_definitions()
@@ -1502,7 +1492,11 @@ fn callback_return_methods(ci: &ComponentInterface, name: &str) -> Vec<String> {
     methods
         .into_iter()
         .flatten()
-        .filter(|method| method.return_type().is_some_and(is_callback_return_type))
+        .filter(|method| {
+            method
+                .return_type()
+                .is_some_and(callback_metadata::is_callback_return_type)
+        })
         .map(|method| js_fn_name(method.name()))
         .collect()
 }
