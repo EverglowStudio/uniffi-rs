@@ -3837,34 +3837,7 @@ fn cli_build_wasm_orchestrates_arithmetic_fixture() {
     };
 
     let root = workspace_root();
-    let build = Command::new(&cargo)
-        .current_dir(&root)
-        .args([
-            "build",
-            "-p",
-            "uniffi",
-            "--features",
-            "cli",
-            "--bin",
-            "uniffi-bindgen",
-        ])
-        .output()
-        .expect("failed to build uniffi-bindgen");
-    if !build.status.success() {
-        panic!(
-            "building uniffi-bindgen failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr),
-        );
-    }
-
-    let cli = root.join(if cfg!(windows) {
-        "target/debug/uniffi-bindgen.exe"
-    } else {
-        "target/debug/uniffi-bindgen"
-    });
-    assert!(cli.exists(), "expected built CLI at {cli}");
-
+    let cli = build_uniffi_bindgen_cli(&cargo);
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
@@ -3934,6 +3907,140 @@ fn cli_build_wasm_orchestrates_arithmetic_fixture() {
             .any(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm")),
         "wasm-bindgen output dir should contain a .wasm artifact: {pkg_entries:?}"
     );
+}
+
+#[test]
+fn cli_build_orchestrates_full_javascript_tree() {
+    let Some(cargo) = which_tool("cargo") else {
+        eprintln!("SKIP cli_build_orchestrates_full_javascript_tree: cargo unavailable");
+        return;
+    };
+    if !has_wasm32_target(&cargo) {
+        eprintln!(
+            "SKIP cli_build_orchestrates_full_javascript_tree: wasm32-unknown-unknown target not installed"
+        );
+        return;
+    }
+    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
+        eprintln!("SKIP cli_build_orchestrates_full_javascript_tree: wasm-bindgen CLI not found");
+        return;
+    };
+
+    let root = workspace_root();
+    let cli = build_uniffi_bindgen_cli(&cargo);
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target-napi")).unwrap();
+    let (manifest, source) = write_cli_wasm_fixture(tmp.path());
+
+    let output = Command::new(cli.as_std_path())
+        .current_dir(&root)
+        .arg("javascript")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest.as_str())
+        .arg("--source")
+        .arg(source.as_str())
+        .arg("--out-dir")
+        .arg(out_dir.as_str())
+        .arg("--host-crates-dir")
+        .arg(host_dir.as_str())
+        .arg("--target-dir")
+        .arg(target_dir.as_str())
+        .arg("--wasm-bindgen-bin")
+        .arg(
+            Utf8PathBuf::from_path_buf(wasm_bindgen.clone())
+                .unwrap()
+                .as_str(),
+        )
+        .output()
+        .expect("failed to invoke uniffi-bindgen javascript build");
+    if !output.status.success() {
+        panic!(
+            "javascript build failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    for path in [
+        "common/api.ts",
+        "common/public-types.ts",
+        "browser/index.ts",
+        "browser/backend-wasm.ts",
+        "node/index.ts",
+        "node/backend-napi.ts",
+        "node/cli_wasm.node",
+        "electron/index.ts",
+        "electron/backend-napi.ts",
+        "electron/preload.cjs",
+        "electron/renderer.ts",
+        "electron/cli_wasm.node",
+    ] {
+        let file = out_dir.join(path);
+        assert!(file.exists(), "missing combined build artifact: {file}");
+    }
+
+    assert!(host_dir.join("wasm/Cargo.toml").exists());
+    assert!(host_dir.join("napi/Cargo.toml").exists());
+
+    let browser_pkg = out_dir.join("browser/pkg");
+    let pkg_entries = std::fs::read_dir(browser_pkg.as_std_path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect::<Vec<_>>();
+    assert!(
+        pkg_entries
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm")),
+        "combined build should leave wasm-bindgen .wasm in browser/pkg: {pkg_entries:?}"
+    );
+    assert!(
+        pkg_entries
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("js")),
+        "combined build should leave wasm-bindgen JS glue in browser/pkg: {pkg_entries:?}"
+    );
+
+    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    assert!(
+        preload.contains("dispatchSync") && preload.contains("dispatchAsync"),
+        "combined build electron preload should expose sync and async dispatch:\n{preload}"
+    );
+}
+
+fn build_uniffi_bindgen_cli(cargo: &std::path::Path) -> Utf8PathBuf {
+    let root = workspace_root();
+    let build = Command::new(cargo)
+        .current_dir(&root)
+        .args([
+            "build",
+            "-p",
+            "uniffi",
+            "--features",
+            "cli",
+            "--bin",
+            "uniffi-bindgen",
+        ])
+        .output()
+        .expect("failed to build uniffi-bindgen");
+    if !build.status.success() {
+        panic!(
+            "building uniffi-bindgen failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+        );
+    }
+
+    let cli = root.join(if cfg!(windows) {
+        "target/debug/uniffi-bindgen.exe"
+    } else {
+        "target/debug/uniffi-bindgen"
+    });
+    assert!(cli.exists(), "expected built CLI at {cli}");
+    cli
 }
 
 fn write_cli_wasm_fixture(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
