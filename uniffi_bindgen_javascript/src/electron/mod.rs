@@ -28,15 +28,14 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use fs_err as fs;
-use heck::ToSnakeCase;
-use uniffi_bindgen::{Component, ComponentInterface};
+use uniffi_bindgen::Component;
 
 use crate::JsConfig;
 
 pub fn emit(dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()> {
     let ci = &component.ci;
     let ns = ci.namespace();
-    let async_keys = collect_async_keys(ci);
+    let async_keys = crate::dispatch_key::collect_async_keys(ci);
     let name_pairs = crate::name_map::collect(ci);
     let name_map_literal = crate::name_map::render_name_map_js_literal(&name_pairs);
     let enum_shape_helpers = crate::enum_shape::helper_js();
@@ -46,64 +45,6 @@ pub fn emit(dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()> {
     )?;
     fs::write(dir.join("renderer.ts"), render_renderer(ns, &async_keys))?;
     Ok(())
-}
-
-/// Walk the component interface and compute the set of backend dispatch
-/// keys that are async. The naming must stay in lockstep with
-/// `api_module/mod.rs`: free functions use the raw Rust name,
-/// constructors/methods use `{obj_snake}_{member_snake}`.
-fn collect_async_keys(ci: &ComponentInterface) -> Vec<String> {
-    let mut keys = Vec::new();
-    for f in ci.function_definitions() {
-        if f.is_async() {
-            keys.push(f.name().to_string());
-        }
-    }
-    for record in ci.record_definitions() {
-        let snake = record.name().to_snake_case();
-        for c in record.constructors() {
-            if c.is_async() {
-                keys.push(format!("{snake}_{}", c.name().to_snake_case()));
-            }
-        }
-        for m in record.methods() {
-            if m.is_async() {
-                keys.push(format!("{snake}_{}", m.name().to_snake_case()));
-            }
-        }
-    }
-    for enum_ in ci.enum_definitions() {
-        if ci.is_name_used_as_error(enum_.name()) {
-            continue;
-        }
-        let snake = enum_.name().to_snake_case();
-        for c in enum_.constructors() {
-            if c.is_async() {
-                keys.push(format!("{snake}_{}", c.name().to_snake_case()));
-            }
-        }
-        for m in enum_.methods() {
-            if m.is_async() {
-                keys.push(format!("{snake}_{}", m.name().to_snake_case()));
-            }
-        }
-    }
-    for obj in ci.object_definitions() {
-        let snake = obj.name().to_snake_case();
-        for c in obj.constructors() {
-            if c.is_async() {
-                keys.push(format!("{snake}_{}", c.name().to_snake_case()));
-            }
-        }
-        for m in obj.methods() {
-            if m.is_async() {
-                keys.push(format!("{snake}_{}", m.name().to_snake_case()));
-            }
-        }
-    }
-    keys.sort();
-    keys.dedup();
-    keys
 }
 
 fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &str) -> String {

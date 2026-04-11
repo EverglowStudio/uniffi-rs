@@ -28,6 +28,7 @@ use fs_err as fs;
 use uniffi_bindgen::{BindgenLoader, Component};
 
 pub mod api_module;
+pub mod dispatch_key;
 pub mod electron;
 pub mod enum_shape;
 pub mod flavors;
