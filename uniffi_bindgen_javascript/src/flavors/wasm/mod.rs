@@ -28,19 +28,17 @@
 //! `Type::Object` args/returns, trait objects like `Arc<dyn Greeter>`),
 //! timestamp / duration, sync and async callback-trait lowering
 //! including fallible async methods, and callback methods returning
-//! ordinary UniFFI objects / trait objects via the object registry.
+//! ordinary UniFFI objects / trait objects via the object registry or
+//! callback traits / callback interfaces via the callback registry.
 //! Also covered: custom types, and string-key `Map` / `HashMap<String, V>`
 //! lowering (validated against `Logger` and dedicated custom/map fixtures
 //! in `bindgen-tests/javascript/tests/smoke.rs`).
 //!
-//! Still **not** covered: callback traits / callback interfaces returning
-//! callback traits, callback object args, non-string-key maps, nested
-//! object/callback values in maps, `Set`, and cancellation. Unsupported
-//! exported shapes are emitted as runtime-throwing stubs (with the reason
-//! embedded in the thrown `JsError`) rather than being silently skipped.
-//! Callback methods returning callback traits / callback interfaces are
-//! rejected at generation time because the wrapper trait impl would otherwise
-//! have to promise a Rust return type it cannot construct yet.
+//! Still **not** covered: callback object args, non-string-key maps,
+//! nested object/callback values in maps, `Set`, and cancellation.
+//! Unsupported exported shapes are emitted as runtime-throwing stubs
+//! (with the reason embedded in the thrown `JsError`) rather than being
+//! silently skipped.
 //!
 //! Downstream build prerequisite: any client crate with async UniFFI
 //! exports targeting wasm must enable `uniffi`'s
@@ -112,12 +110,12 @@ export async function adaptWasmBindgenGlue(
         }}
     }}
     // If the shim has any callback-trait lowering, it exposes a setter for
-    // the JS-side dispatch and release thunks. Hook them into the shared
-    // callback registry so Rust can call back into JS by handle.
+    // the JS-side dispatch / release / register thunks. Hook them into the
+    // shared callback registry so Rust can call back into JS by handle.
+    const {{ lookupCallback, releaseCallback, registerCallback, UniffiError }} = await import(
+        "../common/runtime.ts"
+    );
     if (typeof g.__uniffi_set_cb_invoker === "function") {{
-        const {{ lookupCallback, releaseCallback, UniffiError }} = await import(
-            "../common/runtime.ts"
-        );
         const invoke = (handle: number, method: string, args: unknown): unknown => {{
             const cb = lookupCallback(handle) as Record<string, (...a: unknown[]) => unknown> | undefined;
             if (!cb) {{
@@ -137,9 +135,12 @@ export async function adaptWasmBindgenGlue(
             return fn.apply(cb, arr);
         }};
         const release = (handle: number): void => releaseCallback(handle);
-        (g.__uniffi_set_cb_invoker as (i: unknown, r: unknown) => void)(invoke, release);
+        (g.__uniffi_set_cb_invoker as (i: unknown, r: unknown, reg: unknown) => void)(
+            invoke,
+            release,
+            registerCallback,
+        );
     }}
-    const {{ registerCallback }} = await import("../common/runtime.ts");
     const callbackErrorPayload = (error: unknown, shape: unknown): unknown => {{
         if (error !== null && typeof error === "object") {{
             const raw = error as Record<string, unknown>;
