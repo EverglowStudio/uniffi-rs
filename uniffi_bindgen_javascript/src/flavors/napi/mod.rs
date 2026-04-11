@@ -44,6 +44,7 @@ pub fn emit(dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()> {
 
 fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
     let namespace = ci.namespace();
+    let env_var = napi_path_env_var(namespace);
     let name_map_literal =
         crate::name_map::render_name_map_js_literal(&crate::name_map::collect(ci));
     let enum_shape_helpers = crate::enum_shape::helper_ts();
@@ -58,8 +59,44 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
          // imports this adapter only through that contract.\n\
          \n\
          import {{ createRequire }} from \"node:module\";\n\
+         import {{ resolve }} from \"node:path\";\n\
          const require = createRequire(import.meta.url);\n\
-         const native = require(\"./{namespace}.node\");\n\
+         const __uniffiNamespace = \"{namespace}\";\n\
+         const __uniffiSpecificNapiPathEnv = \"{env_var}\";\n\
+         const __uniffiDefaultAddonPath = \"./{namespace}.node\";\n\
+         \n\
+         function __uniffiResolveEnvAddonPath(path: string): string {{\n\
+             return path.startsWith(\"/\") || /^[A-Za-z]:[\\\\/]/.test(path) ? path : resolve(path);\n\
+         }}\n\
+         \n\
+         function __uniffiAddonCandidate(): {{ label: string; specifier: string }} {{\n\
+             const specific = process.env[__uniffiSpecificNapiPathEnv];\n\
+             if (specific && specific.length > 0) {{\n\
+                 return {{ label: __uniffiSpecificNapiPathEnv, specifier: __uniffiResolveEnvAddonPath(specific) }};\n\
+             }}\n\
+             const generic = process.env.UNIFFI_NAPI_PATH;\n\
+             if (generic && generic.length > 0) {{\n\
+                 return {{ label: \"UNIFFI_NAPI_PATH\", specifier: __uniffiResolveEnvAddonPath(generic) }};\n\
+             }}\n\
+             return {{ label: \"default\", specifier: __uniffiDefaultAddonPath }};\n\
+         }}\n\
+         \n\
+         function __uniffiLoadNativeAddon(): Record<string, unknown> {{\n\
+             const candidate = __uniffiAddonCandidate();\n\
+             try {{\n\
+                 return require(candidate.specifier) as Record<string, unknown>;\n\
+             }} catch (error) {{\n\
+                 const cause = error instanceof Error ? `${{error.name}}: ${{error.message}}` : String(error);\n\
+                 throw new Error(\n\
+                     `failed to load UniFFI N-API addon for namespace \"${{__uniffiNamespace}}\" from ${{candidate.label}} (${{candidate.specifier}}). ` +\n\
+                         `Run \"uniffi-bindgen javascript build-napi --manifest-path <Cargo.toml> --out-dir <generated>\" ` +\n\
+                         `so ${{__uniffiDefaultAddonPath}} exists, or set ${{__uniffiSpecificNapiPathEnv}}=/absolute/path/to/${{__uniffiNamespace}}.node ` +\n\
+                         `or UNIFFI_NAPI_PATH=/absolute/path/to/addon.node. Cause: ${{cause}}`,\n\
+                 );\n\
+             }}\n\
+         }}\n\
+         \n\
+         const native = __uniffiLoadNativeAddon();\n\
          \n\
          // Generator-computed map from `common/api.ts` low-level\n\
          // snake_case dispatch keys to the `lowerCamelCase` names that\n\
@@ -70,6 +107,10 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
          const __uniffiNameMap: Record<string, string> = {name_map_literal} as Record<string, string>;\n\
          \n\
          {enum_shape_helpers}\n\
+         \n\
+         function __uniffiIsObjectFreeKey(name: string): boolean {{\n\
+             return name.startsWith(\"__uniffi_\") && name.endsWith(\"_object_free\");\n\
+         }}\n\
          \n\
          function __uniffiCallbackErrorPayload(error: unknown, shape: unknown): unknown {{\n\
              if (error !== null && typeof error === \"object\") {{\n\
@@ -191,11 +232,16 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
              {{}} as Record<string, unknown>,\n\
              {{\n\
                  get(_t, name: string) {{\n\
+                     // `common/objects.ts` uses the wasm registry destructor\n\
+                     // key for every flavor. N-API object wrappers are native\n\
+                     // class instances whose lifetime is owned by napi-rs/V8,\n\
+                     // so the generated backend intentionally treats those\n\
+                     // destructor calls as idempotent no-ops.\n\
+                     if (__uniffiIsObjectFreeKey(name)) return (_handle: unknown): void => {{}};\n\
                      // Translate low-level key → addon export name. Fall\n\
-                     // back to the raw name so destructors / anything\n\
-                     // the generator didn't put in the map still\n\
-                     // surface a clear `undefined` rather than silently\n\
-                     // hitting an unrelated member.\n\
+                     // back to the raw name so anything the generator didn't\n\
+                     // put in the map still surfaces a clear `undefined`\n\
+                     // rather than silently hitting an unrelated member.\n\
                      const exportName = __uniffiNameMap[name] ?? name;\n\
                      const v = (native as Record<string, unknown>)[exportName];\n\
                      if (typeof v !== \"function\") return v;\n\
@@ -239,6 +285,25 @@ fn render_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
          export {{ native as __uniffiNativeAddon }};\n\
          export const __uniffiBackendKind = \"napi\" as const;\n"
     )
+}
+
+fn napi_path_env_var(namespace: &str) -> String {
+    let mut out = String::from("UNIFFI_");
+    let mut last_was_sep = false;
+    for ch in namespace.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out.push_str("_NAPI_PATH");
+    out
 }
 
 fn render_index(ci: &uniffi_bindgen::ComponentInterface) -> String {

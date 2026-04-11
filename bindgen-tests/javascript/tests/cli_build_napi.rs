@@ -168,6 +168,14 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
         host_dir.join("napi/Cargo.toml").exists(),
         "missing generated napi host crate"
     );
+    let backend_napi = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    assert!(
+        backend_napi.contains("UNIFFI_CLI_NAPI_NAPI_PATH")
+            && backend_napi.contains("UNIFFI_NAPI_PATH")
+            && backend_napi.contains("uniffi-bindgen javascript build-napi")
+            && backend_napi.contains("function __uniffiLoadNativeAddon"),
+        "backend-napi.ts should expose an actionable env-overridable addon loader:\n{backend_napi}"
+    );
 
     let Some(node) = which_tool("node") else {
         eprintln!("SKIP cli_build_napi_orchestrates_synthetic_fixture: node unavailable");
@@ -188,10 +196,10 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
          console.log('ok');\n",
     )
     .unwrap();
-    let run = Command::new(node)
+    let run = Command::new(&node)
         .arg("--experimental-strip-types")
         .arg("--no-warnings")
-        .arg(driver)
+        .arg(&driver)
         .output()
         .expect("failed to run generated N-API adapter driver");
     if !run.status.success() {
@@ -201,9 +209,40 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
             String::from_utf8_lossy(&run.stderr),
         );
     }
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "generated N-API adapter driver did not print ok"
+    );
+
+    let default_addon = single_node_addon(out_dir.join("node"));
+    let override_addon = tmp.path().join("override_cli_napi.node");
+    std::fs::copy(&default_addon, &override_addon).unwrap();
+    std::fs::remove_file(&default_addon).unwrap();
+    let override_run = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(&driver)
+        .env("UNIFFI_CLI_NAPI_NAPI_PATH", override_addon)
+        .output()
+        .expect("failed to run generated N-API adapter driver through env override");
+    if !override_run.status.success() {
+        panic!(
+            "generated N-API adapter driver failed through env override:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&override_run.stdout),
+            String::from_utf8_lossy(&override_run.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&override_run.stdout).contains("ok"),
+        "generated N-API env override driver did not print ok"
+    );
 }
 
 fn assert_single_node_addon(dir: Utf8PathBuf) {
+    let _ = single_node_addon(dir);
+}
+
+fn single_node_addon(dir: Utf8PathBuf) -> std::path::PathBuf {
     let addons = std::fs::read_dir(dir.as_std_path())
         .unwrap()
         .filter_map(|entry| entry.ok())
@@ -215,4 +254,5 @@ fn assert_single_node_addon(dir: Utf8PathBuf) {
         1,
         "expected exactly one .node addon in {dir}: {addons:?}"
     );
+    addons.into_iter().next().unwrap()
 }
