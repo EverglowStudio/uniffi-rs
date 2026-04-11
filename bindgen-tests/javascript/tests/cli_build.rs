@@ -295,6 +295,7 @@ fn cli_build_orchestrates_wasm_and_napi() {
     for path in [
         "common/api.ts",
         "browser/index.ts",
+        "browser/index.web.ts",
         "browser/backend-wasm.ts",
         "node/index.ts",
         "node/backend-napi.ts",

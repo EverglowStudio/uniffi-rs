@@ -25,9 +25,9 @@
 //!
 //! Scope: functions that actually exist on the napi addon. Object
 //! destructors (`__uniffi_<obj>_object_free`) are NOT included — napi
-//! manages class lifetime through Rust `Drop`, and the electron bridge
-//! handles `dispose` via its `drop` message kind, not through
-//! `addon[method]`.
+//! manages native class lifetime through napi-rs/V8 and the node adapter
+//! handles `dispose` as an idempotent no-op. Electron handles `dispose`
+//! via its preload `drop` message kind, not through `addon[method]`.
 
 use uniffi_bindgen::ComponentInterface;
 

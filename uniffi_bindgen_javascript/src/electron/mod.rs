@@ -364,6 +364,16 @@ fn render_renderer(namespace: &str, async_keys: &[String]) -> String {
              );\n\
          }}\n\
          \n\
+         function dropSync(handle: unknown): void {{\n\
+             if (\n\
+                 handle !== null &&\n\
+                 typeof handle === \"object\" &&\n\
+                 (handle as {{ __uniffiHandle?: boolean }}).__uniffiHandle === true\n\
+             ) {{\n\
+                 unwrap(window.__uniffi__.dispatchSync({{ kind: \"drop\", id: (handle as {{ id: number }}).id }}));\n\
+             }}\n\
+         }}\n\
+         \n\
          async function callAsync(method: string, ...args: unknown[]): Promise<unknown> {{\n\
              const id = nextCallId++;\n\
              return unwrap(\n\
@@ -373,6 +383,13 @@ fn render_renderer(namespace: &str, async_keys: &[String]) -> String {
          \n\
          const backend = new Proxy({{}}, {{\n\
              get(_t, method: string) {{\n\
+                 if (method.startsWith(\"__uniffi_\") && method.endsWith(\"_object_free\")) {{\n\
+                     // `common/objects.ts` calls the wasm-style destructor\n\
+                     // key for all flavors. In Electron, opaque handles live\n\
+                     // in preload, so translate the destructor into the\n\
+                     // existing synchronous drop bridge message.\n\
+                     return (handle: unknown) => dropSync(handle);\n\
+                 }}\n\
                  if (ASYNC_METHODS.has(method)) {{\n\
                      return (...args: unknown[]) => callAsync(method, ...args);\n\
                  }}\n\

@@ -2922,6 +2922,11 @@ crate-type = ["rlib"]
             "node/backend-napi.ts missing mapping `{snake}` -> `{camel}`:\n{backend_napi}"
         );
     }
+    assert!(
+        backend_napi.contains("__uniffiIsObjectFreeKey")
+            && backend_napi.contains("destructor calls as idempotent no-ops"),
+        "node/backend-napi.ts must handle wasm-style object_free keys as documented no-ops:\n{backend_napi}"
+    );
 
     let preload = std::fs::read_to_string(gen_dir.join("electron/preload.cjs")).unwrap();
     assert!(
@@ -2940,6 +2945,14 @@ crate-type = ["rlib"]
     assert!(
         preload.contains("resolveMethod(msg.method)"),
         "electron/preload.cjs must dispatch through resolveMethod()"
+    );
+
+    let renderer = std::fs::read_to_string(gen_dir.join("electron/renderer.ts")).unwrap();
+    assert!(
+        renderer.contains("dropSync(handle: unknown)")
+            && renderer.contains("kind: \"drop\"")
+            && renderer.contains("method.endsWith(\"_object_free\")"),
+        "electron/renderer.ts must translate object_free keys into preload drop messages:\n{renderer}"
     );
 }
 
@@ -5829,6 +5842,9 @@ expectBigint(nodeApi.roundtripI64(-9223372036854775808n), -9223372036854775808n,
 expectBigint(await nodeApi.asyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "node api asyncRoundtripU64");
 const nodeCounter = nodeApi.Counter.withInitial(3n);
 expectBigint(nodeCounter.get(), 3n, "node api counter.get");
+nodeCounter.dispose();
+nodeCounter.dispose();
+expectThrow("node api counter use-after-dispose", () => nodeCounter.get(), /dispose|UniffiUseAfterDispose/i);
 assert(await nodeApi.slowAdd(20, 22, 300n) === 42, "node api slowAdd mixed args");
 
 require("./electron/preload.cjs");
@@ -6168,6 +6184,20 @@ const electronCounter = electronApi.invokeValueProviderMakeCounter(electronProvi
 electronCounter.inc();
 if (electronCounter.value() !== 13) {
     throw new Error(`electron makeCounter failed: ${electronCounter.value()}`);
+}
+electronCounter.dispose();
+electronCounter.dispose();
+let electronCounterUseAfterDispose = false;
+try {
+    electronCounter.value();
+} catch (e) {
+    electronCounterUseAfterDispose = true;
+    if (!/dispose|UniffiUseAfterDispose/i.test(String((e as Error).message ?? e))) {
+        throw new Error(`electron counter use-after-dispose wrong error: ${e && (e as Error).message}`);
+    }
+}
+if (!electronCounterUseAfterDispose) {
+    throw new Error("electron counter use-after-dispose should throw");
 }
 const electronGreeter = electronApi.invokeValueProviderMakeGreeter(electronProvider as any, "Yo");
 if (electronGreeter.greet("Ada") !== "Yo Ada!") {

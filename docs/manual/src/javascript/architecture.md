@@ -11,7 +11,7 @@ adapters:
 
 ```text
 common/            high-level TypeScript API and copied runtime
-browser/           wasm-bindgen adapter and browser entrypoint
+browser/           wasm-bindgen adapter, explicit entrypoint, optional web auto-entrypoint
 node/              N-API adapter and Node entrypoint
 electron/          preload bridge and renderer entrypoint
 rust_modules/      generated wasm / N-API host crates when requested
@@ -38,6 +38,17 @@ flavors live in small helper modules:
   shapes such as napi-rs `type`.
 - `host_crates`: generated Rust host crates for wasm and N-API so downstream
   users do not need to maintain wrapper crates by hand.
+
+The wasm web auto-entrypoint is emitted by the `uniffi-bindgen javascript
+build-wasm` / `build` CLI orchestration after `wasm-bindgen` runs, not by the
+base `wasm` flavor generator. This keeps `browser/index.ts` target-agnostic and
+explicit while letting the CLI write target-specific imports for the final
+wasm-bindgen JS glue and `.wasm` asset names.
+
+The Node/N-API adapter still installs synchronously on import. Its native addon
+loader first honors generated environment-variable overrides for packaging
+scenarios, then falls back to the copied `./<namespace>.node` addon produced by
+`uniffi-bindgen javascript build-napi`.
 
 When adding a feature, prefer extending these helpers over copying equivalent
 logic into each flavor.

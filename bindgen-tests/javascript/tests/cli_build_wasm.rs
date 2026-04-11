@@ -173,6 +173,7 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
     for path in [
         "common/api.ts",
         "browser/index.ts",
+        "browser/index.web.ts",
         "browser/backend-wasm.ts",
     ] {
         let file = out_dir.join(path);
@@ -223,5 +224,18 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
             .iter()
             .any(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm")),
         "wasm-bindgen output dir should contain a .wasm artifact: {pkg_entries:?}"
+    );
+    let glue_stem = pkg_entries
+        .iter()
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("js"))
+        .and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .expect("wasm-bindgen output dir should contain a .js glue file");
+    let web_entry = std::fs::read_to_string(out_dir.join("browser/index.web.ts")).unwrap();
+    assert!(
+        web_entry.contains(&format!("{glue_stem}.js"))
+            && web_entry.contains(&format!("{glue_stem}_bg.wasm?url"))
+            && web_entry.contains("export const ready: Promise<void> = init();")
+            && web_entry.contains("export * from \"./index.ts\";"),
+        "browser auto-entrypoint should import the real wasm-bindgen output and re-export the explicit entrypoint:\n{web_entry}"
     );
 }
