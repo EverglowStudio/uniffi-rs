@@ -33,6 +33,9 @@ pub(crate) enum JavascriptCommands {
 
     /// Build JavaScript + N-API bindings, emit/build the napi host crate, and copy `.node` addons.
     BuildNapi(BuildNapiArgs),
+
+    /// Build JavaScript + Harmony/OpenHarmony bindings through ohos-rs Node-API.
+    BuildOhos(BuildOhosArgs),
 }
 
 #[derive(Clone, Args)]
@@ -267,6 +270,77 @@ pub(crate) struct BuildNapiArgs {
     metadata_no_deps: bool,
 }
 
+#[derive(Clone, Args)]
+pub(crate) struct BuildOhosArgs {
+    /// Downstream core crate Cargo.toml.
+    #[clap(long = "manifest-path")]
+    manifest_path: Utf8PathBuf,
+
+    /// Directory in which to write generated JavaScript files.
+    #[clap(long, short)]
+    out_dir: Utf8PathBuf,
+
+    /// Optional override for the library/cdylib path used for JS generation.
+    #[clap(long = "library-path")]
+    library_path: Option<Utf8PathBuf>,
+
+    /// Optional UDL or source input passed directly to the JS generator.
+    #[clap(long)]
+    source: Option<Utf8PathBuf>,
+
+    /// Directory (default `rust_modules`) in which to emit the generated OHOS host crate.
+    #[clap(long = "host-crates-dir", default_value = "rust_modules")]
+    host_crates_dir: Utf8PathBuf,
+
+    /// Output directory passed to `ohrs build --dist`.
+    #[clap(long = "dist-dir")]
+    dist_dir: Option<Utf8PathBuf>,
+
+    /// OHOS architecture alias passed to `ohrs build --arch`. Defaults to `aarch` and `x64`.
+    #[clap(long = "arch")]
+    arch: Vec<String>,
+
+    /// Override the `cargo` binary used for the initial metadata/source build.
+    #[clap(long = "cargo-bin", default_value = "cargo")]
+    cargo_bin: String,
+
+    /// Override the `ohrs` binary used to build the OHOS host crate.
+    #[clap(long = "ohrs-bin", default_value = "ohrs")]
+    ohrs_bin: String,
+
+    /// Optional local checkout of ohos-rs; when set, generated host crate uses path deps.
+    #[clap(long = "ohos-rs-dir")]
+    ohos_rs_dir: Option<Utf8PathBuf>,
+
+    /// Cargo target directory passed through to `ohrs build --target-dir`.
+    #[clap(long = "target-dir")]
+    target_dir: Option<Utf8PathBuf>,
+
+    /// Build the downstream core crate and generated OHOS host crate in release mode.
+    #[clap(long)]
+    release: bool,
+
+    /// Do not try to format the generated bindings.
+    #[clap(long, short)]
+    no_format: bool,
+
+    /// Path to optional uniffi config file.
+    #[clap(long, short)]
+    config: Option<Utf8PathBuf>,
+
+    /// Optional crate filter passed through to the JS generator.
+    #[clap(long = "crate")]
+    crate_name: Option<String>,
+
+    /// Whether we should exclude dependencies when running cargo metadata.
+    #[clap(long)]
+    metadata_no_deps: bool,
+
+    /// Additional cargo args passed to `ohrs build` after `--`.
+    #[clap(last = true)]
+    cargo_args: Vec<String>,
+}
+
 #[derive(Copy, Clone, ValueEnum)]
 enum NapiBuildFlavorArg {
     Napi,
@@ -312,6 +386,7 @@ pub(crate) fn run(args: JavascriptArgs) -> Result<()> {
         JavascriptCommands::Build(args) => build(args),
         JavascriptCommands::BuildWasm(args) => build_wasm(args),
         JavascriptCommands::BuildNapi(args) => build_napi(args),
+        JavascriptCommands::BuildOhos(args) => build_ohos(args),
     }
 }
 
@@ -406,6 +481,7 @@ fn build_wasm(args: BuildWasmArgs) -> Result<()> {
         Some(HostCrateOptions {
             manifest_path: manifest_path.clone(),
             host_crates_dir: args.host_crates_dir.clone(),
+            ohos_rs_dir: None,
         }),
         vec![FlavorTarget::Wasm],
     )?;
@@ -532,6 +608,7 @@ fn build_napi(args: BuildNapiArgs) -> Result<()> {
         Some(HostCrateOptions {
             manifest_path: manifest_path.clone(),
             host_crates_dir: args.host_crates_dir.clone(),
+            ohos_rs_dir: None,
         }),
         flavors.clone(),
     )?;
@@ -583,7 +660,7 @@ fn build_napi(args: BuildNapiArgs) -> Result<()> {
         let subdir = match flavor {
             FlavorTarget::Napi => "node",
             FlavorTarget::Electron => "electron",
-            FlavorTarget::Wasm => continue,
+            FlavorTarget::Wasm | FlavorTarget::Harmony => continue,
         };
         let flavor_dir = args.out_dir.join(subdir);
         ensure_single_generated_rs(&flavor_dir)
@@ -596,6 +673,104 @@ fn build_napi(args: BuildNapiArgs) -> Result<()> {
         std::fs::copy(&napi_artifact, &addon_path)
             .with_context(|| format!("copying built napi addon {napi_artifact} to {addon_path}"))?;
     }
+
+    Ok(())
+}
+
+fn build_ohos(args: BuildOhosArgs) -> Result<()> {
+    let manifest_path = canonicalize_or_keep(&args.manifest_path);
+    let core_meta = cargo_package_metadata(&manifest_path)?;
+
+    let mut build_core =
+        cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
+    run_command(
+        &args.cargo_bin,
+        &mut build_core,
+        "cargo",
+        "install Rust's cargo toolchain or pass --cargo-bin <path>",
+    )?;
+
+    let generation_source = if let Some(source) = &args.source {
+        canonicalize_or_keep(source)
+    } else {
+        let library_path = args
+            .library_path
+            .clone()
+            .map(|p| canonicalize_or_keep(&p))
+            .unwrap_or_else(|| core_meta.host_cdylib_path(args.release));
+        if !library_path.exists() {
+            bail!(
+                "built library not found at {}. Ensure the downstream crate declares a cdylib target, pass --library-path <path>, or pass --source <udl-or-library>",
+                library_path
+            );
+        }
+        library_path
+    };
+
+    generate_js(
+        &manifest_path,
+        generation_source,
+        args.out_dir.clone(),
+        args.config.clone(),
+        args.crate_name.clone(),
+        args.metadata_no_deps,
+        args.no_format,
+        Some(HostCrateOptions {
+            manifest_path: manifest_path.clone(),
+            host_crates_dir: args.host_crates_dir.clone(),
+            ohos_rs_dir: args.ohos_rs_dir.clone(),
+        }),
+        vec![FlavorTarget::Harmony],
+    )?;
+
+    let host_root = if args.host_crates_dir.is_absolute() {
+        args.host_crates_dir.clone()
+    } else {
+        Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+            .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?
+            .join(&args.host_crates_dir)
+    };
+    let ohos_dir = host_root.join("ohos");
+    let ohos_manifest = ohos_dir.join("Cargo.toml");
+    if !ohos_manifest.exists() {
+        bail!(
+            "OHOS host crate was not emitted at {}",
+            ohos_manifest
+                .parent()
+                .unwrap_or_else(|| Utf8Path::new("<unknown>"))
+        );
+    }
+
+    let arches = if args.arch.is_empty() {
+        vec!["aarch".to_string(), "x64".to_string()]
+    } else {
+        args.arch.clone()
+    };
+    let dist_dir = args
+        .dist_dir
+        .clone()
+        .unwrap_or_else(|| ohos_dir.join("dist"));
+    let mut ohrs = Command::new(&args.ohrs_bin);
+    ohrs.arg("build").arg("--dist").arg(dist_dir.as_str());
+    if args.release {
+        ohrs.arg("--release");
+    }
+    for arch in &arches {
+        ohrs.arg("--arch").arg(arch);
+    }
+    if let Some(target_dir) = &args.target_dir {
+        ohrs.arg("--target-dir").arg(target_dir.as_str());
+    }
+    if !args.cargo_args.is_empty() {
+        ohrs.arg("--").args(&args.cargo_args);
+    }
+    ohrs.current_dir(ohos_dir.as_std_path());
+    run_command(
+        &args.ohrs_bin,
+        &mut ohrs,
+        "ohrs",
+        "install ohos-rs `cargo-ohrs`, configure the Harmony/OpenHarmony SDK, or pass --ohrs-bin <path>",
+    )?;
 
     Ok(())
 }

@@ -57,6 +57,7 @@ enum JsFlavorArg {
     Wasm,
     Napi,
     Electron,
+    Harmony,
 }
 
 impl From<JsFlavorArg> for FlavorTarget {
@@ -65,6 +66,7 @@ impl From<JsFlavorArg> for FlavorTarget {
             JsFlavorArg::Wasm => FlavorTarget::Wasm,
             JsFlavorArg::Napi => FlavorTarget::Napi,
             JsFlavorArg::Electron => FlavorTarget::Electron,
+            JsFlavorArg::Harmony => FlavorTarget::Harmony,
         }
     }
 }
@@ -294,7 +296,7 @@ pub fn run_main() -> anyhow::Result<()> {
                 if js_flavor.is_empty() {
                     anyhow::bail!(
                         "--flavor is required when --language javascript is set \
-                         (pick one or more of: wasm, napi, electron)"
+                         (pick one or more of: wasm, napi, electron, harmony)"
                     );
                 }
                 let mut paths = BindgenPaths::default();
@@ -335,6 +337,7 @@ pub fn run_main() -> anyhow::Result<()> {
                                 host_crates_dir: host_crates_dir
                                     .clone()
                                     .unwrap_or_else(|| Utf8PathBuf::from("rust_modules")),
+                                ohos_rs_dir: None,
                             })
                         } else {
                             None
