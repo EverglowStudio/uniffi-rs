@@ -3883,6 +3883,35 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
          \x20   pub right: u32,\n\
          }\n\n\
          #[derive(Debug)]\n\
+         pub struct Counter {\n\
+         \x20   inner: std::sync::Mutex<u32>,\n\
+         }\n\n\
+         impl Counter {\n\
+         \x20   pub fn new(initial: u32) -> std::sync::Arc<Self> {\n\
+         \x20       std::sync::Arc::new(Self { inner: std::sync::Mutex::new(initial) })\n\
+         \x20   }\n\
+         \x20   pub fn inc(&self) {\n\
+         \x20       *self.inner.lock().unwrap() += 1;\n\
+         \x20   }\n\
+         \x20   pub fn value(&self) -> u32 {\n\
+         \x20       *self.inner.lock().unwrap()\n\
+         \x20   }\n\
+         }\n\n\
+         pub trait Greeter: Send + Sync {\n\
+         \x20   fn greet(&self, name: String) -> String;\n\
+         }\n\n\
+         pub struct English {\n\
+         \x20   prefix: String,\n\
+         }\n\n\
+         impl Greeter for English {\n\
+         \x20   fn greet(&self, name: String) -> String {\n\
+         \x20       format!(\"{}{}{}!\", self.prefix, if self.prefix.ends_with(' ') { \"\" } else { \" \" }, name)\n\
+         \x20   }\n\
+         }\n\n\
+         pub fn english_greeter(prefix: String) -> std::sync::Arc<dyn Greeter> {\n\
+         \x20   std::sync::Arc::new(English { prefix })\n\
+         }\n\n\
+         #[derive(Debug)]\n\
          pub enum ProviderError {\n\
          \x20   BadValue,\n\
          }\n\n\
@@ -3897,6 +3926,8 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
          pub trait ValueProvider: Send + Sync {\n\
          \x20   fn get_value(&self) -> u32;\n\
          \x20   fn make_payload(&self) -> Payload;\n\
+         \x20   fn make_counter(&self, initial: u32) -> std::sync::Arc<Counter>;\n\
+         \x20   fn make_greeter(&self, prefix: String) -> std::sync::Arc<dyn Greeter>;\n\
          \x20   fn checked_value(&self, fail: bool) -> Result<u32, ProviderError>;\n\
          \x20   fn checked_payload(&self, fail: bool) -> Result<Payload, ProviderError>;\n\
          \x20   fn checked_void(&self, fail: bool) -> Result<(), ProviderError>;\n\
@@ -3906,6 +3937,12 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
          }\n\n\
          pub fn invoke_value_provider_make_payload(provider: std::sync::Arc<dyn ValueProvider>) -> Payload {\n\
          \x20   provider.make_payload()\n\
+         }\n\n\
+         pub fn invoke_value_provider_make_counter(provider: std::sync::Arc<dyn ValueProvider>, initial: u32) -> std::sync::Arc<Counter> {\n\
+         \x20   provider.make_counter(initial)\n\
+         }\n\n\
+         pub fn invoke_value_provider_make_greeter(provider: std::sync::Arc<dyn ValueProvider>, prefix: String) -> std::sync::Arc<dyn Greeter> {\n\
+         \x20   provider.make_greeter(prefix)\n\
          }\n\n\
          pub fn invoke_value_provider_checked_value(provider: std::sync::Arc<dyn ValueProvider>, fail: bool) -> Result<u32, ProviderError> {\n\
          \x20   provider.checked_value(fail)\n\
@@ -3928,6 +3965,17 @@ dictionary Payload {
   u32 right;
 };
 
+interface Counter {
+  constructor(u32 initial);
+  void inc();
+  u32 value();
+};
+
+[Trait]
+interface Greeter {
+  string greet(string name);
+};
+
 [Error]
 enum ProviderError {
   "BadValue",
@@ -3937,6 +3985,8 @@ enum ProviderError {
 interface ValueProvider {
   u32 get_value();
   Payload make_payload();
+  Counter make_counter(u32 initial);
+  Greeter make_greeter(string prefix);
   [Throws=ProviderError]
   u32 checked_value(boolean fail);
   [Throws=ProviderError]
@@ -3948,6 +3998,9 @@ interface ValueProvider {
 namespace callback_return {
   u32 invoke_value_provider_get_value(ValueProvider provider);
   Payload invoke_value_provider_make_payload(ValueProvider provider);
+  Counter invoke_value_provider_make_counter(ValueProvider provider, u32 initial);
+  Greeter invoke_value_provider_make_greeter(ValueProvider provider, string prefix);
+  Greeter english_greeter(string prefix);
   [Throws=ProviderError]
   u32 invoke_value_provider_checked_value(ValueProvider provider, boolean fail);
   [Throws=ProviderError]
@@ -5350,7 +5403,9 @@ exports.__state = state;
     let callbacks = std::fs::read_to_string(generated.join("common/callbacks.ts")).unwrap();
     assert!(
         callbacks.contains("interface ValueProvider")
-            && callbacks.contains("makePayload(): Payload"),
+            && callbacks.contains("makePayload(): Payload")
+            && callbacks.contains("makeCounter(initial: number): Counter")
+            && callbacks.contains("makeGreeter(prefix: string): Greeter"),
         "common/callbacks.ts should expose a return-capable callback interface:\n{callbacks}"
     );
 
@@ -5371,15 +5426,23 @@ exports.__state = state;
         r#"
 import { invokeValueProviderGetValue, invokeValueProviderMakePayload } from "./node/index.ts";
 import {
+    Counter,
     ProviderError,
+    englishGreeter,
     invokeValueProviderCheckedPayload,
     invokeValueProviderCheckedValue,
     invokeValueProviderCheckedVoid,
+    invokeValueProviderMakeCounter,
+    invokeValueProviderMakeGreeter,
 } from "./node/index.ts";
 import { UniffiError } from "./common/runtime.ts";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
+// Simulate the renderer global before importing the electron entry.
+(globalThis as any).window = globalThis as any;
+const electronApi = await import("./electron/renderer.ts");
+require("./electron/preload.cjs");
 
 const provider = {
     getValue() {
@@ -5387,6 +5450,12 @@ const provider = {
     },
     makePayload() {
         return { left: 7, right: 11 };
+    },
+    makeCounter(initial: number) {
+        return Counter.new(initial);
+    },
+    makeGreeter(prefix: string) {
+        return englishGreeter(prefix);
     },
     checkedValue(fail: boolean) {
         if (fail) throw new ProviderError("BadValue", "BadValue");
@@ -5408,6 +5477,15 @@ if (scalar !== 42) {
 const payload = invokeValueProviderMakePayload(provider as any);
 if (payload.left !== 7 || payload.right !== 11) {
     throw new Error(`makePayload failed: ${JSON.stringify(payload)}`);
+}
+const returnedCounter = invokeValueProviderMakeCounter(provider as any, 10);
+returnedCounter.inc();
+if (returnedCounter.value() !== 11) {
+    throw new Error(`node makeCounter failed: ${returnedCounter.value()}`);
+}
+const returnedGreeter = invokeValueProviderMakeGreeter(provider as any, "Hi");
+if (returnedGreeter.greet("Ada") !== "Hi Ada!") {
+    throw new Error(`node makeGreeter failed: ${returnedGreeter.greet("Ada")}`);
 }
 
 if (invokeValueProviderCheckedValue(provider as any, false) !== 77) {
@@ -5447,6 +5525,24 @@ const bridge = (globalThis as any).__uniffi__;
 if (!bridge || typeof bridge.dispatchSync !== "function") {
     throw new Error("missing electron preload bridge");
 }
+const electronProvider = {
+    ...provider,
+    makeCounter(initial: number) {
+        return electronApi.Counter.new(initial);
+    },
+    makeGreeter(prefix: string) {
+        return electronApi.englishGreeter(prefix);
+    },
+};
+const electronCounter = electronApi.invokeValueProviderMakeCounter(electronProvider as any, 12);
+electronCounter.inc();
+if (electronCounter.value() !== 13) {
+    throw new Error(`electron makeCounter failed: ${electronCounter.value()}`);
+}
+const electronGreeter = electronApi.invokeValueProviderMakeGreeter(electronProvider as any, "Yo");
+if (electronGreeter.greet("Ada") !== "Yo Ada!") {
+    throw new Error(`electron makeGreeter failed: ${electronGreeter.greet("Ada")}`);
+}
 const electronMarker = {
     __uniffiCallback: true,
     object: provider,
@@ -5460,7 +5556,7 @@ let electronRes = bridge.dispatchSync({
     kind: "call",
     id: 1,
     method: "invoke_value_provider_checked_value",
-    args: [electronMarker, false],
+    args: [{ ...electronMarker, object: electronProvider }, false],
 });
 if (electronRes.kind !== "ok" || electronRes.value !== 77) {
     throw new Error(`electron checked value failed: ${JSON.stringify(electronRes)}`);
@@ -5469,7 +5565,7 @@ electronRes = bridge.dispatchSync({
     kind: "call",
     id: 2,
     method: "invoke_value_provider_checked_value",
-    args: [electronMarker, true],
+    args: [{ ...electronMarker, object: electronProvider }, true],
 });
 if (electronRes.kind !== "err" || !String(electronRes.error?.message ?? "").includes("BadValue")) {
     throw new Error(`electron checked value error failed: ${JSON.stringify(electronRes)}`);
