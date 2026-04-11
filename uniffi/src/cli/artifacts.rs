@@ -85,8 +85,12 @@ pub(crate) struct BuildArgs {
     wasm_bindgen_target: WasmBindgenTargetArg,
 
     /// Override the `wasm-bindgen` binary to invoke.
-    #[clap(long = "wasm-bindgen-bin", default_value = "wasm-bindgen")]
-    wasm_bindgen_bin: String,
+    #[clap(long = "wasm-bindgen-bin")]
+    wasm_bindgen_bin: Option<String>,
+
+    /// Optional local checkout of wasm-bindgen; when set and --wasm-bindgen-bin is omitted, build and use it.
+    #[clap(long = "wasm-bindgen-dir")]
+    wasm_bindgen_dir: Option<Utf8PathBuf>,
 
     /// Cargo target directory for the generated N-API host build.
     #[clap(long = "napi-target-dir")]
@@ -201,7 +205,7 @@ fn build(args: BuildArgs) -> Result<()> {
     }
 
     if targets.wasm {
-        build_wasm(args.to_wasm_args()).context("building wasm artifact target")?;
+        build_wasm(args.to_wasm_args()?).context("building wasm artifact target")?;
     }
 
     let mut napi_flavors = Vec::new();
@@ -471,8 +475,8 @@ fn expand_targets(targets: &[ArtifactTargetArg]) -> Result<ExpandedTargets> {
 }
 
 impl BuildArgs {
-    fn to_wasm_args(&self) -> BuildWasmArgs {
-        BuildWasmArgs {
+    fn to_wasm_args(&self) -> Result<BuildWasmArgs> {
+        Ok(BuildWasmArgs {
             manifest_path: self.manifest_path.clone(),
             out_dir: self.out_dir.clone(),
             library_path: self.library_path.clone(),
@@ -481,13 +485,13 @@ impl BuildArgs {
             wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
             wasm_bindgen_target: self.wasm_bindgen_target,
             cargo_bin: self.cargo_bin.clone(),
-            wasm_bindgen_bin: self.wasm_bindgen_bin.clone(),
+            wasm_bindgen_bin: self.resolve_wasm_bindgen_bin()?,
             release: self.release,
             no_format: self.no_format,
             config: self.config.clone(),
             crate_name: self.crate_name.clone(),
             metadata_no_deps: self.metadata_no_deps,
-        }
+        })
     }
 
     fn to_napi_args(&self, flavor: Vec<NapiBuildFlavorArg>) -> BuildNapiArgs {
@@ -577,6 +581,44 @@ impl BuildArgs {
             });
         if !bin.exists() {
             bail!("built ohrs binary not found at {}", bin);
+        }
+        Ok(bin.to_string())
+    }
+
+    fn resolve_wasm_bindgen_bin(&self) -> Result<String> {
+        if let Some(bin) = &self.wasm_bindgen_bin {
+            return Ok(bin.clone());
+        }
+        let Some(wasm_bindgen_dir) = &self.wasm_bindgen_dir else {
+            return Ok("wasm-bindgen".to_string());
+        };
+
+        let manifest = wasm_bindgen_dir.join("crates/cli/Cargo.toml");
+        if !manifest.exists() {
+            bail!(
+                "--wasm-bindgen-dir was provided, but {} does not exist",
+                manifest
+            );
+        }
+
+        let mut cargo = Command::new(&self.cargo_bin);
+        cargo
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(manifest.as_str())
+            .arg("--bin")
+            .arg("wasm-bindgen");
+        run_command(&self.cargo_bin, &mut cargo, "cargo")?;
+
+        let bin = wasm_bindgen_dir
+            .join("target/debug")
+            .join(if cfg!(target_os = "windows") {
+                "wasm-bindgen.exe"
+            } else {
+                "wasm-bindgen"
+            });
+        if !bin.exists() {
+            bail!("built wasm-bindgen binary not found at {}", bin);
         }
         Ok(bin.to_string())
     }
