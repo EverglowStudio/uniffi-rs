@@ -440,11 +440,19 @@ fn expand_targets(targets: &[ArtifactTargetArg]) -> Result<ExpandedTargets> {
             ArtifactTargetArg::Harmony => expanded.harmony = true,
             ArtifactTargetArg::Apple => expanded.apple = true,
             ArtifactTargetArg::Android => expanded.android = true,
-            ArtifactTargetArg::AllJs | ArtifactTargetArg::All => {
+            ArtifactTargetArg::AllJs => {
                 expanded.wasm = true;
                 expanded.node = true;
                 expanded.electron = true;
                 expanded.harmony = true;
+            }
+            ArtifactTargetArg::All => {
+                expanded.wasm = true;
+                expanded.node = true;
+                expanded.electron = true;
+                expanded.harmony = true;
+                expanded.apple = true;
+                expanded.android = true;
             }
         }
     }
@@ -909,6 +917,21 @@ mod tests {
                 harmony: true,
                 apple: false,
                 android: false,
+            }
+        );
+    }
+
+    #[test]
+    fn expands_all_targets() {
+        assert_eq!(
+            expand_targets(&[ArtifactTargetArg::All]).unwrap(),
+            ExpandedTargets {
+                wasm: true,
+                node: true,
+                electron: true,
+                harmony: true,
+                apple: true,
+                android: true,
             }
         );
     }
