@@ -185,13 +185,13 @@ export interface <Name> { <method>(<args>): <Ret> | Promise<<Ret>>; }
 - Callback failures must be normalized through the same error model described
   above.
 - The napi/electron adapters and wasm adapter support synchronous callbacks
-  that return values and callbacks that throw a declared UniFFI error.
+  that return values, including configured custom types backed by supported
+  builtins, and callbacks that throw a declared UniFFI error.
   Internally the adapter converts thrown typed JS errors into a backend
   envelope before Rust receives the callback result.
 
-Support is flavor-dependent. For example, the wasm backend currently supports a
-smaller callback subset than the napi/electron path: async callback methods and
-object/callback/custom callback returns are still not part of contract v1.
+Support is still intentionally scoped: async callback methods and
+object/callback callback returns are not part of contract v1.
 
 ## Async
 
@@ -294,6 +294,6 @@ fast rather than run with mixed assumptions.
 - non-string keyed record-like structures
 - cancellation / `AbortSignal`
 - async callback traits
-- callback methods returning objects, callback traits, or custom types
+- callback methods returning objects or callback traits
 
 These are future contract extensions rather than v1 guarantees.
