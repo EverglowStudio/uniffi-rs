@@ -7,9 +7,11 @@ use super::javascript::{
     NapiBuildFlavorArg, WasmBindgenTargetArg,
 };
 use anyhow::{bail, Context, Result};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
+use cargo_metadata::MetadataCommand;
 use clap::{Args, Subcommand, ValueEnum};
 use std::process::Command;
+use uniffi_bindgen::bindings::{generate, GenerateOptions, TargetLanguage};
 
 #[derive(Args)]
 pub(crate) struct ArtifactsArgs {
@@ -112,6 +114,22 @@ pub(crate) struct BuildArgs {
     /// Additional cargo args passed to `ohrs build` after `--`.
     #[clap(last = true)]
     ohos_cargo_args: Vec<String>,
+
+    /// Apple Rust target triple. Defaults to iOS device and Apple Silicon simulator.
+    #[clap(long = "apple-target")]
+    apple_target: Vec<String>,
+
+    /// Output `.xcframework` path for `--target apple`.
+    #[clap(long = "apple-xcframework-out")]
+    apple_xcframework_out: Option<Utf8PathBuf>,
+
+    /// Optional directory in which to copy generated Swift sources.
+    #[clap(long = "apple-swift-out")]
+    apple_swift_out: Option<Utf8PathBuf>,
+
+    /// Optional XCFramework name. Defaults to the output path stem.
+    #[clap(long = "apple-framework-name")]
+    apple_framework_name: Option<String>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, ValueEnum)]
@@ -147,7 +165,7 @@ fn build(args: BuildArgs) -> Result<()> {
     let targets = expand_targets(&args.target)?;
 
     if targets.apple {
-        bail!("artifacts build --target apple is not implemented yet; see artifact CLI roadmap P2");
+        build_apple(&args).context("building Apple artifact target")?;
     }
     if targets.android {
         bail!(
@@ -172,6 +190,113 @@ fn build(args: BuildArgs) -> Result<()> {
 
     if targets.harmony {
         build_ohos(args.to_ohos_args()?).context("building Harmony/OpenHarmony artifact target")?;
+    }
+
+    Ok(())
+}
+
+fn build_apple(args: &BuildArgs) -> Result<()> {
+    let xcframework_out = args
+        .apple_xcframework_out
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--target apple requires --apple-xcframework-out <path>"))?;
+    let targets = apple_targets(args);
+    let meta = cargo_package_metadata(&args.manifest_path)?;
+    let profile = if args.release { "release" } else { "debug" };
+
+    let mut host_build = Command::new(&args.cargo_bin);
+    host_build
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(args.manifest_path.as_str());
+    if args.release {
+        host_build.arg("--release");
+    }
+    run_command(&args.cargo_bin, &mut host_build, "cargo")?;
+
+    for target in &targets {
+        let mut rustup = Command::new("rustup");
+        rustup.arg("target").arg("add").arg(target);
+        run_command("rustup", &mut rustup, "rustup")?;
+
+        let mut cargo = Command::new(&args.cargo_bin);
+        cargo
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(args.manifest_path.as_str())
+            .arg("--target")
+            .arg(target);
+        if args.release {
+            cargo.arg("--release");
+        }
+        run_command(&args.cargo_bin, &mut cargo, "cargo")?;
+    }
+
+    let generation_source = if let Some(source) = &args.source {
+        source.clone()
+    } else {
+        args.library_path
+            .clone()
+            .unwrap_or_else(|| host_cdylib_path(&meta, args.release))
+    };
+    if !generation_source.exists() {
+        bail!(
+            "Swift generation source not found at {}. Pass --library-path or --source to override",
+            generation_source
+        );
+    }
+
+    let swift_bindings_dir = args.out_dir.join("swift");
+    std::fs::create_dir_all(&swift_bindings_dir)
+        .with_context(|| format!("creating Swift output dir {swift_bindings_dir}"))?;
+    generate(GenerateOptions {
+        languages: vec![TargetLanguage::Swift],
+        out_dir: swift_bindings_dir.clone(),
+        source: generation_source,
+        config_override: args.config.clone(),
+        crate_filter: args.crate_name.clone(),
+        metadata_no_deps: args.metadata_no_deps,
+        format: !args.no_format,
+    })?;
+
+    let headers_dir = args.out_dir.join("apple/headers");
+    stage_swift_headers(&swift_bindings_dir, &headers_dir)?;
+
+    if let Some(swift_out) = &args.apple_swift_out {
+        copy_swift_sources(&swift_bindings_dir, swift_out)?;
+    }
+
+    if let Some(parent) = xcframework_out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating XCFramework parent dir {parent}"))?;
+    }
+    if xcframework_out.exists() {
+        std::fs::remove_dir_all(&xcframework_out)
+            .with_context(|| format!("removing stale XCFramework {xcframework_out}"))?;
+    }
+
+    let libs: Vec<_> = targets
+        .iter()
+        .map(|target| apple_staticlib_path(&meta, target, profile))
+        .collect();
+    let mut xcodebuild = Command::new("xcodebuild");
+    xcodebuild.args(xcodebuild_create_xcframework_args(
+        &libs,
+        &headers_dir,
+        &xcframework_out,
+    ));
+    run_command("xcodebuild", &mut xcodebuild, "xcodebuild")?;
+
+    if let Some(expected_name) = &args.apple_framework_name {
+        let actual = xcframework_out
+            .file_stem()
+            .unwrap_or_default()
+            .trim_end_matches(".xcframework");
+        if actual != expected_name {
+            eprintln!(
+                "warning: --apple-framework-name `{expected_name}` does not match output name `{actual}`"
+            );
+        }
     }
 
     Ok(())
@@ -314,6 +439,165 @@ impl BuildArgs {
     }
 }
 
+fn apple_targets(args: &BuildArgs) -> Vec<String> {
+    if args.apple_target.is_empty() {
+        vec![
+            "aarch64-apple-ios".to_string(),
+            "aarch64-apple-ios-sim".to_string(),
+        ]
+    } else {
+        args.apple_target.clone()
+    }
+}
+
+fn stage_swift_headers(swift_bindings_dir: &Utf8Path, headers_dir: &Utf8Path) -> Result<()> {
+    if headers_dir.exists() {
+        std::fs::remove_dir_all(headers_dir)
+            .with_context(|| format!("removing stale headers dir {headers_dir}"))?;
+    }
+    std::fs::create_dir_all(headers_dir)
+        .with_context(|| format!("creating headers dir {headers_dir}"))?;
+
+    let mut modulemap = String::new();
+    for entry in std::fs::read_dir(swift_bindings_dir)
+        .with_context(|| format!("reading Swift bindings dir {swift_bindings_dir}"))?
+    {
+        let entry = entry?;
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|p| anyhow::anyhow!("Swift output path is not utf8: {}", p.display()))?;
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        if name.ends_with("FFI.h") {
+            std::fs::copy(&path, headers_dir.join(name))
+                .with_context(|| format!("copying Swift FFI header {path}"))?;
+        } else if name.ends_with("FFI.modulemap") {
+            modulemap.push_str(&std::fs::read_to_string(&path)?);
+            modulemap.push('\n');
+        }
+    }
+    if modulemap.is_empty() {
+        bail!("no Swift FFI modulemap found in {swift_bindings_dir}");
+    }
+    std::fs::write(headers_dir.join("module.modulemap"), modulemap)
+        .with_context(|| format!("writing module.modulemap in {headers_dir}"))?;
+    Ok(())
+}
+
+fn copy_swift_sources(swift_bindings_dir: &Utf8Path, swift_out: &Utf8Path) -> Result<()> {
+    std::fs::create_dir_all(swift_out)
+        .with_context(|| format!("creating Swift source output dir {swift_out}"))?;
+    for entry in std::fs::read_dir(swift_bindings_dir)
+        .with_context(|| format!("reading Swift bindings dir {swift_bindings_dir}"))?
+    {
+        let entry = entry?;
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|p| anyhow::anyhow!("Swift output path is not utf8: {}", p.display()))?;
+        if path.extension() == Some("swift") {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            std::fs::copy(&path, swift_out.join(name))
+                .with_context(|| format!("copying Swift source {path}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn run_command(binary: &str, command: &mut Command, tool_name: &str) -> Result<()> {
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .with_context(|| format!("{tool_name} invocation failed while spawning `{binary}`"))?;
+    if !output.status.success() {
+        bail!(
+            "{tool_name} command failed: {rendered}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CargoPackageMetadata {
+    target_directory: Utf8PathBuf,
+    lib_target_name: String,
+}
+
+fn cargo_package_metadata(manifest_path: &Utf8Path) -> Result<CargoPackageMetadata> {
+    let metadata = MetadataCommand::new()
+        .manifest_path(manifest_path.as_std_path())
+        .exec()
+        .with_context(|| format!("running cargo metadata for {manifest_path}"))?;
+    let package = metadata
+        .root_package()
+        .with_context(|| format!("no root package found for manifest {manifest_path}"))?;
+    let lib_target = package
+        .targets
+        .iter()
+        .find(|target| {
+            target
+                .kind
+                .iter()
+                .any(|kind| kind.to_string() == "staticlib")
+        })
+        .or_else(|| {
+            package
+                .targets
+                .iter()
+                .find(|target| target.kind.iter().any(|kind| kind.to_string() == "lib"))
+        })
+        .with_context(|| format!("package {} has no lib/staticlib target", package.name))?;
+    Ok(CargoPackageMetadata {
+        target_directory: Utf8PathBuf::from_path_buf(
+            metadata.target_directory.clone().into_std_path_buf(),
+        )
+        .map_err(|p| anyhow::anyhow!("cargo metadata target dir is not utf8: {}", p.display()))?,
+        lib_target_name: lib_target.name.clone(),
+    })
+}
+
+fn host_cdylib_path(meta: &CargoPackageMetadata, release: bool) -> Utf8PathBuf {
+    meta.target_directory
+        .join(if release { "release" } else { "debug" })
+        .join(host_cdylib_filename(&meta.lib_target_name))
+}
+
+fn host_cdylib_filename(lib_target_name: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{lib_target_name}.dll")
+    } else if cfg!(target_os = "macos") {
+        format!("lib{lib_target_name}.dylib")
+    } else {
+        format!("lib{lib_target_name}.so")
+    }
+}
+
+fn apple_staticlib_path(meta: &CargoPackageMetadata, target: &str, profile: &str) -> Utf8PathBuf {
+    meta.target_directory
+        .join(target)
+        .join(profile)
+        .join(format!("lib{}.a", meta.lib_target_name))
+}
+
+fn xcodebuild_create_xcframework_args(
+    libs: &[Utf8PathBuf],
+    headers_dir: &Utf8Path,
+    output: &Utf8Path,
+) -> Vec<String> {
+    let mut args = vec!["-create-xcframework".to_string()];
+    for lib in libs {
+        args.push("-library".to_string());
+        args.push(lib.to_string());
+        args.push("-headers".to_string());
+        args.push(headers_dir.to_string());
+    }
+    args.push("-output".to_string());
+    args.push(output.to_string());
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +635,45 @@ mod tests {
     #[test]
     fn rejects_empty_target_list() {
         assert!(expand_targets(&[]).is_err());
+    }
+
+    #[test]
+    fn computes_apple_staticlib_path() {
+        let meta = CargoPackageMetadata {
+            target_directory: Utf8PathBuf::from("/repo/target"),
+            lib_target_name: "uni_core".to_string(),
+        };
+        assert_eq!(
+            apple_staticlib_path(&meta, "aarch64-apple-ios", "release"),
+            Utf8PathBuf::from("/repo/target/aarch64-apple-ios/release/libuni_core.a")
+        );
+    }
+
+    #[test]
+    fn renders_xcodebuild_create_xcframework_args() {
+        let args = xcodebuild_create_xcframework_args(
+            &[
+                Utf8PathBuf::from("/target/device/libuni_core.a"),
+                Utf8PathBuf::from("/target/sim/libuni_core.a"),
+            ],
+            Utf8Path::new("/headers"),
+            Utf8Path::new("/out/uni_core.xcframework"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-create-xcframework",
+                "-library",
+                "/target/device/libuni_core.a",
+                "-headers",
+                "/headers",
+                "-library",
+                "/target/sim/libuni_core.a",
+                "-headers",
+                "/headers",
+                "-output",
+                "/out/uni_core.xcframework",
+            ]
+        );
     }
 }
