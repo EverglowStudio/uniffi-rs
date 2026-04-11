@@ -623,8 +623,12 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             match l {
                 Lowering::Native(_) | Lowering::Value { .. } => {
                     let ty = arg.as_type();
-                    let lift = lift_expr(n, &ty, 0);
-                    writeln!(out, "        let __lifted_{n} = {lift};").unwrap();
+                    let lift = lift_expr_result(n, &ty, 0);
+                    writeln!(
+                        out,
+                        "        let __lifted_{n} = (|| -> ::std::result::Result<JsValue, JsError> {{ {lift} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad argument `{n}`: {{e:?}}\"));"
+                    )
+                    .unwrap();
                     writeln!(out, "        let _ = __args_arr.push(&__lifted_{n});").unwrap();
                 }
                 _ => {
@@ -659,6 +663,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             writeln!(out, "        if __ok {{").unwrap();
             if let Some(return_type) = m.return_type() {
                 let value_lower = lower_expr("__value", return_type, 0);
+                let value_ty = core_ty_for(return_type, crate_ident);
                 writeln!(
                     out,
                     "            let __value = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"value\")).unwrap_or(JsValue::UNDEFINED);"
@@ -666,7 +671,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 .unwrap();
                 writeln!(
                     out,
-                    "            Ok(({value_lower}).unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad success value: {{e:?}}\")))"
+                    "            Ok((|| -> ::std::result::Result<{value_ty}, JsError> {{ {value_lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad success value: {{e:?}}\")))"
                 )
                 .unwrap();
             } else {
@@ -678,9 +683,10 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 "            let __error = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"error\")).unwrap_or(JsValue::UNDEFINED);"
             )
             .unwrap();
+            let error_ty = core_ty_for(error_ty, crate_ident);
             writeln!(
                 out,
-                "            Err(({error_lower}).unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad error value: {{e:?}}\")))"
+                "            Err((|| -> ::std::result::Result<{error_ty}, JsError> {{ {error_lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad error value: {{e:?}}\")))"
             )
             .unwrap();
             writeln!(out, "        }}").unwrap();
@@ -701,9 +707,10 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                     .expect("ret_info Some implies return_type")
                     .clone();
                 let lower = lower_expr("__ret", &ty, 0);
+                let return_ty = core_ty_for(&ty, crate_ident);
                 writeln!(
                     out,
-                    "        ({lower}).unwrap_or_else(|e| panic!(\"uniffi wasm callback bad return: {{e:?}}\"))"
+                    "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad return: {{e:?}}\"))"
                 )
                 .unwrap();
             }

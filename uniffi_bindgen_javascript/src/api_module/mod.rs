@@ -423,6 +423,17 @@ fn emit_value_module_imports(
             join_sorted(&grouped.callbacks)
         ));
     }
+    let callback_helpers = value_type_callback_helpers(ci, local_module);
+    if !callback_helpers.is_empty() {
+        let helpers = callback_helpers
+            .iter()
+            .map(|name| format!("__uniffiLowerCallback{name}"))
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "import {{ {} }} from \"./callbacks.ts\";\n",
+            join_sorted(&helpers)
+        ));
+    }
 
     let object_values = usage
         .objects_in_ret
@@ -466,7 +477,12 @@ fn emit_value_module_imports(
         ));
     }
 
-    if has_sync || has_async || !usage.named.is_empty() || !helper_customs.is_empty() {
+    if has_sync
+        || has_async
+        || !usage.named.is_empty()
+        || !callback_helpers.is_empty()
+        || !helper_customs.is_empty()
+    {
         out.push('\n');
     }
 }
@@ -603,58 +619,193 @@ fn render_errors(ci: &ComponentInterface) -> String {
 
 fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("callbacks");
-    let custom_names = ci
+    let mut usage = Usage::default();
+    for obj in ci
         .object_definitions()
         .iter()
         .filter(|obj| matches!(obj.imp(), ObjectImpl::CallbackTrait))
-        .flat_map(|obj| obj.methods())
-        .flat_map(|method| {
-            method
-                .arguments()
-                .iter()
-                .map(|arg| arg.as_type())
-                .chain(method.return_type().into_iter().cloned())
-                .collect::<Vec<_>>()
-        })
-        .flat_map(|ty| custom_type_names(&ty, config))
-        .collect::<BTreeSet<_>>();
-    if !custom_names.is_empty() {
+    {
+        for method in obj.methods() {
+            for arg in method.arguments() {
+                usage.see(&arg.as_type(), UsagePos::Arg, config);
+            }
+            if let Some(ret) = method.return_type() {
+                usage.see(ret, UsagePos::Ret, config);
+            }
+        }
+    }
+    for callback in ci.callback_interface_definitions() {
+        for method in callback.methods() {
+            for arg in method.arguments() {
+                usage.see(&arg.as_type(), UsagePos::Arg, config);
+            }
+            if let Some(ret) = method.return_type() {
+                usage.see(ret, UsagePos::Ret, config);
+            }
+        }
+    }
+
+    let grouped = group_named_types(ci, &usage.named);
+    if !grouped.records.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./records.ts\";\n",
+            join_sorted(&grouped.records)
+        ));
+    }
+    if !grouped.enums.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./enums.ts\";\n",
+            join_sorted(&grouped.enums)
+        ));
+    }
+    if !grouped.errors.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./errors.ts\";\n",
+            join_sorted(&grouped.errors)
+        ));
+    }
+    if !grouped.objects.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./objects.ts\";\n",
+            join_sorted(&grouped.objects)
+        ));
+    }
+    let custom_type_imports = usage.customs.iter().cloned().collect::<Vec<_>>();
+    if !custom_type_imports.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./custom-types.ts\";\n\n",
-            join_sorted(&custom_names.into_iter().collect::<Vec<_>>())
+            join_sorted(&custom_type_imports)
+        ));
+    }
+    let helper_customs = callback_custom_helpers(ci, config);
+    if !helper_customs.is_empty() {
+        let helpers = helper_customs
+            .iter()
+            .flat_map(|name| {
+                [
+                    format!("__uniffiLowerCustom{name}"),
+                    format!("__uniffiLiftCustom{name}"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "import {{ {} }} from \"./custom-types.ts\";\n",
+            join_sorted(&helpers)
+        ));
+    }
+    if !grouped.records.is_empty()
+        || !grouped.enums.is_empty()
+        || !grouped.errors.is_empty()
+        || !grouped.objects.is_empty()
+        || !custom_type_imports.is_empty()
+        || !helper_customs.is_empty()
+    {
+        out.push('\n');
+    }
+
+    let mut rendered = BTreeSet::new();
+    for callback in ci.callback_interface_definitions() {
+        let methods = callback.methods();
+        rendered.insert(callback.name().to_string());
+        out.push_str(&render_callback_definition(
+            ci,
+            config,
+            callback.name(),
+            &methods,
         ));
     }
     for obj in ci.object_definitions() {
         if !matches!(obj.imp(), ObjectImpl::CallbackTrait) {
             continue;
         }
-        out.push_str(&format!("export interface {} {{\n", obj.name()));
-        for m in obj.methods() {
-            let args = m
-                .arguments()
-                .iter()
-                .map(|a| {
-                    format!(
-                        "{}: {}",
-                        js_field_name(a.name()),
-                        ts_type(&a.as_type(), config)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let ret = match m.return_type() {
-                Some(t) => ts_type(t, config),
-                None => "void".to_string(),
-            };
+        if !rendered.insert(obj.name().to_string()) {
+            continue;
+        }
+        let methods = obj.methods();
+        out.push_str(&render_callback_definition(
+            ci,
+            config,
+            obj.name(),
+            &methods,
+        ));
+    }
+    out
+}
+
+fn render_callback_definition(
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    name: &str,
+    methods: &[&Method],
+) -> String {
+    let mut out = format!("export interface {name} {{\n");
+    for m in methods {
+        let args = m
+            .arguments()
+            .iter()
+            .map(|a| {
+                format!(
+                    "{}: {}",
+                    js_field_name(a.name()),
+                    ts_type(&a.as_type(), config)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ret = match m.return_type() {
+            Some(t) => ts_type(t, config),
+            None => "void".to_string(),
+        };
+        out.push_str(&format!(
+            "    {}({}): {};\n",
+            js_fn_name(m.name()),
+            args,
+            ret
+        ));
+    }
+    out.push_str("}\n\n");
+    out.push_str(&render_callback_lowerer(ci, config, name, methods));
+    out
+}
+
+fn render_callback_lowerer(
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    name: &str,
+    methods: &[&Method],
+) -> String {
+    let mut out = format!(
+        "export function __uniffiLowerCallback{name}(__uniffiCallbackObject: {name}): Record<string, unknown> {{\n    return {{\n"
+    );
+    for method in methods {
+        let method_name = js_fn_name(method.name());
+        let args = method
+            .arguments()
+            .iter()
+            .map(|arg| format!("{}: any", js_field_name(arg.name())))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let pass = method
+            .arguments()
+            .iter()
+            .map(|arg| {
+                let js = js_field_name(arg.name());
+                ts_lift_expr(ci, config, &arg.as_type(), &js, 0)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Some(ret) = method.return_type() {
+            let lower = ts_lower_expr(ci, config, ret, "__ret", 0);
             out.push_str(&format!(
-                "    {}({}): {};\n",
-                js_fn_name(m.name()),
-                args,
-                ret
+                "        {method_name}({args}): any {{\n            const __ret = __uniffiCallbackObject.{method_name}({pass});\n            return {lower};\n        }},\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "        {method_name}({args}): void {{\n            __uniffiCallbackObject.{method_name}({pass});\n        }},\n"
             ));
         }
-        out.push_str("}\n\n");
     }
+    out.push_str("    };\n}\n\n");
     out
 }
 
@@ -756,6 +907,17 @@ fn render_objects(ci: &ComponentInterface, config: &JsConfig) -> String {
         out.push_str(&format!(
             "import type {{ {} }} from \"./callbacks.ts\";\n",
             join_sorted(&grouped.callbacks)
+        ));
+    }
+    let callback_helpers = object_callback_helpers(ci);
+    if !callback_helpers.is_empty() {
+        let helpers = callback_helpers
+            .iter()
+            .map(|name| format!("__uniffiLowerCallback{name}"))
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "import {{ {} }} from \"./callbacks.ts\";\n",
+            join_sorted(&helpers)
         ));
     }
     let custom_type_imports = usage.customs.iter().cloned().collect::<Vec<_>>();
@@ -1012,6 +1174,17 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
             join_sorted(&grouped.callbacks)
         ));
     }
+    let callback_helpers = function_callback_helpers(ci);
+    if !callback_helpers.is_empty() {
+        let helpers = callback_helpers
+            .iter()
+            .map(|name| format!("__uniffiLowerCallback{name}"))
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "import {{ {} }} from \"./callbacks.ts\";\n",
+            join_sorted(&helpers)
+        ));
+    }
     let custom_type_imports = usage.customs.iter().cloned().collect::<Vec<_>>();
     if !custom_type_imports.is_empty() {
         out.push_str(&format!(
@@ -1203,8 +1376,9 @@ fn ts_lower_expr(
         }
         | Type::CallbackInterface { name, .. } => {
             let fallible_methods = callback_fallible_methods(ci, name);
+            let object = format!("__uniffiLowerCallback{name}({ident})");
             if fallible_methods.is_empty() {
-                format!("{{ __uniffiCallback: true, object: {ident} }}")
+                format!("{{ __uniffiCallback: true, object: {object} }}")
             } else {
                 let methods = fallible_methods
                     .iter()
@@ -1212,7 +1386,7 @@ fn ts_lower_expr(
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(
-                    "{{ __uniffiCallback: true, object: {ident}, fallibleMethods: {{ {methods} }} }}"
+                    "{{ __uniffiCallback: true, object: {object}, fallibleMethods: {{ {methods} }} }}"
                 )
             }
         }
@@ -1669,34 +1843,6 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
     out
 }
 
-fn custom_type_names(ty: &Type, config: &JsConfig) -> Vec<String> {
-    let mut names = BTreeSet::new();
-    collect_custom_type_names(ty, config, &mut names);
-    names.into_iter().collect()
-}
-
-fn collect_custom_type_names(ty: &Type, config: &JsConfig, names: &mut BTreeSet<String>) {
-    match ty {
-        Type::Custom { name, builtin, .. } => {
-            if config.custom_type(name).is_some() {
-                names.insert(name.clone());
-            }
-            collect_custom_type_names(builtin, config, names);
-        }
-        Type::Optional { inner_type } | Type::Sequence { inner_type } => {
-            collect_custom_type_names(inner_type, config, names)
-        }
-        Type::Map {
-            key_type,
-            value_type,
-        } => {
-            collect_custom_type_names(key_type, config, names);
-            collect_custom_type_names(value_type, config, names);
-        }
-        _ => {}
-    }
-}
-
 fn all_custom_types(ci: &ComponentInterface, config: &JsConfig) -> BTreeSet<(String, Type)> {
     let mut customs = BTreeSet::new();
     for record in ci.record_definitions() {
@@ -1934,6 +2080,119 @@ fn value_type_custom_helpers(
         _ => {}
     }
     names
+}
+
+fn function_callback_helpers(ci: &ComponentInterface) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for function in ci.function_definitions() {
+        for arg in function.arguments() {
+            collect_callback_helpers(&arg.as_type(), &mut names);
+        }
+    }
+    names
+}
+
+fn object_callback_helpers(ci: &ComponentInterface) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for object in ci.object_definitions() {
+        if matches!(object.imp(), ObjectImpl::CallbackTrait) {
+            continue;
+        }
+        for constructor in object.constructors() {
+            for arg in constructor.arguments() {
+                collect_callback_helpers(&arg.as_type(), &mut names);
+            }
+        }
+        for method in object.methods() {
+            for arg in method.arguments() {
+                collect_callback_helpers(&arg.as_type(), &mut names);
+            }
+        }
+    }
+    names
+}
+
+fn value_type_callback_helpers(ci: &ComponentInterface, local_module: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    match local_module {
+        "records" => {
+            for record in ci.record_definitions() {
+                for constructor in record.constructors() {
+                    for arg in constructor.arguments() {
+                        collect_callback_helpers(&arg.as_type(), &mut names);
+                    }
+                }
+                for method in record.methods() {
+                    for arg in method.arguments() {
+                        collect_callback_helpers(&arg.as_type(), &mut names);
+                    }
+                }
+            }
+        }
+        "enums" => {
+            for enum_ in ci
+                .enum_definitions()
+                .iter()
+                .filter(|e| !ci.is_name_used_as_error(e.name()))
+            {
+                for constructor in enum_.constructors() {
+                    for arg in constructor.arguments() {
+                        collect_callback_helpers(&arg.as_type(), &mut names);
+                    }
+                }
+                for method in enum_.methods() {
+                    for arg in method.arguments() {
+                        collect_callback_helpers(&arg.as_type(), &mut names);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    names
+}
+
+fn callback_custom_helpers(ci: &ComponentInterface, config: &JsConfig) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for object in ci
+        .object_definitions()
+        .iter()
+        .filter(|obj| matches!(obj.imp(), ObjectImpl::CallbackTrait))
+    {
+        for method in object.methods() {
+            for arg in method.arguments() {
+                collect_public_customs(ci, config, &arg.as_type(), &mut names, &mut HashSet::new());
+            }
+            if let Some(ret) = method.return_type() {
+                collect_public_customs(ci, config, ret, &mut names, &mut HashSet::new());
+            }
+        }
+    }
+    names
+}
+
+fn collect_callback_helpers(ty: &Type, out: &mut BTreeSet<String>) {
+    match ty {
+        Type::Object {
+            name,
+            imp: ObjectImpl::CallbackTrait,
+            ..
+        }
+        | Type::CallbackInterface { name, .. } => {
+            out.insert(name.clone());
+        }
+        Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+            collect_callback_helpers(inner_type, out)
+        }
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            collect_callback_helpers(key_type, out);
+            collect_callback_helpers(value_type, out);
+        }
+        _ => {}
+    }
 }
 
 fn collect_public_customs(

@@ -366,12 +366,7 @@ impl<'a> Generator<'a> {
             Type::CallbackInterface { name, .. } => {
                 bail!("callback interface type `{name}` is not supported directly")
             }
-            Type::Custom { name, builtin, .. } => {
-                if matches!(usage, TypeUsage::CallbackReturn) {
-                    bail!("{label} type `{name}` is not supported as a napi callback return yet");
-                }
-                self.ensure_type_supported(builtin, usage, label)
-            }
+            Type::Custom { builtin, .. } => self.ensure_type_supported(builtin, usage, label),
         }
     }
 
@@ -719,7 +714,7 @@ impl<'a> Generator<'a> {
             .into_iter()
             .map(|arg| {
                 let arg_ident = rust_ident(arg.name());
-                let arg_ty = self.bridge_value_type(&arg.as_type())?;
+                let arg_ty = self.core_callback_return_type(&arg.as_type())?;
                 Ok(quote!(#arg_ident: #arg_ty))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1542,8 +1537,11 @@ impl<'a> Generator<'a> {
         let args = method
             .arguments()
             .into_iter()
-            .map(|arg| rust_ident(arg.name()))
-            .collect::<Vec<_>>();
+            .map(|arg| {
+                let arg_ident = rust_ident(arg.name());
+                self.lift_value_expr(quote!(#arg_ident), &arg.as_type())
+            })
+            .collect::<Result<Vec<_>>>()?;
         match args.as_slice() {
             [] => Ok(quote!(())),
             [arg] => Ok(quote!(#arg)),

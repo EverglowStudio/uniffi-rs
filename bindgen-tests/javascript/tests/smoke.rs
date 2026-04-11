@@ -1646,10 +1646,18 @@ dictionary Contact {
   sequence<Email> aliases;
 };
 
+[Trait, WithForeign]
+interface EmailFormatter {
+  Email format_email(Email value);
+  Contact format_contact(Contact value);
+};
+
 namespace wasm_custom {
   Email normalize_email(Email value);
   Contact normalize_contact(Contact value);
   sequence<Email> normalize_many(sequence<Email> values);
+  Email format_email_with(EmailFormatter formatter, Email value);
+  Contact format_contact_with(EmailFormatter formatter, Contact value);
 };
 "#,
         biz_deps: "",
@@ -1703,11 +1711,30 @@ pub fn normalize_contact(value: Contact) -> Contact {
 pub fn normalize_many(values: Vec<Email>) -> Vec<Email> {
     values.into_iter().map(normalize_email).collect()
 }
+
+pub trait EmailFormatter: Send + Sync {
+    fn format_email(&self, value: Email) -> Email;
+    fn format_contact(&self, value: Contact) -> Contact;
+}
+
+pub fn format_email_with(formatter: std::sync::Arc<dyn EmailFormatter>, value: Email) -> Email {
+    formatter.format_email(value)
+}
+
+pub fn format_contact_with(formatter: std::sync::Arc<dyn EmailFormatter>, value: Contact) -> Contact {
+    formatter.format_contact(value).normalize()
+}
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
 import { initBackend } from "./gen/browser/index.ts";
-import { normalizeEmail, normalizeContact, normalizeMany } from "./gen/common/api.ts";
+import {
+  formatContactWith,
+  formatEmailWith,
+  normalizeContact,
+  normalizeEmail,
+  normalizeMany,
+} from "./gen/common/api.ts";
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_custom_shim.js");
@@ -1728,6 +1755,29 @@ if (contact.aliases[0].value !== "alias@one.com" || contact.aliases[1].value !==
 const many = normalizeMany([{ value: " X@Y.COM " }, { value: "Z@Q.COM" }]);
 if (many[0].value !== "x@y.com" || many[1].value !== "z@q.com") {
   throw new Error(`normalizeMany=${JSON.stringify(many)}`);
+}
+
+const formatter = {
+  formatEmail(value: { value: string }) {
+    return { value: `${value.value.trim().toUpperCase()}!` };
+  },
+  formatContact(value: { primary: { value: string }; aliases: Array<{ value: string }> }) {
+    return {
+      primary: { value: value.primary.value.trim().toUpperCase() },
+      aliases: value.aliases.map((alias) => ({ value: alias.value.trim().toUpperCase() })),
+    };
+  },
+};
+const formatted = formatEmailWith(formatter, { value: " ada@example.com " });
+if (formatted.value !== "ADA@EXAMPLE.COM!") {
+  throw new Error(`formatEmailWith=${JSON.stringify(formatted)}`);
+}
+const formattedContact = formatContactWith(formatter, {
+  primary: { value: " Root@Example.Com " },
+  aliases: [{ value: " Alias@One.Com " }],
+});
+if (formattedContact.primary.value !== "root@example.com" || formattedContact.aliases[0].value !== "alias@one.com") {
+  throw new Error(`formatContactWith=${JSON.stringify(formattedContact)}`);
 }
 
 console.log("ok");
@@ -3863,6 +3913,19 @@ pub fn normalize_contact(value: Contact) -> Contact {
 pub fn normalize_many(values: Vec<Email>) -> Vec<Email> {
     values.into_iter().map(normalize_email).collect()
 }
+
+pub trait EmailFormatter: Send + Sync {
+    fn format_email(&self, value: Email) -> Email;
+    fn format_contact(&self, value: Contact) -> Contact;
+}
+
+pub fn format_email_with(formatter: std::sync::Arc<dyn EmailFormatter>, value: Email) -> Email {
+    formatter.format_email(value)
+}
+
+pub fn format_contact_with(formatter: std::sync::Arc<dyn EmailFormatter>, value: Contact) -> Contact {
+    formatter.format_contact(value).normalize()
+}
 "#,
     )
     .unwrap();
@@ -3878,10 +3941,18 @@ dictionary Contact {
   sequence<Email> aliases;
 };
 
+[Trait, WithForeign]
+interface EmailFormatter {
+  Email format_email(Email value);
+  Contact format_contact(Contact value);
+};
+
 namespace custom_js_core {
   Email normalize_email(Email value);
   Contact normalize_contact(Contact value);
   sequence<Email> normalize_many(sequence<Email> values);
+  Email format_email_with(EmailFormatter formatter, Email value);
+  Contact format_contact_with(EmailFormatter formatter, Contact value);
 };
 "#,
     )
@@ -4073,7 +4144,13 @@ fn generated_node_adapter_runs_custom_types_fixture() {
     std::fs::write(
         &driver,
         r#"
-import { normalizeEmail, normalizeContact, normalizeMany } from "./node/index.ts";
+import {
+  formatContactWith,
+  formatEmailWith,
+  normalizeContact,
+  normalizeEmail,
+  normalizeMany,
+} from "./node/index.ts";
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -4098,6 +4175,26 @@ assert(
   many[0].value === "x@y.com" && many[1].value === "z@q.com",
   `normalizeMany=${JSON.stringify(many)}`,
 );
+
+const formatter = {
+  formatEmail(value: { value: string }) {
+    return { value: `${value.value.trim().toUpperCase()}!` };
+  },
+  formatContact(value: { primary: { value: string }; aliases: Array<{ value: string }> }) {
+    return {
+      primary: { value: value.primary.value.trim().toUpperCase() },
+      aliases: value.aliases.map((alias) => ({ value: alias.value.trim().toUpperCase() })),
+    };
+  },
+};
+const formatted = formatEmailWith(formatter, { value: " ada@example.com " });
+assert(formatted.value === "ADA@EXAMPLE.COM!", `formatEmailWith=${JSON.stringify(formatted)}`);
+const formattedContact = formatContactWith(formatter, {
+  primary: { value: " Root@Example.Com " },
+  aliases: [{ value: " Alias@One.Com " }],
+});
+assert(formattedContact.primary.value === "root@example.com", `formattedContact.primary=${formattedContact.primary.value}`);
+assert(formattedContact.aliases[0].value === "alias@one.com", `formattedContact.aliases=${JSON.stringify(formattedContact.aliases)}`);
 
 console.log("ok");
 "#,
@@ -4881,6 +4978,24 @@ eq(
   ["x@y.com", "z@q.com"],
   "normalizeMany",
 );
+eq(
+  addon.formatEmailWith({{ formatEmail(value) {{ return `${{value.trim().toUpperCase()}}!`; }}, formatContact(value) {{ return value; }} }}, " ada@example.com "),
+  "ADA@EXAMPLE.COM!",
+  "formatEmailWith",
+);
+eq(
+  addon.formatContactWith({{
+    formatEmail(value) {{ return value; }},
+    formatContact(value) {{
+      return {{
+        primary: value.primary.trim().toUpperCase(),
+        aliases: value.aliases.map((alias) => alias.trim().toUpperCase()),
+      }};
+    }},
+  }}, {{ primary: " Root@Example.Com ", aliases: [" Alias@One.Com "] }}),
+  {{ primary: "root@example.com", aliases: ["alias@one.com"] }},
+  "formatContactWith",
+);
 
 console.log("ok");
 "#,
@@ -4940,6 +5055,26 @@ assert(contact.aliases[1].value === "two@example.com", `alias1=${contact.aliases
 const many = api.normalizeMany([{ value: " X@Y.COM " }, { value: "Z@Q.COM" }]);
 assert(many[0].value === "x@y.com", `many0=${many[0].value}`);
 assert(many[1].value === "z@q.com", `many1=${many[1].value}`);
+
+const formatter = {
+  formatEmail(value: { value: string }) {
+    return { value: `${value.value.trim().toUpperCase()}!` };
+  },
+  formatContact(value: { primary: { value: string }; aliases: Array<{ value: string }> }) {
+    return {
+      primary: { value: value.primary.value.trim().toUpperCase() },
+      aliases: value.aliases.map((alias) => ({ value: alias.value.trim().toUpperCase() })),
+    };
+  },
+};
+const formatted = api.formatEmailWith(formatter, { value: " ada@example.com " });
+assert(formatted.value === "ADA@EXAMPLE.COM!", `formatEmailWith=${JSON.stringify(formatted)}`);
+const formattedContact = api.formatContactWith(formatter, {
+  primary: { value: " Root@Example.Com " },
+  aliases: [{ value: " Alias@One.Com " }],
+});
+assert(formattedContact.primary.value === "root@example.com", `formattedContact.primary=${formattedContact.primary.value}`);
+assert(formattedContact.aliases[0].value === "alias@one.com", `formattedContact.aliases=${JSON.stringify(formattedContact.aliases)}`);
 
 console.log("ok");
 "#,
@@ -5019,6 +5154,26 @@ assert(contact.aliases[1].value === "two@example.com", `alias1=${contact.aliases
 const many = api.normalizeMany([{ value: " X@Y.COM " }, { value: "Z@Q.COM" }]);
 assert(many[0].value === "x@y.com", `many0=${many[0].value}`);
 assert(many[1].value === "z@q.com", `many1=${many[1].value}`);
+
+const formatter = {
+  formatEmail(value: { value: string }) {
+    return { value: `${value.value.trim().toUpperCase()}!` };
+  },
+  formatContact(value: { primary: { value: string }; aliases: Array<{ value: string }> }) {
+    return {
+      primary: { value: value.primary.value.trim().toUpperCase() },
+      aliases: value.aliases.map((alias) => ({ value: alias.value.trim().toUpperCase() })),
+    };
+  },
+};
+const formatted = api.formatEmailWith(formatter, { value: " ada@example.com " });
+assert(formatted.value === "ADA@EXAMPLE.COM!", `formatEmailWith=${JSON.stringify(formatted)}`);
+const formattedContact = api.formatContactWith(formatter, {
+  primary: { value: " Root@Example.Com " },
+  aliases: [{ value: " Alias@One.Com " }],
+});
+assert(formattedContact.primary.value === "root@example.com", `formattedContact.primary=${formattedContact.primary.value}`);
+assert(formattedContact.aliases[0].value === "alias@one.com", `formattedContact.aliases=${JSON.stringify(formattedContact.aliases)}`);
 
 console.log("ok");
 "#,
