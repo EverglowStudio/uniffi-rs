@@ -48,7 +48,7 @@ fn generate_arithmetic(out_dir: &Utf8PathBuf) {
 }
 
 #[test]
-fn napi_rejects_async_callback_return_callbacks() {
+fn napi_accepts_async_callback_return_callbacks() {
     let tmp = tempfile::tempdir().unwrap();
     let crate_dir = tmp.path().join("async_callback_return");
     let src_dir = crate_dir.join("src");
@@ -92,11 +92,11 @@ namespace async_callback_return {
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default());
-    let err = generate(
+    generate(
         &loader,
         GenerateJsOptions {
             source: Utf8PathBuf::from_path_buf(udl_path).unwrap(),
-            out_dir,
+            out_dir: out_dir.clone(),
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -104,11 +104,23 @@ namespace async_callback_return {
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
     )
-    .expect_err("N-API/Electron must reject async callback-return callbacks");
+    .expect("N-API/Electron should accept async callback-return callbacks");
+    let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
     assert!(
-        err.to_string()
-            .contains("async callback methods returning callback traits/interfaces"),
-        "unexpected error: {err:?}"
+        api.contains("callbackReturnMethods: { \"makeLogger\": true }"),
+        "callback-return metadata should be emitted:\n{api}"
+    );
+    let napi_rs = std::fs::read_to_string(out_dir.join("node/async_callback_return.rs")).unwrap();
+    assert!(
+        napi_rs.contains("__UniffiCallbackHandle")
+            && napi_rs.contains("__uniffi_from_callback_registry"),
+        "napi bridge should emit callback-return registry support:\n{napi_rs}"
+    );
+    let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    assert!(
+        backend.contains("__uniffiStoreCallbackReturn")
+            && backend.contains("__uniffiCallbackDispatcher"),
+        "napi backend should store async callback returns:\n{backend}"
     );
 }
 
@@ -4230,7 +4242,7 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
         format!(
             "[package]\nname = \"napi-callback-return-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
              [lib]\nname = \"napi_callback_return_core\"\ncrate-type = [\"lib\"]\n\n\
-             [dependencies]\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\n",
+             [dependencies]\nasync-trait = \"0.1\"\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\n",
             uniffi_path.as_str()
         ),
     )
@@ -4286,12 +4298,15 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
          \x20   }\n\
          }\n\n\
          impl std::error::Error for ProviderError {}\n\n\
+         #[async_trait::async_trait]\n\
          pub trait ValueProvider: Send + Sync {\n\
          \x20   fn get_value(&self) -> u32;\n\
          \x20   fn make_payload(&self) -> Payload;\n\
          \x20   fn make_counter(&self, initial: u32) -> std::sync::Arc<Counter>;\n\
          \x20   fn make_greeter(&self, prefix: String) -> std::sync::Arc<dyn Greeter>;\n\
          \x20   fn make_host_logger(&self, prefix: String) -> std::sync::Arc<dyn HostLogger>;\n\
+         \x20   async fn make_async_host_logger(&self, prefix: String) -> std::sync::Arc<dyn HostLogger>;\n\
+         \x20   async fn checked_make_async_host_logger(&self, prefix: String, fail: bool) -> Result<std::sync::Arc<dyn HostLogger>, ProviderError>;\n\
          \x20   fn checked_value(&self, fail: bool) -> Result<u32, ProviderError>;\n\
          \x20   fn checked_payload(&self, fail: bool) -> Result<Payload, ProviderError>;\n\
          \x20   fn checked_void(&self, fail: bool) -> Result<(), ProviderError>;\n\
@@ -4310,6 +4325,12 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
          }\n\n\
          pub fn invoke_value_provider_run_host_logger(provider: std::sync::Arc<dyn ValueProvider>, prefix: String, name: String) -> String {\n\
          \x20   provider.make_host_logger(prefix).greet(name)\n\
+         }\n\n\
+         pub async fn invoke_value_provider_run_async_host_logger(provider: std::sync::Arc<dyn ValueProvider>, prefix: String, name: String) -> String {\n\
+         \x20   provider.make_async_host_logger(prefix).await.greet(name)\n\
+         }\n\n\
+         pub async fn invoke_value_provider_run_checked_async_host_logger(provider: std::sync::Arc<dyn ValueProvider>, prefix: String, fail: bool, name: String) -> Result<String, ProviderError> {\n\
+         \x20   Ok(provider.checked_make_async_host_logger(prefix, fail).await?.greet(name))\n\
          }\n\n\
          pub fn invoke_value_provider_checked_value(provider: std::sync::Arc<dyn ValueProvider>, fail: bool) -> Result<u32, ProviderError> {\n\
          \x20   provider.checked_value(fail)\n\
@@ -4360,6 +4381,10 @@ interface ValueProvider {
   Counter make_counter(u32 initial);
   Greeter make_greeter(string prefix);
   HostLogger make_host_logger(string prefix);
+  [Async]
+  HostLogger make_async_host_logger(string prefix);
+  [Async, Throws=ProviderError]
+  HostLogger checked_make_async_host_logger(string prefix, boolean fail);
   [Throws=ProviderError]
   u32 checked_value(boolean fail);
   [Throws=ProviderError]
@@ -4374,6 +4399,10 @@ namespace callback_return {
   Counter invoke_value_provider_make_counter(ValueProvider provider, u32 initial);
   Greeter invoke_value_provider_make_greeter(ValueProvider provider, string prefix);
   string invoke_value_provider_run_host_logger(ValueProvider provider, string prefix, string name);
+  [Async]
+  string invoke_value_provider_run_async_host_logger(ValueProvider provider, string prefix, string name);
+  [Async, Throws=ProviderError]
+  string invoke_value_provider_run_checked_async_host_logger(ValueProvider provider, string prefix, boolean fail, string name);
   Greeter english_greeter(string prefix);
   [Throws=ProviderError]
   u32 invoke_value_provider_checked_value(ValueProvider provider, boolean fail);
@@ -5809,6 +5838,8 @@ import {
     invokeValueProviderCheckedVoid,
     invokeValueProviderMakeCounter,
     invokeValueProviderMakeGreeter,
+    invokeValueProviderRunAsyncHostLogger,
+    invokeValueProviderRunCheckedAsyncHostLogger,
     invokeValueProviderRunHostLogger,
 } from "./node/index.ts";
 import { UniffiError } from "./common/runtime.ts";
@@ -5834,6 +5865,23 @@ const provider = {
         return englishGreeter(prefix);
     },
     makeHostLogger(prefix: string) {
+        return {
+            greet(name: string) {
+                return `${prefix} ${name}!`;
+            },
+        };
+    },
+    async makeAsyncHostLogger(prefix: string) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return {
+            greet(name: string) {
+                return `${prefix} ${name}!`;
+            },
+        };
+    },
+    async checkedMakeAsyncHostLogger(prefix: string, fail: boolean) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        if (fail) throw new ProviderError("BadValue", "BadValue");
         return {
             greet(name: string) {
                 return `${prefix} ${name}!`;
@@ -5873,6 +5921,26 @@ if (returnedGreeter.greet("Ada") !== "Hi Ada!") {
 const returnedHostLogger = invokeValueProviderRunHostLogger(provider as any, "Host", "Ada");
 if (returnedHostLogger !== "Host Ada!") {
     throw new Error(`node runHostLogger failed: ${returnedHostLogger}`);
+}
+const returnedAsyncHostLogger = await invokeValueProviderRunAsyncHostLogger(provider as any, "AsyncHost", "Ada");
+if (returnedAsyncHostLogger !== "AsyncHost Ada!") {
+    throw new Error(`node runAsyncHostLogger failed: ${returnedAsyncHostLogger}`);
+}
+const checkedAsyncHostLogger = await invokeValueProviderRunCheckedAsyncHostLogger(provider as any, "CheckedHost", false, "Ada");
+if (checkedAsyncHostLogger !== "CheckedHost Ada!") {
+    throw new Error(`node checked async host logger failed: ${checkedAsyncHostLogger}`);
+}
+let checkedAsyncHostLoggerFailed = false;
+try {
+    await invokeValueProviderRunCheckedAsyncHostLogger(provider as any, "CheckedHost", true, "Ada");
+} catch (e) {
+    checkedAsyncHostLoggerFailed = true;
+    if (!(e instanceof UniffiError) || !String((e as Error).message).includes("BadValue")) {
+        throw new Error(`checked async host logger threw wrong error: ${e && (e as Error).message}`);
+    }
+}
+if (!checkedAsyncHostLoggerFailed) {
+    throw new Error("checked async host logger should throw");
 }
 if (invokeValueProviderCheckedValue(provider as any, false) !== 77) {
     throw new Error("checkedValue(false) failed");
@@ -5926,6 +5994,23 @@ const electronProvider = {
             },
         };
     },
+    async makeAsyncHostLogger(prefix: string) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return {
+            greet(name: string) {
+                return `${prefix} ${name}!`;
+            },
+        };
+    },
+    async checkedMakeAsyncHostLogger(prefix: string, fail: boolean) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        if (fail) throw new electronApi.ProviderError("BadValue", "BadValue");
+        return {
+            greet(name: string) {
+                return `${prefix} ${name}!`;
+            },
+        };
+    },
 };
 const electronCounter = electronApi.invokeValueProviderMakeCounter(electronProvider as any, 12);
 electronCounter.inc();
@@ -5940,6 +6025,26 @@ const electronHostLogger = electronApi.invokeValueProviderRunHostLogger(electron
 if (electronHostLogger !== "EH Ada!") {
     throw new Error(`electron runHostLogger failed: ${electronHostLogger}`);
 }
+const electronAsyncHostLogger = await electronApi.invokeValueProviderRunAsyncHostLogger(electronProvider as any, "EAH", "Ada");
+if (electronAsyncHostLogger !== "EAH Ada!") {
+    throw new Error(`electron runAsyncHostLogger failed: ${electronAsyncHostLogger}`);
+}
+const electronCheckedAsyncHostLogger = await electronApi.invokeValueProviderRunCheckedAsyncHostLogger(electronProvider as any, "EChecked", false, "Ada");
+if (electronCheckedAsyncHostLogger !== "EChecked Ada!") {
+    throw new Error(`electron checked async host logger failed: ${electronCheckedAsyncHostLogger}`);
+}
+let electronCheckedAsyncHostLoggerFailed = false;
+try {
+    await electronApi.invokeValueProviderRunCheckedAsyncHostLogger(electronProvider as any, "EChecked", true, "Ada");
+} catch (e) {
+    electronCheckedAsyncHostLoggerFailed = true;
+    if (!(e instanceof electronApi.UniffiError) || !String((e as Error).message).includes("BadValue")) {
+        throw new Error(`electron checked async host logger wrong error: ${e && (e as Error).message}`);
+    }
+}
+if (!electronCheckedAsyncHostLoggerFailed) {
+    throw new Error("electron checked async host logger should throw");
+}
 const electronMarker = {
     __uniffiCallback: true,
     object: provider,
@@ -5947,6 +6052,15 @@ const electronMarker = {
         checkedValue: "flat",
         checkedPayload: "flat",
         checkedVoid: "flat",
+        checkedMakeAsyncHostLogger: "flat",
+    },
+    asyncMethods: {
+        makeAsyncHostLogger: true,
+        checkedMakeAsyncHostLogger: true,
+    },
+    callbackReturnMethods: {
+        makeAsyncHostLogger: true,
+        checkedMakeAsyncHostLogger: true,
     },
 };
 let electronRes = bridge.dispatchSync({
@@ -6270,7 +6384,7 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
     let bridge = std::fs::read_to_string(bridge_path).unwrap();
     assert!(
         bridge.contains("__UniffiCheckedWorkerCheckedVoidCallbackResult")
-            && bridge.contains("Promise<__UniffiCheckedWorkerCheckedVoidCallbackResult>")
+            && bridge.contains("napi::bindgen_prelude::Promise")
             && bridge.contains(".call_async(Ok"),
         "napi bridge should implement fallible async callback methods through TSFN Promise:\n{bridge}"
     );

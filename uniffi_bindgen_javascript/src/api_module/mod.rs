@@ -1415,6 +1415,7 @@ fn ts_lower_expr(
         | Type::CallbackInterface { name, .. } => {
             let fallible_methods = callback_fallible_methods(ci, name);
             let async_methods = callback_async_methods(ci, name);
+            let callback_return_methods = callback_return_methods(ci, name);
             let object = format!("__uniffiLowerCallback{name}({ident})");
             let mut extras = Vec::new();
             if !fallible_methods.is_empty() {
@@ -1433,6 +1434,14 @@ fn ts_lower_expr(
                     .join(", ");
                 extras.push(format!("asyncMethods: {{ {methods} }}"));
             }
+            if !callback_return_methods.is_empty() {
+                let methods = callback_return_methods
+                    .iter()
+                    .map(|m| format!("\"{m}\": true"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                extras.push(format!("callbackReturnMethods: {{ {methods} }}"));
+            }
             if extras.is_empty() {
                 format!("{{ __uniffiCallback: true, object: {object} }}")
             } else {
@@ -1446,6 +1455,16 @@ fn ts_lower_expr(
         Type::Object { .. } => format!("{ident}.__uniffi.raw"),
         _ => ident.to_string(),
     }
+}
+
+fn is_callback_return_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Object {
+            imp: ObjectImpl::CallbackTrait,
+            ..
+        } | Type::CallbackInterface { .. }
+    )
 }
 
 fn callback_async_methods(ci: &ComponentInterface, name: &str) -> Vec<String> {
@@ -1464,6 +1483,26 @@ fn callback_async_methods(ci: &ComponentInterface, name: &str) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter(|method| method.is_async())
+        .map(|method| js_fn_name(method.name()))
+        .collect()
+}
+
+fn callback_return_methods(ci: &ComponentInterface, name: &str) -> Vec<String> {
+    let methods = ci
+        .object_definitions()
+        .iter()
+        .find(|obj| obj.name() == name && matches!(obj.imp(), ObjectImpl::CallbackTrait))
+        .map(|obj| obj.methods())
+        .or_else(|| {
+            ci.callback_interface_definitions()
+                .iter()
+                .find(|callback| callback.name() == name)
+                .map(|callback| callback.methods())
+        });
+    methods
+        .into_iter()
+        .flatten()
+        .filter(|method| method.return_type().is_some_and(is_callback_return_type))
         .map(|method| js_fn_name(method.name()))
         .collect()
 }
