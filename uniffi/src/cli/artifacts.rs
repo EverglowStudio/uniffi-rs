@@ -130,6 +130,34 @@ pub(crate) struct BuildArgs {
     /// Optional XCFramework name. Defaults to the output path stem.
     #[clap(long = "apple-framework-name")]
     apple_framework_name: Option<String>,
+
+    /// Android ABI. Defaults to arm64-v8a and x86_64.
+    #[clap(long = "android-abi")]
+    android_abi: Vec<String>,
+
+    /// Android API level used for NDK clang wrappers.
+    #[clap(long = "android-api", default_value_t = 23)]
+    android_api: u32,
+
+    /// Android NDK home. Falls back to ANDROID_NDK_HOME or latest ANDROID_SDK_ROOT/ndk/*.
+    #[clap(long = "android-ndk-home")]
+    android_ndk_home: Option<Utf8PathBuf>,
+
+    /// jniLibs output directory for `--target android`.
+    #[clap(long = "android-jni-libs-out")]
+    android_jni_libs_out: Option<Utf8PathBuf>,
+
+    /// Optional directory in which to copy generated Kotlin sources.
+    #[clap(long = "android-kotlin-out")]
+    android_kotlin_out: Option<Utf8PathBuf>,
+
+    /// Kotlin package name override.
+    #[clap(long = "android-package-name")]
+    android_package_name: Option<String>,
+
+    /// Optional AAR output path. Not implemented in P3.
+    #[clap(long = "android-aar-out")]
+    android_aar_out: Option<Utf8PathBuf>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, ValueEnum)]
@@ -168,9 +196,7 @@ fn build(args: BuildArgs) -> Result<()> {
         build_apple(&args).context("building Apple artifact target")?;
     }
     if targets.android {
-        bail!(
-            "artifacts build --target android is not implemented yet; see artifact CLI roadmap P3"
-        );
+        build_android(&args).context("building Android artifact target")?;
     }
 
     if targets.wasm {
@@ -190,6 +216,104 @@ fn build(args: BuildArgs) -> Result<()> {
 
     if targets.harmony {
         build_ohos(args.to_ohos_args()?).context("building Harmony/OpenHarmony artifact target")?;
+    }
+
+    Ok(())
+}
+
+fn build_android(args: &BuildArgs) -> Result<()> {
+    if args.android_aar_out.is_some() {
+        bail!("--android-aar-out is not implemented yet; P3 currently builds jniLibs + Kotlin");
+    }
+
+    let jni_libs_out = args
+        .android_jni_libs_out
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--target android requires --android-jni-libs-out <dir>"))?;
+    let ndk_home = resolve_android_ndk_home(args)?;
+    let prebuilt = android_llvm_prebuilt_dir(&ndk_home)?;
+    let abis = android_abis(args)?;
+    let meta = cargo_package_metadata(&args.manifest_path)?;
+    let profile = if args.release { "release" } else { "debug" };
+
+    let mut host_build = Command::new(&args.cargo_bin);
+    host_build
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(args.manifest_path.as_str());
+    if args.release {
+        host_build.arg("--release");
+    }
+    run_command(&args.cargo_bin, &mut host_build, "cargo")?;
+
+    for abi in &abis {
+        let mut rustup = Command::new("rustup");
+        rustup.arg("target").arg("add").arg(abi.rust_target);
+        run_command("rustup", &mut rustup, "rustup")?;
+
+        let clang = android_clang_path(&prebuilt, abi, args.android_api);
+        if !clang.exists() {
+            bail!(
+                "Android NDK clang not found at {}. Check --android-ndk-home/ANDROID_NDK_HOME and --android-api",
+                clang
+            );
+        }
+
+        let mut cargo = Command::new(&args.cargo_bin);
+        cargo
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(args.manifest_path.as_str())
+            .arg("--target")
+            .arg(abi.rust_target)
+            .env(android_linker_env(abi.rust_target), clang.as_str());
+        if args.release {
+            cargo.arg("--release");
+        }
+        run_command(&args.cargo_bin, &mut cargo, "cargo")?;
+
+        let lib = android_sharedlib_path(&meta, abi.rust_target, profile);
+        if !lib.exists() {
+            bail!("Android shared library not found at {}", lib);
+        }
+        let out_dir = jni_libs_out.join(abi.abi);
+        std::fs::create_dir_all(&out_dir)
+            .with_context(|| format!("creating Android jniLibs dir {out_dir}"))?;
+        let dest = out_dir.join(format!("lib{}.so", meta.lib_target_name));
+        std::fs::copy(&lib, &dest)
+            .with_context(|| format!("copying Android shared library {lib} to {dest}"))?;
+    }
+
+    let generation_source = if let Some(source) = &args.source {
+        source.clone()
+    } else {
+        args.library_path
+            .clone()
+            .unwrap_or_else(|| host_cdylib_path(&meta, args.release))
+    };
+    if !generation_source.exists() {
+        bail!(
+            "Kotlin generation source not found at {}. Pass --library-path or --source to override",
+            generation_source
+        );
+    }
+
+    let kotlin_bindings_dir = args.out_dir.join("kotlin");
+    std::fs::create_dir_all(&kotlin_bindings_dir)
+        .with_context(|| format!("creating Kotlin output dir {kotlin_bindings_dir}"))?;
+    let kotlin_config = android_kotlin_config(args)?;
+    generate(GenerateOptions {
+        languages: vec![TargetLanguage::Kotlin],
+        out_dir: kotlin_bindings_dir.clone(),
+        source: generation_source,
+        config_override: kotlin_config.or_else(|| args.config.clone()),
+        crate_filter: args.crate_name.clone(),
+        metadata_no_deps: args.metadata_no_deps,
+        format: !args.no_format,
+    })?;
+
+    if let Some(kotlin_out) = &args.android_kotlin_out {
+        copy_dir_contents(&kotlin_bindings_dir, kotlin_out)?;
     }
 
     Ok(())
@@ -598,6 +722,181 @@ fn xcodebuild_create_xcframework_args(
     args
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AndroidAbi {
+    abi: &'static str,
+    rust_target: &'static str,
+    clang_prefix: &'static str,
+}
+
+fn android_abis(args: &BuildArgs) -> Result<Vec<AndroidAbi>> {
+    let requested = if args.android_abi.is_empty() {
+        vec!["arm64-v8a".to_string(), "x86_64".to_string()]
+    } else {
+        args.android_abi.clone()
+    };
+    requested
+        .iter()
+        .map(|abi| android_abi(abi))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn android_abi(abi: &str) -> Result<AndroidAbi> {
+    match abi {
+        "arm64-v8a" | "aarch64-linux-android" => Ok(AndroidAbi {
+            abi: "arm64-v8a",
+            rust_target: "aarch64-linux-android",
+            clang_prefix: "aarch64-linux-android",
+        }),
+        "x86_64" | "x86_64-linux-android" => Ok(AndroidAbi {
+            abi: "x86_64",
+            rust_target: "x86_64-linux-android",
+            clang_prefix: "x86_64-linux-android",
+        }),
+        "armeabi-v7a" | "armv7-linux-androideabi" => Ok(AndroidAbi {
+            abi: "armeabi-v7a",
+            rust_target: "armv7-linux-androideabi",
+            clang_prefix: "armv7a-linux-androideabi",
+        }),
+        "x86" | "i686-linux-android" => Ok(AndroidAbi {
+            abi: "x86",
+            rust_target: "i686-linux-android",
+            clang_prefix: "i686-linux-android",
+        }),
+        _ => bail!(
+            "unsupported Android ABI `{abi}`; expected arm64-v8a, x86_64, armeabi-v7a, or x86"
+        ),
+    }
+}
+
+fn resolve_android_ndk_home(args: &BuildArgs) -> Result<Utf8PathBuf> {
+    if let Some(path) = &args.android_ndk_home {
+        return Ok(path.clone());
+    }
+    if let Ok(path) = std::env::var("ANDROID_NDK_HOME") {
+        if !path.is_empty() {
+            return Utf8PathBuf::from_path_buf(path.into())
+                .map_err(|p| anyhow::anyhow!("ANDROID_NDK_HOME is not utf8: {}", p.display()));
+        }
+    }
+    if let Ok(sdk_root) = std::env::var("ANDROID_SDK_ROOT") {
+        let ndk_root = Utf8PathBuf::from_path_buf(sdk_root.into())
+            .map_err(|p| anyhow::anyhow!("ANDROID_SDK_ROOT is not utf8: {}", p.display()))?
+            .join("ndk");
+        if let Some(latest) = latest_child_dir(&ndk_root)? {
+            return Ok(latest);
+        }
+    }
+    bail!(
+        "Android NDK not found. Pass --android-ndk-home, set ANDROID_NDK_HOME, or set ANDROID_SDK_ROOT with an ndk/<version> directory"
+    )
+}
+
+fn latest_child_dir(root: &Utf8Path) -> Result<Option<Utf8PathBuf>> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    let mut dirs = Vec::new();
+    for entry in std::fs::read_dir(root).with_context(|| format!("reading {root}"))? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let path = Utf8PathBuf::from_path_buf(entry.path())
+                .map_err(|p| anyhow::anyhow!("NDK path is not utf8: {}", p.display()))?;
+            dirs.push(path);
+        }
+    }
+    dirs.sort();
+    Ok(dirs.pop())
+}
+
+fn android_llvm_prebuilt_dir(ndk_home: &Utf8Path) -> Result<Utf8PathBuf> {
+    let host_candidates: &[&str] = if cfg!(target_os = "macos") {
+        &["darwin-x86_64", "darwin-aarch64"]
+    } else if cfg!(target_os = "linux") {
+        &["linux-x86_64"]
+    } else if cfg!(target_os = "windows") {
+        &["windows-x86_64"]
+    } else {
+        &[]
+    };
+    for host in host_candidates {
+        let path = ndk_home.join("toolchains/llvm/prebuilt").join(host);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    bail!(
+        "Android NDK LLVM prebuilt directory not found under {}",
+        ndk_home.join("toolchains/llvm/prebuilt")
+    )
+}
+
+fn android_clang_path(prebuilt: &Utf8Path, abi: &AndroidAbi, api: u32) -> Utf8PathBuf {
+    prebuilt.join("bin").join(format!(
+        "{}{}-clang{}",
+        abi.clang_prefix,
+        api,
+        std::env::consts::EXE_SUFFIX
+    ))
+}
+
+fn android_linker_env(rust_target: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_LINKER",
+        rust_target.replace('-', "_").to_ascii_uppercase()
+    )
+}
+
+fn android_sharedlib_path(meta: &CargoPackageMetadata, target: &str, profile: &str) -> Utf8PathBuf {
+    meta.target_directory
+        .join(target)
+        .join(profile)
+        .join(format!("lib{}.so", meta.lib_target_name))
+}
+
+fn android_kotlin_config(args: &BuildArgs) -> Result<Option<Utf8PathBuf>> {
+    let Some(package_name) = &args.android_package_name else {
+        return Ok(None);
+    };
+    let dir = args.out_dir.join("android");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating Android generated config dir {dir}"))?;
+    let path = dir.join("uniffi-kotlin.toml");
+    std::fs::write(
+        &path,
+        format!("[bindings.kotlin]\npackage_name = \"{package_name}\"\n"),
+    )
+    .with_context(|| format!("writing Kotlin config override {path}"))?;
+    Ok(Some(path))
+}
+
+fn copy_dir_contents(from: &Utf8Path, to: &Utf8Path) -> Result<()> {
+    if to.exists() {
+        std::fs::remove_dir_all(to).with_context(|| format!("removing stale directory {to}"))?;
+    }
+    std::fs::create_dir_all(to).with_context(|| format!("creating directory {to}"))?;
+    copy_dir_contents_inner(from, to)
+}
+
+fn copy_dir_contents_inner(from: &Utf8Path, to: &Utf8Path) -> Result<()> {
+    for entry in std::fs::read_dir(from).with_context(|| format!("reading {from}"))? {
+        let entry = entry?;
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|p| anyhow::anyhow!("path is not utf8: {}", p.display()))?;
+        let name = path
+            .file_name()
+            .with_context(|| format!("path has no file name: {path}"))?;
+        let dest = to.join(name);
+        if entry.file_type()?.is_dir() {
+            std::fs::create_dir_all(&dest).with_context(|| format!("creating {dest}"))?;
+            copy_dir_contents_inner(&path, &dest)?;
+        } else {
+            std::fs::copy(&path, &dest).with_context(|| format!("copying {path} to {dest}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +973,43 @@ mod tests {
                 "-output",
                 "/out/uni_core.xcframework",
             ]
+        );
+    }
+
+    #[test]
+    fn maps_android_abi() {
+        assert_eq!(
+            android_abi("arm64-v8a").unwrap(),
+            AndroidAbi {
+                abi: "arm64-v8a",
+                rust_target: "aarch64-linux-android",
+                clang_prefix: "aarch64-linux-android",
+            }
+        );
+        assert_eq!(
+            android_abi("armeabi-v7a").unwrap().clang_prefix,
+            "armv7a-linux-androideabi"
+        );
+        assert!(android_abi("mips").is_err());
+    }
+
+    #[test]
+    fn computes_android_linker_env() {
+        assert_eq!(
+            android_linker_env("aarch64-linux-android"),
+            "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+        );
+    }
+
+    #[test]
+    fn computes_android_sharedlib_path() {
+        let meta = CargoPackageMetadata {
+            target_directory: Utf8PathBuf::from("/repo/target"),
+            lib_target_name: "uni_core".to_string(),
+        };
+        assert_eq!(
+            android_sharedlib_path(&meta, "aarch64-linux-android", "debug"),
+            Utf8PathBuf::from("/repo/target/aarch64-linux-android/debug/libuni_core.so")
         );
     }
 }
