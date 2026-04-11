@@ -756,6 +756,11 @@ fn render_callback_definition(
             Some(t) => ts_type(t, config),
             None => "void".to_string(),
         };
+        let ret = if m.is_async() {
+            format!("{ret} | Promise<{ret}>")
+        } else {
+            ret
+        };
         out.push_str(&format!(
             "    {}({}): {};\n",
             js_fn_name(m.name()),
@@ -794,7 +799,18 @@ fn render_callback_lowerer(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        if let Some(ret) = method.return_type() {
+        if method.is_async() {
+            if let Some(ret) = method.return_type() {
+                let lower = ts_lower_expr(ci, config, ret, "__ret", 0);
+                out.push_str(&format!(
+                    "        {method_name}({args}): Promise<any> {{\n            return Promise.resolve(__uniffiCallbackObject.{method_name}({pass})).then((__ret) => {{ return {lower}; }});\n        }},\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "        {method_name}({args}): Promise<void> {{\n            return Promise.resolve(__uniffiCallbackObject.{method_name}({pass})).then(() => undefined);\n        }},\n"
+                ));
+            }
+        } else if let Some(ret) = method.return_type() {
             let lower = ts_lower_expr(ci, config, ret, "__ret", 0);
             out.push_str(&format!(
                 "        {method_name}({args}): any {{\n            const __ret = __uniffiCallbackObject.{method_name}({pass});\n            return {lower};\n        }},\n"
@@ -1376,17 +1392,31 @@ fn ts_lower_expr(
         }
         | Type::CallbackInterface { name, .. } => {
             let fallible_methods = callback_fallible_methods(ci, name);
+            let async_methods = callback_async_methods(ci, name);
             let object = format!("__uniffiLowerCallback{name}({ident})");
-            if fallible_methods.is_empty() {
-                format!("{{ __uniffiCallback: true, object: {object} }}")
-            } else {
+            let mut extras = Vec::new();
+            if !fallible_methods.is_empty() {
                 let methods = fallible_methods
                     .iter()
                     .map(|(m, shape)| format!("\"{m}\": \"{shape}\""))
                     .collect::<Vec<_>>()
                     .join(", ");
+                extras.push(format!("fallibleMethods: {{ {methods} }}"));
+            }
+            if !async_methods.is_empty() {
+                let methods = async_methods
+                    .iter()
+                    .map(|m| format!("\"{m}\": true"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                extras.push(format!("asyncMethods: {{ {methods} }}"));
+            }
+            if extras.is_empty() {
+                format!("{{ __uniffiCallback: true, object: {object} }}")
+            } else {
                 format!(
-                    "{{ __uniffiCallback: true, object: {object}, fallibleMethods: {{ {methods} }} }}"
+                    "{{ __uniffiCallback: true, object: {object}, {} }}",
+                    extras.join(", ")
                 )
             }
         }
@@ -1394,6 +1424,26 @@ fn ts_lower_expr(
         Type::Object { .. } => format!("{ident}.__uniffi.raw"),
         _ => ident.to_string(),
     }
+}
+
+fn callback_async_methods(ci: &ComponentInterface, name: &str) -> Vec<String> {
+    let methods = ci
+        .object_definitions()
+        .iter()
+        .find(|obj| obj.name() == name && matches!(obj.imp(), ObjectImpl::CallbackTrait))
+        .map(|obj| obj.methods())
+        .or_else(|| {
+            ci.callback_interface_definitions()
+                .iter()
+                .find(|callback| callback.name() == name)
+                .map(|callback| callback.methods())
+        });
+    methods
+        .into_iter()
+        .flatten()
+        .filter(|method| method.is_async())
+        .map(|method| js_fn_name(method.name()))
+        .collect()
 }
 
 fn callback_fallible_methods(ci: &ComponentInterface, name: &str) -> Vec<(String, &'static str)> {
