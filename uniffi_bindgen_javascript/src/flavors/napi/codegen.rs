@@ -337,8 +337,8 @@ impl<'a> Generator<'a> {
                 }
                 ObjectImpl::CallbackTrait => {
                     ensure!(
-                        matches!(usage, TypeUsage::Arg),
-                        "{label} type `{name}` is only supported as a direct function/method argument"
+                        matches!(usage, TypeUsage::Arg | TypeUsage::CallbackReturn),
+                        "{label} type `{name}` is only supported as a direct function/method argument or callback return"
                     );
                     Ok(())
                 }
@@ -355,7 +355,11 @@ impl<'a> Generator<'a> {
             }
             Type::Timestamp | Type::Duration => Ok(()),
             Type::CallbackInterface { name, .. } => {
-                bail!("callback interface type `{name}` is not supported directly")
+                ensure!(
+                    matches!(usage, TypeUsage::Arg | TypeUsage::CallbackReturn),
+                    "{label} type `{name}` is only supported as a direct function/method argument or callback return"
+                );
+                Ok(())
             }
             Type::Custom { builtin, .. } => self.ensure_type_supported(builtin, usage, label),
         }
@@ -1002,6 +1006,14 @@ impl<'a> Generator<'a> {
                     napi_val: napi::bindgen_prelude::sys::napi_value,
                 ) -> napi::bindgen_prelude::Result<Self> {
                     let obj = napi::bindgen_prelude::Object::from_napi_value(env, napi_val)?;
+                    let obj = if obj
+                        .get_named_property_unchecked::<bool>("__uniffiCallback")
+                        .unwrap_or(false)
+                    {
+                        obj.get_named_property_unchecked::<napi::bindgen_prelude::Object>("object")?
+                    } else {
+                        obj
+                    };
                     Ok(Self {
                         #(#field_inits)*
                         #env_init
@@ -1477,7 +1489,8 @@ impl<'a> Generator<'a> {
             Type::Timestamp => Ok(quote!(__UniffiTimestamp)),
             Type::Duration => Ok(quote!(__UniffiDuration)),
             Type::CallbackInterface { name, .. } => {
-                bail!("callback interface `{name}` is not supported directly")
+                let ident = rust_ident(name);
+                Ok(quote!(#ident))
             }
             Type::Custom { builtin, .. } => self.bridge_value_type(builtin),
         }
@@ -1707,7 +1720,8 @@ impl<'a> Generator<'a> {
                     Ok(quote!(napi::bindgen_prelude::ClassInstance<'static, #ident>))
                 }
                 ObjectImpl::CallbackTrait => {
-                    bail!("callback trait `{name}` cannot be returned directly")
+                    let ident = rust_ident(name);
+                    Ok(quote!(#ident))
                 }
             },
             _ => self.bridge_return_type(ty),
@@ -1747,10 +1761,11 @@ impl<'a> Generator<'a> {
             })),
             Type::Bytes => Ok(quote!(#expr.into())),
             Type::Record { .. } | Type::Enum { .. } => Ok(quote!(#expr.into())),
-            Type::Object { imp, name, .. } => match imp {
+            Type::Object { imp, .. } => match imp {
                 ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!((*(#expr)).0.clone())),
                 ObjectImpl::CallbackTrait => {
-                    bail!("callback trait `{name}` cannot be returned directly")
+                    let core_path = self.core_type_path(ty.clone());
+                    Ok(quote!(std::sync::Arc::new(#expr) as std::sync::Arc<dyn #core_path>))
                 }
             },
             Type::Optional { inner_type } => {
@@ -1776,8 +1791,9 @@ impl<'a> Generator<'a> {
             }
             Type::Timestamp => Ok(quote!(#expr.0)),
             Type::Duration => Ok(quote!(#expr.0)),
-            Type::CallbackInterface { name, .. } => {
-                bail!("callback interface `{name}` cannot be returned directly")
+            Type::CallbackInterface { .. } => {
+                let core_path = self.core_type_path(ty.clone());
+                Ok(quote!(std::sync::Arc::new(#expr) as std::sync::Arc<dyn #core_path>))
             }
             Type::Custom {
                 module_path,
@@ -1833,17 +1849,14 @@ impl<'a> Generator<'a> {
                 let core_path = self.core_type_path(ty.clone());
                 Ok(quote!(#core_path))
             }
-            Type::Object { name, imp, .. } => match imp {
+            Type::Object { imp, .. } => match imp {
                 ObjectImpl::Struct => {
                     let core_path = self.core_type_path(ty.clone());
                     Ok(quote!(std::sync::Arc<#core_path>))
                 }
-                ObjectImpl::Trait => {
+                ObjectImpl::Trait | ObjectImpl::CallbackTrait => {
                     let core_path = self.core_type_path(ty.clone());
                     Ok(quote!(std::sync::Arc<dyn #core_path>))
-                }
-                ObjectImpl::CallbackTrait => {
-                    bail!("callback trait `{name}` cannot be returned directly")
                 }
             },
             Type::Optional { inner_type } => {
@@ -1864,8 +1877,9 @@ impl<'a> Generator<'a> {
             }
             Type::Timestamp => Ok(quote!(::std::time::SystemTime)),
             Type::Duration => Ok(quote!(::std::time::Duration)),
-            Type::CallbackInterface { name, .. } => {
-                bail!("callback interface `{name}` cannot be returned directly")
+            Type::CallbackInterface { .. } => {
+                let core_path = self.core_type_path(ty.clone());
+                Ok(quote!(std::sync::Arc<dyn #core_path>))
             }
         }
     }
