@@ -152,197 +152,197 @@ impl BuildArgs {
 pub(crate) struct BuildWasmArgs {
     /// Downstream core crate Cargo.toml.
     #[clap(long = "manifest-path")]
-    manifest_path: Utf8PathBuf,
+    pub(crate) manifest_path: Utf8PathBuf,
 
     /// Directory in which to write generated JavaScript files.
     #[clap(long, short)]
-    out_dir: Utf8PathBuf,
+    pub(crate) out_dir: Utf8PathBuf,
 
     /// Optional override for the library/cdylib path used for JS generation.
     /// When omitted, the command builds the crate at --manifest-path and derives
     /// the cdylib location from Cargo metadata.
     #[clap(long = "library-path")]
-    library_path: Option<Utf8PathBuf>,
+    pub(crate) library_path: Option<Utf8PathBuf>,
 
     /// Optional UDL or source input passed directly to the JS generator.
     /// When set, this overrides the built-library path for generation, but
     /// the downstream core crate is still built as part of the orchestration.
     #[clap(long)]
-    source: Option<Utf8PathBuf>,
+    pub(crate) source: Option<Utf8PathBuf>,
 
     /// Directory (default `rust_modules`) in which to emit the generated wasm host crate.
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
-    host_crates_dir: Utf8PathBuf,
+    pub(crate) host_crates_dir: Utf8PathBuf,
 
     /// Where to write the wasm-bindgen output tree. Defaults to `<out-dir>/browser/pkg`.
     #[clap(long = "wasm-bindgen-out-dir")]
-    wasm_bindgen_out_dir: Option<Utf8PathBuf>,
+    pub(crate) wasm_bindgen_out_dir: Option<Utf8PathBuf>,
 
     /// wasm-bindgen output target.
     #[clap(long = "wasm-bindgen-target", value_enum, default_value = "web")]
-    wasm_bindgen_target: WasmBindgenTargetArg,
+    pub(crate) wasm_bindgen_target: WasmBindgenTargetArg,
 
     /// Override the `cargo` binary to invoke.
     #[clap(long = "cargo-bin", default_value = "cargo")]
-    cargo_bin: String,
+    pub(crate) cargo_bin: String,
 
     /// Override the `wasm-bindgen` binary to invoke.
     #[clap(long = "wasm-bindgen-bin", default_value = "wasm-bindgen")]
-    wasm_bindgen_bin: String,
+    pub(crate) wasm_bindgen_bin: String,
 
     /// Build the downstream core crate and generated wasm host crate in release mode.
     #[clap(long)]
-    release: bool,
+    pub(crate) release: bool,
 
     /// Do not try to format the generated bindings.
     #[clap(long, short)]
-    no_format: bool,
+    pub(crate) no_format: bool,
 
     /// Path to optional uniffi config file.
     #[clap(long, short)]
-    config: Option<Utf8PathBuf>,
+    pub(crate) config: Option<Utf8PathBuf>,
 
     /// Optional crate filter passed through to the JS generator.
     #[clap(long = "crate")]
-    crate_name: Option<String>,
+    pub(crate) crate_name: Option<String>,
 
     /// Whether we should exclude dependencies when running cargo metadata.
     #[clap(long)]
-    metadata_no_deps: bool,
+    pub(crate) metadata_no_deps: bool,
 }
 
 #[derive(Clone, Args)]
 pub(crate) struct BuildNapiArgs {
     /// Downstream core crate Cargo.toml.
     #[clap(long = "manifest-path")]
-    manifest_path: Utf8PathBuf,
+    pub(crate) manifest_path: Utf8PathBuf,
 
     /// Directory in which to write generated JavaScript files.
     #[clap(long, short)]
-    out_dir: Utf8PathBuf,
+    pub(crate) out_dir: Utf8PathBuf,
 
     /// Optional override for the library/cdylib path used for JS generation.
     /// When omitted, the command builds the crate at --manifest-path and derives
     /// the cdylib location from Cargo metadata.
     #[clap(long = "library-path")]
-    library_path: Option<Utf8PathBuf>,
+    pub(crate) library_path: Option<Utf8PathBuf>,
 
     /// Optional UDL or source input passed directly to the JS generator.
     /// When set, this overrides the built-library path for generation, but
     /// the downstream core crate is still built as part of the orchestration.
     #[clap(long)]
-    source: Option<Utf8PathBuf>,
+    pub(crate) source: Option<Utf8PathBuf>,
 
     /// Directory (default `rust_modules`) in which to emit the generated napi host crate.
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
-    host_crates_dir: Utf8PathBuf,
+    pub(crate) host_crates_dir: Utf8PathBuf,
 
     /// N-API consumption form(s) to emit. Defaults to both node and electron.
     #[clap(long = "flavor", value_enum)]
-    flavor: Vec<NapiBuildFlavorArg>,
+    pub(crate) flavor: Vec<NapiBuildFlavorArg>,
 
     /// Override the `cargo` binary to invoke.
     #[clap(long = "cargo-bin", default_value = "cargo")]
-    cargo_bin: String,
+    pub(crate) cargo_bin: String,
 
     /// Cargo target directory for the generated N-API host build.
     #[clap(long = "target-dir")]
-    target_dir: Option<Utf8PathBuf>,
+    pub(crate) target_dir: Option<Utf8PathBuf>,
 
     /// Build the downstream core crate and generated napi host crate in release mode.
     #[clap(long)]
-    release: bool,
+    pub(crate) release: bool,
 
     /// Do not try to format the generated bindings.
     #[clap(long, short)]
-    no_format: bool,
+    pub(crate) no_format: bool,
 
     /// Path to optional uniffi config file.
     #[clap(long, short)]
-    config: Option<Utf8PathBuf>,
+    pub(crate) config: Option<Utf8PathBuf>,
 
     /// Optional crate filter passed through to the JS generator.
     #[clap(long = "crate")]
-    crate_name: Option<String>,
+    pub(crate) crate_name: Option<String>,
 
     /// Whether we should exclude dependencies when running cargo metadata.
     #[clap(long)]
-    metadata_no_deps: bool,
+    pub(crate) metadata_no_deps: bool,
 }
 
 #[derive(Clone, Args)]
 pub(crate) struct BuildOhosArgs {
     /// Downstream core crate Cargo.toml.
     #[clap(long = "manifest-path")]
-    manifest_path: Utf8PathBuf,
+    pub(crate) manifest_path: Utf8PathBuf,
 
     /// Directory in which to write generated JavaScript files.
     #[clap(long, short)]
-    out_dir: Utf8PathBuf,
+    pub(crate) out_dir: Utf8PathBuf,
 
     /// Optional override for the library/cdylib path used for JS generation.
     #[clap(long = "library-path")]
-    library_path: Option<Utf8PathBuf>,
+    pub(crate) library_path: Option<Utf8PathBuf>,
 
     /// Optional UDL or source input passed directly to the JS generator.
     #[clap(long)]
-    source: Option<Utf8PathBuf>,
+    pub(crate) source: Option<Utf8PathBuf>,
 
     /// Directory (default `rust_modules`) in which to emit the generated OHOS host crate.
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
-    host_crates_dir: Utf8PathBuf,
+    pub(crate) host_crates_dir: Utf8PathBuf,
 
     /// Output directory passed to `ohrs build --dist`.
     #[clap(long = "dist-dir")]
-    dist_dir: Option<Utf8PathBuf>,
+    pub(crate) dist_dir: Option<Utf8PathBuf>,
 
     /// OHOS architecture alias passed to `ohrs build --arch`. Defaults to `aarch` and `x64`.
     #[clap(long = "arch")]
-    arch: Vec<String>,
+    pub(crate) arch: Vec<String>,
 
     /// Override the `cargo` binary used for the initial metadata/source build.
     #[clap(long = "cargo-bin", default_value = "cargo")]
-    cargo_bin: String,
+    pub(crate) cargo_bin: String,
 
     /// Override the `ohrs` binary used to build the OHOS host crate.
     #[clap(long = "ohrs-bin", default_value = "ohrs")]
-    ohrs_bin: String,
+    pub(crate) ohrs_bin: String,
 
     /// Optional local checkout of ohos-rs; when set, generated host crate uses path deps.
     #[clap(long = "ohos-rs-dir")]
-    ohos_rs_dir: Option<Utf8PathBuf>,
+    pub(crate) ohos_rs_dir: Option<Utf8PathBuf>,
 
     /// Cargo target directory passed through to `ohrs build --target-dir`.
     #[clap(long = "target-dir")]
-    target_dir: Option<Utf8PathBuf>,
+    pub(crate) target_dir: Option<Utf8PathBuf>,
 
     /// Build the downstream core crate and generated OHOS host crate in release mode.
     #[clap(long)]
-    release: bool,
+    pub(crate) release: bool,
 
     /// Do not try to format the generated bindings.
     #[clap(long, short)]
-    no_format: bool,
+    pub(crate) no_format: bool,
 
     /// Path to optional uniffi config file.
     #[clap(long, short)]
-    config: Option<Utf8PathBuf>,
+    pub(crate) config: Option<Utf8PathBuf>,
 
     /// Optional crate filter passed through to the JS generator.
     #[clap(long = "crate")]
-    crate_name: Option<String>,
+    pub(crate) crate_name: Option<String>,
 
     /// Whether we should exclude dependencies when running cargo metadata.
     #[clap(long)]
-    metadata_no_deps: bool,
+    pub(crate) metadata_no_deps: bool,
 
     /// Additional cargo args passed to `ohrs build` after `--`.
     #[clap(last = true)]
-    cargo_args: Vec<String>,
+    pub(crate) cargo_args: Vec<String>,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
-enum NapiBuildFlavorArg {
+pub(crate) enum NapiBuildFlavorArg {
     Napi,
     Electron,
 }
@@ -357,7 +357,7 @@ impl From<NapiBuildFlavorArg> for FlavorTarget {
 }
 
 #[derive(Copy, Clone, ValueEnum)]
-enum WasmBindgenTargetArg {
+pub(crate) enum WasmBindgenTargetArg {
     Web,
     Nodejs,
     Bundler,
@@ -440,7 +440,7 @@ fn build(args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_wasm(args: BuildWasmArgs) -> Result<()> {
+pub(crate) fn build_wasm(args: BuildWasmArgs) -> Result<()> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let core_meta = cargo_package_metadata(&manifest_path)?;
 
@@ -557,7 +557,7 @@ fn build_wasm(args: BuildWasmArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_napi(args: BuildNapiArgs) -> Result<()> {
+pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let core_meta = cargo_package_metadata(&manifest_path)?;
 
@@ -677,7 +677,7 @@ fn build_napi(args: BuildNapiArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_ohos(args: BuildOhosArgs) -> Result<()> {
+pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let core_meta = cargo_package_metadata(&manifest_path)?;
 
