@@ -6,7 +6,7 @@
 //! async exports, and napi-specific surface generation.
 
 use anyhow::{bail, ensure, Result};
-use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
+use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse2;
@@ -1105,11 +1105,7 @@ impl<'a> Generator<'a> {
         object: &Object,
         constructor: &Constructor,
     ) -> Result<TokenStream> {
-        let function_name = format!(
-            "{}_{}",
-            object.name().to_snake_case(),
-            constructor.name().to_snake_case()
-        );
+        let function_name = crate::dispatch_key::constructor_key(object.name(), constructor);
         let fn_ident = rust_ident(&function_name);
         let object_ident = rust_ident(object.name());
         let object_ty = object.as_type();
@@ -1156,11 +1152,7 @@ impl<'a> Generator<'a> {
 
     fn render_object_method(&self, method: &Method) -> Result<TokenStream> {
         let object_ident = rust_ident(method.object_name());
-        let function_name = format!(
-            "{}_{}",
-            method.object_name().to_snake_case(),
-            method.name().to_snake_case()
-        );
+        let function_name = crate::dispatch_key::object_method_key(method);
         let fn_ident = rust_ident(&function_name);
         let method_ident = rust_ident(method.name());
         let receiver_ident = rust_ident("handle");
@@ -1217,11 +1209,7 @@ impl<'a> Generator<'a> {
         owner_ty: &Type,
         method: &Method,
     ) -> Result<TokenStream> {
-        let function_name = format!(
-            "{}_{}",
-            owner_name.to_snake_case(),
-            method.name().to_snake_case()
-        );
+        let function_name = crate::dispatch_key::method_key(owner_name, method);
         let fn_ident = rust_ident(&function_name);
         let self_ident = rust_ident("self_");
         let self_bridge_ty = self.bridge_value_type(owner_ty)?;
@@ -1295,11 +1283,7 @@ impl<'a> Generator<'a> {
         owner_ty: &Type,
         constructor: &Constructor,
     ) -> Result<TokenStream> {
-        let function_name = format!(
-            "{}_{}",
-            owner_name.to_snake_case(),
-            constructor.name().to_snake_case()
-        );
+        let function_name = crate::dispatch_key::constructor_key(owner_name, constructor);
         let fn_ident = rust_ident(&function_name);
         let output_ty = self.bridge_return_type(owner_ty)?;
         let core_path = self.core_type_path(owner_ty.clone());

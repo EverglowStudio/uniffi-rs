@@ -29,84 +29,15 @@
 //! handles `dispose` via its `drop` message kind, not through
 //! `addon[method]`.
 
-use heck::{ToLowerCamelCase, ToSnakeCase};
 use uniffi_bindgen::ComponentInterface;
 
-/// `snake_case` → `lowerCamelCase`. Pure string transform; no IR.
-///
-/// Kept as a free function so both the generator and the test suite
-/// can pin representative conversions directly in code.
-pub fn snake_to_camel(snake: &str) -> String {
-    // `heck`'s `to_lower_camel_case` already handles:
-    //   add              -> add
-    //   greet_with       -> greetWith
-    //   slow_add         -> slowAdd
-    //   counter_new      -> counterNew
-    //   counter_with_initial -> counterWithInitial
-    //   run_job          -> runJob
-    //
-    // Going through `to_snake_case` first normalises input that is
-    // already camel/Pascal/mixed, so the function is idempotent.
-    snake.to_snake_case().to_lower_camel_case()
-}
+pub use crate::dispatch_key::snake_to_camel;
 
 /// Collect every `(low_level_key, napi_export_name)` pair the generated
 /// node/electron backends will need to look up. Sorted and deduplicated
 /// so the emitted literal is stable across runs.
 pub fn collect(ci: &ComponentInterface) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = Vec::new();
-
-    // Free functions — `api_module/mod.rs` emits `f.name()` verbatim.
-    for f in ci.function_definitions() {
-        let key = f.name().to_string();
-        pairs.push((key.clone(), snake_to_camel(&key)));
-    }
-
-    // Value-type constructors/methods — `api_module/mod.rs` emits
-    // `{type_snake}_{member_snake}`.
-    for record in ci.record_definitions() {
-        let record_snake = record.name().to_snake_case();
-        for c in record.constructors() {
-            let key = format!("{record_snake}_{}", c.name().to_snake_case());
-            pairs.push((key.clone(), snake_to_camel(&key)));
-        }
-        for m in record.methods() {
-            let key = format!("{record_snake}_{}", m.name().to_snake_case());
-            pairs.push((key.clone(), snake_to_camel(&key)));
-        }
-    }
-    for enum_ in ci.enum_definitions() {
-        if ci.is_name_used_as_error(enum_.name()) {
-            continue;
-        }
-        let enum_snake = enum_.name().to_snake_case();
-        for c in enum_.constructors() {
-            let key = format!("{enum_snake}_{}", c.name().to_snake_case());
-            pairs.push((key.clone(), snake_to_camel(&key)));
-        }
-        for m in enum_.methods() {
-            let key = format!("{enum_snake}_{}", m.name().to_snake_case());
-            pairs.push((key.clone(), snake_to_camel(&key)));
-        }
-    }
-
-    // Object constructors & methods — `api_module/mod.rs` emits
-    // `{obj_snake}_{member_snake}`.
-    for obj in ci.object_definitions() {
-        let obj_snake = obj.name().to_snake_case();
-        for c in obj.constructors() {
-            let key = format!("{obj_snake}_{}", c.name().to_snake_case());
-            pairs.push((key.clone(), snake_to_camel(&key)));
-        }
-        for m in obj.methods() {
-            let key = format!("{obj_snake}_{}", m.name().to_snake_case());
-            pairs.push((key.clone(), snake_to_camel(&key)));
-        }
-    }
-
-    pairs.sort();
-    pairs.dedup();
-    pairs
+    crate::dispatch_key::collect_name_map_pairs(ci)
 }
 
 /// Emit the map as a JS object literal (`{ "counter_new": "counterNew", ... }`).
