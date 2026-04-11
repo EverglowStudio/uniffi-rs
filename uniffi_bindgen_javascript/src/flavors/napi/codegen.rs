@@ -15,6 +15,8 @@ use uniffi_bindgen::interface::{
     Object, ObjectImpl, Record, Type, Variant,
 };
 
+use crate::callback_metadata;
+
 pub fn render_napi_rust(ci: &ComponentInterface) -> Result<String> {
     let generator = Generator::new(ci);
     generator.validate()?;
@@ -2121,39 +2123,14 @@ impl<'a> Generator<'a> {
             method.is_async()
                 && method
                     .return_type()
-                    .is_some_and(Self::is_direct_callback_return_type)
+                    .is_some_and(callback_metadata::is_callback_return_type)
         })
     }
 
-    fn is_direct_callback_return_type(ty: &Type) -> bool {
-        matches!(
-            ty,
-            Type::Object {
-                imp: ObjectImpl::CallbackTrait,
-                ..
-            } | Type::CallbackInterface { .. }
-        )
-    }
-
-    fn contains_callback_return_type(ty: &Type) -> bool {
-        match ty {
-            Type::Object {
-                imp: ObjectImpl::CallbackTrait,
-                ..
-            }
-            | Type::CallbackInterface { .. } => true,
-            Type::Optional { inner_type } | Type::Sequence { inner_type } => {
-                Self::contains_callback_return_type(inner_type)
-            }
-            Type::Map { value_type, .. } => Self::contains_callback_return_type(value_type),
-            _ => false,
-        }
-    }
-
     fn callback_async_bridge_type(&self, ty: &Type) -> Result<TokenStream> {
-        if Self::is_direct_callback_return_type(ty) {
+        if callback_metadata::is_callback_return_type(ty) {
             Ok(quote!(__UniffiCallbackHandle))
-        } else if Self::contains_callback_return_type(ty) {
+        } else if callback_metadata::contains_callback_return_type(ty) {
             bail!(
                 "async callback methods returning nested callback traits/interfaces are not supported in the N-API/Electron backend yet"
             )
@@ -2281,7 +2258,7 @@ impl<'a> Generator<'a> {
     }
 
     fn lower_async_callback_value_expr(&self, expr: TokenStream, ty: &Type) -> Result<TokenStream> {
-        if Self::is_direct_callback_return_type(ty) {
+        if callback_metadata::is_callback_return_type(ty) {
             self.lower_callback_handle_expr(expr, ty)
         } else {
             self.lower_callback_value_expr(expr, ty)
