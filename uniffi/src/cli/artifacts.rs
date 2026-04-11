@@ -871,9 +871,6 @@ fn android_kotlin_config(args: &BuildArgs) -> Result<Option<Utf8PathBuf>> {
 }
 
 fn copy_dir_contents(from: &Utf8Path, to: &Utf8Path) -> Result<()> {
-    if to.exists() {
-        std::fs::remove_dir_all(to).with_context(|| format!("removing stale directory {to}"))?;
-    }
     std::fs::create_dir_all(to).with_context(|| format!("creating directory {to}"))?;
     copy_dir_contents_inner(from, to)
 }
