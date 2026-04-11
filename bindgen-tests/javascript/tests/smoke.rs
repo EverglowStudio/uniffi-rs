@@ -2894,6 +2894,7 @@ fn emits_host_crate_tree_when_opted_in() {
     assert!(napi_toml.contains("napi = "));
     assert!(napi_toml.contains("napi-derive"));
     assert!(napi_toml.contains("napi-build"));
+    assert!(napi_toml.contains("async-trait = \"0.1\""));
     assert!(
         napi_toml.contains("uniffi-example-arithmetic = { path ="),
         "napi Cargo.toml should path-depend on core crate, got:\n{napi_toml}"
@@ -3612,6 +3613,99 @@ fn generate_callback_return_napi_host(root: &std::path::Path) -> Utf8PathBuf {
         },
     )
     .expect("callback-return napi generator run should succeed");
+    host_dir
+}
+
+fn write_async_callback_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
+    let core = root.join("async_callback_core");
+    let src = core.join("src");
+    let uniffi_path = workspace_root().join("uniffi");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        core.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"napi-async-callback-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
+             [lib]\nname = \"napi_async_callback_core\"\ncrate-type = [\"lib\"]\n\n\
+             [dependencies]\nasync-trait = \"0.1\"\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\n",
+            uniffi_path.as_str()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "use std::sync::Arc;\n\n\
+         #[derive(Clone, Debug, PartialEq, Eq)]\n\
+         pub struct WorkRecord {\n\
+         \x20   pub total: u32,\n\
+         }\n\n\
+         #[async_trait::async_trait]\n\
+         pub trait AsyncWorker: Send + Sync {\n\
+         \x20   async fn note(&self, msg: String);\n\
+         \x20   async fn compute(&self, a: u32, b: u32) -> u32;\n\
+         \x20   async fn make_record(&self, a: u32, b: u32) -> WorkRecord;\n\
+         }\n\n\
+         pub async fn run_async_worker(worker: Arc<dyn AsyncWorker>) -> WorkRecord {\n\
+         \x20   worker.note(\"start\".to_string()).await;\n\
+         \x20   let value = worker.compute(20, 22).await;\n\
+         \x20   let record = worker.make_record(value, 1).await;\n\
+         \x20   worker.note(\"done\".to_string()).await;\n\
+         \x20   record\n\
+         }\n",
+    )
+    .unwrap();
+    let udl = core.join("src/async_callback.udl");
+    std::fs::write(
+        &udl,
+        r#"
+dictionary WorkRecord {
+  u32 total;
+};
+
+[Trait, WithForeign]
+interface AsyncWorker {
+  [Async]
+  void note(string msg);
+  [Async]
+  u32 compute(u32 a, u32 b);
+  [Async]
+  WorkRecord make_record(u32 a, u32 b);
+};
+
+namespace async_callback {
+  [Async]
+  WorkRecord run_async_worker(AsyncWorker worker);
+};
+"#,
+    )
+    .unwrap();
+    (
+        Utf8PathBuf::from_path_buf(udl).unwrap(),
+        Utf8PathBuf::from_path_buf(core.join("Cargo.toml")).unwrap(),
+    )
+}
+
+fn generate_async_callback_napi_host(root: &std::path::Path) -> Utf8PathBuf {
+    let (udl, manifest) = write_async_callback_core_crate(root);
+    let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: udl,
+            out_dir,
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: manifest,
+                host_crates_dir: host_dir.clone(),
+            }),
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
+        },
+    )
+    .expect("async-callback napi generator run should succeed");
     host_dir
 }
 
@@ -4910,6 +5004,185 @@ console.log("ok");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("ok"),
         "callback-return driver did not print ok:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn host_crates_napi_runs_async_callback_trait_fixture() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!(
+            "SKIP host_crates_napi_runs_async_callback_trait_fixture: node 22.6+ unavailable"
+        );
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host_dir = generate_async_callback_napi_host(tmp.path());
+    let manifest = host_dir.join("napi/Cargo.toml");
+    let target_dir = tmp.path().join("cargo-target-async-callback");
+
+    let cargo_toml = std::fs::read_to_string(&manifest).unwrap();
+    assert!(
+        cargo_toml.contains("async-trait = \"0.1\""),
+        "napi host crate must include async-trait for async callback impls:\n{cargo_toml}"
+    );
+
+    let build = match run_cargo_build(&manifest, &[], &target_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP host_crates_napi_runs_async_callback_trait_fixture: cargo unavailable during build: {e}");
+            return;
+        }
+    };
+    if !build.status.success() {
+        panic!(
+            "cargo build on async-callback napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+        );
+    }
+
+    let lib_name = cdylib_filename("napi-async-callback-core-napi");
+    let built_lib = target_dir.join("debug").join(lib_name);
+    assert!(
+        built_lib.exists(),
+        "expected built async-callback cdylib at {}",
+        built_lib.display()
+    );
+
+    let generated = tmp.path().join("generated");
+    let node_addon = generated.join("node/async_callback.node");
+    std::fs::copy(&built_lib, &node_addon).unwrap();
+
+    let electron_dir = generated.join("electron");
+    let electron_addon = electron_dir.join("async_callback.node");
+    std::fs::copy(&built_lib, &electron_addon).unwrap();
+    let electron_stub = electron_dir.join("node_modules/electron");
+    std::fs::create_dir_all(&electron_stub).unwrap();
+    std::fs::write(
+        electron_stub.join("index.js"),
+        r#"exports.contextBridge = {
+  exposeInMainWorld(name, value) {
+    globalThis[name] = value;
+  },
+};
+"#,
+    )
+    .unwrap();
+
+    let callbacks = std::fs::read_to_string(generated.join("common/callbacks.ts")).unwrap();
+    assert!(
+        callbacks.contains("note(msg: string): void | Promise<void>;")
+            && callbacks.contains("compute(a: number, b: number): number | Promise<number>;")
+            && callbacks
+                .contains("makeRecord(a: number, b: number): WorkRecord | Promise<WorkRecord>;")
+            && callbacks.contains("Promise.resolve(__uniffiCallbackObject.compute"),
+        "common/callbacks.ts should expose and lower async callback methods:\n{callbacks}"
+    );
+    let api = std::fs::read_to_string(generated.join("common/api.ts")).unwrap();
+    for needle in [
+        "asyncMethods: {",
+        "\"note\": true",
+        "\"compute\": true",
+        "\"makeRecord\": true",
+    ] {
+        assert!(
+            api.contains(needle),
+            "common/api.ts should mark async callback methods with `{needle}`:\n{api}"
+        );
+    }
+    let bridge_path = std::fs::read_dir(generated.join("node"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .expect("generated node bridge should contain a Rust shim");
+    let bridge = std::fs::read_to_string(bridge_path).unwrap();
+    assert!(
+        bridge.contains("#[async_trait::async_trait]")
+            && bridge.contains("napi::bindgen_prelude::Promise<WorkRecord>")
+            && bridge.contains(".call_async(Ok"),
+        "napi bridge should implement async callback methods through TSFN Promise:\n{bridge}"
+    );
+    let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
+    assert!(
+        preload.contains("asyncMethods") && preload.contains("Promise.resolve(v(...callArgs))"),
+        "electron preload should preserve async callback marker behavior:\n{preload}"
+    );
+
+    let driver = generated.join("async-callback-driver.ts");
+    std::fs::write(
+        &driver,
+        r#"
+import { runAsyncWorker } from "./node/index.ts";
+import { createRequire } from "node:module";
+
+globalThis.window = globalThis;
+const require = createRequire(import.meta.url);
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+function delay(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 1));
+}
+
+function makeWorker(label: string) {
+  const calls: string[] = [];
+  return {
+    calls,
+    worker: {
+      async note(msg: string): Promise<void> {
+        await delay();
+        calls.push(`${label}:${msg}`);
+      },
+      async compute(a: number, b: number): Promise<number> {
+        await delay();
+        return a + b;
+      },
+      async makeRecord(a: number, b: number): Promise<{ total: number }> {
+        await delay();
+        return { total: a + b };
+      },
+    },
+  };
+}
+
+const nodeCase = makeWorker("node");
+const nodeRecord = await runAsyncWorker(nodeCase.worker as any);
+assert(nodeRecord.total === 43, `node total=${nodeRecord.total}`);
+assert(nodeCase.calls.join(",") === "node:start,node:done", `node calls=${nodeCase.calls.join(",")}`);
+
+require("./electron/preload.cjs");
+const electronApi = await import("./electron/renderer.ts");
+const electronCase = makeWorker("electron");
+const electronRecord = await electronApi.runAsyncWorker(electronCase.worker as any);
+assert(electronRecord.total === 43, `electron total=${electronRecord.total}`);
+assert(electronCase.calls.join(",") === "electron:start,electron:done", `electron calls=${electronCase.calls.join(",")}`);
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(&generated)
+        .output()
+        .expect("failed to run async-callback driver");
+    if !output.status.success() {
+        panic!(
+            "async-callback driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "async-callback driver did not print ok:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
 }

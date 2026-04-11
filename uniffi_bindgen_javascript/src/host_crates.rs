@@ -218,6 +218,7 @@ fn emit_napi(
          [dependencies]\n\
          {core_name} = {{ path = \"{rel_core}\" }}\n\
          {uniffi_dep}\
+         async-trait = \"0.1\"\n\
          napi = {{ version = \"3.8.4\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }}\n\
          napi-derive = {{ version = \"3.5.3\", features = [\"type-def\"] }}\n\
          \n\

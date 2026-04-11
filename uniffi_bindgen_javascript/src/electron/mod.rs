@@ -198,6 +198,7 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
          function __uniffiNormalizeCallbackObject(obj, marker) {{\n\
              if (obj === null || typeof obj !== \"object\") return obj;\n\
              const fallibleMethods = (marker && marker.fallibleMethods) || {{}};\n\
+             const asyncMethods = (marker && marker.asyncMethods) || {{}};\n\
              const out = {{}};\n\
              const keys = Object.keys(obj);\n\
              for (let i = 0; i < keys.length; i++) {{\n\
@@ -209,8 +210,20 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
                              ? args.slice(1)\n\
                              : args;\n\
                          const errorShape = fallibleMethods[k];\n\
+                         const isAsync = asyncMethods[k] === true;\n\
                          if (!errorShape) {{\n\
+                             if (isAsync) {{\n\
+                                 return Promise.resolve(v(...callArgs)).then(function (value) {{\n\
+                                     return __uniffiLowerShape(value);\n\
+                                 }});\n\
+                             }}\n\
                              return __uniffiLowerShape(v(...callArgs));\n\
+                         }}\n\
+                         if (isAsync) {{\n\
+                             return Promise.resolve(v(...callArgs)).then(\n\
+                                 function (value) {{ return {{ ok: true, value: __uniffiLowerShape(value) }}; }},\n\
+                                 function (error) {{ return {{ ok: false, error: __uniffiCallbackErrorPayload(error, errorShape) }}; }}\n\
+                             );\n\
                          }}\n\
                          try {{\n\
                              return {{ ok: true, value: __uniffiLowerShape(v(...callArgs)) }};\n\
