@@ -261,8 +261,8 @@ impl<'a> Generator<'a> {
                     );
                     for method in object.methods() {
                         ensure!(
-                            !method.is_async(),
-                            "callback trait method `{}`.{} async callbacks are not supported",
+                            !(method.is_async() && method.throws_type().is_some()),
+                            "callback trait method `{}`.{} fallible async callbacks are not supported",
                             object.name(),
                             method.name()
                         );
@@ -618,10 +618,9 @@ impl<'a> Generator<'a> {
 
     fn render_callback_trait(&self, object: &Object) -> Result<TokenStream> {
         let ident = rust_ident(object.name());
-        let needs_env = object
-            .methods()
-            .into_iter()
-            .any(|method| method.return_type().is_some() || method.throws_type().is_some());
+        let needs_env = object.methods().into_iter().any(|method| {
+            !method.is_async() && (method.return_type().is_some() || method.throws_type().is_some())
+        });
         let env_field = needs_env.then(|| quote!(env: usize,));
         let fields = object
             .methods()
@@ -641,6 +640,11 @@ impl<'a> Generator<'a> {
             .collect::<Result<Vec<_>>>()?;
         let from_napi = self.render_callback_from_napi_impl(object, needs_env)?;
         let core_path = self.core_type_path(object.as_type());
+        let async_trait_attr = object
+            .methods()
+            .into_iter()
+            .any(|method| method.is_async())
+            .then(|| quote!(#[async_trait::async_trait]));
 
         Ok(quote! {
             pub struct #ident {
@@ -652,6 +656,7 @@ impl<'a> Generator<'a> {
 
             #from_napi
 
+            #async_trait_attr
             impl #core_path for #ident {
                 #(#impl_methods)*
             }
@@ -661,7 +666,19 @@ impl<'a> Generator<'a> {
     fn render_callback_field(&self, object: &Object, method: &Method) -> Result<TokenStream> {
         let field_ident = rust_ident(method.name());
         let tsfn_args = self.callback_tsfn_args(method)?;
-        if method.throws_type().is_some() {
+        if method.is_async() && method.throws_type().is_some() {
+            bail!(
+                "callback trait method `{}`.{} fallible async callbacks are not supported",
+                object.name(),
+                method.name()
+            );
+        }
+        if method.is_async() {
+            let bridge_return_ty = self.callback_bridge_return_type(method)?;
+            Ok(quote! {
+                pub #field_ident: ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
+            })
+        } else if method.throws_type().is_some() {
             let result_ty = self.callback_result_ident(object, method);
             Ok(quote! {
                 pub #field_ident: FunctionRef<#tsfn_args, #result_ty>
@@ -720,6 +737,64 @@ impl<'a> Generator<'a> {
             .collect::<Result<Vec<_>>>()?;
 
         let call_value = self.callback_call_value(method)?;
+        if method.is_async() {
+            if method.throws_type().is_some() {
+                bail!(
+                    "callback trait method `{}`.{} fallible async callbacks are not supported",
+                    object.name(),
+                    method.name()
+                );
+            }
+            let method_name = method.name().to_string();
+            return match method.return_type() {
+                Some(return_type) => {
+                    let return_ty = self.core_callback_return_type(return_type)?;
+                    let lowered =
+                        self.lower_callback_value_expr(quote!(#return_value_ident), return_type)?;
+                    Ok(quote! {
+                        async fn #method_ident(&self, #(#args),*) -> #return_ty {
+                            let __callback_promise = self.#method_ident.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
+                                panic!(
+                                    "callback trait `{}`.{} failed to call async JS callback: {}",
+                                    #object_name,
+                                    #method_name,
+                                    err
+                                );
+                            });
+                            let #return_value_ident = __callback_promise.await.unwrap_or_else(|err| {
+                                panic!(
+                                    "callback trait `{}`.{} async JS callback rejected: {}",
+                                    #object_name,
+                                    #method_name,
+                                    err
+                                );
+                            });
+                            #lowered
+                        }
+                    })
+                }
+                None => Ok(quote! {
+                    async fn #method_ident(&self, #(#args),*) {
+                        let __callback_promise = self.#method_ident.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
+                            panic!(
+                                "callback trait `{}`.{} failed to call async JS callback: {}",
+                                #object_name,
+                                #method_name,
+                                err
+                            );
+                        });
+                        __callback_promise.await.unwrap_or_else(|err| {
+                            panic!(
+                                "callback trait `{}`.{} async JS callback rejected: {}",
+                                #object_name,
+                                #method_name,
+                                err
+                            );
+                        });
+                    }
+                }),
+            };
+        }
         if let Some(throws_type) = method.throws_type() {
             let return_ty = match method.return_type() {
                 Some(return_type) => self.core_callback_return_type(return_type)?,
@@ -728,7 +803,8 @@ impl<'a> Generator<'a> {
             let error_ty = self.core_type_path(throws_type.clone());
             let method_name = method.name().to_string();
             let success = if let Some(return_type) = method.return_type() {
-                let lowered = self.lower_value_expr(quote!(__callback_return), return_type)?;
+                let lowered =
+                    self.lower_callback_value_expr(quote!(__callback_return), return_type)?;
                 quote! {
                     let __callback_return = __callback_result.value.unwrap_or_else(|| {
                         panic!(
@@ -742,7 +818,8 @@ impl<'a> Generator<'a> {
             } else {
                 quote!(Ok(()))
             };
-            let lowered_error = self.lower_value_expr(quote!(__callback_error), throws_type)?;
+            let lowered_error =
+                self.lower_callback_value_expr(quote!(__callback_error), throws_type)?;
             return Ok(quote! {
                 fn #method_ident(&self, #(#args),*) -> std::result::Result<#return_ty, #error_ty> {
                     let __env = napi::bindgen_prelude::Env::from_raw(
@@ -781,7 +858,8 @@ impl<'a> Generator<'a> {
         match method.return_type() {
             Some(return_type) => {
                 let return_ty = self.core_callback_return_type(return_type)?;
-                let lowered = self.lower_value_expr(quote!(#return_value_ident), return_type)?;
+                let lowered =
+                    self.lower_callback_value_expr(quote!(#return_value_ident), return_type)?;
                 let method_name = method.name().to_string();
                 Ok(quote! {
                     fn #method_ident(&self, #(#args),*) -> #return_ty {
@@ -883,7 +961,19 @@ impl<'a> Generator<'a> {
         method: &Method,
     ) -> Result<TokenStream> {
         let tsfn_args = self.callback_tsfn_args(method)?;
-        if method.throws_type().is_some() {
+        if method.is_async() && method.throws_type().is_some() {
+            bail!(
+                "callback trait method `{}`.{} fallible async callbacks are not supported",
+                object.name(),
+                method.name()
+            );
+        }
+        if method.is_async() {
+            let bridge_return_ty = self.callback_bridge_return_type(method)?;
+            Ok(
+                quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>),
+            )
+        } else if method.throws_type().is_some() {
             let result_ty = self.callback_result_ident(object, method);
             Ok(quote!(napi::bindgen_prelude::FunctionRef<#tsfn_args, #result_ty>))
         } else if let Some(return_type) = method.return_type() {
@@ -1529,6 +1619,97 @@ impl<'a> Generator<'a> {
                     .map(|arg| self.bridge_value_type(&arg.as_type()))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(quote!(FnArgs<(#(#tys),*)>))
+            }
+        }
+    }
+
+    fn callback_bridge_return_type(&self, method: &Method) -> Result<TokenStream> {
+        match method.return_type() {
+            Some(return_type) => self.bridge_return_type(return_type),
+            None => Ok(quote!(())),
+        }
+    }
+
+    fn lower_callback_value_expr(&self, expr: TokenStream, ty: &Type) -> Result<TokenStream> {
+        match ty {
+            Type::UInt8
+            | Type::Int8
+            | Type::UInt16
+            | Type::Int16
+            | Type::UInt32
+            | Type::Int32
+            | Type::Float32
+            | Type::Float64
+            | Type::Boolean
+            | Type::String => Ok(expr),
+            Type::UInt64 => Ok(quote!({
+                let __big = #expr;
+                let (__sign, __val, __lossless) = __big.get_u64();
+                if __sign && __val != 0 {
+                    panic!("callback returned a negative value for u64");
+                }
+                if !__lossless {
+                    panic!("callback returned a BigInt value that does not fit into u64");
+                }
+                __val
+            })),
+            Type::Int64 => Ok(quote!({
+                let __big = #expr;
+                let (__val, __lossless) = __big.get_i64();
+                if !__lossless {
+                    panic!("callback returned a BigInt value that does not fit into i64");
+                }
+                __val
+            })),
+            Type::Bytes => Ok(quote!(#expr.into())),
+            Type::Record { .. } | Type::Enum { .. } => Ok(quote!(#expr.into())),
+            Type::Object { imp, name, .. } => match imp {
+                ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!(#expr.0.clone())),
+                ObjectImpl::CallbackTrait => {
+                    bail!("callback trait `{name}` cannot be returned directly")
+                }
+            },
+            Type::Optional { inner_type } => {
+                let inner = self.lower_callback_value_expr(quote!(value), inner_type)?;
+                Ok(quote!(#expr.map(|value| { #inner })))
+            }
+            Type::Sequence { inner_type } => {
+                let inner = self.lower_callback_value_expr(quote!(value), inner_type)?;
+                Ok(quote!(#expr.into_iter().map(|value| { #inner }).collect()))
+            }
+            Type::Map {
+                key_type,
+                value_type,
+            } => {
+                let key = self.lower_callback_value_expr(quote!(key), key_type)?;
+                let value = self.lower_callback_value_expr(quote!(value), value_type)?;
+                Ok(quote!(
+                    #expr
+                        .into_iter()
+                        .map(|(key, value)| ({ #key }, { #value }))
+                        .collect()
+                ))
+            }
+            Type::Timestamp => Ok(quote!(#expr.0)),
+            Type::Duration => Ok(quote!(#expr.0)),
+            Type::CallbackInterface { name, .. } => {
+                bail!("callback interface `{name}` cannot be returned directly")
+            }
+            Type::Custom {
+                module_path,
+                builtin,
+                ..
+            } => {
+                let builtin_lower = self.lower_callback_value_expr(expr, builtin)?;
+                let builtin_ty = self.bridge_value_type(builtin)?;
+                let custom_ty = self.core_type_path(ty.clone());
+                let tag_ty = self.core_tag_path(module_path);
+                Ok(quote!({
+                    let __builtin = { #builtin_lower };
+                    let __ffi = <#builtin_ty as ::uniffi::Lower<#tag_ty>>::lower(__builtin);
+                    <#custom_ty as ::uniffi::Lift<#tag_ty>>::try_lift(__ffi)
+                        .expect("uniffi napi custom callback type lift failed")
+                }))
             }
         }
     }
