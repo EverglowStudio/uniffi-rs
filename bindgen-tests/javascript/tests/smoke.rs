@@ -1533,6 +1533,130 @@ console.log("ok");
     });
 }
 
+/// Callback-return object / trait-object smoke — JS callback returns a
+/// normal UniFFI object (`Counter`) and a trait object (`Greeter`).
+/// The Rust consumer calls methods on the returned values, proving the
+/// object registry round-trip works in wasm.
+#[test]
+fn runs_generated_wasm_shim_callback_object_return() {
+    run_wasm_e2e(WasmE2eSpec {
+        name: "wasm_cb_object",
+        udl: r#"
+interface Counter {
+  constructor(u32 initial);
+  void inc();
+  u32 value();
+};
+
+[Trait]
+interface Greeter {
+  string greet(string name);
+};
+
+callback interface Maker {
+  Counter make_counter(u32 initial);
+  Greeter make_greeter(string prefix);
+};
+
+namespace wasm_cb_object {
+  Greeter english_greeter(string prefix);
+  Counter invoke_maker_make_counter(Maker maker, u32 initial);
+  Greeter invoke_maker_make_greeter(Maker maker, string prefix);
+};
+"#,
+        biz_deps: "",
+        shim_deps: "",
+        biz_lib: r#"
+use std::sync::{Arc, Mutex};
+
+pub struct Counter {
+    inner: Mutex<u32>,
+}
+
+impl Counter {
+    pub fn new(initial: u32) -> Arc<Self> {
+        Arc::new(Self { inner: Mutex::new(initial) })
+    }
+    pub fn inc(&self) {
+        *self.inner.lock().unwrap() += 1;
+    }
+    pub fn value(&self) -> u32 {
+        *self.inner.lock().unwrap()
+    }
+}
+
+pub trait Greeter: Send + Sync {
+    fn greet(&self, name: String) -> String;
+}
+
+pub struct English {
+    prefix: String,
+}
+
+impl Greeter for English {
+    fn greet(&self, name: String) -> String {
+        format!("{}{}{}", self.prefix, if self.prefix.ends_with(' ') { "" } else { " " }, name)
+    }
+}
+
+pub fn english_greeter(prefix: String) -> Arc<dyn Greeter> {
+    Arc::new(English { prefix })
+}
+
+pub trait Maker: Send + Sync {
+    fn make_counter(&self, initial: u32) -> Arc<Counter>;
+    fn make_greeter(&self, prefix: String) -> Arc<dyn Greeter>;
+}
+
+pub fn invoke_maker_make_counter(maker: Arc<dyn Maker>, initial: u32) -> Arc<Counter> {
+    maker.make_counter(initial)
+}
+
+pub fn invoke_maker_make_greeter(maker: Arc<dyn Maker>, prefix: String) -> Arc<dyn Greeter> {
+    maker.make_greeter(prefix)
+}
+"#,
+        driver_ts: r#"
+import { createRequire } from "node:module";
+import { initBackend } from "./gen/browser/index.ts";
+import {
+    Counter,
+    englishGreeter,
+    invokeMakerMakeCounter,
+    invokeMakerMakeGreeter,
+} from "./gen/common/api.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/wasm_cb_object_shim.js");
+await initBackend(glue);
+
+const maker = {
+    makeCounter(initial: number) {
+        return Counter.new(initial);
+    },
+    makeGreeter(prefix: string) {
+        return englishGreeter(prefix);
+    },
+};
+
+const counter = invokeMakerMakeCounter(maker as any, 10);
+counter.inc();
+if (counter.value() !== 11) {
+    throw new Error(`counter.value()=${counter.value()}`);
+}
+
+const greeter = invokeMakerMakeGreeter(maker as any, "Hello");
+if (greeter.greet("world") !== "Hello world") {
+    throw new Error(`greeter.greet()=${greeter.greet("world")}`);
+}
+
+console.log("ok");
+"#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
+    });
+}
+
 #[test]
 fn runs_generated_wasm_shim_fallible_callback_trait() {
     run_wasm_e2e(WasmE2eSpec {
@@ -5317,6 +5441,7 @@ for (const [label, fn] of [
     if (!threw) throw new Error(`${label}(true) should throw`);
 }
 
+(globalThis as any).window = globalThis as any;
 require("./electron/preload.cjs");
 const bridge = (globalThis as any).__uniffi__;
 if (!bridge || typeof bridge.dispatchSync !== "function") {
