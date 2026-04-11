@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use super::javascript;
+use super::{artifacts, javascript};
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::fmt;
@@ -173,6 +173,9 @@ enum Commands {
 
     /// JavaScript-target-specific workflows
     Javascript(javascript::JavascriptArgs),
+
+    /// Build final artifacts for UniFFI consumer targets
+    Artifacts(artifacts::ArtifactsArgs),
 }
 
 #[derive(Args)]
@@ -306,6 +309,9 @@ pub fn run_main() -> anyhow::Result<()> {
         }
         Commands::Javascript(args) => {
             javascript::run(args)?;
+        }
+        Commands::Artifacts(args) => {
+            artifacts::run(args)?;
         }
         Commands::Scaffolding {
             out_dir,
