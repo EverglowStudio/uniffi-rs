@@ -1717,6 +1717,171 @@ console.log("ok");
 }
 
 #[test]
+fn runs_generated_wasm_shim_fallible_async_callback_trait() {
+    run_wasm_e2e(WasmE2eSpec {
+        name: "wasm_fallible_async_cb",
+        udl: r#"
+dictionary Payload {
+  u32 left;
+  u32 right;
+};
+
+[Error]
+enum ProviderError {
+  "BadValue",
+};
+
+[Trait, WithForeign]
+interface CheckedWorker {
+  [Async, Throws=ProviderError]
+  void checked_void(boolean fail);
+  [Async, Throws=ProviderError]
+  u32 checked_value(boolean fail);
+  [Async, Throws=ProviderError]
+  Payload checked_record(boolean fail);
+};
+
+namespace wasm_fallible_async_cb {
+  [Async, Throws=ProviderError]
+  boolean invoke_checked_void(CheckedWorker worker, boolean fail);
+  [Async, Throws=ProviderError]
+  u32 invoke_checked_value(CheckedWorker worker, boolean fail);
+  [Async, Throws=ProviderError]
+  Payload invoke_checked_record(CheckedWorker worker, boolean fail);
+};
+"#,
+        biz_deps: "async-trait = \"0.1\"\n",
+        shim_deps: "",
+        biz_lib: r#"
+use std::sync::Arc;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payload {
+    pub left: u32,
+    pub right: u32,
+}
+
+#[derive(Debug)]
+pub enum ProviderError {
+    BadValue,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadValue => write!(f, "BadValue"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+#[async_trait::async_trait(?Send)]
+pub trait CheckedWorker: Send + Sync {
+    async fn checked_void(&self, fail: bool) -> Result<(), ProviderError>;
+    async fn checked_value(&self, fail: bool) -> Result<u32, ProviderError>;
+    async fn checked_record(&self, fail: bool) -> Result<Payload, ProviderError>;
+}
+
+pub async fn invoke_checked_void(worker: Arc<dyn CheckedWorker>, fail: bool) -> Result<bool, ProviderError> {
+    worker.checked_void(fail).await?;
+    Ok(true)
+}
+
+pub async fn invoke_checked_value(worker: Arc<dyn CheckedWorker>, fail: bool) -> Result<u32, ProviderError> {
+    worker.checked_value(fail).await
+}
+
+pub async fn invoke_checked_record(worker: Arc<dyn CheckedWorker>, fail: bool) -> Result<Payload, ProviderError> {
+    worker.checked_record(fail).await
+}
+"#,
+        driver_ts: r#"
+import { createRequire } from "node:module";
+import {
+  ProviderError,
+  invokeCheckedRecord,
+  invokeCheckedValue,
+  invokeCheckedVoid,
+} from "./gen/common/api.ts";
+import { initBackend } from "./gen/browser/index.ts";
+import { UniffiError } from "./gen/common/runtime.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/wasm_fallible_async_cb_shim.js");
+await initBackend(glue);
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+function delay(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 1));
+}
+
+function makeProvider() {
+  const calls: string[] = [];
+  return {
+    calls,
+    provider: {
+      async checkedVoid(fail: boolean): Promise<void> {
+        await delay();
+        calls.push(`void:${fail}`);
+        if (fail) throw new ProviderError("BadValue", "BadValue");
+      },
+      async checkedValue(fail: boolean): Promise<number> {
+        await delay();
+        calls.push(`value:${fail}`);
+        if (fail) throw new ProviderError("BadValue", "BadValue");
+        return 77;
+      },
+      async checkedRecord(fail: boolean): Promise<{ left: number; right: number }> {
+        await delay();
+        calls.push(`record:${fail}`);
+        if (fail) throw new ProviderError("BadValue", "BadValue");
+        return { left: 7, right: 11 };
+      },
+    },
+  };
+}
+
+async function expectTypedError(label: string, fn: () => Promise<unknown>): Promise<void> {
+  let threw = false;
+  try {
+    await fn();
+  } catch (e) {
+    threw = true;
+    if (!(e instanceof UniffiError)) {
+      throw new Error(`${label} threw wrong type: ${e && (e as Error).message}`);
+    }
+    if (!String((e as Error).message).includes("BadValue")) {
+      throw new Error(`${label} threw wrong message: ${(e as Error).message}`);
+    }
+  }
+  if (!threw) throw new Error(`${label}(true) should throw`);
+}
+
+const { calls, provider } = makeProvider();
+assert(await invokeCheckedVoid(provider as any, false) === true, "checkedVoid(false)");
+assert(await invokeCheckedValue(provider as any, false) === 77, "checkedValue(false)");
+const record = await invokeCheckedRecord(provider as any, false);
+assert(record.left === 7 && record.right === 11, `checkedRecord(false)=${JSON.stringify(record)}`);
+await expectTypedError("checkedVoid", () => invokeCheckedVoid(provider as any, true));
+await expectTypedError("checkedValue", () => invokeCheckedValue(provider as any, true));
+await expectTypedError("checkedRecord", () => invokeCheckedRecord(provider as any, true));
+assert(
+    calls.join(",") === "void:false,value:false,record:false,void:true,value:true,record:true",
+    `calls=${calls.join(",")}`
+);
+
+console.log("ok");
+"#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
+    });
+}
+
+#[test]
 fn runs_generated_wasm_shim_custom_types() {
     run_wasm_e2e(WasmE2eSpec {
         name: "wasm_custom",
@@ -3793,6 +3958,125 @@ fn generate_async_callback_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     host_dir
 }
 
+fn write_fallible_async_callback_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
+    let core = root.join("fallible_async_callback_core");
+    let src = core.join("src");
+    let uniffi_path = workspace_root().join("uniffi");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        core.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"napi-fallible-async-callback-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
+             [lib]\nname = \"napi_fallible_async_callback_core\"\ncrate-type = [\"lib\"]\n\n\
+             [dependencies]\nasync-trait = \"0.1\"\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\n",
+            uniffi_path.as_str()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "use std::sync::Arc;\n\n\
+         #[derive(Clone, Debug, PartialEq, Eq)]\n\
+         pub struct Payload {\n\
+         \x20   pub left: u32,\n\
+         \x20   pub right: u32,\n\
+         }\n\n\
+         #[derive(Debug)]\n\
+         pub enum ProviderError {\n\
+         \x20   BadValue,\n\
+         }\n\n\
+         impl std::fmt::Display for ProviderError {\n\
+         \x20   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n\
+         \x20       match self {\n\
+         \x20           Self::BadValue => write!(f, \"BadValue\"),\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n\n\
+         impl std::error::Error for ProviderError {}\n\n\
+         #[async_trait::async_trait]\n\
+         pub trait CheckedWorker: Send + Sync {\n\
+         \x20   async fn checked_void(&self, fail: bool) -> Result<(), ProviderError>;\n\
+         \x20   async fn checked_value(&self, fail: bool) -> Result<u32, ProviderError>;\n\
+         \x20   async fn checked_record(&self, fail: bool) -> Result<Payload, ProviderError>;\n\
+         }\n\n\
+         pub async fn invoke_checked_void(worker: Arc<dyn CheckedWorker>, fail: bool) -> Result<bool, ProviderError> {\n\
+         \x20   worker.checked_void(fail).await?;\n\
+         \x20   Ok(true)\n\
+         }\n\n\
+         pub async fn invoke_checked_value(worker: Arc<dyn CheckedWorker>, fail: bool) -> Result<u32, ProviderError> {\n\
+         \x20   worker.checked_value(fail).await\n\
+         }\n\n\
+         pub async fn invoke_checked_record(worker: Arc<dyn CheckedWorker>, fail: bool) -> Result<Payload, ProviderError> {\n\
+         \x20   worker.checked_record(fail).await\n\
+         }\n",
+    )
+    .unwrap();
+    let udl = core.join("src/fallible_async_callback.udl");
+    std::fs::write(
+        &udl,
+        r#"
+dictionary Payload {
+  u32 left;
+  u32 right;
+};
+
+[Error]
+enum ProviderError {
+  "BadValue",
+};
+
+[Trait, WithForeign]
+interface CheckedWorker {
+  [Async, Throws=ProviderError]
+  void checked_void(boolean fail);
+  [Async, Throws=ProviderError]
+  u32 checked_value(boolean fail);
+  [Async, Throws=ProviderError]
+  Payload checked_record(boolean fail);
+};
+
+namespace fallible_async_callback {
+  [Async, Throws=ProviderError]
+  boolean invoke_checked_void(CheckedWorker worker, boolean fail);
+  [Async, Throws=ProviderError]
+  u32 invoke_checked_value(CheckedWorker worker, boolean fail);
+  [Async, Throws=ProviderError]
+  Payload invoke_checked_record(CheckedWorker worker, boolean fail);
+};
+"#,
+    )
+    .unwrap();
+    (
+        Utf8PathBuf::from_path_buf(udl).unwrap(),
+        Utf8PathBuf::from_path_buf(core.join("Cargo.toml")).unwrap(),
+    )
+}
+
+fn generate_fallible_async_callback_napi_host(root: &std::path::Path) -> Utf8PathBuf {
+    let (udl, manifest) = write_fallible_async_callback_core_crate(root);
+    let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: udl,
+            out_dir,
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: manifest,
+                host_crates_dir: host_dir.clone(),
+            }),
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
+        },
+    )
+    .expect("fallible async callback napi generator run should succeed");
+    host_dir
+}
+
 fn write_temporal_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
     let core = root.join("temporal_core");
     let src = core.join("src");
@@ -5267,6 +5551,232 @@ console.log("ok");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("ok"),
         "async-callback driver did not print ok:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn host_crates_napi_runs_fallible_async_callback_fixture() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!(
+            "SKIP host_crates_napi_runs_fallible_async_callback_fixture: node 22.6+ unavailable"
+        );
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host_dir = generate_fallible_async_callback_napi_host(tmp.path());
+    let manifest = host_dir.join("napi/Cargo.toml");
+    let target_dir = tmp.path().join("cargo-target-fallible-async-callback");
+
+    let cargo_toml = std::fs::read_to_string(&manifest).unwrap();
+    assert!(
+        cargo_toml.contains("async-trait = \"0.1\"")
+            && cargo_toml.contains("napi = { version = \"3.8.4\""),
+        "napi host crate template should keep async-trait + napi 3.x defaults:\n{cargo_toml}"
+    );
+
+    let build = match run_cargo_build(&manifest, &[], &target_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP host_crates_napi_runs_fallible_async_callback_fixture: cargo unavailable during build: {e}");
+            return;
+        }
+    };
+    if !build.status.success() {
+        panic!(
+            "cargo build on fallible-async napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+        );
+    }
+
+    let lib_name = cdylib_filename("napi-fallible-async-callback-core-napi");
+    let built_lib = target_dir.join("debug").join(lib_name);
+    assert!(
+        built_lib.exists(),
+        "expected built fallible-async cdylib at {}",
+        built_lib.display()
+    );
+
+    let generated = tmp.path().join("generated");
+    let node_addon = generated.join("node/fallible_async_callback.node");
+    std::fs::copy(&built_lib, &node_addon).unwrap();
+
+    let electron_dir = generated.join("electron");
+    let electron_addon = electron_dir.join("fallible_async_callback.node");
+    std::fs::copy(&built_lib, &electron_addon).unwrap();
+    let electron_stub = electron_dir.join("node_modules/electron");
+    std::fs::create_dir_all(&electron_stub).unwrap();
+    std::fs::write(
+        electron_stub.join("index.js"),
+        r#"exports.contextBridge = {
+  exposeInMainWorld(name, value) {
+    globalThis[name] = value;
+  },
+};
+"#,
+    )
+    .unwrap();
+
+    let callbacks = std::fs::read_to_string(generated.join("common/callbacks.ts")).unwrap();
+    for needle in [
+        "checkedVoid(fail: boolean): void | Promise<void>;",
+        "checkedValue(fail: boolean): number | Promise<number>;",
+        "checkedRecord(fail: boolean): Payload | Promise<Payload>;",
+        "Promise.resolve(__uniffiCallbackObject.checkedValue",
+    ] {
+        assert!(
+            callbacks.contains(needle),
+            "common/callbacks.ts should expose async fallible callbacks via `{needle}`:\n{callbacks}"
+        );
+    }
+    let api = std::fs::read_to_string(generated.join("common/api.ts")).unwrap();
+    for needle in [
+        "fallibleMethods: {",
+        "\"checkedVoid\": \"flat\"",
+        "\"checkedValue\": \"flat\"",
+        "\"checkedRecord\": \"flat\"",
+        "asyncMethods: {",
+    ] {
+        assert!(
+            api.contains(needle),
+            "common/api.ts should mark async fallible callback methods with `{needle}`:\n{api}"
+        );
+    }
+    let bridge_path = std::fs::read_dir(generated.join("node"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .expect("generated node bridge should contain a Rust shim");
+    let bridge = std::fs::read_to_string(bridge_path).unwrap();
+    assert!(
+        bridge.contains("__UniffiCheckedWorkerCheckedVoidCallbackResult")
+            && bridge.contains("Promise<__UniffiCheckedWorkerCheckedVoidCallbackResult>")
+            && bridge.contains(".call_async(Ok"),
+        "napi bridge should implement fallible async callback methods through TSFN Promise:\n{bridge}"
+    );
+    let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
+    assert!(
+        preload.contains("fallibleMethods")
+            && preload.contains("asyncMethods")
+            && preload.contains("Promise.resolve(v(...callArgs)).then("),
+        "electron preload should preserve async fallible callback marker behavior:\n{preload}"
+    );
+
+    let driver = generated.join("fallible-async-callback-driver.ts");
+    std::fs::write(
+        &driver,
+        r#"
+import { createRequire } from "node:module";
+import {
+  ProviderError,
+  invokeCheckedRecord,
+  invokeCheckedValue,
+  invokeCheckedVoid,
+} from "./node/index.ts";
+import { UniffiError } from "./common/runtime.ts";
+
+globalThis.window = globalThis;
+const require = createRequire(import.meta.url);
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+function delay(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 1));
+}
+
+function makeProvider(label: string) {
+  const calls: string[] = [];
+  return {
+    calls,
+    provider: {
+      async checkedVoid(fail: boolean): Promise<void> {
+        await delay();
+        calls.push(`${label}:void:${fail}`);
+        if (fail) throw new ProviderError("BadValue", "BadValue");
+      },
+      async checkedValue(fail: boolean): Promise<number> {
+        await delay();
+        calls.push(`${label}:value:${fail}`);
+        if (fail) throw new ProviderError("BadValue", "BadValue");
+        return 77;
+      },
+      async checkedRecord(fail: boolean): Promise<{ left: number; right: number }> {
+        await delay();
+        calls.push(`${label}:record:${fail}`);
+        if (fail) throw new ProviderError("BadValue", "BadValue");
+        return { left: 7, right: 11 };
+      },
+    },
+  };
+}
+
+async function expectTypedError(label: string, fn: () => Promise<unknown>): Promise<void> {
+  let threw = false;
+  try {
+    await fn();
+  } catch (e) {
+    threw = true;
+    if (!(e instanceof UniffiError)) {
+      throw new Error(`${label} threw wrong type: ${e && (e as Error).message}`);
+    }
+    if (!String((e as Error).message).includes("BadValue")) {
+      throw new Error(`${label} threw wrong message: ${(e as Error).message}`);
+    }
+  }
+  if (!threw) throw new Error(`${label}(true) should throw`);
+}
+
+const nodeCase = makeProvider("node");
+assert(await invokeCheckedVoid(nodeCase.provider as any, false) === true, "node checkedVoid(false)");
+assert(await invokeCheckedValue(nodeCase.provider as any, false) === 77, "node checkedValue(false)");
+const nodeRecord = await invokeCheckedRecord(nodeCase.provider as any, false);
+assert(nodeRecord.left === 7 && nodeRecord.right === 11, `node checkedRecord(false)=${JSON.stringify(nodeRecord)}`);
+await expectTypedError("node checkedVoid", () => invokeCheckedVoid(nodeCase.provider as any, true));
+await expectTypedError("node checkedValue", () => invokeCheckedValue(nodeCase.provider as any, true));
+await expectTypedError("node checkedRecord", () => invokeCheckedRecord(nodeCase.provider as any, true));
+assert(nodeCase.calls.join(",") === "node:void:false,node:value:false,node:record:false,node:void:true,node:value:true,node:record:true", `node calls=${nodeCase.calls.join(",")}`);
+
+require("./electron/preload.cjs");
+const electronApi = await import("./electron/renderer.ts");
+const electronCase = makeProvider("electron");
+assert(await electronApi.invokeCheckedVoid(electronCase.provider as any, false) === true, "electron checkedVoid(false)");
+assert(await electronApi.invokeCheckedValue(electronCase.provider as any, false) === 77, "electron checkedValue(false)");
+const electronRecord = await electronApi.invokeCheckedRecord(electronCase.provider as any, false);
+assert(electronRecord.left === 7 && electronRecord.right === 11, `electron checkedRecord(false)=${JSON.stringify(electronRecord)}`);
+await expectTypedError("electron checkedVoid", () => electronApi.invokeCheckedVoid(electronCase.provider as any, true));
+await expectTypedError("electron checkedValue", () => electronApi.invokeCheckedValue(electronCase.provider as any, true));
+await expectTypedError("electron checkedRecord", () => electronApi.invokeCheckedRecord(electronCase.provider as any, true));
+assert(
+    electronCase.calls.join(",") === "electron:void:false,electron:value:false,electron:record:false,electron:void:true,electron:value:true,electron:record:true",
+    `electron calls=${electronCase.calls.join(",")}`
+);
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(&generated)
+        .output()
+        .expect("failed to run fallible async callback driver");
+    if !output.status.success() {
+        panic!(
+            "fallible async callback driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "fallible async callback driver did not print ok:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
 }
