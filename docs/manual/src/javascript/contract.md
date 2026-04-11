@@ -197,11 +197,16 @@ export interface <Name> { <method>(<args>): <Ret> | Promise<<Ret>>; }
   the synchronous fallible path.
 - The napi/electron/wasm adapters support synchronous callback methods
   returning ordinary UniFFI objects or trait objects (`struct` / `trait`
-  object interfaces), as well as callback traits / callback interfaces. The
+  object interfaces), as well as callback traits / callback interfaces.
+  The wasm adapter also supports async and fallible callback methods
+  returning callback traits / callback interfaces. The N-API / Electron
+  backend still rejects that async callback-return-callback shape because it
+  needs a separate V8 handle-scope/runtime bridge fix. Fallible callback
+  methods use the same typed error envelope on success and failure paths. The
   JS callback lowerer forwards the wrapped value and each backend rehydrates
   it through its own object registry or callback-wrapper path.
 
-Support is still intentionally scoped: async/fallible callback methods
+Support is still intentionally scoped: N-API / Electron async callback methods
 returning callback traits / callback interfaces, cancellation, and the
 remaining non-string-key map shapes are not part of contract v1.
 
@@ -305,7 +310,7 @@ fast rather than run with mixed assumptions.
 - `Map<K, V>` / `Set<T>` representation details
 - non-string keyed record-like structures
 - cancellation / `AbortSignal`
-- async/fallible callback methods returning callback traits / callback
-  interfaces
+- N-API / Electron async callback methods returning callback traits /
+  callback interfaces
 
 These are future contract extensions rather than v1 guarantees.
