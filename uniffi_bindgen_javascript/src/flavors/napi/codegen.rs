@@ -330,10 +330,7 @@ impl<'a> Generator<'a> {
             }
             Type::Object { name, imp, .. } => match imp {
                 ObjectImpl::Struct | ObjectImpl::Trait => {
-                    if matches!(
-                        usage,
-                        TypeUsage::Value | TypeUsage::CallbackArg | TypeUsage::CallbackReturn
-                    ) {
+                    if matches!(usage, TypeUsage::Value | TypeUsage::CallbackArg) {
                         bail!("{label} type `{name}` is not supported in nested/value contexts");
                     }
                     Ok(())
@@ -666,10 +663,17 @@ impl<'a> Generator<'a> {
                 Ok(quote! {
                     pub #field_ident: ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
                 })
-            } else {
-                let bridge_return_ty = self.callback_bridge_return_type(method)?;
+            } else if let Some(return_type) = method.return_type() {
+                let bridge_return_ty = self.callback_bridge_type(return_type)?;
                 Ok(quote! {
                     pub #field_ident: ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
+                })
+            } else {
+                Ok(quote! {
+                    pub #field_ident: ThreadsafeFunction<
+                        #tsfn_args,
+                        napi::bindgen_prelude::Promise<()>,
+                    >
                 })
             }
         } else if method.throws_type().is_some() {
@@ -678,7 +682,7 @@ impl<'a> Generator<'a> {
                 pub #field_ident: FunctionRef<#tsfn_args, #result_ty>
             })
         } else if let Some(return_type) = method.return_type() {
-            let bridge_return_ty = self.bridge_return_type(return_type)?;
+            let bridge_return_ty = self.callback_bridge_type(return_type)?;
             Ok(quote! {
                 pub #field_ident: FunctionRef<#tsfn_args, #bridge_return_ty>
             })
@@ -701,7 +705,7 @@ impl<'a> Generator<'a> {
                 .expect("result structs are only rendered for fallible callbacks"),
         )?;
         let value_field = if let Some(return_type) = method.return_type() {
-            let value_ty = self.bridge_return_type(return_type)?;
+            let value_ty = self.callback_bridge_type(return_type)?;
             quote!(pub value: Option<#value_ty>,)
         } else {
             quote!()
@@ -1019,17 +1023,21 @@ impl<'a> Generator<'a> {
                 Ok(
                     quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>),
                 )
-            } else {
-                let bridge_return_ty = self.callback_bridge_return_type(method)?;
+            } else if let Some(return_type) = method.return_type() {
+                let bridge_return_ty = self.callback_bridge_type(return_type)?;
                 Ok(
                     quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>),
+                )
+            } else {
+                Ok(
+                    quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<()>>),
                 )
             }
         } else if method.throws_type().is_some() {
             let result_ty = self.callback_result_ident(object, method);
             Ok(quote!(napi::bindgen_prelude::FunctionRef<#tsfn_args, #result_ty>))
         } else if let Some(return_type) = method.return_type() {
-            let bridge_return_ty = self.bridge_return_type(return_type)?;
+            let bridge_return_ty = self.callback_bridge_type(return_type)?;
             Ok(quote!(napi::bindgen_prelude::FunctionRef<#tsfn_args, #bridge_return_ty>))
         } else {
             Ok(quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args>))
@@ -1675,10 +1683,34 @@ impl<'a> Generator<'a> {
         }
     }
 
-    fn callback_bridge_return_type(&self, method: &Method) -> Result<TokenStream> {
-        match method.return_type() {
-            Some(return_type) => self.bridge_return_type(return_type),
-            None => Ok(quote!(())),
+    fn callback_bridge_type(&self, ty: &Type) -> Result<TokenStream> {
+        match ty {
+            Type::Optional { inner_type } => {
+                let inner = self.callback_bridge_type(inner_type)?;
+                Ok(quote!(Option<#inner>))
+            }
+            Type::Sequence { inner_type } => {
+                let inner = self.callback_bridge_type(inner_type)?;
+                Ok(quote!(Vec<#inner>))
+            }
+            Type::Map {
+                key_type,
+                value_type,
+            } => {
+                let key = self.bridge_value_type(key_type)?;
+                let value = self.callback_bridge_type(value_type)?;
+                Ok(quote!(std::collections::HashMap<#key, #value>))
+            }
+            Type::Object { name, imp, .. } => match imp {
+                ObjectImpl::Struct | ObjectImpl::Trait => {
+                    let ident = rust_ident(name);
+                    Ok(quote!(napi::bindgen_prelude::ClassInstance<'static, #ident>))
+                }
+                ObjectImpl::CallbackTrait => {
+                    bail!("callback trait `{name}` cannot be returned directly")
+                }
+            },
+            _ => self.bridge_return_type(ty),
         }
     }
 
@@ -1716,7 +1748,7 @@ impl<'a> Generator<'a> {
             Type::Bytes => Ok(quote!(#expr.into())),
             Type::Record { .. } | Type::Enum { .. } => Ok(quote!(#expr.into())),
             Type::Object { imp, name, .. } => match imp {
-                ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!(#expr.0.clone())),
+                ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!((*(#expr)).0.clone())),
                 ObjectImpl::CallbackTrait => {
                     bail!("callback trait `{name}` cannot be returned directly")
                 }
@@ -1802,9 +1834,13 @@ impl<'a> Generator<'a> {
                 Ok(quote!(#core_path))
             }
             Type::Object { name, imp, .. } => match imp {
-                ObjectImpl::Struct | ObjectImpl::Trait => {
+                ObjectImpl::Struct => {
                     let core_path = self.core_type_path(ty.clone());
-                    Ok(quote!(#core_path))
+                    Ok(quote!(std::sync::Arc<#core_path>))
+                }
+                ObjectImpl::Trait => {
+                    let core_path = self.core_type_path(ty.clone());
+                    Ok(quote!(std::sync::Arc<dyn #core_path>))
                 }
                 ObjectImpl::CallbackTrait => {
                     bail!("callback trait `{name}` cannot be returned directly")

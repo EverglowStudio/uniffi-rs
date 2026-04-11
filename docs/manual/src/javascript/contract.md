@@ -195,11 +195,11 @@ export interface <Name> { <method>(<args>): <Ret> | Promise<<Ret>>; }
   the Rust async function. When a callback is fallible, rejected Promises or
   thrown typed errors are normalized into the same backend envelope used by
   the synchronous fallible path.
-- The wasm adapter supports callback methods returning ordinary UniFFI
-  objects or trait objects (`struct` / `trait` object interfaces). The JS
-  callback lowerer forwards the wrapped native handle, and the wasm bridge
-  rehydrates the object handle on the Rust side. The N-API and Electron
-  adapters do not include object callback returns in contract v1 yet.
+- The napi/electron/wasm adapters support callback methods returning
+  ordinary UniFFI objects or trait objects (`struct` / `trait` object
+  interfaces). The JS callback lowerer forwards the wrapped native handle;
+  each backend rehydrates it through its own object registry or native class
+  instance path.
 
 Support is still intentionally scoped: callback traits / callback interfaces
 returning callback traits, cancellation, and the remaining non-string-key map

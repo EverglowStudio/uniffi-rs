@@ -214,19 +214,19 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
                          if (!errorShape) {{\n\
                              if (isAsync) {{\n\
                                  return Promise.resolve(v(...callArgs)).then(function (value) {{\n\
-                                     return __uniffiLowerShape(value);\n\
+                                     return __uniffiLowerShape(resolveArg(value));\n\
                                  }});\n\
                              }}\n\
-                             return __uniffiLowerShape(v(...callArgs));\n\
+                             return __uniffiLowerShape(resolveArg(v(...callArgs)));\n\
                          }}\n\
                          if (isAsync) {{\n\
                              return Promise.resolve(v(...callArgs)).then(\n\
-                                 function (value) {{ return {{ ok: true, value: __uniffiLowerShape(value) }}; }},\n\
+                                 function (value) {{ return {{ ok: true, value: __uniffiLowerShape(resolveArg(value)) }}; }},\n\
                                  function (error) {{ return {{ ok: false, error: __uniffiCallbackErrorPayload(error, errorShape) }}; }}\n\
                              );\n\
                          }}\n\
                          try {{\n\
-                             return {{ ok: true, value: __uniffiLowerShape(v(...callArgs)) }};\n\
+                             return {{ ok: true, value: __uniffiLowerShape(resolveArg(v(...callArgs))) }};\n\
                          }} catch (error) {{\n\
                              return {{ ok: false, error: __uniffiCallbackErrorPayload(error, errorShape) }};\n\
                          }}\n\
