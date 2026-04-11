@@ -3637,7 +3637,7 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
         );
     }
     for required in [
-        "import * as native from \"libarithmetic.so\"",
+        "import * as native from \"libarithmetic_ohos.so\"",
         "__uniffiNameMap",
         "__uniffiLowerShape",
         "__uniffiLiftShape",
@@ -3698,7 +3698,7 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     let toml = std::fs::read_to_string(host_dir.join("ohos/Cargo.toml")).unwrap();
     for required in [
         "name = \"uniffi-example-arithmetic-ohos\"",
-        "name = \"arithmetic\"",
+        "name = \"arithmetic_ohos\"",
         "napi-ohos = { path =",
         "crates/napi",
         "napi-derive-ohos = { path =",
