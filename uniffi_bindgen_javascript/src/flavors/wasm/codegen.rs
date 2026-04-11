@@ -28,9 +28,10 @@
 //!   `thread_local!`-stored `js_sys::Function`s. `Drop` releases the JS
 //!   registry slot. Non-fallible async callback methods are supported by
 //!   generating `async fn` impls that await a `Promise` from JS.
-//!   Callback methods may return ordinary object / trait-object handles
-//!   and are lifted back through the per-object registry. Callback trait /
-//!   callback interface returns remain unsupported and are rejected.
+//!   Callback methods may return ordinary object / trait-object handles or
+//!   callback traits / callback interfaces; the latter are registered from
+//!   the returned JS callback object and lifted back as backend-owned
+//!   callback wrappers.
 //!
 //! Anything still unsupported is emitted as a stub that throws `JsError` at
 //! runtime — never a silent skip. Timestamp and duration are covered with
@@ -235,12 +236,18 @@ fn emit_callback_helpers(out: &mut String) {
         r#"thread_local! {{
     static __UNIFFI_CB_INVOKE: RefCell<Option<::js_sys::Function>> = RefCell::new(None);
     static __UNIFFI_CB_RELEASE: RefCell<Option<::js_sys::Function>> = RefCell::new(None);
+    static __UNIFFI_CB_REGISTER: RefCell<Option<::js_sys::Function>> = RefCell::new(None);
 }}
 
 #[wasm_bindgen]
-pub fn __uniffi_set_cb_invoker(invoke: ::js_sys::Function, release: ::js_sys::Function) {{
+pub fn __uniffi_set_cb_invoker(
+    invoke: ::js_sys::Function,
+    release: ::js_sys::Function,
+    register: ::js_sys::Function,
+) {{
     __UNIFFI_CB_INVOKE.with(|c| *c.borrow_mut() = Some(invoke));
     __UNIFFI_CB_RELEASE.with(|c| *c.borrow_mut() = Some(release));
+    __UNIFFI_CB_REGISTER.with(|c| *c.borrow_mut() = Some(register));
 }}
 
 fn __uniffi_cb_invoke(handle: u32, method: &str, args: JsValue) -> JsValue {{
@@ -276,6 +283,23 @@ fn __uniffi_cb_release(handle: u32) {{
             let _ = f.call1(&JsValue::NULL, &JsValue::from_f64(handle as f64));
         }}
     }});
+}}
+
+fn __uniffi_cb_register(value: JsValue) -> Result<u32, JsError> {{
+    __UNIFFI_CB_REGISTER.with(|c| {{
+        let b = c.borrow();
+        let f = b.as_ref().expect("uniffi: callback register not installed");
+        let handle = f
+            .call1(&JsValue::NULL, &value)
+            .map_err(|err| JsError::new(&format!("callback register failed: {{:?}}", err)))?;
+        let n = handle
+            .as_f64()
+            .ok_or_else(|| JsError::new("callback register did not return a numeric handle"))?;
+        if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {{
+            return Err(JsError::new("callback register returned an invalid handle"));
+        }}
+        Ok::<u32, JsError>(n as u32)
+    }})
 }}
 "#
     )
@@ -607,12 +631,6 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             .collect::<Vec<_>>()
             .join(", ");
         let ret_info = m.return_type().map(|t| classify(t, crate_ident));
-        if matches!(ret_info, Some(Lowering::Callback { .. })) {
-            panic!(
-                "callback trait/interface returns are not supported in wasm yet; only ordinary object returns are supported"
-            );
-        }
-
         let success_ret_ty = match &ret_info {
             Some(_) => callback_return_core_ty(
                 m.return_type().expect("ret_info Some implies return_type"),
@@ -731,7 +749,8 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 match &ret_info {
                     Some(Lowering::Native(_))
                     | Some(Lowering::Value { .. })
-                    | Some(Lowering::Object { .. }) => {
+                    | Some(Lowering::Object { .. })
+                    | Some(Lowering::Callback { .. }) => {
                         let ty = m
                             .return_type()
                             .expect("ret_info Some implies return_type")
@@ -741,13 +760,6 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                         writeln!(
                             out,
                             "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad async return: {{e:?}}\"))"
-                        )
-                        .unwrap();
-                    }
-                    Some(Lowering::Callback { .. }) => {
-                        writeln!(
-                            out,
-                            "        Err(JsError::new(\"callback trait/interface returns are not supported in wasm yet\"))"
                         )
                         .unwrap();
                     }
@@ -823,7 +835,8 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             match &ret_info {
                 Some(Lowering::Native(_))
                 | Some(Lowering::Value { .. })
-                | Some(Lowering::Object { .. }) => {
+                | Some(Lowering::Object { .. })
+                | Some(Lowering::Callback { .. }) => {
                     let ty = m
                         .return_type()
                         .expect("ret_info Some implies return_type")
@@ -833,13 +846,6 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                     writeln!(
                         out,
                         "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad return: {{e:?}}\"))"
-                    )
-                    .unwrap();
-                }
-                Some(Lowering::Callback { .. }) => {
-                    writeln!(
-                        out,
-                        "        Err(JsError::new(\"callback trait/interface returns are not supported in wasm yet\"))"
                     )
                     .unwrap();
                 }
@@ -859,7 +865,8 @@ fn callback_return_core_ty(ty: &Type, crate_ident: &str) -> String {
         Lowering::Native(s) => s,
         Lowering::Value { core_ty, .. } => core_ty,
         Lowering::Object { rust_ty, .. } => format!("Arc<{rust_ty}>"),
-        Lowering::Callback { .. } | Lowering::Unsupported(_) => {
+        Lowering::Callback { rust_ty, .. } => format!("Arc<{rust_ty}>"),
+        Lowering::Unsupported(_) => {
             unreachable!("unsupported callback return types are rejected before codegen")
         }
     }
@@ -1712,10 +1719,17 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
                     "{{ let __value: JsValue = {expr}; let __handle = if let Some(__handle) = __value.as_f64() {{ __handle }} else {{ let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected object handle or wrapper\"))?; let __uniffi = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffi\")).map_err(|_| JsError::new(\"object wrapper missing __uniffi\"))?; let __uniffi_obj: ::js_sys::Object = __uniffi.dyn_into().map_err(|_| JsError::new(\"object wrapper __uniffi is not an object\"))?; let __raw = ::js_sys::Reflect::get(&__uniffi_obj, &JsValue::from_str(\"raw\")).map_err(|_| JsError::new(\"object wrapper missing raw handle\"))?; __raw.as_f64().ok_or_else(|| JsError::new(\"object wrapper raw handle is not numeric\"))? }}; if !__handle.is_finite() || __handle < 0.0 || __handle.fract() != 0.0 || __handle > u32::MAX as f64 {{ Err(JsError::new(\"invalid object handle\")) }} else {{ __uniffi_{snake}_get(__handle as u32) }} }}"
                 )
             }
-            ObjectImpl::CallbackTrait =>
-                "Err::<_, JsError>(JsError::new(\"callback trait returns are not supported in wasm yet\"))"
-                    .to_string(),
+            ObjectImpl::CallbackTrait => {
+                format!(
+                    "{{ let __value: JsValue = {expr}; let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected callback object\"))?; let __cb = if ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffiCallback\")).map_err(|_| JsError::new(\"failed to inspect callback marker\"))?.as_bool().unwrap_or(false) {{ ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"object\")).map_err(|_| JsError::new(\"callback marker missing object\"))? }} else {{ __obj.into() }}; let __handle = __uniffi_cb_register(__cb)?; Ok::<_, JsError>(Arc::new(__Js{name} {{ handle: __handle }})) }}"
+                )
+            }
         },
+        Type::CallbackInterface { name, .. } => {
+            format!(
+                "{{ let __value: JsValue = {expr}; let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected callback object\"))?; let __cb = if ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffiCallback\")).map_err(|_| JsError::new(\"failed to inspect callback marker\"))?.as_bool().unwrap_or(false) {{ ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"object\")).map_err(|_| JsError::new(\"callback marker missing object\"))? }} else {{ __obj.into() }}; let __handle = __uniffi_cb_register(__cb)?; Ok::<_, JsError>(Arc::new(__Js{name} {{ handle: __handle }})) }}"
+            )
+        }
         Type::Custom {
             module_path,
             name,
@@ -1733,7 +1747,6 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
                 "Ok::<{custom_ty}, JsError>({{ let __builtin = ({builtin_lower})?; let __ffi = <{builtin_ty} as ::uniffi::Lower<{tag_ty}>>::lower(__builtin); <{custom_ty} as ::uniffi::Lift<{tag_ty}>>::try_lift(__ffi).expect(\"uniffi wasm custom type lift failed\") }})"
             )
         }
-        _ => "Err::<_, JsError>(JsError::new(\"unsupported wasm value type in lower\"))".to_string(),
     }
 }
 
