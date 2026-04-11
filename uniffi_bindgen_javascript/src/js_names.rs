@@ -22,6 +22,24 @@ pub(crate) fn field_name(rust: &str) -> String {
     member_name(rust)
 }
 
+pub(crate) fn native_library_stem(namespace: &str) -> String {
+    let mut out = String::new();
+    for ch in namespace.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("uniffi");
+    }
+    if out.starts_with(|ch: char| ch.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -31,5 +49,12 @@ mod tests {
         assert_eq!(function_name("run_job"), "runJob");
         assert_eq!(method_name("slow_add"), "slowAdd");
         assert_eq!(field_name("created_at"), "createdAt");
+    }
+
+    #[test]
+    fn native_library_stem_is_rust_lib_name_safe() {
+        assert_eq!(native_library_stem("uni_core"), "uni_core");
+        assert_eq!(native_library_stem("uni-core"), "uni_core");
+        assert_eq!(native_library_stem("1core"), "_1core");
     }
 }

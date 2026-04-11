@@ -14,7 +14,8 @@ common/            high-level TypeScript API and copied runtime
 browser/           wasm-bindgen adapter, explicit entrypoint, optional web auto-entrypoint
 node/              N-API adapter and Node entrypoint
 electron/          preload bridge and renderer entrypoint
-rust_modules/      generated wasm / N-API host crates when requested
+harmony/           ohos-rs Node-API adapter and Harmony/OpenHarmony entrypoint
+rust_modules/      generated wasm / N-API / OHOS host crates when requested
 ```
 
 The shared API is intentionally flavor-agnostic. Flavor adapters translate
@@ -49,6 +50,14 @@ The Node/N-API adapter still installs synchronously on import. Its native addon
 loader first honors generated environment-variable overrides for packaging
 scenarios, then falls back to the copied `./<namespace>.node` addon produced by
 `uniffi-bindgen javascript build-napi`.
+
+The Harmony/OpenHarmony adapter is also Node-API based, but it targets the
+`ohos-rs` fork rather than ordinary napi-rs. It emits `harmony/` TypeScript
+that imports native exports from `lib<namespace>.so`, and a generated
+`rust_modules/ohos` host crate whose Rust bridge references `napi_ohos`,
+`napi_derive_ohos`, and `napi_build_ohos`. The `javascript build-ohos` CLI
+orchestrates `ohrs build`; normal Rust tests keep this path toolchain-gated so
+the OHOS SDK is not required for the rest of the target.
 
 When adding a feature, prefer extending these helpers over copying equivalent
 logic into each flavor.

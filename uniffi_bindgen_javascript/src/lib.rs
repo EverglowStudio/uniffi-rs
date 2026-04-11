@@ -18,6 +18,7 @@
 //!   browser/   index.ts backend-wasm.ts
 //!   node/      index.ts backend-napi.ts
 //!   electron/  preload.cjs renderer.ts
+//!   harmony/   index.ts backend-ohos.ts
 //! ```
 
 use std::collections::BTreeMap;
@@ -48,6 +49,7 @@ pub use host_crates::HostCrateOptions;
 pub enum AbiFlavor {
     Wasm,
     Napi,
+    Ohos,
 }
 
 /// Top-level options for the JavaScript target.
@@ -78,6 +80,7 @@ pub enum FlavorTarget {
     Wasm,
     Napi,
     Electron,
+    Harmony,
 }
 
 impl FlavorTarget {
@@ -85,6 +88,7 @@ impl FlavorTarget {
         match self {
             FlavorTarget::Wasm => AbiFlavor::Wasm,
             FlavorTarget::Napi | FlavorTarget::Electron => AbiFlavor::Napi,
+            FlavorTarget::Harmony => AbiFlavor::Ohos,
         }
     }
 }
@@ -116,6 +120,7 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
     }
 
     let mut emitted_crate_names: Vec<String> = Vec::new();
+    let mut emitted_namespaces: Vec<String> = Vec::new();
     for component in &components {
         if let Some(crate_filter) = &options.crate_filter {
             if component.ci.crate_name() != crate_filter {
@@ -124,6 +129,7 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
         }
         emit_component(component, &options)?;
         emitted_crate_names.push(component.ci.crate_name().to_string());
+        emitted_namespaces.push(component.ci.namespace().to_string());
     }
 
     if let Some(host_opts) = &options.host_crates {
@@ -131,6 +137,7 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
         let want_wasm = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Wasm);
         // electron reuses the napi host crate — no separate electron crate.
         let want_napi = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Napi);
+        let want_ohos = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Ohos);
         host_crates::emit(
             host_opts,
             &options.out_dir,
@@ -138,6 +145,8 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
             &meta,
             want_wasm,
             want_napi,
+            want_ohos,
+            &emitted_namespaces,
         )?;
     }
     Ok(())
@@ -153,6 +162,7 @@ fn emit_component(component: &Component<JsConfig>, options: &GenerateJsOptions) 
             FlavorTarget::Wasm => "browser",
             FlavorTarget::Napi => "node",
             FlavorTarget::Electron => "electron",
+            FlavorTarget::Harmony => "harmony",
         };
         let dir = options.out_dir.join(subdir);
         fs::create_dir_all(&dir)?;

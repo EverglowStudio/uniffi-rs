@@ -19,5 +19,6 @@ pub fn emit(dir: &Utf8Path, flavor: AbiFlavor, component: &Component<JsConfig>) 
     match flavor {
         AbiFlavor::Wasm => wasm::emit(dir, component),
         AbiFlavor::Napi => napi::emit(dir, component),
+        AbiFlavor::Ohos => napi::emit_ohos(dir, component),
     }
 }

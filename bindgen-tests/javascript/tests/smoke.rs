@@ -3485,6 +3485,7 @@ fn generate_arithmetic_with_host_crates(out_dir: &Utf8PathBuf, host_crates_dir: 
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_crates_dir.clone(),
+                ohos_rs_dir: None,
             }),
             flavors: vec![
                 FlavorTarget::Wasm,
@@ -3572,6 +3573,156 @@ fn does_not_emit_host_crates_by_default() {
     assert!(!out_dir.join("napi/Cargo.toml").exists());
 }
 
+#[test]
+fn emits_harmony_flavor_with_ohos_napi_surface() {
+    let out = tempfile::tempdir().unwrap();
+    let out_dir = Utf8PathBuf::from_path_buf(out.path().join("generated")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source,
+            out_dir: out_dir.clone(),
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: None,
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Harmony],
+        },
+    )
+    .expect("generator should emit both node and harmony flavors");
+
+    for name in [
+        "common/public-types.ts",
+        "node/backend-napi.ts",
+        "node/arithmetical.rs",
+        "harmony/backend-ohos.ts",
+        "harmony/index.ts",
+        "harmony/arithmetical.rs",
+    ] {
+        let p = out_dir.join(name);
+        assert!(p.exists(), "expected output file missing: {p}");
+    }
+
+    let node_rs = std::fs::read_to_string(out_dir.join("node/arithmetical.rs")).unwrap();
+    assert!(
+        node_rs.contains("use napi::bindgen_prelude::*;")
+            && node_rs.contains("use napi_derive::napi;"),
+        "node bridge must keep ordinary napi-rs imports:\n{node_rs}"
+    );
+    assert!(
+        !node_rs.contains("napi_ohos"),
+        "node bridge must not use ohos-rs imports:\n{node_rs}"
+    );
+
+    let ohos_rs = std::fs::read_to_string(out_dir.join("harmony/arithmetical.rs")).unwrap();
+    assert!(
+        ohos_rs.contains("use napi_ohos::bindgen_prelude::*;")
+            && ohos_rs.contains("use napi_derive_ohos::napi;")
+            && ohos_rs.contains("napi_ohos::bindgen_prelude::BigInt"),
+        "harmony bridge must use ohos-rs imports:\n{ohos_rs}"
+    );
+    assert!(
+        !ohos_rs.contains("napi::"),
+        "harmony bridge must not reference ordinary napi-rs:\n{ohos_rs}"
+    );
+
+    let backend = std::fs::read_to_string(out_dir.join("harmony/backend-ohos.ts")).unwrap();
+    for forbidden in ["node:module", "createRequire", "process.env", ".node"] {
+        assert!(
+            !backend.contains(forbidden),
+            "harmony backend must not contain Node-only `{forbidden}`:\n{backend}"
+        );
+    }
+    for required in [
+        "import * as native from \"libarithmetic.so\"",
+        "__uniffiNameMap",
+        "__uniffiLowerShape",
+        "__uniffiLiftShape",
+        "__uniffiCallback",
+        "__uniffiBackendKind = \"ohos\"",
+        "then(",
+    ] {
+        assert!(
+            backend.contains(required),
+            "harmony backend missing `{required}`:\n{backend}"
+        );
+    }
+}
+
+#[test]
+fn emits_ohos_host_crate_when_harmony_is_requested() {
+    let out = tempfile::tempdir().unwrap();
+    let out_dir = Utf8PathBuf::from_path_buf(out.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(out.path().join("rust_modules")).unwrap();
+    let fake_ohos_rs = Utf8PathBuf::from_path_buf(out.path().join("ohos-rs")).unwrap();
+    for subdir in ["crates/napi", "crates/macro", "crates/build"] {
+        std::fs::create_dir_all(fake_ohos_rs.join(subdir)).unwrap();
+    }
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");
+    let manifest = workspace_root().join("examples/arithmetic/Cargo.toml");
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source,
+            out_dir: out_dir.clone(),
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: manifest,
+                host_crates_dir: host_dir.clone(),
+                ohos_rs_dir: Some(fake_ohos_rs),
+            }),
+            flavors: vec![FlavorTarget::Harmony],
+        },
+    )
+    .expect("harmony host-crate generation should succeed");
+
+    assert!(host_dir.join("ohos/Cargo.toml").exists());
+    assert!(host_dir.join("ohos/build.rs").exists());
+    assert!(host_dir.join("ohos/src/lib.rs").exists());
+    assert!(
+        !host_dir.join("napi/Cargo.toml").exists(),
+        "harmony-only generation must not emit ordinary napi host crate"
+    );
+    assert!(
+        !host_dir.join("wasm/Cargo.toml").exists(),
+        "harmony-only generation must not emit wasm host crate"
+    );
+
+    let toml = std::fs::read_to_string(host_dir.join("ohos/Cargo.toml")).unwrap();
+    for required in [
+        "name = \"uniffi-example-arithmetic-ohos\"",
+        "name = \"arithmetic\"",
+        "napi-ohos = { path =",
+        "crates/napi",
+        "napi-derive-ohos = { path =",
+        "crates/macro",
+        "napi-build-ohos = { path =",
+        "crates/build",
+        "features = [\"napi8\", \"tokio_rt\"]",
+        "features = [\"type-def\"]",
+        "[workspace]",
+    ] {
+        assert!(
+            toml.contains(required),
+            "OHOS Cargo.toml missing `{required}`:\n{toml}"
+        );
+    }
+    let build_rs = std::fs::read_to_string(host_dir.join("ohos/build.rs")).unwrap();
+    assert!(build_rs.contains("napi_build_ohos::setup"));
+    let lib_rs = std::fs::read_to_string(host_dir.join("ohos/src/lib.rs")).unwrap();
+    assert!(
+        lib_rs.contains("include!(") && lib_rs.contains("harmony/arithmetical.rs"),
+        "OHOS lib.rs must include generated harmony bridge:\n{lib_rs}"
+    );
+}
+
 /// Build a tiny synthetic downstream core crate + UDL inside `root`
 /// whose public function signatures match what the JS bridge codegen
 /// emits. This lets the compile-level tests below run `cargo check`
@@ -3616,6 +3767,7 @@ fn generate_synthetic_with_host_crates(root: &std::path::Path) -> (Utf8PathBuf, 
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Wasm, FlavorTarget::Napi],
         },
@@ -3748,6 +3900,7 @@ fn generate_synthetic_gated(root: &std::path::Path, flavors: Vec<FlavorTarget>) 
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                ohos_rs_dir: None,
             }),
             flavors,
         },
@@ -4389,6 +4542,7 @@ fn generate_rich_napi_host(root: &std::path::Path) -> Utf8PathBuf {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
@@ -4602,6 +4756,7 @@ fn generate_callback_return_napi_host(root: &std::path::Path) -> Utf8PathBuf {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
@@ -4695,6 +4850,7 @@ fn generate_async_callback_napi_host(root: &std::path::Path) -> Utf8PathBuf {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
@@ -4814,6 +4970,7 @@ fn generate_fallible_async_callback_napi_host(root: &std::path::Path) -> Utf8Pat
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
@@ -4968,6 +5125,7 @@ fn generate_temporal_napi_host(root: &std::path::Path) -> Utf8PathBuf {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
