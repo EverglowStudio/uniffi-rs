@@ -4082,22 +4082,43 @@ const glue = require("./browser/pkg/__WASM_GLUE__");
 const browser = await import("./browser/index.ts");
 await browser.initBackend(glue);
 assertEq(browser.add(2n, 3n), 5n, "browser.add");
+assertEq(browser.slowAdd(20n, 22n), 42n, "browser.slowAdd name mapping");
+assertEq(await browser.asyncAdd(30n, 12n), 42n, "browser.asyncAdd");
 assertEq(browser.sub(9n, 4n), 5n, "browser.sub");
 assertEq(browser.equal(8n, 8n), true, "browser.equal");
+const browserEvent = browser.makeEvent(true) as { tag?: string; x?: number; y?: number };
+assertEq(browserEvent.tag, "Moved", "browser.makeEvent tag");
+assertEq(browserEvent.x, 3, "browser.makeEvent x");
+assertEq(browserEvent.y, 4, "browser.makeEvent y");
+assertEq(browser.describeEvent({ tag: "Moved", x: 5, y: 6 }), "moved:5,6", "browser.describeEvent");
 await expectThrown("browser.sub underflow", () => browser.sub(1n, 2n));
 
 const nodeApi = await import("./node/index.ts");
 assertEq(nodeApi.add(4n, 6n), 10n, "node.add");
+assertEq(nodeApi.slowAdd(20n, 22n), 42n, "node.slowAdd name mapping");
+assertEq(await nodeApi.asyncAdd(30n, 12n), 42n, "node.asyncAdd");
 assertEq(nodeApi.sub(9n, 4n), 5n, "node.sub");
 assertEq(nodeApi.equal(8n, 9n), false, "node.equal");
+const nodeEvent = nodeApi.makeEvent(true) as { tag?: string; x?: number; y?: number };
+assertEq(nodeEvent.tag, "Moved", "node.makeEvent tag");
+assertEq(nodeEvent.x, 3, "node.makeEvent x");
+assertEq(nodeEvent.y, 4, "node.makeEvent y");
+assertEq(nodeApi.describeEvent({ tag: "Moved", x: 5, y: 6 }), "moved:5,6", "node.describeEvent");
 await expectThrown("node.sub underflow", () => nodeApi.sub(1n, 2n));
 
 (globalThis as { window?: unknown }).window = globalThis;
 require("./electron/preload.cjs");
 const electronApi = await import("./electron/renderer.ts");
 assertEq(electronApi.add(10n, 11n), 21n, "electron.add");
+assertEq(electronApi.slowAdd(20n, 22n), 42n, "electron.slowAdd name mapping");
+assertEq(await electronApi.asyncAdd(30n, 12n), 42n, "electron.asyncAdd");
 assertEq(electronApi.sub(9n, 4n), 5n, "electron.sub");
 assertEq(electronApi.equal(8n, 8n), true, "electron.equal");
+const electronEvent = electronApi.makeEvent(true) as { tag?: string; x?: number; y?: number };
+assertEq(electronEvent.tag, "Moved", "electron.makeEvent tag");
+assertEq(electronEvent.x, 3, "electron.makeEvent x");
+assertEq(electronEvent.y, 4, "electron.makeEvent y");
+assertEq(electronApi.describeEvent({ tag: "Moved", x: 5, y: 6 }), "moved:5,6", "electron.describeEvent");
 await expectThrown("electron.sub underflow", () => electronApi.sub(1n, 2n));
 
 console.log("combined build runtime ok");
@@ -4199,13 +4220,23 @@ fn write_cli_wasm_fixture(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) 
          enum ArithmeticError {\n\
          \x20   \"IntegerOverflow\",\n\
          };\n\n\
+         [Enum]\n\
+         interface CliEvent {\n\
+         \x20   Started();\n\
+         \x20   Moved(u32 x, u32 y);\n\
+         };\n\n\
          namespace cli_wasm {\n\
          \x20   [Throws=ArithmeticError]\n\
          \x20   u64 add(u64 a, u64 b);\n\
+         \x20   u64 slow_add(u64 a, u64 b);\n\
+         \x20   [Async]\n\
+         \x20   u64 async_add(u64 a, u64 b);\n\
          \x20   [Throws=ArithmeticError]\n\
          \x20   u64 sub(u64 a, u64 b);\n\
          \x20   u64 div(u64 dividend, u64 divisor);\n\
          \x20   boolean equal(u64 a, u64 b);\n\
+         \x20   CliEvent make_event(boolean moved);\n\
+         \x20   string describe_event(CliEvent event);\n\
          };\n",
     )
     .unwrap();
@@ -4217,9 +4248,15 @@ fn write_cli_wasm_fixture(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) 
          \x20   #[error(\"Integer overflow\")]\n\
          \x20   IntegerOverflow,\n\
          }\n\n\
+         pub enum CliEvent {\n\
+         \x20   Started,\n\
+         \x20   Moved { x: u32, y: u32 },\n\
+         }\n\n\
          pub fn add(a: u64, b: u64) -> Result<u64, ArithmeticError> {\n\
          \x20   a.checked_add(b).ok_or(ArithmeticError::IntegerOverflow)\n\
          }\n\n\
+         pub fn slow_add(a: u64, b: u64) -> u64 { a + b }\n\n\
+         pub async fn async_add(a: u64, b: u64) -> u64 { a + b }\n\n\
          pub fn sub(a: u64, b: u64) -> Result<u64, ArithmeticError> {\n\
          \x20   a.checked_sub(b).ok_or(ArithmeticError::IntegerOverflow)\n\
          }\n\n\
@@ -4228,6 +4265,15 @@ fn write_cli_wasm_fixture(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) 
          \x20   dividend / divisor\n\
          }\n\n\
          pub fn equal(a: u64, b: u64) -> bool { a == b }\n\n\
+         pub fn make_event(moved: bool) -> CliEvent {\n\
+         \x20   if moved { CliEvent::Moved { x: 3, y: 4 } } else { CliEvent::Started }\n\
+         }\n\n\
+         pub fn describe_event(event: CliEvent) -> String {\n\
+         \x20   match event {\n\
+         \x20       CliEvent::Started => \"started\".to_string(),\n\
+         \x20       CliEvent::Moved { x, y } => format!(\"moved:{x},{y}\"),\n\
+         \x20   }\n\
+         }\n\n\
          uniffi::include_scaffolding!(\"cli_wasm\");\n",
     )
     .unwrap();
