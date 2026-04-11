@@ -235,6 +235,8 @@ Application code should vary only in the chosen flavor entrypoint, for example:
 
 ```ts
 import * as core from "./generated/browser";
+// or, after `uniffi-bindgen javascript build-wasm --wasm-bindgen-target web`
+import * as core from "./generated/browser/index.web.ts";
 // or
 import * as core from "./generated/node";
 // or
@@ -294,6 +296,45 @@ export async function initBackend(
 Applications must call `await initBackend(glue)` before any generated wasm API
 use. Later calls are no-ops. The napi and electron entrypoints remain
 synchronous to import.
+
+When the CLI runs `uniffi-bindgen javascript build-wasm` or `javascript build`
+with `--wasm-bindgen-target web`, it also emits `browser/index.web.ts` after
+the final wasm-bindgen file names are known. That auto-entrypoint imports the
+generated wasm-bindgen JS glue and `.wasm` asset URL, re-exports
+`browser/index.ts`, and exposes:
+
+```ts
+export function init(input?: unknown): Promise<void>;
+export const ready: Promise<void>;
+```
+
+Bundler-based web applications may import this file and await `ready` instead
+of hand-writing the wasm-bindgen glue import. Advanced applications should keep
+using `browser/index.ts` when they need to control wasm initialization
+explicitly. The auto-entrypoint is target-specific and is not emitted for
+`--wasm-bindgen-target nodejs`.
+
+## Node/N-API addon loading
+
+The generated `node/index.ts` remains synchronous to import and installs its
+backend immediately. By default the Node adapter loads the copied addon next to
+the generated adapter:
+
+```ts
+./<namespace>.node
+```
+
+For packaging scenarios, the adapter supports environment variable overrides:
+
+```text
+UNIFFI_<NAMESPACE_IN_SHOUTY_SNAKE>_NAPI_PATH=/absolute/path/to/addon.node
+UNIFFI_NAPI_PATH=/absolute/path/to/addon.node
+```
+
+The namespace-specific variable wins over the generic variable. Relative
+override paths are resolved from the current process working directory. If
+loading fails, the generated adapter reports the namespace, the chosen path,
+and a hint to run `uniffi-bindgen javascript build-napi` or set the override.
 
 ## Versioning
 
