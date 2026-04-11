@@ -26,19 +26,17 @@
 //! records, enums (incl. payload variants), errors-with-data, opaque
 //! objects (`Self` and `Arc<Self>` constructors, methods, free-function
 //! `Type::Object` args/returns, trait objects like `Arc<dyn Greeter>`),
-//! timestamp / duration, synchronous and non-fallible async
-//! callback-trait lowering, custom types, and string-key `Map` /
-//! `HashMap<String, V>`
-//! lowering (validated against `Logger` and dedicated custom/map fixtures in
-//! `bindgen-tests/javascript/tests/smoke.rs`).
+//! timestamp / duration, sync and async callback-trait lowering
+//! including fallible async methods, custom types, and string-key `Map` /
+//! `HashMap<String, V>` lowering (validated against `Logger` and dedicated
+//! custom/map fixtures in `bindgen-tests/javascript/tests/smoke.rs`).
 //!
-//! Still **not** covered: fallible async callback-trait methods, callback
-//! object/callback-trait args or returns, non-string-key maps, nested
-//! object/callback values in maps, `Set`, and cancellation. Unsupported shapes
-//! are emitted as runtime-throwing stubs (with the reason embedded in the
-//! thrown `JsError`) rather than being silently skipped, so the rest of the tree
-//! still builds and hitting an unsupported export is diagnosable at call time
-//! instead of at link time.
+//! Still **not** covered: callback object/callback-trait args or returns,
+//! non-string-key maps, nested object/callback values in maps, `Set`, and
+//! cancellation. Unsupported shapes are emitted as runtime-throwing stubs
+//! (with the reason embedded in the thrown `JsError`) rather than being
+//! silently skipped, so the rest of the tree still builds and hitting an
+//! unsupported export is diagnosable at call time instead of at link time.
 //!
 //! Downstream build prerequisite: any client crate with async UniFFI
 //! exports targeting wasm must enable `uniffi`'s
@@ -189,6 +187,16 @@ export async function adaptWasmBindgenGlue(
                         }}
                     }}
                     return fn.apply(obj, args);
+                }}
+                if (isAsync) {{
+                    try {{
+                        return Promise.resolve(fn.apply(obj, args)).then(
+                            (value) => ({{ ok: true, value }}),
+                            (error) => ({{ ok: false, error: callbackErrorPayload(error, errorShape) }}),
+                        );
+                    }} catch (error) {{
+                        return Promise.resolve({{ ok: false, error: callbackErrorPayload(error, errorShape) }});
+                    }}
                 }}
                 try {{
                     return {{ ok: true, value: fn.apply(obj, args) }};

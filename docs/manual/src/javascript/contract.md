@@ -189,17 +189,16 @@ export interface <Name> { <method>(<args>): <Ret> | Promise<<Ret>>; }
   builtins, and callbacks that throw a declared UniFFI error.
   Internally the adapter converts thrown typed JS errors into a backend
   envelope before Rust receives the callback result.
-- The napi/electron/wasm adapters support non-fallible async callback methods.
-  JavaScript implementations may return either a plain value or a `Promise`;
-  the generated Rust bridge awaits the callback before resuming the Rust
-  async function. This path covers `void`, scalar/string/bytes, records,
-  enums, `Option`, `Vec`, `Map`, timestamp/duration, and configured custom
-  types that are otherwise supported by the target-specific bridge.
-- Fallible async callback methods are not supported yet and are rejected at
-  generation time.
+- The napi/electron/wasm adapters support async callback methods, including
+  fallible ones. JavaScript implementations may return either a plain value or
+  a `Promise`; the generated Rust bridge awaits the callback before resuming
+  the Rust async function. When a callback is fallible, rejected Promises or
+  thrown typed errors are normalized into the same backend envelope used by
+  the synchronous fallible path.
 
-Support is still intentionally scoped: fallible async callback methods and
-object/callback callback returns are not part of contract v1.
+Support is still intentionally scoped: callback methods returning objects or
+callback traits, cancellation, and the remaining non-string-key map shapes are
+not part of contract v1.
 
 ## Async
 
@@ -301,7 +300,6 @@ fast rather than run with mixed assumptions.
 - `Map<K, V>` / `Set<T>` representation details
 - non-string keyed record-like structures
 - cancellation / `AbortSignal`
-- fallible async callback traits
 - callback methods returning objects or callback traits
 
 These are future contract extensions rather than v1 guarantees.
