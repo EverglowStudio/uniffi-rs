@@ -292,7 +292,7 @@ fn emit_ohos(
     let package_name = format!("{}-ohos", meta.package_name);
     let ohos_deps = render_ohos_dependencies(ohos_rs_dir, &crate_dir)?;
     let lib_name = match namespaces {
-        [namespace] => crate::js_names::native_library_stem(namespace),
+        [namespace] => crate::js_names::ohos_native_library_stem(namespace),
         [] => bail!("OHOS host-crate emission requested but no component namespace was generated"),
         _ => bail!(
             "OHOS host-crate emission currently supports one component per host crate; got namespaces: {namespaces:?}"

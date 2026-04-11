@@ -40,6 +40,10 @@ pub(crate) fn native_library_stem(namespace: &str) -> String {
     out
 }
 
+pub(crate) fn ohos_native_library_stem(namespace: &str) -> String {
+    format!("{}_ohos", native_library_stem(namespace))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +60,12 @@ mod tests {
         assert_eq!(native_library_stem("uni_core"), "uni_core");
         assert_eq!(native_library_stem("uni-core"), "uni_core");
         assert_eq!(native_library_stem("1core"), "_1core");
+    }
+
+    #[test]
+    fn ohos_native_library_stem_avoids_core_cdylib_collision() {
+        assert_eq!(ohos_native_library_stem("uni_core"), "uni_core_ohos");
+        assert_eq!(ohos_native_library_stem("uni-core"), "uni_core_ohos");
+        assert_eq!(ohos_native_library_stem("1core"), "_1core_ohos");
     }
 }
