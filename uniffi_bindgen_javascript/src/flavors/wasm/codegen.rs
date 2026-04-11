@@ -28,6 +28,9 @@
 //!   `thread_local!`-stored `js_sys::Function`s. `Drop` releases the JS
 //!   registry slot. Non-fallible async callback methods are supported by
 //!   generating `async fn` impls that await a `Promise` from JS.
+//!   Callback methods may return ordinary object / trait-object handles
+//!   and are lifted back through the per-object registry. Callback trait /
+//!   callback interface returns remain unsupported and are rejected.
 //!
 //! Anything still unsupported is emitted as a stub that throws `JsError` at
 //! runtime — never a silent skip. Timestamp and duration are covered with
@@ -604,10 +607,18 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             .collect::<Vec<_>>()
             .join(", ");
         let ret_info = m.return_type().map(|t| classify(t, crate_ident));
+        if matches!(ret_info, Some(Lowering::Callback { .. })) {
+            panic!(
+                "callback trait/interface returns are not supported in wasm yet; only ordinary object returns are supported"
+            );
+        }
+
         let success_ret_ty = match &ret_info {
-            Some(Lowering::Native(s)) => s.clone(),
-            Some(Lowering::Value { core_ty, .. }) => core_ty.clone(),
-            _ => "()".to_string(),
+            Some(_) => callback_return_core_ty(
+                m.return_type().expect("ret_info Some implies return_type"),
+                crate_ident,
+            ),
+            None => "()".to_string(),
         };
         let ret_ty = if let Some(error_ty) = m.throws_type() {
             format!(
@@ -689,7 +700,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 writeln!(out, "        if __ok {{").unwrap();
                 if let Some(return_type) = m.return_type() {
                     let value_lower = lower_expr("__value", return_type, 0);
-                    let value_ty = core_ty_for(return_type, crate_ident);
+                    let value_ty = callback_return_core_ty(return_type, crate_ident);
                     writeln!(
                         out,
                         "            let __value = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"value\")).unwrap_or(JsValue::UNDEFINED);"
@@ -718,20 +729,29 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 writeln!(out, "        }}").unwrap();
             } else {
                 match &ret_info {
-                    Some(Lowering::Native(_)) | Some(Lowering::Value { .. }) => {
+                    Some(Lowering::Native(_))
+                    | Some(Lowering::Value { .. })
+                    | Some(Lowering::Object { .. }) => {
                         let ty = m
                             .return_type()
                             .expect("ret_info Some implies return_type")
                             .clone();
                         let lower = lower_expr("__ret", &ty, 0);
-                        let return_ty = core_ty_for(&ty, crate_ident);
+                        let return_ty = callback_return_core_ty(&ty, crate_ident);
                         writeln!(
                             out,
                             "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad async return: {{e:?}}\"))"
                         )
                         .unwrap();
                     }
-                    Some(_) | None => {
+                    Some(Lowering::Callback { .. }) => {
+                        writeln!(
+                            out,
+                            "        Err(JsError::new(\"callback trait/interface returns are not supported in wasm yet\"))"
+                        )
+                        .unwrap();
+                    }
+                    Some(Lowering::Unsupported(_)) | None => {
                         writeln!(out, "        let _ = __ret;").unwrap();
                     }
                 }
@@ -763,7 +783,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 writeln!(out, "        if __ok {{").unwrap();
                 if let Some(return_type) = m.return_type() {
                     let value_lower = lower_expr("__value", return_type, 0);
-                    let value_ty = core_ty_for(return_type, crate_ident);
+                    let value_ty = callback_return_core_ty(return_type, crate_ident);
                     writeln!(
                         out,
                         "            let __value = ::js_sys::Reflect::get(&__ret_obj, &JsValue::from_str(\"value\")).unwrap_or(JsValue::UNDEFINED);"
@@ -801,20 +821,29 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             .unwrap();
             // Lift return via explicit lower_expr — no serde.
             match &ret_info {
-                Some(Lowering::Native(_)) | Some(Lowering::Value { .. }) => {
+                Some(Lowering::Native(_))
+                | Some(Lowering::Value { .. })
+                | Some(Lowering::Object { .. }) => {
                     let ty = m
                         .return_type()
                         .expect("ret_info Some implies return_type")
                         .clone();
                     let lower = lower_expr("__ret", &ty, 0);
-                    let return_ty = core_ty_for(&ty, crate_ident);
+                    let return_ty = callback_return_core_ty(&ty, crate_ident);
                     writeln!(
                         out,
                         "        (|| -> ::std::result::Result<{return_ty}, JsError> {{ {lower} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad return: {{e:?}}\"))"
                     )
                     .unwrap();
                 }
-                Some(_) | None => {
+                Some(Lowering::Callback { .. }) => {
+                    writeln!(
+                        out,
+                        "        Err(JsError::new(\"callback trait/interface returns are not supported in wasm yet\"))"
+                    )
+                    .unwrap();
+                }
+                Some(Lowering::Unsupported(_)) | None => {
                     writeln!(out, "        let _ = __ret;").unwrap();
                 }
             }
@@ -823,6 +852,17 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
     }
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
+}
+
+fn callback_return_core_ty(ty: &Type, crate_ident: &str) -> String {
+    match classify(ty, crate_ident) {
+        Lowering::Native(s) => s,
+        Lowering::Value { core_ty, .. } => core_ty,
+        Lowering::Object { rust_ty, .. } => format!("Arc<{rust_ty}>"),
+        Lowering::Callback { .. } | Lowering::Unsupported(_) => {
+            unreachable!("unsupported callback return types are rejected before codegen")
+        }
+    }
 }
 
 fn lower_camel(rust: &str) -> String {
@@ -1665,6 +1705,17 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
                 "{{ let __obj{depth}: ::js_sys::Object = {expr}.dyn_into().map_err(|_| JsError::new(\"expected object for map\"))?; let __keys{depth} = ::js_sys::Object::keys(&__obj{depth}); let mut __out{depth} = ::std::collections::HashMap::new(); for __i{depth} in 0..__keys{depth}.length() {{ let {key}: JsValue = __keys{depth}.get(__i{depth}); let {value}: JsValue = ::js_sys::Reflect::get(&__obj{depth}, &{key}).map_err(|_| JsError::new(\"reflect get map value failed\"))?; __out{depth}.insert(({key_lower})?, ({value_lower})?); }} Ok::<_, JsError>(__out{depth}) }}"
             )
         }
+        Type::Object { name, imp, .. } => match imp {
+            ObjectImpl::Struct | ObjectImpl::Trait => {
+                let snake = name.to_snake_case();
+                format!(
+                    "{{ let __value: JsValue = {expr}; let __handle = if let Some(__handle) = __value.as_f64() {{ __handle }} else {{ let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected object handle or wrapper\"))?; let __uniffi = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffi\")).map_err(|_| JsError::new(\"object wrapper missing __uniffi\"))?; let __uniffi_obj: ::js_sys::Object = __uniffi.dyn_into().map_err(|_| JsError::new(\"object wrapper __uniffi is not an object\"))?; let __raw = ::js_sys::Reflect::get(&__uniffi_obj, &JsValue::from_str(\"raw\")).map_err(|_| JsError::new(\"object wrapper missing raw handle\"))?; __raw.as_f64().ok_or_else(|| JsError::new(\"object wrapper raw handle is not numeric\"))? }}; if !__handle.is_finite() || __handle < 0.0 || __handle.fract() != 0.0 || __handle > u32::MAX as f64 {{ Err(JsError::new(\"invalid object handle\")) }} else {{ __uniffi_{snake}_get(__handle as u32) }} }}"
+                )
+            }
+            ObjectImpl::CallbackTrait =>
+                "Err::<_, JsError>(JsError::new(\"callback trait returns are not supported in wasm yet\"))"
+                    .to_string(),
+        },
         Type::Custom {
             module_path,
             name,
