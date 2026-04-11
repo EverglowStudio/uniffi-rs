@@ -86,6 +86,8 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
          \n\
          const handles = new Map();\n\
          let nextHandleId = 1;\n\
+         const __uniffiReturnedCallbacks = new Map();\n\
+         let __uniffiNextReturnedCallbackId = 1;\n\
          \n\
          function serializeError(raw) {{\n\
              if (raw && typeof raw === \"object\") {{\n\
@@ -136,10 +138,39 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
              throw error;\n\
          }}\n\
          \n\
+         function __uniffiDispatchReturnedCallback(...rawArgs) {{\n\
+             const args = rawArgs.length >= 3 && (rawArgs[0] === null || rawArgs[0] === undefined || rawArgs[0] instanceof Error)\n\
+                 ? rawArgs.slice(1)\n\
+                 : rawArgs;\n\
+             const id = args[0];\n\
+             const method = args[1];\n\
+             if (typeof id !== \"number\" || typeof method !== \"string\") {{\n\
+                 throw new Error(\"invalid uniffi returned-callback dispatch arguments\");\n\
+             }}\n\
+             const obj = __uniffiReturnedCallbacks.get(id);\n\
+             if (!obj) {{\n\
+                 throw new Error(\"uniffi returned callback \" + id + \" is not available\");\n\
+             }}\n\
+             const fn = obj[method];\n\
+             if (typeof fn !== \"function\") {{\n\
+                 throw new Error(\"uniffi returned callback \" + id + \" has no method \" + method);\n\
+             }}\n\
+             return fn(...args.slice(2));\n\
+         }}\n\
+         \n\
+         function __uniffiStoreCallbackReturn(value) {{\n\
+             const marker = value && typeof value === \"object\" && value.__uniffiCallback === true ? value : null;\n\
+             const obj = marker ? __uniffiNormalizeCallbackObject(marker.object, marker) : __uniffiNormalizeCallbackObject(value);\n\
+             const id = __uniffiNextReturnedCallbackId++;\n\
+             __uniffiReturnedCallbacks.set(id, obj);\n\
+             return {{ id }};\n\
+         }}\n\
+         \n\
          function __uniffiNormalizeCallbackObject(obj, marker) {{\n\
              if (obj === null || typeof obj !== \"object\") return obj;\n\
              const fallibleMethods = (marker && marker.fallibleMethods) || {{}};\n\
              const asyncMethods = (marker && marker.asyncMethods) || {{}};\n\
+             const callbackReturnMethods = (marker && marker.callbackReturnMethods) || {{}};\n\
              const out = {{}};\n\
              const keys = Object.keys(obj);\n\
              for (let i = 0; i < keys.length; i++) {{\n\
@@ -152,17 +183,18 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
                              : args;\n\
                          const errorShape = fallibleMethods[k];\n\
                          const isAsync = asyncMethods[k] === true;\n\
+                         const returnsCallback = callbackReturnMethods[k] === true;\n\
                          if (!errorShape) {{\n\
                              if (isAsync) {{\n\
                                  return Promise.resolve(v(...callArgs)).then(function (value) {{\n\
-                                     return __uniffiLowerShape(resolveArg(value));\n\
+                                     return returnsCallback ? __uniffiStoreCallbackReturn(value) : __uniffiLowerShape(resolveArg(value));\n\
                                  }});\n\
                              }}\n\
                              return __uniffiLowerShape(resolveArg(v(...callArgs)));\n\
                          }}\n\
                          if (isAsync) {{\n\
                              return Promise.resolve(v(...callArgs)).then(\n\
-                                 function (value) {{ return {{ ok: true, value: __uniffiLowerShape(resolveArg(value)) }}; }},\n\
+                                 function (value) {{ return {{ ok: true, value: returnsCallback ? __uniffiStoreCallbackReturn(value) : __uniffiLowerShape(resolveArg(value)) }}; }},\n\
                                  function (error) {{ return {{ ok: false, error: __uniffiCallbackErrorPayload(error, errorShape) }}; }}\n\
                              );\n\
                          }}\n\
@@ -176,6 +208,7 @@ fn render_preload(namespace: &str, name_map_literal: &str, enum_shape_helpers: &
                      out[k] = v;\n\
                  }}\n\
              }}\n\
+             out.__uniffiCallbackDispatcher = __uniffiDispatchReturnedCallback;\n\
              return out;\n\
          }}\n\
          \n\

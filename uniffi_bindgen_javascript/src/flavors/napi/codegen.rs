@@ -6,7 +6,7 @@
 //! async exports, and napi-specific surface generation.
 
 use anyhow::{bail, ensure, Result};
-use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse2;
@@ -75,6 +75,11 @@ impl<'a> Generator<'a> {
 
             #[derive(Clone, Debug, PartialEq, Eq, Hash)]
             struct __UniffiDuration(pub ::std::time::Duration);
+
+            #[napi(object)]
+            pub struct __UniffiCallbackHandle {
+                pub id: u32,
+            }
 
             impl TypeName for __UniffiTimestamp {
                 fn type_name() -> &'static str {
@@ -616,12 +621,14 @@ impl<'a> Generator<'a> {
         let needs_env = object.methods().into_iter().any(|method| {
             !method.is_async() && (method.return_type().is_some() || method.throws_type().is_some())
         });
-        let env_field = needs_env.then(|| quote!(env: usize,));
+        let env_field = needs_env.then(|| quote!(env: Option<usize>,));
         let fields = object
             .methods()
             .into_iter()
             .map(|method| self.render_callback_field(object, method))
             .collect::<Result<Vec<_>>>()?;
+        let registry_fields = self.render_callback_registry_fields()?;
+        let registry_constructor = self.render_callback_registry_constructor(object)?;
         let impl_methods = object
             .methods()
             .into_iter()
@@ -644,10 +651,14 @@ impl<'a> Generator<'a> {
         Ok(quote! {
             pub struct #ident {
                 #(#fields,)*
+                #(#registry_fields,)*
+                __uniffi_callback_registry_id: Option<u32>,
                 #env_field
             }
 
             #(#result_structs)*
+
+            #registry_constructor
 
             #from_napi
 
@@ -660,35 +671,32 @@ impl<'a> Generator<'a> {
 
     fn render_callback_field(&self, object: &Object, method: &Method) -> Result<TokenStream> {
         let field_ident = rust_ident(method.name());
+        let ty = self.callback_field_from_napi_type(object, method)?;
+        Ok(quote! {
+            pub #field_ident: Option<#ty>
+        })
+    }
+
+    fn render_callback_direct_field_type(
+        &self,
+        object: &Object,
+        method: &Method,
+    ) -> Result<TokenStream> {
         let tsfn_args = self.callback_tsfn_args(method)?;
-        if method.is_async() {
-            if let Some(return_type) = method.return_type() {
-                ensure!(
-                    !matches!(
-                        return_type,
-                        Type::Object {
-                            imp: ObjectImpl::CallbackTrait,
-                            ..
-                        } | Type::CallbackInterface { .. }
-                    ),
-                    "async callback methods returning callback traits/interfaces are not supported in the N-API/Electron backend yet"
-                );
-            }
-        }
         if method.is_async() {
             if method.throws_type().is_some() {
                 let result_ty = self.callback_result_ident(object, method);
                 Ok(quote! {
-                    pub #field_ident: ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
+                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
                 })
             } else if let Some(return_type) = method.return_type() {
-                let bridge_return_ty = self.callback_bridge_type(return_type)?;
+                let bridge_return_ty = self.callback_async_bridge_type(return_type)?;
                 Ok(quote! {
-                    pub #field_ident: ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
+                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
                 })
             } else {
                 Ok(quote! {
-                    pub #field_ident: ThreadsafeFunction<
+                    ThreadsafeFunction<
                         #tsfn_args,
                         napi::bindgen_prelude::Promise<()>,
                     >
@@ -697,17 +705,130 @@ impl<'a> Generator<'a> {
         } else if method.throws_type().is_some() {
             let result_ty = self.callback_result_ident(object, method);
             Ok(quote! {
-                pub #field_ident: FunctionRef<#tsfn_args, #result_ty>
+                FunctionRef<#tsfn_args, #result_ty>
             })
         } else if let Some(return_type) = method.return_type() {
             let bridge_return_ty = self.callback_bridge_type(return_type)?;
             Ok(quote! {
-                pub #field_ident: FunctionRef<#tsfn_args, #bridge_return_ty>
+                FunctionRef<#tsfn_args, #bridge_return_ty>
             })
         } else {
             Ok(quote! {
-                pub #field_ident: ThreadsafeFunction<#tsfn_args>
+                ThreadsafeFunction<#tsfn_args>
             })
+        }
+    }
+
+    fn render_callback_registry_fields(&self) -> Result<Vec<TokenStream>> {
+        self.callback_registry_field_defs()?
+            .into_iter()
+            .map(|(field_ident, ty)| {
+                Ok(quote! {
+                    #field_ident: Option<std::sync::Arc<#ty>>
+                })
+            })
+            .collect()
+    }
+
+    fn render_callback_registry_constructor(&self, object: &Object) -> Result<TokenStream> {
+        let ident = rust_ident(object.name());
+        let direct_inits = object
+            .methods()
+            .into_iter()
+            .map(|method| {
+                let field_ident = rust_ident(method.name());
+                quote!(#field_ident: None,)
+            })
+            .collect::<Vec<_>>();
+        let registry_defs = self.callback_registry_field_defs()?;
+        let registry_args = registry_defs
+            .iter()
+            .map(|(field_ident, ty)| quote!(#field_ident: Option<std::sync::Arc<#ty>>))
+            .collect::<Vec<_>>();
+        let registry_inits = registry_defs
+            .iter()
+            .map(|(field_ident, _)| quote!(#field_ident,))
+            .collect::<Vec<_>>();
+        let env_init = object
+            .methods()
+            .into_iter()
+            .any(|method| {
+                !method.is_async()
+                    && (method.return_type().is_some() || method.throws_type().is_some())
+            })
+            .then(|| quote!(env: None,));
+        Ok(quote! {
+            impl #ident {
+                fn __uniffi_from_callback_registry(
+                    __uniffi_callback_registry_id: u32,
+                    #(#registry_args),*
+                ) -> Self {
+                    Self {
+                        #(#direct_inits)*
+                        #(#registry_inits)*
+                        __uniffi_callback_registry_id: Some(__uniffi_callback_registry_id),
+                        #env_init
+                    }
+                }
+            }
+        })
+    }
+
+    fn callback_registry_field_defs(&self) -> Result<Vec<(syn::Ident, TokenStream)>> {
+        self.ci
+            .object_definitions()
+            .iter()
+            .filter(|object| matches!(object.imp(), ObjectImpl::CallbackTrait))
+            .flat_map(|object| {
+                object.methods().into_iter().map(|method| {
+                    let ty = self.callback_registry_field_type(object, method)?;
+                    Ok((
+                        self.callback_registry_field_ident(object.name(), method.name()),
+                        ty,
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn callback_registry_field_ident(&self, object_name: &str, method_name: &str) -> syn::Ident {
+        rust_ident(&format!(
+            "__uniffi_registry_{}_{}",
+            object_name.to_snake_case(),
+            method_name.to_snake_case()
+        ))
+    }
+
+    fn callback_registry_field_type(
+        &self,
+        object: &Object,
+        method: &Method,
+    ) -> Result<TokenStream> {
+        let tsfn_args = self.callback_registry_tsfn_args(method)?;
+        if method.is_async() {
+            if method.throws_type().is_some() {
+                let result_ty = self.callback_result_ident(object, method);
+                Ok(quote! {
+                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
+                })
+            } else if let Some(return_type) = method.return_type() {
+                let bridge_return_ty = self.callback_async_bridge_type(return_type)?;
+                Ok(quote! {
+                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
+                })
+            } else {
+                Ok(quote! {
+                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<()>>
+                })
+            }
+        } else if method.throws_type().is_some() {
+            let result_ty = self.callback_result_ident(object, method);
+            Ok(quote!(ThreadsafeFunction<#tsfn_args, #result_ty>))
+        } else if let Some(return_type) = method.return_type() {
+            let bridge_return_ty = self.callback_bridge_type(return_type)?;
+            Ok(quote!(ThreadsafeFunction<#tsfn_args, #bridge_return_ty>))
+        } else {
+            Ok(quote!(ThreadsafeFunction<#tsfn_args>))
         }
     }
 
@@ -723,7 +844,11 @@ impl<'a> Generator<'a> {
                 .expect("result structs are only rendered for fallible callbacks"),
         )?;
         let value_field = if let Some(return_type) = method.return_type() {
-            let value_ty = self.callback_bridge_type(return_type)?;
+            let value_ty = if method.is_async() {
+                self.callback_async_bridge_type(return_type)?
+            } else {
+                self.callback_bridge_type(return_type)?
+            };
             quote!(pub value: Option<#value_ty>,)
         } else {
             quote!()
@@ -742,6 +867,7 @@ impl<'a> Generator<'a> {
         let method_ident = rust_ident(method.name());
         let return_value_ident = format_ident!("__callback_return");
         let object_name = object.name().to_string();
+        let method_name = method.name().to_string();
         let args = method
             .arguments()
             .into_iter()
@@ -753,8 +879,9 @@ impl<'a> Generator<'a> {
             .collect::<Result<Vec<_>>>()?;
 
         let call_value = self.callback_call_value(method)?;
+        let registry_call_value = self.callback_registry_call_value(method)?;
+        let registry_field_ident = self.callback_registry_field_ident(object.name(), method.name());
         if method.is_async() {
-            let method_name = method.name().to_string();
             if method.throws_type().is_some() {
                 let result_ident = self.callback_result_ident(object, method);
                 let error_ty = self.core_type_path(
@@ -768,8 +895,8 @@ impl<'a> Generator<'a> {
                     None => quote!(()),
                 };
                 let success = if let Some(return_type) = method.return_type() {
-                    let lowered =
-                        self.lower_callback_value_expr(quote!(__callback_value), return_type)?;
+                    let lowered = self
+                        .lower_async_callback_value_expr(quote!(__callback_value), return_type)?;
                     quote! {
                         let __callback_value = __callback_result.value.unwrap_or_else(|| {
                             panic!(
@@ -789,7 +916,51 @@ impl<'a> Generator<'a> {
                 )?;
                 return Ok(quote! {
                     async fn #method_ident(&self, #(#args),*) -> std::result::Result<#return_ty, #error_ty> {
-                        let __callback_promise = self.#method_ident.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
+                        if let Some(__id) = self.__uniffi_callback_registry_id {
+                            let __registry = self.#registry_field_ident.as_ref().unwrap_or_else(|| {
+                                panic!(
+                                    "callback trait `{}`.{} has no returned-callback dispatcher",
+                                    #object_name,
+                                    #method_name
+                                );
+                            });
+                            let __callback_promise = __registry.call_async(Ok(#registry_call_value)).await.unwrap_or_else(|err| {
+                                panic!(
+                                    "callback trait `{}`.{} failed to dispatch returned async JS callback: {}",
+                                    #object_name,
+                                    #method_name,
+                                    err
+                                );
+                            });
+                            let __callback_result: #result_ident = __callback_promise.await.unwrap_or_else(|err| {
+                                panic!(
+                                    "callback trait `{}`.{} returned async JS callback rejected: {}",
+                                    #object_name,
+                                    #method_name,
+                                    err
+                                );
+                            });
+                            if __callback_result.ok {
+                                #success
+                            } else {
+                                let __callback_error = __callback_result.error.unwrap_or_else(|| {
+                                    panic!(
+                                        "callback trait `{}`.{} returned err without a typed error",
+                                        #object_name,
+                                        #method_name
+                                    );
+                                });
+                                Err(#lowered_error)
+                            }
+                        } else {
+                        let __callback = self.#method_ident.as_ref().unwrap_or_else(|| {
+                            panic!(
+                                "callback trait `{}`.{} has no JS callback",
+                                #object_name,
+                                #method_name
+                            );
+                        });
+                        let __callback_promise = __callback.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
                             panic!(
                                 "callback trait `{}`.{} failed to call async JS callback: {}",
                                 #object_name,
@@ -817,17 +988,53 @@ impl<'a> Generator<'a> {
                             });
                             Err(#lowered_error)
                         }
+                        }
                     }
                 });
             }
             return match method.return_type() {
                 Some(return_type) => {
                     let return_ty = self.core_callback_return_type(return_type)?;
-                    let lowered =
-                        self.lower_callback_value_expr(quote!(#return_value_ident), return_type)?;
+                    let lowered = self.lower_async_callback_value_expr(
+                        quote!(#return_value_ident),
+                        return_type,
+                    )?;
                     Ok(quote! {
                         async fn #method_ident(&self, #(#args),*) -> #return_ty {
-                            let __callback_promise = self.#method_ident.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
+                            if let Some(__id) = self.__uniffi_callback_registry_id {
+                                let __registry = self.#registry_field_ident.as_ref().unwrap_or_else(|| {
+                                    panic!(
+                                        "callback trait `{}`.{} has no returned-callback dispatcher",
+                                        #object_name,
+                                        #method_name
+                                    );
+                                });
+                                let __callback_promise = __registry.call_async(Ok(#registry_call_value)).await.unwrap_or_else(|err| {
+                                    panic!(
+                                        "callback trait `{}`.{} failed to dispatch returned async JS callback: {}",
+                                        #object_name,
+                                        #method_name,
+                                        err
+                                    );
+                                });
+                                let #return_value_ident = __callback_promise.await.unwrap_or_else(|err| {
+                                    panic!(
+                                        "callback trait `{}`.{} returned async JS callback rejected: {}",
+                                        #object_name,
+                                        #method_name,
+                                        err
+                                    );
+                                });
+                                #lowered
+                            } else {
+                            let __callback = self.#method_ident.as_ref().unwrap_or_else(|| {
+                                panic!(
+                                    "callback trait `{}`.{} has no JS callback",
+                                    #object_name,
+                                    #method_name
+                                );
+                            });
+                            let __callback_promise = __callback.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
                                 panic!(
                                     "callback trait `{}`.{} failed to call async JS callback: {}",
                                     #object_name,
@@ -844,12 +1051,45 @@ impl<'a> Generator<'a> {
                                 );
                             });
                             #lowered
+                            }
                         }
                     })
                 }
                 None => Ok(quote! {
                     async fn #method_ident(&self, #(#args),*) {
-                        let __callback_promise = self.#method_ident.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
+                        if let Some(__id) = self.__uniffi_callback_registry_id {
+                            let __registry = self.#registry_field_ident.as_ref().unwrap_or_else(|| {
+                                panic!(
+                                    "callback trait `{}`.{} has no returned-callback dispatcher",
+                                    #object_name,
+                                    #method_name
+                                );
+                            });
+                            let __callback_promise = __registry.call_async(Ok(#registry_call_value)).await.unwrap_or_else(|err| {
+                                panic!(
+                                    "callback trait `{}`.{} failed to dispatch returned async JS callback: {}",
+                                    #object_name,
+                                    #method_name,
+                                    err
+                                );
+                            });
+                            __callback_promise.await.unwrap_or_else(|err| {
+                                panic!(
+                                    "callback trait `{}`.{} returned async JS callback rejected: {}",
+                                    #object_name,
+                                    #method_name,
+                                    err
+                                );
+                            });
+                        } else {
+                        let __callback = self.#method_ident.as_ref().unwrap_or_else(|| {
+                            panic!(
+                                "callback trait `{}`.{} has no JS callback",
+                                #object_name,
+                                #method_name
+                            );
+                        });
+                        let __callback_promise = __callback.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
                             panic!(
                                 "callback trait `{}`.{} failed to call async JS callback: {}",
                                 #object_name,
@@ -865,6 +1105,7 @@ impl<'a> Generator<'a> {
                                 err
                             );
                         });
+                        }
                     }
                 }),
             };
@@ -896,10 +1137,75 @@ impl<'a> Generator<'a> {
                 self.lower_callback_value_expr(quote!(__callback_error), throws_type)?;
             return Ok(quote! {
                 fn #method_ident(&self, #(#args),*) -> std::result::Result<#return_ty, #error_ty> {
+                    if let Some(__id) = self.__uniffi_callback_registry_id {
+                        let __registry = self.#registry_field_ident.as_ref().unwrap_or_else(|| {
+                            panic!(
+                                "callback trait `{}`.{} has no returned-callback dispatcher",
+                                #object_name,
+                                #method_name
+                            );
+                        });
+                        let (__sender, __receiver) = std::sync::mpsc::channel();
+                        let __status = __registry.call_with_return_value(
+                            Ok(#registry_call_value),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                            move |__result, _| {
+                                __sender.send(__result).or(Ok(()))
+                            },
+                        );
+                        if __status != napi::Status::Ok {
+                            panic!(
+                                "callback trait `{}`.{} failed to dispatch returned JS callback: {}",
+                                #object_name,
+                                #method_name,
+                                __status
+                            );
+                        }
+                        let __callback_result = __receiver.recv().unwrap_or_else(|err| {
+                            panic!(
+                                "callback trait `{}`.{} failed to receive returned JS callback result: {}",
+                                #object_name,
+                                #method_name,
+                                err
+                            );
+                        }).unwrap_or_else(|err| {
+                            panic!(
+                                "callback trait `{}`.{} returned JS callback threw an unexpected JS error: {}",
+                                #object_name,
+                                #method_name,
+                                err
+                            );
+                        });
+                        if __callback_result.ok {
+                            #success
+                        } else {
+                            let __callback_error = __callback_result.error.unwrap_or_else(|| {
+                                panic!(
+                                    "callback trait `{}`.{} returned err without a typed error",
+                                    #object_name,
+                                    #method_name
+                                );
+                            });
+                            Err(#lowered_error)
+                        }
+                    } else {
                     let __env = napi::bindgen_prelude::Env::from_raw(
-                        self.env as napi::bindgen_prelude::sys::napi_env,
+                        self.env.unwrap_or_else(|| {
+                            panic!(
+                                "callback trait `{}`.{} has no JS env",
+                                #object_name,
+                                #method_name
+                            );
+                        }) as napi::bindgen_prelude::sys::napi_env,
                     );
-                    let __callback_result = self.#method_ident.borrow_back(&__env).unwrap_or_else(|err| {
+                    let __callback = self.#method_ident.as_ref().unwrap_or_else(|| {
+                        panic!(
+                            "callback trait `{}`.{} has no JS callback",
+                            #object_name,
+                            #method_name
+                        );
+                    });
+                    let __callback_result = __callback.borrow_back(&__env).unwrap_or_else(|err| {
                         panic!(
                             "callback trait `{}`.{} failed to borrow JS function: {}",
                             #object_name,
@@ -926,6 +1232,7 @@ impl<'a> Generator<'a> {
                         });
                         Err(#lowered_error)
                     }
+                    }
                 }
             });
         }
@@ -937,10 +1244,64 @@ impl<'a> Generator<'a> {
                 let method_name = method.name().to_string();
                 Ok(quote! {
                     fn #method_ident(&self, #(#args),*) -> #return_ty {
+                        if let Some(__id) = self.__uniffi_callback_registry_id {
+                            let __registry = self.#registry_field_ident.as_ref().unwrap_or_else(|| {
+                                panic!(
+                                    "callback trait `{}`.{} has no returned-callback dispatcher",
+                                    #object_name,
+                                    #method_name
+                                );
+                            });
+                            let (__sender, __receiver) = std::sync::mpsc::channel();
+                            let __status = __registry.call_with_return_value(
+                                Ok(#registry_call_value),
+                                ThreadsafeFunctionCallMode::NonBlocking,
+                                move |__result, _| {
+                                    __sender.send(__result).or(Ok(()))
+                                },
+                            );
+                            if __status != napi::Status::Ok {
+                                panic!(
+                                    "callback trait `{}`.{} failed to dispatch returned JS callback: {}",
+                                    #object_name,
+                                    #method_name,
+                                    __status
+                                );
+                            }
+                            let #return_value_ident = __receiver.recv().unwrap_or_else(|err| {
+                                panic!(
+                                    "callback trait `{}`.{} failed to receive returned JS callback result: {}",
+                                    #object_name,
+                                    #method_name,
+                                    err
+                                );
+                            }).unwrap_or_else(|err| {
+                                panic!(
+                                    "callback trait `{}`.{} returned JS callback threw in JS callback: {}",
+                                    #object_name,
+                                    #method_name,
+                                    err
+                                );
+                            });
+                            #lowered
+                        } else {
                         let __env = napi::bindgen_prelude::Env::from_raw(
-                            self.env as napi::bindgen_prelude::sys::napi_env,
+                            self.env.unwrap_or_else(|| {
+                                panic!(
+                                    "callback trait `{}`.{} has no JS env",
+                                    #object_name,
+                                    #method_name
+                                );
+                            }) as napi::bindgen_prelude::sys::napi_env,
                         );
-                        let #return_value_ident = self.#method_ident.borrow_back(&__env).unwrap_or_else(|err| {
+                        let __callback = self.#method_ident.as_ref().unwrap_or_else(|| {
+                            panic!(
+                                "callback trait `{}`.{} has no JS callback",
+                                #object_name,
+                                #method_name
+                            );
+                        });
+                        let #return_value_ident = __callback.borrow_back(&__env).unwrap_or_else(|err| {
                             panic!(
                                 "callback trait `{}`.{} failed to borrow JS function: {}",
                                 #object_name,
@@ -956,12 +1317,31 @@ impl<'a> Generator<'a> {
                             );
                         });
                         #lowered
+                        }
                     }
                 })
             }
             None => Ok(quote! {
                 fn #method_ident(&self, #(#args),*) {
-                    let _ = self.#method_ident.call(Ok(#call_value), ThreadsafeFunctionCallMode::NonBlocking);
+                    if let Some(__id) = self.__uniffi_callback_registry_id {
+                        let __registry = self.#registry_field_ident.as_ref().unwrap_or_else(|| {
+                            panic!(
+                                "callback trait `{}`.{} has no returned-callback dispatcher",
+                                #object_name,
+                                #method_name
+                            );
+                        });
+                        let _ = __registry.call(Ok(#registry_call_value), ThreadsafeFunctionCallMode::NonBlocking);
+                    } else {
+                        let __callback = self.#method_ident.as_ref().unwrap_or_else(|| {
+                            panic!(
+                                "callback trait `{}`.{} has no JS callback",
+                                #object_name,
+                                #method_name
+                            );
+                        });
+                        let _ = __callback.call(Ok(#call_value), ThreadsafeFunctionCallMode::NonBlocking);
+                    }
                 }
             }),
         }
@@ -974,7 +1354,8 @@ impl<'a> Generator<'a> {
     ) -> Result<TokenStream> {
         let ident = rust_ident(object.name());
         let type_name = object.name();
-        let env_init = needs_env.then(|| quote!(env: env as usize,));
+        let env_init = needs_env.then(|| quote!(env: Some(env as usize),));
+        let needs_return_dispatcher = self.callback_object_needs_return_dispatcher(object);
         let field_inits = object
             .methods()
             .into_iter()
@@ -983,10 +1364,25 @@ impl<'a> Generator<'a> {
                 let field_name = method.name().to_lower_camel_case();
                 let ty = self.callback_field_from_napi_type(object, method)?;
                 Ok(quote! {
-                    #field_ident: obj.get_named_property_unchecked::<#ty>(#field_name)?,
+                    #field_ident: Some(obj.get_named_property_unchecked::<#ty>(#field_name)?),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let registry_inits = self
+            .callback_registry_field_defs()?
+            .into_iter()
+            .map(|(field_ident, ty)| {
+                if needs_return_dispatcher {
+                    quote! {
+                        #field_ident: Some(std::sync::Arc::new(
+                            obj.get_named_property_unchecked::<#ty>("__uniffiCallbackDispatcher")?
+                        )),
+                    }
+                } else {
+                    quote!(#field_ident: None,)
+                }
+            })
+            .collect::<Vec<_>>();
 
         Ok(quote! {
             impl napi::bindgen_prelude::TypeName for #ident {
@@ -1036,6 +1432,8 @@ impl<'a> Generator<'a> {
                         };
                         Ok(Self {
                             #(#field_inits)*
+                            #(#registry_inits)*
+                            __uniffi_callback_registry_id: None,
                             #env_init
                         })
                     })();
@@ -1069,35 +1467,7 @@ impl<'a> Generator<'a> {
         object: &Object,
         method: &Method,
     ) -> Result<TokenStream> {
-        let tsfn_args = self.callback_tsfn_args(method)?;
-        if method.is_async() {
-            if method.throws_type().is_some() {
-                let result_ty = self.callback_result_ident(object, method);
-                Ok(
-                    quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>),
-                )
-            } else if let Some(return_type) = method.return_type() {
-                let bridge_return_ty = self.callback_bridge_type(return_type)?;
-                Ok(
-                    quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>),
-                )
-            } else {
-                Ok(quote!(
-                    napi::threadsafe_function::ThreadsafeFunction<
-                        #tsfn_args,
-                        napi::bindgen_prelude::Promise<()>,
-                    >
-                ))
-            }
-        } else if method.throws_type().is_some() {
-            let result_ty = self.callback_result_ident(object, method);
-            Ok(quote!(napi::bindgen_prelude::FunctionRef<#tsfn_args, #result_ty>))
-        } else if let Some(return_type) = method.return_type() {
-            let bridge_return_ty = self.callback_bridge_type(return_type)?;
-            Ok(quote!(napi::bindgen_prelude::FunctionRef<#tsfn_args, #bridge_return_ty>))
-        } else {
-            Ok(quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args>))
-        }
+        self.render_callback_direct_field_type(object, method)
     }
 
     fn render_constructor(
@@ -1724,6 +2094,74 @@ impl<'a> Generator<'a> {
         }
     }
 
+    fn callback_registry_tsfn_args(&self, method: &Method) -> Result<TokenStream> {
+        let arg_tys = method
+            .arguments()
+            .into_iter()
+            .map(|arg| self.bridge_value_type(&arg.as_type()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(quote!(FnArgs<(u32, String, #(#arg_tys),*)>))
+    }
+
+    fn callback_registry_call_value(&self, method: &Method) -> Result<TokenStream> {
+        let method_name = method.name().to_lower_camel_case();
+        let args = method
+            .arguments()
+            .into_iter()
+            .map(|arg| {
+                let arg_ident = rust_ident(arg.name());
+                self.lift_value_expr(quote!(#arg_ident), &arg.as_type())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(quote!(FnArgs::from((__id, #method_name.to_string(), #(#args),*))))
+    }
+
+    fn callback_object_needs_return_dispatcher(&self, object: &Object) -> bool {
+        object.methods().into_iter().any(|method| {
+            method.is_async()
+                && method
+                    .return_type()
+                    .is_some_and(Self::is_direct_callback_return_type)
+        })
+    }
+
+    fn is_direct_callback_return_type(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Object {
+                imp: ObjectImpl::CallbackTrait,
+                ..
+            } | Type::CallbackInterface { .. }
+        )
+    }
+
+    fn contains_callback_return_type(ty: &Type) -> bool {
+        match ty {
+            Type::Object {
+                imp: ObjectImpl::CallbackTrait,
+                ..
+            }
+            | Type::CallbackInterface { .. } => true,
+            Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+                Self::contains_callback_return_type(inner_type)
+            }
+            Type::Map { value_type, .. } => Self::contains_callback_return_type(value_type),
+            _ => false,
+        }
+    }
+
+    fn callback_async_bridge_type(&self, ty: &Type) -> Result<TokenStream> {
+        if Self::is_direct_callback_return_type(ty) {
+            Ok(quote!(__UniffiCallbackHandle))
+        } else if Self::contains_callback_return_type(ty) {
+            bail!(
+                "async callback methods returning nested callback traits/interfaces are not supported in the N-API/Electron backend yet"
+            )
+        } else {
+            self.callback_bridge_type(ty)
+        }
+    }
+
     fn callback_bridge_type(&self, ty: &Type) -> Result<TokenStream> {
         match ty {
             Type::Optional { inner_type } => {
@@ -1839,6 +2277,41 @@ impl<'a> Generator<'a> {
                         .expect("uniffi napi custom callback type lift failed")
                 }))
             }
+        }
+    }
+
+    fn lower_async_callback_value_expr(&self, expr: TokenStream, ty: &Type) -> Result<TokenStream> {
+        if Self::is_direct_callback_return_type(ty) {
+            self.lower_callback_handle_expr(expr, ty)
+        } else {
+            self.lower_callback_value_expr(expr, ty)
+        }
+    }
+
+    fn lower_callback_handle_expr(&self, expr: TokenStream, ty: &Type) -> Result<TokenStream> {
+        match ty {
+            Type::Object {
+                name,
+                imp: ObjectImpl::CallbackTrait,
+                ..
+            }
+            | Type::CallbackInterface { name, .. } => {
+                let ident = rust_ident(name);
+                let core_path = self.core_type_path(ty.clone());
+                let dispatch_args = self
+                    .callback_registry_field_defs()?
+                    .into_iter()
+                    .map(|(field_ident, _)| quote!(self.#field_ident.clone()))
+                    .collect::<Vec<_>>();
+                Ok(quote!({
+                    let __handle = #expr;
+                    std::sync::Arc::new(#ident::__uniffi_from_callback_registry(
+                        __handle.id,
+                        #(#dispatch_args),*
+                    )) as std::sync::Arc<dyn #core_path>
+                }))
+            }
+            _ => self.lower_callback_value_expr(expr, ty),
         }
     }
 
