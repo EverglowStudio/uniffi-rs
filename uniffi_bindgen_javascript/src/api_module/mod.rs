@@ -620,6 +620,7 @@ fn render_errors(ci: &ComponentInterface) -> String {
 fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("callbacks");
     let mut usage = Usage::default();
+    let mut needs_callback_return_unwrap = false;
     for obj in ci
         .object_definitions()
         .iter()
@@ -630,6 +631,7 @@ fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
                 usage.see(&arg.as_type(), UsagePos::Arg, config);
             }
             if let Some(ret) = method.return_type() {
+                needs_callback_return_unwrap |= needs_object_callback_return_unwrap(ret);
                 usage.see(ret, UsagePos::Ret, config);
             }
         }
@@ -640,6 +642,7 @@ fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
                 usage.see(&arg.as_type(), UsagePos::Arg, config);
             }
             if let Some(ret) = method.return_type() {
+                needs_callback_return_unwrap |= needs_object_callback_return_unwrap(ret);
                 usage.see(ret, UsagePos::Ret, config);
             }
         }
@@ -702,6 +705,11 @@ fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
     {
         out.push('\n');
     }
+    if needs_callback_return_unwrap {
+        out.push_str(
+            "function __uniffiUnwrapCallbackReturn(value: unknown): unknown {\n    let current = value;\n    while (current !== null && typeof current === \"object\") {\n        const uniffi = (current as Record<string, unknown>).__uniffi;\n        if (uniffi === null || typeof uniffi !== \"object\") break;\n        const raw = (uniffi as Record<string, unknown>).raw;\n        if (raw === current) break;\n        current = raw;\n    }\n    return current;\n}\n\n",
+        );
+    }
 
     let mut rendered = BTreeSet::new();
     for callback in ci.callback_interface_definitions() {
@@ -730,6 +738,16 @@ fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
         ));
     }
     out
+}
+
+fn needs_object_callback_return_unwrap(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Object {
+            imp: ObjectImpl::Struct | ObjectImpl::Trait,
+            ..
+        }
+    )
 }
 
 fn render_callback_definition(
@@ -801,7 +819,13 @@ fn render_callback_lowerer(
             .join(", ");
         if method.is_async() {
             if let Some(ret) = method.return_type() {
-                let lower = ts_lower_expr(ci, config, ret, "__ret", 0);
+                let lower = match ret {
+                    Type::Object {
+                        imp: ObjectImpl::Struct | ObjectImpl::Trait,
+                        ..
+                    } => "__uniffiUnwrapCallbackReturn(__ret)".to_string(),
+                    _ => ts_lower_expr(ci, config, ret, "__ret", 0),
+                };
                 out.push_str(&format!(
                     "        {method_name}({args}): Promise<any> {{\n            return Promise.resolve(__uniffiCallbackObject.{method_name}({pass})).then((__ret) => {{ return {lower}; }});\n        }},\n"
                 ));
@@ -811,7 +835,13 @@ fn render_callback_lowerer(
                 ));
             }
         } else if let Some(ret) = method.return_type() {
-            let lower = ts_lower_expr(ci, config, ret, "__ret", 0);
+            let lower = match ret {
+                Type::Object {
+                    imp: ObjectImpl::Struct | ObjectImpl::Trait,
+                    ..
+                } => "__uniffiUnwrapCallbackReturn(__ret)".to_string(),
+                _ => ts_lower_expr(ci, config, ret, "__ret", 0),
+            };
             out.push_str(&format!(
                 "        {method_name}({args}): any {{\n            const __ret = __uniffiCallbackObject.{method_name}({pass});\n            return {lower};\n        }},\n"
             ));

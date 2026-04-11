@@ -27,16 +27,20 @@
 //! objects (`Self` and `Arc<Self>` constructors, methods, free-function
 //! `Type::Object` args/returns, trait objects like `Arc<dyn Greeter>`),
 //! timestamp / duration, sync and async callback-trait lowering
-//! including fallible async methods, custom types, and string-key `Map` /
-//! `HashMap<String, V>` lowering (validated against `Logger` and dedicated
-//! custom/map fixtures in `bindgen-tests/javascript/tests/smoke.rs`).
+//! including fallible async methods, and callback methods returning
+//! ordinary UniFFI objects / trait objects via the object registry.
+//! Also covered: custom types, and string-key `Map` / `HashMap<String, V>`
+//! lowering (validated against `Logger` and dedicated custom/map fixtures
+//! in `bindgen-tests/javascript/tests/smoke.rs`).
 //!
-//! Still **not** covered: callback object/callback-trait args or returns,
-//! non-string-key maps, nested object/callback values in maps, `Set`, and
-//! cancellation. Unsupported shapes are emitted as runtime-throwing stubs
-//! (with the reason embedded in the thrown `JsError`) rather than being
-//! silently skipped, so the rest of the tree still builds and hitting an
-//! unsupported export is diagnosable at call time instead of at link time.
+//! Still **not** covered: callback traits / callback interfaces returning
+//! callback traits, callback object args, non-string-key maps, nested
+//! object/callback values in maps, `Set`, and cancellation. Unsupported
+//! exported shapes are emitted as runtime-throwing stubs (with the reason
+//! embedded in the thrown `JsError`) rather than being silently skipped.
+//! Callback methods returning callback traits / callback interfaces are
+//! rejected at generation time because the wrapper trait impl would otherwise
+//! have to promise a Rust return type it cannot construct yet.
 //!
 //! Downstream build prerequisite: any client crate with async UniFFI
 //! exports targeting wasm must enable `uniffi`'s
