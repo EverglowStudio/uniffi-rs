@@ -156,6 +156,7 @@ fn emit_wasm(
          [dependencies]\n\
          {core_name} = {{ path = \"{rel_core}\" }}\n\
          {uniffi_dep}\
+         async-trait = \"0.1\"\n\
          wasm-bindgen = \"=0.2.117\"\n\
          wasm-bindgen-futures = \"0.4\"\n\
          js-sys = \"0.3\"\n\

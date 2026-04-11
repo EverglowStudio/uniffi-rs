@@ -1450,6 +1450,89 @@ console.log("ok");
     });
 }
 
+/// Async callback-trait / `with_foreign` trait — JS async methods should be
+/// awaited by the generated Rust wasm shim, and Promise-returning JS callback
+/// methods must round-trip through the callback registry.
+#[test]
+fn runs_generated_wasm_shim_async_callback_trait() {
+    run_wasm_e2e(WasmE2eSpec {
+        name: "wasm_async_cb",
+        udl: r#"
+dictionary WorkRecord {
+  u32 total;
+};
+
+[Trait, WithForeign]
+interface AsyncWorker {
+  [Async]
+  void note(string msg);
+  [Async]
+  WorkRecord make_record(u32 a, u32 b);
+};
+
+namespace wasm_async_cb {
+  [Async]
+  WorkRecord run_async_worker(AsyncWorker worker);
+};
+"#,
+        biz_deps: "async-trait = \"0.1\"\n",
+        shim_deps: "",
+        biz_lib: r#"
+use std::sync::Arc;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkRecord {
+    pub total: u32,
+}
+
+#[async_trait::async_trait(?Send)]
+pub trait AsyncWorker: Send + Sync {
+    async fn note(&self, msg: String);
+    async fn make_record(&self, a: u32, b: u32) -> WorkRecord;
+}
+
+pub async fn run_async_worker(worker: Arc<dyn AsyncWorker>) -> WorkRecord {
+    worker.note("start".to_string()).await;
+    let record = worker.make_record(20, 22).await;
+    worker.note("done".to_string()).await;
+    record
+}
+"#,
+        driver_ts: r#"
+import { createRequire } from "node:module";
+import { initBackend } from "./gen/browser/index.ts";
+import { runAsyncWorker } from "./gen/common/api.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/wasm_async_cb_shim.js");
+await initBackend(glue);
+
+const calls: string[] = [];
+const worker = {
+    async note(msg: string): Promise<void> {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        calls.push(msg);
+    },
+    async makeRecord(a: number, b: number): Promise<{ total: number }> {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return { total: a + b };
+    },
+};
+const record = await runAsyncWorker(worker as any);
+if (record.total !== 42) {
+    throw new Error(`total=${record.total}`);
+}
+if (calls.join(",") !== "start,done") {
+    throw new Error(`calls=${calls.join(",")}`);
+}
+
+console.log("ok");
+"#,
+        config_toml: None,
+        generated_files: EMPTY_GENERATED_FILES,
+    });
+}
+
 #[test]
 fn runs_generated_wasm_shim_fallible_callback_trait() {
     run_wasm_e2e(WasmE2eSpec {
@@ -2055,6 +2138,7 @@ crate-type = ["cdylib"]
 wasm-bindgen = "=0.2.117"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
+async-trait = "0.1"
 {uniffi_dep}
 {name} = {{ path = "../biz" }}
 {extra}

@@ -26,13 +26,14 @@
 //! records, enums (incl. payload variants), errors-with-data, opaque
 //! objects (`Self` and `Arc<Self>` constructors, methods, free-function
 //! `Type::Object` args/returns, trait objects like `Arc<dyn Greeter>`),
-//! timestamp / duration, and synchronous `void`-returning callback-trait
-//! lowering, custom types, and string-key `Map` / `HashMap<String, V>`
+//! timestamp / duration, synchronous and non-fallible async
+//! callback-trait lowering, custom types, and string-key `Map` /
+//! `HashMap<String, V>`
 //! lowering (validated against `Logger` and dedicated custom/map fixtures in
 //! `bindgen-tests/javascript/tests/smoke.rs`).
 //!
-//! Still **not** covered: async callback-trait methods, callback
-//! object/callback/custom args or returns, non-string-key maps, nested
+//! Still **not** covered: fallible async callback-trait methods, callback
+//! object/callback-trait args or returns, non-string-key maps, nested
 //! object/callback values in maps, `Set`, and cancellation. Unsupported shapes
 //! are emitted as runtime-throwing stubs (with the reason embedded in the
 //! thrown `JsError`) rather than being silently skipped, so the rest of the tree
@@ -164,9 +165,11 @@ export async function adaptWasmBindgenGlue(
     const normalizeCallbackObject = (marker: {{
         object: object;
         fallibleMethods?: Record<string, string>;
+        asyncMethods?: Record<string, boolean>;
     }}): object => {{
         const obj = marker.object as Record<string, unknown>;
         const fallibleMethods = marker.fallibleMethods ?? {{}};
+        const asyncMethods = marker.asyncMethods ?? {{}};
         const out: Record<string, unknown> = {{}};
         for (const [k, v] of Object.entries(obj)) {{
             if (typeof v !== "function") {{
@@ -176,7 +179,17 @@ export async function adaptWasmBindgenGlue(
             out[k] = (...args: unknown[]) => {{
                 const fn = v as (...a: unknown[]) => unknown;
                 const errorShape = fallibleMethods[k];
-                if (!errorShape) return fn.apply(obj, args);
+                const isAsync = asyncMethods[k] === true;
+                if (!errorShape) {{
+                    if (isAsync) {{
+                        try {{
+                            return Promise.resolve(fn.apply(obj, args));
+                        }} catch (error) {{
+                            return Promise.reject(error);
+                        }}
+                    }}
+                    return fn.apply(obj, args);
+                }}
                 try {{
                     return {{ ok: true, value: fn.apply(obj, args) }};
                 }} catch (error) {{
@@ -198,6 +211,7 @@ export async function adaptWasmBindgenGlue(
                 normalizeCallbackObject(a as {{
                     object: object;
                     fallibleMethods?: Record<string, string>;
+                    asyncMethods?: Record<string, boolean>;
                 }}),
             );
         }}
