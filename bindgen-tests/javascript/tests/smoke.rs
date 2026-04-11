@@ -3966,6 +3966,8 @@ fn cli_build_orchestrates_full_javascript_tree() {
                 .unwrap()
                 .as_str(),
         )
+        .arg("--wasm-bindgen-target")
+        .arg("nodejs")
         .output()
         .expect("failed to invoke uniffi-bindgen javascript build");
     if !output.status.success() {
@@ -4020,6 +4022,110 @@ fn cli_build_orchestrates_full_javascript_tree() {
     assert!(
         preload.contains("dispatchSync") && preload.contains("dispatchAsync"),
         "combined build electron preload should expose sync and async dispatch:\n{preload}"
+    );
+
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!(
+            "SKIP cli_build_orchestrates_full_javascript_tree runtime matrix: \
+             node with --experimental-strip-types not available"
+        );
+        return;
+    };
+
+    let wasm_glue_js = pkg_entries
+        .iter()
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("js"))
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .expect("browser/pkg should contain a wasm-bindgen JS glue file")
+        .to_string();
+
+    // The renderer path can be exercised without launching Electron by
+    // stubbing the preload-only `contextBridge` API. This keeps the test
+    // focused on generated bridge semantics rather than Electron process
+    // management.
+    let electron_stub = out_dir.join("electron/node_modules/electron");
+    std::fs::create_dir_all(electron_stub.as_std_path()).unwrap();
+    std::fs::write(
+        electron_stub.join("index.js").as_std_path(),
+        r#"
+exports.contextBridge = {
+    exposeInMainWorld(name, value) {
+        globalThis[name] = value;
+    },
+};
+"#,
+    )
+    .unwrap();
+
+    let driver = r#"
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+
+function assertEq(actual: unknown, expected: unknown, label: string): void {
+    if (actual !== expected) {
+        throw new Error(`${label}: expected ${String(expected)}, got ${String(actual)}`);
+    }
+}
+
+async function expectThrown(label: string, call: () => unknown): Promise<void> {
+    try {
+        await call();
+    } catch (_e) {
+        return;
+    }
+    throw new Error(`${label}: expected an error`);
+}
+
+const glue = require("./browser/pkg/__WASM_GLUE__");
+const browser = await import("./browser/index.ts");
+await browser.initBackend(glue);
+assertEq(browser.add(2n, 3n), 5n, "browser.add");
+assertEq(browser.sub(9n, 4n), 5n, "browser.sub");
+assertEq(browser.equal(8n, 8n), true, "browser.equal");
+await expectThrown("browser.sub underflow", () => browser.sub(1n, 2n));
+
+const nodeApi = await import("./node/index.ts");
+assertEq(nodeApi.add(4n, 6n), 10n, "node.add");
+assertEq(nodeApi.sub(9n, 4n), 5n, "node.sub");
+assertEq(nodeApi.equal(8n, 9n), false, "node.equal");
+await expectThrown("node.sub underflow", () => nodeApi.sub(1n, 2n));
+
+(globalThis as { window?: unknown }).window = globalThis;
+require("./electron/preload.cjs");
+const electronApi = await import("./electron/renderer.ts");
+assertEq(electronApi.add(10n, 11n), 21n, "electron.add");
+assertEq(electronApi.sub(9n, 4n), 5n, "electron.sub");
+assertEq(electronApi.equal(8n, 8n), true, "electron.equal");
+await expectThrown("electron.sub underflow", () => electronApi.sub(1n, 2n));
+
+console.log("combined build runtime ok");
+"#
+    .replace("__WASM_GLUE__", &wasm_glue_js);
+    let driver_path = out_dir.join("combined-build-driver.ts");
+    std::fs::write(driver_path.as_std_path(), driver).unwrap();
+    let runtime = Command::new(&node)
+        .current_dir(out_dir.as_std_path())
+        .args([
+            "--experimental-strip-types",
+            "--no-warnings",
+            "combined-build-driver.ts",
+        ])
+        .output()
+        .expect("failed to run combined build runtime driver");
+    if !runtime.status.success() {
+        panic!(
+            "combined build runtime driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&runtime.stdout),
+            String::from_utf8_lossy(&runtime.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&runtime.stdout).contains("combined build runtime ok"),
+        "combined build runtime driver did not report success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
     );
 }
 
