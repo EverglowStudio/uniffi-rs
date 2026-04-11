@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashSet};
 use anyhow::Result;
 use camino::Utf8Path;
 use fs_err as fs;
-use heck::{ToLowerCamelCase, ToSnakeCase};
+use heck::ToSnakeCase;
 use uniffi_bindgen::{
     interface::{
         AsType, ComponentInterface, Constructor, Enum, Function, Method, Object, ObjectImpl,
@@ -1319,11 +1319,11 @@ fn header(module: &str) -> String {
 }
 
 fn js_fn_name(rust: &str) -> String {
-    rust.to_lower_camel_case()
+    crate::js_names::function_name(rust)
 }
 
 fn js_field_name(rust: &str) -> String {
-    rust.to_lower_camel_case()
+    crate::js_names::field_name(rust)
 }
 
 /// Returns `(decls, pass)` where `decls` is the comma-separated TS
