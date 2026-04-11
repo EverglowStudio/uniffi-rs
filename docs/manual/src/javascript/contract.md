@@ -349,7 +349,7 @@ Harmony does **not** use Node's `.node` addon loader. The generated backend
 imports the raw native module through the Harmony native module specifier:
 
 ```ts
-import * as native from "lib<namespace>.so";
+import * as native from "lib<namespace>_ohos.so";
 ```
 
 The consuming Harmony application is responsible for declaring that native
@@ -358,7 +358,7 @@ module in its `oh-package.json5`, for example:
 ```json5
 {
   "dependencies": {
-    "lib<namespace>.so": "file:./src/main/lib<namespace>"
+    "lib<namespace>_ohos.so": "file:./src/main/lib<namespace>_ohos"
   }
 }
 ```

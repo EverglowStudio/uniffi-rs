@@ -53,7 +53,7 @@ scenarios, then falls back to the copied `./<namespace>.node` addon produced by
 
 The Harmony/OpenHarmony adapter is also Node-API based, but it targets the
 `ohos-rs` fork rather than ordinary napi-rs. It emits `harmony/` TypeScript
-that imports native exports from `lib<namespace>.so`, and a generated
+that imports native exports from `lib<namespace>_ohos.so`, and a generated
 `rust_modules/ohos` host crate whose Rust bridge references `napi_ohos`,
 `napi_derive_ohos`, and `napi_build_ohos`. The `javascript build-ohos` CLI
 orchestrates `ohrs build`; normal Rust tests keep this path toolchain-gated so
