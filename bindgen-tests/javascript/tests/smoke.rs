@@ -1533,10 +1533,11 @@ console.log("ok");
     });
 }
 
-/// Callback-return object / trait-object smoke — JS callback returns a
-/// normal UniFFI object (`Counter`) and a trait object (`Greeter`).
-/// The Rust consumer calls methods on the returned values, proving the
-/// object registry round-trip works in wasm.
+/// Callback-return smoke — JS callback returns a normal UniFFI object
+/// (`Counter`), a trait object (`Greeter`), plus callback trait /
+/// callback interface values (`Logger`, `HostLogger`). The Rust consumer
+/// immediately calls methods on the returned callback values, proving the
+/// object and callback registry round-trips work in wasm.
 #[test]
 fn runs_generated_wasm_shim_callback_object_return() {
     run_wasm_e2e(WasmE2eSpec {
@@ -1553,15 +1554,28 @@ interface Greeter {
   string greet(string name);
 };
 
+callback interface Logger {
+  string log(string message);
+};
+
+[Trait, WithForeign]
+interface HostLogger {
+  string greet(string name);
+};
+
 callback interface Maker {
   Counter make_counter(u32 initial);
   Greeter make_greeter(string prefix);
+  Logger make_logger(string prefix);
+  HostLogger make_host_logger(string prefix);
 };
 
 namespace wasm_cb_object {
   Greeter english_greeter(string prefix);
   Counter invoke_maker_make_counter(Maker maker, u32 initial);
   Greeter invoke_maker_make_greeter(Maker maker, string prefix);
+  string invoke_maker_run_logger(Maker maker, string prefix, string message);
+  string invoke_maker_run_host_logger(Maker maker, string prefix, string name);
 };
 "#,
         biz_deps: "",
@@ -1589,6 +1603,14 @@ pub trait Greeter: Send + Sync {
     fn greet(&self, name: String) -> String;
 }
 
+pub trait Logger: Send + Sync {
+    fn log(&self, message: String) -> String;
+}
+
+pub trait HostLogger: Send + Sync {
+    fn greet(&self, name: String) -> String;
+}
+
 pub struct English {
     prefix: String,
 }
@@ -1606,6 +1628,8 @@ pub fn english_greeter(prefix: String) -> Arc<dyn Greeter> {
 pub trait Maker: Send + Sync {
     fn make_counter(&self, initial: u32) -> Arc<Counter>;
     fn make_greeter(&self, prefix: String) -> Arc<dyn Greeter>;
+    fn make_logger(&self, prefix: String) -> Arc<dyn Logger>;
+    fn make_host_logger(&self, prefix: String) -> Arc<dyn HostLogger>;
 }
 
 pub fn invoke_maker_make_counter(maker: Arc<dyn Maker>, initial: u32) -> Arc<Counter> {
@@ -1614,6 +1638,14 @@ pub fn invoke_maker_make_counter(maker: Arc<dyn Maker>, initial: u32) -> Arc<Cou
 
 pub fn invoke_maker_make_greeter(maker: Arc<dyn Maker>, prefix: String) -> Arc<dyn Greeter> {
     maker.make_greeter(prefix)
+}
+
+pub fn invoke_maker_run_logger(maker: Arc<dyn Maker>, prefix: String, message: String) -> String {
+    maker.make_logger(prefix).log(message)
+}
+
+pub fn invoke_maker_run_host_logger(maker: Arc<dyn Maker>, prefix: String, name: String) -> String {
+    maker.make_host_logger(prefix).greet(name)
 }
 "#,
         driver_ts: r#"
@@ -1624,6 +1656,8 @@ import {
     englishGreeter,
     invokeMakerMakeCounter,
     invokeMakerMakeGreeter,
+    invokeMakerRunHostLogger,
+    invokeMakerRunLogger,
 } from "./gen/common/api.ts";
 
 const require = createRequire(import.meta.url);
@@ -1637,6 +1671,20 @@ const maker = {
     makeGreeter(prefix: string) {
         return englishGreeter(prefix);
     },
+    makeLogger(prefix: string) {
+        return {
+            log(message: string) {
+                return `${prefix}:${message}`;
+            },
+        };
+    },
+    makeHostLogger(prefix: string) {
+        return {
+            greet(name: string) {
+                return `${prefix} ${name}!`;
+            },
+        };
+    },
 };
 
 const counter = invokeMakerMakeCounter(maker as any, 10);
@@ -1649,6 +1697,19 @@ const greeter = invokeMakerMakeGreeter(maker as any, "Hello");
 if (greeter.greet("world") !== "Hello world") {
     throw new Error(`greeter.greet()=${greeter.greet("world")}`);
 }
+
+const loggerLog = invokeMakerRunLogger(maker as any, "Log", "world");
+if (loggerLog !== "Log:world") {
+    throw new Error(`loggerLog=${loggerLog}`);
+}
+
+const hostLoggerGreet = invokeMakerRunHostLogger(maker as any, "Host", "world");
+if (hostLoggerGreet !== "Host world!") {
+    throw new Error(`hostLoggerGreet=${hostLoggerGreet}`);
+}
+
+counter.dispose();
+greeter.dispose();
 
 console.log("ok");
 "#,
@@ -3900,6 +3961,9 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
          pub trait Greeter: Send + Sync {\n\
          \x20   fn greet(&self, name: String) -> String;\n\
          }\n\n\
+         pub trait HostLogger: Send + Sync {\n\
+         \x20   fn greet(&self, name: String) -> String;\n\
+         }\n\n\
          pub struct English {\n\
          \x20   prefix: String,\n\
          }\n\n\
@@ -3928,6 +3992,7 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
          \x20   fn make_payload(&self) -> Payload;\n\
          \x20   fn make_counter(&self, initial: u32) -> std::sync::Arc<Counter>;\n\
          \x20   fn make_greeter(&self, prefix: String) -> std::sync::Arc<dyn Greeter>;\n\
+         \x20   fn make_host_logger(&self, prefix: String) -> std::sync::Arc<dyn HostLogger>;\n\
          \x20   fn checked_value(&self, fail: bool) -> Result<u32, ProviderError>;\n\
          \x20   fn checked_payload(&self, fail: bool) -> Result<Payload, ProviderError>;\n\
          \x20   fn checked_void(&self, fail: bool) -> Result<(), ProviderError>;\n\
@@ -3943,6 +4008,9 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
          }\n\n\
          pub fn invoke_value_provider_make_greeter(provider: std::sync::Arc<dyn ValueProvider>, prefix: String) -> std::sync::Arc<dyn Greeter> {\n\
          \x20   provider.make_greeter(prefix)\n\
+         }\n\n\
+         pub fn invoke_value_provider_run_host_logger(provider: std::sync::Arc<dyn ValueProvider>, prefix: String, name: String) -> String {\n\
+         \x20   provider.make_host_logger(prefix).greet(name)\n\
          }\n\n\
          pub fn invoke_value_provider_checked_value(provider: std::sync::Arc<dyn ValueProvider>, fail: bool) -> Result<u32, ProviderError> {\n\
          \x20   provider.checked_value(fail)\n\
@@ -3976,6 +4044,11 @@ interface Greeter {
   string greet(string name);
 };
 
+[Trait, WithForeign]
+interface HostLogger {
+  string greet(string name);
+};
+
 [Error]
 enum ProviderError {
   "BadValue",
@@ -3987,6 +4060,7 @@ interface ValueProvider {
   Payload make_payload();
   Counter make_counter(u32 initial);
   Greeter make_greeter(string prefix);
+  HostLogger make_host_logger(string prefix);
   [Throws=ProviderError]
   u32 checked_value(boolean fail);
   [Throws=ProviderError]
@@ -4000,6 +4074,7 @@ namespace callback_return {
   Payload invoke_value_provider_make_payload(ValueProvider provider);
   Counter invoke_value_provider_make_counter(ValueProvider provider, u32 initial);
   Greeter invoke_value_provider_make_greeter(ValueProvider provider, string prefix);
+  string invoke_value_provider_run_host_logger(ValueProvider provider, string prefix, string name);
   Greeter english_greeter(string prefix);
   [Throws=ProviderError]
   u32 invoke_value_provider_checked_value(ValueProvider provider, boolean fail);
@@ -5405,7 +5480,8 @@ exports.__state = state;
         callbacks.contains("interface ValueProvider")
             && callbacks.contains("makePayload(): Payload")
             && callbacks.contains("makeCounter(initial: number): Counter")
-            && callbacks.contains("makeGreeter(prefix: string): Greeter"),
+            && callbacks.contains("makeGreeter(prefix: string): Greeter")
+            && callbacks.contains("makeHostLogger(prefix: string): HostLogger"),
         "common/callbacks.ts should expose a return-capable callback interface:\n{callbacks}"
     );
 
@@ -5434,6 +5510,7 @@ import {
     invokeValueProviderCheckedVoid,
     invokeValueProviderMakeCounter,
     invokeValueProviderMakeGreeter,
+    invokeValueProviderRunHostLogger,
 } from "./node/index.ts";
 import { UniffiError } from "./common/runtime.ts";
 import { createRequire } from "node:module";
@@ -5456,6 +5533,13 @@ const provider = {
     },
     makeGreeter(prefix: string) {
         return englishGreeter(prefix);
+    },
+    makeHostLogger(prefix: string) {
+        return {
+            greet(name: string) {
+                return `${prefix} ${name}!`;
+            },
+        };
     },
     checkedValue(fail: boolean) {
         if (fail) throw new ProviderError("BadValue", "BadValue");
@@ -5486,6 +5570,10 @@ if (returnedCounter.value() !== 11) {
 const returnedGreeter = invokeValueProviderMakeGreeter(provider as any, "Hi");
 if (returnedGreeter.greet("Ada") !== "Hi Ada!") {
     throw new Error(`node makeGreeter failed: ${returnedGreeter.greet("Ada")}`);
+}
+const returnedHostLogger = invokeValueProviderRunHostLogger(provider as any, "Host", "Ada");
+if (returnedHostLogger !== "Host Ada!") {
+    throw new Error(`node runHostLogger failed: ${returnedHostLogger}`);
 }
 
 if (invokeValueProviderCheckedValue(provider as any, false) !== 77) {
@@ -5533,6 +5621,13 @@ const electronProvider = {
     makeGreeter(prefix: string) {
         return electronApi.englishGreeter(prefix);
     },
+    makeHostLogger(prefix: string) {
+        return {
+            greet(name: string) {
+                return `${prefix} ${name}!`;
+            },
+        };
+    },
 };
 const electronCounter = electronApi.invokeValueProviderMakeCounter(electronProvider as any, 12);
 electronCounter.inc();
@@ -5542,6 +5637,10 @@ if (electronCounter.value() !== 13) {
 const electronGreeter = electronApi.invokeValueProviderMakeGreeter(electronProvider as any, "Yo");
 if (electronGreeter.greet("Ada") !== "Yo Ada!") {
     throw new Error(`electron makeGreeter failed: ${electronGreeter.greet("Ada")}`);
+}
+const electronHostLogger = electronApi.invokeValueProviderRunHostLogger(electronProvider as any, "EH", "Ada");
+if (electronHostLogger !== "EH Ada!") {
+    throw new Error(`electron runHostLogger failed: ${electronHostLogger}`);
 }
 const electronMarker = {
     __uniffiCallback: true,
