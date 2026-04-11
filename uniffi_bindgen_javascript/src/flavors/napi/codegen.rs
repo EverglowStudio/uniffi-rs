@@ -662,6 +662,20 @@ impl<'a> Generator<'a> {
         let field_ident = rust_ident(method.name());
         let tsfn_args = self.callback_tsfn_args(method)?;
         if method.is_async() {
+            if let Some(return_type) = method.return_type() {
+                ensure!(
+                    !matches!(
+                        return_type,
+                        Type::Object {
+                            imp: ObjectImpl::CallbackTrait,
+                            ..
+                        } | Type::CallbackInterface { .. }
+                    ),
+                    "async callback methods returning callback traits/interfaces are not supported in the N-API/Electron backend yet"
+                );
+            }
+        }
+        if method.is_async() {
             if method.throws_type().is_some() {
                 let result_ty = self.callback_result_ident(object, method);
                 Ok(quote! {
@@ -1005,19 +1019,46 @@ impl<'a> Generator<'a> {
                     env: napi::bindgen_prelude::sys::napi_env,
                     napi_val: napi::bindgen_prelude::sys::napi_value,
                 ) -> napi::bindgen_prelude::Result<Self> {
-                    let obj = napi::bindgen_prelude::Object::from_napi_value(env, napi_val)?;
-                    let obj = if obj
-                        .get_named_property_unchecked::<bool>("__uniffiCallback")
-                        .unwrap_or(false)
-                    {
-                        obj.get_named_property_unchecked::<napi::bindgen_prelude::Object>("object")?
-                    } else {
-                        obj
+                    let mut __scope = std::ptr::null_mut();
+                    napi::check_status!(
+                        unsafe { napi::bindgen_prelude::sys::napi_open_handle_scope(env, &mut __scope) },
+                        "Failed to open callback wrapper handle scope"
+                    )?;
+                    let __result = (|| -> napi::bindgen_prelude::Result<Self> {
+                        let obj = napi::bindgen_prelude::Object::from_napi_value(env, napi_val)?;
+                        let obj = if obj
+                            .get_named_property_unchecked::<bool>("__uniffiCallback")
+                            .unwrap_or(false)
+                        {
+                            obj.get_named_property_unchecked::<napi::bindgen_prelude::Object>("object")?
+                        } else {
+                            obj
+                        };
+                        Ok(Self {
+                            #(#field_inits)*
+                            #env_init
+                        })
+                    })();
+                    let __close_status = unsafe {
+                        napi::bindgen_prelude::sys::napi_close_handle_scope(env, __scope)
                     };
-                    Ok(Self {
-                        #(#field_inits)*
-                        #env_init
-                    })
+                    napi::check_status!(
+                        __close_status,
+                        "Failed to close callback wrapper handle scope"
+                    )?;
+                    __result
+                }
+            }
+
+            impl napi::bindgen_prelude::ToNapiValue for #ident {
+                unsafe fn to_napi_value(
+                    _env: napi::bindgen_prelude::sys::napi_env,
+                    _val: Self,
+                ) -> napi::bindgen_prelude::Result<napi::bindgen_prelude::sys::napi_value> {
+                    Err(napi::bindgen_prelude::Error::new(
+                        napi::bindgen_prelude::Status::GenericFailure,
+                        "callback wrapper values are inbound-only",
+                    ))
                 }
             }
         })
@@ -1041,9 +1082,12 @@ impl<'a> Generator<'a> {
                     quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>),
                 )
             } else {
-                Ok(
-                    quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<()>>),
-                )
+                Ok(quote!(
+                    napi::threadsafe_function::ThreadsafeFunction<
+                        #tsfn_args,
+                        napi::bindgen_prelude::Promise<()>,
+                    >
+                ))
             }
         } else if method.throws_type().is_some() {
             let result_ty = self.callback_result_ident(object, method);

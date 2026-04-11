@@ -30,6 +30,9 @@
 //! including fallible async methods, and callback methods returning
 //! ordinary UniFFI objects / trait objects via the object registry or
 //! callback traits / callback interfaces via the callback registry.
+//! Async and fallible callback methods can return callback traits /
+//! callback interfaces too, and those return values are rehydrated through
+//! the same callback registry path.
 //! Also covered: custom types, and string-key `Map` / `HashMap<String, V>`
 //! lowering (validated against `Logger` and dedicated custom/map fixtures
 //! in `bindgen-tests/javascript/tests/smoke.rs`).
