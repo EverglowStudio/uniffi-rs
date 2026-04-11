@@ -495,11 +495,7 @@ fn render_value_method(
     config: &JsConfig,
 ) -> String {
     let js_name = js_fn_name(method.name());
-    let fn_name = format!(
-        "{}_{}",
-        owner_name.to_snake_case(),
-        method.name().to_snake_case()
-    );
+    let fn_name = crate::dispatch_key::method_key(owner_name, method);
     let (arg_decls, arg_pass) = lowered_args(
         ci,
         config,
@@ -558,11 +554,7 @@ fn render_value_constructor(
     config: &JsConfig,
 ) -> String {
     let js_name = js_fn_name(constructor.name());
-    let fn_name = format!(
-        "{}_{}",
-        owner_name.to_snake_case(),
-        constructor.name().to_snake_case()
-    );
+    let fn_name = crate::dispatch_key::constructor_key(owner_name, constructor);
     let (arg_decls, arg_pass) = lowered_args(
         ci,
         config,
@@ -1018,7 +1010,7 @@ fn render_object_class(ci: &ComponentInterface, obj: &Object, config: &JsConfig)
     );
     for c in obj.constructors() {
         let c_js = js_fn_name(c.name());
-        let fn_name = format!("{snake}_{}", c.name().to_snake_case());
+        let fn_name = crate::dispatch_key::constructor_key(obj.name(), c);
         let (arg_decls, arg_pass) = lowered_args(
             ci,
             config,
@@ -1041,7 +1033,7 @@ fn render_object_class(ci: &ComponentInterface, obj: &Object, config: &JsConfig)
     }
     for m in obj.methods() {
         let m_js = js_fn_name(m.name());
-        let fn_name = format!("{snake}_{}", m.name().to_snake_case());
+        let fn_name = crate::dispatch_key::method_key(obj.name(), m);
         let (arg_decls, arg_pass) = lowered_args(
             ci,
             config,
@@ -1274,8 +1266,8 @@ fn render_free_function(ci: &ComponentInterface, config: &JsConfig, f: &Function
         None => "void".to_string(),
     };
     let call_g = call_generic(ret_ty);
-    let rust_name = f.name();
-    let js_name = js_fn_name(rust_name);
+    let rust_name = crate::dispatch_key::free_function_key(f.name());
+    let js_name = js_fn_name(f.name());
     if f.is_async() {
         if let Some(ret_ty) = ret_ty {
             format!(
