@@ -48,6 +48,71 @@ fn generate_arithmetic(out_dir: &Utf8PathBuf) {
 }
 
 #[test]
+fn napi_rejects_async_callback_return_callbacks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crate_dir = tmp.path().join("async_callback_return");
+    let src_dir = crate_dir.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        r#"[package]
+name = "async-callback-return"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(src_dir.join("lib.rs"), "// placeholder\n").unwrap();
+    let udl_path = src_dir.join("async_callback_return.udl");
+    std::fs::write(
+        &udl_path,
+        r#"
+[Trait, WithForeign]
+interface Logger {
+  string log(string message);
+};
+
+[Trait, WithForeign]
+interface Maker {
+  [Async]
+  Logger make_logger(string prefix);
+};
+
+namespace async_callback_return {
+  [Async]
+  string run(Maker maker);
+};
+"#,
+    )
+    .unwrap();
+
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    let err = generate(
+        &loader,
+        GenerateJsOptions {
+            source: Utf8PathBuf::from_path_buf(udl_path).unwrap(),
+            out_dir,
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: None,
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
+        },
+    )
+    .expect_err("N-API/Electron must reject async callback-return callbacks");
+    assert!(
+        err.to_string()
+            .contains("async callback methods returning callback traits/interfaces"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
 fn emits_real_tree_for_all_flavors() {
     let out = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(out.path().to_path_buf()).unwrap();
@@ -1563,11 +1628,22 @@ interface HostLogger {
   string greet(string name);
 };
 
+[Error]
+enum ProviderError {
+  "BadValue",
+};
+
 callback interface Maker {
   Counter make_counter(u32 initial);
   Greeter make_greeter(string prefix);
   Logger make_logger(string prefix);
   HostLogger make_host_logger(string prefix);
+  [Async]
+  Logger make_async_logger(string prefix);
+  [Async]
+  HostLogger make_async_host_logger(string prefix);
+  [Async, Throws=ProviderError]
+  Logger checked_make_async_logger(string prefix, boolean fail);
 };
 
 namespace wasm_cb_object {
@@ -1576,9 +1652,15 @@ namespace wasm_cb_object {
   Greeter invoke_maker_make_greeter(Maker maker, string prefix);
   string invoke_maker_run_logger(Maker maker, string prefix, string message);
   string invoke_maker_run_host_logger(Maker maker, string prefix, string name);
+  [Async]
+  string invoke_maker_run_async_logger(Maker maker, string prefix, string message);
+  [Async]
+  string invoke_maker_run_async_host_logger(Maker maker, string prefix, string name);
+  [Async, Throws=ProviderError]
+  string invoke_maker_checked_make_async_logger(Maker maker, string prefix, boolean fail, string message);
 };
 "#,
-        biz_deps: "",
+        biz_deps: "async-trait = \"0.1\"\n",
         shim_deps: "",
         biz_lib: r#"
 use std::sync::{Arc, Mutex};
@@ -1611,6 +1693,21 @@ pub trait HostLogger: Send + Sync {
     fn greet(&self, name: String) -> String;
 }
 
+#[derive(Debug)]
+pub enum ProviderError {
+    BadValue,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadValue => write!(f, "BadValue"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
 pub struct English {
     prefix: String,
 }
@@ -1625,11 +1722,19 @@ pub fn english_greeter(prefix: String) -> Arc<dyn Greeter> {
     Arc::new(English { prefix })
 }
 
+#[async_trait::async_trait(?Send)]
 pub trait Maker: Send + Sync {
     fn make_counter(&self, initial: u32) -> Arc<Counter>;
     fn make_greeter(&self, prefix: String) -> Arc<dyn Greeter>;
     fn make_logger(&self, prefix: String) -> Arc<dyn Logger>;
     fn make_host_logger(&self, prefix: String) -> Arc<dyn HostLogger>;
+    async fn make_async_logger(&self, prefix: String) -> Arc<dyn Logger>;
+    async fn make_async_host_logger(&self, prefix: String) -> Arc<dyn HostLogger>;
+    async fn checked_make_async_logger(
+        &self,
+        prefix: String,
+        fail: bool,
+    ) -> Result<Arc<dyn Logger>, ProviderError>;
 }
 
 pub fn invoke_maker_make_counter(maker: Arc<dyn Maker>, initial: u32) -> Arc<Counter> {
@@ -1647,15 +1752,47 @@ pub fn invoke_maker_run_logger(maker: Arc<dyn Maker>, prefix: String, message: S
 pub fn invoke_maker_run_host_logger(maker: Arc<dyn Maker>, prefix: String, name: String) -> String {
     maker.make_host_logger(prefix).greet(name)
 }
+
+pub async fn invoke_maker_run_async_logger(
+    maker: Arc<dyn Maker>,
+    prefix: String,
+    message: String,
+) -> String {
+    maker.make_async_logger(prefix).await.log(message)
+}
+
+pub async fn invoke_maker_run_async_host_logger(
+    maker: Arc<dyn Maker>,
+    prefix: String,
+    name: String,
+) -> String {
+    maker.make_async_host_logger(prefix).await.greet(name)
+}
+
+pub async fn invoke_maker_checked_make_async_logger(
+    maker: Arc<dyn Maker>,
+    prefix: String,
+    fail: bool,
+    message: String,
+) -> Result<String, ProviderError> {
+    Ok(maker
+        .checked_make_async_logger(prefix, fail)
+        .await?
+        .log(message))
+}
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
 import { initBackend } from "./gen/browser/index.ts";
 import {
     Counter,
+    ProviderError,
     englishGreeter,
     invokeMakerMakeCounter,
     invokeMakerMakeGreeter,
+    invokeMakerRunAsyncLogger,
+    invokeMakerRunAsyncHostLogger,
+    invokeMakerCheckedMakeAsyncLogger,
     invokeMakerRunHostLogger,
     invokeMakerRunLogger,
 } from "./gen/common/api.ts";
@@ -1685,6 +1822,33 @@ const maker = {
             },
         };
     },
+    async makeAsyncLogger(prefix: string) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return {
+            log(message: string) {
+                return `${prefix}:${message}`;
+            },
+        };
+    },
+    async makeAsyncHostLogger(prefix: string) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return {
+            greet(name: string) {
+                return `${prefix} ${name}!`;
+            },
+        };
+    },
+    async checkedMakeAsyncLogger(prefix: string, fail: boolean) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        if (fail) {
+            throw new ProviderError("BadValue", "BadValue");
+        }
+        return {
+            log(message: string) {
+                return `${prefix}:${message}`;
+            },
+        };
+    },
 };
 
 const counter = invokeMakerMakeCounter(maker as any, 10);
@@ -1706,6 +1870,34 @@ if (loggerLog !== "Log:world") {
 const hostLoggerGreet = invokeMakerRunHostLogger(maker as any, "Host", "world");
 if (hostLoggerGreet !== "Host world!") {
     throw new Error(`hostLoggerGreet=${hostLoggerGreet}`);
+}
+
+const asyncLogger = await invokeMakerRunAsyncLogger(maker as any, "Async", "world");
+if (asyncLogger !== "Async:world") {
+    throw new Error(`asyncLogger=${asyncLogger}`);
+}
+
+const asyncHostLogger = await invokeMakerRunAsyncHostLogger(maker as any, "AsyncHost", "world");
+if (asyncHostLogger !== "AsyncHost world!") {
+    throw new Error(`asyncHostLogger=${asyncHostLogger}`);
+}
+
+const checkedAsyncLogger = await invokeMakerCheckedMakeAsyncLogger(maker as any, "Checked", false, "world");
+if (checkedAsyncLogger !== "Checked:world") {
+    throw new Error(`checkedAsyncLogger=${checkedAsyncLogger}`);
+}
+
+let checkedAsyncLoggerFailed = false;
+try {
+    await invokeMakerCheckedMakeAsyncLogger(maker as any, "Checked", true, "world");
+} catch (error) {
+    checkedAsyncLoggerFailed = true;
+    if (!(error instanceof Error) || !String(error.message).includes("BadValue")) {
+        throw new Error(`checkedAsyncLogger(true) wrong error: ${String(error)}`);
+    }
+}
+if (!checkedAsyncLoggerFailed) {
+    throw new Error("checkedAsyncLogger(true) should throw");
 }
 
 counter.dispose();
@@ -5575,7 +5767,6 @@ const returnedHostLogger = invokeValueProviderRunHostLogger(provider as any, "Ho
 if (returnedHostLogger !== "Host Ada!") {
     throw new Error(`node runHostLogger failed: ${returnedHostLogger}`);
 }
-
 if (invokeValueProviderCheckedValue(provider as any, false) !== 77) {
     throw new Error("checkedValue(false) failed");
 }
