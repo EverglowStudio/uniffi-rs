@@ -90,6 +90,7 @@ nav:
 
   - 'JavaScript':
     - ./javascript/contract.md
+    - ./javascript/architecture.md
 
   - 'Kotlin':
     - ./kotlin/configuration.md
