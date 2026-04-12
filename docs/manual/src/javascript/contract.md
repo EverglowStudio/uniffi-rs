@@ -299,10 +299,12 @@ Applications must call `await initBackend(glue)` before any generated wasm API
 use. Later calls are no-ops. The napi and electron entrypoints remain
 synchronous to import.
 
-When the CLI runs `uniffi-bindgen javascript build-wasm` or `javascript build`
-with `--wasm-bindgen-target web`, it also emits `browser/index.web.ts` after
-the final wasm-bindgen file names are known. That auto-entrypoint imports the
-generated wasm-bindgen JS glue and `.wasm` asset URL, re-exports
+When the CLI runs `uniffi-bindgen javascript build-wasm`, `javascript build`,
+or `artifacts build --target wasm` with `--wasm-bindgen-target web`, it also
+emits `browser/index.web.ts` after the final wasm-bindgen file names are
+known. The CLI uses UniFFI's built-in wasm-bindgen runner by default; callers do
+not need a `wasm-bindgen` binary or source checkout. The auto-entrypoint imports
+the generated wasm-bindgen JS glue and `.wasm` asset URL, re-exports
 `browser/index.ts`, and exposes:
 
 ```ts
@@ -371,9 +373,6 @@ napi-derive-ohos = { version = "1.1.6", features = ["type-def"] }
 napi-build-ohos = "1.1.6"
 ```
 
-When `--ohos-rs-dir` is supplied to the CLI, the host crate uses local path
-dependencies to that checkout instead of crates.io versions.
-
 The CLI orchestration command is:
 
 ```text
@@ -383,13 +382,30 @@ uniffi-bindgen javascript build-ohos \
   --arch aarch \
   --arch x64 \
   [--release] \
-  [--ohos-rs-dir <path>]
+  [--static] \
+  [--skip-libs] \
+  [--dts-cache] \
+  [--skip-check] \
+  [--zigbuild] \
+  [--bisheng] \
+  [--package <package>] \
+  [--skip-napi-check] \
+  [--soname <libname-or-libname.so>] \
+  [-- --no-default-features --features ohos]
 ```
 
-The command emits `common/`, `harmony/`, and `rust_modules/ohos`, then invokes
-`ohrs build` against the generated host crate. The default architecture list is
-`aarch` and `x64`, matching the common `ohos-rs` aliases for `arm64-v8a` and
-`x86_64`.
+The command emits `common/`, `harmony/`, and `rust_modules/ohos`, then uses
+UniFFI's built-in OHOS builder against the generated host crate. Callers do not
+need an `ohrs` binary or an `ohos-rs` source checkout. The default architecture
+list is `aarch` and `x64`, matching the common OHOS aliases for `arm64-v8a` and
+`x86_64`. A real native build still requires the OHOS SDK/NDK environment and
+Rust OHOS target support. The built-in builder mirrors the common `ohrs build`
+controls for static library copying, skipped lib copy, d.ts cache reuse,
+zigbuild/BiSheng toolchain selection, package filtering, SONAME, and trailing
+cargo arguments. If the manifest is a workspace root with multiple
+OHOS-capable packages and no package filter is supplied, the builder emits each
+package under `<dist>/<package>/...`; single-package builds keep the
+`<dist>/<arch>/...` layout.
 
 ## Versioning
 

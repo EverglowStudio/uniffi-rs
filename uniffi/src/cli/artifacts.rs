@@ -84,39 +84,59 @@ pub(crate) struct BuildArgs {
     #[clap(long = "wasm-bindgen-target", value_enum, default_value = "web")]
     wasm_bindgen_target: WasmBindgenTargetArg,
 
-    /// Override the `wasm-bindgen` binary to invoke.
-    #[clap(long = "wasm-bindgen-bin")]
-    wasm_bindgen_bin: Option<String>,
-
-    /// Optional local checkout of wasm-bindgen; when set and --wasm-bindgen-bin is omitted, build and use it.
-    #[clap(long = "wasm-bindgen-dir")]
-    wasm_bindgen_dir: Option<Utf8PathBuf>,
-
     /// Cargo target directory for the generated N-API host build.
     #[clap(long = "napi-target-dir")]
     napi_target_dir: Option<Utf8PathBuf>,
 
-    /// Output directory passed to `ohrs build --dist`.
+    /// Output directory for built OHOS artifacts.
     #[clap(long = "ohos-dist-dir")]
     ohos_dist_dir: Option<Utf8PathBuf>,
 
-    /// OHOS architecture alias passed to `ohrs build --arch`. Defaults to `aarch` and `x64`.
+    /// OHOS architecture alias for the built-in OHOS builder. Defaults to `aarch` and `x64`.
     #[clap(long = "ohos-arch")]
     ohos_arch: Vec<String>,
 
-    /// Override the `ohrs` binary used to build the OHOS host crate.
-    #[clap(long = "ohrs-bin")]
-    ohrs_bin: Option<String>,
-
-    /// Optional local checkout of ohos-rs; when set, generated host crate uses path deps.
-    #[clap(long = "ohos-rs-dir")]
-    ohos_rs_dir: Option<Utf8PathBuf>,
-
-    /// Cargo target directory passed through to `ohrs build --target-dir`.
+    /// Cargo target directory for the generated OHOS host build.
     #[clap(long = "ohos-target-dir")]
     ohos_target_dir: Option<Utf8PathBuf>,
 
-    /// Additional cargo args passed to `ohrs build` after `--`.
+    /// Copy OHOS static `.a` libraries in addition to shared `.so` artifacts.
+    #[clap(long = "ohos-static")]
+    ohos_static: bool,
+
+    /// Skip copying OHOS native libraries; still generate TypeScript declarations.
+    #[clap(long = "ohos-skip-libs")]
+    ohos_skip_libs: bool,
+
+    /// Reuse the generated OHOS type definition cache.
+    #[clap(long = "ohos-dts-cache")]
+    ohos_dts_cache: bool,
+
+    /// Skip OHOS napi package version checks.
+    #[clap(long = "ohos-skip-check")]
+    ohos_skip_check: bool,
+
+    /// Use `cargo zigbuild` for OHOS host builds.
+    #[clap(long = "ohos-zigbuild")]
+    ohos_zigbuild: bool,
+
+    /// Use HarmonyOS BiSheng toolchain paths for OHOS host builds.
+    #[clap(long = "ohos-bisheng")]
+    ohos_bisheng: bool,
+
+    /// Package to build when the generated OHOS manifest is a workspace root.
+    #[clap(long = "ohos-package")]
+    ohos_package: Option<String>,
+
+    /// Skip the check that candidate OHOS packages depend on napi-derive-ohos.
+    #[clap(long = "ohos-skip-napi-check")]
+    ohos_skip_napi_check: bool,
+
+    /// SONAME linker value for the generated OHOS shared library.
+    #[clap(long = "ohos-soname")]
+    ohos_soname: Option<String>,
+
+    /// Additional cargo args passed to the OHOS host cargo build after `--`.
     #[clap(last = true)]
     ohos_cargo_args: Vec<String>,
 
@@ -485,7 +505,6 @@ impl BuildArgs {
             wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
             wasm_bindgen_target: self.wasm_bindgen_target,
             cargo_bin: self.cargo_bin.clone(),
-            wasm_bindgen_bin: self.resolve_wasm_bindgen_bin()?,
             release: self.release,
             no_format: self.no_format,
             config: self.config.clone(),
@@ -522,105 +541,23 @@ impl BuildArgs {
             dist_dir: self.ohos_dist_dir.clone(),
             arch: self.ohos_arch.clone(),
             cargo_bin: self.cargo_bin.clone(),
-            ohrs_bin: self.resolve_ohrs_bin()?,
-            ohos_rs_dir: self.ohos_rs_dir.clone(),
             target_dir: self.ohos_target_dir.clone(),
             release: self.release,
+            copy_static: self.ohos_static,
+            skip_libs: self.ohos_skip_libs,
+            dts_cache: self.ohos_dts_cache,
+            skip_check: self.ohos_skip_check,
+            zigbuild: self.ohos_zigbuild,
+            bisheng: self.ohos_bisheng,
+            package: self.ohos_package.clone(),
+            skip_napi_check: self.ohos_skip_napi_check,
+            soname: self.ohos_soname.clone(),
             no_format: self.no_format,
             config: self.config.clone(),
             crate_name: self.crate_name.clone(),
             metadata_no_deps: self.metadata_no_deps,
             cargo_args: self.ohos_cargo_args.clone(),
         })
-    }
-
-    fn resolve_ohrs_bin(&self) -> Result<String> {
-        if let Some(bin) = &self.ohrs_bin {
-            return Ok(bin.clone());
-        }
-        let Some(ohos_rs_dir) = &self.ohos_rs_dir else {
-            return Ok("ohrs".to_string());
-        };
-
-        let manifest = ohos_rs_dir.join("cli/cargo-ohrs/Cargo.toml");
-        if !manifest.exists() {
-            bail!(
-                "--ohos-rs-dir was provided, but {} does not exist",
-                manifest
-            );
-        }
-
-        let mut cargo = Command::new(&self.cargo_bin);
-        cargo
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(manifest.as_str())
-            .arg("--bin")
-            .arg("ohrs");
-        let rendered = format!("{cargo:?}");
-        let output = cargo.output().with_context(|| {
-            format!(
-                "spawning cargo to build ohrs from {}. Pass --ohrs-bin <path> to skip auto-build",
-                manifest
-            )
-        })?;
-        if !output.status.success() {
-            bail!(
-                "cargo command failed while building ohrs: {rendered}\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        let bin = ohos_rs_dir
-            .join("target/debug")
-            .join(if cfg!(target_os = "windows") {
-                "ohrs.exe"
-            } else {
-                "ohrs"
-            });
-        if !bin.exists() {
-            bail!("built ohrs binary not found at {}", bin);
-        }
-        Ok(bin.to_string())
-    }
-
-    fn resolve_wasm_bindgen_bin(&self) -> Result<String> {
-        if let Some(bin) = &self.wasm_bindgen_bin {
-            return Ok(bin.clone());
-        }
-        let Some(wasm_bindgen_dir) = &self.wasm_bindgen_dir else {
-            return Ok("wasm-bindgen".to_string());
-        };
-
-        let manifest = wasm_bindgen_dir.join("crates/cli/Cargo.toml");
-        if !manifest.exists() {
-            bail!(
-                "--wasm-bindgen-dir was provided, but {} does not exist",
-                manifest
-            );
-        }
-
-        let mut cargo = Command::new(&self.cargo_bin);
-        cargo
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(manifest.as_str())
-            .arg("--bin")
-            .arg("wasm-bindgen");
-        run_command(&self.cargo_bin, &mut cargo, "cargo")?;
-
-        let bin = wasm_bindgen_dir
-            .join("target/debug")
-            .join(if cfg!(target_os = "windows") {
-                "wasm-bindgen.exe"
-            } else {
-                "wasm-bindgen"
-            });
-        if !bin.exists() {
-            bail!("built wasm-bindgen binary not found at {}", bin);
-        }
-        Ok(bin.to_string())
     }
 }
 
@@ -1166,5 +1103,51 @@ mod tests {
     #[test]
     fn renders_android_manifest() {
         assert!(android_manifest("com.example.core").contains("package=\"com.example.core\""));
+    }
+
+    #[test]
+    fn artifacts_cli_no_longer_exposes_checkout_tool_flags() {
+        let artifacts_src = include_str!("artifacts.rs");
+        for forbidden in [
+            concat!("wasm-bindgen", "-dir"),
+            concat!("ohos-rs", "-dir"),
+            concat!("wasm-bindgen", "-bin"),
+            concat!("ohrs", "-bin"),
+            concat!("resolve_wasm", "_bindgen_bin"),
+            concat!("resolve_ohrs", "_bin"),
+        ] {
+            assert!(
+                !artifacts_src.contains(forbidden),
+                "artifact CLI source still exposes `{forbidden}`:\n{artifacts_src}"
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_build_defaults_to_embedded_tooling() {
+        let javascript_src = include_str!("javascript.rs");
+        for forbidden in [
+            concat!("default_value = \"wasm", "-bindgen\""),
+            concat!("default_value = \"o", "hrs\""),
+            concat!("wasm-bindgen", "-dir"),
+            concat!("ohos-rs", "-dir"),
+            concat!("wasm-bindgen", "-bin"),
+            concat!("ohrs", "-bin"),
+            concat!("install wasm", "-bindgen-cli"),
+            concat!("install ohos", "-rs"),
+        ] {
+            assert!(
+                !javascript_src.contains(forbidden),
+                "javascript CLI source still exposes default external tooling `{forbidden}`:\n{javascript_src}"
+            );
+        }
+        assert!(
+            javascript_src.contains("run_wasm_bindgen_in_process"),
+            "javascript build-wasm must use the built-in wasm-bindgen runner"
+        );
+        assert!(
+            javascript_src.contains("super::ohos::build"),
+            "javascript build-ohos must use the built-in OHOS builder"
+        );
     }
 }
