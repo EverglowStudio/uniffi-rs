@@ -4,6 +4,7 @@
 
 mod artifacts;
 mod javascript;
+mod ohos;
 mod swift;
 mod uniffi_bindgen;
 

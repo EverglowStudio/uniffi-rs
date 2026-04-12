@@ -9,6 +9,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use std::process::Command;
 use uniffi_bindgen::{cargo_metadata::CrateConfigSupplier, BindgenLoader, BindgenPaths};
 use uniffi_bindgen_javascript::{generate, FlavorTarget, GenerateJsOptions, HostCrateOptions};
+use wasm_bindgen_cli_support::Bindgen;
 
 #[derive(Args)]
 pub(crate) struct JavascriptArgs {
@@ -34,7 +35,7 @@ pub(crate) enum JavascriptCommands {
     /// Build JavaScript + N-API bindings, emit/build the napi host crate, and copy `.node` addons.
     BuildNapi(BuildNapiArgs),
 
-    /// Build JavaScript + Harmony/OpenHarmony bindings through ohos-rs Node-API.
+    /// Build JavaScript + Harmony/OpenHarmony bindings through OHOS Node-API.
     BuildOhos(BuildOhosArgs),
 }
 
@@ -80,10 +81,6 @@ pub(crate) struct BuildArgs {
     #[clap(long = "cargo-bin", default_value = "cargo")]
     cargo_bin: String,
 
-    /// Override the `wasm-bindgen` binary to invoke.
-    #[clap(long = "wasm-bindgen-bin", default_value = "wasm-bindgen")]
-    wasm_bindgen_bin: String,
-
     /// Cargo target directory for the generated N-API host build.
     #[clap(long = "target-dir")]
     target_dir: Option<Utf8PathBuf>,
@@ -120,7 +117,6 @@ impl BuildArgs {
             wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
             wasm_bindgen_target: self.wasm_bindgen_target,
             cargo_bin: self.cargo_bin.clone(),
-            wasm_bindgen_bin: self.wasm_bindgen_bin.clone(),
             release: self.release,
             no_format: self.no_format,
             config: self.config.clone(),
@@ -185,10 +181,6 @@ pub(crate) struct BuildWasmArgs {
     /// Override the `cargo` binary to invoke.
     #[clap(long = "cargo-bin", default_value = "cargo")]
     pub(crate) cargo_bin: String,
-
-    /// Override the `wasm-bindgen` binary to invoke.
-    #[clap(long = "wasm-bindgen-bin", default_value = "wasm-bindgen")]
-    pub(crate) wasm_bindgen_bin: String,
 
     /// Build the downstream core crate and generated wasm host crate in release mode.
     #[clap(long)]
@@ -292,11 +284,11 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     pub(crate) host_crates_dir: Utf8PathBuf,
 
-    /// Output directory passed to `ohrs build --dist`.
+    /// Output directory for built OHOS artifacts.
     #[clap(long = "dist-dir")]
     pub(crate) dist_dir: Option<Utf8PathBuf>,
 
-    /// OHOS architecture alias passed to `ohrs build --arch`. Defaults to `aarch` and `x64`.
+    /// OHOS architecture alias for the built-in OHOS builder. Defaults to `aarch` and `x64`.
     #[clap(long = "arch")]
     pub(crate) arch: Vec<String>,
 
@@ -304,17 +296,45 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "cargo-bin", default_value = "cargo")]
     pub(crate) cargo_bin: String,
 
-    /// Override the `ohrs` binary used to build the OHOS host crate.
-    #[clap(long = "ohrs-bin", default_value = "ohrs")]
-    pub(crate) ohrs_bin: String,
-
-    /// Optional local checkout of ohos-rs; when set, generated host crate uses path deps.
-    #[clap(long = "ohos-rs-dir")]
-    pub(crate) ohos_rs_dir: Option<Utf8PathBuf>,
-
-    /// Cargo target directory passed through to `ohrs build --target-dir`.
+    /// Cargo target directory for the generated OHOS host build.
     #[clap(long = "target-dir")]
     pub(crate) target_dir: Option<Utf8PathBuf>,
+
+    /// Copy static `.a` libraries in addition to shared `.so` artifacts.
+    #[clap(long = "static")]
+    pub(crate) copy_static: bool,
+
+    /// Skip copying native libraries; still generate TypeScript declarations.
+    #[clap(long = "skip-libs")]
+    pub(crate) skip_libs: bool,
+
+    /// Reuse the generated OHOS type definition cache.
+    #[clap(long = "dts-cache")]
+    pub(crate) dts_cache: bool,
+
+    /// Skip napi-ohos version checks.
+    #[clap(long = "skip-check")]
+    pub(crate) skip_check: bool,
+
+    /// Use `cargo zigbuild` for the generated OHOS host crate.
+    #[clap(long = "zigbuild")]
+    pub(crate) zigbuild: bool,
+
+    /// Use HarmonyOS BiSheng toolchain paths instead of OpenHarmony LLVM paths.
+    #[clap(long = "bisheng")]
+    pub(crate) bisheng: bool,
+
+    /// Package to build when the OHOS manifest is a workspace root.
+    #[clap(long = "package", short = 'p')]
+    pub(crate) package: Option<String>,
+
+    /// Skip the check that candidate packages depend on napi-derive-ohos.
+    #[clap(long = "skip-napi-check")]
+    pub(crate) skip_napi_check: bool,
+
+    /// SONAME linker value for the generated shared library.
+    #[clap(long = "soname")]
+    pub(crate) soname: Option<String>,
 
     /// Build the downstream core crate and generated OHOS host crate in release mode.
     #[clap(long)]
@@ -336,7 +356,7 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long)]
     pub(crate) metadata_no_deps: bool,
 
-    /// Additional cargo args passed to `ohrs build` after `--`.
+    /// Additional cargo args passed to the OHOS host cargo build after `--`.
     #[clap(last = true)]
     pub(crate) cargo_args: Vec<String>,
 }
@@ -366,16 +386,6 @@ pub(crate) enum WasmBindgenTargetArg {
 }
 
 impl WasmBindgenTargetArg {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Web => "web",
-            Self::Nodejs => "nodejs",
-            Self::Bundler => "bundler",
-            Self::NoModules => "no-modules",
-            Self::Deno => "deno",
-        }
-    }
-
     fn emits_web_auto_entrypoint(self) -> bool {
         matches!(self, Self::Web)
     }
@@ -533,18 +543,10 @@ pub(crate) fn build_wasm(args: BuildWasmArgs) -> Result<()> {
     std::fs::create_dir_all(&wasm_bindgen_out_dir)
         .with_context(|| format!("creating wasm-bindgen output dir {wasm_bindgen_out_dir}"))?;
 
-    let mut wasm_bindgen = Command::new(&args.wasm_bindgen_bin);
-    wasm_bindgen
-        .arg("--target")
-        .arg(args.wasm_bindgen_target.as_str())
-        .arg("--out-dir")
-        .arg(wasm_bindgen_out_dir.as_str())
-        .arg(wasm_artifact.as_str());
-    run_command(
-        &args.wasm_bindgen_bin,
-        &mut wasm_bindgen,
-        "wasm-bindgen",
-        "install wasm-bindgen-cli with `cargo install wasm-bindgen-cli` or pass --wasm-bindgen-bin <path>",
+    run_wasm_bindgen_in_process(
+        &wasm_artifact,
+        &wasm_bindgen_out_dir,
+        args.wasm_bindgen_target,
     )?;
 
     emit_browser_auto_entrypoint(
@@ -718,7 +720,7 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         Some(HostCrateOptions {
             manifest_path: manifest_path.clone(),
             host_crates_dir: args.host_crates_dir.clone(),
-            ohos_rs_dir: args.ohos_rs_dir.clone(),
+            ohos_rs_dir: None,
         }),
         vec![FlavorTarget::Harmony],
     )?;
@@ -750,28 +752,55 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         .dist_dir
         .clone()
         .unwrap_or_else(|| ohos_dir.join("dist"));
-    let mut ohrs = Command::new(&args.ohrs_bin);
-    ohrs.arg("build").arg("--dist").arg(dist_dir.as_str());
-    if args.release {
-        ohrs.arg("--release");
-    }
-    for arch in &arches {
-        ohrs.arg("--arch").arg(arch);
-    }
-    if let Some(target_dir) = &args.target_dir {
-        ohrs.arg("--target-dir").arg(target_dir.as_str());
-    }
-    if !args.cargo_args.is_empty() {
-        ohrs.arg("--").args(&args.cargo_args);
-    }
-    ohrs.current_dir(ohos_dir.as_std_path());
-    run_command(
-        &args.ohrs_bin,
-        &mut ohrs,
-        "ohrs",
-        "install ohos-rs `cargo-ohrs`, configure the Harmony/OpenHarmony SDK, or pass --ohrs-bin <path>",
-    )?;
+    super::ohos::build(super::ohos::BuildOptions {
+        cargo_bin: args.cargo_bin.clone(),
+        manifest_path: ohos_manifest,
+        dist_dir,
+        arches,
+        target_dir: args.target_dir.clone(),
+        release: args.release,
+        cargo_args: args.cargo_args,
+        copy_static: args.copy_static,
+        skip_libs: args.skip_libs,
+        dts_cache: args.dts_cache,
+        skip_check: args.skip_check,
+        zigbuild: args.zigbuild,
+        bisheng: args.bisheng,
+        package: args.package,
+        skip_napi_check: args.skip_napi_check,
+        soname: args.soname,
+    })?;
 
+    Ok(())
+}
+
+fn run_wasm_bindgen_in_process(
+    wasm_artifact: &Utf8Path,
+    out_dir: &Utf8Path,
+    target: WasmBindgenTargetArg,
+) -> Result<()> {
+    let mut bindgen = Bindgen::new();
+    match target {
+        WasmBindgenTargetArg::Web => {
+            bindgen.web(true)?;
+        }
+        WasmBindgenTargetArg::Nodejs => {
+            bindgen.nodejs(true)?;
+        }
+        WasmBindgenTargetArg::Bundler => {
+            bindgen.bundler(true)?;
+        }
+        WasmBindgenTargetArg::NoModules => {
+            bindgen.no_modules(true)?;
+        }
+        WasmBindgenTargetArg::Deno => {
+            bindgen.deno(true)?;
+        }
+    };
+    bindgen.input_path(wasm_artifact.as_std_path());
+    bindgen
+        .generate(out_dir.as_std_path())
+        .with_context(|| format!("running built-in wasm-bindgen for {wasm_artifact}"))?;
     Ok(())
 }
 
