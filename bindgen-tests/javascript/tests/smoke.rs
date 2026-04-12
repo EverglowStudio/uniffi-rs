@@ -3657,10 +3657,6 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     let out = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(out.path().join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(out.path().join("rust_modules")).unwrap();
-    let fake_ohos_rs = Utf8PathBuf::from_path_buf(out.path().join("ohos-rs")).unwrap();
-    for subdir in ["crates/napi", "crates/macro", "crates/build"] {
-        std::fs::create_dir_all(fake_ohos_rs.join(subdir)).unwrap();
-    }
     std::fs::create_dir_all(&out_dir).unwrap();
     let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");
     let manifest = workspace_root().join("examples/arithmetic/Cargo.toml");
@@ -3676,7 +3672,7 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
-                ohos_rs_dir: Some(fake_ohos_rs),
+                ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Harmony],
         },
@@ -3699,12 +3695,9 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     for required in [
         "name = \"uniffi-example-arithmetic-ohos\"",
         "name = \"arithmetic_ohos\"",
-        "napi-ohos = { path =",
-        "crates/napi",
-        "napi-derive-ohos = { path =",
-        "crates/macro",
-        "napi-build-ohos = { path =",
-        "crates/build",
+        "napi-ohos = { version = \"1.1.6\"",
+        "napi-derive-ohos = { version = \"1.1.6\"",
+        "napi-build-ohos = \"1.1.6\"",
         "features = [\"napi8\", \"tokio_rt\"]",
         "features = [\"type-def\"]",
         "[workspace]",
@@ -3712,6 +3705,12 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
         assert!(
             toml.contains(required),
             "OHOS Cargo.toml missing `{required}`:\n{toml}"
+        );
+    }
+    for forbidden in ["/Users/frain/Developer/refer/uni/ohos-rs", "ohos-rs/crates"] {
+        assert!(
+            !toml.contains(forbidden),
+            "default OHOS host crate must not use local ohos-rs path deps `{forbidden}`:\n{toml}"
         );
     }
     let build_rs = std::fs::read_to_string(host_dir.join("ohos/build.rs")).unwrap();
@@ -4007,13 +4006,6 @@ fn cli_build_wasm_orchestrates_arithmetic_fixture() {
         );
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!(
-            "SKIP cli_build_wasm_orchestrates_arithmetic_fixture: wasm-bindgen CLI not found"
-        );
-        return;
-    };
-
     let root = workspace_root();
     let cli = build_uniffi_bindgen_cli(&cargo);
     let tmp = tempfile::tempdir().unwrap();
@@ -4036,12 +4028,6 @@ fn cli_build_wasm_orchestrates_arithmetic_fixture() {
         .arg(host_dir.as_str())
         .arg("--wasm-bindgen-out-dir")
         .arg(pkg_dir.as_str())
-        .arg("--wasm-bindgen-bin")
-        .arg(
-            Utf8PathBuf::from_path_buf(wasm_bindgen.clone())
-                .unwrap()
-                .as_str(),
-        )
         .output()
         .expect("failed to invoke uniffi-bindgen javascript build-wasm");
     if !output.status.success() {
@@ -4099,11 +4085,6 @@ fn cli_build_orchestrates_full_javascript_tree() {
         );
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!("SKIP cli_build_orchestrates_full_javascript_tree: wasm-bindgen CLI not found");
-        return;
-    };
-
     let root = workspace_root();
     let cli = build_uniffi_bindgen_cli(&cargo);
     let tmp = tempfile::tempdir().unwrap();
@@ -4126,12 +4107,6 @@ fn cli_build_orchestrates_full_javascript_tree() {
         .arg(host_dir.as_str())
         .arg("--target-dir")
         .arg(target_dir.as_str())
-        .arg("--wasm-bindgen-bin")
-        .arg(
-            Utf8PathBuf::from_path_buf(wasm_bindgen.clone())
-                .unwrap()
-                .as_str(),
-        )
         .arg("--wasm-bindgen-target")
         .arg("nodejs")
         .output()
