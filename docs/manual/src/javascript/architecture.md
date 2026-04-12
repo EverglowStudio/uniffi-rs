@@ -41,10 +41,12 @@ flavors live in small helper modules:
   users do not need to maintain wrapper crates by hand.
 
 The wasm web auto-entrypoint is emitted by the `uniffi-bindgen javascript
-build-wasm` / `build` CLI orchestration after `wasm-bindgen` runs, not by the
-base `wasm` flavor generator. This keeps `browser/index.ts` target-agnostic and
-explicit while letting the CLI write target-specific imports for the final
-wasm-bindgen JS glue and `.wasm` asset names.
+build-wasm` / `build` CLI orchestration after the built-in wasm-bindgen runner
+finishes, not by the base `wasm` flavor generator. This keeps
+`browser/index.ts` target-agnostic and explicit while letting the CLI write
+target-specific imports for the final wasm-bindgen JS glue and `.wasm` asset
+names. The default path uses the `wasm-bindgen-cli-support` Rust API in-process;
+it does not require a `wasm-bindgen` binary on `PATH`.
 
 The Node/N-API adapter still installs synchronously on import. Its native addon
 loader first honors generated environment-variable overrides for packaging
@@ -55,9 +57,12 @@ The Harmony/OpenHarmony adapter is also Node-API based, but it targets the
 `ohos-rs` fork rather than ordinary napi-rs. It emits `harmony/` TypeScript
 that imports native exports from `lib<namespace>_ohos.so`, and a generated
 `rust_modules/ohos` host crate whose Rust bridge references `napi_ohos`,
-`napi_derive_ohos`, and `napi_build_ohos`. The `javascript build-ohos` CLI
-orchestrates `ohrs build`; normal Rust tests keep this path toolchain-gated so
-the OHOS SDK is not required for the rest of the target.
+`napi_derive_ohos`, and `napi_build_ohos`. The `javascript build-ohos` CLI uses
+UniFFI's built-in OHOS builder by default; it covers the common `ohrs build`
+controls for arch selection, target dir, static/skipped lib copy, package
+filtering, zigbuild/BiSheng, SONAME, d.ts cache, and trailing cargo args.
+Normal Rust tests keep the native link path toolchain-gated so the OHOS SDK is
+not required for the rest of the target.
 
 When adding a feature, prefer extending these helpers over copying equivalent
 logic into each flavor.
