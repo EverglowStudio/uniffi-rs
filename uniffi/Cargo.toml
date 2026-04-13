@@ -28,6 +28,8 @@ clap = { version = "4", default-features = false, features = [ "cargo", "derive"
 zip = { version = "0.6", default-features = false, features = ["deflate"], optional = true }
 wasm-bindgen-cli-support = { version = "=0.2.117", optional = true }
 serde_json = { version = "1", optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
 
 [dev-dependencies]
 trybuild = "1"
@@ -46,7 +48,7 @@ cargo-metadata = ["dep:cargo_metadata", "uniffi_bindgen?/cargo-metadata"]
 
 # Support for `uniffi_bindgen_main()`. Enable this feature for your
 # `uniffi-bindgen` binaries.
-cli = [ "bindgen", "dep:clap", "dep:camino", "dep:cargo_metadata", "dep:serde_json", "dep:uniffi_bindgen_javascript", "dep:wasm-bindgen-cli-support", "dep:zip" ]
+cli = [ "bindgen", "dep:clap", "dep:camino", "dep:cargo_metadata", "dep:serde_json", "dep:uniffi_bindgen_javascript", "dep:wasm-bindgen-cli-support", "dep:zip", "dep:flate2", "dep:tar" ]
 # Support for running example/fixture tests for `uniffi-bindgen`.  You probably
 # don't need to enable this.
 bindgen-tests = [ "dep:uniffi_bindgen", "uniffi_bindgen?/bindgen-tests" ]

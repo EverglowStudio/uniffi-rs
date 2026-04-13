@@ -278,7 +278,9 @@ When `--artifact-dir` is set:
 - wasm-bindgen output defaults to `<artifact-dir>/browser/pkg`
 - Node addons default to `<artifact-dir>/node/<namespace>.node`
 - Electron addons default to `<artifact-dir>/electron/<namespace>.node`
-- OHOS dist output defaults to `<artifact-dir>/ohos/dist`
+- Harmony/OpenHarmony dist output defaults to `<artifact-dir>/ohos/dist` (intermediate native output)
+- Harmony/OpenHarmony HAR staging defaults to `<artifact-dir>/ohos/package`
+- Harmony/OpenHarmony final HAR defaults to `<artifact-dir>/ohos/<package>.har`
 
 Generated source entrypoints contain relative default load paths back to those
 artifact locations, while environment override variables remain available for
@@ -393,16 +395,9 @@ imports the raw native module through the Harmony native module specifier:
 import * as native from "lib<namespace>_ohos.so";
 ```
 
-The consuming Harmony application is responsible for declaring that native
-module in its `oh-package.json5`, for example:
-
-```json5
-{
-  "dependencies": {
-    "lib<namespace>_ohos.so": "file:./src/main/lib<namespace>_ohos"
-  }
-}
-```
+`artifacts build --target harmony` now packages these native libraries and type
+definitions into a HAR by default. Consumers should depend on the generated HAR
+package instead of manually copying `.so` and `.d.ts` files.
 
 The generated OHOS host crate uses `ohos-rs` package names:
 
@@ -415,21 +410,26 @@ napi-build-ohos = "1.1.6"
 The CLI orchestration command is:
 
 ```text
-uniffi-bindgen javascript build-ohos \
+uniffi-bindgen artifacts build \
   --manifest-path <core Cargo.toml> \
   --out-dir <generated> \
-  --arch aarch \
-  --arch x64 \
+  --artifact-dir <artifact-root> \
+  --target harmony \
+  --ohos-arch aarch \
+  --ohos-arch x64 \
+  [--ohos-package-name <ohpm-name>] \
+  [--ohos-har-out <path/to/output.har>] \
+  [--ohos-no-har] \
   [--release] \
-  [--static] \
-  [--skip-libs] \
-  [--dts-cache] \
-  [--skip-check] \
-  [--zigbuild] \
-  [--bisheng] \
-  [--package <package>] \
-  [--skip-napi-check] \
-  [--soname <libname-or-libname.so>] \
+  [--ohos-static] \
+  [--ohos-skip-libs] \
+  [--ohos-dts-cache] \
+  [--ohos-skip-check] \
+  [--ohos-zigbuild] \
+  [--ohos-bisheng] \
+  [--ohos-package <package>] \
+  [--ohos-skip-napi-check] \
+  [--ohos-soname <libname-or-libname.so>] \
   [-- --no-default-features --features ohos]
 ```
 
@@ -441,10 +441,22 @@ list is `aarch` and `x64`, matching the common OHOS aliases for `arm64-v8a` and
 Rust OHOS target support. The built-in builder mirrors the common `ohrs build`
 controls for static library copying, skipped lib copy, d.ts cache reuse,
 zigbuild/BiSheng toolchain selection, package filtering, SONAME, and trailing
-cargo arguments. If the manifest is a workspace root with multiple
-OHOS-capable packages and no package filter is supplied, the builder emits each
-package under `<dist>/<package>/...`; single-package builds keep the
-`<dist>/<arch>/...` layout.
+cargo arguments.
+
+By default each selected OHOS package is staged to:
+
+- `package/oh-package.json5`
+- `package/index.ets`
+- `package/src/main/module.json5`
+- `package/libs/index.d.ts`
+- `package/libs/<arch>/lib<namespace>_ohos.so`
+
+and then archived to a `.har` with `tar + gzip` under `<artifact-root>/ohos`.
+The tar root directory is always `package/`. `--ohos-dist-dir` remains the
+intermediate native output directory and is not the final published artifact.
+When multiple OHOS packages are selected, UniFFI emits one HAR per package; if
+you need a single custom HAR name/path, pass `--ohos-package` to build one
+package explicitly.
 
 ## Versioning
 
