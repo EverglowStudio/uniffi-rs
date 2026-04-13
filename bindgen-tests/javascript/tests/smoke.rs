@@ -24,6 +24,12 @@ fn workspace_root() -> Utf8PathBuf {
     manifest.join("../..").canonicalize_utf8().unwrap()
 }
 
+fn contains_dynamic_type_word(source: &str) -> bool {
+    source
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word == "any" || word == "unknown")
+}
+
 fn generate_arithmetic(out_dir: &Utf8PathBuf) {
     let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");
     assert!(source.exists(), "fixture UDL missing: {source}");
@@ -3625,6 +3631,7 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
         "node/arithmetical.rs",
         "harmony/backend-ohos.ts",
         "harmony/index.ts",
+        "harmony/arithmetical.ohos-extra-types.d.ts",
         "harmony/arithmetical.rs",
     ] {
         let p = out_dir.join(name);
@@ -3655,6 +3662,10 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
     );
 
     let backend = std::fs::read_to_string(out_dir.join("harmony/backend-ohos.ts")).unwrap();
+    assert!(
+        !contains_dynamic_type_word(&backend),
+        "harmony backend must not emit ArkTS-hostile dynamic type words `any`/`unknown`:\n{backend}"
+    );
     for forbidden in ["node:module", "createRequire", "process.env", ".node"] {
         assert!(
             !backend.contains(forbidden),
@@ -3663,6 +3674,7 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
     }
     for required in [
         "import * as native from \"libarithmetic_ohos.so\"",
+        "type UniffiValue = UniffiPrimitive | object",
         "__uniffiNameMap",
         "__uniffiLowerShape",
         "__uniffiLiftShape",
@@ -3741,6 +3753,7 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     }
     let build_rs = std::fs::read_to_string(host_dir.join("ohos/build.rs")).unwrap();
     assert!(build_rs.contains("napi_build_ohos::setup"));
+    assert!(build_rs.contains("ohos-extra-types.d.ts"));
     let lib_rs = std::fs::read_to_string(host_dir.join("ohos/src/lib.rs")).unwrap();
     assert!(
         lib_rs.contains("include!(") && lib_rs.contains("harmony/arithmetical.rs"),
