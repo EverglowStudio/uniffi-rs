@@ -15,10 +15,20 @@ use uniffi_bindgen::Component;
 
 use crate::{AbiFlavor, JsConfig};
 
-pub fn emit(dir: &Utf8Path, flavor: AbiFlavor, component: &Component<JsConfig>) -> Result<()> {
+#[derive(Clone, Debug, Default)]
+pub struct FlavorEmitOptions {
+    pub default_addon_path: Option<String>,
+}
+
+pub fn emit(
+    dir: &Utf8Path,
+    flavor: AbiFlavor,
+    component: &Component<JsConfig>,
+    options: &FlavorEmitOptions,
+) -> Result<()> {
     match flavor {
         AbiFlavor::Wasm => wasm::emit(dir, component),
-        AbiFlavor::Napi => napi::emit(dir, component),
+        AbiFlavor::Napi => napi::emit(dir, component, options.default_addon_path.as_deref()),
         AbiFlavor::Ohos => napi::emit_ohos(dir, component),
     }
 }

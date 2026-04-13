@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use fs_err as fs;
 use uniffi_bindgen::{BindgenLoader, Component};
 
@@ -60,6 +60,10 @@ pub struct GenerateJsOptions {
     /// Output directory; the generator creates `common/` plus one
     /// subdirectory per requested flavor (`browser/`, `node/`, `electron/`).
     pub out_dir: Utf8PathBuf,
+    /// Optional directory used by artifact-building commands for non-source
+    /// outputs such as `.node` addons. When set, generated backend entrypoints
+    /// use this location as their default load path.
+    pub artifact_dir: Option<Utf8PathBuf>,
     /// Optional uniffi.toml override.
     pub config_override: Option<Utf8PathBuf>,
     /// Limit generation to a single crate.
@@ -166,12 +170,86 @@ fn emit_component(component: &Component<JsConfig>, options: &GenerateJsOptions) 
         };
         let dir = options.out_dir.join(subdir);
         fs::create_dir_all(&dir)?;
-        flavors::emit(&dir, target.abi(), component)?;
+        let addon_path = if matches!(target.abi(), AbiFlavor::Napi) {
+            default_addon_path(&dir, options.artifact_dir.as_deref(), subdir, component)?
+        } else {
+            None
+        };
+        flavors::emit(
+            &dir,
+            target.abi(),
+            component,
+            &flavors::FlavorEmitOptions {
+                default_addon_path: addon_path,
+            },
+        )?;
         if matches!(target, FlavorTarget::Electron) {
-            electron::emit(&dir, component)?;
+            electron::emit(
+                &dir,
+                component,
+                default_addon_path(&dir, options.artifact_dir.as_deref(), subdir, component)?
+                    .as_deref(),
+            )?;
         }
     }
     Ok(())
+}
+
+fn default_addon_path(
+    from_dir: &Utf8Path,
+    artifact_dir: Option<&Utf8Path>,
+    subdir: &str,
+    component: &Component<JsConfig>,
+) -> Result<Option<String>> {
+    let Some(artifact_dir) = artifact_dir else {
+        return Ok(None);
+    };
+    let addon = artifact_dir
+        .join(subdir)
+        .join(format!("{}.node", component.ci.namespace()));
+    Ok(Some(relative_module_specifier(from_dir, &addon)?))
+}
+
+fn relative_module_specifier(from_dir: &Utf8Path, to: &Utf8Path) -> Result<String> {
+    let from_abs = absolutize(from_dir)?;
+    let to_abs = absolutize(to)?;
+    let rel = relative_path_from_dir(&from_abs, &to_abs)
+        .to_string()
+        .replace('\\', "/");
+    let rel = if rel.is_empty() {
+        ".".to_string()
+    } else if rel.starts_with('.') {
+        rel
+    } else {
+        format!("./{rel}")
+    };
+    Ok(rel.replace('"', "\\\""))
+}
+
+fn absolutize(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+        .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?
+        .join(path))
+}
+
+fn relative_path_from_dir(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {
+    let from: Vec<&str> = from_dir.components().map(|c| c.as_str()).collect();
+    let to_vec: Vec<&str> = to.components().map(|c| c.as_str()).collect();
+    let mut i = 0;
+    while i < from.len() && i < to_vec.len() && from[i] == to_vec[i] {
+        i += 1;
+    }
+    let mut result = Utf8PathBuf::new();
+    for _ in i..from.len() {
+        result.push("..");
+    }
+    for c in &to_vec[i..] {
+        result.push(c);
+    }
+    result
 }
 
 /// Per-component config loaded from `uniffi.toml`.

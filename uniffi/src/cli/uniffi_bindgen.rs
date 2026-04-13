@@ -152,6 +152,12 @@ enum Commands {
         #[clap(long = "host-crates-dir")]
         host_crates_dir: Option<Utf8PathBuf>,
 
+        /// Directory used by generated JavaScript backend entrypoints as the
+        /// default location for built non-source artifacts such as `.node`
+        /// addons. Only meaningful with `--language javascript`.
+        #[clap(long = "artifact-dir")]
+        artifact_dir: Option<Utf8PathBuf>,
+
         /// Whether we should exclude dependencies when running "cargo metadata".
         /// This will mean external types may not be resolved if they are implemented in crates
         /// outside of this workspace.
@@ -265,6 +271,7 @@ pub fn run_main() -> anyhow::Result<()> {
             emit_host_crates,
             manifest_path,
             host_crates_dir,
+            artifact_dir,
             ..
         } => {
             if language.is_empty() {
@@ -325,6 +332,7 @@ pub fn run_main() -> anyhow::Result<()> {
                     GenerateJsOptions {
                         source,
                         out_dir,
+                        artifact_dir,
                         config_override: config,
                         crate_filter: crate_name,
                         metadata_no_deps,

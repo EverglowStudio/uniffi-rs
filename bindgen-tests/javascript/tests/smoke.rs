@@ -33,6 +33,7 @@ fn generate_arithmetic(out_dir: &Utf8PathBuf) {
         GenerateJsOptions {
             source,
             out_dir: out_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -97,6 +98,7 @@ namespace async_callback_return {
         GenerateJsOptions {
             source: Utf8PathBuf::from_path_buf(udl_path).unwrap(),
             out_dir: out_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -176,6 +178,21 @@ fn emits_real_tree_for_all_flavors() {
     assert!(
         pt.contains("./api.ts"),
         "public-types.ts should re-export free functions from api.ts"
+    );
+    assert!(
+        pt.contains("export interface ArithmeticModule"),
+        "public-types.ts should expose an explicit module API type:\n{pt}"
+    );
+    assert!(
+        pt.contains("add: typeof import(\"./api.ts\").add;")
+            && pt.contains("ArithmeticError: typeof import(\"./errors.ts\").ArithmeticError;")
+            && pt.contains("UniffiError: typeof import(\"./runtime.ts\").UniffiError;"),
+        "public-types.ts should describe runtime exports in the module API type:\n{pt}"
+    );
+    assert!(
+        pt.contains("export type ArithmeticApi = ArithmeticModule;")
+            && pt.contains("export type UniffiPublicApi = ArithmeticModule;"),
+        "public-types.ts should expose stable component-specific and generic API aliases:\n{pt}"
     );
     // No `bigint | number` in public contract.
     assert!(
@@ -511,6 +528,7 @@ crate-type = ["rlib"]
         GenerateJsOptions {
             source: udl_path,
             out_dir: gen_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -700,6 +718,7 @@ crate-type = ["rlib"]
         GenerateJsOptions {
             source: udl_path.clone(),
             out_dir: gen_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -2460,6 +2479,7 @@ fn custom_types_wasm_static_contract() {
         GenerateJsOptions {
             source: udl,
             out_dir: gen_dir.clone(),
+            artifact_dir: None,
             config_override: Some(config),
             crate_filter: None,
             metadata_no_deps: true,
@@ -2642,6 +2662,7 @@ crate-type = ["rlib"]
         GenerateJsOptions {
             source: udl_path.clone(),
             out_dir: gen_dir.clone(),
+            artifact_dir: None,
             config_override,
             crate_filter: None,
             metadata_no_deps: true,
@@ -2891,6 +2912,7 @@ crate-type = ["rlib"]
         GenerateJsOptions {
             source: udl_path,
             out_dir: gen_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -2999,6 +3021,7 @@ crate-type = ["rlib"]
         GenerateJsOptions {
             source: udl_path,
             out_dir: gen_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -3479,6 +3502,7 @@ fn generate_arithmetic_with_host_crates(out_dir: &Utf8PathBuf, host_crates_dir: 
         GenerateJsOptions {
             source,
             out_dir: out_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -3585,6 +3609,7 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
         GenerateJsOptions {
             source,
             out_dir: out_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -3666,6 +3691,7 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
         GenerateJsOptions {
             source,
             out_dir: out_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -3760,6 +3786,7 @@ fn generate_synthetic_with_host_crates(root: &std::path::Path) -> (Utf8PathBuf, 
         GenerateJsOptions {
             source: udl,
             out_dir: out_dir.clone(),
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -3893,6 +3920,7 @@ fn generate_synthetic_gated(root: &std::path::Path, flavors: Vec<FlavorTarget>) 
         GenerateJsOptions {
             source: udl,
             out_dir,
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -4090,6 +4118,7 @@ fn cli_build_orchestrates_full_javascript_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let artifact_dir = Utf8PathBuf::from_path_buf(tmp.path().join("artifacts")).unwrap();
     let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target-napi")).unwrap();
     let (manifest, source) = write_cli_wasm_fixture(tmp.path());
 
@@ -4105,6 +4134,8 @@ fn cli_build_orchestrates_full_javascript_tree() {
         .arg(out_dir.as_str())
         .arg("--host-crates-dir")
         .arg(host_dir.as_str())
+        .arg("--artifact-dir")
+        .arg(artifact_dir.as_str())
         .arg("--target-dir")
         .arg(target_dir.as_str())
         .arg("--wasm-bindgen-target")
@@ -4126,12 +4157,10 @@ fn cli_build_orchestrates_full_javascript_tree() {
         "browser/backend-wasm.ts",
         "node/index.ts",
         "node/backend-napi.ts",
-        "node/cli_wasm.node",
         "electron/index.ts",
         "electron/backend-napi.ts",
         "electron/preload.cjs",
         "electron/renderer.ts",
-        "electron/cli_wasm.node",
     ] {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing combined build artifact: {file}");
@@ -4139,8 +4168,24 @@ fn cli_build_orchestrates_full_javascript_tree() {
 
     assert!(host_dir.join("wasm/Cargo.toml").exists());
     assert!(host_dir.join("napi/Cargo.toml").exists());
+    assert!(
+        !out_dir.join("node/cli_wasm.node").exists(),
+        "--artifact-dir should keep node addon out of the generated source tree"
+    );
+    assert!(
+        !out_dir.join("electron/cli_wasm.node").exists(),
+        "--artifact-dir should keep electron addon out of the generated source tree"
+    );
+    assert!(
+        artifact_dir.join("node/cli_wasm.node").exists(),
+        "missing node addon in artifact dir"
+    );
+    assert!(
+        artifact_dir.join("electron/cli_wasm.node").exists(),
+        "missing electron addon in artifact dir"
+    );
 
-    let browser_pkg = out_dir.join("browser/pkg");
+    let browser_pkg = artifact_dir.join("browser/pkg");
     let pkg_entries = std::fs::read_dir(browser_pkg.as_std_path())
         .unwrap()
         .filter_map(|e| e.ok())
@@ -4158,11 +4203,26 @@ fn cli_build_orchestrates_full_javascript_tree() {
             .any(|p| p.extension().and_then(|e| e.to_str()) == Some("js")),
         "combined build should leave wasm-bindgen JS glue in browser/pkg: {pkg_entries:?}"
     );
+    assert!(
+        pkg_entries
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("ts")),
+        "combined build should leave wasm-bindgen TypeScript declarations in browser/pkg: {pkg_entries:?}"
+    );
 
     let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
     assert!(
         preload.contains("dispatchSync") && preload.contains("dispatchAsync"),
         "combined build electron preload should expose sync and async dispatch:\n{preload}"
+    );
+    assert!(
+        preload.contains("../artifacts/electron/cli_wasm.node"),
+        "preload should load the addon from --artifact-dir:\n{preload}"
+    );
+    let node_backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    assert!(
+        node_backend.contains("../artifacts/node/cli_wasm.node"),
+        "node backend should load the addon from --artifact-dir:\n{node_backend}"
     );
 
     let Some(node) = locate_node_with_strip_types() else {
@@ -4219,7 +4279,7 @@ async function expectThrown(label: string, call: () => unknown): Promise<void> {
     throw new Error(`${label}: expected an error`);
 }
 
-const glue = require("./browser/pkg/__WASM_GLUE__");
+const glue = require("__WASM_PKG__/__WASM_GLUE__");
 const browser = await import("./browser/index.ts");
 await browser.initBackend(glue);
 assertEq(browser.add(2n, 3n), 5n, "browser.add");
@@ -4264,6 +4324,10 @@ await expectThrown("electron.sub underflow", () => electronApi.sub(1n, 2n));
 
 console.log("combined build runtime ok");
 "#
+    .replace(
+        "__WASM_PKG__",
+        &artifact_dir.join("browser/pkg").to_string().replace('\\', "/"),
+    )
     .replace("__WASM_GLUE__", &wasm_glue_js);
     let driver_path = out_dir.join("combined-build-driver.ts");
     std::fs::write(driver_path.as_std_path(), driver).unwrap();
@@ -4511,6 +4575,7 @@ fn generate_rich_napi_host(root: &std::path::Path) -> Utf8PathBuf {
         GenerateJsOptions {
             source: udl,
             out_dir,
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -4725,6 +4790,7 @@ fn generate_callback_return_napi_host(root: &std::path::Path) -> Utf8PathBuf {
         GenerateJsOptions {
             source: udl,
             out_dir,
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -4819,6 +4885,7 @@ fn generate_async_callback_napi_host(root: &std::path::Path) -> Utf8PathBuf {
         GenerateJsOptions {
             source: udl,
             out_dir,
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -4939,6 +5006,7 @@ fn generate_fallible_async_callback_napi_host(root: &std::path::Path) -> Utf8Pat
         GenerateJsOptions {
             source: udl,
             out_dir,
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -5094,6 +5162,7 @@ fn generate_temporal_napi_host(root: &std::path::Path) -> Utf8PathBuf {
         GenerateJsOptions {
             source: udl,
             out_dir,
+            artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
@@ -5329,6 +5398,7 @@ fn generate_custom_napi_tree(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBu
         GenerateJsOptions {
             source: udl,
             out_dir: out_dir.clone(),
+            artifact_dir: None,
             config_override: Some(config),
             crate_filter: None,
             metadata_no_deps: true,
