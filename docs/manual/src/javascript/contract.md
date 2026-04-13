@@ -286,6 +286,102 @@ Generated source entrypoints contain relative default load paths back to those
 artifact locations, while environment override variables remain available for
 advanced packaging layouts.
 
+## Managed package layout
+
+`artifacts build` also supports an opt-in package-oriented layout:
+
+```bash
+uniffi-bindgen artifacts build \
+  --manifest-path crates/my-core/Cargo.toml \
+  --target wasm \
+  --target node \
+  --managed-layout \
+  --package-dir .
+```
+
+Managed mode derives these paths from `--package-dir`:
+
+- generated source: `src/generated/uniffi`
+- build artifacts: `target/uniffi-artifacts/js`
+- generated host crates: `target/uniffi-artifacts/rust`
+- manifest: `artifact-manifest.json`
+- web entrypoint: `src/index.web.ts` when `--target wasm` is requested
+- node entrypoint: `src/index.node.ts` when `--target node` is requested
+
+The generated package entrypoints are thin re-export facades:
+
+```ts
+// src/index.web.ts
+export * from "./generated/uniffi/browser/index.web.ts";
+export type * from "./generated/uniffi/common/public-types.ts";
+
+// src/index.node.ts
+export * from "./generated/uniffi/node/index.ts";
+export type * from "./generated/uniffi/common/public-types.ts";
+```
+
+The web happy path becomes:
+
+```ts
+import { ready, welcomeAgent } from "./src/index.web.ts";
+
+await ready;
+console.log(welcomeAgent("Ada"));
+```
+
+The node happy path becomes:
+
+```ts
+import { welcomeAgent } from "./src/index.node.ts";
+
+console.log(welcomeAgent("Ada"));
+```
+
+Managed mode emits deterministic `artifact-manifest.json` for build tools. The
+manifest is metadata, not the public runtime API:
+
+```json
+{
+  "schemaVersion": 1,
+  "generator": "uniffi-bindgen-javascript",
+  "namespace": "my_core",
+  "targets": ["wasm", "node"],
+  "source": {
+    "root": "src/generated/uniffi",
+    "publicTypes": "src/generated/uniffi/common/public-types.ts"
+  },
+  "entrypoints": {
+    "web": "src/index.web.ts",
+    "node": "src/index.node.ts",
+    "electron": null,
+    "harmony": null
+  },
+  "artifacts": {
+    "wasm": {
+      "glue": "target/uniffi-artifacts/js/browser/pkg/my_core_wasm.js",
+      "wasm": "target/uniffi-artifacts/js/browser/pkg/my_core_wasm_bg.wasm",
+      "dts": "target/uniffi-artifacts/js/browser/pkg/my_core_wasm.d.ts"
+    },
+    "node": {
+      "addon": "target/uniffi-artifacts/js/node/my_core.node",
+      "env": "UNIFFI_MY_CORE_NAPI_PATH"
+    },
+    "electron": null,
+    "harmony": null
+  },
+  "hostCrates": {
+    "wasm": "target/uniffi-artifacts/rust/wasm/Cargo.toml",
+    "napi": "target/uniffi-artifacts/rust/napi/Cargo.toml",
+    "ohos": null
+  }
+}
+```
+
+When `--target harmony` is requested, the manifest's `artifacts.harmony.har`
+points at the generated HAR, for example
+`target/uniffi-artifacts/js/ohos/my-core-ohos.har`. Managed mode does not
+generate package.json exports or npm publishing metadata.
+
 ## Electron preload ↔ renderer message shape
 
 `contextBridge.exposeInMainWorld("__uniffi__", ...)` exposes a single bridge:
