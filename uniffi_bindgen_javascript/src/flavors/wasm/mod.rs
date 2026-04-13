@@ -63,11 +63,24 @@ pub fn emit(dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()> {
     let ns = ci.namespace();
 
     let rust_source = codegen::render_wasm_rust(ci);
-    fs::write(dir.join(format!("{}.rs", ci.crate_name())), rust_source)?;
+    fs::write(
+        dir.join(format!("{}.rs", ci.crate_name())),
+        normalize_generated_text(rust_source),
+    )?;
 
     fs::write(dir.join("backend-wasm.ts"), render_backend(ns))?;
     fs::write(dir.join("index.ts"), render_index(ns))?;
     Ok(())
+}
+
+fn normalize_generated_text(mut text: String) -> String {
+    while text.ends_with("\n\n") {
+        text.pop();
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 
 fn render_backend(namespace: &str) -> String {
