@@ -65,6 +65,10 @@ pub(crate) struct BuildArgs {
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     host_crates_dir: Utf8PathBuf,
 
+    /// Directory for built non-source artifacts such as wasm-bindgen pkg and `.node` addons.
+    #[clap(long = "artifact-dir")]
+    artifact_dir: Option<Utf8PathBuf>,
+
     /// Where to write the wasm-bindgen output tree. Defaults to `<out-dir>/browser/pkg`.
     #[clap(long = "wasm-bindgen-out-dir")]
     wasm_bindgen_out_dir: Option<Utf8PathBuf>,
@@ -114,6 +118,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir.clone(),
+            artifact_dir: self.artifact_dir.clone(),
             wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
             wasm_bindgen_target: self.wasm_bindgen_target,
             cargo_bin: self.cargo_bin.clone(),
@@ -132,6 +137,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir.clone(),
+            artifact_dir: self.artifact_dir.clone(),
             flavor: self.napi_flavor.clone(),
             cargo_bin: self.cargo_bin.clone(),
             target_dir: self.target_dir.clone(),
@@ -169,6 +175,10 @@ pub(crate) struct BuildWasmArgs {
     /// Directory (default `rust_modules`) in which to emit the generated wasm host crate.
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     pub(crate) host_crates_dir: Utf8PathBuf,
+
+    /// Directory for built non-source artifacts. Defaults to `<out-dir>/browser/pkg` for wasm-bindgen output when omitted.
+    #[clap(long = "artifact-dir")]
+    pub(crate) artifact_dir: Option<Utf8PathBuf>,
 
     /// Where to write the wasm-bindgen output tree. Defaults to `<out-dir>/browser/pkg`.
     #[clap(long = "wasm-bindgen-out-dir")]
@@ -229,6 +239,10 @@ pub(crate) struct BuildNapiArgs {
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     pub(crate) host_crates_dir: Utf8PathBuf,
 
+    /// Directory for built non-source artifacts. Defaults to copying `.node` addons next to generated backend files when omitted.
+    #[clap(long = "artifact-dir")]
+    pub(crate) artifact_dir: Option<Utf8PathBuf>,
+
     /// N-API consumption form(s) to emit. Defaults to both node and electron.
     #[clap(long = "flavor", value_enum)]
     pub(crate) flavor: Vec<NapiBuildFlavorArg>,
@@ -283,6 +297,10 @@ pub(crate) struct BuildOhosArgs {
     /// Directory (default `rust_modules`) in which to emit the generated OHOS host crate.
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     pub(crate) host_crates_dir: Utf8PathBuf,
+
+    /// Directory for built non-source artifacts. Defaults to `<host-crate>/dist` for OHOS output when omitted.
+    #[clap(long = "artifact-dir")]
+    pub(crate) artifact_dir: Option<Utf8PathBuf>,
 
     /// Output directory for built OHOS artifacts.
     #[clap(long = "dist-dir")]
@@ -410,6 +428,7 @@ pub(crate) fn generate_js(
     no_format: bool,
     host_crates: Option<HostCrateOptions>,
     flavors: Vec<FlavorTarget>,
+    artifact_dir: Option<Utf8PathBuf>,
 ) -> Result<()> {
     let mut paths = BindgenPaths::default();
     if let Some(cfg) = config.clone() {
@@ -430,6 +449,7 @@ pub(crate) fn generate_js(
         GenerateJsOptions {
             source,
             out_dir,
+            artifact_dir,
             config_override: config,
             crate_filter: crate_name,
             metadata_no_deps,
@@ -494,6 +514,7 @@ pub(crate) fn build_wasm(args: BuildWasmArgs) -> Result<()> {
             ohos_rs_dir: None,
         }),
         vec![FlavorTarget::Wasm],
+        args.artifact_dir.clone(),
     )?;
 
     let host_root = if args.host_crates_dir.is_absolute() {
@@ -539,6 +560,11 @@ pub(crate) fn build_wasm(args: BuildWasmArgs) -> Result<()> {
     let wasm_bindgen_out_dir = args
         .wasm_bindgen_out_dir
         .clone()
+        .or_else(|| {
+            args.artifact_dir
+                .as_ref()
+                .map(|dir| dir.join("browser/pkg"))
+        })
         .unwrap_or_else(|| args.out_dir.join("browser/pkg"));
     std::fs::create_dir_all(&wasm_bindgen_out_dir)
         .with_context(|| format!("creating wasm-bindgen output dir {wasm_bindgen_out_dir}"))?;
@@ -613,6 +639,7 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
             ohos_rs_dir: None,
         }),
         flavors.clone(),
+        args.artifact_dir.clone(),
     )?;
 
     let host_root = if args.host_crates_dir.is_absolute() {
@@ -669,9 +696,14 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
             .with_context(|| format!("finding generated Rust bridge in {flavor_dir}"))?;
         let addon_stem = generated_addon_stem(&flavor_dir)
             .with_context(|| format!("finding generated addon name in {flavor_dir}"))?;
-        let addon_path = flavor_dir.join(format!("{addon_stem}.node"));
-        std::fs::create_dir_all(&flavor_dir)
-            .with_context(|| format!("creating addon output dir {flavor_dir}"))?;
+        let addon_dir = args
+            .artifact_dir
+            .as_ref()
+            .map(|dir| dir.join(subdir))
+            .unwrap_or_else(|| flavor_dir.clone());
+        let addon_path = addon_dir.join(format!("{addon_stem}.node"));
+        std::fs::create_dir_all(&addon_dir)
+            .with_context(|| format!("creating addon output dir {addon_dir}"))?;
         std::fs::copy(&napi_artifact, &addon_path)
             .with_context(|| format!("copying built napi addon {napi_artifact} to {addon_path}"))?;
     }
@@ -723,6 +755,7 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
             ohos_rs_dir: None,
         }),
         vec![FlavorTarget::Harmony],
+        args.artifact_dir.clone(),
     )?;
 
     let host_root = if args.host_crates_dir.is_absolute() {
@@ -751,6 +784,7 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     let dist_dir = args
         .dist_dir
         .clone()
+        .or_else(|| args.artifact_dir.as_ref().map(|dir| dir.join("ohos/dist")))
         .unwrap_or_else(|| ohos_dir.join("dist"));
     super::ohos::build(super::ohos::BuildOptions {
         cargo_bin: args.cargo_bin.clone(),
@@ -798,6 +832,7 @@ fn run_wasm_bindgen_in_process(
         }
     };
     bindgen.input_path(wasm_artifact.as_std_path());
+    bindgen.typescript(true);
     bindgen
         .generate(out_dir.as_std_path())
         .with_context(|| format!("running built-in wasm-bindgen for {wasm_artifact}"))?;

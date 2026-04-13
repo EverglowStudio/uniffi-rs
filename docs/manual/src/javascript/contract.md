@@ -42,11 +42,23 @@ surface:
 - re-exports object classes
 - re-exports free functions from `api.ts`
 - re-exports `UniffiError` from `runtime.ts`
+- declares a component module type named `<Namespace>Module`, with
+  `<Namespace>Api` and `UniffiPublicApi` aliases
 
 Shared UI/application code should prefer this file over handwritten parallel
 `types.ts` files.
 
 All `i64`/`u64` values are represented as `bigint` in this public surface.
+
+Example:
+
+```ts
+import type { UniCoreModule, Email } from "./generated/common/public-types.ts";
+
+export function render(core: UniCoreModule, email: Email) {
+  return core.normalizeEmail(email);
+}
+```
 
 ## Naming rules
 
@@ -244,6 +256,33 @@ import * as core from "./generated/electron/renderer";
 // or
 import * as core from "./generated/harmony";
 ```
+
+## Built artifact directory
+
+The source tree emitted under `--out-dir` should contain TypeScript and Rust
+shim sources only. Build products should be written to `--artifact-dir`:
+
+```bash
+uniffi-bindgen artifacts build \
+  --manifest-path crates/my-core/Cargo.toml \
+  --out-dir crates/my-core/generated/js \
+  --host-crates-dir target/uniffi-artifacts/rust \
+  --artifact-dir target/uniffi-artifacts/js \
+  --target wasm \
+  --target node \
+  --target electron
+```
+
+When `--artifact-dir` is set:
+
+- wasm-bindgen output defaults to `<artifact-dir>/browser/pkg`
+- Node addons default to `<artifact-dir>/node/<namespace>.node`
+- Electron addons default to `<artifact-dir>/electron/<namespace>.node`
+- OHOS dist output defaults to `<artifact-dir>/ohos/dist`
+
+Generated source entrypoints contain relative default load paths back to those
+artifact locations, while environment override variables remain available for
+advanced packaging layouts.
 
 ## Electron preload ↔ renderer message shape
 
