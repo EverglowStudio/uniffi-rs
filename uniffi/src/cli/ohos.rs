@@ -1108,10 +1108,10 @@ fn collect_type_defs(path: &Utf8Path, defs: &mut Vec<TypeDefLine>) -> Result<()>
         }
         return Ok(());
     }
-    let Some(ext) = path.extension() else {
-        return Ok(());
-    };
-    if ext != "d.ts" && ext != "ts" {
+    if path
+        .extension()
+        .is_some_and(|ext| ext != "d.ts" && ext != "ts")
+    {
         return Ok(());
     }
     let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
@@ -1537,6 +1537,25 @@ mod tests {
     }
 
     #[test]
+    fn collects_extensionless_ohos_type_def_files() {
+        let root = temp_test_dir("uniffi-ohos-type-defs");
+        std::fs::write(
+            root.join("uni-core-ohos"),
+            r#"{"kind":"fn","name":"welcomeAgent","def":"function welcomeAgent(agentName: string): string","js_doc":null,"js_mod":null}"#,
+        )
+        .unwrap();
+
+        let mut defs = Vec::new();
+        collect_type_defs(&root, &mut defs).unwrap();
+        let rendered = render_index_d_ts(defs);
+
+        assert!(
+            rendered.contains("export declare function welcomeAgent(agentName: string): string")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn renders_har_package_metadata_and_entry_templates() {
         let package_json = render_oh_package_json5("@ohos-rs/ada", "0.1.2");
         assert!(package_json.contains("\"name\": \"@ohos-rs/ada\""));
@@ -1601,7 +1620,8 @@ mod tests {
         let file = std::fs::File::open(&har).unwrap();
         let decoder = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(decoder);
-        let mut saw_required = false;
+        let mut saw_package_json = false;
+        let mut saw_module_json5 = false;
         for entry in archive.entries().unwrap() {
             let entry = entry.unwrap();
             let path = entry.path().unwrap().to_string_lossy().to_string();
@@ -1615,10 +1635,20 @@ mod tests {
                 "entry must be rooted at package/: {path}"
             );
             if path == "package/oh-package.json5" {
-                saw_required = true;
+                saw_package_json = true;
+            }
+            if path == "package/src/main/module.json5" {
+                saw_module_json5 = true;
             }
         }
-        assert!(saw_required, "HAR must contain package/oh-package.json5");
+        assert!(
+            saw_package_json,
+            "HAR must contain package/oh-package.json5"
+        );
+        assert!(
+            saw_module_json5,
+            "HAR must contain package/src/main/module.json5"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
