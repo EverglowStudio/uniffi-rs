@@ -52,6 +52,10 @@ pub(crate) struct BuildArgs {
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     host_crates_dir: Utf8PathBuf,
 
+    /// Directory for built non-source artifacts such as wasm-bindgen pkg, `.node` addons, and OHOS dist output.
+    #[clap(long = "artifact-dir")]
+    artifact_dir: Option<Utf8PathBuf>,
+
     /// Build downstream core and generated host crates in release mode.
     #[clap(long)]
     release: bool,
@@ -502,6 +506,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir.clone(),
+            artifact_dir: self.artifact_dir.clone(),
             wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
             wasm_bindgen_target: self.wasm_bindgen_target,
             cargo_bin: self.cargo_bin.clone(),
@@ -520,6 +525,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir.clone(),
+            artifact_dir: self.artifact_dir.clone(),
             flavor,
             cargo_bin: self.cargo_bin.clone(),
             target_dir: self.napi_target_dir.clone(),
@@ -538,6 +544,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir.clone(),
+            artifact_dir: self.artifact_dir.clone(),
             dist_dir: self.ohos_dist_dir.clone(),
             arch: self.ohos_arch.clone(),
             cargo_bin: self.cargo_bin.clone(),
