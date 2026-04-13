@@ -302,9 +302,21 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "artifact-dir")]
     pub(crate) artifact_dir: Option<Utf8PathBuf>,
 
-    /// Output directory for built OHOS artifacts.
+    /// Output directory for built OHOS dist artifacts (intermediate native output).
     #[clap(long = "dist-dir")]
     pub(crate) dist_dir: Option<Utf8PathBuf>,
+
+    /// OHPM package name for generated HAR metadata (supports scoped names like `@scope/name`).
+    #[clap(long = "package-name")]
+    pub(crate) package_name: Option<String>,
+
+    /// Output `.har` path. Defaults to `<artifact-root>/<package>.har`.
+    #[clap(long = "har-out")]
+    pub(crate) har_out: Option<Utf8PathBuf>,
+
+    /// Skip final HAR packaging and keep only `dist/` intermediate outputs.
+    #[clap(long = "no-har")]
+    pub(crate) no_har: bool,
 
     /// OHOS architecture alias for the built-in OHOS builder. Defaults to `aarch` and `x64`.
     #[clap(long = "arch")]
@@ -790,6 +802,9 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         cargo_bin: args.cargo_bin.clone(),
         manifest_path: ohos_manifest,
         dist_dir,
+        package_name: args.package_name,
+        har_out: args.har_out,
+        no_har: args.no_har,
         arches,
         target_dir: args.target_dir.clone(),
         release: args.release,
