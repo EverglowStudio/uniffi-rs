@@ -32,9 +32,9 @@ pub(crate) struct BuildArgs {
     #[clap(long = "manifest-path")]
     manifest_path: Utf8PathBuf,
 
-    /// Directory in which to write generated files.
+    /// Directory in which to write generated files. Required unless --managed-layout is used.
     #[clap(long, short)]
-    out_dir: Utf8PathBuf,
+    out_dir: Option<Utf8PathBuf>,
 
     /// Artifact target(s) to build. P0/P1 supports wasm, node, electron, and harmony.
     #[clap(long = "target", value_enum)]
@@ -48,13 +48,21 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     source: Option<Utf8PathBuf>,
 
-    /// Directory (default `rust_modules`) in which to emit generated host crates.
-    #[clap(long = "host-crates-dir", default_value = "rust_modules")]
-    host_crates_dir: Utf8PathBuf,
+    /// Directory (default `rust_modules`, or `<package-dir>/target/uniffi-artifacts/rust` in managed mode) in which to emit generated host crates.
+    #[clap(long = "host-crates-dir")]
+    host_crates_dir: Option<Utf8PathBuf>,
 
     /// Directory for built non-source artifacts such as wasm-bindgen pkg, `.node` addons, and OHOS dist output.
     #[clap(long = "artifact-dir")]
     artifact_dir: Option<Utf8PathBuf>,
+
+    /// Opt in to a package-oriented JavaScript layout rooted at --package-dir.
+    #[clap(long = "managed-layout")]
+    managed_layout: bool,
+
+    /// Package root used by --managed-layout. Defaults to the current working directory.
+    #[clap(long = "package-dir")]
+    package_dir: Option<Utf8PathBuf>,
 
     /// Build downstream core and generated host crates in release mode.
     #[clap(long)]
@@ -224,14 +232,264 @@ struct ExpandedTargets {
     android: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ManagedLayout {
+    package_dir: Utf8PathBuf,
+    source_root: Utf8PathBuf,
+    artifact_root: Utf8PathBuf,
+    host_crates_root: Utf8PathBuf,
+    manifest_path: Utf8PathBuf,
+}
+
+impl ManagedLayout {
+    fn apply(args: &mut BuildArgs, targets: &ExpandedTargets) -> Result<Option<Self>> {
+        if !args.managed_layout {
+            if args.package_dir.is_some() {
+                bail!("--package-dir requires --managed-layout");
+            }
+            if args.out_dir.is_none() {
+                bail!("--out-dir <dir> is required unless --managed-layout is used");
+            }
+            return Ok(None);
+        }
+        if targets.apple || targets.android {
+            bail!("--managed-layout currently supports JavaScript targets only");
+        }
+        if args.out_dir.is_some() {
+            bail!("--managed-layout derives --out-dir; omit --out-dir");
+        }
+        if args.host_crates_dir.is_some() {
+            bail!("--managed-layout derives --host-crates-dir; omit --host-crates-dir");
+        }
+        if args.artifact_dir.is_some() {
+            bail!("--managed-layout derives --artifact-dir; omit --artifact-dir");
+        }
+        if args.wasm_bindgen_out_dir.is_some() {
+            bail!("--managed-layout derives --wasm-bindgen-out-dir; omit --wasm-bindgen-out-dir");
+        }
+        if args.ohos_dist_dir.is_some() {
+            bail!("--managed-layout derives --ohos-dist-dir; omit --ohos-dist-dir");
+        }
+        if args.ohos_har_out.is_some() {
+            bail!("--managed-layout derives --ohos-har-out; omit --ohos-har-out");
+        }
+
+        let package_dir = args
+            .package_dir
+            .clone()
+            .unwrap_or_else(|| Utf8PathBuf::from("."));
+        let package_dir = resolve_cwd_path(&package_dir)?;
+        let source_root = package_dir.join("src/generated/uniffi");
+        let artifact_root = package_dir.join("target/uniffi-artifacts/js");
+        let host_crates_root = package_dir.join("target/uniffi-artifacts/rust");
+        let manifest_path = package_dir.join("artifact-manifest.json");
+
+        args.out_dir = Some(source_root.clone());
+        args.host_crates_dir = Some(host_crates_root.clone());
+        args.artifact_dir = Some(artifact_root.clone());
+
+        Ok(Some(Self {
+            package_dir,
+            source_root,
+            artifact_root,
+            host_crates_root,
+            manifest_path,
+        }))
+    }
+
+    fn emit(
+        &self,
+        targets: &ExpandedTargets,
+        meta: &CargoPackageMetadata,
+        args: &BuildArgs,
+    ) -> Result<()> {
+        if targets.wasm {
+            self.emit_web_entrypoint()?;
+        }
+        if targets.node {
+            self.emit_node_entrypoint()?;
+        }
+        self.emit_manifest(targets, meta, args)?;
+        Ok(())
+    }
+
+    fn emit_web_entrypoint(&self) -> Result<()> {
+        let entrypoint = self.package_dir.join("src/index.web.ts");
+        self.write_entrypoint(
+            &entrypoint,
+            &self.source_root.join("browser/index.web.ts"),
+            &self.source_root.join("common/public-types.ts"),
+            "web",
+        )
+    }
+
+    fn emit_node_entrypoint(&self) -> Result<()> {
+        let entrypoint = self.package_dir.join("src/index.node.ts");
+        self.write_entrypoint(
+            &entrypoint,
+            &self.source_root.join("node/index.ts"),
+            &self.source_root.join("common/public-types.ts"),
+            "node",
+        )
+    }
+
+    fn write_entrypoint(
+        &self,
+        entrypoint: &Utf8Path,
+        runtime_entry: &Utf8Path,
+        public_types: &Utf8Path,
+        label: &str,
+    ) -> Result<()> {
+        let parent = entrypoint
+            .parent()
+            .with_context(|| format!("managed {label} entrypoint has no parent: {entrypoint}"))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating managed {label} entrypoint dir {parent}"))?;
+        let runtime_spec = module_specifier(parent, runtime_entry)?;
+        let public_types_spec = module_specifier(parent, public_types)?;
+        let source = format!(
+            "// AUTOGENERATED by uniffi_bindgen_javascript (managed {label} entrypoint).\n\
+             // Do not edit by hand.\n\
+             \n\
+             export * from \"{runtime_spec}\";\n\
+             export type * from \"{public_types_spec}\";\n",
+        );
+        std::fs::write(entrypoint, source)
+            .with_context(|| format!("writing managed {label} entrypoint {entrypoint}"))?;
+        Ok(())
+    }
+
+    fn emit_manifest(
+        &self,
+        targets: &ExpandedTargets,
+        meta: &CargoPackageMetadata,
+        args: &BuildArgs,
+    ) -> Result<()> {
+        let namespace = &meta.lib_target_name;
+        let wasm_stem = format!("{}_wasm", rust_identifier(&meta.package_name));
+        let node_env = format!("UNIFFI_{}_NAPI_PATH", namespace.to_ascii_uppercase());
+        let harmony_package = args
+            .ohos_package_name
+            .clone()
+            .unwrap_or_else(|| format!("{}-ohos", meta.package_name));
+        let manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "generator": "uniffi-bindgen-javascript",
+            "namespace": namespace,
+            "targets": self.manifest_targets(targets),
+            "source": {
+                "root": self.rel(&self.source_root)?,
+                "common": self.rel(&self.source_root.join("common"))?,
+                "browser": if targets.wasm { serde_json::Value::String(self.rel(&self.source_root.join("browser"))?) } else { serde_json::Value::Null },
+                "node": if targets.node { serde_json::Value::String(self.rel(&self.source_root.join("node"))?) } else { serde_json::Value::Null },
+                "electron": if targets.electron { serde_json::Value::String(self.rel(&self.source_root.join("electron"))?) } else { serde_json::Value::Null },
+                "harmony": if targets.harmony { serde_json::Value::String(self.rel(&self.source_root.join("harmony"))?) } else { serde_json::Value::Null },
+                "publicTypes": self.rel(&self.source_root.join("common/public-types.ts"))?,
+            },
+            "entrypoints": {
+                "web": if targets.wasm { serde_json::Value::String("src/index.web.ts".to_string()) } else { serde_json::Value::Null },
+                "node": if targets.node { serde_json::Value::String("src/index.node.ts".to_string()) } else { serde_json::Value::Null },
+                "electron": serde_json::Value::Null,
+                "harmony": serde_json::Value::Null,
+            },
+            "artifacts": {
+                "wasm": if targets.wasm {
+                    serde_json::json!({
+                        "glue": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}.js")))?,
+                        "wasm": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}_bg.wasm")))?,
+                        "dts": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}.d.ts")))?,
+                    })
+                } else { serde_json::Value::Null },
+                "node": if targets.node {
+                    serde_json::json!({
+                        "addon": self.addon_rel("node", namespace)?,
+                        "env": node_env,
+                    })
+                } else { serde_json::Value::Null },
+                "electron": if targets.electron {
+                    serde_json::json!({
+                        "addon": self.addon_rel("electron", namespace)?,
+                        "env": node_env,
+                    })
+                } else { serde_json::Value::Null },
+                "harmony": if targets.harmony {
+                    serde_json::json!({
+                        "har": self.rel(&self.artifact_root.join(format!("ohos/{harmony_package}.har")))?,
+                        "dist": self.rel(&self.artifact_root.join("ohos/dist"))?,
+                        "package": self.rel(&self.artifact_root.join("ohos/package"))?,
+                    })
+                } else { serde_json::Value::Null },
+            },
+            "hostCrates": {
+                "wasm": if targets.wasm { serde_json::Value::String(self.rel(&self.host_crates_root.join("wasm/Cargo.toml"))?) } else { serde_json::Value::Null },
+                "napi": if targets.node || targets.electron { serde_json::Value::String(self.rel(&self.host_crates_root.join("napi/Cargo.toml"))?) } else { serde_json::Value::Null },
+                "ohos": if targets.harmony { serde_json::Value::String(self.rel(&self.host_crates_root.join("ohos/Cargo.toml"))?) } else { serde_json::Value::Null },
+            },
+        });
+        let text = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(&self.manifest_path, format!("{text}\n"))
+            .with_context(|| format!("writing managed artifact manifest {}", self.manifest_path))?;
+        Ok(())
+    }
+
+    fn manifest_targets(&self, targets: &ExpandedTargets) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if targets.wasm {
+            out.push("wasm");
+        }
+        if targets.node {
+            out.push("node");
+        }
+        if targets.electron {
+            out.push("electron");
+        }
+        if targets.harmony {
+            out.push("harmony");
+        }
+        out
+    }
+
+    fn rel(&self, path: &Utf8Path) -> Result<String> {
+        let rel = relative_path_from_dir(&self.package_dir, path)
+            .to_string()
+            .replace('\\', "/");
+        if rel.starts_with('/') || rel.contains(':') {
+            bail!("managed manifest path must be relative: {rel}");
+        }
+        Ok(if rel.is_empty() { ".".to_string() } else { rel })
+    }
+
+    fn addon_rel(&self, subdir: &str, fallback_stem: &str) -> Result<String> {
+        let dir = self.artifact_root.join(subdir);
+        if dir.exists() {
+            let mut nodes = Vec::new();
+            for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {dir}"))? {
+                let entry = entry?;
+                let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|p| {
+                    anyhow::anyhow!("managed addon artifact path is not utf8: {}", p.display())
+                })?;
+                if path.extension() == Some("node") {
+                    nodes.push(path);
+                }
+            }
+            nodes.sort();
+            if let [path] = nodes.as_slice() {
+                return self.rel(path);
+            }
+        }
+        self.rel(&dir.join(format!("{fallback_stem}.node")))
+    }
+}
+
 pub(crate) fn run(args: ArtifactsArgs) -> Result<()> {
     match args.command {
         ArtifactsCommands::Build(args) => build(args),
     }
 }
 
-fn build(args: BuildArgs) -> Result<()> {
+fn build(mut args: BuildArgs) -> Result<()> {
     let targets = expand_targets(&args.target)?;
+    let managed_layout = ManagedLayout::apply(&mut args, &targets)?;
 
     if targets.apple {
         build_apple(&args).context("building Apple artifact target")?;
@@ -252,11 +510,18 @@ fn build(args: BuildArgs) -> Result<()> {
         napi_flavors.push(NapiBuildFlavorArg::Electron);
     }
     if !napi_flavors.is_empty() {
-        build_napi(args.to_napi_args(napi_flavors)).context("building N-API artifact target")?;
+        build_napi(args.to_napi_args(napi_flavors)?).context("building N-API artifact target")?;
     }
 
     if targets.harmony {
         build_ohos(args.to_ohos_args()?).context("building Harmony/OpenHarmony artifact target")?;
+    }
+
+    if let Some(layout) = managed_layout {
+        let meta = cargo_package_metadata(&args.manifest_path)?;
+        layout
+            .emit(&targets, &meta, &args)
+            .context("emitting managed JavaScript layout")?;
     }
 
     Ok(())
@@ -335,7 +600,8 @@ fn build_android(args: &BuildArgs) -> Result<()> {
         );
     }
 
-    let kotlin_bindings_dir = args.out_dir.join("kotlin");
+    let out_dir = args.out_dir()?;
+    let kotlin_bindings_dir = out_dir.join("kotlin");
     std::fs::create_dir_all(&kotlin_bindings_dir)
         .with_context(|| format!("creating Kotlin output dir {kotlin_bindings_dir}"))?;
     let kotlin_config = android_kotlin_config(args)?;
@@ -360,7 +626,7 @@ fn build_android(args: &BuildArgs) -> Result<()> {
             .unwrap_or_else(|| format!("uniffi.{}", meta.lib_target_name));
         create_android_aar(
             aar_out,
-            &args.out_dir.join("android/aar-root"),
+            &out_dir.join("android/aar-root"),
             &jni_libs_out,
             &kotlin_bindings_dir,
             &package_name,
@@ -421,7 +687,8 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
         );
     }
 
-    let swift_bindings_dir = args.out_dir.join("swift");
+    let out_dir = args.out_dir()?;
+    let swift_bindings_dir = out_dir.join("swift");
     std::fs::create_dir_all(&swift_bindings_dir)
         .with_context(|| format!("creating Swift output dir {swift_bindings_dir}"))?;
     generate(GenerateOptions {
@@ -434,7 +701,7 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
         format: !args.no_format,
     })?;
 
-    let headers_dir = args.out_dir.join("apple/headers");
+    let headers_dir = out_dir.join("apple/headers");
     stage_swift_headers(&swift_bindings_dir, &headers_dir)?;
 
     if let Some(swift_out) = &args.apple_swift_out {
@@ -511,13 +778,25 @@ fn expand_targets(targets: &[ArtifactTargetArg]) -> Result<ExpandedTargets> {
 }
 
 impl BuildArgs {
+    fn out_dir(&self) -> Result<Utf8PathBuf> {
+        self.out_dir.clone().ok_or_else(|| {
+            anyhow::anyhow!("--out-dir <dir> is required unless --managed-layout is used")
+        })
+    }
+
+    fn host_crates_dir(&self) -> Utf8PathBuf {
+        self.host_crates_dir
+            .clone()
+            .unwrap_or_else(|| Utf8PathBuf::from("rust_modules"))
+    }
+
     fn to_wasm_args(&self) -> Result<BuildWasmArgs> {
         Ok(BuildWasmArgs {
             manifest_path: self.manifest_path.clone(),
-            out_dir: self.out_dir.clone(),
+            out_dir: self.out_dir()?,
             library_path: self.library_path.clone(),
             source: self.source.clone(),
-            host_crates_dir: self.host_crates_dir.clone(),
+            host_crates_dir: self.host_crates_dir(),
             artifact_dir: self.artifact_dir.clone(),
             wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
             wasm_bindgen_target: self.wasm_bindgen_target,
@@ -530,13 +809,13 @@ impl BuildArgs {
         })
     }
 
-    fn to_napi_args(&self, flavor: Vec<NapiBuildFlavorArg>) -> BuildNapiArgs {
-        BuildNapiArgs {
+    fn to_napi_args(&self, flavor: Vec<NapiBuildFlavorArg>) -> Result<BuildNapiArgs> {
+        Ok(BuildNapiArgs {
             manifest_path: self.manifest_path.clone(),
-            out_dir: self.out_dir.clone(),
+            out_dir: self.out_dir()?,
             library_path: self.library_path.clone(),
             source: self.source.clone(),
-            host_crates_dir: self.host_crates_dir.clone(),
+            host_crates_dir: self.host_crates_dir(),
             artifact_dir: self.artifact_dir.clone(),
             flavor,
             cargo_bin: self.cargo_bin.clone(),
@@ -546,16 +825,16 @@ impl BuildArgs {
             config: self.config.clone(),
             crate_name: self.crate_name.clone(),
             metadata_no_deps: self.metadata_no_deps,
-        }
+        })
     }
 
     fn to_ohos_args(&self) -> Result<BuildOhosArgs> {
         Ok(BuildOhosArgs {
             manifest_path: self.manifest_path.clone(),
-            out_dir: self.out_dir.clone(),
+            out_dir: self.out_dir()?,
             library_path: self.library_path.clone(),
             source: self.source.clone(),
-            host_crates_dir: self.host_crates_dir.clone(),
+            host_crates_dir: self.host_crates_dir(),
             artifact_dir: self.artifact_dir.clone(),
             dist_dir: self.ohos_dist_dir.clone(),
             package_name: self.ohos_package_name.clone(),
@@ -663,9 +942,51 @@ fn run_command(binary: &str, command: &mut Command, tool_name: &str) -> Result<(
     Ok(())
 }
 
+fn resolve_cwd_path(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+            .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?
+            .join(path))
+    }
+}
+
+fn module_specifier(from_dir: &Utf8Path, to: &Utf8Path) -> Result<String> {
+    let rel = relative_path_from_dir(from_dir, to)
+        .to_string()
+        .replace('\\', "/");
+    let rel = if rel.is_empty() {
+        ".".to_string()
+    } else if rel.starts_with('.') {
+        rel
+    } else {
+        format!("./{rel}")
+    };
+    Ok(rel.replace('"', "\\\""))
+}
+
+fn relative_path_from_dir(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {
+    let from: Vec<&str> = from_dir.components().map(|c| c.as_str()).collect();
+    let to_vec: Vec<&str> = to.components().map(|c| c.as_str()).collect();
+    let mut i = 0;
+    while i < from.len() && i < to_vec.len() && from[i] == to_vec[i] {
+        i += 1;
+    }
+    let mut result = Utf8PathBuf::new();
+    for _ in i..from.len() {
+        result.push("..");
+    }
+    for c in &to_vec[i..] {
+        result.push(c);
+    }
+    result
+}
+
 #[derive(Debug)]
 struct CargoPackageMetadata {
     target_directory: Utf8PathBuf,
+    package_name: String,
     lib_target_name: String,
 }
 
@@ -698,6 +1019,7 @@ fn cargo_package_metadata(manifest_path: &Utf8Path) -> Result<CargoPackageMetada
             metadata.target_directory.clone().into_std_path_buf(),
         )
         .map_err(|p| anyhow::anyhow!("cargo metadata target dir is not utf8: {}", p.display()))?,
+        package_name: package.name.to_string(),
         lib_target_name: lib_target.name.clone(),
     })
 }
@@ -716,6 +1038,10 @@ fn host_cdylib_filename(lib_target_name: &str) -> String {
     } else {
         format!("lib{lib_target_name}.so")
     }
+}
+
+fn rust_identifier(package_name: &str) -> String {
+    package_name.replace('-', "_")
 }
 
 fn apple_staticlib_path(meta: &CargoPackageMetadata, target: &str, profile: &str) -> Utf8PathBuf {
@@ -878,7 +1204,7 @@ fn android_kotlin_config(args: &BuildArgs) -> Result<Option<Utf8PathBuf>> {
     let Some(package_name) = &args.android_package_name else {
         return Ok(None);
     };
-    let dir = args.out_dir.join("android");
+    let dir = args.out_dir()?.join("android");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating Android generated config dir {dir}"))?;
     let path = dir.join("uniffi-kotlin.toml");
@@ -995,6 +1321,67 @@ fn add_dir_to_zip<W: Write + Seek>(
 mod tests {
     use super::*;
 
+    fn empty_build_args() -> BuildArgs {
+        BuildArgs {
+            manifest_path: Utf8PathBuf::from("/repo/crates/core/Cargo.toml"),
+            out_dir: Some(Utf8PathBuf::from("/repo/generated")),
+            target: vec![ArtifactTargetArg::Wasm],
+            library_path: None,
+            source: None,
+            host_crates_dir: None,
+            artifact_dir: None,
+            managed_layout: false,
+            package_dir: None,
+            release: false,
+            cargo_bin: "cargo".to_string(),
+            no_format: false,
+            config: None,
+            crate_name: None,
+            metadata_no_deps: false,
+            wasm_bindgen_out_dir: None,
+            wasm_bindgen_target: WasmBindgenTargetArg::Web,
+            napi_target_dir: None,
+            ohos_dist_dir: None,
+            ohos_package_name: None,
+            ohos_har_out: None,
+            ohos_no_har: false,
+            ohos_arch: Vec::new(),
+            ohos_target_dir: None,
+            ohos_static: false,
+            ohos_skip_libs: false,
+            ohos_dts_cache: false,
+            ohos_skip_check: false,
+            ohos_zigbuild: false,
+            ohos_bisheng: false,
+            ohos_package: None,
+            ohos_skip_napi_check: false,
+            ohos_soname: None,
+            ohos_cargo_args: Vec::new(),
+            apple_target: Vec::new(),
+            apple_xcframework_out: None,
+            apple_swift_out: None,
+            apple_framework_name: None,
+            android_abi: Vec::new(),
+            android_api: 23,
+            android_ndk_home: None,
+            android_jni_libs_out: None,
+            android_kotlin_out: None,
+            android_package_name: None,
+            android_aar_out: None,
+        }
+    }
+
+    fn unique_tmp_dir(name: &str) -> Utf8PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("uniffi-{name}-{}-{nanos}", std::process::id())),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn expands_all_js_targets() {
         assert_eq!(
@@ -1046,9 +1433,103 @@ mod tests {
     }
 
     #[test]
+    fn managed_layout_derives_package_paths() {
+        let mut args = empty_build_args();
+        let package_dir = unique_tmp_dir("managed-layout-derive");
+        args.managed_layout = true;
+        args.package_dir = Some(package_dir.clone());
+        args.out_dir = None;
+        args.target = vec![ArtifactTargetArg::Wasm, ArtifactTargetArg::Node];
+
+        let targets = expand_targets(&args.target).unwrap();
+        let layout = ManagedLayout::apply(&mut args, &targets)
+            .unwrap()
+            .expect("managed layout should resolve");
+
+        assert_eq!(
+            args.out_dir.unwrap(),
+            package_dir.join("src/generated/uniffi")
+        );
+        assert_eq!(
+            args.host_crates_dir.unwrap(),
+            package_dir.join("target/uniffi-artifacts/rust")
+        );
+        assert_eq!(
+            args.artifact_dir.unwrap(),
+            package_dir.join("target/uniffi-artifacts/js")
+        );
+        assert_eq!(
+            layout.manifest_path,
+            package_dir.join("artifact-manifest.json")
+        );
+    }
+
+    #[test]
+    fn managed_layout_emits_entries_and_relative_manifest() {
+        let mut args = empty_build_args();
+        let package_dir = unique_tmp_dir("managed-layout-manifest");
+        args.managed_layout = true;
+        args.package_dir = Some(package_dir.clone());
+        args.out_dir = None;
+        args.target = vec![
+            ArtifactTargetArg::Wasm,
+            ArtifactTargetArg::Node,
+            ArtifactTargetArg::Harmony,
+        ];
+
+        let targets = expand_targets(&args.target).unwrap();
+        let layout = ManagedLayout::apply(&mut args, &targets)
+            .unwrap()
+            .expect("managed layout should resolve");
+        let meta = CargoPackageMetadata {
+            target_directory: package_dir.join("target"),
+            package_name: "uni-core".to_string(),
+            lib_target_name: "uni_core".to_string(),
+        };
+        layout.emit(&targets, &meta, &args).unwrap();
+
+        let web = std::fs::read_to_string(package_dir.join("src/index.web.ts")).unwrap();
+        assert!(web.contains("export * from \"./generated/uniffi/browser/index.web.ts\";"));
+        assert!(web.contains("export type * from \"./generated/uniffi/common/public-types.ts\";"));
+
+        let node = std::fs::read_to_string(package_dir.join("src/index.node.ts")).unwrap();
+        assert!(node.contains("export * from \"./generated/uniffi/node/index.ts\";"));
+        assert!(node.contains("export type * from \"./generated/uniffi/common/public-types.ts\";"));
+
+        let manifest_text =
+            std::fs::read_to_string(package_dir.join("artifact-manifest.json")).unwrap();
+        assert!(
+            !manifest_text.contains(package_dir.as_str()),
+            "manifest must not contain absolute package paths:\n{manifest_text}"
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+        assert_eq!(manifest["schemaVersion"], 1);
+        assert_eq!(manifest["namespace"], "uni_core");
+        assert_eq!(
+            manifest["targets"],
+            serde_json::json!(["wasm", "node", "harmony"])
+        );
+        assert_eq!(
+            manifest["artifacts"]["wasm"]["glue"],
+            "target/uniffi-artifacts/js/browser/pkg/uni_core_wasm.js"
+        );
+        assert_eq!(
+            manifest["artifacts"]["harmony"]["har"],
+            "target/uniffi-artifacts/js/ohos/uni-core-ohos.har"
+        );
+        assert_eq!(
+            manifest["hostCrates"]["ohos"],
+            "target/uniffi-artifacts/rust/ohos/Cargo.toml"
+        );
+
+        let _ = std::fs::remove_dir_all(package_dir.as_std_path());
+    }
+
+    #[test]
     fn computes_apple_staticlib_path() {
         let meta = CargoPackageMetadata {
             target_directory: Utf8PathBuf::from("/repo/target"),
+            package_name: "uni-core".to_string(),
             lib_target_name: "uni_core".to_string(),
         };
         assert_eq!(
@@ -1114,6 +1595,7 @@ mod tests {
     fn computes_android_sharedlib_path() {
         let meta = CargoPackageMetadata {
             target_directory: Utf8PathBuf::from("/repo/target"),
+            package_name: "uni-core".to_string(),
             lib_target_name: "uni_core".to_string(),
         };
         assert_eq!(

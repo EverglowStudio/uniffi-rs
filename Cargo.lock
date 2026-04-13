@@ -1886,6 +1886,7 @@ version = "0.31.0"
 dependencies = [
  "anyhow",
  "camino",
+ "serde_json",
  "tempfile",
  "uniffi_bindgen",
  "uniffi_bindgen_javascript",

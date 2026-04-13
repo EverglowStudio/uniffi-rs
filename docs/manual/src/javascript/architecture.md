@@ -53,6 +53,17 @@ loader first honors generated environment-variable overrides for packaging
 scenarios, then falls back to the copied `./<namespace>.node` addon produced by
 `uniffi-bindgen javascript build-napi`.
 
+Managed layout is implemented in the artifact CLI layer rather than in each
+flavor. `uniffi-bindgen artifacts build --managed-layout --package-dir <dir>`
+derives `src/generated/uniffi`, `target/uniffi-artifacts/js`,
+`target/uniffi-artifacts/rust`, package-level `src/index.web.ts` /
+`src/index.node.ts` facades, and `artifact-manifest.json`. This keeps flavor
+emitters focused on backend contracts while the CLI, which already coordinates
+source generation, host crates, and built artifacts, owns package-level paths.
+The managed entrypoints are re-export-only facades, so the benchmark smoke
+compares them against direct generated entrypoints to guard against accidental
+wrapper overhead.
+
 The Harmony/OpenHarmony adapter is also Node-API based, but it targets the
 `ohos-rs` fork rather than ordinary napi-rs. It emits `harmony/` TypeScript
 that imports native exports from `lib<namespace>_ohos.so`, and a generated
