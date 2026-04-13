@@ -61,8 +61,11 @@ that imports native exports from `lib<namespace>_ohos.so`, and a generated
 UniFFI's built-in OHOS builder by default; it covers the common `ohrs build`
 controls for arch selection, target dir, static/skipped lib copy, package
 filtering, zigbuild/BiSheng, SONAME, d.ts cache, and trailing cargo args.
-Normal Rust tests keep the native link path toolchain-gated so the OHOS SDK is
-not required for the rest of the target.
+After building native libraries into `dist/` (intermediate output), the
+artifacts pipeline stages a minimal OHPM package tree and emits a final `.har`
+archive (`tar + gzip`, tar root `package/`) by default. Normal Rust tests keep
+the native link path toolchain-gated so the OHOS SDK is not required for the
+rest of the target.
 
 When adding a feature, prefer extending these helpers over copying equivalent
 logic into each flavor.

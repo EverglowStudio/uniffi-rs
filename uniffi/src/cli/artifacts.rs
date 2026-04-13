@@ -92,9 +92,21 @@ pub(crate) struct BuildArgs {
     #[clap(long = "napi-target-dir")]
     napi_target_dir: Option<Utf8PathBuf>,
 
-    /// Output directory for built OHOS artifacts.
+    /// Output directory for built OHOS dist artifacts (intermediate native output).
     #[clap(long = "ohos-dist-dir")]
     ohos_dist_dir: Option<Utf8PathBuf>,
+
+    /// OHPM package name for generated HAR metadata (supports scoped names like `@scope/name`).
+    #[clap(long = "ohos-package-name")]
+    ohos_package_name: Option<String>,
+
+    /// Output `.har` path. Defaults to `<artifact-root>/<package>.har`.
+    #[clap(long = "ohos-har-out")]
+    ohos_har_out: Option<Utf8PathBuf>,
+
+    /// Skip final HAR packaging and keep only `dist/` intermediate outputs.
+    #[clap(long = "ohos-no-har")]
+    ohos_no_har: bool,
 
     /// OHOS architecture alias for the built-in OHOS builder. Defaults to `aarch` and `x64`.
     #[clap(long = "ohos-arch")]
@@ -546,6 +558,9 @@ impl BuildArgs {
             host_crates_dir: self.host_crates_dir.clone(),
             artifact_dir: self.artifact_dir.clone(),
             dist_dir: self.ohos_dist_dir.clone(),
+            package_name: self.ohos_package_name.clone(),
+            har_out: self.ohos_har_out.clone(),
+            no_har: self.ohos_no_har,
             arch: self.ohos_arch.clone(),
             cargo_bin: self.cargo_bin.clone(),
             target_dir: self.ohos_target_dir.clone(),
@@ -1156,5 +1171,32 @@ mod tests {
             javascript_src.contains("super::ohos::build"),
             "javascript build-ohos must use the built-in OHOS builder"
         );
+    }
+
+    #[test]
+    fn artifacts_cli_wires_harmony_har_options() {
+        let artifacts_src = include_str!("artifacts.rs");
+        for required in [
+            concat!("ohos-package", "-name"),
+            concat!("ohos-har", "-out"),
+            concat!("ohos-no", "-har"),
+        ] {
+            assert!(
+                artifacts_src.contains(required),
+                "artifact CLI source missing harmony HAR option `{required}`:\n{artifacts_src}"
+            );
+        }
+
+        let javascript_src = include_str!("javascript.rs");
+        for required in [
+            concat!("package", "-name"),
+            concat!("har", "-out"),
+            concat!("no", "-har"),
+        ] {
+            assert!(
+                javascript_src.contains(required),
+                "javascript build-ohos source missing HAR option `{required}`:\n{javascript_src}"
+            );
+        }
     }
 }
