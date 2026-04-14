@@ -515,10 +515,38 @@ node_modules/\n\
                 "ohos": if targets.harmony { serde_json::Value::String(self.rel(&self.host_crates_root.join("ohos/Cargo.toml"))?) } else { serde_json::Value::Null },
             },
         });
+        let manifest = self.merge_existing_manifest(manifest)?;
         let text = serde_json::to_string_pretty(&manifest)?;
         std::fs::write(&self.manifest_path, format!("{text}\n"))
             .with_context(|| format!("writing managed artifact manifest {}", self.manifest_path))?;
         Ok(())
+    }
+
+    fn merge_existing_manifest(
+        &self,
+        mut manifest: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        if !self.manifest_path.exists() {
+            return Ok(manifest);
+        }
+
+        let existing_text = std::fs::read_to_string(&self.manifest_path)
+            .with_context(|| format!("reading managed artifact manifest {}", self.manifest_path))?;
+        let existing: serde_json::Value = serde_json::from_str(&existing_text)
+            .with_context(|| format!("parsing managed artifact manifest {}", self.manifest_path))?;
+
+        let compatible = existing.get("schemaVersion") == manifest.get("schemaVersion")
+            && existing.get("generator") == manifest.get("generator")
+            && existing.get("namespace") == manifest.get("namespace");
+        if !compatible {
+            return Ok(manifest);
+        }
+
+        merge_manifest_targets(&mut manifest, &existing);
+        for key in ["source", "entrypoints", "artifacts", "hostCrates"] {
+            merge_manifest_object_section(&mut manifest, &existing, key);
+        }
+        Ok(manifest)
     }
 
     fn has_js(&self, targets: &ExpandedTargets) -> bool {
@@ -580,6 +608,61 @@ node_modules/\n\
     }
 }
 
+fn merge_manifest_targets(manifest: &mut serde_json::Value, existing: &serde_json::Value) {
+    let mut present = std::collections::BTreeSet::new();
+    for value in existing
+        .get("targets")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .chain(
+            manifest
+                .get("targets")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten(),
+        )
+    {
+        if let Some(target) = value.as_str() {
+            present.insert(target.to_string());
+        }
+    }
+
+    let targets = ["wasm", "node", "electron", "harmony", "apple", "android"]
+        .into_iter()
+        .filter(|target| present.contains(*target))
+        .map(serde_json::Value::from)
+        .collect();
+    manifest["targets"] = serde_json::Value::Array(targets);
+}
+
+fn merge_manifest_object_section(
+    manifest: &mut serde_json::Value,
+    existing: &serde_json::Value,
+    key: &str,
+) {
+    let Some(current) = manifest
+        .get_mut(key)
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    let Some(previous) = existing.get(key).and_then(|value| value.as_object()) else {
+        return;
+    };
+
+    for (field, previous_value) in previous {
+        if current
+            .get(field)
+            .map(|value| !value.is_null())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        current.insert(field.clone(), previous_value.clone());
+    }
+}
+
 pub(crate) fn run(args: ArtifactsArgs) -> Result<()> {
     match args.command {
         ArtifactsCommands::Build(args) => build(args),
@@ -620,7 +703,7 @@ fn build(mut args: BuildArgs) -> Result<()> {
         let meta = cargo_package_metadata(&args.manifest_path)?;
         layout
             .emit(&targets, &meta, &args)
-            .context("emitting managed JavaScript layout")?;
+            .context("emitting managed artifact layout")?;
     }
 
     Ok(())
@@ -1691,6 +1774,69 @@ name = "uni_core"
         assert_eq!(
             manifest["hostCrates"]["ohos"],
             "artifacts/rust/ohos/Cargo.toml"
+        );
+
+        let _ = std::fs::remove_dir_all(package_dir.as_std_path());
+    }
+
+    #[test]
+    fn managed_manifest_merges_incremental_target_runs() {
+        let package_dir = unique_tmp_dir("managed-layout-merge");
+        let meta = CargoPackageMetadata {
+            target_directory: package_dir.join("target"),
+            package_name: "uni-core".to_string(),
+            lib_target_name: "uni_core".to_string(),
+        };
+
+        let mut js_args = empty_build_args();
+        js_args.manifest_path = write_test_manifest(&package_dir);
+        js_args.managed_layout = true;
+        js_args.package_dir = Some(package_dir.clone());
+        js_args.out_dir = None;
+        js_args.target = vec![ArtifactTargetArg::Wasm, ArtifactTargetArg::Node];
+        let js_targets = expand_targets(&js_args.target).unwrap();
+        let js_layout = ManagedLayout::apply(&mut js_args, &js_targets)
+            .unwrap()
+            .expect("managed layout should resolve");
+        js_layout.emit(&js_targets, &meta, &js_args).unwrap();
+
+        let mut apple_args = empty_build_args();
+        apple_args.manifest_path = package_dir.join("Cargo.toml");
+        apple_args.managed_layout = true;
+        apple_args.package_dir = Some(package_dir.clone());
+        apple_args.out_dir = None;
+        apple_args.target = vec![ArtifactTargetArg::Apple];
+        let apple_targets = expand_targets(&apple_args.target).unwrap();
+        let apple_layout = ManagedLayout::apply(&mut apple_args, &apple_targets)
+            .unwrap()
+            .expect("managed layout should resolve");
+        apple_layout
+            .emit(&apple_targets, &meta, &apple_args)
+            .unwrap();
+
+        let manifest_text =
+            std::fs::read_to_string(package_dir.join("artifact-manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+        assert_eq!(
+            manifest["targets"],
+            serde_json::json!(["wasm", "node", "apple"])
+        );
+        assert_eq!(manifest["source"]["browser"], "src/ffi/browser");
+        assert_eq!(manifest["source"]["node"], "src/ffi/node");
+        assert_eq!(manifest["source"]["swift"], "src/ffi/swift");
+        assert_eq!(manifest["entrypoints"]["web"], "src/index.web.ts");
+        assert_eq!(manifest["entrypoints"]["node"], "src/index.node.ts");
+        assert_eq!(
+            manifest["artifacts"]["wasm"]["wasm"],
+            "artifacts/browser/pkg/uni_core_wasm_bg.wasm"
+        );
+        assert_eq!(
+            manifest["artifacts"]["apple"]["xcframework"],
+            "artifacts/apple/uni_core.xcframework"
+        );
+        assert_eq!(
+            manifest["hostCrates"]["wasm"],
+            "artifacts/rust/wasm/Cargo.toml"
         );
 
         let _ = std::fs::remove_dir_all(package_dir.as_std_path());
