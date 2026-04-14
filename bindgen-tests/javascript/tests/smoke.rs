@@ -4406,6 +4406,8 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         .arg("--target")
         .arg("wasm")
         .arg("--target")
+        .arg("mini-program")
+        .arg("--target")
         .arg("node")
         .arg("--managed-layout")
         .arg("--package-dir")
@@ -4424,14 +4426,18 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
 
     for path in [
         "src/index.web.ts",
+        "src/index.mini-program.ts",
         "src/index.node.ts",
         "src/ffi/common/public-types.ts",
         "src/ffi/browser/index.web.ts",
+        "src/ffi/browser/index.mini-program.ts",
         "src/ffi/node/index.ts",
         "artifacts/rust/wasm/Cargo.toml",
         "artifacts/rust/napi/Cargo.toml",
         "artifacts/browser/pkg/cli_wasm_fixture_wasm.js",
         "artifacts/browser/pkg/cli_wasm_fixture_wasm_bg.wasm",
+        "artifacts/mini-program/cli_wasm_fixture_wasm.js",
+        "artifacts/mini-program/cli_wasm_fixture_wasm_bg.wasm",
         "artifacts/node/cli_wasm.node",
         "artifact-manifest.json",
         ".gitignore",
@@ -4452,6 +4458,52 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
     assert!(
         !web_entry.contains(package_dir.as_str()) && !web_entry.contains("artifacts/"),
         "managed web entry must not contain absolute paths or artifact internals:\n{web_entry}"
+    );
+
+    let mini_entry =
+        std::fs::read_to_string(package_dir.join("src/index.mini-program.ts")).unwrap();
+    assert!(
+        mini_entry.contains("export * from \"./ffi/browser/index.mini-program.ts\";"),
+        "managed Mini Program entry must re-export generated Mini Program entry:\n{mini_entry}"
+    );
+    assert!(
+        mini_entry.contains("export type * from \"./ffi/common/public-types.ts\";"),
+        "managed Mini Program entry must re-export public types:\n{mini_entry}"
+    );
+
+    let mini_runtime =
+        std::fs::read_to_string(package_dir.join("src/ffi/browser/index.mini-program.ts")).unwrap();
+    for forbidden in [
+        "?url",
+        "fetch(",
+        "import.meta.url",
+        "window",
+        "document",
+        "node:",
+    ] {
+        assert!(
+            !mini_runtime.contains(forbidden),
+            "Mini Program entry must not contain web/Node-only token `{forbidden}`:\n{mini_runtime}"
+        );
+    }
+    assert!(
+        mini_runtime.contains("WXWebAssembly.instantiate"),
+        "Mini Program entry should validate WXWebAssembly.instantiate:\n{mini_runtime}"
+    );
+
+    let mini_glue = std::fs::read_to_string(
+        package_dir.join("artifacts/mini-program/cli_wasm_fixture_wasm.js"),
+    )
+    .unwrap();
+    for forbidden in ["fetch(", "import.meta.url", "?url", "window", "document"] {
+        assert!(
+            !mini_glue.contains(forbidden),
+            "patched Mini Program glue must not contain web-only token `{forbidden}`:\n{mini_glue}"
+        );
+    }
+    assert!(
+        mini_glue.contains("WXWebAssembly.instantiate(wasmPath, imports)"),
+        "patched Mini Program glue must load through WXWebAssembly.instantiate:\n{mini_glue}"
     );
 
     let node_entry = std::fs::read_to_string(package_dir.join("src/index.node.ts")).unwrap();
@@ -4481,21 +4533,103 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
     assert_eq!(manifest_json["schemaVersion"], 2);
     assert_eq!(
         manifest_json["targets"],
-        serde_json::json!(["wasm", "node"])
+        serde_json::json!(["wasm", "mini-program", "node"])
     );
     assert_eq!(manifest_json["source"]["root"], "src/ffi");
     assert_eq!(manifest_json["source"]["common"], "src/ffi/common");
     assert_eq!(manifest_json["entrypoints"]["web"], "src/index.web.ts");
+    assert_eq!(
+        manifest_json["entrypoints"]["miniProgram"],
+        "src/index.mini-program.ts"
+    );
     assert_eq!(manifest_json["entrypoints"]["node"], "src/index.node.ts");
     assert_eq!(
         manifest_json["artifacts"]["wasm"]["wasm"],
         "artifacts/browser/pkg/cli_wasm_fixture_wasm_bg.wasm"
     );
     assert_eq!(
+        manifest_json["artifacts"]["miniProgram"]["glue"],
+        "artifacts/mini-program/cli_wasm_fixture_wasm.js"
+    );
+    assert_eq!(
+        manifest_json["artifacts"]["miniProgram"]["wasm"],
+        "artifacts/mini-program/cli_wasm_fixture_wasm_bg.wasm"
+    );
+    assert_eq!(
+        manifest_json["artifacts"]["miniProgram"]["defaultWasmPath"],
+        "/assets/cli_wasm_fixture_wasm_bg.wasm"
+    );
+    assert_eq!(
         manifest_json["artifacts"]["node"]["addon"],
         "artifacts/node/cli_wasm.node"
     );
     assert!(manifest_json["artifacts"]["harmony"].is_null());
+
+    std::fs::write(
+        package_dir.join("package.json").as_std_path(),
+        r#"{ "type": "module" }"#,
+    )
+    .unwrap();
+
+    let mini_driver = r#"
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+
+function assertEq(actual: unknown, expected: unknown, label: string): void {
+    if (actual !== expected) {
+        throw new Error(`${label}: expected ${String(expected)}, got ${String(actual)}`);
+    }
+}
+
+const calls: string[] = [];
+(globalThis as { WXWebAssembly?: unknown }).WXWebAssembly = {
+    async instantiate(path: string, imports: WebAssembly.Imports): Promise<WebAssembly.WebAssemblyInstantiatedSource> {
+        calls.push(path);
+        const localPath = path.startsWith("/assets/")
+            ? `artifacts/mini-program/${path.slice("/assets/".length)}`
+            : path;
+        const bytes = await readFile(resolve(localPath));
+        return WebAssembly.instantiate(bytes, imports);
+    },
+};
+
+const mini = await import("./src/index.mini-program.ts");
+await mini.init("/assets/cli_wasm_fixture_wasm_bg.wasm");
+assertEq(calls[0], "/assets/cli_wasm_fixture_wasm_bg.wasm", "WXWebAssembly path");
+assertEq(mini.add(2n, 3n), 5n, "mini.add");
+assertEq(mini.slowAdd(20n, 22n), 42n, "mini.slowAdd");
+assertEq(await mini.asyncAdd(30n, 12n), 42n, "mini.asyncAdd");
+await mini.init("/assets/ignored.wasm");
+assertEq(calls.length, 1, "mini init idempotent");
+console.log("mini-program managed runtime ok");
+"#;
+    std::fs::write(
+        package_dir.join("mini-program-smoke.ts").as_std_path(),
+        mini_driver,
+    )
+    .unwrap();
+    let mini_runtime = Command::new(&node)
+        .current_dir(package_dir.as_std_path())
+        .args([
+            "--experimental-strip-types",
+            "--no-warnings",
+            "mini-program-smoke.ts",
+        ])
+        .output()
+        .expect("failed to run Mini Program smoke");
+    if !mini_runtime.status.success() {
+        panic!(
+            "Mini Program smoke failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&mini_runtime.stdout),
+            String::from_utf8_lossy(&mini_runtime.stderr),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&mini_runtime.stdout).contains("mini-program managed runtime ok"),
+        "Mini Program smoke did not report success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&mini_runtime.stdout),
+        String::from_utf8_lossy(&mini_runtime.stderr),
+    );
 
     let bench_driver = r#"
 import { performance } from "node:perf_hooks";

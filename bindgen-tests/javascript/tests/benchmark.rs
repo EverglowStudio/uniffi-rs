@@ -222,10 +222,6 @@ fn javascript_generated_entrypoint_benchmark_quick() {
         eprintln!("SKIP javascript benchmark: wasm32-unknown-unknown target not installed");
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!("SKIP javascript benchmark: wasm-bindgen CLI not found");
-        return;
-    };
     let Some(node) = which_tool("node") else {
         eprintln!("SKIP javascript benchmark: node unavailable");
         return;
@@ -266,8 +262,6 @@ fn javascript_generated_entrypoint_benchmark_quick() {
         .arg(pkg_dir.as_str())
         .arg("--wasm-bindgen-target")
         .arg("nodejs")
-        .arg("--wasm-bindgen-bin")
-        .arg(Utf8PathBuf::from_path_buf(wasm_bindgen).unwrap().as_str())
         .arg("--target-dir")
         .arg(target_dir.as_str())
         .output()

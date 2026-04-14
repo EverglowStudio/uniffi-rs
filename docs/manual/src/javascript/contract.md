@@ -342,16 +342,17 @@ manifest is metadata, not the public runtime API:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "generator": "uniffi-bindgen-javascript",
   "namespace": "my_core",
-  "targets": ["wasm", "node"],
+  "targets": ["wasm", "mini-program", "node"],
   "source": {
     "root": "src/generated/uniffi",
     "publicTypes": "src/generated/uniffi/common/public-types.ts"
   },
   "entrypoints": {
     "web": "src/index.web.ts",
+    "miniProgram": "src/index.mini-program.ts",
     "node": "src/index.node.ts",
     "electron": null,
     "harmony": null
@@ -361,6 +362,11 @@ manifest is metadata, not the public runtime API:
       "glue": "target/uniffi-artifacts/js/browser/pkg/my_core_wasm.js",
       "wasm": "target/uniffi-artifacts/js/browser/pkg/my_core_wasm_bg.wasm",
       "dts": "target/uniffi-artifacts/js/browser/pkg/my_core_wasm.d.ts"
+    },
+    "miniProgram": {
+      "glue": "target/uniffi-artifacts/js/mini-program/my_core_wasm.js",
+      "wasm": "target/uniffi-artifacts/js/mini-program/my_core_wasm_bg.wasm",
+      "defaultWasmPath": "/assets/my_core_wasm_bg.wasm"
     },
     "node": {
       "addon": "target/uniffi-artifacts/js/node/my_core.node",
@@ -454,6 +460,49 @@ of hand-writing the wasm-bindgen glue import. Advanced applications should keep
 using `browser/index.ts` when they need to control wasm initialization
 explicitly. The auto-entrypoint is target-specific and is not emitted for
 `--wasm-bindgen-target nodejs`.
+
+## Mini Program wasm initialization
+
+`artifacts build --target mini-program` is a wasm consumption form, not a new
+ABI. It reuses the wasm-bindgen host crate, the `browser/` UniFFI adapter, and
+the shared `common/` public API, then emits a Mini Program-specific entrypoint:
+
+```ts
+import * as core from "@my/core/mini-program";
+
+await core.init("/assets/my_core_wasm_bg.wasm");
+```
+
+Managed layout writes `src/index.mini-program.ts`,
+`src/ffi/browser/index.mini-program.ts`, and
+`artifacts/mini-program/<crate>_wasm.{js,d.ts}` plus
+`artifacts/mini-program/<crate>_wasm_bg.wasm`. Package authors should expose
+the entrypoint with:
+
+```json
+{
+  "exports": {
+    "./mini-program": "./src/index.mini-program.ts"
+  }
+}
+```
+
+The generated entrypoint exposes:
+
+```ts
+export const DEFAULT_WASM_PATH: string;
+export function init(wasmPath?: string): Promise<void>;
+export function initWithPath(wasmPath: string): Promise<void>;
+export function initWithGlue(glue: WasmBindgenGlue | Promise<WasmBindgenGlue>, wasmPath: string): Promise<void>;
+```
+
+The CLI patches the copied wasm-bindgen web glue so its default initializer
+calls `WXWebAssembly.instantiate(packagePath, imports)` instead of browser
+loading APIs. The entrypoint and patched glue do not rely on `fetch`,
+`import.meta.url`, Vite `?url`, DOM globals, or Node APIs. Applications are
+still responsible for copying the generated `.wasm` into the Mini Program code
+package at the path passed to `init`; the manifest records the default
+`/assets/<crate>_wasm_bg.wasm` path as `artifacts.miniProgram.defaultWasmPath`.
 
 ## Node/N-API addon loading
 

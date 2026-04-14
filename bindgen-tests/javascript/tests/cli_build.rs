@@ -240,11 +240,6 @@ fn cli_build_orchestrates_wasm_and_napi() {
         );
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!("SKIP cli_build_orchestrates_wasm_and_napi: wasm-bindgen CLI not found");
-        return;
-    };
-
     let root = workspace_root();
     build_uniffi_bindgen(&root, &cargo);
 
@@ -274,12 +269,6 @@ fn cli_build_orchestrates_wasm_and_napi() {
         .arg(host_dir.as_str())
         .arg("--wasm-bindgen-out-dir")
         .arg(pkg_dir.as_str())
-        .arg("--wasm-bindgen-bin")
-        .arg(
-            Utf8PathBuf::from_path_buf(wasm_bindgen.clone())
-                .unwrap()
-                .as_str(),
-        )
         .arg("--target-dir")
         .arg(target_dir.as_str())
         .output()
@@ -328,10 +317,6 @@ fn cli_build_runs_value_type_methods() {
         );
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!("SKIP cli_build_runs_value_type_methods: wasm-bindgen CLI not found");
-        return;
-    };
     let Some(node) = which_tool("node") else {
         eprintln!("SKIP cli_build_runs_value_type_methods: node unavailable");
         return;
@@ -372,12 +357,6 @@ fn cli_build_runs_value_type_methods() {
         .arg(host_dir.as_str())
         .arg("--wasm-bindgen-out-dir")
         .arg(pkg_dir.as_str())
-        .arg("--wasm-bindgen-bin")
-        .arg(
-            Utf8PathBuf::from_path_buf(wasm_bindgen.clone())
-                .unwrap()
-                .as_str(),
-        )
         .arg("--target-dir")
         .arg(target_dir.as_str())
         .output()
