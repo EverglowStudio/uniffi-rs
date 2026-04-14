@@ -3,7 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use super::javascript::{
-    build_napi, build_ohos, build_wasm, BuildNapiArgs, BuildOhosArgs, BuildWasmArgs,
+    build_napi, build_ohos, build_wasm, emit_mini_program_wasm_runtime,
+    mini_program_default_wasm_path, BuildNapiArgs, BuildOhosArgs, BuildWasmArgs,
     NapiBuildFlavorArg, WasmBindgenTargetArg,
 };
 use anyhow::{bail, Context, Result};
@@ -212,6 +213,8 @@ pub(crate) struct BuildArgs {
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, ValueEnum)]
 pub(crate) enum ArtifactTargetArg {
     Wasm,
+    #[clap(name = "mini-program")]
+    MiniProgram,
     Node,
     Electron,
     Harmony,
@@ -225,6 +228,7 @@ pub(crate) enum ArtifactTargetArg {
 #[derive(Default, Debug, Eq, PartialEq)]
 struct ExpandedTargets {
     wasm: bool,
+    mini_program: bool,
     node: bool,
     electron: bool,
     harmony: bool,
@@ -336,6 +340,9 @@ impl ManagedLayout {
         if targets.wasm {
             self.emit_web_entrypoint()?;
         }
+        if targets.mini_program {
+            self.emit_mini_program_entrypoint()?;
+        }
         if targets.node {
             self.emit_node_entrypoint()?;
         }
@@ -354,6 +361,16 @@ impl ManagedLayout {
             &self.source_root.join("browser/index.web.ts"),
             &self.source_root.join("common/public-types.ts"),
             "web",
+        )
+    }
+
+    fn emit_mini_program_entrypoint(&self) -> Result<()> {
+        let entrypoint = self.package_dir.join("src/index.mini-program.ts");
+        self.write_entrypoint(
+            &entrypoint,
+            &self.source_root.join("browser/index.mini-program.ts"),
+            &self.source_root.join("common/public-types.ts"),
+            "mini-program",
         )
     }
 
@@ -456,7 +473,7 @@ node_modules/\n\
             "source": {
                 "root": self.rel(&self.source_root)?,
                 "common": if self.has_js(targets) { serde_json::Value::String(self.rel(&self.source_root.join("common"))?) } else { serde_json::Value::Null },
-                "browser": if targets.wasm { serde_json::Value::String(self.rel(&self.source_root.join("browser"))?) } else { serde_json::Value::Null },
+                "browser": if targets.wasm || targets.mini_program { serde_json::Value::String(self.rel(&self.source_root.join("browser"))?) } else { serde_json::Value::Null },
                 "node": if targets.node { serde_json::Value::String(self.rel(&self.source_root.join("node"))?) } else { serde_json::Value::Null },
                 "electron": if targets.electron { serde_json::Value::String(self.rel(&self.source_root.join("electron"))?) } else { serde_json::Value::Null },
                 "harmony": if targets.harmony { serde_json::Value::String(self.rel(&self.source_root.join("harmony"))?) } else { serde_json::Value::Null },
@@ -466,6 +483,7 @@ node_modules/\n\
             },
             "entrypoints": {
                 "web": if targets.wasm { serde_json::Value::String("src/index.web.ts".to_string()) } else { serde_json::Value::Null },
+                "miniProgram": if targets.mini_program { serde_json::Value::String("src/index.mini-program.ts".to_string()) } else { serde_json::Value::Null },
                 "node": if targets.node { serde_json::Value::String("src/index.node.ts".to_string()) } else { serde_json::Value::Null },
                 "electron": if targets.electron { serde_json::Value::String("src/index.electron.ts".to_string()) } else { serde_json::Value::Null },
                 "harmony": serde_json::Value::Null,
@@ -476,6 +494,13 @@ node_modules/\n\
                         "glue": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}.js")))?,
                         "wasm": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}_bg.wasm")))?,
                         "dts": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}.d.ts")))?,
+                    })
+                } else { serde_json::Value::Null },
+                "miniProgram": if targets.mini_program {
+                    serde_json::json!({
+                        "glue": self.rel(&self.artifact_root.join(format!("mini-program/{wasm_stem}.js")))?,
+                        "wasm": self.rel(&self.artifact_root.join(format!("mini-program/{wasm_stem}_bg.wasm")))?,
+                        "defaultWasmPath": mini_program_default_wasm_path(&wasm_stem),
                     })
                 } else { serde_json::Value::Null },
                 "node": if targets.node {
@@ -510,7 +535,7 @@ node_modules/\n\
                 } else { serde_json::Value::Null },
             },
             "hostCrates": {
-                "wasm": if targets.wasm { serde_json::Value::String(self.rel(&self.host_crates_root.join("wasm/Cargo.toml"))?) } else { serde_json::Value::Null },
+                "wasm": if targets.wasm || targets.mini_program { serde_json::Value::String(self.rel(&self.host_crates_root.join("wasm/Cargo.toml"))?) } else { serde_json::Value::Null },
                 "napi": if targets.node || targets.electron { serde_json::Value::String(self.rel(&self.host_crates_root.join("napi/Cargo.toml"))?) } else { serde_json::Value::Null },
                 "ohos": if targets.harmony { serde_json::Value::String(self.rel(&self.host_crates_root.join("ohos/Cargo.toml"))?) } else { serde_json::Value::Null },
             },
@@ -550,13 +575,16 @@ node_modules/\n\
     }
 
     fn has_js(&self, targets: &ExpandedTargets) -> bool {
-        targets.wasm || targets.node || targets.electron || targets.harmony
+        targets.wasm || targets.mini_program || targets.node || targets.electron || targets.harmony
     }
 
     fn manifest_targets(&self, targets: &ExpandedTargets) -> Vec<&'static str> {
         let mut out = Vec::new();
         if targets.wasm {
             out.push("wasm");
+        }
+        if targets.mini_program {
+            out.push("mini-program");
         }
         if targets.node {
             out.push("node");
@@ -628,11 +656,19 @@ fn merge_manifest_targets(manifest: &mut serde_json::Value, existing: &serde_jso
         }
     }
 
-    let targets = ["wasm", "node", "electron", "harmony", "apple", "android"]
-        .into_iter()
-        .filter(|target| present.contains(*target))
-        .map(serde_json::Value::from)
-        .collect();
+    let targets = [
+        "wasm",
+        "mini-program",
+        "node",
+        "electron",
+        "harmony",
+        "apple",
+        "android",
+    ]
+    .into_iter()
+    .filter(|target| present.contains(*target))
+    .map(serde_json::Value::from)
+    .collect();
     manifest["targets"] = serde_json::Value::Array(targets);
 }
 
@@ -671,6 +707,9 @@ pub(crate) fn run(args: ArtifactsArgs) -> Result<()> {
 
 fn build(mut args: BuildArgs) -> Result<()> {
     let targets = expand_targets(&args.target)?;
+    if targets.mini_program && args.wasm_bindgen_target != WasmBindgenTargetArg::Web {
+        bail!("--target mini-program requires --wasm-bindgen-target web");
+    }
     let managed_layout = ManagedLayout::apply(&mut args, &targets)?;
 
     if targets.apple {
@@ -680,8 +719,19 @@ fn build(mut args: BuildArgs) -> Result<()> {
         build_android(&args).context("building Android artifact target")?;
     }
 
-    if targets.wasm {
+    if targets.wasm || targets.mini_program {
         build_wasm(args.to_wasm_args()?).context("building wasm artifact target")?;
+    }
+    if targets.mini_program {
+        let meta = cargo_package_metadata(&args.manifest_path)?;
+        let wasm_stem = format!("{}_wasm", rust_identifier(&meta.package_name));
+        emit_mini_program_wasm_runtime(
+            &args.out_dir()?,
+            &args.wasm_bindgen_out_dir()?,
+            &args.mini_program_out_dir()?,
+            &wasm_stem,
+        )
+        .context("emitting Mini Program wasm runtime")?;
     }
 
     let mut napi_flavors = Vec::new();
@@ -935,6 +985,7 @@ fn expand_targets(targets: &[ArtifactTargetArg]) -> Result<ExpandedTargets> {
     for target in targets {
         match target {
             ArtifactTargetArg::Wasm => expanded.wasm = true,
+            ArtifactTargetArg::MiniProgram => expanded.mini_program = true,
             ArtifactTargetArg::Node => expanded.node = true,
             ArtifactTargetArg::Electron => expanded.electron = true,
             ArtifactTargetArg::Harmony => expanded.harmony = true,
@@ -942,12 +993,14 @@ fn expand_targets(targets: &[ArtifactTargetArg]) -> Result<ExpandedTargets> {
             ArtifactTargetArg::Android => expanded.android = true,
             ArtifactTargetArg::AllJs => {
                 expanded.wasm = true;
+                expanded.mini_program = true;
                 expanded.node = true;
                 expanded.electron = true;
                 expanded.harmony = true;
             }
             ArtifactTargetArg::All => {
                 expanded.wasm = true;
+                expanded.mini_program = true;
                 expanded.node = true;
                 expanded.electron = true;
                 expanded.harmony = true;
@@ -970,6 +1023,34 @@ impl BuildArgs {
         self.host_crates_dir
             .clone()
             .unwrap_or_else(|| Utf8PathBuf::from("rust_modules"))
+    }
+
+    fn wasm_bindgen_out_dir(&self) -> Result<Utf8PathBuf> {
+        Ok(self
+            .wasm_bindgen_out_dir
+            .clone()
+            .or_else(|| {
+                self.artifact_dir
+                    .as_ref()
+                    .map(|dir| dir.join("browser/pkg"))
+            })
+            .unwrap_or_else(|| {
+                self.out_dir()
+                    .expect("out_dir is validated")
+                    .join("browser/pkg")
+            }))
+    }
+
+    fn mini_program_out_dir(&self) -> Result<Utf8PathBuf> {
+        Ok(self
+            .artifact_dir
+            .as_ref()
+            .map(|dir| dir.join("mini-program"))
+            .unwrap_or_else(|| {
+                self.out_dir()
+                    .expect("out_dir is validated")
+                    .join("mini-program")
+            }))
     }
 
     fn to_wasm_args(&self) -> Result<BuildWasmArgs> {
@@ -1590,6 +1671,7 @@ name = "uni_core"
             expand_targets(&[ArtifactTargetArg::AllJs]).unwrap(),
             ExpandedTargets {
                 wasm: true,
+                mini_program: true,
                 node: true,
                 electron: true,
                 harmony: true,
@@ -1605,6 +1687,7 @@ name = "uni_core"
             expand_targets(&[ArtifactTargetArg::All]).unwrap(),
             ExpandedTargets {
                 wasm: true,
+                mini_program: true,
                 node: true,
                 electron: true,
                 harmony: true,
@@ -1620,6 +1703,7 @@ name = "uni_core"
             expand_targets(&[ArtifactTargetArg::Node, ArtifactTargetArg::Electron]).unwrap(),
             ExpandedTargets {
                 wasm: false,
+                mini_program: false,
                 node: true,
                 electron: true,
                 harmony: false,
@@ -1644,6 +1728,7 @@ name = "uni_core"
         args.out_dir = None;
         args.target = vec![
             ArtifactTargetArg::Wasm,
+            ArtifactTargetArg::MiniProgram,
             ArtifactTargetArg::Node,
             ArtifactTargetArg::Electron,
             ArtifactTargetArg::Harmony,
@@ -1699,6 +1784,7 @@ name = "uni_core"
         args.out_dir = None;
         args.target = vec![
             ArtifactTargetArg::Wasm,
+            ArtifactTargetArg::MiniProgram,
             ArtifactTargetArg::Node,
             ArtifactTargetArg::Electron,
             ArtifactTargetArg::Harmony,
@@ -1720,6 +1806,11 @@ name = "uni_core"
         let web = std::fs::read_to_string(package_dir.join("src/index.web.ts")).unwrap();
         assert!(web.contains("export * from \"./ffi/browser/index.web.ts\";"));
         assert!(web.contains("export type * from \"./ffi/common/public-types.ts\";"));
+
+        let mini_program =
+            std::fs::read_to_string(package_dir.join("src/index.mini-program.ts")).unwrap();
+        assert!(mini_program.contains("export * from \"./ffi/browser/index.mini-program.ts\";"));
+        assert!(mini_program.contains("export type * from \"./ffi/common/public-types.ts\";"));
 
         let node = std::fs::read_to_string(package_dir.join("src/index.node.ts")).unwrap();
         assert!(node.contains("export * from \"./ffi/node/index.ts\";"));
@@ -1748,7 +1839,15 @@ name = "uni_core"
         assert_eq!(manifest["namespace"], "uni_core");
         assert_eq!(
             manifest["targets"],
-            serde_json::json!(["wasm", "node", "electron", "harmony", "apple", "android"])
+            serde_json::json!([
+                "wasm",
+                "mini-program",
+                "node",
+                "electron",
+                "harmony",
+                "apple",
+                "android"
+            ])
         );
         assert_eq!(manifest["source"]["root"], "src/ffi");
         assert_eq!(manifest["source"]["common"], "src/ffi/common");
@@ -1756,8 +1855,24 @@ name = "uni_core"
         assert_eq!(manifest["source"]["kotlin"], "src/ffi/kotlin");
         assert_eq!(manifest["entrypoints"]["electron"], "src/index.electron.ts");
         assert_eq!(
+            manifest["entrypoints"]["miniProgram"],
+            "src/index.mini-program.ts"
+        );
+        assert_eq!(
             manifest["artifacts"]["wasm"]["glue"],
             "artifacts/browser/pkg/uni_core_wasm.js"
+        );
+        assert_eq!(
+            manifest["artifacts"]["miniProgram"]["glue"],
+            "artifacts/mini-program/uni_core_wasm.js"
+        );
+        assert_eq!(
+            manifest["artifacts"]["miniProgram"]["wasm"],
+            "artifacts/mini-program/uni_core_wasm_bg.wasm"
+        );
+        assert_eq!(
+            manifest["artifacts"]["miniProgram"]["defaultWasmPath"],
+            "/assets/uni_core_wasm_bg.wasm"
         );
         assert_eq!(
             manifest["artifacts"]["harmony"]["har"],
@@ -1793,7 +1908,11 @@ name = "uni_core"
         js_args.managed_layout = true;
         js_args.package_dir = Some(package_dir.clone());
         js_args.out_dir = None;
-        js_args.target = vec![ArtifactTargetArg::Wasm, ArtifactTargetArg::Node];
+        js_args.target = vec![
+            ArtifactTargetArg::Wasm,
+            ArtifactTargetArg::MiniProgram,
+            ArtifactTargetArg::Node,
+        ];
         let js_targets = expand_targets(&js_args.target).unwrap();
         let js_layout = ManagedLayout::apply(&mut js_args, &js_targets)
             .unwrap()
@@ -1819,12 +1938,16 @@ name = "uni_core"
         let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
         assert_eq!(
             manifest["targets"],
-            serde_json::json!(["wasm", "node", "apple"])
+            serde_json::json!(["wasm", "mini-program", "node", "apple"])
         );
         assert_eq!(manifest["source"]["browser"], "src/ffi/browser");
         assert_eq!(manifest["source"]["node"], "src/ffi/node");
         assert_eq!(manifest["source"]["swift"], "src/ffi/swift");
         assert_eq!(manifest["entrypoints"]["web"], "src/index.web.ts");
+        assert_eq!(
+            manifest["entrypoints"]["miniProgram"],
+            "src/index.mini-program.ts"
+        );
         assert_eq!(manifest["entrypoints"]["node"], "src/index.node.ts");
         assert_eq!(
             manifest["artifacts"]["wasm"]["wasm"],
@@ -1833,6 +1956,10 @@ name = "uni_core"
         assert_eq!(
             manifest["artifacts"]["apple"]["xcframework"],
             "artifacts/apple/uni_core.xcframework"
+        );
+        assert_eq!(
+            manifest["artifacts"]["miniProgram"]["defaultWasmPath"],
+            "/assets/uni_core_wasm_bg.wasm"
         );
         assert_eq!(
             manifest["hostCrates"]["wasm"],
