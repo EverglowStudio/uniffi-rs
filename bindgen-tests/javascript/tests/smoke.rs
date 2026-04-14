@@ -4425,15 +4425,16 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
     for path in [
         "src/index.web.ts",
         "src/index.node.ts",
-        "src/generated/uniffi/common/public-types.ts",
-        "src/generated/uniffi/browser/index.web.ts",
-        "src/generated/uniffi/node/index.ts",
-        "target/uniffi-artifacts/rust/wasm/Cargo.toml",
-        "target/uniffi-artifacts/rust/napi/Cargo.toml",
-        "target/uniffi-artifacts/js/browser/pkg/cli_wasm_fixture_wasm.js",
-        "target/uniffi-artifacts/js/browser/pkg/cli_wasm_fixture_wasm_bg.wasm",
-        "target/uniffi-artifacts/js/node/cli_wasm.node",
+        "src/ffi/common/public-types.ts",
+        "src/ffi/browser/index.web.ts",
+        "src/ffi/node/index.ts",
+        "artifacts/rust/wasm/Cargo.toml",
+        "artifacts/rust/napi/Cargo.toml",
+        "artifacts/browser/pkg/cli_wasm_fixture_wasm.js",
+        "artifacts/browser/pkg/cli_wasm_fixture_wasm_bg.wasm",
+        "artifacts/node/cli_wasm.node",
         "artifact-manifest.json",
+        ".gitignore",
     ] {
         let file = package_dir.join(path);
         assert!(file.exists(), "missing managed layout file: {file}");
@@ -4441,26 +4442,33 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
 
     let web_entry = std::fs::read_to_string(package_dir.join("src/index.web.ts")).unwrap();
     assert!(
-        web_entry.contains("export * from \"./generated/uniffi/browser/index.web.ts\";"),
+        web_entry.contains("export * from \"./ffi/browser/index.web.ts\";"),
         "managed web entry must re-export generated browser auto entry:\n{web_entry}"
     );
     assert!(
-        web_entry.contains("export type * from \"./generated/uniffi/common/public-types.ts\";"),
+        web_entry.contains("export type * from \"./ffi/common/public-types.ts\";"),
         "managed web entry must re-export public types:\n{web_entry}"
     );
     assert!(
-        !web_entry.contains(package_dir.as_str()) && !web_entry.contains("target/uniffi-artifacts"),
+        !web_entry.contains(package_dir.as_str()) && !web_entry.contains("artifacts/"),
         "managed web entry must not contain absolute paths or artifact internals:\n{web_entry}"
     );
 
     let node_entry = std::fs::read_to_string(package_dir.join("src/index.node.ts")).unwrap();
     assert!(
-        node_entry.contains("export * from \"./generated/uniffi/node/index.ts\";"),
+        node_entry.contains("export * from \"./ffi/node/index.ts\";"),
         "managed node entry must re-export generated node entry:\n{node_entry}"
     );
     assert!(
-        node_entry.contains("export type * from \"./generated/uniffi/common/public-types.ts\";"),
+        node_entry.contains("export type * from \"./ffi/common/public-types.ts\";"),
         "managed node entry must re-export public types:\n{node_entry}"
+    );
+
+    let gitignore = std::fs::read_to_string(package_dir.join(".gitignore")).unwrap();
+    assert!(gitignore.contains("/artifacts/"));
+    assert!(
+        !gitignore.contains("src/ffi"),
+        "managed gitignore must not hide reviewable FFI source:\n{gitignore}"
     );
 
     let manifest_text =
@@ -4470,20 +4478,22 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "managed manifest must be relative-only:\n{manifest_text}"
     );
     let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
-    assert_eq!(manifest_json["schemaVersion"], 1);
+    assert_eq!(manifest_json["schemaVersion"], 2);
     assert_eq!(
         manifest_json["targets"],
         serde_json::json!(["wasm", "node"])
     );
+    assert_eq!(manifest_json["source"]["root"], "src/ffi");
+    assert_eq!(manifest_json["source"]["common"], "src/ffi/common");
     assert_eq!(manifest_json["entrypoints"]["web"], "src/index.web.ts");
     assert_eq!(manifest_json["entrypoints"]["node"], "src/index.node.ts");
     assert_eq!(
         manifest_json["artifacts"]["wasm"]["wasm"],
-        "target/uniffi-artifacts/js/browser/pkg/cli_wasm_fixture_wasm_bg.wasm"
+        "artifacts/browser/pkg/cli_wasm_fixture_wasm_bg.wasm"
     );
     assert_eq!(
         manifest_json["artifacts"]["node"]["addon"],
-        "target/uniffi-artifacts/js/node/cli_wasm.node"
+        "artifacts/node/cli_wasm.node"
     );
     assert!(manifest_json["artifacts"]["harmony"].is_null());
 
@@ -4506,7 +4516,7 @@ function run(label: string, fn: (a: bigint, b: bigint) => bigint): { elapsed: nu
 }
 
 const managed = await import("./src/index.node.ts");
-const direct = await import("./src/generated/uniffi/node/index.ts");
+const direct = await import("./src/ffi/node/index.ts");
 assertEq(managed.add(2n, 3n), 5n, "managed.add");
 assertEq(direct.add(2n, 3n), 5n, "direct.add");
 
