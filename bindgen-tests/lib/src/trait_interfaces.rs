@@ -92,7 +92,6 @@ impl TestTraitInterface for TestTraitInterfaceImpl {
 
 /// Async version of `TestTraitInterface`
 #[uniffi::export(with_foreign)]
-#[async_trait::async_trait]
 pub trait AsyncTestTraitInterface: Send + Sync {
     /// No-op function, this tests if that we can make calls at all
     async fn noop(&self);
