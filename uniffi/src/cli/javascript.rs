@@ -406,7 +406,7 @@ impl From<NapiBuildFlavorArg> for FlavorTarget {
     }
 }
 
-#[derive(Copy, Clone, ValueEnum)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum WasmBindgenTargetArg {
     Web,
     Nodejs,
@@ -1025,6 +1025,191 @@ fn emit_browser_auto_entrypoint(
     std::fs::write(&entrypoint, source)
         .with_context(|| format!("writing browser auto-entrypoint {entrypoint}"))?;
     Ok(())
+}
+
+pub(crate) fn emit_mini_program_wasm_runtime(
+    out_dir: &Utf8Path,
+    wasm_bindgen_out_dir: &Utf8Path,
+    mini_program_out_dir: &Utf8Path,
+    wasm_bindgen_stem: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(mini_program_out_dir).with_context(|| {
+        format!("creating Mini Program wasm artifact dir {mini_program_out_dir}")
+    })?;
+
+    let glue_source_path = wasm_bindgen_out_dir.join(format!("{wasm_bindgen_stem}.js"));
+    let glue_dest_path = mini_program_out_dir.join(format!("{wasm_bindgen_stem}.js"));
+    let glue_source = std::fs::read_to_string(&glue_source_path)
+        .with_context(|| format!("reading wasm-bindgen JS glue {glue_source_path}"))?;
+    let glue_source = patch_mini_program_wasm_bindgen_glue(&glue_source, wasm_bindgen_stem)?;
+    std::fs::write(&glue_dest_path, glue_source)
+        .with_context(|| format!("writing Mini Program wasm-bindgen JS glue {glue_dest_path}"))?;
+
+    for suffix in ["_bg.wasm", ".d.ts"] {
+        let source = wasm_bindgen_out_dir.join(format!("{wasm_bindgen_stem}{suffix}"));
+        if !source.exists() {
+            if suffix == ".d.ts" {
+                continue;
+            }
+            bail!("wasm-bindgen output missing required artifact {source}");
+        }
+        let dest = mini_program_out_dir.join(format!("{wasm_bindgen_stem}{suffix}"));
+        std::fs::copy(&source, &dest)
+            .with_context(|| format!("copying Mini Program artifact {source} to {dest}"))?;
+    }
+
+    emit_mini_program_auto_entrypoint(out_dir, mini_program_out_dir, wasm_bindgen_stem)?;
+    Ok(())
+}
+
+fn patch_mini_program_wasm_bindgen_glue(source: &str, wasm_bindgen_stem: &str) -> Result<String> {
+    let default_wasm_path = mini_program_default_wasm_path(wasm_bindgen_stem);
+    let replacement = format!(
+        r#"async function __wbg_init(wasmPath = "{default_wasm_path}") {{
+    if (wasm !== undefined) return wasm;
+
+    if (typeof wasmPath !== "string" || wasmPath.length === 0) {{
+        throw new Error("UniFFI Mini Program wasm init requires a non-empty package path string");
+    }}
+    if (typeof WXWebAssembly === "undefined" || typeof WXWebAssembly.instantiate !== "function") {{
+        throw new Error("UniFFI Mini Program wasm init requires WXWebAssembly.instantiate(path, imports)");
+    }}
+
+    const imports = __wbg_get_imports();
+    if (typeof __wbg_init_memory === "function") {{
+        __wbg_init_memory(imports);
+    }}
+    const instantiated = await WXWebAssembly.instantiate(wasmPath, imports);
+    return __wbg_finalize_init(instantiated.instance, instantiated.module);
+}}"#
+    );
+    let patched = replace_js_function(source, "async function __wbg_init", &replacement)
+        .context("patching wasm-bindgen __wbg_init for Mini Program")?;
+    Ok(patched.replace(
+        "const ret = typeof window === 'undefined' ? null : window;",
+        "const ret = null;",
+    ))
+}
+
+fn replace_js_function(source: &str, signature_start: &str, replacement: &str) -> Result<String> {
+    let start = source
+        .find(signature_start)
+        .with_context(|| format!("could not find `{signature_start}`"))?;
+    let brace_start = source[start..]
+        .find('{')
+        .map(|idx| start + idx)
+        .with_context(|| format!("could not find `{signature_start}` body"))?;
+    let brace_end = matching_brace(source, brace_start)
+        .with_context(|| format!("could not find `{signature_start}` body end"))?;
+
+    let mut out = String::with_capacity(source.len() + replacement.len());
+    out.push_str(&source[..start]);
+    out.push_str(replacement);
+    out.push_str(&source[brace_end + 1..]);
+    Ok(out)
+}
+
+fn matching_brace(source: &str, open_idx: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(open_idx).copied() != Some(b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (idx, byte) in bytes.iter().enumerate().skip(open_idx) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn emit_mini_program_auto_entrypoint(
+    out_dir: &Utf8Path,
+    mini_program_out_dir: &Utf8Path,
+    wasm_bindgen_stem: &str,
+) -> Result<()> {
+    let browser_dir = out_dir.join("browser");
+    let entrypoint = browser_dir.join("index.mini-program.ts");
+    std::fs::create_dir_all(&browser_dir)
+        .with_context(|| format!("creating browser output dir {browser_dir}"))?;
+    let browser_dir_abs = browser_dir
+        .canonicalize_utf8()
+        .with_context(|| format!("canonicalizing browser dir {browser_dir}"))?;
+    let mini_program_out_dir_abs = mini_program_out_dir.canonicalize_utf8().with_context(|| {
+        format!("canonicalizing Mini Program artifact dir {mini_program_out_dir}")
+    })?;
+    let rel_artifact_dir = relative_path_from_dir(&browser_dir_abs, &mini_program_out_dir_abs)
+        .to_string()
+        .replace('\\', "/");
+    let rel_artifact_dir = if rel_artifact_dir.is_empty() {
+        ".".to_string()
+    } else if rel_artifact_dir.starts_with('.') {
+        rel_artifact_dir
+    } else {
+        format!("./{rel_artifact_dir}")
+    };
+    let glue_path = format!("{rel_artifact_dir}/{wasm_bindgen_stem}.js");
+    let default_wasm_path = mini_program_default_wasm_path(wasm_bindgen_stem);
+
+    let source = format!(
+        "// AUTOGENERATED by uniffi_bindgen_javascript (wasm Mini Program auto-entrypoint).\n\
+         //\n\
+         // This file is emitted by `uniffi-bindgen artifacts build --target mini-program`.\n\
+         // It consumes a patched wasm-bindgen JS glue module whose default init\n\
+         // calls `WXWebAssembly.instantiate(packagePath, imports)`.\n\
+         \n\
+         import * as glue from \"{glue_path}\";\n\
+         import {{ initBackend, type WasmBindgenGlue }} from \"./index.ts\";\n\
+         \n\
+         export * from \"./index.ts\";\n\
+         \n\
+         declare const WXWebAssembly:\n\
+             | undefined\n\
+             | {{\n\
+                   instantiate(\n\
+                       path: string,\n\
+                       imports: WebAssembly.Imports,\n\
+                   ): Promise<WebAssembly.WebAssemblyInstantiatedSource>;\n\
+               }};\n\
+         \n\
+         export const DEFAULT_WASM_PATH = \"{default_wasm_path}\";\n\
+         \n\
+         let readyPromise: Promise<void> | null = null;\n\
+         \n\
+         function assertWXWebAssembly(): void {{\n\
+             if (typeof WXWebAssembly === \"undefined\" || typeof WXWebAssembly.instantiate !== \"function\") {{\n\
+                 throw new Error(\"UniFFI Mini Program wasm init requires WXWebAssembly.instantiate(path, imports)\");\n\
+             }}\n\
+         }}\n\
+         \n\
+         export function init(wasmPath: string = DEFAULT_WASM_PATH): Promise<void> {{\n\
+             return initWithGlue(glue, wasmPath);\n\
+         }}\n\
+         \n\
+         export function initWithPath(wasmPath: string): Promise<void> {{\n\
+             return init(wasmPath);\n\
+         }}\n\
+         \n\
+         export function initWithGlue(customGlue: WasmBindgenGlue | Promise<WasmBindgenGlue>, wasmPath: string): Promise<void> {{\n\
+             assertWXWebAssembly();\n\
+             readyPromise ??= initBackend(customGlue, wasmPath);\n\
+             return readyPromise;\n\
+         }}\n",
+    );
+    std::fs::write(&entrypoint, source)
+        .with_context(|| format!("writing Mini Program auto-entrypoint {entrypoint}"))?;
+    Ok(())
+}
+
+pub(crate) fn mini_program_default_wasm_path(wasm_bindgen_stem: &str) -> String {
+    format!("/assets/{wasm_bindgen_stem}_bg.wasm")
 }
 
 fn relative_path_from_dir(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {

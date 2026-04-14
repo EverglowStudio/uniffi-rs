@@ -121,11 +121,6 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
         );
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!("SKIP cli_build_wasm_orchestrates_synthetic_fixture: wasm-bindgen CLI not found");
-        return;
-    };
-
     let root = workspace_root();
     build_uniffi_bindgen(&root, &cargo);
 
@@ -154,12 +149,6 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
         .arg(host_dir.as_str())
         .arg("--wasm-bindgen-out-dir")
         .arg(pkg_dir.as_str())
-        .arg("--wasm-bindgen-bin")
-        .arg(
-            Utf8PathBuf::from_path_buf(wasm_bindgen.clone())
-                .unwrap()
-                .as_str(),
-        )
         .output()
         .expect("failed to invoke uniffi-bindgen javascript build-wasm");
     if !output.status.success() {
