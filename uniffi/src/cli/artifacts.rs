@@ -48,7 +48,7 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     source: Option<Utf8PathBuf>,
 
-    /// Directory (default `rust_modules`, or `<package-dir>/target/uniffi-artifacts/rust` in managed mode) in which to emit generated host crates.
+    /// Directory (default `rust_modules`, or `<package-dir>/artifacts/rust` in managed mode) in which to emit generated host crates.
     #[clap(long = "host-crates-dir")]
     host_crates_dir: Option<Utf8PathBuf>,
 
@@ -56,7 +56,7 @@ pub(crate) struct BuildArgs {
     #[clap(long = "artifact-dir")]
     artifact_dir: Option<Utf8PathBuf>,
 
-    /// Opt in to a package-oriented JavaScript layout rooted at --package-dir.
+    /// Opt in to a package-oriented artifact layout rooted at --package-dir.
     #[clap(long = "managed-layout")]
     managed_layout: bool,
 
@@ -252,9 +252,6 @@ impl ManagedLayout {
             }
             return Ok(None);
         }
-        if targets.apple || targets.android {
-            bail!("--managed-layout currently supports JavaScript targets only");
-        }
         if args.out_dir.is_some() {
             bail!("--managed-layout derives --out-dir; omit --out-dir");
         }
@@ -273,20 +270,53 @@ impl ManagedLayout {
         if args.ohos_har_out.is_some() {
             bail!("--managed-layout derives --ohos-har-out; omit --ohos-har-out");
         }
+        if args.apple_xcframework_out.is_some() {
+            bail!("--managed-layout derives --apple-xcframework-out; omit --apple-xcframework-out");
+        }
+        if args.apple_swift_out.is_some() {
+            bail!("--managed-layout writes Swift sources under src/ffi; omit --apple-swift-out");
+        }
+        if args.android_jni_libs_out.is_some() {
+            bail!("--managed-layout derives --android-jni-libs-out; omit --android-jni-libs-out");
+        }
+        if args.android_kotlin_out.is_some() {
+            bail!(
+                "--managed-layout writes Kotlin sources under src/ffi; omit --android-kotlin-out"
+            );
+        }
 
         let package_dir = args
             .package_dir
             .clone()
             .unwrap_or_else(|| Utf8PathBuf::from("."));
         let package_dir = resolve_cwd_path(&package_dir)?;
-        let source_root = package_dir.join("src/generated/uniffi");
-        let artifact_root = package_dir.join("target/uniffi-artifacts/js");
-        let host_crates_root = package_dir.join("target/uniffi-artifacts/rust");
+        let meta = cargo_package_metadata(&args.manifest_path)?;
+        let source_root = package_dir.join("src/ffi");
+        let artifact_root = package_dir.join("artifacts");
+        let host_crates_root = artifact_root.join("rust");
         let manifest_path = package_dir.join("artifact-manifest.json");
 
         args.out_dir = Some(source_root.clone());
         args.host_crates_dir = Some(host_crates_root.clone());
         args.artifact_dir = Some(artifact_root.clone());
+        if targets.harmony {
+            let harmony_package = args
+                .ohos_package_name
+                .clone()
+                .unwrap_or_else(|| format!("{}-ohos", meta.package_name));
+            args.ohos_dist_dir = Some(artifact_root.join("harmony/dist"));
+            args.ohos_har_out = Some(artifact_root.join(format!("harmony/{harmony_package}.har")));
+        }
+        if targets.apple {
+            args.apple_xcframework_out = Some(
+                artifact_root
+                    .join("apple")
+                    .join(format!("{}.xcframework", meta.lib_target_name)),
+            );
+        }
+        if targets.android {
+            args.android_jni_libs_out = Some(artifact_root.join("android/jniLibs"));
+        }
 
         Ok(Some(Self {
             package_dir,
@@ -309,6 +339,10 @@ impl ManagedLayout {
         if targets.node {
             self.emit_node_entrypoint()?;
         }
+        if targets.electron {
+            self.emit_electron_entrypoint()?;
+        }
+        self.emit_gitignore()?;
         self.emit_manifest(targets, meta, args)?;
         Ok(())
     }
@@ -330,6 +364,16 @@ impl ManagedLayout {
             &self.source_root.join("node/index.ts"),
             &self.source_root.join("common/public-types.ts"),
             "node",
+        )
+    }
+
+    fn emit_electron_entrypoint(&self) -> Result<()> {
+        let entrypoint = self.package_dir.join("src/index.electron.ts");
+        self.write_entrypoint(
+            &entrypoint,
+            &self.source_root.join("electron/renderer.ts"),
+            &self.source_root.join("common/public-types.ts"),
+            "electron",
         )
     }
 
@@ -359,6 +403,38 @@ impl ManagedLayout {
         Ok(())
     }
 
+    fn emit_gitignore(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.package_dir)
+            .with_context(|| format!("creating managed package dir {}", self.package_dir))?;
+        let gitignore = self.package_dir.join(".gitignore");
+        let block = "\
+# UniFFI generated build artifacts\n\
+/artifacts/\n\
+/target/\n\
+node_modules/\n\
+*.node\n\
+*.wasm\n\
+*.har\n\
+*.xcframework\n\
+*.so\n\
+*.dylib\n\
+*.dll\n\
+*.a\n";
+        if gitignore.exists() {
+            let existing = std::fs::read_to_string(&gitignore)
+                .with_context(|| format!("reading managed .gitignore {gitignore}"))?;
+            if !existing.contains("# UniFFI generated build artifacts") {
+                let separator = if existing.ends_with('\n') { "" } else { "\n" };
+                std::fs::write(&gitignore, format!("{existing}{separator}\n{block}"))
+                    .with_context(|| format!("updating managed .gitignore {gitignore}"))?;
+            }
+        } else {
+            std::fs::write(&gitignore, block)
+                .with_context(|| format!("writing managed .gitignore {gitignore}"))?;
+        }
+        Ok(())
+    }
+
     fn emit_manifest(
         &self,
         targets: &ExpandedTargets,
@@ -373,23 +449,25 @@ impl ManagedLayout {
             .clone()
             .unwrap_or_else(|| format!("{}-ohos", meta.package_name));
         let manifest = serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "generator": "uniffi-bindgen-javascript",
             "namespace": namespace,
             "targets": self.manifest_targets(targets),
             "source": {
                 "root": self.rel(&self.source_root)?,
-                "common": self.rel(&self.source_root.join("common"))?,
+                "common": if self.has_js(targets) { serde_json::Value::String(self.rel(&self.source_root.join("common"))?) } else { serde_json::Value::Null },
                 "browser": if targets.wasm { serde_json::Value::String(self.rel(&self.source_root.join("browser"))?) } else { serde_json::Value::Null },
                 "node": if targets.node { serde_json::Value::String(self.rel(&self.source_root.join("node"))?) } else { serde_json::Value::Null },
                 "electron": if targets.electron { serde_json::Value::String(self.rel(&self.source_root.join("electron"))?) } else { serde_json::Value::Null },
                 "harmony": if targets.harmony { serde_json::Value::String(self.rel(&self.source_root.join("harmony"))?) } else { serde_json::Value::Null },
-                "publicTypes": self.rel(&self.source_root.join("common/public-types.ts"))?,
+                "swift": if targets.apple { serde_json::Value::String(self.rel(&self.source_root.join("swift"))?) } else { serde_json::Value::Null },
+                "kotlin": if targets.android { serde_json::Value::String(self.rel(&self.source_root.join("kotlin"))?) } else { serde_json::Value::Null },
+                "publicTypes": if self.has_js(targets) { serde_json::Value::String(self.rel(&self.source_root.join("common/public-types.ts"))?) } else { serde_json::Value::Null },
             },
             "entrypoints": {
                 "web": if targets.wasm { serde_json::Value::String("src/index.web.ts".to_string()) } else { serde_json::Value::Null },
                 "node": if targets.node { serde_json::Value::String("src/index.node.ts".to_string()) } else { serde_json::Value::Null },
-                "electron": serde_json::Value::Null,
+                "electron": if targets.electron { serde_json::Value::String("src/index.electron.ts".to_string()) } else { serde_json::Value::Null },
                 "harmony": serde_json::Value::Null,
             },
             "artifacts": {
@@ -414,9 +492,20 @@ impl ManagedLayout {
                 } else { serde_json::Value::Null },
                 "harmony": if targets.harmony {
                     serde_json::json!({
-                        "har": self.rel(&self.artifact_root.join(format!("ohos/{harmony_package}.har")))?,
-                        "dist": self.rel(&self.artifact_root.join("ohos/dist"))?,
-                        "package": self.rel(&self.artifact_root.join("ohos/package"))?,
+                        "har": self.rel(&self.artifact_root.join(format!("harmony/{harmony_package}.har")))?,
+                        "dist": self.rel(&self.artifact_root.join("harmony/dist"))?,
+                        "package": self.rel(&self.artifact_root.join("harmony/package"))?,
+                    })
+                } else { serde_json::Value::Null },
+                "apple": if targets.apple {
+                    serde_json::json!({
+                        "xcframework": self.rel(args.apple_xcframework_out.as_ref().expect("managed apple path derived"))?,
+                    })
+                } else { serde_json::Value::Null },
+                "android": if targets.android {
+                    serde_json::json!({
+                        "jniLibs": self.rel(args.android_jni_libs_out.as_ref().expect("managed android path derived"))?,
+                        "aar": args.android_aar_out.as_ref().map(|p| self.rel(p)).transpose()?,
                     })
                 } else { serde_json::Value::Null },
             },
@@ -432,6 +521,10 @@ impl ManagedLayout {
         Ok(())
     }
 
+    fn has_js(&self, targets: &ExpandedTargets) -> bool {
+        targets.wasm || targets.node || targets.electron || targets.harmony
+    }
+
     fn manifest_targets(&self, targets: &ExpandedTargets) -> Vec<&'static str> {
         let mut out = Vec::new();
         if targets.wasm {
@@ -445,6 +538,12 @@ impl ManagedLayout {
         }
         if targets.harmony {
             out.push("harmony");
+        }
+        if targets.apple {
+            out.push("apple");
+        }
+        if targets.android {
+            out.push("android");
         }
         out
     }
@@ -1382,6 +1481,26 @@ mod tests {
         .unwrap()
     }
 
+    fn write_test_manifest(package_dir: &Utf8Path) -> Utf8PathBuf {
+        let src_dir = package_dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("lib.rs"), "pub fn marker() {}\n").unwrap();
+        let manifest = package_dir.join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            r#"[package]
+name = "uni-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "uni_core"
+"#,
+        )
+        .unwrap();
+        manifest
+    }
+
     #[test]
     fn expands_all_js_targets() {
         assert_eq!(
@@ -1436,45 +1555,72 @@ mod tests {
     fn managed_layout_derives_package_paths() {
         let mut args = empty_build_args();
         let package_dir = unique_tmp_dir("managed-layout-derive");
-        args.managed_layout = true;
-        args.package_dir = Some(package_dir.clone());
-        args.out_dir = None;
-        args.target = vec![ArtifactTargetArg::Wasm, ArtifactTargetArg::Node];
-
-        let targets = expand_targets(&args.target).unwrap();
-        let layout = ManagedLayout::apply(&mut args, &targets)
-            .unwrap()
-            .expect("managed layout should resolve");
-
-        assert_eq!(
-            args.out_dir.unwrap(),
-            package_dir.join("src/generated/uniffi")
-        );
-        assert_eq!(
-            args.host_crates_dir.unwrap(),
-            package_dir.join("target/uniffi-artifacts/rust")
-        );
-        assert_eq!(
-            args.artifact_dir.unwrap(),
-            package_dir.join("target/uniffi-artifacts/js")
-        );
-        assert_eq!(
-            layout.manifest_path,
-            package_dir.join("artifact-manifest.json")
-        );
-    }
-
-    #[test]
-    fn managed_layout_emits_entries_and_relative_manifest() {
-        let mut args = empty_build_args();
-        let package_dir = unique_tmp_dir("managed-layout-manifest");
+        args.manifest_path = write_test_manifest(&package_dir);
         args.managed_layout = true;
         args.package_dir = Some(package_dir.clone());
         args.out_dir = None;
         args.target = vec![
             ArtifactTargetArg::Wasm,
             ArtifactTargetArg::Node,
+            ArtifactTargetArg::Electron,
             ArtifactTargetArg::Harmony,
+            ArtifactTargetArg::Apple,
+            ArtifactTargetArg::Android,
+        ];
+
+        let targets = expand_targets(&args.target).unwrap();
+        let layout = ManagedLayout::apply(&mut args, &targets)
+            .unwrap()
+            .expect("managed layout should resolve");
+
+        assert_eq!(args.out_dir.as_ref().unwrap(), &package_dir.join("src/ffi"));
+        assert_eq!(
+            args.host_crates_dir.as_ref().unwrap(),
+            &package_dir.join("artifacts/rust")
+        );
+        assert_eq!(
+            args.artifact_dir.as_ref().unwrap(),
+            &package_dir.join("artifacts")
+        );
+        assert_eq!(
+            args.ohos_dist_dir.as_ref().unwrap(),
+            &package_dir.join("artifacts/harmony/dist")
+        );
+        assert_eq!(
+            args.ohos_har_out.as_ref().unwrap(),
+            &package_dir.join("artifacts/harmony/uni-core-ohos.har")
+        );
+        assert_eq!(
+            args.apple_xcframework_out.as_ref().unwrap(),
+            &package_dir.join("artifacts/apple/uni_core.xcframework")
+        );
+        assert_eq!(
+            args.android_jni_libs_out.as_ref().unwrap(),
+            &package_dir.join("artifacts/android/jniLibs")
+        );
+        assert_eq!(
+            layout.manifest_path,
+            package_dir.join("artifact-manifest.json")
+        );
+
+        let _ = std::fs::remove_dir_all(package_dir.as_std_path());
+    }
+
+    #[test]
+    fn managed_layout_emits_entries_and_relative_manifest() {
+        let mut args = empty_build_args();
+        let package_dir = unique_tmp_dir("managed-layout-manifest");
+        args.manifest_path = write_test_manifest(&package_dir);
+        args.managed_layout = true;
+        args.package_dir = Some(package_dir.clone());
+        args.out_dir = None;
+        args.target = vec![
+            ArtifactTargetArg::Wasm,
+            ArtifactTargetArg::Node,
+            ArtifactTargetArg::Electron,
+            ArtifactTargetArg::Harmony,
+            ArtifactTargetArg::Apple,
+            ArtifactTargetArg::Android,
         ];
 
         let targets = expand_targets(&args.target).unwrap();
@@ -1489,12 +1635,24 @@ mod tests {
         layout.emit(&targets, &meta, &args).unwrap();
 
         let web = std::fs::read_to_string(package_dir.join("src/index.web.ts")).unwrap();
-        assert!(web.contains("export * from \"./generated/uniffi/browser/index.web.ts\";"));
-        assert!(web.contains("export type * from \"./generated/uniffi/common/public-types.ts\";"));
+        assert!(web.contains("export * from \"./ffi/browser/index.web.ts\";"));
+        assert!(web.contains("export type * from \"./ffi/common/public-types.ts\";"));
 
         let node = std::fs::read_to_string(package_dir.join("src/index.node.ts")).unwrap();
-        assert!(node.contains("export * from \"./generated/uniffi/node/index.ts\";"));
-        assert!(node.contains("export type * from \"./generated/uniffi/common/public-types.ts\";"));
+        assert!(node.contains("export * from \"./ffi/node/index.ts\";"));
+        assert!(node.contains("export type * from \"./ffi/common/public-types.ts\";"));
+
+        let electron = std::fs::read_to_string(package_dir.join("src/index.electron.ts")).unwrap();
+        assert!(electron.contains("export * from \"./ffi/electron/renderer.ts\";"));
+        assert!(electron.contains("export type * from \"./ffi/common/public-types.ts\";"));
+
+        let gitignore = std::fs::read_to_string(package_dir.join(".gitignore")).unwrap();
+        assert!(gitignore.contains("# UniFFI generated build artifacts"));
+        assert!(gitignore.contains("/artifacts/"));
+        assert!(
+            !gitignore.contains("src/ffi"),
+            "FFI source must be reviewable and not ignored:\n{gitignore}"
+        );
 
         let manifest_text =
             std::fs::read_to_string(package_dir.join("artifact-manifest.json")).unwrap();
@@ -1503,23 +1661,36 @@ mod tests {
             "manifest must not contain absolute package paths:\n{manifest_text}"
         );
         let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
-        assert_eq!(manifest["schemaVersion"], 1);
+        assert_eq!(manifest["schemaVersion"], 2);
         assert_eq!(manifest["namespace"], "uni_core");
         assert_eq!(
             manifest["targets"],
-            serde_json::json!(["wasm", "node", "harmony"])
+            serde_json::json!(["wasm", "node", "electron", "harmony", "apple", "android"])
         );
+        assert_eq!(manifest["source"]["root"], "src/ffi");
+        assert_eq!(manifest["source"]["common"], "src/ffi/common");
+        assert_eq!(manifest["source"]["swift"], "src/ffi/swift");
+        assert_eq!(manifest["source"]["kotlin"], "src/ffi/kotlin");
+        assert_eq!(manifest["entrypoints"]["electron"], "src/index.electron.ts");
         assert_eq!(
             manifest["artifacts"]["wasm"]["glue"],
-            "target/uniffi-artifacts/js/browser/pkg/uni_core_wasm.js"
+            "artifacts/browser/pkg/uni_core_wasm.js"
         );
         assert_eq!(
             manifest["artifacts"]["harmony"]["har"],
-            "target/uniffi-artifacts/js/ohos/uni-core-ohos.har"
+            "artifacts/harmony/uni-core-ohos.har"
+        );
+        assert_eq!(
+            manifest["artifacts"]["apple"]["xcframework"],
+            "artifacts/apple/uni_core.xcframework"
+        );
+        assert_eq!(
+            manifest["artifacts"]["android"]["jniLibs"],
+            "artifacts/android/jniLibs"
         );
         assert_eq!(
             manifest["hostCrates"]["ohos"],
-            "target/uniffi-artifacts/rust/ohos/Cargo.toml"
+            "artifacts/rust/ohos/Cargo.toml"
         );
 
         let _ = std::fs::remove_dir_all(package_dir.as_std_path());
