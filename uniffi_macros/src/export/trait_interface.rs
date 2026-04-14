@@ -3,8 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{quote, quote_spanned};
-use syn::ItemTrait;
+use quote::{quote, quote_spanned, ToTokens};
+use syn::{Attribute, ItemTrait};
 
 use uniffi_meta::{ObjectImpl, TraitKind};
 
@@ -14,7 +14,10 @@ use crate::{
     },
     ffiops,
     object::interface_meta_static_var,
-    util::{ident_to_string, tagged_impl_header, wasm_single_threaded_annotation},
+    util::{
+        async_trait_annotation, ident_to_string, tagged_impl_header,
+        wasm_single_threaded_annotation,
+    },
 };
 
 pub(super) fn gen_trait_scaffolding(
@@ -272,8 +275,11 @@ pub fn alter_trait(item: &ItemTrait) -> TokenStream {
         items,
         ..
     } = item;
+    let async_trait_attr =
+        (has_async_method(item) && !has_async_trait_attr(attrs)).then(async_trait_annotation);
 
     quote! {
+        #async_trait_attr
         #(#attrs)*
         #vis #unsafety #auto_token #trait_token #ident #generics #colon_token #supertraits {
             #(#items)*
@@ -283,5 +289,104 @@ pub fn alter_trait(item: &ItemTrait) -> TokenStream {
                 ::std::option::Option::None
             }
         }
+    }
+}
+
+fn has_async_method(item: &ItemTrait) -> bool {
+    item.items
+        .iter()
+        .any(|item| matches!(item, syn::TraitItem::Fn(method) if method.sig.asyncness.is_some()))
+}
+
+fn has_async_trait_attr(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(attr_mentions_async_trait)
+}
+
+fn attr_mentions_async_trait(attr: &Attribute) -> bool {
+    if attr
+        .path()
+        .segments
+        .iter()
+        .any(|segment| segment.ident == "async_trait")
+    {
+        return true;
+    }
+    attr.path().is_ident("cfg_attr")
+        && attr
+            .meta
+            .to_token_stream()
+            .to_string()
+            .contains("async_trait")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    #[test]
+    fn alter_trait_injects_async_trait_for_async_methods() {
+        let item: ItemTrait = syn::parse_quote! {
+            pub trait AsyncFormatter: Send + Sync {
+                async fn format(&self, value: String) -> String;
+            }
+        };
+
+        let tokens = alter_trait(&item).to_string();
+
+        assert!(tokens.contains("async_trait"));
+        assert!(tokens.contains("uniffi_foreign_handle"));
+    }
+
+    #[test]
+    fn alter_trait_does_not_inject_async_trait_for_sync_traits() {
+        let item: ItemTrait = syn::parse_quote! {
+            pub trait Formatter: Send + Sync {
+                fn format(&self, value: String) -> String;
+            }
+        };
+
+        let tokens = alter_trait(&item).to_string();
+
+        assert!(!tokens.contains("async_trait"));
+        assert!(tokens.contains("uniffi_foreign_handle"));
+    }
+
+    #[test]
+    fn detects_explicit_async_trait_attributes() {
+        let item: ItemTrait = syn::parse_quote! {
+            #[async_trait::async_trait(?Send)]
+            pub trait AsyncFormatter: Send + Sync {
+                async fn format(&self, value: String) -> String;
+            }
+        };
+
+        assert!(has_async_trait_attr(&item.attrs));
+    }
+
+    #[test]
+    fn detects_cfg_attr_async_trait_attributes() {
+        let item: ItemTrait = syn::parse_quote! {
+            #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+            pub trait AsyncFormatter: Send + Sync {
+                async fn format(&self, value: String) -> String;
+            }
+        };
+
+        assert!(has_async_trait_attr(&item.attrs));
+    }
+
+    #[test]
+    fn explicit_async_trait_is_not_duplicated() {
+        let item: ItemTrait = syn::parse_quote! {
+            #[async_trait::async_trait]
+            pub trait AsyncFormatter: Send + Sync {
+                async fn format(&self, value: String) -> String;
+            }
+        };
+
+        let tokens = alter_trait(&item).to_string();
+
+        assert_eq!(tokens.matches(&quote!(async_trait).to_string()).count(), 2);
     }
 }
