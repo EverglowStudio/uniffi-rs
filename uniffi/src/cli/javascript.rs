@@ -1086,10 +1086,94 @@ fn patch_mini_program_wasm_bindgen_glue(source: &str, wasm_bindgen_stem: &str) -
     );
     let patched = replace_js_function(source, "async function __wbg_init", &replacement)
         .context("patching wasm-bindgen __wbg_init for Mini Program")?;
-    Ok(patched.replace(
+    let patched = patched.replace(
         "const ret = typeof window === 'undefined' ? null : window;",
         "const ret = null;",
-    ))
+    );
+    Ok(patch_mini_program_text_encoding(&patched))
+}
+
+fn patch_mini_program_text_encoding(source: &str) -> String {
+    let patched = source
+        .replace("new TextDecoder(", "new __uniffiTextDecoder(")
+        .replace("new TextEncoder(", "new __uniffiTextEncoder(");
+    format!("{}\n{}", mini_program_text_encoding_prelude(), patched)
+}
+
+fn mini_program_text_encoding_prelude() -> &'static str {
+    r#"const __uniffiMiniProgramGlobal = typeof globalThis !== "undefined" ? globalThis : {};
+const __uniffiTextDecoder = __uniffiMiniProgramGlobal.TextDecoder ?? class {
+    decode(input) {
+        if (input === undefined) return "";
+        const bytes = input instanceof Uint8Array
+            ? input
+            : ArrayBuffer.isView(input)
+                ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+                : new Uint8Array(input);
+        let out = "";
+        for (let i = 0; i < bytes.length;) {
+            const b0 = bytes[i++];
+            if (b0 < 0x80) {
+                out += String.fromCharCode(b0);
+                continue;
+            }
+            if ((b0 & 0xe0) === 0xc0 && i < bytes.length) {
+                const b1 = bytes[i++] & 0x3f;
+                out += String.fromCharCode(((b0 & 0x1f) << 6) | b1);
+                continue;
+            }
+            if ((b0 & 0xf0) === 0xe0 && i + 1 < bytes.length) {
+                const b1 = bytes[i++] & 0x3f;
+                const b2 = bytes[i++] & 0x3f;
+                out += String.fromCharCode(((b0 & 0x0f) << 12) | (b1 << 6) | b2);
+                continue;
+            }
+            if ((b0 & 0xf8) === 0xf0 && i + 2 < bytes.length) {
+                const b1 = bytes[i++] & 0x3f;
+                const b2 = bytes[i++] & 0x3f;
+                const b3 = bytes[i++] & 0x3f;
+                let cp = ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3;
+                cp -= 0x10000;
+                out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+                continue;
+            }
+            out += "\ufffd";
+        }
+        return out;
+    }
+};
+const __uniffiTextEncoder = __uniffiMiniProgramGlobal.TextEncoder ?? class {
+    encode(input = "") {
+        const bytes = [];
+        const text = String(input);
+        for (let i = 0; i < text.length; i += 1) {
+            let cp = text.charCodeAt(i);
+            if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < text.length) {
+                const next = text.charCodeAt(i + 1);
+                if (next >= 0xdc00 && next <= 0xdfff) {
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (next - 0xdc00);
+                    i += 1;
+                }
+            }
+            if (cp < 0x80) {
+                bytes.push(cp);
+            } else if (cp < 0x800) {
+                bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+            } else if (cp < 0x10000) {
+                bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+            } else {
+                bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+            }
+        }
+        return new Uint8Array(bytes);
+    }
+    encodeInto(input, view) {
+        const bytes = this.encode(input);
+        const written = Math.min(bytes.length, view.length);
+        view.set(bytes.subarray(0, written));
+        return { read: String(input).length, written };
+    }
+};"#
 }
 
 fn replace_js_function(source: &str, signature_start: &str, replacement: &str) -> Result<String> {
