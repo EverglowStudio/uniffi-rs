@@ -749,6 +749,7 @@ impl ComponentInterface {
         let iterator = self
             .iter_user_ffi_function_definitions()
             .cloned()
+            .chain(self.iter_stream_ffi_function_definitions())
             .chain(self.iter_rust_buffer_ffi_function_definitions())
             .chain(self.iter_futures_ffi_function_definitions());
 
@@ -807,6 +808,39 @@ impl ComponentInterface {
                     .flat_map(|r| r.iter_ffi_function_definitions()),
             )
             .chain(self.functions.iter().map(|f| &f.ffi_func))
+    }
+
+    /// List synthetic FFI function definitions for Rust streams returned by top-level functions.
+    fn iter_stream_ffi_function_definitions(&self) -> impl Iterator<Item = FfiFunction> + '_ {
+        self.functions.iter().flat_map(|func| {
+            let Some(Type::Stream { .. }) = func.return_type() else {
+                return Vec::new();
+            };
+            vec![
+                FfiFunction {
+                    name: func.ffi_stream_next_func(),
+                    is_async: true,
+                    arguments: vec![FfiArgument {
+                        name: "handle".to_owned(),
+                        type_: FfiType::Handle,
+                    }],
+                    return_type: Some(FfiType::Handle),
+                    has_rust_call_status_arg: false,
+                    is_object_free_function: false,
+                },
+                FfiFunction {
+                    name: func.ffi_stream_cancel_func(),
+                    is_async: false,
+                    arguments: vec![FfiArgument {
+                        name: "handle".to_owned(),
+                        type_: FfiType::Handle,
+                    }],
+                    return_type: None,
+                    has_rust_call_status_arg: false,
+                    is_object_free_function: false,
+                },
+            ]
+        })
     }
 
     /// List all FFI functions definitions for RustBuffer functionality.
@@ -948,6 +982,15 @@ impl ComponentInterface {
         self.types
             .add_known_types(defn.iter_types())
             .with_context(|| format!("adding function {defn:?}"))?;
+        if let Some(Type::Stream { item_type, .. }) = defn.return_type() {
+            self.types
+                .add_known_type(&Type::Optional {
+                    inner_type: Box::new((**item_type).clone()),
+                })
+                .with_context(|| {
+                    format!("adding stream next optional item type for function {defn:?}")
+                })?;
+        }
         defn.throws_name()
             .map(|n| self.errors.insert(n.to_string()));
         self.functions.push(defn);
