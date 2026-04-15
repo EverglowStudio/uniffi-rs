@@ -406,6 +406,9 @@ fn emit_value_module_imports(
     if usage.needs_to_u64 {
         runtime.push("toU64");
     }
+    if usage.needs_input_stream {
+        runtime.push("createUniffiInputStream");
+    }
     if !runtime.is_empty() {
         out.push_str(&format!(
             "import {{ {} }} from \"./runtime.ts\";\n",
@@ -930,6 +933,9 @@ fn render_objects(ci: &ComponentInterface, config: &JsConfig) -> String {
     if usage.needs_from_u64 {
         runtime.push("fromU64");
     }
+    if usage.needs_input_stream {
+        runtime.push("createUniffiInputStream");
+    }
     out.push_str(&format!(
         "import {{ {} }} from \"./runtime.ts\";\n",
         runtime.join(", ")
@@ -1173,6 +1179,9 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
     }
     if usage.needs_stream {
         runtime.push("createUniffiAsyncIterable");
+    }
+    if usage.needs_input_stream {
+        runtime.push("createUniffiInputStream");
     }
     if !runtime.is_empty() {
         out.push_str(&format!(
@@ -1444,6 +1453,22 @@ fn ts_lower_expr(
             }
             None => ts_lower_expr(ci, config, builtin, ident, depth + 1),
         },
+        Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => {
+            let value = format!("__uniffiInputValue{depth}");
+            let error = format!("__uniffiInputError{depth}");
+            let lowered_value =
+                ts_arrow_expr_body(ts_lower_expr(ci, config, item_type, &value, depth + 1));
+            let lowered_error =
+                ts_arrow_expr_body(ts_lower_expr(ci, config, error_type, &error, depth + 1));
+            let error_shape = input_stream_error_shape(ci, error_type);
+            format!(
+                "createUniffiInputStream({ident}, {{ lowerItem: ({value}: any) => {lowered_value}, lowerError: ({error}: unknown) => {lowered_error}, errorShape: \"{error_shape}\" }})"
+            )
+        }
         // Callback traits / `with_foreign` traits are lowered as a
         // tagged marker. Each backend adapter intercepts the marker and
         // translates it into whatever its native layer wants:
@@ -1652,6 +1677,24 @@ fn ts_arrow_expr_body(expr: String) -> String {
     }
 }
 
+fn input_stream_error_shape(ci: &ComponentInterface, error_type: &Type) -> &'static str {
+    match error_type {
+        Type::Enum { name, .. } => ci
+            .enum_definitions()
+            .iter()
+            .find(|enum_| enum_.name() == name)
+            .filter(|enum_| {
+                enum_
+                    .variants()
+                    .iter()
+                    .all(|variant| variant.fields().is_empty())
+            })
+            .map(|_| "flat")
+            .unwrap_or("shape"),
+        _ => "shape",
+    }
+}
+
 /// Map a uniffi `Type` to its TypeScript surface type. `i64`/`u64` are
 /// surfaced as `bigint` — the 64-bit integer contract is bigint-first
 /// so there is no silent precision loss for values beyond
@@ -1730,6 +1773,7 @@ struct Usage {
     needs_from_i64: bool,
     needs_from_u64: bool,
     needs_stream: bool,
+    needs_input_stream: bool,
     /// Every named type (record/enum/error/object/callback/trait) touched.
     named: BTreeSet<String>,
     /// Object names appearing as return types — their class value (not
@@ -1793,9 +1837,14 @@ impl Usage {
                 self.needs_stream = true;
                 self.see(item_type, pos, config);
             }
-            Type::InputStream { item_type, .. } => {
-                self.needs_stream = true;
+            Type::InputStream {
+                item_type,
+                error_type,
+                ..
+            } => {
+                self.needs_input_stream = true;
                 self.see(item_type, pos, config);
+                self.see(error_type, pos, config);
             }
             _ => {}
         }
@@ -2149,8 +2198,19 @@ fn collect_custom_types(ty: &Type, config: &JsConfig, customs: &mut BTreeSet<(St
             }
             collect_custom_types(builtin, config, customs);
         }
-        Type::Optional { inner_type } | Type::Sequence { inner_type } => {
-            collect_custom_types(inner_type, config, customs)
+        Type::Optional { inner_type }
+        | Type::Sequence { inner_type }
+        | Type::Stream {
+            item_type: inner_type,
+            ..
+        } => collect_custom_types(inner_type, config, customs),
+        Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => {
+            collect_custom_types(item_type, config, customs);
+            collect_custom_types(error_type, config, customs);
         }
         Type::Map {
             key_type,
@@ -2429,8 +2489,19 @@ fn collect_public_customs(
             }
             collect_public_customs(ci, config, builtin, out, seen_named);
         }
-        Type::Optional { inner_type } | Type::Sequence { inner_type } => {
-            collect_public_customs(ci, config, inner_type, out, seen_named)
+        Type::Optional { inner_type }
+        | Type::Sequence { inner_type }
+        | Type::Stream {
+            item_type: inner_type,
+            ..
+        } => collect_public_customs(ci, config, inner_type, out, seen_named),
+        Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => {
+            collect_public_customs(ci, config, item_type, out, seen_named);
+            collect_public_customs(ci, config, error_type, out, seen_named);
         }
         Type::Map {
             key_type,
