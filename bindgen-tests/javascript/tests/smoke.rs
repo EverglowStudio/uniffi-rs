@@ -3948,6 +3948,129 @@ console.log("ok");
 }
 
 #[test]
+fn harmony_stream_fallback_static_and_runtime_contract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(fixture) = build_stream_fixture(tmp.path()) else {
+        return;
+    };
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    generate_stream_tree(&fixture, &out_dir, None, vec![FlavorTarget::Harmony]);
+
+    let index = std::fs::read_to_string(out_dir.join("harmony/index.ts")).unwrap();
+    assert!(
+        index.contains("export * from \"./stream.ts\";"),
+        "harmony index should re-export stream fallback helpers:\n{index}"
+    );
+
+    let stream = std::fs::read_to_string(out_dir.join("harmony/stream.ts")).unwrap();
+    for needle in [
+        "export interface UniFfiStream<T>",
+        "next(): Promise<IteratorResult<T>>;",
+        "cancel(): Promise<void>;",
+        "export function toUniFfiStream<T>(source: AsyncIterable<T>): UniFfiStream<T>",
+        "source[Symbol.asyncIterator]()",
+        "returnFn.call(iterator)",
+        "export function countEventsStream(count: number): UniFfiStream<StreamEvent>",
+        "return toUniFfiStream(countEvents(count));",
+        "export function errorAfterOneStream(): UniFfiStream<StreamEvent>",
+        "import type { StreamEvent } from \"../common/public-types.ts\";",
+    ] {
+        assert!(
+            stream.contains(needle),
+            "harmony stream helper missing `{needle}`:\n{stream}"
+        );
+    }
+    assert!(
+        !stream.contains("unknown") && !contains_dynamic_type_word(&stream),
+        "harmony stream helper should avoid explicit any/unknown:\n{stream}"
+    );
+    assert!(
+        !stream.contains("__call") && !stream.contains("_stream_next"),
+        "harmony fallback should not expose raw stream ABI keys:\n{stream}"
+    );
+
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("skipping harmony stream runtime driver: node with --experimental-strip-types not available");
+        return;
+    };
+    std::fs::write(
+        out_dir.join("harmony-stream-driver.ts"),
+        r#"
+import { toUniFfiStream } from "./harmony/stream.ts";
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+let returnCount = 0;
+const source = {
+  [Symbol.asyncIterator](): AsyncIterator<number> {
+    let nextValue = 0;
+    return {
+      async next(): Promise<IteratorResult<number>> {
+        if (nextValue >= 3) return { done: true, value: undefined as number };
+        return { done: false, value: nextValue++ };
+      },
+      async return(): Promise<IteratorResult<number>> {
+        returnCount += 1;
+        return { done: true, value: undefined as number };
+      },
+    };
+  },
+};
+
+const stream = toUniFfiStream(source);
+const one = await stream.next();
+assert(one.done === false && one.value === 0, "first next");
+await stream.cancel();
+await stream.cancel();
+assert(returnCount === 1, `cancel idempotent ${returnCount}`);
+const afterCancel = await stream.next();
+assert(afterCancel.done === true, "next after cancel done");
+
+let threw = false;
+const bad = toUniFfiStream({
+  [Symbol.asyncIterator](): AsyncIterator<number> {
+    return {
+      async next(): Promise<IteratorResult<number>> {
+        throw new Error("boom");
+      },
+    };
+  },
+});
+try {
+  await bad.next();
+} catch (error) {
+  threw = error instanceof Error && error.message === "boom";
+}
+assert(threw, "error rejection propagates");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("harmony-stream-driver.ts")
+        .current_dir(&out_dir)
+        .output()
+        .expect("failed to run harmony stream driver");
+    assert!(
+        output.status.success(),
+        "harmony stream driver failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "harmony stream driver did not print ok"
+    );
+}
+
+#[test]
 fn host_crates_napi_runs_stream_fixture() {
     let Some(node) = locate_node_with_strip_types() else {
         eprintln!("SKIP host_crates_napi_runs_stream_fixture: node 22.6+ unavailable");
