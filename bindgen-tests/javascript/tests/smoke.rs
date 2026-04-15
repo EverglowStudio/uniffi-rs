@@ -3773,6 +3773,10 @@ fn js_async_iterable_stream_stub_contract() {
             "common/api.ts should expose stream async iterable contract via `{needle}`:\n{api}"
         );
     }
+    assert!(
+        !api.contains("StreamError"),
+        "common/api.ts should not import unused stream error types:\n{api}"
+    );
     let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
     assert!(
         backend.contains("\"count_events_stream_next\": \"countEventsStreamNext\"")
