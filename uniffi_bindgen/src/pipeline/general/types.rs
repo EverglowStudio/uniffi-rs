@@ -68,6 +68,15 @@ pub fn canonical_name(ty: &Type) -> String {
             canonical_name(item_type),
             canonical_name(error_type),
         ),
+        Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => format!(
+            "InputStream{}{}",
+            canonical_name(item_type),
+            canonical_name(error_type),
+        ),
     }
 }
 
@@ -124,6 +133,15 @@ pub fn map_type(mut ty: Type, context: &Context) -> Result<Type> {
             error_type,
             is_send,
         } => Type::Stream {
+            item_type: Box::new(map_type(*item_type, context)?),
+            error_type: Box::new(map_type(*error_type, context)?),
+            is_send,
+        },
+        Type::InputStream {
+            item_type,
+            error_type,
+            is_send,
+        } => Type::InputStream {
             item_type: Box::new(map_type(*item_type, context)?),
             error_type: Box::new(map_type(*error_type, context)?),
             is_send,
@@ -197,6 +215,31 @@ mod tests {
         assert_eq!(
             type_node.ty,
             Type::Stream {
+                item_type: Box::new(Type::UInt32),
+                error_type: Box::new(Type::String),
+                is_send: true,
+            }
+        );
+    }
+
+    #[test]
+    fn maps_input_stream_type_into_general_ir() {
+        let context = Context::new("test");
+        let stream_type = Type::InputStream {
+            item_type: Box::new(Type::UInt32),
+            error_type: Box::new(Type::String),
+            is_send: true,
+        };
+
+        let type_node: TypeNode = stream_type.map_node(&context).unwrap();
+        assert_eq!(type_node.canonical_name, "InputStreamUInt32String");
+        assert_eq!(
+            type_node.ffi_type,
+            FfiType::Handle(HandleKind::ForeignStream)
+        );
+        assert_eq!(
+            type_node.ty,
+            Type::InputStream {
                 item_type: Box::new(Type::UInt32),
                 error_type: Box::new(Type::String),
                 is_send: true,

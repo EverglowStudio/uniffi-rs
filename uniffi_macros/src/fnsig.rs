@@ -165,6 +165,19 @@ impl FnSignature {
                 })
             })
             .collect::<syn::Result<Vec<_>>>()?;
+        let has_input_stream_arg = args.iter().any(|arg| arg.input_stream.is_some());
+        if has_input_stream_arg && !matches!(&kind, FnKind::Function) {
+            return Err(syn::Error::new(
+                span,
+                "input stream parameters are currently only supported for top-level functions",
+            ));
+        }
+        if has_input_stream_arg && stream_return.is_some() {
+            return Err(syn::Error::new(
+                span,
+                "bidirectional streams are not supported yet",
+            ));
+        }
 
         if let Some(ident) = export_fn_args.defaults.idents().first() {
             return Err(syn::Error::new(
@@ -464,6 +477,13 @@ pub(crate) struct StreamReturnType {
     pub(crate) is_send: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InputStreamArgType {
+    pub(crate) item_ty: TokenStream,
+    pub(crate) error_ty: TokenStream,
+    pub(crate) is_send: bool,
+}
+
 pub(crate) struct Arg {
     pub(crate) span: Span,
     pub(crate) kind: ArgKind,
@@ -521,11 +541,22 @@ pub(crate) struct NamedArg {
     pub(crate) name: String,
     pub(crate) ty: TokenStream,
     pub(crate) ref_type: Option<Type>,
+    pub(crate) input_stream: Option<InputStreamArgType>,
     pub(crate) default: Option<DefaultValue>,
 }
 
 impl NamedArg {
     pub(crate) fn new(ident: Ident, ty: &Type, defaults: &mut DefaultMap) -> syn::Result<Self> {
+        if let Some(input_stream) = input_stream_arg_type(ty)? {
+            return Ok(Self {
+                name: ident_to_string(&ident),
+                ty: quote! { #ty },
+                ref_type: None,
+                input_stream: Some(input_stream),
+                default: defaults.remove(&ident),
+                ident,
+            });
+        }
         reject_stream_argument(ty)?;
         Ok(match ty {
             Type::Reference(r) => {
@@ -539,6 +570,7 @@ impl NamedArg {
                     name: ident_to_string(&ident),
                     ty,
                     ref_type: Some(*inner.clone()),
+                    input_stream: None,
                     default: defaults.remove(&ident),
                     ident,
                 }
@@ -547,6 +579,7 @@ impl NamedArg {
                 name: ident_to_string(&ident),
                 ty: quote! { #ty },
                 ref_type: None,
+                input_stream: None,
                 default: defaults.remove(&ident),
                 ident,
             },
@@ -578,7 +611,7 @@ fn reject_stream_argument(ty: &Type) -> syn::Result<()> {
     if type_contains_stream_path(ty) {
         Err(syn::Error::new_spanned(
             ty,
-            "stream parameters are not supported yet; only return-position streams are supported",
+            "stream parameters must use uniffi::UniFfiInputStream<T, E> directly; nested streams and Pin<Box<dyn Stream<...>>> parameters are not supported",
         ))
     } else {
         Ok(())
@@ -588,23 +621,23 @@ fn reject_stream_argument(ty: &Type) -> syn::Result<()> {
 fn type_contains_stream_path(ty: &Type) -> bool {
     match ty {
         Type::Path(path) => {
-            path.path
-                .segments
-                .iter()
-                .any(|segment| segment.ident == "Stream" || segment.ident == "UniFfiStream")
-                || path.path.segments.iter().any(|segment| {
-                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                        args.args.iter().any(|arg| match arg {
-                            syn::GenericArgument::Type(ty) => type_contains_stream_path(ty),
-                            syn::GenericArgument::AssocType(assoc) => {
-                                type_contains_stream_path(&assoc.ty)
-                            }
-                            _ => false,
-                        })
-                    } else {
-                        false
-                    }
-                })
+            path.path.segments.iter().any(|segment| {
+                segment.ident == "Stream"
+                    || segment.ident == "UniFfiStream"
+                    || segment.ident == "UniFfiInputStream"
+            }) || path.path.segments.iter().any(|segment| {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    args.args.iter().any(|arg| match arg {
+                        syn::GenericArgument::Type(ty) => type_contains_stream_path(ty),
+                        syn::GenericArgument::AssocType(assoc) => {
+                            type_contains_stream_path(&assoc.ty)
+                        }
+                        _ => false,
+                    })
+                } else {
+                    false
+                }
+            })
         }
         Type::TraitObject(obj) => obj.bounds.iter().any(|bound| match bound {
             syn::TypeParamBound::Trait(trait_bound) => trait_bound
@@ -726,6 +759,58 @@ fn uniffi_stream_alias_args(ty: &Type) -> syn::Result<Option<(&Type, &Type)>> {
         return Err(syn::Error::new_spanned(
             ty,
             "UniFfiStream returns must have exactly two type arguments",
+        ));
+    }
+    Ok(Some((item_ty, error_ty)))
+}
+
+fn input_stream_arg_type(ty: &Type) -> syn::Result<Option<InputStreamArgType>> {
+    let Some((item_ty, error_ty)) = uniffi_input_stream_alias_args(ty)? else {
+        return Ok(None);
+    };
+    Ok(Some(InputStreamArgType {
+        item_ty: quote! { #item_ty },
+        error_ty: quote! { #error_ty },
+        is_send: true,
+    }))
+}
+
+fn uniffi_input_stream_alias_args(ty: &Type) -> syn::Result<Option<(&Type, &Type)>> {
+    let Type::Path(path) = strip_grouped_type(ty) else {
+        return Ok(None);
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return Ok(None);
+    };
+    if segment.ident != "UniFfiInputStream" {
+        return Ok(None);
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "UniFfiInputStream parameters must use UniFfiInputStream<T, E>",
+        ));
+    };
+    let mut type_args = args.args.iter().filter_map(|arg| match arg {
+        syn::GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    let item_ty = type_args.next().ok_or_else(|| {
+        syn::Error::new_spanned(
+            ty,
+            "UniFfiInputStream parameters must use UniFfiInputStream<T, E>",
+        )
+    })?;
+    let error_ty = type_args.next().ok_or_else(|| {
+        syn::Error::new_spanned(
+            ty,
+            "UniFfiInputStream parameters must use UniFfiInputStream<T, E>",
+        )
+    })?;
+    if type_args.next().is_some() {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "UniFfiInputStream parameters must have exactly two type arguments",
         ));
     }
     Ok(Some((item_ty, error_ty)))
@@ -937,7 +1022,95 @@ mod tests {
         };
         assert!(err
             .to_string()
-            .contains("stream parameters are not supported"));
+            .contains("Pin<Box<dyn Stream<...>>> parameters are not supported"));
+    }
+
+    #[test]
+    fn parses_input_stream_parameter_alias() {
+        let ty: syn::Type = parse_quote! {
+            uniffi::UniFfiInputStream<u32, MyError>
+        };
+        let arg = NamedArg::new(parse_quote! { events }, &ty, &mut Default::default()).unwrap();
+        let input_stream = arg.input_stream.unwrap();
+        assert_eq!(input_stream.item_ty.to_string(), quote! { u32 }.to_string());
+        assert_eq!(
+            input_stream.error_ty.to_string(),
+            quote! { MyError }.to_string()
+        );
+        assert!(input_stream.is_send);
+    }
+
+    #[test]
+    fn parses_async_function_with_input_stream_parameter() {
+        let sig: syn::Signature = parse_quote! {
+            async fn sum_events(events: uniffi::UniFfiInputStream<u32, MyError>) -> Result<u64, MyError>
+        };
+        let sig = FnSignature::new(
+            FnKind::Function,
+            sig,
+            ExportFnArgs::default(),
+            String::new(),
+        )
+        .unwrap();
+        assert_eq!(sig.args.len(), 1);
+        assert!(sig.args[0].input_stream.is_some());
+    }
+
+    #[test]
+    fn rejects_nested_input_stream_parameter() {
+        let ty: syn::Type = parse_quote! {
+            Option<uniffi::UniFfiInputStream<u32, MyError>>
+        };
+        let err = match NamedArg::new(parse_quote! { events }, &ty, &mut Default::default()) {
+            Ok(_) => panic!("expected nested input stream parameter rejection"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("must use uniffi::UniFfiInputStream"));
+    }
+
+    #[test]
+    fn rejects_method_input_stream_parameters() {
+        let sig: syn::Signature = parse_quote! {
+            fn consume(&self, events: uniffi::UniFfiInputStream<u32, MyError>)
+        };
+        let err = match FnSignature::new(
+            FnKind::Method {
+                self_ident: parse_quote! { MyObject },
+                foreign_self_ident: parse_quote! { MyObject },
+            },
+            sig,
+            ExportFnArgs::default(),
+            String::new(),
+        ) {
+            Ok(_) => panic!("expected method input stream parameter rejection"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("only supported for top-level functions"));
+    }
+
+    #[test]
+    fn rejects_input_stream_bidirectional_signature() {
+        let sig: syn::Signature = parse_quote! {
+            fn bidi(
+                events: uniffi::UniFfiInputStream<u32, MyError>,
+            ) -> uniffi::UniFfiStream<u32, MyError>
+        };
+        let err = match FnSignature::new(
+            FnKind::Function,
+            sig,
+            ExportFnArgs::default(),
+            String::new(),
+        ) {
+            Ok(_) => panic!("expected bidi stream rejection"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("bidirectional streams are not supported"));
     }
 
     #[test]

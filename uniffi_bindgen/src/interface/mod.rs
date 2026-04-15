@@ -1701,6 +1701,52 @@ new definition: Enum {
     }
 
     #[test]
+    fn input_stream_argument_metadata_reaches_component_interface() {
+        let mut group = uniffi_meta::MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: "stream_core".to_string(),
+                name: "stream_core".to_string(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            uniffi_meta::FnMetadata {
+                module_path: "stream_core".to_string(),
+                name: "sum_events".to_string(),
+                is_async: true,
+                inputs: vec![uniffi_meta::FnParamMetadata {
+                    name: "events".to_string(),
+                    ty: Type::InputStream {
+                        item_type: Box::new(Type::UInt32),
+                        error_type: Box::new(Type::String),
+                        is_send: true,
+                    },
+                    by_ref: false,
+                    optional: false,
+                    default: None,
+                }],
+                return_type: Some(Type::UInt64),
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+
+        let ci = ComponentInterface::from_metadata(group).unwrap();
+        let func = ci.get_function_definition("sum_events").unwrap();
+        assert_eq!(
+            func.arguments()[0].as_type(),
+            Type::InputStream {
+                item_type: Box::new(Type::UInt32),
+                error_type: Box::new(Type::String),
+                is_send: true,
+            }
+        );
+    }
+
+    #[test]
     fn test_no_infinite_recursion_when_walking_types() {
         const UDL: &str = r#"
             namespace test{};
