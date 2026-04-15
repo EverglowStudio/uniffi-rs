@@ -91,6 +91,33 @@ impl MapCodeType {
     }
 }
 
+#[derive(Debug)]
+pub struct StreamCodeType {
+    item: Type,
+}
+
+impl StreamCodeType {
+    pub fn new(item: Type) -> Self {
+        Self { item }
+    }
+}
+
+impl CodeType for StreamCodeType {
+    fn type_label(&self) -> String {
+        format!(
+            "AsyncThrowingStream<{}, Error>",
+            super::SwiftCodeOracle.find(&self.item).type_label()
+        )
+    }
+
+    fn canonical_name(&self) -> String {
+        format!(
+            "Stream{}",
+            super::SwiftCodeOracle.find(&self.item).canonical_name()
+        )
+    }
+}
+
 impl CodeType for MapCodeType {
     fn type_label(&self) -> String {
         format!(
