@@ -267,6 +267,38 @@ impl ComponentInterface {
             .chain(self.objects.iter().flat_map(|o| o.ffi_callbacks()))
     }
 
+    fn input_stream_callback_definitions(&self) -> Vec<FfiCallbackFunction> {
+        if !self.has_input_stream_fns() {
+            return Vec::new();
+        }
+        vec![
+            FfiCallbackFunction {
+                name: "InputStreamNextCallback".to_owned(),
+                arguments: vec![
+                    FfiArgument::new("handle", FfiType::UInt64),
+                    FfiArgument::new(
+                        "callback",
+                        FfiType::Callback("ForeignFutureCompleteRustBuffer".to_owned()),
+                    ),
+                    FfiArgument::new("callback_data", FfiType::UInt64),
+                    FfiArgument::new(
+                        "dropped_callback",
+                        FfiType::Struct("ForeignFutureDroppedCallbackStruct".to_owned())
+                            .mut_reference(),
+                    ),
+                ],
+                return_type: None,
+                has_rust_call_status_arg: false,
+            },
+            FfiCallbackFunction {
+                name: "InputStreamCancelCallback".to_owned(),
+                arguments: vec![FfiArgument::new("handle", FfiType::UInt64)],
+                return_type: None,
+                has_rust_call_status_arg: false,
+            },
+        ]
+    }
+
     /// Get the definitions for callback FFI functions
     ///
     /// These are defined by the foreign code and invoked by Rust.
@@ -660,6 +692,12 @@ impl ComponentInterface {
         self.functions.iter().any(Function::is_stream)
     }
 
+    pub fn has_input_stream_fns(&self) -> bool {
+        self.functions
+            .iter()
+            .any(|func| !func.input_stream_arguments().is_empty())
+    }
+
     /// Iterate over `T` parameters of the `FutureCallback<T>` callbacks in this interface
     pub fn iter_future_callback_params(&self) -> impl Iterator<Item = FfiType> {
         let unique_results = self
@@ -685,6 +723,11 @@ impl ComponentInterface {
         // function definitions come last.
         self.builtin_ffi_definitions()
             .into_iter()
+            .chain(
+                self.input_stream_callback_definitions()
+                    .into_iter()
+                    .map(Into::into),
+            )
             .chain(
                 self.callback_interface_callback_definitions()
                     .into_iter()
@@ -776,6 +819,7 @@ impl ComponentInterface {
         let iterator = self
             .iter_user_ffi_function_definitions()
             .cloned()
+            .chain(self.iter_input_stream_ffi_function_definitions())
             .chain(self.iter_stream_ffi_function_definitions())
             .chain(self.iter_rust_buffer_ffi_function_definitions())
             .chain(self.iter_futures_ffi_function_definitions());
@@ -867,6 +911,31 @@ impl ComponentInterface {
                     is_object_free_function: false,
                 },
             ]
+        })
+    }
+
+    fn iter_input_stream_ffi_function_definitions(&self) -> impl Iterator<Item = FfiFunction> + '_ {
+        self.functions.iter().flat_map(|func| {
+            func.input_stream_arguments()
+                .into_iter()
+                .map(|arg| FfiFunction {
+                    name: func.ffi_input_stream_init_func(arg),
+                    is_async: false,
+                    arguments: vec![
+                        FfiArgument {
+                            name: "next".to_owned(),
+                            type_: FfiType::Callback("InputStreamNextCallback".to_owned()),
+                        },
+                        FfiArgument {
+                            name: "cancel".to_owned(),
+                            type_: FfiType::Callback("InputStreamCancelCallback".to_owned()),
+                        },
+                    ],
+                    return_type: None,
+                    has_rust_call_status_arg: false,
+                    is_object_free_function: false,
+                })
+                .collect::<Vec<_>>()
         })
     }
 
@@ -1035,6 +1104,18 @@ impl ComponentInterface {
                 })
                 .with_context(|| {
                     format!("adding stream next optional item type for function {defn:?}")
+                })?;
+        }
+        for arg in defn.input_stream_arguments() {
+            let Type::InputStream { item_type, .. } = arg.as_type() else {
+                continue;
+            };
+            self.types
+                .add_known_type(&Type::Optional {
+                    inner_type: item_type,
+                })
+                .with_context(|| {
+                    format!("adding input stream next optional item type for function {defn:?}")
                 })?;
         }
         defn.throws_name()

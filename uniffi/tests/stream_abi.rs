@@ -1,7 +1,12 @@
 use std::{
+    collections::VecDeque,
     fmt,
+    mem::ManuallyDrop,
     pin::Pin,
-    sync::atomic::{AtomicI8, Ordering},
+    sync::{
+        atomic::{AtomicI8, AtomicUsize, Ordering},
+        Mutex,
+    },
     task::{Context, Poll},
 };
 
@@ -26,6 +31,12 @@ impl fmt::Display for StreamError {
 }
 
 impl std::error::Error for StreamError {}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for StreamError {
+    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Boom
+    }
+}
 
 struct CountStream {
     next: u32,
@@ -103,6 +114,17 @@ pub fn count_events_alias(count: u32) -> uniffi::UniFfiStream<StreamEvent, Strea
     })
 }
 
+#[uniffi::export]
+pub async fn sum_input_events(
+    mut events: uniffi::UniFfiInputStream<StreamEvent, StreamError>,
+) -> Result<u64, StreamError> {
+    let mut sum = 0;
+    while let Some(event) = std::future::poll_fn(|cx| Pin::new(&mut events).poll_next(cx)).await {
+        sum += u64::from(event?.value);
+    }
+    Ok(sum)
+}
+
 uniffi::setup_scaffolding!();
 
 extern "C" fn capture_poll(data: u64, poll: uniffi::RustFuturePoll) {
@@ -160,6 +182,86 @@ fn complete_next_future(
     } else {
         (status.code, None)
     }
+}
+
+fn complete_u64_future(future: uniffi::Handle) -> (uniffi::RustCallStatusCode, u64) {
+    let poll_result = AtomicI8::new(-1);
+    unsafe {
+        ffi_uniffi_rust_future_poll_u64(
+            future.clone(),
+            capture_poll,
+            (&poll_result as *const AtomicI8) as u64,
+        );
+    }
+    assert_eq!(poll_result.load(Ordering::SeqCst), 0);
+
+    let mut status = uniffi::RustCallStatus::default();
+    let value = unsafe { ffi_uniffi_rust_future_complete_u64(future.clone(), &mut status) };
+    unsafe {
+        ffi_uniffi_rust_future_free_u64(future);
+    }
+    (status.code, value)
+}
+
+static INPUT_STREAM_VALUES: uniffi::deps::once_cell::sync::Lazy<
+    Mutex<VecDeque<Result<Option<StreamEvent>, StreamError>>>,
+> = uniffi::deps::once_cell::sync::Lazy::new(|| Mutex::new(VecDeque::new()));
+static INPUT_STREAM_TEST_LOCK: uniffi::deps::once_cell::sync::Lazy<Mutex<()>> =
+    uniffi::deps::once_cell::sync::Lazy::new(|| Mutex::new(()));
+static INPUT_STREAM_CANCELS: AtomicUsize = AtomicUsize::new(0);
+
+fn set_input_stream_values(
+    values: impl IntoIterator<Item = Result<Option<StreamEvent>, StreamError>>,
+) {
+    let mut guard = INPUT_STREAM_VALUES.lock().unwrap();
+    guard.clear();
+    guard.extend(values);
+    INPUT_STREAM_CANCELS.store(0, Ordering::SeqCst);
+}
+
+extern "C" fn input_stream_next(
+    _handle: uniffi::Handle,
+    callback: uniffi::ForeignFutureCallback<uniffi::RustBuffer>,
+    callback_data: u64,
+    _dropped_callback: &mut uniffi::ForeignFutureDroppedCallbackStruct,
+) {
+    let value = INPUT_STREAM_VALUES
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or(Ok(None));
+    match value {
+        Ok(value) => callback(
+            callback_data,
+            uniffi::ForeignFutureResult::from_raw_parts(
+                <Option<StreamEvent> as uniffi::Lower<UniFfiTag>>::lower(value),
+                uniffi::RustCallStatus::default(),
+            ),
+        ),
+        Err(error) => callback(
+            callback_data,
+            uniffi::ForeignFutureResult::from_raw_parts(
+                uniffi::RustBuffer::default(),
+                uniffi::RustCallStatus {
+                    code: uniffi::RustCallStatusCode::Error,
+                    error_buf: ManuallyDrop::new(
+                        <StreamError as uniffi::LowerError<UniFfiTag>>::lower_error(error),
+                    ),
+                },
+            ),
+        ),
+    }
+}
+
+extern "C" fn input_stream_cancel(_handle: uniffi::Handle) {
+    INPUT_STREAM_CANCELS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn register_input_stream_callbacks() {
+    uniffi_uniffi_fn_func_sum_input_events_input_stream_events_init(
+        input_stream_next,
+        input_stream_cancel,
+    );
 }
 
 #[test]
@@ -258,4 +360,36 @@ fn stream_concurrent_next_is_rejected() {
         ffi_uniffi_rust_future_free_rust_buffer(pending);
     }
     uniffi_uniffi_fn_func_pending_events_stream_cancel(handle);
+}
+
+#[test]
+fn input_stream_scaffolding_consumes_registered_foreign_callbacks() {
+    let _guard = INPUT_STREAM_TEST_LOCK.lock().unwrap();
+    register_input_stream_callbacks();
+    set_input_stream_values([
+        Ok(Some(StreamEvent { value: 2 })),
+        Ok(Some(StreamEvent { value: 4 })),
+        Ok(None),
+    ]);
+
+    let future = uniffi_uniffi_fn_func_sum_input_events(uniffi::Handle::from_raw_unchecked(1));
+    assert_eq!(
+        complete_u64_future(future),
+        (uniffi::RustCallStatusCode::Success, 6)
+    );
+    assert_eq!(INPUT_STREAM_CANCELS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn input_stream_scaffolding_lifts_typed_error_from_registered_callbacks() {
+    let _guard = INPUT_STREAM_TEST_LOCK.lock().unwrap();
+    register_input_stream_callbacks();
+    set_input_stream_values([Ok(Some(StreamEvent { value: 2 })), Err(StreamError::Boom)]);
+
+    let future = uniffi_uniffi_fn_func_sum_input_events(uniffi::Handle::from_raw_unchecked(3));
+    assert_eq!(
+        complete_u64_future(future),
+        (uniffi::RustCallStatusCode::Error, 0)
+    );
+    assert_eq!(INPUT_STREAM_CANCELS.load(Ordering::SeqCst), 1);
 }

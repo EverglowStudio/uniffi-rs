@@ -221,13 +221,46 @@ impl FnSignature {
     pub fn lift_closure(&self, self_lift: Option<TokenStream>) -> TokenStream {
         let arg_lifts = self.args.iter().map(|arg| {
             let ident = &arg.ident;
-            let try_lift = ffiops::try_lift(&arg.ty);
             let name = &arg.name;
-            quote! {
-                match #try_lift(#ident) {
-                    ::std::result::Result::Ok(v) => v,
-                    ::std::result::Result::Err(e) => {
-                        return ::std::result::Result::Err((#name, e))
+            if let Some(input_stream) = &arg.input_stream {
+                let cell_ident = self.input_stream_callback_cell_ident(arg);
+                let item_ty = &input_stream.item_ty;
+                let error_ty = &input_stream.error_ty;
+                quote! {
+                    {
+                        if #ident.as_raw() == 0 {
+                            return ::std::result::Result::Err((
+                                #name,
+                                ::uniffi::deps::anyhow::anyhow!("input stream handle was null")
+                            ));
+                        }
+                        let (uniffi_input_stream_next, uniffi_input_stream_cancel) =
+                            match #cell_ident.get() {
+                                ::std::option::Option::Some(callbacks) => *callbacks,
+                                ::std::option::Option::None => {
+                                    return ::std::result::Result::Err((
+                                        #name,
+                                        ::uniffi::deps::anyhow::anyhow!(
+                                            "input stream callbacks were not registered"
+                                        )
+                                    ));
+                                }
+                            };
+                        ::uniffi::UniFfiInputStream::<#item_ty, #error_ty>::from_foreign_callbacks::<crate::UniFfiTag>(
+                            #ident,
+                            uniffi_input_stream_next,
+                            uniffi_input_stream_cancel,
+                        )
+                    }
+                }
+            } else {
+                let try_lift = ffiops::try_lift(&arg.ty);
+                quote! {
+                    match #try_lift(#ident) {
+                        ::std::result::Result::Ok(v) => v,
+                        ::std::result::Result::Err(e) => {
+                            return ::std::result::Result::Err((#name, e))
+                        }
                     }
                 }
             }
@@ -237,6 +270,43 @@ impl FnSignature {
             move || ::std::result::Result::Ok((
                 #(#all_lifts,)*
             ))
+        }
+    }
+
+    pub(crate) fn input_stream_callback_cell_ident(&self, arg: &NamedArg) -> Ident {
+        let ffi_name = uniffi_meta::fn_symbol_name(&self.mod_path, &self.name);
+        Ident::new(
+            &format!("UNIFFI_INPUT_STREAM_CALLBACKS_{}_{}", ffi_name, arg.name)
+                .to_ascii_uppercase(),
+            Span::call_site(),
+        )
+    }
+
+    pub(crate) fn input_stream_init_fn_ident(&self, arg: &NamedArg) -> Ident {
+        Ident::new(
+            &uniffi_meta::fn_input_stream_init_symbol_name(&self.mod_path, &self.name, &arg.name),
+            Span::call_site(),
+        )
+    }
+
+    pub(crate) fn input_stream_next_callback_type(
+        input_stream: &InputStreamArgType,
+    ) -> TokenStream {
+        let item_ty = &input_stream.item_ty;
+        let error_ty = &input_stream.error_ty;
+        quote! {
+            ::uniffi::ForeignInputStreamNextCallback<
+                <::std::result::Result<::std::option::Option<#item_ty>, #error_ty> as ::uniffi::LiftReturn<crate::UniFfiTag>>::ReturnType
+            >
+        }
+    }
+
+    pub(crate) fn input_stream_callback_tuple_type(
+        input_stream: &InputStreamArgType,
+    ) -> TokenStream {
+        let next_ty = Self::input_stream_next_callback_type(input_stream);
+        quote! {
+            (#next_ty, ::uniffi::ForeignInputStreamCancelCallback)
         }
     }
 
