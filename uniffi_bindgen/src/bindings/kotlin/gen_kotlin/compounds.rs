@@ -205,3 +205,40 @@ impl CodeType for StreamCodeType {
         )
     }
 }
+
+#[derive(Debug)]
+pub struct InputStreamCodeType {
+    item: Type,
+    error: Type,
+}
+
+impl InputStreamCodeType {
+    pub fn new(item: Type, error: Type) -> Self {
+        Self { item, error }
+    }
+
+    fn item(&self) -> &Type {
+        &self.item
+    }
+
+    fn error(&self) -> &Type {
+        &self.error
+    }
+}
+
+impl CodeType for InputStreamCodeType {
+    fn type_label(&self, ci: &ComponentInterface) -> String {
+        format!(
+            "Flow<{}>",
+            super::KotlinCodeOracle.find(self.item()).type_label(ci)
+        )
+    }
+
+    fn canonical_name(&self) -> String {
+        format!(
+            "InputStream{}{}",
+            super::KotlinCodeOracle.find(self.item()).canonical_name(),
+            super::KotlinCodeOracle.find(self.error()).canonical_name()
+        )
+    }
+}
