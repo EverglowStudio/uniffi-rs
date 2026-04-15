@@ -210,6 +210,11 @@ impl<'a> MetadataReader<'a> {
             codes::TYPE_HASH_SET => Type::Set {
                 inner_type: Box::new(self.read_type()?),
             },
+            codes::TYPE_STREAM => Type::Stream {
+                item_type: Box::new(self.read_type()?),
+                error_type: Box::new(self.read_type()?),
+                is_send: self.read_bool()?,
+            },
             codes::TYPE_UNIT => bail!("Unexpected TYPE_UNIT"),
             codes::TYPE_RESULT => bail!("Unexpected TYPE_RESULT"),
             _ => bail!("Unexpected metadata type code: {value:?}"),
@@ -648,5 +653,29 @@ impl<'a> MetadataReader<'a> {
             codes::LIT_EMPTY_SET => LiteralMetadata::EmptySet,
             _ => bail!("Unexpected literal kind code: {literal_kind:?}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::codes;
+
+    #[test]
+    fn reads_stream_type_metadata() {
+        let bytes = [
+            codes::TYPE_STREAM,
+            codes::TYPE_U32,
+            codes::TYPE_STRING,
+            1, // is_send
+        ];
+        assert_eq!(
+            read_metadata_type(&bytes).unwrap(),
+            Type::Stream {
+                item_type: Box::new(Type::UInt32),
+                error_type: Box::new(Type::String),
+                is_send: true,
+            }
+        );
     }
 }

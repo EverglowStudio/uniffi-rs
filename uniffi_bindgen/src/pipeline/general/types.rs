@@ -59,6 +59,15 @@ pub fn canonical_name(ty: &Type) -> String {
         Type::Set { inner_type } => {
             format!("Set{}", canonical_name(inner_type))
         }
+        Type::Stream {
+            item_type,
+            error_type,
+            ..
+        } => format!(
+            "Stream{}{}",
+            canonical_name(item_type),
+            canonical_name(error_type),
+        ),
     }
 }
 
@@ -109,6 +118,15 @@ pub fn map_type(mut ty: Type, context: &Context) -> Result<Type> {
         },
         Type::Set { inner_type } => Type::Set {
             inner_type: Box::new(map_type(*inner_type, context)?),
+        },
+        Type::Stream {
+            item_type,
+            error_type,
+            is_send,
+        } => Type::Stream {
+            item_type: Box::new(map_type(*item_type, context)?),
+            error_type: Box::new(map_type(*error_type, context)?),
+            is_send,
         },
         // All other types can be returned unchanged
         _ => ty,

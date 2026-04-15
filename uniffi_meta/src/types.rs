@@ -138,6 +138,11 @@ pub enum Type {
     Set {
         inner_type: Box<Type>,
     },
+    Stream {
+        item_type: Box<Type>,
+        error_type: Box<Type>,
+        is_send: bool,
+    },
     // Custom type on the scaffolding side
     Custom {
         module_path: String,
@@ -162,6 +167,11 @@ impl Type {
                 key_type,
                 value_type,
             } => Box::new(key_type.iter_types().chain(value_type.iter_types())),
+            Type::Stream {
+                item_type,
+                error_type,
+                ..
+            } => Box::new(item_type.iter_types().chain(error_type.iter_types())),
             Type::Custom { builtin, .. } => builtin.iter_types(),
             _ => Box::new(std::iter::empty()),
         }
@@ -225,6 +235,14 @@ impl Type {
             } => {
                 key_type.rename_recursive(name_transformer);
                 value_type.rename_recursive(name_transformer);
+            }
+            Type::Stream {
+                item_type,
+                error_type,
+                ..
+            } => {
+                item_type.rename_recursive(name_transformer);
+                error_type.rename_recursive(name_transformer);
             }
             Type::Custom { builtin, .. } => {
                 builtin.rename_recursive(name_transformer);

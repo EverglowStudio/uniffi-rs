@@ -49,6 +49,7 @@ pub fn ffi_type(ty: &Type, context: &Context) -> Result<FfiType> {
         | Type::Set { .. }
         | Type::Timestamp
         | Type::Duration => FfiType::RustBuffer(None),
+        Type::Stream { .. } => FfiType::Handle(HandleKind::RustStream),
         Type::Custom {
             namespace, builtin, ..
         } => {

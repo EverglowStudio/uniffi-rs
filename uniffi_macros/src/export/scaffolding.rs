@@ -267,10 +267,82 @@ pub(super) fn gen_ffi_function(
     let ffi_fn_name = ffi_ident.to_string();
     let name = &sig.name;
     let return_ty = &sig.return_ty;
+    let use_trait = use_trait.map(|tr| quote! { use #tr; });
+    if let Some(stream_return) = &sig.stream_return {
+        let item_ty = &stream_return.item_ty;
+        let error_ty = &stream_return.error_ty;
+        let stream_next_ident = Ident::new(
+            &uniffi_meta::fn_stream_next_symbol_name(&sig.mod_path, &sig.name),
+            proc_macro2::Span::call_site(),
+        );
+        let stream_cancel_ident = Ident::new(
+            &uniffi_meta::fn_stream_cancel_symbol_name(&sig.mod_path, &sig.name),
+            proc_macro2::Span::call_site(),
+        );
+        let registry_ident = Ident::new(
+            &format!("__UNIFFI_STREAM_REGISTRY_{}", ffi_fn_name).to_ascii_uppercase(),
+            proc_macro2::Span::call_site(),
+        );
+        let scaffolding_fn_ffi_buffer_version =
+            ffi_buffer_scaffolding_fn(&ffi_ident, &quote! { ::uniffi::Handle }, &param_types, true);
+
+        return Ok(quote! {
+            #[doc(hidden)]
+            static #registry_ident: ::uniffi::RustStreamRegistry<#item_ty, #error_ty> =
+                ::uniffi::deps::once_cell::sync::Lazy::new(::std::default::Default::default);
+
+            #[doc(hidden)]
+            #[unsafe(no_mangle)]
+            pub extern "C" fn #ffi_ident(
+                #(#param_names: #param_types,)*
+                call_status: &mut ::uniffi::RustCallStatus,
+            ) -> ::uniffi::Handle {
+                #use_trait
+                ::uniffi::deps::trace!("calling: {}", #ffi_fn_name);
+                let uniffi_lift_args = #lift_closure;
+                ::uniffi::rust_call(call_status, || {
+                    let uniffi_lifted_args: ::std::result::Result<_, (&'static str, ::uniffi::deps::anyhow::Error)> =
+                        uniffi_lift_args();
+                    match uniffi_lifted_args {
+                        ::std::result::Result::Ok(uniffi_args) => {
+                            ::uniffi::deps::trace!("lift_args success: {}", #ffi_fn_name);
+                            let uniffi_result = #rust_fn_call;
+                            ::uniffi::deps::trace!("call success: {}", #ffi_fn_name);
+                            let uniffi_result = #convert_result;
+                            ::std::result::Result::Ok(::uniffi::rust_stream_new(&#registry_ident, uniffi_result))
+                        }
+                        ::std::result::Result::Err((arg_name, error)) => {
+                            ::uniffi::deps::trace!("lift_args error: {}", #ffi_fn_name);
+                            ::std::result::Result::Err(::uniffi::RustCallError::InternalError(
+                                ::std::format!("Failed to convert arg '{arg_name}':\n{error:?}")
+                            ))
+                        },
+                    }
+                })
+            }
+
+            #[doc(hidden)]
+            #[unsafe(no_mangle)]
+            pub extern "C" fn #stream_next_ident(handle: ::uniffi::Handle) -> ::uniffi::Handle {
+                ::uniffi::rust_stream_next::<#item_ty, #error_ty, crate::UniFfiTag>(
+                    &#registry_ident,
+                    handle,
+                    crate::UniFfiTag,
+                )
+            }
+
+            #[doc(hidden)]
+            #[unsafe(no_mangle)]
+            pub extern "C" fn #stream_cancel_ident(handle: ::uniffi::Handle) {
+                ::uniffi::rust_stream_cancel::<#item_ty, #error_ty>(&#registry_ident, handle)
+            }
+
+            #scaffolding_fn_ffi_buffer_version
+        });
+    }
     let ffi_return_ty = ffiops::lower_return_type(return_ty);
     let lower_return = ffiops::lower_return(return_ty);
     let handle_failed_lift = ffiops::lower_return_handle_failed_lift(return_ty);
-    let use_trait = use_trait.map(|tr| quote! { use #tr; });
 
     Ok(if !sig.is_async {
         let scaffolding_fn_ffi_buffer_version =
