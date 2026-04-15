@@ -3342,6 +3342,234 @@ console.log("ok");
     );
 }
 
+fn generate_callback_shape_tree(out_dir: &Utf8PathBuf) {
+    let root = out_dir.parent().expect("temp output has parent");
+    let biz = root.join("callback_shape");
+    std::fs::create_dir_all(biz.join("src")).unwrap();
+    let udl = r#"
+[Enum]
+interface StreamEvent {
+    Started(string message_id);
+    Delta(string message_id, string content_delta);
+};
+
+[Trait, WithForeign]
+interface StreamSink {
+    void on_event(StreamEvent event);
+};
+
+namespace callback_shape {
+    void emit_event(StreamSink sink);
+};
+"#;
+    let udl_path = biz.join("src/callback_shape.udl");
+    std::fs::write(&udl_path, udl).unwrap();
+    std::fs::write(
+        biz.join("Cargo.toml"),
+        r#"[package]
+name = "callback-shape"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+"#,
+    )
+    .unwrap();
+    std::fs::write(biz.join("src/lib.rs"), "// placeholder\n").unwrap();
+
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: udl_path,
+            out_dir: out_dir.clone(),
+            artifact_dir: None,
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: None,
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
+        },
+    )
+    .expect("generator should succeed for callback shape fixture");
+}
+
+#[test]
+fn napi_callback_args_are_lifted_with_js_stub() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("skipping: node with --experimental-strip-types not available");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    generate_callback_shape_tree(&out_dir);
+
+    let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    for needle in [
+        "args.slice(2).map(__uniffiLiftShape)",
+        "const liftedArgs = callArgs.map(__uniffiLiftShape);",
+        "Promise.resolve(fn(...liftedArgs))",
+        "__uniffiLowerShape(fn(...liftedArgs))",
+    ] {
+        assert!(
+            backend.contains(needle),
+            "node/backend-napi.ts should preserve callback arg lift and return lower via `{needle}`:\n{backend}"
+        );
+    }
+
+    std::fs::write(
+        out_dir.join("stub-addon.cjs"),
+        r#"
+module.exports = {
+  emitEvent(sink) {
+    sink.onEvent({ type: "Started", messageId: "msg-3" });
+  },
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        out_dir.join("node-callback-shape-driver.ts"),
+        r#"
+import assert from "node:assert/strict";
+
+process.env.UNIFFI_CALLBACK_SHAPE_NAPI_PATH = new URL("./stub-addon.cjs", import.meta.url).pathname;
+const api = await import("./node/index.ts");
+
+const events: unknown[] = [];
+api.emitEvent({
+  onEvent(event: unknown) {
+    events.push(event);
+  },
+});
+
+assert.deepEqual(events, [{ tag: "Started", messageId: "msg-3" }]);
+console.log("ok");
+"#,
+    )
+    .unwrap();
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(out_dir.join("node-callback-shape-driver.ts").as_path())
+        .current_dir(&out_dir)
+        .output()
+        .expect("failed to run node callback shape driver");
+    if !output.status.success() {
+        panic!(
+            "node callback shape driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "node callback shape driver did not print ok:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn electron_preload_callback_args_are_lifted_with_js_stub() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("skipping: node with --experimental-strip-types not available");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    generate_callback_shape_tree(&out_dir);
+
+    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    for needle in [
+        "UNIFFI_CALLBACK_SHAPE_NAPI_PATH",
+        "UNIFFI_NAPI_PATH",
+        "args.slice(2).map(__uniffiLiftShape)",
+        "const liftedArgs = callArgs.map(__uniffiLiftShape);",
+        "Promise.resolve(v(...liftedArgs))",
+        "__uniffiLowerShape(resolveArg(v(...liftedArgs)))",
+    ] {
+        assert!(
+            preload.contains(needle),
+            "electron/preload.cjs should preserve stub loading and callback arg lift via `{needle}`:\n{preload}"
+        );
+    }
+
+    let electron_stub = out_dir.join("electron/node_modules/electron");
+    std::fs::create_dir_all(&electron_stub).unwrap();
+    std::fs::write(
+        electron_stub.join("index.js"),
+        r#"
+exports.contextBridge = {
+  exposeInMainWorld(name, value) {
+    globalThis[name] = value;
+  },
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        out_dir.join("stub-addon.cjs"),
+        r#"
+module.exports = {
+  emitEvent(sink) {
+    sink.onEvent({ type: "Started", messageId: "msg-3" });
+  },
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        out_dir.join("electron-callback-shape-driver.ts"),
+        r#"
+import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+
+process.env.UNIFFI_CALLBACK_SHAPE_NAPI_PATH = new URL("./stub-addon.cjs", import.meta.url).pathname;
+(globalThis as { window?: unknown }).window = globalThis;
+const require = createRequire(import.meta.url);
+require("./electron/preload.cjs");
+const api = await import("./electron/renderer.ts");
+
+const events: unknown[] = [];
+api.emitEvent({
+  onEvent(event: unknown) {
+    events.push(event);
+  },
+});
+
+assert.deepEqual(events, [{ tag: "Started", messageId: "msg-3" }]);
+console.log("ok");
+"#,
+    )
+    .unwrap();
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(out_dir.join("electron-callback-shape-driver.ts").as_path())
+        .current_dir(&out_dir)
+        .output()
+        .expect("failed to run electron callback shape driver");
+    if !output.status.success() {
+        panic!(
+            "electron callback shape driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "electron callback shape driver did not print ok:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[test]
 fn electron_wrap_result_does_not_wrap_arrays_or_plain_values() {
     // The old `wrapResult` used a loose `constructor.name !== \"Object\"`
@@ -6937,7 +7165,9 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
     );
     let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
     assert!(
-        preload.contains("asyncMethods") && preload.contains("Promise.resolve(v(...callArgs))"),
+        preload.contains("asyncMethods")
+            && preload.contains("const liftedArgs = callArgs.map(__uniffiLiftShape);")
+            && preload.contains("Promise.resolve(v(...liftedArgs))"),
         "electron preload should preserve async callback marker behavior:\n{preload}"
     );
 
@@ -7123,7 +7353,8 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
     assert!(
         preload.contains("fallibleMethods")
             && preload.contains("asyncMethods")
-            && preload.contains("Promise.resolve(v(...callArgs)).then("),
+            && preload.contains("const liftedArgs = callArgs.map(__uniffiLiftShape);")
+            && preload.contains("Promise.resolve(v(...liftedArgs)).then("),
         "electron preload should preserve async fallible callback marker behavior:\n{preload}"
     );
 

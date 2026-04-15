@@ -1059,7 +1059,39 @@ pub(crate) fn emit_mini_program_wasm_runtime(
             .with_context(|| format!("copying Mini Program artifact {source} to {dest}"))?;
     }
 
+    let snippets_source = wasm_bindgen_out_dir.join("snippets");
+    if snippets_source.exists() {
+        let snippets_dest = mini_program_out_dir.join("snippets");
+        if snippets_dest.exists() {
+            std::fs::remove_dir_all(&snippets_dest).with_context(|| {
+                format!("removing stale Mini Program snippets dir {snippets_dest}")
+            })?;
+        }
+        copy_dir_contents(&snippets_source, &snippets_dest).with_context(|| {
+            format!("copying wasm-bindgen snippets {snippets_source} to {snippets_dest}")
+        })?;
+    }
+
     emit_mini_program_auto_entrypoint(out_dir, mini_program_out_dir, wasm_bindgen_stem)?;
+    Ok(())
+}
+
+fn copy_dir_contents(from: &Utf8Path, to: &Utf8Path) -> Result<()> {
+    std::fs::create_dir_all(to).with_context(|| format!("creating directory {to}"))?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("reading {from}"))? {
+        let entry = entry?;
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|p| anyhow::anyhow!("path is not utf8: {}", p.display()))?;
+        let name = path
+            .file_name()
+            .with_context(|| format!("path has no file name: {path}"))?;
+        let dest = to.join(name);
+        if entry.file_type()?.is_dir() {
+            copy_dir_contents(&path, &dest)?;
+        } else {
+            std::fs::copy(&path, &dest).with_context(|| format!("copying {path} to {dest}"))?;
+        }
+    }
     Ok(())
 }
 
