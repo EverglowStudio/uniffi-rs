@@ -43,8 +43,8 @@
 {%- if let Some(stream_item_type) = callable.stream_item_type() %}
 {%- if let Some(stream_error_type) = callable.stream_error_type() %}
 {%- if let Some(stream_next_return_type) = callable.stream_next_return_type() %}
-{{ func_decl }} {{ callable.name()|fn_name }}(
-    {%- call arg_list_decl(callable) %}{% endcall -%}) -> {{ callable.return_type().unwrap()|type_name }} {
+{{ func_decl }} {{ callable.name()|fn_name }}{{ callable|input_stream_generics }}(
+    {%- call arg_list_decl(callable) %}{% endcall -%}) -> {{ callable.return_type().unwrap()|type_name }}{{ callable|input_stream_where_clause }} {
     let __streamHandle =
         {% call to_ffi_call(callable) %}{% endcall %}
     return AsyncThrowingStream<{{ stream_item_type|type_name }}, Error> { continuation in
