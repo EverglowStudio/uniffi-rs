@@ -585,13 +585,6 @@ impl<'a> Generator<'a> {
                 !callable.is_async(),
                 "{label} native stream returns must be synchronous start functions"
             );
-            ensure!(
-                !callable
-                    .arguments()
-                    .iter()
-                    .any(|arg| matches!(arg.as_type(), Type::InputStream { .. })),
-                "{label} cannot combine input stream parameters with native stream returns"
-            );
         }
         for arg in callable.arguments() {
             self.ensure_type_supported(&arg.as_type(), TypeUsage::Arg, label)?;

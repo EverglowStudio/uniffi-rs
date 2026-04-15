@@ -29,9 +29,8 @@ std::pin::Pin<
 >
 ```
 
-The stream item and error must be UniFFI-supported types. Stream parameters, input streams,
-bidirectional streams, infallible `Stream<Item = T>`, non-`'static` streams, methods, and constructors
-are intentionally rejected in this first slice.
+The stream item and error must be UniFFI-supported types. Infallible `Stream<Item = T>`,
+non-`'static` streams, methods, and constructors are intentionally rejected in this first slice.
 
 The explicit `Pin<Box<dyn Stream<...>>>` spelling currently requires `Send + 'static`. Use
 `uniffi::UniFfiStream<T, E>` for portable code that must compile both on native targets and on
@@ -194,6 +193,53 @@ surface to explicit `next()` / `cancel()` methods. `cancel()` calls the underlyi
 `return()` at most once, so it triggers the same Rust-side stream cancel path as `break` in
 `for await`. Done closes the wrapper, and stream item errors remain rejected promises.
 
-## Next Phase
+## Input Streams
 
-Input streams and bidirectional streams are implemented in later phases.
+UniFFI also supports passing a foreign async stream into Rust by using
+`UniFfiInputStream<T, E>` as a direct free-function argument:
+
+```rust
+#[uniffi::export]
+pub async fn sum_events(
+    events: uniffi::UniFfiInputStream<CounterEvent, StreamError>,
+) -> Result<u64, StreamError> {
+    // ...
+}
+```
+
+The JavaScript target lowers an `AsyncIterable<T>` into an opaque input stream handle. Rust polls
+that handle through registered `next` / `cancel` callbacks. Swift maps input streams from
+`AsyncSequence`, and Kotlin maps them from `Flow`.
+
+Input streams are intentionally limited to direct free-function arguments. They are not supported
+inside records, enums, options, sequences, maps, object methods, constructors, or error payloads.
+The input stream item and error must be UniFFI-supported types.
+
+Cancellation is bidirectional:
+
+- If Rust drops the `UniFfiInputStream`, the generated binding calls the foreign iterator's
+  `return()` / stream cancellation path.
+- If the foreign input iterator throws, Rust sees the configured stream error through the normal
+  fallible path.
+
+## Bidirectional Streams
+
+A free function can combine direct input stream arguments with a native stream return:
+
+```rust
+#[uniffi::export]
+pub fn running_sum(
+    events: uniffi::UniFfiInputStream<CounterEvent, StreamError>,
+) -> uniffi::UniFfiStream<CounterEvent, StreamError> {
+    // ...
+}
+```
+
+This shape is the UniFFI equivalent of a simple bidirectional stream: the foreign side supplies an
+input stream, Rust consumes it, and Rust returns an output stream. JavaScript consumes the result as
+`AsyncIterable<T>`, Swift as `AsyncThrowingStream<T, Error>`, and Kotlin as `Flow<T>`.
+
+The same single-consumer rules apply on both sides. Breaking out of the output stream cancels the
+Rust output stream, which drops the Rust input stream and triggers the foreign input cancellation
+path. Errors produced by the input stream propagate through the output stream's error channel when
+the Rust stream yields that error.
