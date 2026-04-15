@@ -143,6 +143,11 @@ pub enum Type {
         error_type: Box<Type>,
         is_send: bool,
     },
+    InputStream {
+        item_type: Box<Type>,
+        error_type: Box<Type>,
+        is_send: bool,
+    },
     // Custom type on the scaffolding side
     Custom {
         module_path: String,
@@ -168,6 +173,11 @@ impl Type {
                 value_type,
             } => Box::new(key_type.iter_types().chain(value_type.iter_types())),
             Type::Stream {
+                item_type,
+                error_type,
+                ..
+            }
+            | Type::InputStream {
                 item_type,
                 error_type,
                 ..
@@ -237,6 +247,11 @@ impl Type {
                 value_type.rename_recursive(name_transformer);
             }
             Type::Stream {
+                item_type,
+                error_type,
+                ..
+            }
+            | Type::InputStream {
                 item_type,
                 error_type,
                 ..
