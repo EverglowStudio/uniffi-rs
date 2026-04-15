@@ -49,7 +49,78 @@ impl<'a> Generator<'a> {
             .any(|function| matches!(function.return_type(), Some(Type::Stream { .. })))
     }
 
+    fn input_stream_types(&self) -> Vec<Type> {
+        let mut out = std::collections::BTreeMap::new();
+        for function in self.ci.function_definitions() {
+            for arg in function.arguments() {
+                self.collect_input_stream_type(&arg.as_type(), &mut out);
+            }
+        }
+        for object in self.ci.object_definitions() {
+            for constructor in object.constructors() {
+                for arg in constructor.arguments() {
+                    self.collect_input_stream_type(&arg.as_type(), &mut out);
+                }
+            }
+            for method in object.methods() {
+                for arg in method.arguments() {
+                    self.collect_input_stream_type(&arg.as_type(), &mut out);
+                }
+            }
+        }
+        for record in self.ci.record_definitions() {
+            for constructor in record.constructors() {
+                for arg in constructor.arguments() {
+                    self.collect_input_stream_type(&arg.as_type(), &mut out);
+                }
+            }
+            for method in record.methods() {
+                for arg in method.arguments() {
+                    self.collect_input_stream_type(&arg.as_type(), &mut out);
+                }
+            }
+        }
+        for enum_ in self.ci.enum_definitions() {
+            for constructor in enum_.constructors() {
+                for arg in constructor.arguments() {
+                    self.collect_input_stream_type(&arg.as_type(), &mut out);
+                }
+            }
+            for method in enum_.methods() {
+                for arg in method.arguments() {
+                    self.collect_input_stream_type(&arg.as_type(), &mut out);
+                }
+            }
+        }
+        out.into_values().collect()
+    }
+
+    fn collect_input_stream_type(
+        &self,
+        ty: &Type,
+        out: &mut std::collections::BTreeMap<String, Type>,
+    ) {
+        match ty {
+            Type::InputStream { .. } => {
+                out.insert(self.input_stream_suffix(ty), ty.clone());
+            }
+            Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+                self.collect_input_stream_type(inner_type, out)
+            }
+            Type::Map {
+                key_type,
+                value_type,
+            } => {
+                self.collect_input_stream_type(key_type, out);
+                self.collect_input_stream_type(value_type, out);
+            }
+            Type::Custom { builtin, .. } => self.collect_input_stream_type(builtin, out),
+            _ => {}
+        }
+    }
+
     fn render(&self) -> Result<TokenStream> {
+        let input_stream_types = self.input_stream_types();
         let records = self
             .ci
             .record_definitions()
@@ -74,6 +145,7 @@ impl<'a> Generator<'a> {
             .iter()
             .map(|function| self.render_function(function))
             .collect::<Result<Vec<_>>>()?;
+        let input_stream_helpers = self.render_input_stream_helpers(&input_stream_types)?;
         let stream_helpers = if self.has_stream_functions() {
             quote! {
                 fn __uniffi_stream_handle_from_bigint(handle: BigInt) -> Result<::uniffi::Handle> {
@@ -217,10 +289,180 @@ impl<'a> Generator<'a> {
                 }
             }
 
+            #input_stream_helpers
+
             #(#records)*
             #(#enums)*
             #(#objects)*
             #(#functions)*
+        })
+    }
+
+    fn render_input_stream_helpers(&self, input_stream_types: &[Type]) -> Result<TokenStream> {
+        if input_stream_types.is_empty() {
+            return Ok(quote!());
+        }
+        let typed_helpers = input_stream_types
+            .iter()
+            .map(|ty| self.render_typed_input_stream_helper(ty))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(quote! {
+            pub struct __UniffiInputStream<NextResult: 'static + FromNapiValue> {
+                handle: u32,
+                next: std::sync::Arc<
+                    ThreadsafeFunction<
+                        u32,
+                        napi::bindgen_prelude::Promise<NextResult>,
+                    >,
+                >,
+                cancel: std::sync::Arc<ThreadsafeFunction<u32>>,
+            }
+
+            impl<NextResult: 'static + FromNapiValue> TypeName for __UniffiInputStream<NextResult> {
+                fn type_name() -> &'static str {
+                    "UniFfiInputStream"
+                }
+
+                fn value_type() -> ValueType {
+                    ValueType::Object
+                }
+            }
+
+            impl<NextResult: 'static + FromNapiValue> ValidateNapiValue
+                for __UniffiInputStream<NextResult>
+            {
+            }
+
+            impl<NextResult: 'static + FromNapiValue> FromNapiValue
+                for __UniffiInputStream<NextResult>
+            where
+                ThreadsafeFunction<
+                    u32,
+                    napi::bindgen_prelude::Promise<NextResult>,
+                >: FromNapiValue,
+                ThreadsafeFunction<u32>: FromNapiValue,
+            {
+                unsafe fn from_napi_value(
+                    env: napi::bindgen_prelude::sys::napi_env,
+                    napi_val: napi::bindgen_prelude::sys::napi_value,
+                ) -> Result<Self> {
+                    let mut __scope = std::ptr::null_mut();
+                    napi::check_status!(
+                        unsafe { napi::bindgen_prelude::sys::napi_open_handle_scope(env, &mut __scope) },
+                        "Failed to open input stream wrapper handle scope"
+                    )?;
+                    let __result = (|| -> Result<Self> {
+                        let obj = napi::bindgen_prelude::Object::from_napi_value(env, napi_val)?;
+                        Ok(Self {
+                            handle: obj.get_named_property_unchecked::<u32>("handle")?,
+                            next: std::sync::Arc::new(
+                                obj.get_named_property_unchecked::<
+                                    ThreadsafeFunction<
+                                        u32,
+                                        napi::bindgen_prelude::Promise<NextResult>,
+                                    >,
+                                >("next")?,
+                            ),
+                            cancel: std::sync::Arc::new(
+                                obj.get_named_property_unchecked::<ThreadsafeFunction<u32>>(
+                                    "cancel",
+                                )?,
+                            ),
+                        })
+                    })();
+                    let __close_status = unsafe {
+                        napi::bindgen_prelude::sys::napi_close_handle_scope(env, __scope)
+                    };
+                    napi::check_status!(
+                        __close_status,
+                        "Failed to close input stream wrapper handle scope"
+                    )?;
+                    __result
+                }
+            }
+
+            #(#typed_helpers)*
+        })
+    }
+
+    fn render_typed_input_stream_helper(&self, ty: &Type) -> Result<TokenStream> {
+        let Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } = ty
+        else {
+            bail!("render_typed_input_stream_helper called with non-input-stream type")
+        };
+        let next_ident = self.input_stream_next_result_ident(ty);
+        let ops_ident = self.input_stream_ops_ident(ty);
+        let item_bridge_ty = self.bridge_return_type(item_type)?;
+        let error_bridge_ty = self.bridge_return_type(error_type)?;
+        let item_core_ty = self.core_value_type(item_type)?;
+        let error_core_ty = self.core_value_type(error_type)?;
+        let lowered_value = self.lower_callback_value_expr(quote!(value), item_type)?;
+        let lowered_error = self.lower_callback_value_expr(quote!(error), error_type)?;
+        Ok(quote! {
+            #[napi(object)]
+            pub struct #next_ident {
+                pub ok: bool,
+                pub done: Option<bool>,
+                pub value: Option<#item_bridge_ty>,
+                pub error: Option<#error_bridge_ty>,
+            }
+
+            struct #ops_ident {
+                next: std::sync::Arc<
+                    ThreadsafeFunction<
+                        u32,
+                        napi::bindgen_prelude::Promise<#next_ident>,
+                    >,
+                >,
+                cancel: std::sync::Arc<ThreadsafeFunction<u32>>,
+                _phantom: std::marker::PhantomData<fn() -> (#item_core_ty, #error_core_ty)>,
+            }
+
+            impl ::uniffi::ForeignInputStreamOps<#item_core_ty, #error_core_ty> for #ops_ident {
+                fn next(
+                    &self,
+                    handle: ::uniffi::Handle,
+                ) -> ::uniffi::ForeignInputStreamNextFuture<#item_core_ty, #error_core_ty> {
+                    let next = self.next.clone();
+                    Box::pin(async move {
+                        let handle = u32::try_from(handle.as_raw()).unwrap_or_else(|_| {
+                            panic!("uniffi input stream handle does not fit in u32")
+                        });
+                        let promise = next.call_async(Ok(handle)).await.unwrap_or_else(|err| {
+                            panic!("uniffi input stream failed to dispatch next(): {}", err)
+                        });
+                        let result: #next_ident = promise.await.unwrap_or_else(|err| {
+                            panic!("uniffi input stream next() dispatcher rejected: {}", err)
+                        });
+                        if !result.ok {
+                            let error = result.error.unwrap_or_else(|| {
+                                panic!("uniffi input stream next() returned err without typed error")
+                            });
+                            return Err(#lowered_error);
+                        }
+                        if result.done.unwrap_or(false) {
+                            return Ok(None);
+                        }
+                        let value = result.value.unwrap_or_else(|| {
+                            panic!("uniffi input stream next() returned value envelope without value")
+                        });
+                        Ok(Some(#lowered_value))
+                    })
+                }
+
+                fn cancel(&self, handle: ::uniffi::Handle) {
+                    let handle = u32::try_from(handle.as_raw()).unwrap_or_else(|_| {
+                        panic!("uniffi input stream handle does not fit in u32")
+                    });
+                    let _ = self
+                        .cancel
+                        .call(Ok(handle), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            }
         })
     }
 
@@ -343,6 +585,13 @@ impl<'a> Generator<'a> {
                 !callable.is_async(),
                 "{label} native stream returns must be synchronous start functions"
             );
+            ensure!(
+                !callable
+                    .arguments()
+                    .iter()
+                    .any(|arg| matches!(arg.as_type(), Type::InputStream { .. })),
+                "{label} cannot combine input stream parameters with native stream returns"
+            );
         }
         for arg in callable.arguments() {
             self.ensure_type_supported(&arg.as_type(), TypeUsage::Arg, label)?;
@@ -394,12 +643,21 @@ impl<'a> Generator<'a> {
                 }
             },
             Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+                ensure!(
+                    !matches!(inner_type.as_ref(), Type::InputStream { .. }),
+                    "{label} nested input stream types are not supported"
+                );
                 self.ensure_type_supported(inner_type, usage, label)
             }
             Type::Map {
                 key_type,
                 value_type,
             } => {
+                ensure!(
+                    !matches!(key_type.as_ref(), Type::InputStream { .. })
+                        && !matches!(value_type.as_ref(), Type::InputStream { .. }),
+                    "{label} nested input stream types are not supported"
+                );
                 self.ensure_type_supported(key_type, TypeUsage::Value, label)?;
                 self.ensure_type_supported(value_type, TypeUsage::Value, label)
             }
@@ -419,8 +677,18 @@ impl<'a> Generator<'a> {
                 }
                 Ok(())
             }
-            Type::InputStream { .. } => {
-                bail!("{label} input stream parameters are not supported yet for JavaScript AsyncIterable lowering")
+            Type::InputStream {
+                item_type,
+                error_type,
+                ..
+            } => {
+                ensure!(
+                    matches!(usage, TypeUsage::Arg),
+                    "{label} input stream is only supported as a direct argument"
+                );
+                self.ensure_type_supported(item_type, TypeUsage::Value, "input stream item")?;
+                self.ensure_type_supported(error_type, TypeUsage::Error, "input stream error")?;
+                Ok(())
             }
             Type::Timestamp | Type::Duration => Ok(()),
             Type::CallbackInterface { name, .. } => {
@@ -1945,6 +2213,10 @@ impl<'a> Generator<'a> {
 
     fn bridge_arg_type(&self, ty: &Type) -> Result<TokenStream> {
         match ty {
+            Type::InputStream { .. } => {
+                let next_ident = self.input_stream_next_result_ident(ty);
+                Ok(quote!(__UniffiInputStream<#next_ident>))
+            }
             Type::Object { name, imp, .. } => {
                 let ident = rust_ident(name);
                 match imp {
@@ -2078,6 +2350,20 @@ impl<'a> Generator<'a> {
                     Ok(quote!(std::sync::Arc::new(#ident) as std::sync::Arc<dyn #trait_path>))
                 }
             },
+            Type::InputStream { .. } => {
+                let ops_ident = self.input_stream_ops_ident(ty);
+                Ok(quote!({
+                    let __stream = #ident;
+                    ::uniffi::UniFfiInputStream::from_handle_and_ops(
+                        ::uniffi::Handle::from_raw_unchecked(u64::from(__stream.handle)),
+                        std::sync::Arc::new(#ops_ident {
+                            next: __stream.next.clone(),
+                            cancel: __stream.cancel.clone(),
+                            _phantom: std::marker::PhantomData,
+                        }),
+                    )
+                }))
+            }
             _ => self.lower_value_expr(quote!(#ident), ty),
         }
     }
@@ -2642,6 +2928,74 @@ impl<'a> Generator<'a> {
             "__Uniffi{}StreamNext",
             function.name().to_upper_camel_case()
         )
+    }
+
+    fn input_stream_next_result_ident(&self, ty: &Type) -> syn::Ident {
+        format_ident!("__UniffiInputStream{}Next", self.input_stream_suffix(ty))
+    }
+
+    fn input_stream_ops_ident(&self, ty: &Type) -> syn::Ident {
+        format_ident!("__UniffiInputStream{}Ops", self.input_stream_suffix(ty))
+    }
+
+    fn input_stream_suffix(&self, ty: &Type) -> String {
+        match ty {
+            Type::InputStream {
+                item_type,
+                error_type,
+                ..
+            } => format!(
+                "{}{}",
+                self.type_suffix(item_type),
+                self.type_suffix(error_type)
+            ),
+            _ => self.type_suffix(ty),
+        }
+    }
+
+    fn type_suffix(&self, ty: &Type) -> String {
+        match ty {
+            Type::UInt8 => "UInt8".into(),
+            Type::Int8 => "Int8".into(),
+            Type::UInt16 => "UInt16".into(),
+            Type::Int16 => "Int16".into(),
+            Type::UInt32 => "UInt32".into(),
+            Type::Int32 => "Int32".into(),
+            Type::UInt64 => "UInt64".into(),
+            Type::Int64 => "Int64".into(),
+            Type::Float32 => "Float32".into(),
+            Type::Float64 => "Float64".into(),
+            Type::Boolean => "Boolean".into(),
+            Type::String => "String".into(),
+            Type::Bytes => "Bytes".into(),
+            Type::Timestamp => "Timestamp".into(),
+            Type::Duration => "Duration".into(),
+            Type::Record { name, .. }
+            | Type::Enum { name, .. }
+            | Type::Object { name, .. }
+            | Type::CallbackInterface { name, .. }
+            | Type::Custom { name, .. } => sanitize_ident(name).to_upper_camel_case(),
+            Type::Optional { inner_type } => format!("Optional{}", self.type_suffix(inner_type)),
+            Type::Sequence { inner_type } => format!("Sequence{}", self.type_suffix(inner_type)),
+            Type::Map {
+                key_type,
+                value_type,
+            } => format!(
+                "Map{}{}",
+                self.type_suffix(key_type),
+                self.type_suffix(value_type)
+            ),
+            Type::Stream {
+                item_type,
+                error_type,
+                ..
+            } => format!(
+                "Stream{}{}",
+                self.type_suffix(item_type),
+                self.type_suffix(error_type)
+            ),
+            Type::InputStream { .. } => format!("InputStream{}", self.input_stream_suffix(ty)),
+        }
     }
 }
 

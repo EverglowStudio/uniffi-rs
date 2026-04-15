@@ -259,6 +259,14 @@ fn render_backend_adapter(
              if (\n\
                  a !== null &&\n\
                  typeof a === \"object\" &&\n\
+                 (a as {{ __uniffiInputStream?: boolean }}).__uniffiInputStream === true\n\
+             ) {{\n\
+                 const marker = a as {{ handle: number; next: unknown; cancel: unknown }};\n\
+                 return {{ handle: marker.handle, next: marker.next, cancel: marker.cancel }};\n\
+             }}\n\
+             if (\n\
+                 a !== null &&\n\
+                 typeof a === \"object\" &&\n\
                  (a as {{ __uniffiCallback?: boolean }}).__uniffiCallback === true\n\
              ) {{\n\
                  return __uniffiNormalizeCallbackObject((a as {{ object: unknown }}).object, a as {{ fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }});\n\

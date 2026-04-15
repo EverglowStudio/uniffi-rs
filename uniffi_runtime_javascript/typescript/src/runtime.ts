@@ -209,6 +209,185 @@ export function createUniffiAsyncIterable<T>(
 }
 
 // ---------------------------------------------------------------------------
+// Foreign input stream registry
+// ---------------------------------------------------------------------------
+
+export type UniffiInputStreamErrorShape = "flat" | "shape";
+
+export interface UniffiInputStreamOptions<T, E> {
+    lowerItem: (value: T) => unknown;
+    lowerError: (error: unknown) => E;
+    errorShape: UniffiInputStreamErrorShape;
+}
+
+export type UniffiInputStreamNext<T, E> =
+    | { ok: true; done: true }
+    | { ok: true; done: false; value: T }
+    | { ok: false; error: E };
+
+export interface UniffiInputStreamMarker<T = unknown, E = unknown> {
+    __uniffiInputStream: true;
+    handle: number;
+    next: (...rawArgs: unknown[]) => Promise<UniffiInputStreamNext<T, E>>;
+    cancel: (...rawArgs: unknown[]) => void;
+}
+
+type InputStreamSlot = {
+    iterator: AsyncIterator<unknown>;
+    lowerItem: (value: unknown) => unknown;
+    lowerError: (error: unknown) => unknown;
+    errorShape: UniffiInputStreamErrorShape;
+    closed: boolean;
+    pending: boolean;
+    cancelStarted: boolean;
+};
+
+const INPUT_STREAMS = new Map<number, InputStreamSlot>();
+let nextInputStreamHandle = 1;
+
+function inputStreamHandleArg(rawArgs: unknown[]): number {
+    const args =
+        rawArgs.length >= 2 &&
+        (rawArgs[0] === null ||
+            rawArgs[0] === undefined ||
+            rawArgs[0] instanceof Error)
+            ? rawArgs.slice(1)
+            : rawArgs;
+    const handle = args[0];
+    if (typeof handle !== "number" || !Number.isInteger(handle) || handle <= 0) {
+        throw new UniffiError({
+            errorName: "UniffiInputStreamHandle",
+            message: "invalid uniffi input stream handle",
+        });
+    }
+    return handle;
+}
+
+export function inputStreamErrorPayload(
+    raw: unknown,
+    shape: UniffiInputStreamErrorShape,
+): unknown {
+    const fromVariant = (
+        variant: unknown,
+        data: unknown,
+        fallback: unknown,
+    ): unknown => {
+        if (shape === "flat") {
+            return typeof variant === "string" ? variant : fallback;
+        }
+        if (typeof variant !== "string") return fallback;
+        if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+            return { tag: variant, ...(data as Record<string, unknown>) };
+        }
+        return { tag: variant };
+    };
+
+    if (raw instanceof UniffiError) {
+        return fromVariant(raw.variant, raw.data, raw);
+    }
+    if (raw !== null && typeof raw === "object") {
+        const obj = raw as Record<string, unknown>;
+        if (shape === "flat") {
+            if (typeof obj.variant === "string") return obj.variant;
+            if (typeof obj.tag === "string") return obj.tag;
+            if (typeof obj.type === "string") return obj.type;
+            return raw;
+        }
+        if (typeof obj.tag === "string") return raw;
+        if (typeof obj.type === "string") {
+            const { type, ...data } = obj;
+            return { tag: type, ...data };
+        }
+        if (typeof obj.variant === "string") {
+            return fromVariant(obj.variant, obj.data, raw);
+        }
+    }
+    return raw;
+}
+
+export function createUniffiInputStream<T, E>(
+    source: AsyncIterable<T>,
+    options: UniffiInputStreamOptions<T, E>,
+): UniffiInputStreamMarker<unknown, E> {
+    if (
+        source === null ||
+        typeof source !== "object" ||
+        typeof (source as AsyncIterable<T>)[Symbol.asyncIterator] !== "function"
+    ) {
+        throw new UniffiError({
+            errorName: "UniffiInputStreamType",
+            message: "expected an AsyncIterable for uniffi input stream argument",
+        });
+    }
+
+    const iterator = source[Symbol.asyncIterator]();
+    const handle = nextInputStreamHandle++;
+    INPUT_STREAMS.set(handle, {
+        iterator: iterator as AsyncIterator<unknown>,
+        lowerItem: options.lowerItem as (value: unknown) => unknown,
+        lowerError: options.lowerError as (error: unknown) => unknown,
+        errorShape: options.errorShape,
+        closed: false,
+        pending: false,
+        cancelStarted: false,
+    });
+
+    return {
+        __uniffiInputStream: true,
+        handle,
+        next: (...rawArgs: unknown[]) =>
+            nextUniffiInputStream(inputStreamHandleArg(rawArgs)),
+        cancel: (...rawArgs: unknown[]): void => {
+            void cancelUniffiInputStream(inputStreamHandleArg(rawArgs));
+        },
+    };
+}
+
+export async function nextUniffiInputStream(
+    handle: number,
+): Promise<UniffiInputStreamNext<unknown, unknown>> {
+    const slot = INPUT_STREAMS.get(handle);
+    if (!slot || slot.closed) return { ok: true, done: true };
+    if (slot.pending) {
+        throw new UniffiError({
+            errorName: "UniffiInputStreamConcurrentNext",
+            message: "concurrent next() on a uniffi input stream is not supported",
+        });
+    }
+    slot.pending = true;
+    try {
+        const result = await slot.iterator.next();
+        if (result.done === true) {
+            slot.closed = true;
+            INPUT_STREAMS.delete(handle);
+            return { ok: true, done: true };
+        }
+        return { ok: true, done: false, value: slot.lowerItem(result.value) };
+    } catch (raw) {
+        slot.closed = true;
+        INPUT_STREAMS.delete(handle);
+        return {
+            ok: false,
+            error: slot.lowerError(inputStreamErrorPayload(raw, slot.errorShape)),
+        };
+    } finally {
+        slot.pending = false;
+    }
+}
+
+export async function cancelUniffiInputStream(handle: number): Promise<void> {
+    const slot = INPUT_STREAMS.get(handle);
+    if (!slot || slot.cancelStarted) return;
+    slot.cancelStarted = true;
+    slot.closed = true;
+    INPUT_STREAMS.delete(handle);
+    const returnFn = slot.iterator.return;
+    if (typeof returnFn === "function") {
+        await returnFn.call(slot.iterator);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Numeric normalisation
 //
 // The high-level contract exposes Rust `i64` / `u64` as JS `bigint`.
