@@ -34,6 +34,15 @@ pub fn map_type(ty: uniffi_meta::Type, context: &Context) -> Result<Type> {
             key_type: key_type.map_node(context)?,
             value_type: value_type.map_node(context)?,
         },
+        uniffi_meta::Type::Stream {
+            item_type,
+            error_type,
+            is_send,
+        } => Type::Stream {
+            item_type: item_type.map_node(context)?,
+            error_type: error_type.map_node(context)?,
+            is_send,
+        },
         uniffi_meta::Type::Object {
             module_path,
             name,

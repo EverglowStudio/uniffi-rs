@@ -539,6 +539,7 @@ pub enum FfiType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Node, MapNode)]
 pub enum HandleKind {
     RustFuture,
+    RustStream,
     ForeignFuture,
     ForeignFutureCallbackData,
     // Interface, trait interface, or callback interface

@@ -99,6 +99,8 @@ pub mod deps {
     #[cfg(feature = "tokio")]
     pub use async_compat;
     pub use bytes;
+    pub use futures_core;
+    pub use once_cell;
     pub use static_assertions;
 }
 

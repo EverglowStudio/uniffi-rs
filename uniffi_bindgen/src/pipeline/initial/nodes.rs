@@ -258,6 +258,11 @@ pub enum Type {
         key_type: Box<Type>,
         value_type: Box<Type>,
     },
+    Stream {
+        item_type: Box<Type>,
+        error_type: Box<Type>,
+        is_send: bool,
+    },
     // User defined types in the API
     Interface {
         namespace: String,

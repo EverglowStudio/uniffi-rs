@@ -136,6 +136,7 @@ impl From<&Type> for FfiType {
             | Type::Map { .. }
             | Type::Timestamp
             | Type::Duration => FfiType::RustBuffer(None),
+            Type::Stream { .. } => FfiType::Handle,
             Type::Custom {
                 builtin,
                 name,

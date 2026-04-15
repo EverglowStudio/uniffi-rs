@@ -177,6 +177,15 @@ fn normalize_type_module_path(ty: &Type) -> Type {
             key_type: Box::new(normalize_type_module_path(key_type)),
             value_type: Box::new(normalize_type_module_path(value_type)),
         },
+        Type::Stream {
+            item_type,
+            error_type,
+            is_send,
+        } => Type::Stream {
+            item_type: Box::new(normalize_type_module_path(item_type)),
+            error_type: Box::new(normalize_type_module_path(error_type)),
+            is_send: *is_send,
+        },
         Type::Custom {
             name,
             builtin,

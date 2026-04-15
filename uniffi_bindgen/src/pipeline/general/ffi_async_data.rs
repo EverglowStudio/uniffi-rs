@@ -46,7 +46,7 @@ pub fn constructor_async_data(
     async_data(context, Some(&ffi_return_type)).map(Some)
 }
 
-fn async_data(context: &Context, ffi_return_type: Option<&FfiType>) -> Result<AsyncData> {
+pub fn async_data(context: &Context, ffi_return_type: Option<&FfiType>) -> Result<AsyncData> {
     let crate_name = context.crate_name()?;
     let return_type_name = match ffi_return_type {
         Some(FfiType::UInt8) => "u8",

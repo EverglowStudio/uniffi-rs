@@ -85,6 +85,7 @@ pub fn type_name(ty: &Type, context: &Context) -> Result<String> {
             type_name(key_type, context)?,
             type_name(value_type, context)?
         ),
+        Type::Stream { .. } => "int".to_string(),
     })
 }
 
@@ -112,6 +113,7 @@ pub fn type_annotation(ty: &Type, context: &Context) -> Result<String> {
             type_annotation(key_type, context)?,
             type_annotation(value_type, context)?
         )),
+        Type::Stream { .. } => type_name(ty, context),
         _ => type_name(ty, context),
     }
 }

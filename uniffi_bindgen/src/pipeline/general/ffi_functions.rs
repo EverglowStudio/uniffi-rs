@@ -25,6 +25,19 @@ pub fn ffi_definitions(
             context,
         )?;
         ffi_definitions.push(ffi_def);
+        if let Some(Type::Stream {
+            item_type,
+            error_type: _,
+            ..
+        }) = func.return_type.as_ref()
+        {
+            ffi_definitions.extend(stream_ffi_defs(
+                &crate_name,
+                &func.name,
+                item_type,
+                context,
+            )?);
+        }
         Ok(())
     })?;
 
@@ -74,6 +87,49 @@ pub fn ffi_definitions(
         Ok(())
     })?;
     Ok(ffi_definitions)
+}
+
+fn stream_ffi_defs(
+    crate_name: &str,
+    func_name: &str,
+    item_type: &Type,
+    context: &Context,
+) -> Result<Vec<FfiDefinition>> {
+    let next_name = uniffi_meta::fn_stream_next_symbol_name(crate_name, func_name);
+    let cancel_name = uniffi_meta::fn_stream_cancel_symbol_name(crate_name, func_name);
+    let next_return_type = Type::Optional {
+        inner_type: Box::new(item_type.clone()),
+    };
+    let next_ffi_return_type = ffi_types::ffi_type(&next_return_type, context)?;
+    Ok(vec![
+        FfiDefinition::RustFunction(FfiFunction {
+            name: RustFfiFunctionName(next_name),
+            async_data: Some(ffi_async_data::async_data(
+                context,
+                Some(&next_ffi_return_type),
+            )?),
+            arguments: vec![FfiArgument {
+                name: "handle".to_owned(),
+                ty: FfiType::Handle(HandleKind::RustStream),
+            }],
+            return_type: FfiReturnType {
+                ty: Some(FfiType::Handle(HandleKind::RustFuture)),
+            },
+            has_rust_call_status_arg: false,
+            kind: FfiFunctionKind::Scaffolding,
+        }),
+        FfiDefinition::RustFunction(FfiFunction {
+            name: RustFfiFunctionName(cancel_name),
+            async_data: None,
+            arguments: vec![FfiArgument {
+                name: "handle".to_owned(),
+                ty: FfiType::Handle(HandleKind::RustStream),
+            }],
+            return_type: FfiReturnType { ty: None },
+            has_rust_call_status_arg: false,
+            kind: FfiFunctionKind::Scaffolding,
+        }),
+    ])
 }
 
 fn method_ffi_def(

@@ -32,6 +32,7 @@ use std::{
     collections::HashMap,
     convert::TryFrom,
     fmt::{Debug, Display},
+    pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -586,6 +587,18 @@ where
     const TYPE_ID_META: MetadataBuffer = MetadataBuffer::from_code(metadata::codes::TYPE_RESULT)
         .concat(R::TYPE_ID_META)
         .concat(E::TYPE_ID_META);
+}
+
+impl<UT, T, E> TypeId<UT>
+    for Pin<Box<dyn futures_core::Stream<Item = std::result::Result<T, E>> + Send + 'static>>
+where
+    T: TypeId<UT>,
+    E: TypeId<UT>,
+{
+    const TYPE_ID_META: MetadataBuffer = MetadataBuffer::from_code(metadata::codes::TYPE_STREAM)
+        .concat(T::TYPE_ID_META)
+        .concat(E::TYPE_ID_META)
+        .concat_bool(true);
 }
 
 unsafe impl<T, UT> LiftRef<UT> for [T]
