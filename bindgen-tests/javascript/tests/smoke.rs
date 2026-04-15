@@ -3592,7 +3592,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-uniffi = {{ path = {:?}, features = ["tokio", "default-async-runtime-tokio"] }}
+uniffi = {{ path = {:?}, features = ["tokio", "default-async-runtime-tokio", "wasm-unstable-single-threaded"] }}
 "#,
             uniffi_dep.as_str()
         ),
@@ -3604,7 +3604,6 @@ uniffi = {{ path = {:?}, features = ["tokio", "default-async-runtime-tokio"] }}
 use std::{
     fmt,
     pin::Pin,
-    task::{Context, Poll},
 };
 
 use uniffi::deps::futures_core::Stream;
@@ -4444,11 +4443,21 @@ fn input_stream_static_generation_contract() {
         );
     }
     let wasm_rs = std::fs::read_to_string(out_dir.join("browser/input_stream_core.rs")).unwrap();
+    for needle in [
+        "__UniffiInputStreamCounterEventStreamErrorOps",
+        "impl ::uniffi::ForeignInputStreamOps",
+        "fn __lower_input_stream_counter_event_stream_error",
+        "::uniffi::UniFfiInputStream::from_handle_and_ops",
+        "::wasm_bindgen_futures::JsFuture::from(__promise).await",
+    ] {
+        assert!(
+            wasm_rs.contains(needle),
+            "wasm bridge missing input stream lowering `{needle}`:\n{wasm_rs}"
+        );
+    }
     assert!(
-        wasm_rs.contains(
-            "uniffi wasm: `sum_input_events` not yet lowered: input streams are not wired into wasm codegen yet",
-        ),
-        "wasm shim should explicitly reject input stream lowering for now:\n{wasm_rs}"
+        !wasm_rs.contains("input streams are not wired into wasm codegen yet"),
+        "wasm shim should no longer emit the input stream unsupported stub:\n{wasm_rs}"
     );
 }
 
@@ -4687,6 +4696,176 @@ console.log("ok");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("ok"),
         "napi input stream driver did not print ok"
+    );
+}
+
+#[test]
+fn host_crates_wasm_input_stream_runs_fixture() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP host_crates_wasm_runs_input_stream_fixture: node 22.6+ unavailable");
+        return;
+    };
+    let Some(cargo) = which_tool("cargo") else {
+        eprintln!("SKIP host_crates_wasm_runs_input_stream_fixture: cargo unavailable");
+        return;
+    };
+    if !has_wasm32_target(&cargo) {
+        eprintln!(
+            "SKIP host_crates_wasm_runs_input_stream_fixture: wasm32-unknown-unknown target unavailable"
+        );
+        return;
+    }
+    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
+        eprintln!("SKIP host_crates_wasm_runs_input_stream_fixture: wasm-bindgen CLI unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(fixture) = build_input_stream_fixture(tmp.path()) else {
+        return;
+    };
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    generate_input_stream_tree(
+        &fixture,
+        &out_dir,
+        Some(host_dir.clone()),
+        vec![FlavorTarget::Wasm],
+    );
+
+    let manifest = host_dir.join("wasm/Cargo.toml");
+    let target_dir = tmp.path().join("target-wasm-input-stream");
+    let build = Command::new(&cargo)
+        .args([
+            "build",
+            "--manifest-path",
+            manifest.as_str(),
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("RUSTFLAGS", "-D warnings")
+        .output()
+        .expect("failed to invoke cargo for wasm input stream host");
+    if !build.status.success() {
+        panic!(
+            "cargo build on input stream wasm host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
+    let wasm_file = target_dir
+        .join("wasm32-unknown-unknown/release")
+        .join("input_stream_core_wasm.wasm");
+    assert!(
+        wasm_file.exists(),
+        "expected built input stream wasm at {}",
+        wasm_file.display()
+    );
+    let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
+    let bg = Command::new(&wasm_bindgen)
+        .args(["--target", "nodejs", "--out-dir"])
+        .arg(pkg.as_str())
+        .arg(wasm_file.as_path())
+        .output()
+        .expect("failed to invoke wasm-bindgen for input stream fixture");
+    if !bg.status.success() {
+        panic!(
+            "wasm-bindgen input stream fixture failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&bg.stdout),
+            String::from_utf8_lossy(&bg.stderr)
+        );
+    }
+
+    std::fs::write(
+        tmp.path().join("wasm-input-stream-driver.ts"),
+        r#"
+import { createRequire } from "node:module";
+import { initBackend, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } from "./generated/browser/index.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/input_stream_core_wasm.js");
+await initBackend(glue);
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+async function* events(): AsyncIterable<{ value: number }> {
+  yield { value: 1 };
+  yield { value: 2 };
+  yield { value: 3 };
+}
+
+const sum = await sumInputEvents(events());
+assert(sum === 6n, `wasm input stream sum ${sum}`);
+
+let returnCount = 0;
+const cancellable = {
+  [Symbol.asyncIterator](): AsyncIterator<{ value: number }> {
+    let sent = false;
+    return {
+      async next(): Promise<IteratorResult<{ value: number }>> {
+        if (sent) return { done: true, value: undefined as any };
+        sent = true;
+        return { done: false, value: { value: 41 } };
+      },
+      async return(): Promise<IteratorResult<{ value: number }>> {
+        returnCount += 1;
+        return { done: true, value: undefined as any };
+      },
+    };
+  },
+};
+const one = await takeOneInputEvent(cancellable);
+assert(one === 41, `wasm take one ${one}`);
+await new Promise((resolve) => setTimeout(resolve, 20));
+assert(returnCount === 1, `wasm Rust drop should call iterator.return once, got ${returnCount}`);
+
+const failing = {
+  [Symbol.asyncIterator](): AsyncIterator<{ value: number }> {
+    return {
+      async next(): Promise<IteratorResult<{ value: number }>> {
+        throw new StreamError("boom", "Boom");
+      },
+    };
+  },
+};
+let threw = false;
+try {
+  await sumInputEvents(failing);
+} catch (error) {
+  threw = true;
+  assert(error instanceof UniffiError, "wasm input stream error should be wrapped");
+  assert(/boom|Boom|StreamError/i.test((error as Error).message), `wasm input stream error message ${(error as Error).message}`);
+}
+assert(threw, "wasm input stream error should throw");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("wasm-input-stream-driver.ts")
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run wasm input stream driver");
+    if !output.status.success() {
+        panic!(
+            "wasm input stream driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "wasm input stream driver did not print ok"
     );
 }
 
