@@ -145,6 +145,36 @@ Generated Kotlin bindings import `kotlinx.coroutines.flow.Flow` and `kotlinx.cor
 when stream-returning functions are present. Consumers must include `kotlinx-coroutines-core` in
 their Gradle dependencies, matching the existing UniFFI async support requirement for coroutines.
 
+## Harmony / OpenHarmony
+
+The Harmony flavor keeps the standard JavaScript API from `common/api.ts`, so stream-returning
+functions still return `AsyncIterable<Item>` for environments that support `for await`.
+
+Harmony also emits `harmony/stream.ts` with an ArkTS-friendly fallback surface:
+
+```ts
+export interface UniFfiStream<T> {
+    next(): Promise<IteratorResult<T>>;
+    cancel(): Promise<void>;
+}
+
+export function toUniFfiStream<T>(source: AsyncIterable<T>): UniFfiStream<T>;
+```
+
+For every stream-returning free function, the Harmony flavor emits a wrapper named
+`<functionName>Stream`:
+
+```ts
+const stream = aiChatStreamPromptStream(state, config);
+const next = await stream.next();
+await stream.cancel();
+```
+
+The fallback wrapper delegates to the standard `AsyncIterable` internally but keeps the consumer call
+surface to explicit `next()` / `cancel()` methods. `cancel()` calls the underlying iterator
+`return()` at most once, so it triggers the same Rust-side stream cancel path as `break` in
+`for await`. Done closes the wrapper, and stream item errors remain rejected promises.
+
 ## Next Phase
 
-Harmony-specific wrappers, input streams, and bidirectional streams are implemented in later phases.
+Input streams and bidirectional streams are implemented in later phases.
