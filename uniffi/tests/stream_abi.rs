@@ -95,6 +95,14 @@ pub fn pending_events(
     Box::pin(PendingStream)
 }
 
+#[uniffi::export]
+pub fn count_events_alias(count: u32) -> uniffi::UniFfiStream<StreamEvent, StreamError> {
+    Box::pin(CountStream {
+        next: 0,
+        end: count,
+    })
+}
+
 uniffi::setup_scaffolding!();
 
 extern "C" fn capture_poll(data: u64, poll: uniffi::RustFuturePoll) {
@@ -118,6 +126,11 @@ fn next_error_after_one(
     handle: uniffi::Handle,
 ) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
     let future = uniffi_uniffi_fn_func_error_after_one_stream_next(handle);
+    complete_next_future(future)
+}
+
+fn next_alias(handle: uniffi::Handle) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
+    let future = uniffi_uniffi_fn_func_count_events_alias_stream_next(handle);
     complete_next_future(future)
 }
 
@@ -172,6 +185,24 @@ fn stream_next_yields_values_then_done() {
     );
     assert_eq!(
         next_count(handle),
+        (uniffi::RustCallStatusCode::Success, None)
+    );
+}
+
+#[test]
+fn stream_alias_yields_values_then_done() {
+    let mut status = uniffi::RustCallStatus::default();
+    let handle = uniffi_uniffi_fn_func_count_events_alias(1, &mut status);
+    assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
+    assert_eq!(
+        next_alias(handle.clone()),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(StreamEvent { value: 0 })
+        )
+    );
+    assert_eq!(
+        next_alias(handle),
         (uniffi::RustCallStatusCode::Success, None)
     );
 }
