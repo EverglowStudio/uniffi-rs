@@ -1374,10 +1374,9 @@ fn ts_lower_expr(
         ),
         Type::Sequence { inner_type } => {
             let item = format!("__item{depth}");
-            format!(
-                "{ident}.map(({item}) => {})",
-                ts_lower_expr(ci, config, inner_type, &item, depth + 1)
-            )
+            let lowered =
+                ts_arrow_expr_body(ts_lower_expr(ci, config, inner_type, &item, depth + 1));
+            format!("{ident}.map(({item}) => {})", lowered)
         }
         Type::Enum { name, .. } => ts_lower_enum(ci, config, name, ident, depth),
         Type::Record { name, .. } => {
@@ -1571,10 +1570,8 @@ fn ts_lift_expr(
         ),
         Type::Sequence { inner_type } => {
             let item = format!("__item{depth}");
-            format!(
-                "{ident}.map(({item}: any) => {})",
-                ts_lift_expr(ci, config, inner_type, &item, depth + 1)
-            )
+            let lifted = ts_arrow_expr_body(ts_lift_expr(ci, config, inner_type, &item, depth + 1));
+            format!("{ident}.map(({item}: any) => {})", lifted)
         }
         Type::Enum { name, .. } => ts_lift_enum(ci, config, name, ident, depth),
         Type::Record { name, .. } => {
@@ -1612,6 +1609,14 @@ fn ts_lift_expr(
         },
         Type::Object { name, .. } => format!("{name}.__fromHandle({ident})"),
         _ => ident.to_string(),
+    }
+}
+
+fn ts_arrow_expr_body(expr: String) -> String {
+    if expr.trim_start().starts_with('{') {
+        format!("({expr})")
+    } else {
+        expr
     }
 }
 

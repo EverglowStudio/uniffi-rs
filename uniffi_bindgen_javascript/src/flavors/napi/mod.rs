@@ -189,7 +189,7 @@ fn render_backend_adapter(
              if (typeof fn !== \"function\") {{\n\
                  throw new Error(`uniffi returned callback ${{id}} has no method ${{method}}`);\n\
              }}\n\
-             return (fn as (...a: unknown[]) => unknown)(...args.slice(2));\n\
+             return (fn as (...a: unknown[]) => unknown)(...args.slice(2).map(__uniffiLiftShape));\n\
          }}\n\
          \n\
          function __uniffiStoreCallbackReturn(value: unknown): {{ id: number }} {{\n\
@@ -216,24 +216,25 @@ fn render_backend_adapter(
                          const callArgs = args.length >= 2 && (args[0] === null || args[0] === undefined || args[0] instanceof Error)\n\
                              ? args.slice(1)\n\
                              : args;\n\
+                         const liftedArgs = callArgs.map(__uniffiLiftShape);\n\
                          const fn = v as (...a: unknown[]) => unknown;\n\
                          const errorShape = fallibleMethods[k];\n\
                          const isAsync = asyncMethods[k] === true;\n\
                          const returnsCallback = callbackReturnMethods[k] === true;\n\
                          if (!errorShape) {{\n\
                              if (isAsync) {{\n\
-                                 return Promise.resolve(fn(...callArgs)).then((value) => returnsCallback ? __uniffiStoreCallbackReturn(value) : __uniffiLowerShape(value));\n\
+                                 return Promise.resolve(fn(...liftedArgs)).then((value) => returnsCallback ? __uniffiStoreCallbackReturn(value) : __uniffiLowerShape(value));\n\
                              }}\n\
-                             return __uniffiLowerShape(fn(...callArgs));\n\
+                             return __uniffiLowerShape(fn(...liftedArgs));\n\
                          }}\n\
                          if (isAsync) {{\n\
-                             return Promise.resolve(fn(...callArgs)).then(\n\
+                             return Promise.resolve(fn(...liftedArgs)).then(\n\
                                  (value) => ({{ ok: true, value: returnsCallback ? __uniffiStoreCallbackReturn(value) : __uniffiLowerShape(value) }}),\n\
                                  (error) => ({{ ok: false, error: __uniffiCallbackErrorPayload(error, errorShape) }}),\n\
                              );\n\
                          }}\n\
                          try {{\n\
-                             return {{ ok: true, value: __uniffiLowerShape(fn(...callArgs)) }};\n\
+                             return {{ ok: true, value: __uniffiLowerShape(fn(...liftedArgs)) }};\n\
                          }} catch (error) {{\n\
                              return {{ ok: false, error: __uniffiCallbackErrorPayload(error, errorShape) }};\n\
                          }}\n\
@@ -381,7 +382,7 @@ fn render_ohos_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> Strin
         .replace("type for any\n", "type for each\n")
 }
 
-fn napi_path_env_var(namespace: &str) -> String {
+pub(crate) fn napi_path_env_var(namespace: &str) -> String {
     let mut out = String::from("UNIFFI_");
     let mut last_was_sep = false;
     for ch in namespace.chars() {
