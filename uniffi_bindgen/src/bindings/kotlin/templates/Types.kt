@@ -166,6 +166,9 @@ object NoHandle
 {%- when Type::Set { inner_type } %}
 {% include "SetTemplate.kt" %}
 
+{%- when Type::InputStream { item_type, error_type, is_send } %}
+{% include "InputStreamTemplate.kt" %}
+
 {%- when Type::CallbackInterface { module_path, name } %}
 {% include "CallbackInterfaceTemplate.kt" %}
 

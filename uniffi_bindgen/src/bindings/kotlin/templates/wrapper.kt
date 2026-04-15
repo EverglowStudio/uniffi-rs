@@ -51,6 +51,11 @@ import java.util.concurrent.ConcurrentHashMap
 {% include "Async.kt" %}
 {%- endif %}
 
+// Foreign input stream support
+{%- if ci.has_input_stream_fns() %}
+{% include "InputStreamRuntime.kt" %}
+{%- endif %}
+
 // Public interface members begin here.
 {{ type_helper_code }}
 
