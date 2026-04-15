@@ -113,3 +113,30 @@ pub fn map_type(mut ty: Type, context: &Context) -> Result<Type> {
         _ => ty,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_stream_type_into_general_ir() {
+        let context = Context::new("test");
+        let stream_type = Type::Stream {
+            item_type: Box::new(Type::UInt32),
+            error_type: Box::new(Type::String),
+            is_send: true,
+        };
+
+        let type_node: TypeNode = stream_type.map_node(&context).unwrap();
+        assert_eq!(type_node.canonical_name, "StreamUInt32String");
+        assert_eq!(type_node.ffi_type, FfiType::Handle(HandleKind::RustStream));
+        assert_eq!(
+            type_node.ty,
+            Type::Stream {
+                item_type: Box::new(Type::UInt32),
+                error_type: Box::new(Type::String),
+                is_send: true,
+            }
+        );
+    }
+}

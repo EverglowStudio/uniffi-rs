@@ -85,7 +85,7 @@ pub fn type_name(ty: &Type, context: &Context) -> Result<String> {
             type_name(key_type, context)?,
             type_name(value_type, context)?
         ),
-        Type::Stream { .. } => "int".to_string(),
+        Type::Stream { .. } => bail!("stream ABI codegen not implemented yet for Python"),
     })
 }
 
@@ -113,7 +113,7 @@ pub fn type_annotation(ty: &Type, context: &Context) -> Result<String> {
             type_annotation(key_type, context)?,
             type_annotation(value_type, context)?
         )),
-        Type::Stream { .. } => type_name(ty, context),
+        Type::Stream { .. } => bail!("stream ABI codegen not implemented yet for Python"),
         _ => type_name(ty, context),
     }
 }
@@ -127,4 +127,25 @@ pub fn ffi_converter_name(ty: &general::TypeNode, context: &Context) -> Result<S
         Some(package) => format!("{package}._UniffiFfiConverter{}", ty.canonical_name),
         None => format!("_UniffiFfiConverter{}", ty.canonical_name),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_type_name_reports_not_implemented() {
+        let err = type_name(
+            &Type::Stream {
+                item_type: Box::new(Type::UInt32),
+                error_type: Box::new(Type::String),
+                is_send: true,
+            },
+            &Context::default(),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("stream ABI codegen not implemented yet for Python"));
+    }
 }

@@ -430,6 +430,7 @@ impl FnSignature {
 pub(crate) struct StreamReturnType {
     pub(crate) item_ty: TokenStream,
     pub(crate) error_ty: TokenStream,
+    pub(crate) is_send: bool,
 }
 
 pub(crate) struct Arg {
@@ -590,6 +591,7 @@ fn stream_return_type(return_type: &ReturnType) -> syn::Result<Option<StreamRetu
         return Ok(Some(StreamReturnType {
             item_ty: quote! { #item_ty },
             error_ty: quote! { #error_ty },
+            is_send: true,
         }));
     }
     if !type_contains_stream_path(ty) {
@@ -651,6 +653,7 @@ fn stream_return_type(return_type: &ReturnType) -> syn::Result<Option<StreamRetu
     Ok(Some(StreamReturnType {
         item_ty: quote! { #item_ty },
         error_ty: quote! { #error_ty },
+        is_send: true,
     }))
 }
 
@@ -797,7 +800,8 @@ fn looks_like_result(return_type: &ReturnType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::stream_return_type;
+    use super::{stream_return_type, FnKind, FnSignature, NamedArg};
+    use crate::export::ExportFnArgs;
     use quote::quote;
     use syn::parse_quote;
 
@@ -813,6 +817,18 @@ mod tests {
         let stream = stream_return_type(&return_type).unwrap().unwrap();
         assert_eq!(stream.item_ty.to_string(), quote! { u32 }.to_string());
         assert_eq!(stream.error_ty.to_string(), quote! { MyError }.to_string());
+        assert!(stream.is_send);
+    }
+
+    #[test]
+    fn parses_imported_stream_return_path() {
+        let return_type: syn::ReturnType = parse_quote! {
+            -> Pin<Box<dyn Stream<Item = Result<MyEvent, MyError>> + Send + 'static>>
+        };
+        let stream = stream_return_type(&return_type).unwrap().unwrap();
+        assert_eq!(stream.item_ty.to_string(), quote! { MyEvent }.to_string());
+        assert_eq!(stream.error_ty.to_string(), quote! { MyError }.to_string());
+        assert!(stream.is_send);
     }
 
     #[test]
@@ -823,6 +839,7 @@ mod tests {
         let stream = stream_return_type(&return_type).unwrap().unwrap();
         assert_eq!(stream.item_ty.to_string(), quote! { u32 }.to_string());
         assert_eq!(stream.error_ty.to_string(), quote! { MyError }.to_string());
+        assert!(stream.is_send);
     }
 
     #[test]
@@ -836,6 +853,7 @@ mod tests {
             stream.error_ty.to_string(),
             quote! { crate :: MyError }.to_string()
         );
+        assert!(stream.is_send);
     }
 
     #[test]
@@ -849,6 +867,60 @@ mod tests {
         };
         let error = stream_return_type(&return_type).unwrap_err().to_string();
         assert!(error.contains("Stream<Item = T> is not supported"));
+    }
+
+    #[test]
+    fn rejects_stream_return_without_static() {
+        let return_type: syn::ReturnType = parse_quote! {
+            -> Pin<Box<dyn Stream<Item = Result<u32, MyError>> + Send>>
+        };
+        let error = stream_return_type(&return_type).unwrap_err().to_string();
+        assert!(error.contains("Send + 'static"));
+    }
+
+    #[test]
+    fn rejects_stream_return_without_send() {
+        let return_type: syn::ReturnType = parse_quote! {
+            -> Pin<Box<dyn Stream<Item = Result<u32, MyError>> + 'static>>
+        };
+        let error = stream_return_type(&return_type).unwrap_err().to_string();
+        assert!(error.contains("Send + 'static"));
+    }
+
+    #[test]
+    fn rejects_stream_parameters() {
+        let ty: syn::Type = parse_quote! {
+            Pin<Box<dyn Stream<Item = Result<u32, MyError>> + Send + 'static>>
+        };
+        let err = match NamedArg::new(parse_quote! { events }, &ty, &mut Default::default()) {
+            Ok(_) => panic!("expected stream parameter rejection"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("stream parameters are not supported"));
+    }
+
+    #[test]
+    fn rejects_method_stream_returns() {
+        let sig: syn::Signature = parse_quote! {
+            fn events(&self) -> Pin<Box<dyn Stream<Item = Result<u32, MyError>> + Send + 'static>>
+        };
+        let err = match FnSignature::new(
+            FnKind::Method {
+                self_ident: parse_quote! { MyObject },
+                foreign_self_ident: parse_quote! { MyObject },
+            },
+            sig,
+            ExportFnArgs::default(),
+            String::new(),
+        ) {
+            Ok(_) => panic!("expected method stream return rejection"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("only supported for top-level functions"));
     }
 }
 
