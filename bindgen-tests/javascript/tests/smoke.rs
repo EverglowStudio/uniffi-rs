@@ -4505,6 +4505,13 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         mini_glue.contains("WXWebAssembly.instantiate(wasmPath, imports)"),
         "patched Mini Program glue must load through WXWebAssembly.instantiate:\n{mini_glue}"
     );
+    assert!(
+        mini_glue.contains("__uniffiTextDecoder")
+            && mini_glue.contains("__uniffiTextEncoder")
+            && !mini_glue.contains("new TextDecoder(")
+            && !mini_glue.contains("new TextEncoder("),
+        "patched Mini Program glue must not require TextDecoder/TextEncoder globals at module evaluation:\n{mini_glue}"
+    );
 
     let node_entry = std::fs::read_to_string(package_dir.join("src/index.node.ts")).unwrap();
     assert!(
@@ -4582,6 +4589,8 @@ function assertEq(actual: unknown, expected: unknown, label: string): void {
 }
 
 const calls: string[] = [];
+(globalThis as { TextDecoder?: unknown; TextEncoder?: unknown }).TextDecoder = undefined;
+(globalThis as { TextDecoder?: unknown; TextEncoder?: unknown }).TextEncoder = undefined;
 (globalThis as { WXWebAssembly?: unknown }).WXWebAssembly = {
     async instantiate(path: string, imports: WebAssembly.Imports): Promise<WebAssembly.WebAssemblyInstantiatedSource> {
         calls.push(path);
