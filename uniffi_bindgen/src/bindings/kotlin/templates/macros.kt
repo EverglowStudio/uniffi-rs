@@ -68,6 +68,44 @@
     {% endif %}
 {% endmacro %}
 
+{%- macro stream_func_decl(func_decl, callable, indent) %}
+    {%- call docstring(callable, indent) %}{% endcall %}
+
+    {%- if let Some(stream_error_type) = callable.stream_error_type() %}
+    {%- if let Some(stream_next_return_type) = callable.stream_next_return_type() %}
+    {{ func_decl }} fun {{ callable.name()|fn_name }}(
+        {%- call arg_list(callable, callable.self_type().is_none()) %}{% endcall -%}
+    ) : {{ callable.return_type().unwrap()|type_name(ci) }} {
+        return flow {
+            val __streamHandle = {% call to_ffi_call(callable) %}{% endcall %}
+            try {
+                while (true) {
+                    val __streamNext = uniffiRustCallAsync(
+                        UniffiLib.{{ callable.ffi_stream_next_func() }}(__streamHandle),
+                        { future, callback, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_poll(ci) }}(future, callback, continuation) },
+                        { future, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_complete(ci) }}(future, continuation) },
+                        { future -> UniffiLib.{{ callable.ffi_stream_next_rust_future_free(ci) }}(future) },
+                        { {{ stream_next_return_type|lift_fn }}(it) },
+                        {%- if ci.is_external(stream_error_type) %}
+                        {{ stream_error_type|type_name(ci) }}ExternalErrorHandler,
+                        {%- else %}
+                        {{ stream_error_type|type_name(ci) }}.ErrorHandler,
+                        {%- endif %}
+                    )
+                    if (__streamNext == null) {
+                        break
+                    }
+                    emit(__streamNext)
+                }
+            } finally {
+                UniffiLib.{{ callable.ffi_stream_cancel_func() }}(__streamHandle)
+            }
+        }
+    }
+    {%- endif %}
+    {%- endif %}
+{% endmacro %}
+
 {%- macro call_async(callable) -%}
     uniffiRustCallAsync(
 

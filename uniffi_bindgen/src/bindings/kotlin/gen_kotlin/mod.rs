@@ -378,7 +378,16 @@ impl<'a> KotlinWrapper<'a> {
     }
 
     pub fn imports(&self) -> Vec<ImportRequirement> {
-        self.type_imports.iter().cloned().collect()
+        let mut imports = self.type_imports.clone();
+        if self.ci.has_stream_fns() {
+            imports.insert(ImportRequirement::Import {
+                name: "kotlinx.coroutines.flow.Flow".to_owned(),
+            });
+            imports.insert(ImportRequirement::Import {
+                name: "kotlinx.coroutines.flow.flow".to_owned(),
+            });
+        }
+        imports.into_iter().collect()
     }
 }
 
@@ -651,7 +660,7 @@ impl<T: AsType> AsCodeType for T {
                 value_type,
             } => Box::new(compounds::MapCodeType::new(*key_type, *value_type)),
             Type::Set { inner_type } => Box::new(compounds::SetCodeType::new(*inner_type)),
-            Type::Stream { .. } => Box::new(primitives::UInt64CodeType),
+            Type::Stream { item_type, .. } => Box::new(compounds::StreamCodeType::new(*item_type)),
             Type::Custom { name, builtin, .. } => {
                 Box::new(custom::CustomCodeType::new(name, builtin.as_codetype()))
             }
@@ -785,6 +794,10 @@ mod filters {
             Type::Set { inner_type } => Ok(format!(
                 "Set<{}>",
                 fully_qualified_type_label(inner_type, ci, config)?
+            )),
+            Type::Stream { item_type, .. } => Ok(format!(
+                "Flow<{}>",
+                fully_qualified_type_label(item_type, ci, config)?,
             )),
             Type::Enum { .. }
             | Type::Record { .. }
@@ -1070,6 +1083,94 @@ mod filters {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::collections::BTreeSet;
+    use uniffi_meta::{
+        EnumMetadata, EnumShape, FieldMetadata, FnMetadata, FnParamMetadata, Metadata,
+        MetadataGroup, NamespaceMetadata, RecordMetadata, Type, VariantMetadata,
+    };
+
+    fn stream_component_interface() -> ComponentInterface {
+        let module_path = "stream_core";
+        let stream_event_type = Type::Record {
+            module_path: module_path.to_owned(),
+            name: "StreamEvent".to_owned(),
+        };
+        let stream_error_type = Type::Enum {
+            module_path: module_path.to_owned(),
+            name: "StreamError".to_owned(),
+        };
+        let mut items = BTreeSet::new();
+        items.insert(Metadata::Record(RecordMetadata {
+            module_path: module_path.to_owned(),
+            name: "StreamEvent".to_owned(),
+            remote: false,
+            fields: vec![FieldMetadata {
+                name: "value".to_owned(),
+                ty: Type::UInt32,
+                default: None,
+                docstring: None,
+            }],
+            docstring: None,
+        }));
+        items.insert(Metadata::Enum(EnumMetadata {
+            module_path: module_path.to_owned(),
+            name: "StreamError".to_owned(),
+            shape: EnumShape::Error { flat: true },
+            remote: false,
+            variants: vec![VariantMetadata {
+                name: "Boom".to_owned(),
+                discr: None,
+                fields: vec![],
+                docstring: None,
+            }],
+            discr_type: None,
+            non_exhaustive: false,
+            docstring: None,
+        }));
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: "count_events".to_owned(),
+            is_async: false,
+            inputs: vec![FnParamMetadata {
+                name: "count".to_owned(),
+                ty: Type::UInt32,
+                by_ref: false,
+                optional: false,
+                default: None,
+            }],
+            return_type: Some(Type::Stream {
+                item_type: Box::new(stream_event_type),
+                error_type: Box::new(stream_error_type),
+                is_send: true,
+            }),
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }));
+        let mut ci = ComponentInterface::from_metadata(MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.to_owned(),
+                name: module_path.to_owned(),
+            },
+            namespace_docstring: None,
+            items,
+        })
+        .unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        ci
+    }
+
+    fn stream_bindings() -> String {
+        generate_bindings(
+            &Config {
+                package_name: Some("uniffi.stream_core".to_owned()),
+                cdylib_name: Some("stream_core".to_owned()),
+                ..Config::default()
+            },
+            &stream_component_interface(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn test_kotlin_version() {
@@ -1128,5 +1229,31 @@ mod test {
             !checksum_checks.contains(".toShort())"),
             "checksum comparisons should compare the widened Int carrier directly"
         );
+    }
+
+    #[test]
+    fn kotlin_stream_flow_static_contract() {
+        let kotlin = stream_bindings();
+
+        assert!(kotlin.contains("import kotlinx.coroutines.flow.Flow"));
+        assert!(kotlin.contains("import kotlinx.coroutines.flow.flow"));
+        assert!(kotlin.contains("fun `countEvents`("));
+        assert!(kotlin.contains(") : Flow<StreamEvent>"));
+        assert!(!kotlin.contains("fun `countEvents`(`count`: kotlin.UInt) : ULong"));
+        assert!(kotlin.contains("return flow {"));
+        assert!(kotlin.contains("val __streamHandle ="));
+        assert!(kotlin.contains("UniffiLib.uniffi_stream_core_fn_func_count_events("));
+        assert!(kotlin.contains(
+            "UniffiLib.uniffi_stream_core_fn_func_count_events_stream_next(__streamHandle)"
+        ));
+        assert!(kotlin.contains(
+            "UniffiLib.uniffi_stream_core_fn_func_count_events_stream_cancel(__streamHandle)"
+        ));
+        assert!(kotlin.contains("val __streamNext = uniffiRustCallAsync("));
+        assert!(kotlin.contains("FfiConverterOptionalTypeStreamEvent.lift(it)"));
+        assert!(kotlin.contains("StreamException.ErrorHandler"));
+        assert!(kotlin.contains("if (__streamNext == null)"));
+        assert!(kotlin.contains("emit(__streamNext)"));
+        assert!(kotlin.contains("} finally {"));
     }
 }

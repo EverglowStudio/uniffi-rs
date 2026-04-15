@@ -121,7 +121,30 @@ Typed stream error preservation is intentionally deferred. Swift currently expos
 `AsyncThrowingStream<Item, Error>` and throws the lifted UniFFI error value through the standard Swift
 `Error` channel.
 
+## Kotlin Flow
+
+The Kotlin target wraps stream-returning free functions as `kotlinx.coroutines.flow.Flow<Item>`:
+
+```kotlin
+countEvents(count = 3u).collect { item ->
+    // item is the stream item type
+}
+```
+
+The public Kotlin API does not expose the raw stream handle. Generated code returns a cold `flow {}`:
+each collection synchronously calls the low-level start function to create a new Rust stream handle,
+then repeatedly awaits the hidden `foo_stream_next(handle)` Rust future through the existing
+`uniffiRustCallAsync` helper. `Some(item)` is emitted, `None` ends the flow, and stream item errors
+are thrown to the collector through the standard Kotlin exception path.
+
+The generated flow body always calls hidden `foo_stream_cancel(handle)` from `finally`. This covers
+normal completion, collector cancellation, and exceptions. The Rust-side cancel path is idempotent,
+so it is safe if Rust has already released the stream after done or error.
+
+Generated Kotlin bindings import `kotlinx.coroutines.flow.Flow` and `kotlinx.coroutines.flow.flow`
+when stream-returning functions are present. Consumers must include `kotlinx-coroutines-core` in
+their Gradle dependencies, matching the existing UniFFI async support requirement for coroutines.
+
 ## Next Phase
 
-Kotlin `Flow`, Harmony-specific wrappers, input streams, and bidirectional streams are implemented in
-later phases.
+Harmony-specific wrappers, input streams, and bidirectional streams are implemented in later phases.
