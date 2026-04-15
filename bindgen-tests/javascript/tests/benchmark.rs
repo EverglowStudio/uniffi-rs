@@ -95,7 +95,7 @@ fn write_benchmark_fixture(root: &std::path::Path) -> Utf8PathBuf {
              name = \"js_benchmark_fixture\"\n\
              crate-type = [\"lib\", \"cdylib\"]\n\n\
              [dependencies]\n\
-             uniffi = {{ path = \"{}\" }}\n\n\
+             uniffi = {{ path = \"{}\", features = [\"tokio\", \"default-async-runtime-tokio\", \"wasm-unstable-single-threaded\"] }}\n\n\
              [workspace]\n",
             uniffi_path
         ),
@@ -105,7 +105,12 @@ fn write_benchmark_fixture(root: &std::path::Path) -> Utf8PathBuf {
         src.join("lib.rs"),
         r#"
 use std::collections::HashMap;
+use std::fmt;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+use uniffi::deps::futures_core::Stream;
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct BenchRecord {
@@ -118,6 +123,26 @@ pub enum BenchEnum {
     One { value: u32 },
     Two { label: String },
 }
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct StreamItem {
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, uniffi::Error)]
+pub enum BenchStreamError {
+    Boom,
+}
+
+impl fmt::Display for BenchStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Boom => write!(f, "boom"),
+        }
+    }
+}
+
+impl std::error::Error for BenchStreamError {}
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NestedData {
@@ -203,12 +228,316 @@ pub async fn async_add(a: u64, b: u64) -> u64 {
     a + b
 }
 
+struct CountStream {
+    next: u32,
+    end: u32,
+}
+
+impl Stream for CountStream {
+    type Item = Result<StreamItem, BenchStreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.next >= self.end {
+            Poll::Ready(None)
+        } else {
+            let value = self.next;
+            self.next += 1;
+            Poll::Ready(Some(Ok(StreamItem { value })))
+        }
+    }
+}
+
+async fn next_input(
+    events: &mut uniffi::UniFfiInputStream<StreamItem, BenchStreamError>,
+) -> Option<Result<StreamItem, BenchStreamError>> {
+    std::future::poll_fn(|cx| Pin::new(&mut *events).poll_next(cx)).await
+}
+
+struct RunningSumStream {
+    events: uniffi::UniFfiInputStream<StreamItem, BenchStreamError>,
+    sum: u32,
+    done: bool,
+}
+
+impl Stream for RunningSumStream {
+    type Item = Result<StreamItem, BenchStreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut self.events).poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(item))) => {
+                self.sum = self.sum.wrapping_add(item.value);
+                Poll::Ready(Some(Ok(StreamItem { value: self.sum })))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.done = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn count_stream(count: u32) -> uniffi::UniFfiStream<StreamItem, BenchStreamError> {
+    Box::pin(CountStream {
+        next: 0,
+        end: count,
+    })
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn sum_input_stream(
+    mut events: uniffi::UniFfiInputStream<StreamItem, BenchStreamError>,
+) -> Result<u64, BenchStreamError> {
+    let mut sum = 0u64;
+    while let Some(item) = next_input(&mut events).await {
+        sum = sum.wrapping_add(u64::from(item?.value));
+    }
+    Ok(sum)
+}
+
+#[uniffi::export]
+pub fn running_sum_stream(
+    events: uniffi::UniFfiInputStream<StreamItem, BenchStreamError>,
+) -> uniffi::UniFfiStream<StreamItem, BenchStreamError> {
+    Box::pin(RunningSumStream {
+        events,
+        sum: 0,
+        done: false,
+    })
+}
+
 uniffi::setup_scaffolding!();
 "#,
     )
     .unwrap();
 
     Utf8PathBuf::from_path_buf(crate_dir.join("Cargo.toml")).unwrap()
+}
+
+fn write_benchmark_driver(root: &std::path::Path, glue_js_name: &str) -> std::path::PathBuf {
+    let driver = root.join("benchmark-driver.ts");
+    std::fs::write(
+        &driver,
+        format!(
+            r#"
+import {{ createRequire }} from "node:module";
+import {{ performance }} from "node:perf_hooks";
+import * as nodeCore from "./generated/node/index.ts";
+import {{ initBackend }} from "./generated/browser/index.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/{glue_js_name}");
+await initBackend(glue);
+const wasmCore = await import("./generated/browser/index.ts");
+
+const iterations = Number(process.env.UNIFFI_JS_BENCH_ITERS ?? "200");
+const streamRepetitions = Number(process.env.UNIFFI_JS_STREAM_BENCH_REPS ?? "3");
+const streamCounts = (process.env.UNIFFI_JS_STREAM_BENCH_COUNTS ?? "100,1000,10000")
+  .split(",")
+  .map((value) => Number(value.trim()))
+  .filter((value) => Number.isInteger(value) && value > 0);
+const meta = {{ node: process.version, iterations, mode: "quick" }};
+
+function bench(backend, caseName, fn) {{
+  for (let i = 0; i < Math.min(iterations, 10); i += 1) fn();
+  const start = performance.now();
+  for (let i = 0; i < iterations; i += 1) fn();
+  const elapsedMs = performance.now() - start;
+  console.log(JSON.stringify({{
+    ...meta,
+    backend,
+    case: caseName,
+    elapsedMs,
+    msPerOp: elapsedMs / iterations,
+  }}));
+}}
+
+async function benchAsync(backend, caseName, fn) {{
+  for (let i = 0; i < Math.min(iterations, 10); i += 1) await fn();
+  const start = performance.now();
+  for (let i = 0; i < iterations; i += 1) await fn();
+  const elapsedMs = performance.now() - start;
+  console.log(JSON.stringify({{
+    ...meta,
+    backend,
+    case: caseName,
+    elapsedMs,
+    msPerOp: elapsedMs / iterations,
+  }}));
+}}
+
+async function benchStream(backend, caseName, count, fn) {{
+  await fn(count);
+  const start = performance.now();
+  for (let i = 0; i < streamRepetitions; i += 1) {{
+    await fn(count);
+  }}
+  const elapsedMs = performance.now() - start;
+  const items = count * streamRepetitions;
+  console.log(JSON.stringify({{
+    ...meta,
+    backend,
+    case: caseName,
+    count,
+    repetitions: streamRepetitions,
+    items,
+    elapsedMs,
+    msPerItem: elapsedMs / items,
+    itemsPerSec: items / (elapsedMs / 1000),
+  }}));
+}}
+
+function expectedSum(count) {{
+  return (BigInt(count) * BigInt(count - 1)) / 2n;
+}}
+
+async function* makeStreamItems(count) {{
+  for (let i = 0; i < count; i += 1) {{
+    yield {{ value: i }};
+  }}
+}}
+
+async function consumeOutputStream(core, count) {{
+  let seen = 0;
+  let sum = 0n;
+  for await (const item of core.countStream(count)) {{
+    seen += 1;
+    sum += BigInt(item.value);
+  }}
+  if (seen !== count || sum !== expectedSum(count)) {{
+    throw new Error(`output stream mismatch seen=${{seen}} sum=${{sum}} count=${{count}}`);
+  }}
+}}
+
+async function consumeInputStream(core, count) {{
+  const sum = await core.sumInputStream(makeStreamItems(count));
+  if (sum !== expectedSum(count)) {{
+    throw new Error(`input stream mismatch sum=${{sum}} count=${{count}}`);
+  }}
+}}
+
+async function consumeBidiStream(core, count) {{
+  let seen = 0;
+  let last = 0;
+  for await (const item of core.runningSumStream(makeStreamItems(count))) {{
+    seen += 1;
+    last = item.value;
+  }}
+  const expectedLast = count === 0 ? 0 : Number(expectedSum(count));
+  if (seen !== count || last !== expectedLast) {{
+    throw new Error(`bidi stream mismatch seen=${{seen}} last=${{last}} count=${{count}}`);
+  }}
+}}
+
+async function benchBackend(label, core) {{
+  const record = {{ count: 7, label: "record" }};
+  const enumValue = {{ tag: "One", value: 9 }};
+  const nested = {{
+    record,
+    enumValue,
+    values: [1, 2, 3],
+    counts: {{ a: 1, b: 2 }},
+  }};
+  const largeString = "x".repeat(4096);
+  const callback = {{ bump(value) {{ return value + 1; }} }};
+
+  bench(label, "scalar-u64-add", () => {{
+    if (core.add(2n, 3n) !== 5n) throw new Error(`${{label}} add failed`);
+  }});
+  bench(label, "string-concat", () => {{
+    if (core.concat("a", "b") !== "ab") throw new Error(`${{label}} concat failed`);
+  }});
+  bench(label, "large-string-roundtrip", () => {{
+    if (core.largeStringRoundtrip(largeString).length !== largeString.length) throw new Error(`${{label}} large string failed`);
+  }});
+  bench(label, "record-roundtrip", () => {{
+    if (core.recordRoundtrip(record).count !== 7) throw new Error(`${{label}} record failed`);
+  }});
+  bench(label, "enum-roundtrip", () => {{
+    if (core.enumRoundtrip(enumValue).tag !== "One") throw new Error(`${{label}} enum failed`);
+  }});
+  bench(label, "vec-roundtrip", () => {{
+    if (core.vecRoundtrip([1, 2, 3]).length !== 3) throw new Error(`${{label}} vec failed`);
+  }});
+  bench(label, "map-roundtrip", () => {{
+    if (core.mapRoundtrip({{ a: 1, b: 2 }}).b !== 2) throw new Error(`${{label}} map failed`);
+  }});
+  bench(label, "nested-data-roundtrip", () => {{
+    const value = core.nestedDataRoundtrip(nested);
+    if (value.record.count !== 7 || value.enumValue.tag !== "One" || value.values.length !== 3 || value.counts.b !== 2) {{
+      throw new Error(`${{label}} nested data failed`);
+    }}
+  }});
+  bench(label, "object-method", () => {{
+    const counter = core.BenchCounter.new(1);
+    if (counter.increment() !== 2) throw new Error(`${{label}} object failed`);
+    counter.dispose?.();
+  }});
+  bench(label, "sync-callback", () => {{
+    if (core.callCallback(callback, 4) !== 5) throw new Error(`${{label}} callback failed`);
+  }});
+  await benchAsync(label, "async-u64-add", async () => {{
+    if (await core.asyncAdd(2n, 3n) !== 5n) throw new Error(`${{label}} async add failed`);
+  }});
+  for (const count of streamCounts) {{
+    await benchStream(label, "stream-output", count, async (n) => consumeOutputStream(core, n));
+    await benchStream(label, "stream-input", count, async (n) => consumeInputStream(core, n));
+    await benchStream(label, "stream-bidi", count, async (n) => consumeBidiStream(core, n));
+  }}
+}}
+
+await benchBackend("napi", nodeCore);
+await benchBackend("wasm", wasmCore);
+"#
+        ),
+    )
+    .unwrap();
+    driver
+}
+
+#[test]
+fn javascript_stream_benchmark_fixture_smoke() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = write_benchmark_fixture(tmp.path());
+    let lib = std::fs::read_to_string(manifest.parent().unwrap().join("src/lib.rs")).unwrap();
+    for needle in [
+        "pub fn count_stream(count: u32) -> uniffi::UniFfiStream<StreamItem, BenchStreamError>",
+        "pub async fn sum_input_stream(",
+        "events: uniffi::UniFfiInputStream<StreamItem, BenchStreamError>",
+        "pub fn running_sum_stream(",
+    ] {
+        assert!(
+            lib.contains(needle),
+            "benchmark fixture should include stream path `{needle}`:\n{lib}"
+        );
+    }
+
+    let driver = write_benchmark_driver(tmp.path(), "fixture_wasm.js");
+    let driver = std::fs::read_to_string(driver).unwrap();
+    for needle in [
+        "UNIFFI_JS_STREAM_BENCH_COUNTS",
+        "\"100,1000,10000\"",
+        "stream-output",
+        "stream-input",
+        "stream-bidi",
+        "countStream(count)",
+        "sumInputStream(makeStreamItems(count))",
+        "runningSumStream(makeStreamItems(count))",
+        "itemsPerSec",
+    ] {
+        assert!(
+            driver.contains(needle),
+            "benchmark driver should include `{needle}`:\n{driver}"
+        );
+    }
 }
 
 #[test]
@@ -282,110 +611,7 @@ fn javascript_generated_entrypoint_benchmark_quick() {
         .expect("wasm-bindgen nodejs output should contain JS glue");
     let glue_js_name = glue_js.file_name().and_then(|s| s.to_str()).unwrap();
 
-    let driver = tmp.path().join("benchmark-driver.ts");
-    std::fs::write(
-        &driver,
-        format!(
-            r#"
-import {{ createRequire }} from "node:module";
-import {{ performance }} from "node:perf_hooks";
-import * as nodeCore from "./generated/node/index.ts";
-import {{ initBackend }} from "./generated/browser/index.ts";
-
-const require = createRequire(import.meta.url);
-const glue = require("./pkg/{glue_js_name}");
-await initBackend(glue);
-const wasmCore = await import("./generated/browser/index.ts");
-
-const iterations = Number(process.env.UNIFFI_JS_BENCH_ITERS ?? "200");
-const meta = {{ node: process.version, iterations, mode: "quick" }};
-
-function bench(backend, caseName, fn) {{
-  for (let i = 0; i < Math.min(iterations, 10); i += 1) fn();
-  const start = performance.now();
-  for (let i = 0; i < iterations; i += 1) fn();
-  const elapsedMs = performance.now() - start;
-  console.log(JSON.stringify({{
-    ...meta,
-    backend,
-    case: caseName,
-    elapsedMs,
-    msPerOp: elapsedMs / iterations,
-  }}));
-}}
-
-async function benchAsync(backend, caseName, fn) {{
-  for (let i = 0; i < Math.min(iterations, 10); i += 1) await fn();
-  const start = performance.now();
-  for (let i = 0; i < iterations; i += 1) await fn();
-  const elapsedMs = performance.now() - start;
-  console.log(JSON.stringify({{
-    ...meta,
-    backend,
-    case: caseName,
-    elapsedMs,
-    msPerOp: elapsedMs / iterations,
-  }}));
-}}
-
-async function benchBackend(label, core) {{
-  const record = {{ count: 7, label: "record" }};
-  const enumValue = {{ tag: "One", value: 9 }};
-  const nested = {{
-    record,
-    enumValue,
-    values: [1, 2, 3],
-    counts: {{ a: 1, b: 2 }},
-  }};
-  const largeString = "x".repeat(4096);
-  const callback = {{ bump(value) {{ return value + 1; }} }};
-
-  bench(label, "scalar-u64-add", () => {{
-    if (core.add(2n, 3n) !== 5n) throw new Error(`${{label}} add failed`);
-  }});
-  bench(label, "string-concat", () => {{
-    if (core.concat("a", "b") !== "ab") throw new Error(`${{label}} concat failed`);
-  }});
-  bench(label, "large-string-roundtrip", () => {{
-    if (core.largeStringRoundtrip(largeString).length !== largeString.length) throw new Error(`${{label}} large string failed`);
-  }});
-  bench(label, "record-roundtrip", () => {{
-    if (core.recordRoundtrip(record).count !== 7) throw new Error(`${{label}} record failed`);
-  }});
-  bench(label, "enum-roundtrip", () => {{
-    if (core.enumRoundtrip(enumValue).tag !== "One") throw new Error(`${{label}} enum failed`);
-  }});
-  bench(label, "vec-roundtrip", () => {{
-    if (core.vecRoundtrip([1, 2, 3]).length !== 3) throw new Error(`${{label}} vec failed`);
-  }});
-  bench(label, "map-roundtrip", () => {{
-    if (core.mapRoundtrip({{ a: 1, b: 2 }}).b !== 2) throw new Error(`${{label}} map failed`);
-  }});
-  bench(label, "nested-data-roundtrip", () => {{
-    const value = core.nestedDataRoundtrip(nested);
-    if (value.record.count !== 7 || value.enumValue.tag !== "One" || value.values.length !== 3 || value.counts.b !== 2) {{
-      throw new Error(`${{label}} nested data failed`);
-    }}
-  }});
-  bench(label, "object-method", () => {{
-    const counter = core.BenchCounter.new(1);
-    if (counter.increment() !== 2) throw new Error(`${{label}} object failed`);
-    counter.dispose?.();
-  }});
-  bench(label, "sync-callback", () => {{
-    if (core.callCallback(callback, 4) !== 5) throw new Error(`${{label}} callback failed`);
-  }});
-  await benchAsync(label, "async-u64-add", async () => {{
-    if (await core.asyncAdd(2n, 3n) !== 5n) throw new Error(`${{label}} async add failed`);
-  }});
-}}
-
-await benchBackend("napi", nodeCore);
-await benchBackend("wasm", wasmCore);
-"#
-        ),
-    )
-    .unwrap();
+    let driver = write_benchmark_driver(tmp.path(), glue_js_name);
 
     let run = Command::new(node)
         .arg("--experimental-strip-types")
@@ -406,5 +632,11 @@ await benchBackend("wasm", wasmCore);
         stdout.contains("\"backend\":\"napi\"") && stdout.contains("\"backend\":\"wasm\""),
         "benchmark should print JSONL rows for both napi and wasm:\n{stdout}"
     );
+    for case in ["stream-output", "stream-input", "stream-bidi"] {
+        assert!(
+            stdout.contains(&format!("\"case\":\"{case}\"")),
+            "benchmark should print JSONL rows for {case}:\n{stdout}"
+        );
+    }
     println!("{stdout}");
 }
