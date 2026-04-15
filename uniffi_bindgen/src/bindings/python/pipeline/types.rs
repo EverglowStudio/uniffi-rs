@@ -106,6 +106,9 @@ pub fn type_name(ty: &Type, context: &Context) -> Result<String> {
             format!("typing.Set[{}]", type_name(inner_type, context)?)
         }
         Type::Stream { .. } => bail!("stream ABI codegen not implemented yet for Python"),
+        Type::InputStream { .. } => {
+            bail!("input stream ABI codegen not implemented yet for Python")
+        }
     })
 }
 
@@ -138,6 +141,9 @@ pub fn type_annotation(ty: &Type, context: &Context) -> Result<String> {
             type_annotation(inner_type, context)?
         )),
         Type::Stream { .. } => bail!("stream ABI codegen not implemented yet for Python"),
+        Type::InputStream { .. } => {
+            bail!("input stream ABI codegen not implemented yet for Python")
+        }
         _ => type_name(ty, context),
     }
 }
@@ -171,5 +177,21 @@ mod tests {
         assert!(err
             .to_string()
             .contains("stream ABI codegen not implemented yet for Python"));
+    }
+
+    #[test]
+    fn input_stream_type_name_reports_not_implemented() {
+        let err = type_name(
+            &Type::InputStream {
+                item_type: Box::new(Type::UInt32),
+                error_type: Box::new(Type::String),
+                is_send: true,
+            },
+            &Context::default(),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("input stream ABI codegen not implemented yet for Python"));
     }
 }

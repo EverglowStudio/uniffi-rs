@@ -1529,6 +1529,9 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
         Type::Stream { .. } => {
             Unsupported("native streams are not wired into wasm codegen yet".into())
         }
+        Type::InputStream { .. } => {
+            Unsupported("input streams are not wired into wasm codegen yet".into())
+        }
     }
 }
 
@@ -1871,6 +1874,9 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
         }
         Type::Stream { .. } => {
             "Err(JsError::new(\"native streams are not wired into wasm lowering yet\"))".into()
+        }
+        Type::InputStream { .. } => {
+            "Err(JsError::new(\"input streams are not wired into wasm lowering yet\"))".into()
         }
         Type::Object { name, imp, .. } => match imp {
             ObjectImpl::Struct | ObjectImpl::Trait => {

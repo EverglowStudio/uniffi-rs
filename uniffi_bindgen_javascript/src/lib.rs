@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use fs_err as fs;
+use uniffi_bindgen::interface::Type;
 use uniffi_bindgen::{BindgenLoader, Component};
 
 pub mod api_module;
@@ -157,6 +158,8 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
 }
 
 fn emit_component(component: &Component<JsConfig>, options: &GenerateJsOptions) -> Result<()> {
+    ensure_input_streams_unsupported(component)?;
+
     let common_dir = options.out_dir.join("common");
     fs::create_dir_all(&common_dir)?;
     api_module::emit(&common_dir, component)?;
@@ -191,6 +194,19 @@ fn emit_component(component: &Component<JsConfig>, options: &GenerateJsOptions) 
                     .as_deref(),
             )?;
         }
+    }
+    Ok(())
+}
+
+fn ensure_input_streams_unsupported(component: &Component<JsConfig>) -> Result<()> {
+    if component
+        .ci
+        .iter_local_types()
+        .any(|ty| matches!(ty, Type::InputStream { .. }))
+    {
+        bail!(
+            "input stream parameters are not supported yet for JavaScript AsyncIterable lowering"
+        );
     }
     Ok(())
 }

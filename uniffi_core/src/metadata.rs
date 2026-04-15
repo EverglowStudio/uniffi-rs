@@ -72,6 +72,7 @@ pub mod codes {
     pub const TYPE_BOX: u8 = 26;
     pub const TYPE_HASH_SET: u8 = 27;
     pub const TYPE_STREAM: u8 = 28;
+    pub const TYPE_INPUT_STREAM: u8 = 29;
     pub const TYPE_UNIT: u8 = 255;
 
     // TraitKind sub-codes.

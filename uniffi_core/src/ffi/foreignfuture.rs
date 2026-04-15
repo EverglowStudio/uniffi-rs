@@ -34,6 +34,15 @@ pub struct ForeignFutureResult<T> {
     call_status: RustCallStatus,
 }
 
+impl<T> ForeignFutureResult<T> {
+    pub fn from_raw_parts(return_value: T, call_status: RustCallStatus) -> Self {
+        Self {
+            return_value,
+            call_status,
+        }
+    }
+}
+
 /// C callback function that's called when the Rust side of a foreign future is dropped
 pub type ForeignFutureDroppedCallback = extern "C" fn(data: u64);
 

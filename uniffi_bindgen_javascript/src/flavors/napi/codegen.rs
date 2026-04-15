@@ -419,6 +419,9 @@ impl<'a> Generator<'a> {
                 }
                 Ok(())
             }
+            Type::InputStream { .. } => {
+                bail!("{label} input stream parameters are not supported yet for JavaScript AsyncIterable lowering")
+            }
             Type::Timestamp | Type::Duration => Ok(()),
             Type::CallbackInterface { name, .. } => {
                 ensure!(
@@ -2035,6 +2038,9 @@ impl<'a> Generator<'a> {
                 Ok(quote!(std::collections::HashMap<#key, #value>))
             }
             Type::Stream { .. } => bail!("native streams are not wired into napi bridge types yet"),
+            Type::InputStream { .. } => {
+                bail!("input streams are not wired into napi bridge types yet")
+            }
             Type::Timestamp => Ok(quote!(__UniffiTimestamp)),
             Type::Duration => Ok(quote!(__UniffiDuration)),
             Type::CallbackInterface { name, .. } => {
@@ -2137,6 +2143,9 @@ impl<'a> Generator<'a> {
                 ))
             }
             Type::Stream { .. } => bail!("native streams are not wired into napi lowering yet"),
+            Type::InputStream { .. } => {
+                bail!("input streams are not wired into napi lowering yet")
+            }
             Type::Timestamp => Ok(quote!(#expr.0)),
             Type::Duration => Ok(quote!(#expr.0)),
             Type::CallbackInterface { name, .. } => {
@@ -2208,6 +2217,7 @@ impl<'a> Generator<'a> {
                 ))
             }
             Type::Stream { .. } => bail!("native streams are not wired into napi lifting yet"),
+            Type::InputStream { .. } => bail!("input streams are not wired into napi lifting yet"),
             Type::Timestamp => Ok(quote!(__UniffiTimestamp(#expr))),
             Type::Duration => Ok(quote!(__UniffiDuration(#expr))),
             Type::CallbackInterface { name, .. } => {
@@ -2386,6 +2396,9 @@ impl<'a> Generator<'a> {
             Type::Stream { .. } => {
                 bail!("native streams are not supported in callback values yet")
             }
+            Type::InputStream { .. } => {
+                bail!("input streams are not supported in callback values yet")
+            }
             Type::Timestamp => Ok(quote!(#expr.0)),
             Type::Duration => Ok(quote!(#expr.0)),
             Type::CallbackInterface { .. } => {
@@ -2510,6 +2523,9 @@ impl<'a> Generator<'a> {
             Type::Stream { .. } => {
                 bail!("native streams are not supported in callback returns yet")
             }
+            Type::InputStream { .. } => {
+                bail!("input streams are not supported in callback returns yet")
+            }
             Type::Timestamp => Ok(quote!(::std::time::SystemTime)),
             Type::Duration => Ok(quote!(::std::time::Duration)),
             Type::CallbackInterface { .. } => {
@@ -2591,6 +2607,7 @@ impl<'a> Generator<'a> {
                 Ok(quote!(std::collections::HashMap<#key, #value>))
             }
             Type::Stream { .. } => bail!("nested native stream types are not supported"),
+            Type::InputStream { .. } => bail!("nested input stream types are not supported"),
             Type::Timestamp => Ok(quote!(::std::time::SystemTime)),
             Type::Duration => Ok(quote!(::std::time::Duration)),
         }
