@@ -175,3 +175,34 @@ pub fn map_field(input: uniffi_meta::FieldMetadata, context: &Context) -> Result
         docstring: input.docstring,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_stream_type_from_metadata_to_initial_ir() {
+        let context = Context {
+            module_path_map: Default::default(),
+            constructors: Default::default(),
+            methods: Default::default(),
+            trait_methods: Default::default(),
+            uniffi_traits: Default::default(),
+            trait_impls: Default::default(),
+        };
+        let ty = uniffi_meta::Type::Stream {
+            item_type: Box::new(uniffi_meta::Type::UInt32),
+            error_type: Box::new(uniffi_meta::Type::String),
+            is_send: true,
+        };
+
+        assert_eq!(
+            map_type(ty, &context).unwrap(),
+            Type::Stream {
+                item_type: Box::new(Type::UInt32),
+                error_type: Box::new(Type::String),
+                is_send: true,
+            }
+        );
+    }
+}

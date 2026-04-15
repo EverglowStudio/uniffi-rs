@@ -653,7 +653,7 @@ where
     const TYPE_ID_META: MetadataBuffer = MetadataBuffer::from_code(metadata::codes::TYPE_STREAM)
         .concat(T::TYPE_ID_META)
         .concat(E::TYPE_ID_META)
-        .concat_bool(false);
+        .concat_bool(true);
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded"))]
@@ -666,7 +666,7 @@ where
     const TYPE_ID_META: MetadataBuffer = MetadataBuffer::from_code(metadata::codes::TYPE_STREAM)
         .concat(T::TYPE_ID_META)
         .concat(E::TYPE_ID_META)
-        .concat_bool(true);
+        .concat_bool(false);
 }
 
 unsafe impl<T, UT> LiftRef<UT> for [T]
@@ -678,4 +678,29 @@ where
 
 unsafe impl<UT> LiftRef<UT> for str {
     type LiftType = String;
+}
+
+#[cfg(test)]
+mod stream_type_id_tests {
+    use super::*;
+
+    struct UniFfiTag;
+
+    #[test]
+    fn send_stream_type_id_metadata_sets_is_send() {
+        type NativeStream = Pin<
+            Box<dyn futures_core::Stream<Item = std::result::Result<u32, String>> + Send + 'static>,
+        >;
+
+        let meta = <NativeStream as TypeId<UniFfiTag>>::TYPE_ID_META;
+        assert_eq!(
+            &meta.bytes[..meta.size],
+            &[
+                metadata::codes::TYPE_STREAM,
+                metadata::codes::TYPE_U32,
+                metadata::codes::TYPE_STRING,
+                1,
+            ]
+        );
+    }
 }
