@@ -223,21 +223,97 @@ impl Config {
 // Generate kotlin bindings for the given ComponentInterface, as a string.
 pub fn generate_bindings(config: &Config, ci: &ComponentInterface) -> Result<String> {
     ensure_flat_enum_trait_methods_supported(ci)?;
-    ensure_input_streams_unsupported(ci)?;
+    ensure_input_streams_supported(ci)?;
     KotlinWrapper::new(config.clone(), ci)
         .context("failed to create a binding generator")?
         .render()
         .context("failed to render kotlin bindings")
 }
 
-fn ensure_input_streams_unsupported(ci: &ComponentInterface) -> Result<()> {
-    if ci
-        .iter_local_types()
-        .any(|ty| matches!(ty, Type::InputStream { .. }))
-    {
-        bail!("input stream parameters are not supported yet for Kotlin Flow lowering");
+fn ensure_input_streams_supported(ci: &ComponentInterface) -> Result<()> {
+    for func in ci.function_definitions() {
+        if func.return_type().is_some_and(type_contains_input_stream) {
+            bail!("input stream values are only supported as direct function arguments");
+        }
+        if func.throws_type().is_some_and(type_contains_input_stream) {
+            bail!("input stream values are only supported as direct function arguments");
+        }
+        if matches!(func.return_type(), Some(Type::Stream { .. }))
+            && !func.input_stream_arguments().is_empty()
+        {
+            bail!("bidirectional streams are not supported yet");
+        }
+        for arg in func.arguments() {
+            if let Type::InputStream {
+                item_type,
+                error_type,
+                ..
+            } = arg.as_type()
+            {
+                if type_contains_input_stream(&item_type) || type_contains_input_stream(&error_type)
+                {
+                    bail!("nested input stream types are not supported");
+                }
+                ensure_input_stream_error_type_supported(ci, &error_type)?;
+                continue;
+            }
+            if type_contains_input_stream(&arg.as_type()) {
+                bail!("nested input stream types are not supported");
+            }
+        }
+    }
+    for obj in ci.object_definitions() {
+        for constructor in obj.constructors() {
+            if callable_contains_input_stream(constructor) {
+                bail!(
+                    "input stream parameters are currently only supported for top-level functions"
+                );
+            }
+        }
+        for method in obj.methods() {
+            if callable_contains_input_stream(method) {
+                bail!(
+                    "input stream parameters are currently only supported for top-level functions"
+                );
+            }
+        }
+    }
+    for callback in ci.callback_interface_definitions() {
+        for method in callback.methods() {
+            if callable_contains_input_stream(method) {
+                bail!(
+                    "input stream parameters are currently only supported for top-level functions"
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn ensure_input_stream_error_type_supported(ci: &ComponentInterface, ty: &Type) -> Result<()> {
+    if matches!(ty, Type::Enum { name, .. } if ci.is_name_used_as_error(name)) {
+        Ok(())
+    } else {
+        bail!("Kotlin input stream error types must be UniFFI error enum types");
+    }
+}
+
+fn callable_contains_input_stream(callable: &impl Callable) -> bool {
+    callable
+        .arguments()
+        .into_iter()
+        .any(|arg| type_contains_input_stream(&arg.as_type()))
+        || callable
+            .return_type()
+            .is_some_and(type_contains_input_stream)
+        || callable
+            .throws_type()
+            .is_some_and(type_contains_input_stream)
+}
+
+fn type_contains_input_stream(ty: &Type) -> bool {
+    ty.iter_types()
+        .any(|nested| matches!(nested, Type::InputStream { .. }))
 }
 
 fn ensure_flat_enum_trait_methods_supported(ci: &ComponentInterface) -> Result<()> {
@@ -368,35 +444,61 @@ impl<'a> KotlinWrapper<'a> {
                 .map(|fn_name| format!("{fn_name}(this)")),
         );
 
+        let input_stream_init_fns = self.ci.function_definitions().iter().flat_map(|func| {
+            func.input_stream_arguments()
+                .into_iter()
+                .map(|arg| format!("{}(this)", func.input_stream_initialization_fn_name(arg)))
+        });
+
         // Also call global initialization function for any external type we use.
         // For example, we need to make sure that all callback interface vtables are registered
         // (#2343).
-        init_fns.extend(
-            self.ci
-                .iter_external_types()
-                .filter_map(|ty| ty.crate_name())
-                .map(|crate_name| {
-                    let namespace = ci.namespace_for_module_path(crate_name).unwrap();
-                    let package_name = self
-                        .config
-                        .external_package_name(crate_name, Some(namespace));
-                    format!("{package_name}.uniffiEnsureInitialized()")
-                })
-                // Collect into a btree set to de-dup and order
-                .collect::<BTreeSet<_>>(),
-        );
+        let extern_module_init_fns = self
+            .ci
+            .iter_external_types()
+            .filter_map(|ty| ty.crate_name())
+            .map(|crate_name| {
+                let namespace = ci.namespace_for_module_path(crate_name).unwrap();
+                let package_name = self
+                    .config
+                    .external_package_name(crate_name, Some(namespace));
+                format!("{package_name}.uniffiEnsureInitialized()")
+            })
+            // Collect into a btree set to de-dup and order
+            .collect::<BTreeSet<_>>();
+
+        init_fns.extend(input_stream_init_fns);
+        init_fns.extend(extern_module_init_fns);
         init_fns
     }
 
     pub fn imports(&self) -> Vec<ImportRequirement> {
         let mut imports = self.type_imports.clone();
-        if self.ci.has_stream_fns() {
+        if self.ci.has_stream_fns() || self.ci.has_input_stream_fns() {
             imports.insert(ImportRequirement::Import {
                 name: "kotlinx.coroutines.flow.Flow".to_owned(),
             });
+        }
+        if self.ci.has_stream_fns() {
             imports.insert(ImportRequirement::Import {
                 name: "kotlinx.coroutines.flow.flow".to_owned(),
             });
+        }
+        if self.ci.has_input_stream_fns() {
+            for name in [
+                "kotlinx.coroutines.CancellationException",
+                "kotlinx.coroutines.CoroutineScope",
+                "kotlinx.coroutines.Dispatchers",
+                "kotlinx.coroutines.Job",
+                "kotlinx.coroutines.SupervisorJob",
+                "kotlinx.coroutines.channels.Channel",
+                "kotlinx.coroutines.flow.collect",
+                "kotlinx.coroutines.launch",
+            ] {
+                imports.insert(ImportRequirement::Import {
+                    name: name.to_owned(),
+                });
+            }
         }
         imports.into_iter().collect()
     }
@@ -672,9 +774,11 @@ impl<T: AsType> AsCodeType for T {
             } => Box::new(compounds::MapCodeType::new(*key_type, *value_type)),
             Type::Set { inner_type } => Box::new(compounds::SetCodeType::new(*inner_type)),
             Type::Stream { item_type, .. } => Box::new(compounds::StreamCodeType::new(*item_type)),
-            Type::InputStream { .. } => {
-                panic!("input stream parameters are not supported yet for Kotlin Flow lowering")
-            }
+            Type::InputStream {
+                item_type,
+                error_type,
+                ..
+            } => Box::new(compounds::InputStreamCodeType::new(*item_type, *error_type)),
             Type::Custom { name, builtin, .. } => {
                 Box::new(custom::CustomCodeType::new(name, builtin.as_codetype()))
             }
@@ -813,9 +917,10 @@ mod filters {
                 "Flow<{}>",
                 fully_qualified_type_label(item_type, ci, config)?,
             )),
-            Type::InputStream { .. } => {
-                bail!("input stream parameters are not supported yet for Kotlin Flow lowering")
-            }
+            Type::InputStream { item_type, .. } => Ok(format!(
+                "Flow<{}>",
+                fully_qualified_type_label(item_type, ci, config)?,
+            )),
             Type::Enum { .. }
             | Type::Record { .. }
             | Type::Object { .. }
@@ -1191,7 +1296,42 @@ mod test {
 
     fn input_stream_component_interface() -> ComponentInterface {
         let module_path = "stream_core";
+        let counter_event_type = Type::Record {
+            module_path: module_path.to_owned(),
+            name: "CounterEvent".to_owned(),
+        };
+        let stream_error_type = Type::Enum {
+            module_path: module_path.to_owned(),
+            name: "StreamError".to_owned(),
+        };
         let mut items = BTreeSet::new();
+        items.insert(Metadata::Record(RecordMetadata {
+            module_path: module_path.to_owned(),
+            name: "CounterEvent".to_owned(),
+            remote: false,
+            fields: vec![FieldMetadata {
+                name: "value".to_owned(),
+                ty: Type::UInt32,
+                default: None,
+                docstring: None,
+            }],
+            docstring: None,
+        }));
+        items.insert(Metadata::Enum(EnumMetadata {
+            module_path: module_path.to_owned(),
+            name: "StreamError".to_owned(),
+            shape: EnumShape::Error { flat: true },
+            remote: false,
+            variants: vec![VariantMetadata {
+                name: "Boom".to_owned(),
+                discr: None,
+                fields: vec![],
+                docstring: None,
+            }],
+            discr_type: None,
+            non_exhaustive: false,
+            docstring: None,
+        }));
         items.insert(Metadata::Func(FnMetadata {
             module_path: module_path.to_owned(),
             name: "sum_events".to_owned(),
@@ -1199,8 +1339,8 @@ mod test {
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),
                 ty: Type::InputStream {
-                    item_type: Box::new(Type::UInt32),
-                    error_type: Box::new(Type::String),
+                    item_type: Box::new(counter_event_type),
+                    error_type: Box::new(stream_error_type),
                     is_send: true,
                 },
                 by_ref: false,
@@ -1311,8 +1451,8 @@ mod test {
     }
 
     #[test]
-    fn kotlin_input_stream_parameters_report_not_implemented() {
-        let err = generate_bindings(
+    fn kotlin_input_stream_flow_static_contract() {
+        let kotlin = generate_bindings(
             &Config {
                 package_name: Some("uniffi.stream_core".to_owned()),
                 cdylib_name: Some("stream_core".to_owned()),
@@ -1320,9 +1460,31 @@ mod test {
             },
             &input_stream_component_interface(),
         )
-        .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("input stream parameters are not supported yet for Kotlin Flow lowering"));
+        .unwrap();
+
+        assert!(kotlin.contains("import kotlinx.coroutines.flow.Flow"));
+        assert!(kotlin.contains("import kotlinx.coroutines.channels.Channel"));
+        assert!(kotlin.contains("suspend fun `sumEvents`("));
+        assert!(kotlin.contains("`events`: Flow<CounterEvent>"));
+        assert!(kotlin
+            .contains("FfiConverterInputStreamTypeCounterEventTypeStreamError.lower(`events`)"));
+        assert!(
+            kotlin.contains("public object FfiConverterInputStreamTypeCounterEventTypeStreamError")
+        );
+        assert!(kotlin.contains("uniffiCreateInputStream("));
+        assert!(kotlin.contains("UniffiInputStreamNext.Item -> lowerNextItem(next.value)"));
+        assert!(kotlin.contains("UniffiInputStreamNext.Done -> lowerNextDone()"));
+        assert!(kotlin.contains("FfiConverterTypeCounterEvent.write(value, bbuf)"));
+        assert!(kotlin.contains("if (error is StreamException)"));
+        assert!(kotlin.contains("FfiConverterTypeStreamError.lower(error)"));
+        assert!(kotlin.contains("private fun uniffiInitInputStreamSumEventsEvents(lib: UniffiLib)"));
+        assert!(
+            kotlin.contains("lib.uniffi_stream_core_fn_func_sum_events_input_stream_events_init(")
+        );
+        assert!(kotlin.contains("uniffiInputStreamNextCallbackImpl"));
+        assert!(kotlin.contains("uniffiInputStreamCancelCallbackImpl"));
+        assert!(kotlin.contains("private val uniffiInputStreamHandleMap"));
+        assert!(kotlin.contains("public fun uniffiInputStreamHandleCountStreamCore()"));
+        assert!(!kotlin.contains("input stream parameters are not supported"));
     }
 }
