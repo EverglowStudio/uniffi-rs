@@ -243,3 +243,53 @@ The same single-consumer rules apply on both sides. Breaking out of the output s
 Rust output stream, which drops the Rust input stream and triggers the foreign input cancellation
 path. Errors produced by the input stream propagate through the output stream's error channel when
 the Rust stream yields that error.
+
+## Performance and Benchmarks
+
+The stream ABI is pull-based. For output streams, every yielded item requires one foreign-side
+`next()` call, one Rust future allocation/poll/completion path, and one item lift. For input streams,
+every item requires the symmetric callback into the foreign iterator and one item lower. A
+bidirectional stream pays both costs because Rust pulls from the input stream while the foreign side
+pulls from the output stream.
+
+This model keeps backpressure and cancellation simple, but it is not a bulk transport. High-frequency
+token streams should batch small tokens into larger semantic chunks when possible. For example, an AI
+chat API should prefer yielding accumulated text deltas or protocol frames instead of a separate FFI
+item for every byte or tiny token. The expected future optimization is a `next_many(max_items)` ABI
+that can return multiple ready items per foreign call while preserving the existing single-item
+`next()` contract as the portable baseline.
+
+The JavaScript target includes an opt-in benchmark harness for the generated wasm-bindgen and
+Node/N-API paths. It covers:
+
+- output stream: Rust `UniFfiStream<T, E>` consumed as JavaScript `AsyncIterable<T>`;
+- input stream: JavaScript `AsyncIterable<T>` consumed by Rust `UniFfiInputStream<T, E>`;
+- bidirectional stream: JavaScript input stream consumed by Rust while Rust returns an output stream.
+
+Run the benchmark manually:
+
+```sh
+cargo test -p uniffi-bindgen-tests-javascript --test benchmark -- --ignored --nocapture
+```
+
+The default stream sizes are `100`, `1_000`, and `10_000` items. They can be overridden for quick
+local checks:
+
+```sh
+UNIFFI_JS_BENCH_ITERS=20 \
+UNIFFI_JS_STREAM_BENCH_REPS=1 \
+UNIFFI_JS_STREAM_BENCH_COUNTS=100 \
+cargo test -p uniffi-bindgen-tests-javascript --test benchmark -- --ignored --nocapture
+```
+
+The benchmark prints JSONL rows with `backend`, `case`, `count`, `elapsedMs`, `msPerItem`, and
+`itemsPerSec` for stream cases. It gracefully skips when `cargo`, Node with
+`--experimental-strip-types`, or the `wasm32-unknown-unknown` target is unavailable.
+
+Default tests do not run the full benchmark. They only run a lightweight smoke test that verifies the
+benchmark fixture and driver still contain the output/input/bidirectional stream cases.
+
+Cancellation latency is observable by adding a case that breaks out of `for await` early and records
+the time until the input iterator's `return()` or the output stream's cancel path runs. The current
+ABI guarantees idempotent cancellation, but in-flight `next()` work may complete or wake before the
+cancelled handle is observed.
