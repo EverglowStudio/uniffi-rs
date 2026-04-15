@@ -3436,7 +3436,11 @@ uniffi = {{ path = {:?}, features = ["wasm-unstable-single-threaded"] }}
     std::fs::write(
         src.join("lib.rs"),
         r#"
-use std::{fmt, pin::Pin};
+use std::{
+    fmt,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use uniffi::deps::futures_core::Stream;
 
@@ -3604,6 +3608,7 @@ uniffi = {{ path = {:?}, features = ["tokio", "default-async-runtime-tokio", "wa
 use std::{
     fmt,
     pin::Pin,
+    task::{Context, Poll},
 };
 
 use uniffi::deps::futures_core::Stream;
@@ -3634,6 +3639,37 @@ async fn next_input(
     std::future::poll_fn(|cx| Pin::new(&mut *events).poll_next(cx)).await
 }
 
+struct RunningSumStream {
+    events: uniffi::UniFfiInputStream<CounterEvent, StreamError>,
+    sum: u32,
+    done: bool,
+}
+
+impl Stream for RunningSumStream {
+    type Item = Result<CounterEvent, StreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut self.events).poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(event))) => {
+                self.sum = self.sum.wrapping_add(event.value);
+                Poll::Ready(Some(Ok(CounterEvent { value: self.sum })))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.done = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn sum_input_events(
     mut events: uniffi::UniFfiInputStream<CounterEvent, StreamError>,
@@ -3654,6 +3690,17 @@ pub async fn take_one_input_event(
         Some(Err(error)) => Err(error),
         None => Ok(0),
     }
+}
+
+#[uniffi::export]
+pub fn running_sum(
+    events: uniffi::UniFfiInputStream<CounterEvent, StreamError>,
+) -> uniffi::UniFfiStream<CounterEvent, StreamError> {
+    Box::pin(RunningSumStream {
+        events,
+        sum: 0,
+        done: false,
+    })
 }
 
 uniffi::setup_scaffolding!();
@@ -4376,7 +4423,7 @@ console.log("ok");
 }
 
 #[test]
-fn input_stream_static_generation_contract() {
+fn input_stream_bidi_static_generation_contract() {
     let tmp = tempfile::tempdir().unwrap();
     let Some(fixture) = build_input_stream_fixture(tmp.path()) else {
         return;
@@ -4403,16 +4450,17 @@ fn input_stream_static_generation_contract() {
         "lowerItem: (__uniffiInputValue0: any) => ({ value: __uniffiInputValue0.value })",
         "lowerError: (__uniffiInputError0: unknown) => __uniffiInputError0",
         "errorShape: \"flat\"",
+        "export function runningSum(events: AsyncIterable<CounterEvent>): AsyncIterable<CounterEvent>",
+        "const __handle = __call<any>(\"running_sum\", createUniffiInputStream(events, {",
+        "return createUniffiAsyncIterable<CounterEvent>({",
+        "next: async (__streamHandle: unknown): Promise<CounterEvent | null> =>",
+        "__call<void>(\"running_sum_stream_cancel\", __streamHandle);",
     ] {
         assert!(
             api.contains(needle),
             "common/api.ts missing input stream contract `{needle}`:\n{api}"
         );
     }
-    assert!(
-        !api.contains("createUniffiAsyncIterable<CounterEvent>"),
-        "input-only fixture should not wrap input streams as output AsyncIterable:\n{api}"
-    );
 
     let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
     assert!(
@@ -4436,6 +4484,9 @@ fn input_stream_static_generation_contract() {
         "impl ::uniffi::ForeignInputStreamOps",
         "::uniffi::UniFfiInputStream::from_handle_and_ops",
         "ThreadsafeFunctionCallMode::NonBlocking",
+        "pub fn running_sum(",
+        "__UniffiInputStream<__UniffiInputStreamCounterEventStreamErrorNext>",
+        "pub async fn running_sum_stream_next(",
     ] {
         assert!(
             napi_rs.contains(needle),
@@ -4449,6 +4500,8 @@ fn input_stream_static_generation_contract() {
         "fn __lower_input_stream_counter_event_stream_error",
         "::uniffi::UniFfiInputStream::from_handle_and_ops",
         "::wasm_bindgen_futures::JsFuture::from(__promise).await",
+        "pub fn running_sum(events: JsValue) -> Result<u64, JsError>",
+        "pub async fn running_sum_stream_next(handle: u64) -> Result<JsValue, JsError>",
     ] {
         assert!(
             wasm_rs.contains(needle),
@@ -4569,7 +4622,7 @@ console.log("ok");
 }
 
 #[test]
-fn host_crates_napi_runs_input_stream_fixture() {
+fn host_crates_napi_runs_input_stream_bidi_fixture() {
     let Some(node) = locate_node_with_strip_types() else {
         eprintln!("SKIP host_crates_napi_runs_input_stream_fixture: node 22.6+ unavailable");
         return;
@@ -4618,7 +4671,7 @@ fn host_crates_napi_runs_input_stream_fixture() {
     std::fs::write(
         out_dir.join("input-stream-driver.ts"),
         r#"
-import { sumInputEvents, takeOneInputEvent, StreamError, UniffiError } from "./node/index.ts";
+import { runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } from "./node/index.ts";
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -4632,6 +4685,12 @@ async function* events(): AsyncIterable<{ value: number }> {
 
 const sum = await sumInputEvents(events());
 assert(sum === 6n, `input stream sum ${sum}`);
+
+const sums: number[] = [];
+for await (const event of runningSum(events())) {
+  sums.push(event.value);
+}
+assert(sums.join(",") === "1,3,6", `bidi running sums ${sums}`);
 
 let returnCount = 0;
 const cancellable = {
@@ -4655,6 +4714,28 @@ assert(one === 41, `take one ${one}`);
 await new Promise((resolve) => setTimeout(resolve, 20));
 assert(returnCount === 1, `Rust drop should call iterator.return once, got ${returnCount}`);
 
+let breakReturnCount = 0;
+const breakable = {
+  [Symbol.asyncIterator](): AsyncIterator<{ value: number }> {
+    let next = 1;
+    return {
+      async next(): Promise<IteratorResult<{ value: number }>> {
+        return { done: false, value: { value: next++ } };
+      },
+      async return(): Promise<IteratorResult<{ value: number }>> {
+        breakReturnCount += 1;
+        return { done: true, value: undefined as any };
+      },
+    };
+  },
+};
+for await (const event of runningSum(breakable)) {
+  assert(event.value === 1, `bidi first value before break ${event.value}`);
+  break;
+}
+await new Promise((resolve) => setTimeout(resolve, 20));
+assert(breakReturnCount === 1, `bidi output break should cancel input once, got ${breakReturnCount}`);
+
 const failing = {
   [Symbol.asyncIterator](): AsyncIterator<{ value: number }> {
     return {
@@ -4673,6 +4754,16 @@ try {
   assert(/boom|Boom|StreamError/i.test((error as Error).message), `input stream error message ${(error as Error).message}`);
 }
 assert(threw, "input stream error should throw");
+
+let streamThrew = false;
+try {
+  for await (const _ of runningSum(failing)) {}
+} catch (error) {
+  streamThrew = true;
+  assert(error instanceof UniffiError, "bidi input stream error should be wrapped");
+  assert(/boom|Boom|StreamError/i.test((error as Error).message), `bidi input stream error message ${(error as Error).message}`);
+}
+assert(streamThrew, "bidi input stream error should throw from output iterator");
 
 console.log("ok");
 "#,
@@ -4700,7 +4791,7 @@ console.log("ok");
 }
 
 #[test]
-fn host_crates_wasm_input_stream_runs_fixture() {
+fn host_crates_wasm_input_stream_bidi_runs_fixture() {
     let Some(node) = locate_node_with_strip_types() else {
         eprintln!("SKIP host_crates_wasm_runs_input_stream_fixture: node 22.6+ unavailable");
         return;
@@ -4784,7 +4875,7 @@ fn host_crates_wasm_input_stream_runs_fixture() {
         tmp.path().join("wasm-input-stream-driver.ts"),
         r#"
 import { createRequire } from "node:module";
-import { initBackend, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } from "./generated/browser/index.ts";
+import { initBackend, runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } from "./generated/browser/index.ts";
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/input_stream_core_wasm.js");
@@ -4802,6 +4893,12 @@ async function* events(): AsyncIterable<{ value: number }> {
 
 const sum = await sumInputEvents(events());
 assert(sum === 6n, `wasm input stream sum ${sum}`);
+
+const sums: number[] = [];
+for await (const event of runningSum(events())) {
+  sums.push(event.value);
+}
+assert(sums.join(",") === "1,3,6", `wasm bidi running sums ${sums}`);
 
 let returnCount = 0;
 const cancellable = {
@@ -4825,6 +4922,28 @@ assert(one === 41, `wasm take one ${one}`);
 await new Promise((resolve) => setTimeout(resolve, 20));
 assert(returnCount === 1, `wasm Rust drop should call iterator.return once, got ${returnCount}`);
 
+let breakReturnCount = 0;
+const breakable = {
+  [Symbol.asyncIterator](): AsyncIterator<{ value: number }> {
+    let next = 1;
+    return {
+      async next(): Promise<IteratorResult<{ value: number }>> {
+        return { done: false, value: { value: next++ } };
+      },
+      async return(): Promise<IteratorResult<{ value: number }>> {
+        breakReturnCount += 1;
+        return { done: true, value: undefined as any };
+      },
+    };
+  },
+};
+for await (const event of runningSum(breakable)) {
+  assert(event.value === 1, `wasm bidi first value before break ${event.value}`);
+  break;
+}
+await new Promise((resolve) => setTimeout(resolve, 20));
+assert(breakReturnCount === 1, `wasm bidi output break should cancel input once, got ${breakReturnCount}`);
+
 const failing = {
   [Symbol.asyncIterator](): AsyncIterator<{ value: number }> {
     return {
@@ -4843,6 +4962,16 @@ try {
   assert(/boom|Boom|StreamError/i.test((error as Error).message), `wasm input stream error message ${(error as Error).message}`);
 }
 assert(threw, "wasm input stream error should throw");
+
+let streamThrew = false;
+try {
+  for await (const _ of runningSum(failing)) {}
+} catch (error) {
+  streamThrew = true;
+  assert(error instanceof UniffiError, "wasm bidi input stream error should be wrapped");
+  assert(/boom|Boom|StreamError/i.test((error as Error).message), `wasm bidi input stream error message ${(error as Error).message}`);
+}
+assert(streamThrew, "wasm bidi input stream error should throw from output iterator");
 
 console.log("ok");
 "#,

@@ -238,11 +238,6 @@ fn ensure_input_streams_supported(ci: &ComponentInterface) -> Result<()> {
         if func.throws_type().is_some_and(type_contains_input_stream) {
             bail!("input stream values are only supported as direct function arguments");
         }
-        if matches!(func.return_type(), Some(Type::Stream { .. }))
-            && !func.input_stream_arguments().is_empty()
-        {
-            bail!("bidirectional streams are not supported yet");
-        }
         for arg in func.arguments() {
             if let Type::InputStream {
                 item_type,
@@ -1339,8 +1334,8 @@ mod test {
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),
                 ty: Type::InputStream {
-                    item_type: Box::new(counter_event_type),
-                    error_type: Box::new(stream_error_type),
+                    item_type: Box::new(counter_event_type.clone()),
+                    error_type: Box::new(stream_error_type.clone()),
                     is_send: true,
                 },
                 by_ref: false,
@@ -1348,6 +1343,30 @@ mod test {
                 default: None,
             }],
             return_type: Some(Type::UInt64),
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }));
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: "running_sum".to_owned(),
+            is_async: false,
+            inputs: vec![FnParamMetadata {
+                name: "events".to_owned(),
+                ty: Type::InputStream {
+                    item_type: Box::new(counter_event_type.clone()),
+                    error_type: Box::new(stream_error_type.clone()),
+                    is_send: true,
+                },
+                by_ref: false,
+                optional: false,
+                default: None,
+            }],
+            return_type: Some(Type::Stream {
+                item_type: Box::new(counter_event_type),
+                error_type: Box::new(stream_error_type),
+                is_send: true,
+            }),
             throws: None,
             checksum: None,
             docstring: None,
@@ -1486,5 +1505,41 @@ mod test {
         assert!(kotlin.contains("private val uniffiInputStreamHandleMap"));
         assert!(kotlin.contains("public fun uniffiInputStreamHandleCountStreamCore()"));
         assert!(!kotlin.contains("input stream parameters are not supported"));
+    }
+
+    #[test]
+    fn kotlin_bidi_stream_flow_static_contract() {
+        let kotlin = generate_bindings(
+            &Config {
+                package_name: Some("uniffi.stream_core".to_owned()),
+                cdylib_name: Some("stream_core".to_owned()),
+                ..Config::default()
+            },
+            &input_stream_component_interface(),
+        )
+        .unwrap();
+
+        assert!(kotlin.contains("import kotlinx.coroutines.flow.Flow"));
+        assert!(kotlin.contains("import kotlinx.coroutines.flow.flow"));
+        assert!(kotlin.contains("fun `runningSum`("));
+        assert!(kotlin.contains("`events`: Flow<CounterEvent>"));
+        assert!(kotlin.contains(") : Flow<CounterEvent>"));
+        assert!(kotlin
+            .contains("FfiConverterInputStreamTypeCounterEventTypeStreamError.lower(`events`)"));
+        assert!(
+            kotlin.contains("private fun uniffiInitInputStreamRunningSumEvents(lib: UniffiLib)")
+        );
+        assert!(
+            kotlin.contains("lib.uniffi_stream_core_fn_func_running_sum_input_stream_events_init(")
+        );
+        assert!(kotlin.contains("UniffiLib.uniffi_stream_core_fn_func_running_sum("));
+        assert!(kotlin.contains(
+            "UniffiLib.uniffi_stream_core_fn_func_running_sum_stream_next(__streamHandle)"
+        ));
+        assert!(kotlin.contains(
+            "UniffiLib.uniffi_stream_core_fn_func_running_sum_stream_cancel(__streamHandle)"
+        ));
+        assert!(kotlin.contains("StreamException.ErrorHandler"));
+        assert!(kotlin.contains("emit(__streamNext)"));
     }
 }

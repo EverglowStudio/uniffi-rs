@@ -566,11 +566,6 @@ fn ensure_input_streams_supported(ci: &ComponentInterface) -> Result<()> {
         if func.throws_type().is_some_and(type_contains_input_stream) {
             bail!("input stream values are only supported as direct function arguments");
         }
-        if matches!(func.return_type(), Some(Type::Stream { .. }))
-            && !func.input_stream_arguments().is_empty()
-        {
-            bail!("bidirectional streams are not supported yet");
-        }
         for arg in func.arguments() {
             if matches!(arg.as_type(), Type::InputStream { .. }) {
                 continue;
@@ -1484,7 +1479,7 @@ mod tests {
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),
                 ty: Type::InputStream {
-                    item_type: Box::new(counter_event_type),
+                    item_type: Box::new(counter_event_type.clone()),
                     error_type: Box::new(stream_error_type.clone()),
                     is_send: true,
                 },
@@ -1493,7 +1488,31 @@ mod tests {
                 default: None,
             }],
             return_type: Some(Type::UInt64),
-            throws: Some(stream_error_type),
+            throws: Some(stream_error_type.clone()),
+            checksum: None,
+            docstring: None,
+        }));
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: "running_sum".to_owned(),
+            is_async: false,
+            inputs: vec![FnParamMetadata {
+                name: "events".to_owned(),
+                ty: Type::InputStream {
+                    item_type: Box::new(counter_event_type.clone()),
+                    error_type: Box::new(stream_error_type.clone()),
+                    is_send: true,
+                },
+                by_ref: false,
+                optional: false,
+                default: None,
+            }],
+            return_type: Some(Type::Stream {
+                item_type: Box::new(counter_event_type),
+                error_type: Box::new(stream_error_type),
+                is_send: true,
+            }),
+            throws: None,
             checksum: None,
             docstring: None,
         }));
@@ -1580,6 +1599,89 @@ mod tests {
         assert!(header.contains("UniffiInputStreamNextCallback"));
         assert!(header.contains("UniffiInputStreamCancelCallback"));
         assert!(header.contains("uniffi_stream_core_fn_func_sum_events_input_stream_events_init("));
+    }
+
+    #[test]
+    fn swift_bidi_stream_static_contract() {
+        let bindings = generate_bindings(
+            &Config {
+                module_name: Some("StreamCore".to_owned()),
+                ..Config::default()
+            },
+            &input_stream_component_interface(),
+        )
+        .unwrap();
+        let swift = bindings.library;
+        let header = bindings.header;
+
+        assert!(
+            swift.contains(
+                "public func runningSum<S0>(events: S0) -> AsyncThrowingStream<CounterEvent, Error> where S0: AsyncSequence, S0.Element == CounterEvent"
+            ),
+            "{swift}"
+        );
+        assert!(swift.contains("private func uniffiInitInputStreamRunningSumEvents()"));
+        assert!(swift.contains("uniffi_stream_core_fn_func_running_sum_input_stream_events_init("));
+        assert!(
+            swift.contains("FfiConverterInputStreamTypeCounterEventTypeStreamError.lower(events)")
+        );
+        assert!(swift.contains("uniffi_stream_core_fn_func_running_sum("));
+        assert!(
+            swift.contains("uniffi_stream_core_fn_func_running_sum_stream_next(__streamHandle)")
+        );
+        assert!(
+            swift.contains("uniffi_stream_core_fn_func_running_sum_stream_cancel(__streamHandle)")
+        );
+        assert!(swift.contains("continuation.finish(throwing: error)"));
+
+        assert!(header.contains("uniffi_stream_core_fn_func_running_sum("));
+        assert!(header.contains("uniffi_stream_core_fn_func_running_sum_stream_next("));
+        assert!(header.contains("uniffi_stream_core_fn_func_running_sum_stream_cancel("));
+        assert!(header.contains("uniffi_stream_core_fn_func_running_sum_input_stream_events_init("));
+    }
+
+    #[test]
+    fn swift_bidi_stream_wrapper_typechecks_when_swiftc_available() {
+        if Command::new("swiftc").arg("--version").output().is_err() {
+            eprintln!(
+                "SKIP swift_bidi_stream_wrapper_typechecks_when_swiftc_available: swiftc unavailable"
+            );
+            return;
+        }
+
+        let bindings = generate_bindings(
+            &Config {
+                module_name: Some("StreamCore".to_owned()),
+                ..Config::default()
+            },
+            &input_stream_component_interface(),
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let swift_path = tmp.path().join("StreamCore.swift");
+        let header_path = tmp.path().join("StreamCoreFFI.h");
+        let modulemap_path = tmp.path().join("StreamCoreFFI.modulemap");
+        fs::write(&swift_path, bindings.library).unwrap();
+        fs::write(&header_path, bindings.header).unwrap();
+        fs::write(&modulemap_path, bindings.modulemap.unwrap()).unwrap();
+
+        let output = Command::new("swiftc")
+            .arg("-typecheck")
+            .arg("-swift-version")
+            .arg("5")
+            .arg("-I")
+            .arg(tmp.path())
+            .arg("-Xcc")
+            .arg(format!("-fmodule-map-file={}", modulemap_path.display()))
+            .arg(&swift_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "swiftc -typecheck failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
