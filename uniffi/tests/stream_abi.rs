@@ -97,10 +97,9 @@ pub fn pending_events(
 
 uniffi::setup_scaffolding!();
 
-static POLL_RESULT: AtomicI8 = AtomicI8::new(-1);
-
-extern "C" fn capture_poll(_: u64, poll: uniffi::RustFuturePoll) {
-    POLL_RESULT.store(poll as i8, Ordering::SeqCst);
+extern "C" fn capture_poll(data: u64, poll: uniffi::RustFuturePoll) {
+    let poll_result = unsafe { &*(data as *const AtomicI8) };
+    poll_result.store(poll as i8, Ordering::SeqCst);
 }
 
 fn start_count(count: u32) -> uniffi::Handle {
@@ -125,11 +124,15 @@ fn next_error_after_one(
 fn complete_next_future(
     future: uniffi::Handle,
 ) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
-    POLL_RESULT.store(-1, Ordering::SeqCst);
+    let poll_result = AtomicI8::new(-1);
     unsafe {
-        ffi_uniffi_rust_future_poll_rust_buffer(future.clone(), capture_poll, 0);
+        ffi_uniffi_rust_future_poll_rust_buffer(
+            future.clone(),
+            capture_poll,
+            (&poll_result as *const AtomicI8) as u64,
+        );
     }
-    assert_eq!(POLL_RESULT.load(Ordering::SeqCst), 0);
+    assert_eq!(poll_result.load(Ordering::SeqCst), 0);
 
     let mut status = uniffi::RustCallStatus::default();
     let buf = unsafe { ffi_uniffi_rust_future_complete_rust_buffer(future.clone(), &mut status) };

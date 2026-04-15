@@ -92,7 +92,36 @@ lowering/lifting helpers and does not introduce `serde` or `serde-wasm-bindgen`.
 AbortSignal integration is not part of this phase. Call `return()` or break out of `for await` to
 cancel.
 
+## Swift AsyncThrowingStream
+
+The Swift target wraps stream-returning free functions as `AsyncThrowingStream<Item, Error>`:
+
+```swift
+for try await item in countEvents(count: 3) {
+    // item is the stream item type
+}
+```
+
+The public Swift API does not expose the raw stream handle. Generated code calls the low-level
+start function synchronously to create the handle, then starts a Swift `Task` that repeatedly awaits
+the hidden `foo_stream_next(handle)` Rust future through the existing `uniffiRustCallAsync` helper.
+The wrapper maps `Ok(Some(item))` to `continuation.yield(item)`, `Ok(None)` to
+`continuation.finish()`, and stream item errors to `continuation.finish(throwing:)`.
+
+`continuation.onTermination` cancels the Swift task and calls the hidden `foo_stream_cancel(handle)`.
+The Rust-side cancel path is idempotent, so this is safe if Rust has already released the stream after
+done or error. A consumer breaking out of `for try await` or otherwise terminating the stream triggers
+the same cancel path.
+
+Each call to a stream-returning function owns one Rust stream handle. Treat the returned
+`AsyncThrowingStream` as a single-consumer sequence; if multiple independent consumers are needed,
+call the Rust function again to create independent handles.
+
+Typed stream error preservation is intentionally deferred. Swift currently exposes the stream as
+`AsyncThrowingStream<Item, Error>` and throws the lifted UniFFI error value through the standard Swift
+`Error` channel.
+
 ## Next Phase
 
-Swift `AsyncSequence` / `AsyncThrowingStream`, Kotlin `Flow`, and Harmony-specific wrappers are
-implemented in later phases.
+Kotlin `Flow`, Harmony-specific wrappers, input streams, and bidirectional streams are implemented in
+later phases.
