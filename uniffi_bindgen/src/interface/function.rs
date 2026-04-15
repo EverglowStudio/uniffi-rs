@@ -33,6 +33,7 @@
 //! ```
 
 use anyhow::Result;
+use heck::ToUpperCamelCase;
 use uniffi_meta::Checksum;
 
 use super::ffi::{FfiArgument, FfiFunction, FfiType};
@@ -87,6 +88,13 @@ impl Function {
         self.arguments.iter().collect()
     }
 
+    pub fn input_stream_arguments(&self) -> Vec<&Argument> {
+        self.arguments
+            .iter()
+            .filter(|arg| matches!(arg.as_type(), Type::InputStream { .. }))
+            .collect()
+    }
+
     pub fn full_arguments(&self) -> Vec<Argument> {
         self.arguments.to_vec()
     }
@@ -117,6 +125,18 @@ impl Function {
 
     pub fn throws_type(&self) -> Option<&Type> {
         self.throws.as_ref()
+    }
+
+    pub fn ffi_input_stream_init_func(&self, arg: &Argument) -> String {
+        uniffi_meta::fn_input_stream_init_symbol_name(&self.module_path, &self.name, arg.name())
+    }
+
+    pub fn input_stream_initialization_fn_name(&self, arg: &Argument) -> String {
+        format!(
+            "uniffiInitInputStream{}{}",
+            self.name.to_upper_camel_case(),
+            arg.name.to_upper_camel_case()
+        )
     }
 
     pub fn derive_ffi_func(&mut self) -> Result<()> {

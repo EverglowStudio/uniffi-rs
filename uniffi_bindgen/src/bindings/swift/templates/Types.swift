@@ -100,6 +100,9 @@
 {%- when Type::Set { inner_type } %}
 {%- include "SetTemplate.swift" %}
 
+{%- when Type::InputStream { item_type, error_type, is_send } %}
+{%- include "InputStreamTemplate.swift" %}
+
 {%- else %}
 {%- endmatch %}
 {%- endfor %}

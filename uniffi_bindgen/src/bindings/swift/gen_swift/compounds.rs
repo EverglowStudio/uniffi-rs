@@ -118,6 +118,35 @@ impl CodeType for StreamCodeType {
     }
 }
 
+#[derive(Debug)]
+pub struct InputStreamCodeType {
+    item: Type,
+    error: Type,
+}
+
+impl InputStreamCodeType {
+    pub fn new(item: Type, error: Type) -> Self {
+        Self { item, error }
+    }
+}
+
+impl CodeType for InputStreamCodeType {
+    fn type_label(&self) -> String {
+        format!(
+            "AsyncThrowingStream<{}, Error>",
+            super::SwiftCodeOracle.find(&self.item).type_label()
+        )
+    }
+
+    fn canonical_name(&self) -> String {
+        format!(
+            "InputStream{}{}",
+            super::SwiftCodeOracle.find(&self.item).canonical_name(),
+            super::SwiftCodeOracle.find(&self.error).canonical_name()
+        )
+    }
+}
+
 impl CodeType for MapCodeType {
     fn type_label(&self) -> String {
         format!(
