@@ -4,7 +4,22 @@ This document describes the first implementation slice for native Rust stream re
 
 ## Supported Rust Shape
 
-The proc-macro path recognizes top-level functions returning:
+The proc-macro path recognizes top-level functions returning the portable alias:
+
+```rust
+#[uniffi::export]
+pub fn events() -> uniffi::UniFfiStream<Item, Error> {
+    // ...
+}
+```
+
+`UniFfiStream<T, E>` is the recommended spelling for downstream code because it keeps the
+platform-specific `Send` requirement out of application APIs:
+
+- native targets: `Pin<Box<dyn Stream<Item = Result<T, E>> + Send + 'static>>`
+- `wasm32` with `wasm-unstable-single-threaded`: `Pin<Box<dyn Stream<Item = Result<T, E>> + 'static>>`
+
+The proc-macro path also recognizes the explicit native shape:
 
 ```rust
 std::pin::Pin<
@@ -17,6 +32,10 @@ std::pin::Pin<
 The stream item and error must be UniFFI-supported types. Stream parameters, input streams,
 bidirectional streams, infallible `Stream<Item = T>`, non-`'static` streams, methods, and constructors
 are intentionally rejected in this first slice.
+
+The explicit `Pin<Box<dyn Stream<...>>>` spelling currently requires `Send + 'static`. Use
+`uniffi::UniFfiStream<T, E>` for portable code that must compile both on native targets and on
+single-threaded wasm with local, non-`Send` streams such as browser-backed HTTP response streams.
 
 ## Low-Level ABI
 

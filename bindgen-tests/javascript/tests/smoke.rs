@@ -3501,7 +3501,7 @@ impl Stream for ErrorAfterOne {
 }
 
 #[uniffi::export]
-pub fn count_events(count: u32) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamError>> + Send + 'static>> {
+pub fn count_events(count: u32) -> uniffi::UniFfiStream<StreamEvent, StreamError> {
     Box::pin(CountStream { next: 0, end: count })
 }
 
@@ -4321,6 +4321,128 @@ console.log("ok");
         String::from_utf8_lossy(&output.stdout).contains("ok"),
         "wasm stream driver did not print ok"
     );
+}
+
+#[test]
+fn wasm_local_uniffi_stream_alias_cargo_checks() {
+    let Some(cargo) = which_tool("cargo") else {
+        eprintln!("SKIP wasm_local_uniffi_stream_alias_cargo_checks: cargo unavailable");
+        return;
+    };
+    if !has_wasm32_target(&cargo) {
+        eprintln!(
+            "SKIP wasm_local_uniffi_stream_alias_cargo_checks: wasm32-unknown-unknown target unavailable"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let crate_dir = tmp.path().join("local-stream-core");
+    let src = crate_dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let uniffi_dep = workspace_root().join("uniffi");
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "local-stream-core"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+uniffi = {{ path = {:?}, features = ["wasm-unstable-single-threaded"] }}
+"#,
+            uniffi_dep.as_str()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
+use std::{
+    cell::Cell,
+    fmt,
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll},
+};
+
+use uniffi::deps::futures_core::Stream;
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LocalStreamEvent {
+    pub value: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
+pub enum LocalStreamError {
+    Boom,
+}
+
+impl fmt::Display for LocalStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Boom => write!(f, "boom"),
+        }
+    }
+}
+
+impl std::error::Error for LocalStreamError {}
+
+struct LocalStream {
+    cursor: Rc<Cell<u32>>,
+    end: u32,
+}
+
+impl Stream for LocalStream {
+    type Item = Result<LocalStreamEvent, LocalStreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let value = self.cursor.get();
+        if value >= self.end {
+            Poll::Ready(None)
+        } else {
+            self.cursor.set(value + 1);
+            Poll::Ready(Some(Ok(LocalStreamEvent { value })))
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn local_events(count: u32) -> uniffi::UniFfiStream<LocalStreamEvent, LocalStreamError> {
+    Box::pin(LocalStream {
+        cursor: Rc::new(Cell::new(0)),
+        end: count,
+    })
+}
+
+uniffi::setup_scaffolding!();
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&cargo)
+        .args([
+            "check",
+            "--manifest-path",
+            crate_dir.join("Cargo.toml").to_str().unwrap(),
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+        .env("CARGO_TARGET_DIR", tmp.path().join("target-local-stream"))
+        .env("RUSTFLAGS", "-D warnings")
+        .output()
+        .expect("failed to invoke cargo for wasm local stream fixture");
+    if !output.status.success() {
+        panic!(
+            "wasm local UniFfiStream fixture failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
