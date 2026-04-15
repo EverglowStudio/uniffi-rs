@@ -336,16 +336,16 @@ export function createUniffiInputStream<T, E>(
         __uniffiInputStream: true,
         handle,
         next: (...rawArgs: unknown[]) =>
-            nextUniffiInputStream(inputStreamHandleArg(rawArgs)),
+            nextUniffiInputStream<E>(inputStreamHandleArg(rawArgs)),
         cancel: (...rawArgs: unknown[]): void => {
             void cancelUniffiInputStream(inputStreamHandleArg(rawArgs));
         },
     };
 }
 
-export async function nextUniffiInputStream(
+export async function nextUniffiInputStream<E = unknown>(
     handle: number,
-): Promise<UniffiInputStreamNext<unknown, unknown>> {
+): Promise<UniffiInputStreamNext<unknown, E>> {
     const slot = INPUT_STREAMS.get(handle);
     if (!slot || slot.closed) return { ok: true, done: true };
     if (slot.pending) {
@@ -368,7 +368,7 @@ export async function nextUniffiInputStream(
         INPUT_STREAMS.delete(handle);
         return {
             ok: false,
-            error: slot.lowerError(inputStreamErrorPayload(raw, slot.errorShape)),
+            error: slot.lowerError(inputStreamErrorPayload(raw, slot.errorShape)) as E,
         };
     } finally {
         slot.pending = false;
