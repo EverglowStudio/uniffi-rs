@@ -11,7 +11,7 @@
 
 use heck::ToSnakeCase;
 use uniffi_bindgen::{
-    interface::{Constructor, Method},
+    interface::{Constructor, Method, Type},
     ComponentInterface,
 };
 
@@ -21,6 +21,14 @@ pub fn snake_to_camel(snake: &str) -> String {
 
 pub fn free_function_key(name: &str) -> String {
     name.to_string()
+}
+
+pub fn stream_next_key(name: &str) -> String {
+    format!("{}_stream_next", free_function_key(name))
+}
+
+pub fn stream_cancel_key(name: &str) -> String {
+    format!("{}_stream_cancel", free_function_key(name))
 }
 
 pub fn member_key(owner_name: &str, member_name: &str) -> String {
@@ -52,6 +60,12 @@ pub fn collect_name_map_pairs(ci: &ComponentInterface) -> Vec<(String, String)> 
     for f in ci.function_definitions() {
         let key = free_function_key(f.name());
         pairs.push((key.clone(), snake_to_camel(&key)));
+        if matches!(f.return_type(), Some(Type::Stream { .. })) {
+            let next = stream_next_key(f.name());
+            pairs.push((next.clone(), snake_to_camel(&next)));
+            let cancel = stream_cancel_key(f.name());
+            pairs.push((cancel.clone(), snake_to_camel(&cancel)));
+        }
     }
 
     for record in ci.record_definitions() {
@@ -103,6 +117,9 @@ pub fn collect_async_keys(ci: &ComponentInterface) -> Vec<String> {
     for f in ci.function_definitions() {
         if f.is_async() {
             keys.push(free_function_key(f.name()));
+        }
+        if matches!(f.return_type(), Some(Type::Stream { .. })) {
+            keys.push(stream_next_key(f.name()));
         }
     }
     for record in ci.record_definitions() {

@@ -129,6 +129,86 @@ export async function __callAsync<T>(fn: string, ...args: unknown[]): Promise<T>
 }
 
 // ---------------------------------------------------------------------------
+// Native stream wrapper
+// ---------------------------------------------------------------------------
+
+export interface UniffiAsyncIterableOptions<T> {
+    handle: unknown;
+    next: (handle: unknown) => Promise<T | null | undefined>;
+    cancel: (handle: unknown) => void | Promise<void>;
+}
+
+/**
+ * Wraps UniFFI's low-level stream handle ABI as a single-consumer
+ * AsyncIterable. The Rust side is pull-based (`next(handle)`) and
+ * cancellation-based (`cancel(handle)`), so the JS wrapper keeps the
+ * ownership rules explicit:
+ *
+ * - The iterable can be consumed once.
+ * - `next()` calls must not overlap.
+ * - `return()` / `break` cancels exactly once.
+ * - A stream error rejects `next()` and closes the iterator.
+ */
+export function createUniffiAsyncIterable<T>(
+    options: UniffiAsyncIterableOptions<T>,
+): AsyncIterable<T> {
+    let consumed = false;
+    let closed = false;
+    let pending = false;
+    let cancelStarted = false;
+
+    const closeWithCancel = async (): Promise<void> => {
+        if (cancelStarted) return;
+        cancelStarted = true;
+        closed = true;
+        await options.cancel(options.handle);
+    };
+
+    return {
+        [Symbol.asyncIterator](): AsyncIterator<T> {
+            if (consumed) {
+                throw new UniffiError({
+                    errorName: "UniffiStreamConsumed",
+                    message:
+                        "uniffi stream AsyncIterable can only be consumed once",
+                });
+            }
+            consumed = true;
+            return {
+                async next(): Promise<IteratorResult<T>> {
+                    if (closed) return { done: true, value: undefined };
+                    if (pending) {
+                        throw new UniffiError({
+                            errorName: "UniffiStreamConcurrentNext",
+                            message:
+                                "concurrent next() on a uniffi stream is not supported",
+                        });
+                    }
+                    pending = true;
+                    try {
+                        const value = await options.next(options.handle);
+                        if (value == null) {
+                            closed = true;
+                            return { done: true, value: undefined };
+                        }
+                        return { done: false, value };
+                    } catch (raw) {
+                        closed = true;
+                        throw wrapError(raw);
+                    } finally {
+                        pending = false;
+                    }
+                },
+                async return(): Promise<IteratorResult<T>> {
+                    await closeWithCancel();
+                    return { done: true, value: undefined };
+                },
+            };
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Numeric normalisation
 //
 // The high-level contract exposes Rust `i64` / `u64` as JS `bigint`.

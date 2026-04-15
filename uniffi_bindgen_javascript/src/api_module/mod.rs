@@ -1134,7 +1134,12 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut has_async = false;
     let mut has_sync = false;
     for f in ci.function_definitions() {
-        if f.is_async() {
+        if matches!(f.return_type(), Some(Type::Stream { .. })) {
+            // Stream start/cancel are synchronous, but next is async.
+            has_sync = true;
+            has_async = true;
+            usage.needs_stream = true;
+        } else if f.is_async() {
             has_async = true;
         } else {
             has_sync = true;
@@ -1165,6 +1170,9 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
     }
     if usage.needs_from_u64 {
         runtime.push("fromU64");
+    }
+    if usage.needs_stream {
+        runtime.push("createUniffiAsyncIterable");
     }
     if !runtime.is_empty() {
         out.push_str(&format!(
@@ -1283,6 +1291,30 @@ fn render_free_function(ci: &ComponentInterface, config: &JsConfig, f: &Function
     let call_g = call_generic(ret_ty);
     let rust_name = crate::dispatch_key::free_function_key(f.name());
     let js_name = js_fn_name(f.name());
+    if let Some(Type::Stream { item_type, .. }) = ret_ty {
+        let next_name = crate::dispatch_key::stream_next_key(f.name());
+        let cancel_name = crate::dispatch_key::stream_cancel_key(f.name());
+        let item_ts = ts_type(item_type, config);
+        let item_call_g = call_generic(Some(item_type));
+        let item_lift = ts_lift_expr(ci, config, item_type, "__next.value", 0);
+        return format!(
+            "export function {js_name}({arg_decls}): {ret_ts} {{\n    \
+             const __handle = __call<any>(\"{rust_name}\"{sep}{arg_pass});\n    \
+             return createUniffiAsyncIterable<{item_ts}>({{\n        \
+             handle: __handle,\n        \
+             next: async (__streamHandle: unknown): Promise<{item_ts} | null> => {{\n            \
+             const __next = await __callAsync<{{ done: boolean; value?: {item_call_g} }}>(\"{next_name}\", __streamHandle);\n            \
+             if (__next == null || __next.done === true) return null;\n            \
+             return {item_lift} as {item_ts};\n        \
+             }},\n        \
+             cancel: (__streamHandle: unknown): void => {{\n            \
+             __call<void>(\"{cancel_name}\", __streamHandle);\n        \
+             }},\n    \
+             }});\n\
+             }}\n",
+            sep = if arg_pass.is_empty() { "" } else { ", " },
+        );
+    }
     if f.is_async() {
         if let Some(ret_ty) = ret_ty {
             format!(
@@ -1694,6 +1726,7 @@ struct Usage {
     needs_to_u64: bool,
     needs_from_i64: bool,
     needs_from_u64: bool,
+    needs_stream: bool,
     /// Every named type (record/enum/error/object/callback/trait) touched.
     named: BTreeSet<String>,
     /// Object names appearing as return types — their class value (not
@@ -1752,6 +1785,15 @@ impl Usage {
             } => {
                 self.see(key_type, pos, config);
                 self.see(value_type, pos, config);
+            }
+            Type::Stream {
+                item_type,
+                error_type,
+                ..
+            } => {
+                self.needs_stream = true;
+                self.see(item_type, pos, config);
+                self.see(error_type, UsagePos::Ret, config);
             }
             _ => {}
         }

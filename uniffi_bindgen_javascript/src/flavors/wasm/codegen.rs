@@ -199,7 +199,16 @@ pub fn render_wasm_rust(ci: &ComponentInterface) -> String {
 
     // Free functions.
     for f in ci.function_definitions() {
-        render_function(&mut out, &crate_ident, &f);
+        if let Some(Type::Stream {
+            item_type,
+            error_type,
+            ..
+        }) = f.return_type()
+        {
+            render_stream_function(&mut out, &crate_ident, &f, item_type, error_type);
+        } else {
+            render_function(&mut out, &crate_ident, &f);
+        }
         writeln!(out).unwrap();
     }
     out
@@ -1081,6 +1090,175 @@ fn render_function(out: &mut String, crate_ident: &str, f: &Function) {
     };
     emit_return(out, &ret_info, &bound);
     writeln!(out, "}}").unwrap();
+}
+
+fn render_stream_function(
+    out: &mut String,
+    crate_ident: &str,
+    f: &Function,
+    item_type: &Type,
+    error_type: &Type,
+) {
+    let name = f.name();
+    let next_name = crate::dispatch_key::stream_next_key(name);
+    let cancel_name = crate::dispatch_key::stream_cancel_key(name);
+    let registry_name = format!("__UNIFFI_{}_STREAMS", name.to_snake_case().to_uppercase());
+    let arg_info: Vec<(String, Lowering)> = f
+        .arguments()
+        .iter()
+        .map(|a| (a.name().to_string(), classify(&a.as_type(), crate_ident)))
+        .collect();
+    let item_info = classify(item_type, crate_ident);
+    let error_ty = core_ty_for(error_type, crate_ident);
+    let item_ty = core_ty_for(item_type, crate_ident);
+
+    let unsupported = first_unsupported(&arg_info, &Some(item_info_for_check(&item_info)));
+    if let Some(reason) = unsupported {
+        let arg_params = arg_info
+            .iter()
+            .map(|(n, _)| format!("_{n}: JsValue"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "#[wasm_bindgen]").unwrap();
+        writeln!(
+            out,
+            "pub fn {name}({arg_params}) -> Result<JsValue, JsError> {{"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    Err(JsError::new(\"uniffi wasm: `{name}` stream not yet lowered: {reason}\"))"
+        )
+        .unwrap();
+        writeln!(out, "}}").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "#[wasm_bindgen]").unwrap();
+        writeln!(
+            out,
+            "pub async fn {next_name}(_handle: u64) -> Result<JsValue, JsError> {{"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    Err(JsError::new(\"uniffi wasm: `{next_name}` stream not yet lowered: {reason}\"))"
+        )
+        .unwrap();
+        writeln!(out, "}}").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "#[wasm_bindgen]").unwrap();
+        writeln!(
+            out,
+            "pub fn {cancel_name}(_handle: u64) -> Result<(), JsError> {{ Ok::<(), JsError>(()) }}"
+        )
+        .unwrap();
+        return;
+    }
+
+    writeln!(
+        out,
+        "static {registry_name}: ::uniffi::RustStreamRegistry<{item_ty}, {error_ty}> = \
+         ::uniffi::deps::once_cell::sync::Lazy::new(|| ::std::sync::Mutex::new(::std::collections::HashMap::new()));"
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+
+    let params = param_list(&arg_info);
+    writeln!(out, "#[wasm_bindgen]").unwrap();
+    writeln!(out, "pub fn {name}({params}) -> Result<u64, JsError> {{").unwrap();
+    emit_arg_decoders(out, &arg_info);
+    let pass = arg_pass(&arg_info);
+    writeln!(out, "    let __stream = ::{crate_ident}::{name}({pass});").unwrap();
+    writeln!(
+        out,
+        "    let __handle = ::uniffi::rust_stream_new(&{registry_name}, __stream);"
+    )
+    .unwrap();
+    writeln!(out, "    Ok::<u64, JsError>(__handle.as_raw())").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "#[wasm_bindgen]").unwrap();
+    writeln!(
+        out,
+        "pub async fn {next_name}(handle: u64) -> Result<JsValue, JsError> {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let __handle = ::uniffi::Handle::from_raw_unchecked(handle);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    match ::uniffi::rust_stream_next_async::<{item_ty}, {error_ty}>(&{registry_name}, __handle).await {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        Ok(Ok(Some(value))) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::FALSE);\n            let __value = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"value\"), &__value);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
+        stream_item_lift_expr(&item_info, item_type)
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        Ok(Ok(None)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::TRUE);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        Ok(Err(e)) => Err(JsError::new(&format!(\"{{e:?}}\"))),"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        Err(e) => Err(JsError::new(&format!(\"{{e:?}}\"))),"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "#[wasm_bindgen]").unwrap();
+    writeln!(
+        out,
+        "pub fn {cancel_name}(handle: u64) -> Result<(), JsError> {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    ::uniffi::rust_stream_cancel::<{item_ty}, {error_ty}>(&{registry_name}, ::uniffi::Handle::from_raw_unchecked(handle));"
+    )
+    .unwrap();
+    writeln!(out, "    Ok::<(), JsError>(())").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+fn item_info_for_check(info: &Lowering) -> Lowering {
+    match info {
+        Lowering::Unsupported(reason) => Lowering::Unsupported(reason.clone()),
+        Lowering::Callback { .. } => {
+            Lowering::Unsupported("stream items cannot be callback traits".into())
+        }
+        Lowering::Object { .. } => Lowering::Unsupported(
+            "stream items cannot be opaque objects in the wasm backend yet".into(),
+        ),
+        _ => Lowering::Native("__stream_item_supported".into()),
+    }
+}
+
+fn stream_item_lift_expr(info: &Lowering, item_type: &Type) -> String {
+    match info {
+        Lowering::Object { snake, .. } => format!(
+            "Ok::<JsValue, JsError>(JsValue::from_f64(__uniffi_{snake}_insert(value) as f64))"
+        ),
+        Lowering::Callback { .. } => {
+            "Err(JsError::new(\"stream items cannot be callback traits\"))".into()
+        }
+        Lowering::Unsupported(reason) => {
+            format!("Err(JsError::new(\"unsupported stream item: {reason}\"))")
+        }
+        _ => lift_expr_result("value", item_type, 0),
+    }
 }
 
 // ---------------------------------------------------------------------

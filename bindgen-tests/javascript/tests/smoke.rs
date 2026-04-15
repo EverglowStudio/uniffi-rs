@@ -15,7 +15,7 @@
 use camino::Utf8PathBuf;
 use std::process::Command;
 use uniffi_bindgen::{BindgenLoader, BindgenPaths};
-use uniffi_bindgen_javascript::{generate, FlavorTarget, GenerateJsOptions};
+use uniffi_bindgen_javascript::{generate, FlavorTarget, GenerateJsOptions, HostCrateOptions};
 
 const EMPTY_GENERATED_FILES: &[(&str, &str)] = &[];
 
@@ -3395,6 +3395,809 @@ crate-type = ["rlib"]
         },
     )
     .expect("generator should succeed for callback shape fixture");
+}
+
+struct StreamFixture {
+    crate_dir: Utf8PathBuf,
+    lib_path: Utf8PathBuf,
+}
+
+fn build_stream_fixture(root: &std::path::Path) -> Option<StreamFixture> {
+    let cargo = match which_tool("cargo") {
+        Some(cargo) => cargo,
+        None => {
+            eprintln!("SKIP stream fixture: cargo unavailable");
+            return None;
+        }
+    };
+    let root = Utf8PathBuf::from_path_buf(root.to_path_buf()).unwrap();
+    let crate_dir = root.join("stream-core");
+    let src = crate_dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let uniffi_dep = workspace_root().join("uniffi");
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "stream-core"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+uniffi = {{ path = {:?}, features = ["wasm-unstable-single-threaded"] }}
+"#,
+            uniffi_dep.as_str()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
+use std::{
+    fmt,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use uniffi::deps::futures_core::Stream;
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StreamEvent {
+    pub value: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
+pub enum StreamError {
+    Boom,
+}
+
+impl fmt::Display for StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Boom => write!(f, "boom"),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {}
+
+struct CountStream {
+    next: u32,
+    end: u32,
+}
+
+impl Stream for CountStream {
+    type Item = Result<StreamEvent, StreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.next >= self.end {
+            Poll::Ready(None)
+        } else {
+            let value = self.next;
+            self.next += 1;
+            Poll::Ready(Some(Ok(StreamEvent { value })))
+        }
+    }
+}
+
+struct ErrorAfterOne {
+    next: u32,
+}
+
+impl Stream for ErrorAfterOne {
+    type Item = Result<StreamEvent, StreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.next += 1;
+        match self.next {
+            1 => Poll::Ready(Some(Ok(StreamEvent { value: 7 }))),
+            2 => Poll::Ready(Some(Err(StreamError::Boom))),
+            _ => Poll::Ready(None),
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn count_events(count: u32) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamError>> + Send + 'static>> {
+    Box::pin(CountStream { next: 0, end: count })
+}
+
+#[uniffi::export]
+pub fn error_after_one() -> Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamError>> + Send + 'static>> {
+    Box::pin(ErrorAfterOne { next: 0 })
+}
+
+uniffi::setup_scaffolding!();
+"#,
+    )
+    .unwrap();
+
+    let target_dir = root.join("target-stream-core");
+    let output = Command::new(&cargo)
+        .args(["build", "--manifest-path"])
+        .arg(crate_dir.join("Cargo.toml").as_std_path())
+        .env("CARGO_TARGET_DIR", target_dir.as_str())
+        .env_remove("RUSTFLAGS")
+        .output()
+        .expect("failed to invoke cargo for stream fixture");
+    if !output.status.success() {
+        panic!(
+            "stream fixture core build failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let lib_path = target_dir
+        .join("debug")
+        .join(cdylib_filename("stream-core"));
+    assert!(
+        lib_path.exists(),
+        "expected stream fixture cdylib at {lib_path}"
+    );
+    Some(StreamFixture {
+        crate_dir,
+        lib_path,
+    })
+}
+
+fn generate_stream_tree(
+    fixture: &StreamFixture,
+    out_dir: &Utf8PathBuf,
+    host_crates: Option<Utf8PathBuf>,
+    flavors: Vec<FlavorTarget>,
+) {
+    let loader = BindgenLoader::new(BindgenPaths::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: fixture.lib_path.clone(),
+            out_dir: out_dir.clone(),
+            artifact_dir: None,
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: host_crates.map(|host_crates_dir| HostCrateOptions {
+                manifest_path: fixture.crate_dir.join("Cargo.toml"),
+                host_crates_dir,
+                ohos_rs_dir: None,
+            }),
+            flavors,
+        },
+    )
+    .expect("generator should succeed for native stream fixture");
+}
+
+#[test]
+fn js_async_iterable_runtime_stub_contract() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("skipping: node with --experimental-strip-types not available");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+    let common = root.join("common");
+    std::fs::create_dir_all(&common).unwrap();
+    std::fs::write(
+        common.join("runtime.ts"),
+        include_str!("../../../uniffi_runtime_javascript/typescript/src/runtime.ts"),
+    )
+    .unwrap();
+    std::fs::write(
+        common.join("api.ts"),
+        r#"
+import { __call, __callAsync, createUniffiAsyncIterable } from "./runtime.ts";
+
+export interface StreamEvent {
+  value: number;
+}
+
+export function countEvents(count: number): AsyncIterable<StreamEvent> {
+  const __handle = __call<any>("count_events", count);
+  return createUniffiAsyncIterable<StreamEvent>({
+    handle: __handle,
+    next: async (__streamHandle: unknown): Promise<StreamEvent | null> => {
+      const __next = await __callAsync<{ done: boolean; value?: any }>("count_events_stream_next", __streamHandle);
+      if (__next == null || __next.done === true) return null;
+      return { value: __next.value.value } as StreamEvent;
+    },
+    cancel: (__streamHandle: unknown): void => {
+      __call<void>("count_events_stream_cancel", __streamHandle);
+    },
+  });
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("driver.ts"),
+        r#"
+import { __installBackend, UniffiError } from "./common/runtime.ts";
+import { countEvents } from "./common/api.ts";
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+let cancelCount = 0;
+let nextId = 1;
+const streams = new Map<string, Array<unknown>>();
+
+__installBackend({
+  count_events(count: number) {
+    const handle = `h${nextId++}`;
+    streams.set(handle, Array.from({ length: count }, (_, value) => ({ value })));
+    return handle;
+  },
+  async count_events_stream_next(handle: string) {
+    const values = streams.get(handle);
+    if (!values) return { done: true };
+    const value = values.shift();
+    return value === undefined ? { done: true } : { done: false, value };
+  },
+  count_events_stream_cancel(handle: string) {
+    cancelCount += 1;
+    streams.delete(handle);
+  },
+});
+
+const values: number[] = [];
+for await (const event of countEvents(3)) values.push(event.value);
+assert(values.join(",") === "0,1,2", `for-await values ${values}`);
+
+const beforeBreak = cancelCount;
+for await (const event of countEvents(10)) {
+  assert(event.value === 0, "break first value");
+  break;
+}
+assert(cancelCount === beforeBreak + 1, "break should cancel once");
+
+const manual = countEvents(10)[Symbol.asyncIterator]();
+assert((await manual.next()).done === false, "manual first next");
+await manual.return?.();
+await manual.return?.();
+assert(cancelCount === beforeBreak + 2, "manual return should be idempotent");
+assert((await manual.next()).done === true, "next after return done");
+
+__installBackend({
+  count_events() { return "err"; },
+  async count_events_stream_next() {
+    throw new UniffiError({ errorName: "StreamError", variant: "Boom", message: "boom" });
+  },
+  count_events_stream_cancel() { cancelCount += 1; },
+});
+let threw = false;
+try {
+  for await (const _ of countEvents(1)) {}
+} catch (error) {
+  threw = true;
+  assert(error instanceof UniffiError, "stream error type");
+  assert((error as UniffiError).errorName === "StreamError", "stream error name");
+}
+assert(threw, "stream error should throw");
+
+let resolvePending: ((value: unknown) => void) | null = null;
+__installBackend({
+  count_events() { return "pending"; },
+  count_events_stream_next() {
+    return new Promise((resolve) => { resolvePending = resolve; });
+  },
+  count_events_stream_cancel() { cancelCount += 1; },
+});
+const concurrent = countEvents(1)[Symbol.asyncIterator]();
+const pending = concurrent.next();
+let concurrentRejected = false;
+try {
+  await concurrent.next();
+} catch (error) {
+  concurrentRejected = true;
+  assert(error instanceof UniffiError, "concurrent next error type");
+  assert((error as UniffiError).errorName === "UniffiStreamConcurrentNext", "concurrent next error name");
+}
+assert(concurrentRejected, "concurrent next should reject");
+resolvePending?.({ done: false, value: { value: 99 } });
+assert((await pending).value.value === 99, "pending value");
+await concurrent.return?.();
+
+const single = countEvents(1);
+single[Symbol.asyncIterator]();
+let consumedRejected = false;
+try {
+  single[Symbol.asyncIterator]();
+} catch (error) {
+  consumedRejected = true;
+  assert(error instanceof UniffiError, "consumed error type");
+  assert((error as UniffiError).errorName === "UniffiStreamConsumed", "consumed error name");
+}
+assert(consumedRejected, "second iterator should throw");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("driver.ts")
+        .current_dir(&root)
+        .output()
+        .expect("failed to run runtime stream driver");
+    if !output.status.success() {
+        panic!(
+            "runtime stream driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "runtime stream driver did not print ok"
+    );
+}
+
+#[test]
+fn js_async_iterable_stream_stub_contract() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("skipping: node with --experimental-strip-types not available");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(fixture) = build_stream_fixture(tmp.path()) else {
+        return;
+    };
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    generate_stream_tree(
+        &fixture,
+        &out_dir,
+        None,
+        vec![
+            FlavorTarget::Wasm,
+            FlavorTarget::Napi,
+            FlavorTarget::Electron,
+        ],
+    );
+
+    let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
+    for needle in [
+        "createUniffiAsyncIterable<StreamEvent>",
+        "__call<any>(\"count_events\"",
+        "__callAsync<{ done: boolean; value?: any }>(\"count_events_stream_next\"",
+        "__call<void>(\"count_events_stream_cancel\"",
+        "return { value: __next.value.value } as StreamEvent;",
+    ] {
+        assert!(
+            api.contains(needle),
+            "common/api.ts should expose stream async iterable contract via `{needle}`:\n{api}"
+        );
+    }
+    let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    assert!(
+        backend.contains("\"count_events_stream_next\": \"countEventsStreamNext\"")
+            && backend.contains("\"count_events_stream_cancel\": \"countEventsStreamCancel\""),
+        "napi backend name map should include stream next/cancel:\n{backend}"
+    );
+    let renderer = std::fs::read_to_string(out_dir.join("electron/renderer.ts")).unwrap();
+    assert!(
+        renderer.contains("\"count_events_stream_next\"")
+            && !renderer.contains("\"count_events_stream_cancel\""),
+        "electron renderer should dispatch next asynchronously and leave cancel sync:\n{renderer}"
+    );
+    let wasm_rs = std::fs::read_to_string(out_dir.join("browser/stream_core.rs")).unwrap();
+    assert!(
+        wasm_rs.contains("RustStreamRegistry")
+            && wasm_rs.contains("pub async fn count_events_stream_next")
+            && wasm_rs.contains("pub fn count_events_stream_cancel"),
+        "wasm shim should emit stream start/next/cancel:\n{wasm_rs}"
+    );
+    let napi_rs = std::fs::read_to_string(out_dir.join("node/stream_core.rs")).unwrap();
+    assert!(
+        napi_rs.contains("RustStreamRegistry")
+            && napi_rs.contains("pub async fn count_events_stream_next")
+            && napi_rs.contains("pub fn count_events_stream_cancel"),
+        "napi shim should emit stream start/next/cancel:\n{napi_rs}"
+    );
+
+    std::fs::write(
+        out_dir.join("driver.ts"),
+        r#"
+import { __installBackend, UniffiError } from "./common/runtime.ts";
+import { countEvents, errorAfterOne } from "./common/api.ts";
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+let cancelCount = 0;
+let nextId = 1;
+const streams = new Map<string, { values: Array<unknown>; errorAt?: number; nextCalls: number }>();
+
+__installBackend({
+  count_events(count: number) {
+    const handle = `h${nextId++}`;
+    streams.set(handle, {
+      values: Array.from({ length: count }, (_, value) => ({ value })),
+      nextCalls: 0,
+    });
+    return handle;
+  },
+  async count_events_stream_next(handle: string) {
+    const stream = streams.get(handle);
+    if (!stream) return { done: true };
+    stream.nextCalls += 1;
+    const value = stream.values.shift();
+    return value === undefined ? { done: true } : { done: false, value };
+  },
+  count_events_stream_cancel(handle: string) {
+    cancelCount += 1;
+    streams.delete(handle);
+  },
+  error_after_one() {
+    const handle = `e${nextId++}`;
+    streams.set(handle, { values: [{ value: 7 }], errorAt: 2, nextCalls: 0 });
+    return handle;
+  },
+  async error_after_one_stream_next(handle: string) {
+    const stream = streams.get(handle);
+    if (!stream) return { done: true };
+    stream.nextCalls += 1;
+    if (stream.errorAt === stream.nextCalls) {
+      throw new UniffiError({ errorName: "StreamError", variant: "Boom", message: "boom" });
+    }
+    const value = stream.values.shift();
+    return value === undefined ? { done: true } : { done: false, value };
+  },
+  error_after_one_stream_cancel(handle: string) {
+    cancelCount += 1;
+    streams.delete(handle);
+  },
+});
+
+const values: number[] = [];
+for await (const event of countEvents(3)) {
+  values.push(event.value);
+}
+assert(values.join(",") === "0,1,2", `for-await values ${values}`);
+
+let threw = false;
+try {
+  for await (const event of errorAfterOne()) {
+    values.push(event.value);
+  }
+} catch (error) {
+  threw = true;
+  assert(error instanceof UniffiError, "stream error should be wrapped");
+  assert((error as UniffiError).errorName === "StreamError", "stream error name");
+}
+assert(threw, "stream error should throw");
+
+const beforeBreak = cancelCount;
+for await (const event of countEvents(10)) {
+  assert(event.value === 0, "break first value");
+  break;
+}
+assert(cancelCount === beforeBreak + 1, "break should cancel once");
+
+const manual = countEvents(10)[Symbol.asyncIterator]();
+assert((await manual.next()).done === false, "manual first next");
+await manual.return?.();
+await manual.return?.();
+assert(cancelCount === beforeBreak + 2, "manual return should be idempotent");
+assert((await manual.next()).done === true, "next after return done");
+
+let resolvePending: ((value: unknown) => void) | null = null;
+__installBackend({
+  count_events() { return "pending"; },
+  count_events_stream_next() {
+    return new Promise((resolve) => { resolvePending = resolve; });
+  },
+  count_events_stream_cancel() { cancelCount += 1; },
+});
+const concurrent = countEvents(1)[Symbol.asyncIterator]();
+const pending = concurrent.next();
+let concurrentRejected = false;
+try {
+  await concurrent.next();
+} catch (error) {
+  concurrentRejected = true;
+  assert(error instanceof UniffiError, "concurrent next error type");
+  assert((error as UniffiError).errorName === "UniffiStreamConcurrentNext", "concurrent next error name");
+}
+assert(concurrentRejected, "concurrent next should reject");
+resolvePending?.({ done: false, value: { value: 99 } });
+assert((await pending).value.value === 99, "pending value");
+await concurrent.return?.();
+
+const single = countEvents(1);
+single[Symbol.asyncIterator]();
+let consumedRejected = false;
+try {
+  single[Symbol.asyncIterator]();
+} catch (error) {
+  consumedRejected = true;
+  assert(error instanceof UniffiError, "consumed error type");
+  assert((error as UniffiError).errorName === "UniffiStreamConsumed", "consumed error name");
+}
+assert(consumedRejected, "second iterator should throw");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("driver.ts")
+        .current_dir(&out_dir)
+        .output()
+        .expect("failed to run stream stub driver");
+    if !output.status.success() {
+        panic!(
+            "stream stub driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "stream stub driver did not print ok"
+    );
+}
+
+#[test]
+fn host_crates_napi_runs_stream_fixture() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP host_crates_napi_runs_stream_fixture: node 22.6+ unavailable");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(fixture) = build_stream_fixture(tmp.path()) else {
+        return;
+    };
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    generate_stream_tree(
+        &fixture,
+        &out_dir,
+        Some(host_dir.clone()),
+        vec![FlavorTarget::Napi, FlavorTarget::Electron],
+    );
+
+    let manifest = host_dir.join("napi/Cargo.toml");
+    let target_dir = tmp.path().join("target-napi-stream");
+    let output = match run_cargo_build(&manifest, &[], &target_dir) {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("SKIP host_crates_napi_runs_stream_fixture: cargo unavailable: {e}");
+            return;
+        }
+    };
+    if !output.status.success() {
+        panic!(
+            "cargo build on stream napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let built_lib = target_dir
+        .join("debug")
+        .join(cdylib_filename("stream-core-napi"));
+    assert!(
+        built_lib.exists(),
+        "expected built stream addon at {}",
+        built_lib.display()
+    );
+    std::fs::copy(&built_lib, out_dir.join("node/stream_core.node")).unwrap();
+
+    std::fs::write(
+        out_dir.join("stream-driver.ts"),
+        r#"
+import { countEvents, errorAfterOne, UniffiError } from "./node/index.ts";
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+const values: number[] = [];
+for await (const event of countEvents(3)) {
+  values.push(event.value);
+}
+assert(values.join(",") === "0,1,2", `napi stream values ${values}`);
+
+const manual = countEvents(2)[Symbol.asyncIterator]();
+assert((await manual.next()).value.value === 0, "manual first");
+await manual.return?.();
+await manual.return?.();
+assert((await manual.next()).done === true, "manual after return done");
+
+let errorValues = 0;
+let threw = false;
+try {
+  for await (const event of errorAfterOne()) {
+    errorValues += event.value;
+  }
+} catch (error) {
+  threw = true;
+  assert(error instanceof UniffiError, "napi stream error should be UniffiError");
+  assert(/boom|Boom|StreamError/i.test((error as Error).message), `napi stream error message ${(error as Error).message}`);
+}
+assert(errorValues === 7, `napi stream error first value ${errorValues}`);
+assert(threw, "napi stream error should throw");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("stream-driver.ts")
+        .current_dir(&out_dir)
+        .output()
+        .expect("failed to run napi stream driver");
+    if !output.status.success() {
+        panic!(
+            "napi stream driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "napi stream driver did not print ok"
+    );
+}
+
+#[test]
+fn host_crates_wasm_runs_stream_fixture() {
+    let Some(node) = locate_node_with_strip_types() else {
+        eprintln!("SKIP host_crates_wasm_runs_stream_fixture: node 22.6+ unavailable");
+        return;
+    };
+    let Some(cargo) = which_tool("cargo") else {
+        eprintln!("SKIP host_crates_wasm_runs_stream_fixture: cargo unavailable");
+        return;
+    };
+    if !has_wasm32_target(&cargo) {
+        eprintln!(
+            "SKIP host_crates_wasm_runs_stream_fixture: wasm32-unknown-unknown target unavailable"
+        );
+        return;
+    }
+    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
+        eprintln!("SKIP host_crates_wasm_runs_stream_fixture: wasm-bindgen CLI unavailable");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(fixture) = build_stream_fixture(tmp.path()) else {
+        return;
+    };
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    generate_stream_tree(
+        &fixture,
+        &out_dir,
+        Some(host_dir.clone()),
+        vec![FlavorTarget::Wasm],
+    );
+
+    let manifest = host_dir.join("wasm/Cargo.toml");
+    let target_dir = tmp.path().join("target-wasm-stream");
+    let build = Command::new(&cargo)
+        .args([
+            "build",
+            "--manifest-path",
+            manifest.as_str(),
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("RUSTFLAGS", "-D warnings")
+        .output()
+        .expect("failed to invoke cargo for wasm stream host");
+    if !build.status.success() {
+        panic!(
+            "cargo build on stream wasm host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
+    let wasm_file = target_dir
+        .join("wasm32-unknown-unknown/release")
+        .join("stream_core_wasm.wasm");
+    assert!(
+        wasm_file.exists(),
+        "expected built stream wasm at {}",
+        wasm_file.display()
+    );
+    let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
+    let bg = Command::new(&wasm_bindgen)
+        .args(["--target", "nodejs", "--out-dir"])
+        .arg(pkg.as_str())
+        .arg(wasm_file.as_path())
+        .output()
+        .expect("failed to invoke wasm-bindgen for stream fixture");
+    if !bg.status.success() {
+        panic!(
+            "wasm-bindgen stream fixture failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&bg.stdout),
+            String::from_utf8_lossy(&bg.stderr)
+        );
+    }
+
+    std::fs::write(
+        tmp.path().join("wasm-stream-driver.ts"),
+        r#"
+import { createRequire } from "node:module";
+import { initBackend, countEvents, errorAfterOne, UniffiError } from "./generated/browser/index.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/stream_core_wasm.js");
+await initBackend(glue);
+
+function assert(cond: boolean, label: string): void {
+  if (!cond) throw new Error(`FAIL ${label}`);
+}
+
+const values: number[] = [];
+for await (const event of countEvents(3)) {
+  values.push(event.value);
+}
+assert(values.join(",") === "0,1,2", `wasm stream values ${values}`);
+
+const manual = countEvents(2)[Symbol.asyncIterator]();
+assert((await manual.next()).value.value === 0, "manual first");
+await manual.return?.();
+await manual.return?.();
+assert((await manual.next()).done === true, "manual after return done");
+
+let errorValues = 0;
+let threw = false;
+try {
+  for await (const event of errorAfterOne()) {
+    errorValues += event.value;
+  }
+} catch (error) {
+  threw = true;
+  assert(error instanceof UniffiError, "wasm stream error should be UniffiError");
+  assert(/boom|Boom|StreamError/i.test((error as Error).message), `wasm stream error message ${(error as Error).message}`);
+}
+assert(errorValues === 7, `wasm stream error first value ${errorValues}`);
+assert(threw, "wasm stream error should throw");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("wasm-stream-driver.ts")
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run wasm stream driver");
+    if !output.status.success() {
+        panic!(
+            "wasm stream driver failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "wasm stream driver did not print ok"
+    );
 }
 
 #[test]

@@ -134,11 +134,25 @@ pub struct LiftArgsError {
     pub error: anyhow::Error,
 }
 
+impl std::fmt::Display for LiftArgsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to convert arg '{}':\n{:?}",
+            self.arg_name, self.error
+        )
+    }
+}
+
+impl std::fmt::Debug for LiftArgsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl LiftArgsError {
     pub fn to_internal_error(self) -> RustCallError {
-        let LiftArgsError { arg_name, error } = self;
-
-        RustCallError::InternalError(format!("Failed to convert arg '{arg_name}':\n{error:?}"))
+        RustCallError::InternalError(self.to_string())
     }
 }
 
