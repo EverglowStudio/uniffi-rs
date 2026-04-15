@@ -519,7 +519,7 @@ fn trait_protocol_name(ci: &ComponentInterface, trait_ty: &Type) -> Result<Strin
 
 /// Generate UniFFI component bindings for Swift, as strings in memory.
 pub fn generate_bindings(config: &Config, ci: &ComponentInterface) -> Result<Bindings> {
-    ensure_input_streams_unsupported(ci)?;
+    ensure_input_streams_supported(ci)?;
     let header = BridgingHeader::new(config, ci)
         .render()
         .context("failed to render Swift bridging header")?;
@@ -544,7 +544,7 @@ pub fn generate_bindings(config: &Config, ci: &ComponentInterface) -> Result<Bin
 
 /// Generate the bridging header for a component
 pub fn generate_header(config: &Config, ci: &ComponentInterface) -> Result<String> {
-    ensure_input_streams_unsupported(ci)?;
+    ensure_input_streams_supported(ci)?;
     BridgingHeader::new(config, ci)
         .render()
         .context("failed to render Swift bridging header")
@@ -552,20 +552,78 @@ pub fn generate_header(config: &Config, ci: &ComponentInterface) -> Result<Strin
 
 /// Generate the swift source for a component
 pub fn generate_swift(config: &Config, ci: &ComponentInterface) -> Result<String> {
-    ensure_input_streams_unsupported(ci)?;
+    ensure_input_streams_supported(ci)?;
     SwiftWrapper::new(config.clone(), ci)
         .render()
         .context("failed to render Swift library")
 }
 
-fn ensure_input_streams_unsupported(ci: &ComponentInterface) -> Result<()> {
-    if ci
-        .iter_local_types()
-        .any(|ty| matches!(ty, Type::InputStream { .. }))
-    {
-        bail!("input stream parameters are not supported yet for Swift AsyncSequence lowering");
+fn ensure_input_streams_supported(ci: &ComponentInterface) -> Result<()> {
+    for func in ci.function_definitions() {
+        if func.return_type().is_some_and(type_contains_input_stream) {
+            bail!("input stream values are only supported as direct function arguments");
+        }
+        if func.throws_type().is_some_and(type_contains_input_stream) {
+            bail!("input stream values are only supported as direct function arguments");
+        }
+        if matches!(func.return_type(), Some(Type::Stream { .. }))
+            && !func.input_stream_arguments().is_empty()
+        {
+            bail!("bidirectional streams are not supported yet");
+        }
+        for arg in func.arguments() {
+            if matches!(arg.as_type(), Type::InputStream { .. }) {
+                continue;
+            }
+            if type_contains_input_stream(&arg.as_type()) {
+                bail!("nested input stream types are not supported");
+            }
+        }
+    }
+    for obj in ci.object_definitions() {
+        for constructor in obj.constructors() {
+            if callable_contains_input_stream(constructor) {
+                bail!(
+                    "input stream parameters are currently only supported for top-level functions"
+                );
+            }
+        }
+        for method in obj.methods() {
+            if callable_contains_input_stream(method) {
+                bail!(
+                    "input stream parameters are currently only supported for top-level functions"
+                );
+            }
+        }
+    }
+    for callback in ci.callback_interface_definitions() {
+        for method in callback.methods() {
+            if callable_contains_input_stream(method) {
+                bail!(
+                    "input stream parameters are currently only supported for top-level functions"
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn callable_contains_input_stream(callable: &impl Callable) -> bool {
+    callable
+        .arguments()
+        .into_iter()
+        .any(|arg| type_contains_input_stream(&arg.as_type()))
+        || callable
+            .return_type()
+            .is_some_and(type_contains_input_stream)
+        || callable
+            .throws_type()
+            .is_some_and(type_contains_input_stream)
+}
+
+fn type_contains_input_stream(ty: &Type) -> bool {
+    ty.iter_types()
+        .any(|nested| matches!(nested, Type::InputStream { .. }))
 }
 
 /// Generate the modulemap for a set of components
@@ -721,7 +779,16 @@ impl<'a> SwiftWrapper<'a> {
             // Collect into a btree set to de-dup and order
             .collect::<BTreeSet<_>>();
 
-        init_fns.chain(extern_module_init_fns).collect()
+        let input_stream_init_fns = self.ci.function_definitions().iter().flat_map(|func| {
+            func.input_stream_arguments()
+                .into_iter()
+                .map(|arg| func.input_stream_initialization_fn_name(arg))
+        });
+
+        init_fns
+            .chain(input_stream_init_fns)
+            .chain(extern_module_init_fns)
+            .collect()
     }
 }
 
@@ -774,9 +841,11 @@ impl SwiftCodeOracle {
             } => Box::new(compounds::MapCodeType::new(*key_type, *value_type)),
             Type::Set { inner_type } => Box::new(compounds::SetCodeType::new(*inner_type)),
             Type::Stream { item_type, .. } => Box::new(compounds::StreamCodeType::new(*item_type)),
-            Type::InputStream { .. } => {
-                panic!("input stream parameters are not supported yet for Swift AsyncSequence lowering")
-            }
+            Type::InputStream {
+                item_type,
+                error_type,
+                ..
+            } => Box::new(compounds::InputStreamCodeType::new(*item_type, *error_type)),
             Type::Custom { name, builtin, .. } => Box::new(custom::CustomCodeType::new(
                 name,
                 self.create_code_type(*builtin),
@@ -915,6 +984,63 @@ pub mod filters {
     }
 
     #[askama::filter_fn]
+    pub fn arg_type_name(
+        arg: &Argument,
+        _: &dyn askama::Values,
+        index: &usize,
+    ) -> Result<String, askama::Error> {
+        Ok(match arg.as_type() {
+            Type::InputStream { .. } => format!("S{index}"),
+            ty => oracle().find(&ty).type_label(),
+        })
+    }
+
+    #[askama::filter_fn]
+    pub fn input_stream_generics(
+        callable: &impl Callable,
+        _: &dyn askama::Values,
+    ) -> Result<String, askama::Error> {
+        let params = callable
+            .arguments()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, arg)| match arg.as_type() {
+                Type::InputStream { .. } => Some(format!("S{i}")),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if params.is_empty() {
+            Ok(String::new())
+        } else {
+            Ok(format!("<{}>", params.join(", ")))
+        }
+    }
+
+    #[askama::filter_fn]
+    pub fn input_stream_where_clause(
+        callable: &impl Callable,
+        _: &dyn askama::Values,
+    ) -> Result<String, askama::Error> {
+        let clauses = callable
+            .arguments()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, arg)| match arg.as_type() {
+                Type::InputStream { item_type, .. } => Some(format!(
+                    "S{i}: AsyncSequence, S{i}.Element == {}",
+                    oracle().find(&item_type).type_label()
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if clauses.is_empty() {
+            Ok(String::new())
+        } else {
+            Ok(format!(" where {}", clauses.join(", ")))
+        }
+    }
+
+    #[askama::filter_fn]
     pub fn return_type_name(
         as_type: Option<&impl AsType>,
         _: &dyn askama::Values,
@@ -976,6 +1102,18 @@ pub mod filters {
             Some(_) => format!("{}_lower", ffi_converter_name),
             None => format!("{}.lower", ffi_converter_name),
         })
+    }
+
+    #[askama::filter_fn]
+    pub fn optional_lower_fn(
+        as_type: &impl AsType,
+        _: &dyn askama::Values,
+    ) -> Result<String, askama::Error> {
+        let ty = Type::Optional {
+            inner_type: Box::new(as_type.as_type()),
+        };
+        let ffi_converter_name = oracle().find(&ty).ffi_converter_name();
+        Ok(format!("{}.lower", ffi_converter_name))
     }
 
     #[askama::filter_fn]
@@ -1303,7 +1441,42 @@ mod tests {
 
     fn input_stream_component_interface() -> ComponentInterface {
         let module_path = "stream_core";
+        let counter_event_type = Type::Record {
+            module_path: module_path.to_owned(),
+            name: "CounterEvent".to_owned(),
+        };
+        let stream_error_type = Type::Enum {
+            module_path: module_path.to_owned(),
+            name: "StreamError".to_owned(),
+        };
         let mut items = BTreeSet::new();
+        items.insert(Metadata::Record(RecordMetadata {
+            module_path: module_path.to_owned(),
+            name: "CounterEvent".to_owned(),
+            remote: false,
+            fields: vec![FieldMetadata {
+                name: "value".to_owned(),
+                ty: Type::UInt32,
+                default: None,
+                docstring: None,
+            }],
+            docstring: None,
+        }));
+        items.insert(Metadata::Enum(EnumMetadata {
+            module_path: module_path.to_owned(),
+            name: "StreamError".to_owned(),
+            shape: EnumShape::Error { flat: true },
+            remote: false,
+            variants: vec![VariantMetadata {
+                name: "Boom".to_owned(),
+                discr: None,
+                fields: vec![],
+                docstring: None,
+            }],
+            discr_type: None,
+            non_exhaustive: false,
+            docstring: None,
+        }));
         items.insert(Metadata::Func(FnMetadata {
             module_path: module_path.to_owned(),
             name: "sum_events".to_owned(),
@@ -1311,8 +1484,8 @@ mod tests {
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),
                 ty: Type::InputStream {
-                    item_type: Box::new(Type::UInt32),
-                    error_type: Box::new(Type::String),
+                    item_type: Box::new(counter_event_type),
+                    error_type: Box::new(stream_error_type.clone()),
                     is_send: true,
                 },
                 by_ref: false,
@@ -1320,7 +1493,7 @@ mod tests {
                 default: None,
             }],
             return_type: Some(Type::UInt64),
-            throws: None,
+            throws: Some(stream_error_type),
             checksum: None,
             docstring: None,
         }));
@@ -1371,20 +1544,42 @@ mod tests {
     }
 
     #[test]
-    fn swift_input_stream_parameters_report_not_implemented() {
-        let err = match generate_bindings(
+    fn swift_input_stream_async_sequence_static_contract() {
+        let bindings = generate_bindings(
             &Config {
                 module_name: Some("StreamCore".to_owned()),
                 ..Config::default()
             },
             &input_stream_component_interface(),
-        ) {
-            Ok(_) => panic!("expected Swift input stream parameter rejection"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains(
-            "input stream parameters are not supported yet for Swift AsyncSequence lowering"
+        )
+        .unwrap();
+        let swift = bindings.library;
+        let header = bindings.header;
+
+        assert!(swift.contains(
+            "public func sumEvents<S0>(events: S0)async throws  -> UInt64 where S0: AsyncSequence, S0.Element == CounterEvent"
+        ), "{swift}");
+        assert!(swift
+            .contains("fileprivate struct FfiConverterInputStreamTypeCounterEventTypeStreamError"));
+        assert!(swift.contains(
+            "static func lower<S>(_ sequence: S) -> UInt64 where S: AsyncSequence, S.Element == CounterEvent"
         ));
+        assert!(swift.contains("uniffiCreateInputStream("));
+        assert!(swift.contains("lowerNext: FfiConverterOptionTypeCounterEvent.lower"));
+        assert!(swift.contains("if let typedError = error as? StreamError"));
+        assert!(swift.contains("return FfiConverterTypeStreamError_lower(typedError)"));
+        assert!(swift.contains("errorHandler: FfiConverterTypeStreamError_lift"));
+        assert!(swift.contains("private func uniffiInitInputStreamSumEventsEvents()"));
+        assert!(swift.contains("uniffi_stream_core_fn_func_sum_events_input_stream_events_init("));
+        assert!(swift.contains("uniffiInputStreamNextCallback"));
+        assert!(swift.contains("uniffiInputStreamCancelCallback"));
+        assert!(swift.contains("UniffiForeignFutureResultRustBuffer("));
+        assert!(!swift.contains("input stream parameters are not supported"));
+
+        assert!(header.contains("typedef"));
+        assert!(header.contains("UniffiInputStreamNextCallback"));
+        assert!(header.contains("UniffiInputStreamCancelCallback"));
+        assert!(header.contains("uniffi_stream_core_fn_func_sum_events_input_stream_events_init("));
     }
 
     #[test]
@@ -1397,6 +1592,50 @@ mod tests {
         }
 
         let bindings = stream_bindings();
+        let tmp = tempfile::tempdir().unwrap();
+        let swift_path = tmp.path().join("StreamCore.swift");
+        let header_path = tmp.path().join("StreamCoreFFI.h");
+        let modulemap_path = tmp.path().join("StreamCoreFFI.modulemap");
+        fs::write(&swift_path, bindings.library).unwrap();
+        fs::write(&header_path, bindings.header).unwrap();
+        fs::write(&modulemap_path, bindings.modulemap.unwrap()).unwrap();
+
+        let output = Command::new("swiftc")
+            .arg("-typecheck")
+            .arg("-swift-version")
+            .arg("5")
+            .arg("-I")
+            .arg(tmp.path())
+            .arg("-Xcc")
+            .arg(format!("-fmodule-map-file={}", modulemap_path.display()))
+            .arg(&swift_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "swiftc -typecheck failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn swift_input_stream_wrapper_typechecks_when_swiftc_available() {
+        if Command::new("swiftc").arg("--version").output().is_err() {
+            eprintln!(
+                "SKIP swift_input_stream_wrapper_typechecks_when_swiftc_available: swiftc unavailable"
+            );
+            return;
+        }
+
+        let bindings = generate_bindings(
+            &Config {
+                module_name: Some("StreamCore".to_owned()),
+                ..Config::default()
+            },
+            &input_stream_component_interface(),
+        )
+        .unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let swift_path = tmp.path().join("StreamCore.swift");
         let header_path = tmp.path().join("StreamCoreFFI.h");

@@ -30,6 +30,15 @@ pub fn fn_stream_cancel_symbol_name(module_path: &str, name: &str) -> String {
     format!("{}_stream_cancel", fn_symbol_name(module_path, name))
 }
 
+pub fn fn_input_stream_init_symbol_name(module_path: &str, name: &str, arg_name: &str) -> String {
+    let arg_name = arg_name.to_ascii_lowercase();
+    format!(
+        "{}_input_stream_{}_init",
+        fn_symbol_name(module_path, name),
+        arg_name
+    )
+}
+
 /// FFI symbol name for an object constructor
 pub fn constructor_symbol_name(module_path: &str, object_name: &str, name: &str) -> String {
     let namespace = crate_name(module_path).replace("::", "__");
