@@ -1786,14 +1786,9 @@ impl Usage {
                 self.see(key_type, pos, config);
                 self.see(value_type, pos, config);
             }
-            Type::Stream {
-                item_type,
-                error_type,
-                ..
-            } => {
+            Type::Stream { item_type, .. } => {
                 self.needs_stream = true;
                 self.see(item_type, pos, config);
-                self.see(error_type, UsagePos::Ret, config);
             }
             _ => {}
         }
