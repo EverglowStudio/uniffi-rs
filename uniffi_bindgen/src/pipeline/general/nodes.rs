@@ -540,6 +540,7 @@ pub enum FfiType {
 pub enum HandleKind {
     RustFuture,
     RustStream,
+    ForeignStream,
     ForeignFuture,
     ForeignFutureCallbackData,
     // Interface, trait interface, or callback interface

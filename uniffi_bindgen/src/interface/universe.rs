@@ -186,6 +186,15 @@ fn normalize_type_module_path(ty: &Type) -> Type {
             error_type: Box::new(normalize_type_module_path(error_type)),
             is_send: *is_send,
         },
+        Type::InputStream {
+            item_type,
+            error_type,
+            is_send,
+        } => Type::InputStream {
+            item_type: Box::new(normalize_type_module_path(item_type)),
+            error_type: Box::new(normalize_type_module_path(error_type)),
+            is_send: *is_send,
+        },
         Type::Custom {
             name,
             builtin,

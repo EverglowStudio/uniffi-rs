@@ -1693,6 +1693,9 @@ fn ts_type(ty: &Type, config: &JsConfig) -> String {
         Type::Stream { item_type, .. } => {
             format!("AsyncIterable<{}>", ts_type(item_type, config))
         }
+        Type::InputStream { item_type, .. } => {
+            format!("AsyncIterable<{}>", ts_type(item_type, config))
+        }
         Type::Timestamp => "Date".to_string(),
         Type::Duration => "number".to_string(),
         Type::CallbackInterface { name, .. } => name.clone(),
@@ -1787,6 +1790,10 @@ impl Usage {
                 self.see(value_type, pos, config);
             }
             Type::Stream { item_type, .. } => {
+                self.needs_stream = true;
+                self.see(item_type, pos, config);
+            }
+            Type::InputStream { item_type, .. } => {
                 self.needs_stream = true;
                 self.see(item_type, pos, config);
             }

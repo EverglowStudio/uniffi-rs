@@ -263,6 +263,11 @@ pub enum Type {
         error_type: Box<Type>,
         is_send: bool,
     },
+    InputStream {
+        item_type: Box<Type>,
+        error_type: Box<Type>,
+        is_send: bool,
+    },
     // User defined types in the API
     Interface {
         namespace: String,

@@ -201,6 +201,11 @@ impl<'a> MetadataReader<'a> {
                 error_type: Box::new(self.read_type()?),
                 is_send: self.read_bool()?,
             },
+            codes::TYPE_INPUT_STREAM => Type::InputStream {
+                item_type: Box::new(self.read_type()?),
+                error_type: Box::new(self.read_type()?),
+                is_send: self.read_bool()?,
+            },
             codes::TYPE_UNIT => bail!("Unexpected TYPE_UNIT"),
             codes::TYPE_RESULT => bail!("Unexpected TYPE_RESULT"),
             _ => bail!("Unexpected metadata type code: {value:?}"),
@@ -629,6 +634,24 @@ mod tests {
         assert_eq!(
             read_metadata_type(&bytes).unwrap(),
             Type::Stream {
+                item_type: Box::new(Type::UInt32),
+                error_type: Box::new(Type::String),
+                is_send: true,
+            }
+        );
+    }
+
+    #[test]
+    fn reads_input_stream_type_metadata() {
+        let bytes = [
+            codes::TYPE_INPUT_STREAM,
+            codes::TYPE_U32,
+            codes::TYPE_STRING,
+            1, // is_send
+        ];
+        assert_eq!(
+            read_metadata_type(&bytes).unwrap(),
+            Type::InputStream {
                 item_type: Box::new(Type::UInt32),
                 error_type: Box::new(Type::String),
                 is_send: true,

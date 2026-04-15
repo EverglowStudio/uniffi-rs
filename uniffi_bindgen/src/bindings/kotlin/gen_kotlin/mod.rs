@@ -223,10 +223,21 @@ impl Config {
 // Generate kotlin bindings for the given ComponentInterface, as a string.
 pub fn generate_bindings(config: &Config, ci: &ComponentInterface) -> Result<String> {
     ensure_flat_enum_trait_methods_supported(ci)?;
+    ensure_input_streams_unsupported(ci)?;
     KotlinWrapper::new(config.clone(), ci)
         .context("failed to create a binding generator")?
         .render()
         .context("failed to render kotlin bindings")
+}
+
+fn ensure_input_streams_unsupported(ci: &ComponentInterface) -> Result<()> {
+    if ci
+        .iter_local_types()
+        .any(|ty| matches!(ty, Type::InputStream { .. }))
+    {
+        bail!("input stream parameters are not supported yet for Kotlin Flow lowering");
+    }
+    Ok(())
 }
 
 fn ensure_flat_enum_trait_methods_supported(ci: &ComponentInterface) -> Result<()> {
@@ -644,6 +655,9 @@ impl<T: AsType> AsCodeType for T {
                 value_type,
             } => Box::new(compounds::MapCodeType::new(*key_type, *value_type)),
             Type::Stream { item_type, .. } => Box::new(compounds::StreamCodeType::new(*item_type)),
+            Type::InputStream { .. } => {
+                panic!("input stream parameters are not supported yet for Kotlin Flow lowering")
+            }
             Type::Custom { name, builtin, .. } => {
                 Box::new(custom::CustomCodeType::new(name, builtin.as_codetype()))
             }
@@ -777,6 +791,9 @@ mod filters {
                 "Flow<{}>",
                 fully_qualified_type_label(item_type, ci, config)?,
             )),
+            Type::InputStream { .. } => {
+                bail!("input stream parameters are not supported yet for Kotlin Flow lowering")
+            }
             Type::Enum { .. }
             | Type::Record { .. }
             | Type::Object { .. }
@@ -1108,6 +1125,42 @@ mod test {
         .unwrap()
     }
 
+    fn input_stream_component_interface() -> ComponentInterface {
+        let module_path = "stream_core";
+        let mut items = BTreeSet::new();
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: "sum_events".to_owned(),
+            is_async: true,
+            inputs: vec![FnParamMetadata {
+                name: "events".to_owned(),
+                ty: Type::InputStream {
+                    item_type: Box::new(Type::UInt32),
+                    error_type: Box::new(Type::String),
+                    is_send: true,
+                },
+                by_ref: false,
+                optional: false,
+                default: None,
+            }],
+            return_type: Some(Type::UInt64),
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }));
+        let mut ci = ComponentInterface::from_metadata(MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.to_owned(),
+                name: module_path.to_owned(),
+            },
+            namespace_docstring: None,
+            items,
+        })
+        .unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        ci
+    }
+
     #[test]
     fn test_kotlin_version() {
         assert_eq!(
@@ -1154,5 +1207,21 @@ mod test {
         assert!(kotlin.contains("if (__streamNext == null)"));
         assert!(kotlin.contains("emit(__streamNext)"));
         assert!(kotlin.contains("} finally {"));
+    }
+
+    #[test]
+    fn kotlin_input_stream_parameters_report_not_implemented() {
+        let err = generate_bindings(
+            &Config {
+                package_name: Some("uniffi.stream_core".to_owned()),
+                cdylib_name: Some("stream_core".to_owned()),
+                ..Config::default()
+            },
+            &input_stream_component_interface(),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("input stream parameters are not supported yet for Kotlin Flow lowering"));
     }
 }

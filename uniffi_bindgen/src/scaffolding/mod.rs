@@ -73,6 +73,15 @@ mod filters {
                 type_rs_inner(item_type)?,
                 type_rs_inner(error_type)?
             ),
+            Type::InputStream {
+                item_type,
+                error_type,
+                ..
+            } => format!(
+                "::uniffi::UniFfiInputStream<{}, {}>",
+                type_rs_inner(item_type)?,
+                type_rs_inner(error_type)?
+            ),
             Type::Custom { name, .. } => format!("r#{name}"),
         })
     }

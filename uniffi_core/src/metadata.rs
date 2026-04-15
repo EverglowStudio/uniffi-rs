@@ -71,6 +71,7 @@ pub mod codes {
     pub const TYPE_TRAIT_INTERFACE: u8 = 24;
     pub const TYPE_CALLBACK_TRAIT_INTERFACE: u8 = 25;
     pub const TYPE_STREAM: u8 = 26;
+    pub const TYPE_INPUT_STREAM: u8 = 27;
     pub const TYPE_UNIT: u8 = 255;
 
     // Literal codes for LiteralMetadata

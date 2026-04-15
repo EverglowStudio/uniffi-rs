@@ -561,6 +561,10 @@ fn collect_ohos_type_names(ty: &Type, out: &mut std::collections::BTreeSet<Strin
         | Type::Stream {
             item_type: inner_type,
             ..
+        }
+        | Type::InputStream {
+            item_type: inner_type,
+            ..
         } => {
             collect_ohos_type_names(inner_type, out);
         }
@@ -675,6 +679,9 @@ fn ohos_native_ts_type(ty: &Type) -> String {
             format!("Record<string, {}>", ohos_native_ts_type(value_type))
         }
         Type::Stream { item_type, .. } => {
+            format!("AsyncIterable<{}>", ohos_native_ts_type(item_type))
+        }
+        Type::InputStream { item_type, .. } => {
             format!("AsyncIterable<{}>", ohos_native_ts_type(item_type))
         }
         Type::Timestamp | Type::Duration => "number".to_string(),

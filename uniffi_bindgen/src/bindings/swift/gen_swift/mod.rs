@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use askama::Template;
 
 use heck::{ToLowerCamelCase, ToShoutySnakeCase, ToUpperCamelCase};
@@ -519,6 +519,7 @@ fn trait_protocol_name(ci: &ComponentInterface, trait_ty: &Type) -> Result<Strin
 
 /// Generate UniFFI component bindings for Swift, as strings in memory.
 pub fn generate_bindings(config: &Config, ci: &ComponentInterface) -> Result<Bindings> {
+    ensure_input_streams_unsupported(ci)?;
     let header = BridgingHeader::new(config, ci)
         .render()
         .context("failed to render Swift bridging header")?;
@@ -543,6 +544,7 @@ pub fn generate_bindings(config: &Config, ci: &ComponentInterface) -> Result<Bin
 
 /// Generate the bridging header for a component
 pub fn generate_header(config: &Config, ci: &ComponentInterface) -> Result<String> {
+    ensure_input_streams_unsupported(ci)?;
     BridgingHeader::new(config, ci)
         .render()
         .context("failed to render Swift bridging header")
@@ -550,9 +552,20 @@ pub fn generate_header(config: &Config, ci: &ComponentInterface) -> Result<Strin
 
 /// Generate the swift source for a component
 pub fn generate_swift(config: &Config, ci: &ComponentInterface) -> Result<String> {
+    ensure_input_streams_unsupported(ci)?;
     SwiftWrapper::new(config.clone(), ci)
         .render()
         .context("failed to render Swift library")
+}
+
+fn ensure_input_streams_unsupported(ci: &ComponentInterface) -> Result<()> {
+    if ci
+        .iter_local_types()
+        .any(|ty| matches!(ty, Type::InputStream { .. }))
+    {
+        bail!("input stream parameters are not supported yet for Swift AsyncSequence lowering");
+    }
+    Ok(())
 }
 
 /// Generate the modulemap for a set of components
@@ -760,6 +773,9 @@ impl SwiftCodeOracle {
                 value_type,
             } => Box::new(compounds::MapCodeType::new(*key_type, *value_type)),
             Type::Stream { item_type, .. } => Box::new(compounds::StreamCodeType::new(*item_type)),
+            Type::InputStream { .. } => {
+                panic!("input stream parameters are not supported yet for Swift AsyncSequence lowering")
+            }
             Type::Custom { name, builtin, .. } => Box::new(custom::CustomCodeType::new(
                 name,
                 self.create_code_type(*builtin),
@@ -1247,6 +1263,42 @@ mod tests {
         .unwrap()
     }
 
+    fn input_stream_component_interface() -> ComponentInterface {
+        let module_path = "stream_core";
+        let mut items = BTreeSet::new();
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: "sum_events".to_owned(),
+            is_async: true,
+            inputs: vec![FnParamMetadata {
+                name: "events".to_owned(),
+                ty: Type::InputStream {
+                    item_type: Box::new(Type::UInt32),
+                    error_type: Box::new(Type::String),
+                    is_send: true,
+                },
+                by_ref: false,
+                optional: false,
+                default: None,
+            }],
+            return_type: Some(Type::UInt64),
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }));
+        let mut ci = ComponentInterface::from_metadata(MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.to_owned(),
+                name: module_path.to_owned(),
+            },
+            namespace_docstring: None,
+            items,
+        })
+        .unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        ci
+    }
+
     #[test]
     fn swift_stream_async_throwing_stream_static_contract() {
         let bindings = stream_bindings();
@@ -1278,6 +1330,23 @@ mod tests {
         assert!(header.contains("uniffi_stream_core_fn_func_count_events("));
         assert!(header.contains("uniffi_stream_core_fn_func_count_events_stream_next("));
         assert!(header.contains("uniffi_stream_core_fn_func_count_events_stream_cancel("));
+    }
+
+    #[test]
+    fn swift_input_stream_parameters_report_not_implemented() {
+        let err = match generate_bindings(
+            &Config {
+                module_name: Some("StreamCore".to_owned()),
+                ..Config::default()
+            },
+            &input_stream_component_interface(),
+        ) {
+            Ok(_) => panic!("expected Swift input stream parameter rejection"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains(
+            "input stream parameters are not supported yet for Swift AsyncSequence lowering"
+        ));
     }
 
     #[test]

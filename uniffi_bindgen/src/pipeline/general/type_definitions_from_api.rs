@@ -64,7 +64,7 @@ pub fn type_definitions(
                     self_type,
                 }));
             }
-            Type::Stream { .. } => {
+            Type::Stream { .. } | Type::InputStream { .. } => {
                 type_definitions.push(TypeDefinition::Simple(ty.map_node(context)?));
             }
             Type::Record {

@@ -80,6 +80,15 @@ pub fn canonical_name(t: &Type) -> String {
             canonical_name(item_type).to_upper_camel_case(),
             canonical_name(error_type).to_upper_camel_case()
         ),
+        Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => format!(
+            "InputStream{}{}",
+            canonical_name(item_type).to_upper_camel_case(),
+            canonical_name(error_type).to_upper_camel_case()
+        ),
         Type::Custom { name, .. } => format!("Type{name}"),
     }
 }
@@ -270,6 +279,9 @@ mod filters {
             Type::Stream { .. } => {
                 panic!("No support for coercing native streams yet")
             }
+            Type::InputStream { .. } => {
+                panic!("No support for coercing input streams yet")
+            }
             Type::Optional { inner_type: t } => {
                 format!("({nm} ? {} : nil)", coerce_rb_inner(nm, ns, t)?)
             }
@@ -350,6 +362,9 @@ mod filters {
             Type::Stream { .. } => {
                 panic!("No support for lowering native streams yet")
             }
+            Type::InputStream { .. } => {
+                panic!("No support for lowering input streams yet")
+            }
             Type::Enum { .. }
             | Type::Record { .. }
             | Type::Optional { .. }
@@ -392,6 +407,9 @@ mod filters {
             }
             Type::Stream { .. } => {
                 panic!("No support for lifting native streams, yet")
+            }
+            Type::InputStream { .. } => {
+                panic!("No support for lifting input streams, yet")
             }
             Type::Enum { .. } => {
                 format!(
