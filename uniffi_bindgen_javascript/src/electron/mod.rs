@@ -261,6 +261,9 @@ fn render_preload(
              if (arg && typeof arg === \"object\" && arg.__uniffiCallback === true) {{\n\
                  return __uniffiNormalizeCallbackObject(arg.object, arg);\n\
              }}\n\
+             if (arg && typeof arg === \"object\" && arg.__uniffiInputStream === true) {{\n\
+                 return {{ handle: arg.handle, next: arg.next, cancel: arg.cancel }};\n\
+             }}\n\
              return arg;\n\
          }}\n\
          \n\
