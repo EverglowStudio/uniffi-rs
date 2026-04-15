@@ -84,6 +84,37 @@ impl Stream for PendingStream {
     }
 }
 
+struct RunningSumStream {
+    events: uniffi::UniFfiInputStream<StreamEvent, StreamError>,
+    sum: u32,
+    done: bool,
+}
+
+impl Stream for RunningSumStream {
+    type Item = Result<StreamEvent, StreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut self.events).poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(event))) => {
+                self.sum = self.sum.wrapping_add(event.value);
+                Poll::Ready(Some(Ok(StreamEvent { value: self.sum })))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.done = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
 #[uniffi::export]
 pub fn count_events(
     count: u32,
@@ -125,6 +156,17 @@ pub async fn sum_input_events(
     Ok(sum)
 }
 
+#[uniffi::export]
+pub fn running_sum(
+    events: uniffi::UniFfiInputStream<StreamEvent, StreamError>,
+) -> uniffi::UniFfiStream<StreamEvent, StreamError> {
+    Box::pin(RunningSumStream {
+        events,
+        sum: 0,
+        done: false,
+    })
+}
+
 uniffi::setup_scaffolding!();
 
 extern "C" fn capture_poll(data: u64, poll: uniffi::RustFuturePoll) {
@@ -153,6 +195,18 @@ fn next_error_after_one(
 
 fn next_alias(handle: uniffi::Handle) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
     let future = uniffi_uniffi_fn_func_count_events_alias_stream_next(handle);
+    complete_next_future(future)
+}
+
+fn start_running_sum(input_handle: uniffi::Handle) -> uniffi::Handle {
+    let mut status = uniffi::RustCallStatus::default();
+    let handle = uniffi_uniffi_fn_func_running_sum(input_handle, &mut status);
+    assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
+    handle
+}
+
+fn next_running_sum(handle: uniffi::Handle) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
+    let future = uniffi_uniffi_fn_func_running_sum_stream_next(handle);
     complete_next_future(future)
 }
 
@@ -259,6 +313,10 @@ extern "C" fn input_stream_cancel(_handle: uniffi::Handle) {
 
 fn register_input_stream_callbacks() {
     uniffi_uniffi_fn_func_sum_input_events_input_stream_events_init(
+        input_stream_next,
+        input_stream_cancel,
+    );
+    uniffi_uniffi_fn_func_running_sum_input_stream_events_init(
         input_stream_next,
         input_stream_cancel,
     );
@@ -392,4 +450,91 @@ fn input_stream_scaffolding_lifts_typed_error_from_registered_callbacks() {
         (uniffi::RustCallStatusCode::Error, 0)
     );
     assert_eq!(INPUT_STREAM_CANCELS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn bidi_stream_scaffolding_lifts_input_and_returns_output_handle() {
+    let _guard = INPUT_STREAM_TEST_LOCK.lock().unwrap();
+    register_input_stream_callbacks();
+    set_input_stream_values([
+        Ok(Some(StreamEvent { value: 1 })),
+        Ok(Some(StreamEvent { value: 2 })),
+        Ok(Some(StreamEvent { value: 3 })),
+        Ok(None),
+    ]);
+
+    let handle = start_running_sum(uniffi::Handle::from_raw_unchecked(5));
+    assert_eq!(
+        next_running_sum(handle.clone()),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(StreamEvent { value: 1 })
+        )
+    );
+    assert_eq!(
+        next_running_sum(handle.clone()),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(StreamEvent { value: 3 })
+        )
+    );
+    assert_eq!(
+        next_running_sum(handle.clone()),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(StreamEvent { value: 6 })
+        )
+    );
+    assert_eq!(
+        next_running_sum(handle),
+        (uniffi::RustCallStatusCode::Success, None)
+    );
+    assert_eq!(INPUT_STREAM_CANCELS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn bidi_stream_scaffolding_propagates_input_error_to_output_next() {
+    let _guard = INPUT_STREAM_TEST_LOCK.lock().unwrap();
+    register_input_stream_callbacks();
+    set_input_stream_values([Ok(Some(StreamEvent { value: 2 })), Err(StreamError::Boom)]);
+
+    let handle = start_running_sum(uniffi::Handle::from_raw_unchecked(7));
+    assert_eq!(
+        next_running_sum(handle.clone()),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(StreamEvent { value: 2 })
+        )
+    );
+    assert_eq!(
+        next_running_sum(handle),
+        (uniffi::RustCallStatusCode::Error, None)
+    );
+    assert_eq!(INPUT_STREAM_CANCELS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn bidi_stream_cancel_drops_input_stream() {
+    let _guard = INPUT_STREAM_TEST_LOCK.lock().unwrap();
+    register_input_stream_callbacks();
+    set_input_stream_values([
+        Ok(Some(StreamEvent { value: 10 })),
+        Ok(Some(StreamEvent { value: 20 })),
+    ]);
+
+    let handle = start_running_sum(uniffi::Handle::from_raw_unchecked(9));
+    assert_eq!(
+        next_running_sum(handle.clone()),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(StreamEvent { value: 10 })
+        )
+    );
+    uniffi_uniffi_fn_func_running_sum_stream_cancel(handle.clone());
+    uniffi_uniffi_fn_func_running_sum_stream_cancel(handle.clone());
+    assert_eq!(INPUT_STREAM_CANCELS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        next_running_sum(handle),
+        (uniffi::RustCallStatusCode::Success, None)
+    );
 }

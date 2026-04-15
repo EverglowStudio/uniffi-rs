@@ -172,13 +172,6 @@ impl FnSignature {
                 "input stream parameters are currently only supported for top-level functions",
             ));
         }
-        if has_input_stream_arg && stream_return.is_some() {
-            return Err(syn::Error::new(
-                span,
-                "bidirectional streams are not supported yet",
-            ));
-        }
-
         if let Some(ident) = export_fn_args.defaults.idents().first() {
             return Err(syn::Error::new(
                 ident.span(),
@@ -1163,24 +1156,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_input_stream_bidirectional_signature() {
+    fn accepts_input_stream_bidirectional_signature() {
         let sig: syn::Signature = parse_quote! {
             fn bidi(
                 events: uniffi::UniFfiInputStream<u32, MyError>,
             ) -> uniffi::UniFfiStream<u32, MyError>
         };
-        let err = match FnSignature::new(
+        let sig = FnSignature::new(
             FnKind::Function,
             sig,
             ExportFnArgs::default(),
             String::new(),
-        ) {
-            Ok(_) => panic!("expected bidi stream rejection"),
-            Err(err) => err,
-        };
-        assert!(err
-            .to_string()
-            .contains("bidirectional streams are not supported"));
+        )
+        .unwrap();
+        assert_eq!(sig.args.len(), 1);
+        assert!(sig.args[0].input_stream.is_some());
+        assert!(sig.stream_return.is_some());
     }
 
     #[test]
