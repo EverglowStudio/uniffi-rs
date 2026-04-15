@@ -134,3 +134,34 @@ impl CodeType for MapCodeType {
         }
     }
 }
+
+#[derive(Debug)]
+pub struct StreamCodeType {
+    item: Type,
+}
+
+impl StreamCodeType {
+    pub fn new(item: Type) -> Self {
+        Self { item }
+    }
+
+    fn item(&self) -> &Type {
+        &self.item
+    }
+}
+
+impl CodeType for StreamCodeType {
+    fn type_label(&self, ci: &ComponentInterface) -> String {
+        format!(
+            "Flow<{}>",
+            super::KotlinCodeOracle.find(self.item()).type_label(ci)
+        )
+    }
+
+    fn canonical_name(&self) -> String {
+        format!(
+            "Stream{}",
+            super::KotlinCodeOracle.find(self.item()).canonical_name()
+        )
+    }
+}

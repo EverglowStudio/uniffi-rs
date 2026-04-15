@@ -633,6 +633,11 @@ impl ComponentInterface {
                 .any(CallbackInterface::has_async_method)
     }
 
+    /// Does this interface contain top-level functions returning native Rust streams?
+    pub fn has_stream_fns(&self) -> bool {
+        self.functions.iter().any(Function::is_stream)
+    }
+
     /// Iterate over `T` parameters of the `FutureCallback<T>` callbacks in this interface
     pub fn iter_future_callback_params(&self) -> impl Iterator<Item = FfiType> {
         let unique_results = self
