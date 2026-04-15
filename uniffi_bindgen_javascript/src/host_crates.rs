@@ -177,7 +177,12 @@ fn emit_wasm(
          js-sys = \"0.3\"\n\
          \n\
          [profile.release]\n\
-         opt-level = \"s\"\n\
+         opt-level = \"z\"\n\
+         lto = \"fat\"\n\
+         codegen-units = 1\n\
+         panic = \"abort\"\n\
+         strip = true\n\
+         debug = false\n\
          \n\
          [workspace]\n",
         package_name = package_name,
