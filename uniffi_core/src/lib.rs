@@ -105,6 +105,8 @@ pub mod deps {
     pub use async_compat;
     pub use async_trait;
     pub use bytes;
+    pub use futures_core;
+    pub use once_cell;
     pub use static_assertions;
 }
 

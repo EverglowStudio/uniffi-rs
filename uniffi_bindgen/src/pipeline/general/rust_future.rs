@@ -5,7 +5,7 @@
 use super::*;
 
 pub fn ffi_definitions(namespace: &initial::Namespace) -> Result<Vec<FfiDefinition>> {
-    if !has_async_fns(namespace) {
+    if !has_async_fns(namespace) && !has_stream_fns(namespace) {
         return Ok(vec![]);
     }
 
@@ -143,4 +143,10 @@ fn has_async_fns(namespace: &initial::Namespace) -> bool {
     namespace.has_descendant(|func: &initial::Function| func.is_async)
         || namespace.has_descendant(|meth: &initial::Method| meth.is_async)
         || namespace.has_descendant(|cons: &initial::Constructor| cons.is_async)
+}
+
+fn has_stream_fns(namespace: &initial::Namespace) -> bool {
+    namespace.has_descendant(|func: &initial::Function| {
+        matches!(func.return_type, Some(Type::Stream { .. }))
+    })
 }

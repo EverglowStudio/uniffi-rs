@@ -43,6 +43,7 @@ pub(crate) struct FnSignature {
     pub receiver: Option<ReceiverArg>,
     pub args: Vec<NamedArg>,
     pub return_ty: TokenStream,
+    pub stream_return: Option<StreamReturnType>,
     // Does this the return type look like a result?
     // Only use this in UDL mode.
     // In general, it's not reliable because it fails for type aliases.
@@ -119,6 +120,20 @@ impl FnSignature {
         let span = sig.span();
         let ident = sig.ident;
         let looks_like_result = looks_like_result(&sig.output);
+        let stream_return = stream_return_type(&sig.output)?;
+        if stream_return.is_some() && !matches!(&kind, FnKind::Function) {
+            return Err(syn::Error::new(
+                span,
+                "native stream returns are currently only supported for top-level functions",
+            ));
+        }
+        if stream_return.is_some() && sig.asyncness.is_some() {
+            return Err(syn::Error::new(
+                span,
+                "native stream-returning functions must be synchronous; the stream itself is asynchronous",
+            ));
+        }
+
         let output = match sig.output {
             ReturnType::Default => quote! { () },
             ReturnType::Type(_, ty) => quote! { #ty },
@@ -179,6 +194,7 @@ impl FnSignature {
             receiver,
             args,
             return_ty: output,
+            stream_return,
             looks_like_result,
             docstring,
         })
@@ -441,6 +457,12 @@ impl FnSignature {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StreamReturnType {
+    pub(crate) item_ty: TokenStream,
+    pub(crate) error_ty: TokenStream,
+}
+
 pub(crate) struct Arg {
     pub(crate) span: Span,
     pub(crate) kind: ArgKind,
@@ -503,6 +525,7 @@ pub(crate) struct NamedArg {
 
 impl NamedArg {
     pub(crate) fn new(ident: Ident, ty: &Type, defaults: &mut DefaultMap) -> syn::Result<Self> {
+        reject_stream_argument(ty)?;
         Ok(match ty {
             Type::Reference(r) => {
                 let inner = &r.elem;
@@ -550,6 +573,212 @@ impl NamedArg {
     }
 }
 
+fn reject_stream_argument(ty: &Type) -> syn::Result<()> {
+    if type_contains_stream_path(ty) {
+        Err(syn::Error::new_spanned(
+            ty,
+            "stream parameters are not supported yet; only return-position streams are supported",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn type_contains_stream_path(ty: &Type) -> bool {
+    match ty {
+        Type::Path(path) => {
+            path.path
+                .segments
+                .iter()
+                .any(|segment| segment.ident == "Stream")
+                || path.path.segments.iter().any(|segment| {
+                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                        args.args.iter().any(|arg| match arg {
+                            syn::GenericArgument::Type(ty) => type_contains_stream_path(ty),
+                            syn::GenericArgument::AssocType(assoc) => {
+                                type_contains_stream_path(&assoc.ty)
+                            }
+                            _ => false,
+                        })
+                    } else {
+                        false
+                    }
+                })
+        }
+        Type::TraitObject(obj) => obj.bounds.iter().any(|bound| match bound {
+            syn::TypeParamBound::Trait(trait_bound) => trait_bound
+                .path
+                .segments
+                .iter()
+                .any(|segment| segment.ident == "Stream"),
+            _ => false,
+        }),
+        Type::Reference(r) => type_contains_stream_path(&r.elem),
+        Type::Group(g) => type_contains_stream_path(&g.elem),
+        Type::Paren(p) => type_contains_stream_path(&p.elem),
+        Type::Tuple(t) => t.elems.iter().any(type_contains_stream_path),
+        _ => false,
+    }
+}
+
+fn stream_return_type(return_type: &ReturnType) -> syn::Result<Option<StreamReturnType>> {
+    let ReturnType::Type(_, ty) = return_type else {
+        return Ok(None);
+    };
+    if !type_contains_stream_path(ty) {
+        return Ok(None);
+    }
+
+    let pin_inner = single_type_arg(ty, "Pin")?;
+    let box_inner = single_type_arg(pin_inner, "Box")?;
+    let Type::TraitObject(trait_object) = strip_grouped_type(box_inner) else {
+        return Err(syn::Error::new_spanned(
+            box_inner,
+            "stream returns must use Pin<Box<dyn futures_core::Stream<Item = Result<T, E>> + Send + 'static>>",
+        ));
+    };
+
+    let has_static = trait_object.bounds.iter().any(|bound| match bound {
+        syn::TypeParamBound::Lifetime(lifetime) => lifetime.ident == "static",
+        _ => false,
+    });
+    let has_send = trait_object.bounds.iter().any(|bound| match bound {
+        syn::TypeParamBound::Trait(trait_bound) => trait_bound
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Send"),
+        _ => false,
+    });
+    if !has_static || !has_send {
+        return Err(syn::Error::new_spanned(
+            trait_object,
+            "stream returns must be Send + 'static in the native ABI slice",
+        ));
+    }
+
+    let item_assoc = trait_object.bounds.iter().find_map(|bound| {
+        let syn::TypeParamBound::Trait(trait_bound) = bound else {
+            return None;
+        };
+        let stream_segment = trait_bound
+            .path
+            .segments
+            .iter()
+            .find(|segment| segment.ident == "Stream")?;
+        let syn::PathArguments::AngleBracketed(args) = &stream_segment.arguments else {
+            return None;
+        };
+        args.args.iter().find_map(|arg| match arg {
+            syn::GenericArgument::AssocType(assoc) if assoc.ident == "Item" => Some(&assoc.ty),
+            _ => None,
+        })
+    });
+    let item_assoc = item_assoc.ok_or_else(|| {
+        syn::Error::new_spanned(
+            trait_object,
+            "stream returns must specify Stream<Item = Result<T, E>>",
+        )
+    })?;
+    let (item_ty, error_ty) = result_type_args(item_assoc)?;
+    Ok(Some(StreamReturnType {
+        item_ty: quote! { #item_ty },
+        error_ty: quote! { #error_ty },
+    }))
+}
+
+fn strip_grouped_type(ty: &Type) -> &Type {
+    match ty {
+        Type::Group(g) => strip_grouped_type(&g.elem),
+        Type::Paren(p) => strip_grouped_type(&p.elem),
+        _ => ty,
+    }
+}
+
+fn single_type_arg<'a>(ty: &'a Type, expected: &str) -> syn::Result<&'a Type> {
+    let Type::Path(path) = strip_grouped_type(ty) else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!("stream returns must be wrapped in {expected}<...>"),
+        ));
+    };
+    let segment = path.path.segments.last().ok_or_else(|| {
+        syn::Error::new_spanned(ty, format!("stream returns must use {expected}<...>"))
+    })?;
+    if segment.ident != expected {
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!("stream returns must use {expected}<...>"),
+        ));
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!("stream returns must use {expected}<...>"),
+        ));
+    };
+    let mut type_args = args.args.iter().filter_map(|arg| match arg {
+        syn::GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    let Some(inner) = type_args.next() else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!("stream returns must use {expected}<T>"),
+        ));
+    };
+    if type_args.next().is_some() {
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!("stream returns must use {expected}<T> with one type argument"),
+        ));
+    }
+    Ok(inner)
+}
+
+fn result_type_args(ty: &Type) -> syn::Result<(&Type, &Type)> {
+    let Type::Path(path) = strip_grouped_type(ty) else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "stream Item must be Result<T, E>",
+        ));
+    };
+    let segment = path
+        .path
+        .segments
+        .last()
+        .ok_or_else(|| syn::Error::new_spanned(ty, "stream Item must be Result<T, E>"))?;
+    if segment.ident != "Result" {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "stream Item must be Result<T, E>; infallible Stream<Item = T> is not supported yet",
+        ));
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "stream Item must be Result<T, E>",
+        ));
+    };
+    let mut type_args = args.args.iter().filter_map(|arg| match arg {
+        syn::GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    let item_ty = type_args
+        .next()
+        .ok_or_else(|| syn::Error::new_spanned(ty, "stream Item must be Result<T, E>"))?;
+    let error_ty = type_args
+        .next()
+        .ok_or_else(|| syn::Error::new_spanned(ty, "stream Item must be Result<T, E>"))?;
+    if type_args.next().is_some() {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "stream Item Result must have exactly two type arguments",
+        ));
+    }
+    Ok((item_ty, error_ty))
+}
+
 fn looks_like_result(return_type: &ReturnType) -> bool {
     if let ReturnType::Type(_, ty) = return_type {
         if let Type::Path(p) = &**ty {
@@ -562,6 +791,40 @@ fn looks_like_result(return_type: &ReturnType) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stream_return_type;
+    use quote::quote;
+    use syn::parse_quote;
+
+    #[test]
+    fn parses_send_static_result_stream_return() {
+        let return_type: syn::ReturnType = parse_quote! {
+            -> std::pin::Pin<
+                Box<
+                    dyn futures_core::Stream<Item = Result<u32, MyError>> + Send + 'static
+                >
+            >
+        };
+        let stream = stream_return_type(&return_type).unwrap().unwrap();
+        assert_eq!(stream.item_ty.to_string(), quote! { u32 }.to_string());
+        assert_eq!(stream.error_ty.to_string(), quote! { MyError }.to_string());
+    }
+
+    #[test]
+    fn rejects_infallible_stream_return() {
+        let return_type: syn::ReturnType = parse_quote! {
+            -> std::pin::Pin<
+                Box<
+                    dyn futures_core::Stream<Item = u32> + Send + 'static
+                >
+            >
+        };
+        let error = stream_return_type(&return_type).unwrap_err().to_string();
+        assert!(error.contains("Stream<Item = T> is not supported"));
+    }
 }
 
 #[derive(Debug)]

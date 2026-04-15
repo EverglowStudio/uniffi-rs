@@ -1658,6 +1658,9 @@ fn ts_type(ty: &Type, config: &JsConfig) -> String {
             ts_type(key_type, config),
             ts_type(value_type, config)
         ),
+        Type::Stream { item_type, .. } => {
+            format!("AsyncIterable<{}>", ts_type(item_type, config))
+        }
         Type::Timestamp => "Date".to_string(),
         Type::Duration => "number".to_string(),
         Type::CallbackInterface { name, .. } => name.clone(),
