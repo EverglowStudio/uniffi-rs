@@ -27,11 +27,12 @@
 // eg, `public func foo_bar() { body }`
 {%- macro func_decl(func_decl, callable, indent) %}
 {%- call docstring(callable, indent) %}{% endcall %}
-{{ func_decl }} {{ callable.name()|fn_name }}(
+{{ func_decl }} {{ callable.name()|fn_name }}{{ callable|input_stream_generics }}(
     {%- call arg_list_decl(callable) %}{% endcall -%})
     {%- call is_async(callable) %}{% endcall %}
     {%- call throws(callable) %}{% endcall %}
-    {%- if let Some(return_type) = callable.return_type() %} -> {{ return_type|type_name }} {%- endif %}  {
+    {%- if let Some(return_type) = callable.return_type() %} -> {{ return_type|type_name }} {%- endif -%}
+    {{ callable|input_stream_where_clause }} {
     {%- call call_body(callable) %}{% endcall %}
 }
 {%- endmacro %}
@@ -160,7 +161,7 @@ public convenience init(
 
 {% macro arg_list_decl(func) %}
     {%- for arg in func.arguments() -%}
-        {% if config.omit_argument_labels() %}_ {% endif %}{{ arg.name()|var_name }}: {{ arg|type_name -}}
+        {% if config.omit_argument_labels() %}_ {% endif %}{{ arg.name()|var_name }}: {{ arg|arg_type_name(loop.index0) -}}
         {%- match arg.default_value() %}
         {%- when Some with(default) %} = {{ default|default_swift(arg) }}
         {%- else %}

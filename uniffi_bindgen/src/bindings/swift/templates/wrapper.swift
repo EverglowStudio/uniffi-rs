@@ -21,6 +21,9 @@ import {{ config.ffi_module_name() }}
 {% include "RustBufferTemplate.swift" %}
 {% include "Helpers.swift" %}
 {% include "HandleMap.swift" %}
+{%- if ci.has_input_stream_fns() %}
+{% include "InputStreamRuntime.swift" %}
+{%- endif %}
 
 // Public interface members begin here.
 {{ type_helper_code }}

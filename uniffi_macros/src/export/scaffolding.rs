@@ -257,6 +257,7 @@ pub(super) fn gen_ffi_function(
     let name = &sig.name;
     let return_ty = &sig.return_ty;
     let use_trait = use_trait.map(|tr| quote! { use #tr; });
+    let input_stream_callback_registrations = gen_input_stream_callback_registrations(sig);
     if let Some(stream_return) = &sig.stream_return {
         let item_ty = &stream_return.item_ty;
         let error_ty = &stream_return.error_ty;
@@ -276,6 +277,8 @@ pub(super) fn gen_ffi_function(
             ffi_buffer_scaffolding_fn(&ffi_ident, &quote! { ::uniffi::Handle }, &param_types, true);
 
         return Ok(quote! {
+            #input_stream_callback_registrations
+
             #[doc(hidden)]
             static #registry_ident: ::uniffi::RustStreamRegistry<#item_ty, #error_ty> =
                 ::uniffi::deps::once_cell::sync::Lazy::new(::std::default::Default::default);
@@ -337,6 +340,8 @@ pub(super) fn gen_ffi_function(
         let scaffolding_fn_ffi_buffer_version =
             ffi_buffer_scaffolding_fn(&ffi_ident, &ffi_return_ty, &param_types, true);
         quote! {
+            #input_stream_callback_registrations
+
             #[doc(hidden)]
             #[unsafe(no_mangle)]
             pub extern "C" fn #ffi_ident(
@@ -373,6 +378,8 @@ pub(super) fn gen_ffi_function(
             ffi_buffer_scaffolding_fn(&ffi_ident, &quote! { ::uniffi::Handle}, &param_types, false);
 
         quote! {
+            #input_stream_callback_registrations
+
             #[doc(hidden)]
             #[unsafe(no_mangle)]
             pub extern "C" fn #ffi_ident(#(#param_names: #param_types,)*) -> ::uniffi::Handle {
@@ -399,10 +406,40 @@ pub(super) fn gen_ffi_function(
     })
 }
 
+fn gen_input_stream_callback_registrations(sig: &FnSignature) -> TokenStream {
+    let registrations = sig.args.iter().filter_map(|arg| {
+        let input_stream = arg.input_stream.as_ref()?;
+        let cell_ident = sig.input_stream_callback_cell_ident(arg);
+        let init_ident = sig.input_stream_init_fn_ident(arg);
+        let next_ty = FnSignature::input_stream_next_callback_type(input_stream);
+        let tuple_ty = FnSignature::input_stream_callback_tuple_type(input_stream);
+        Some(quote! {
+            #[doc(hidden)]
+            static #cell_ident: ::uniffi::deps::once_cell::sync::OnceCell<#tuple_ty> =
+                ::uniffi::deps::once_cell::sync::OnceCell::new();
+
+            #[doc(hidden)]
+            #[unsafe(no_mangle)]
+            pub extern "C" fn #init_ident(
+                next: #next_ty,
+                cancel: ::uniffi::ForeignInputStreamCancelCallback,
+            ) {
+                let _ = #cell_ident.set((next, cancel));
+            }
+        })
+    });
+    quote! {
+        #(#registrations)*
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::wrap_async_future_expr;
-    use crate::export::AsyncRuntime;
+    use super::{gen_ffi_function, wrap_async_future_expr};
+    use crate::{
+        export::{AsyncRuntime, ExportFnArgs},
+        fnsig::{FnKind, FnSignature},
+    };
     use proc_macro2::Span;
     use quote::quote;
     use syn::LitStr;
@@ -432,6 +469,33 @@ mod tests {
         let tokens = wrap_async_future_expr(quote! { call_me() }, None).to_string();
         assert!(!tokens.contains("async_compat"));
         assert_eq!(tokens, quote! { call_me() }.to_string());
+    }
+
+    #[test]
+    fn input_stream_scaffolding_uses_registered_callbacks() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            async fn sum_events(
+                events: uniffi::UniFfiInputStream<u32, MyError>
+            ) -> Result<u64, MyError> {
+                unreachable!()
+            }
+        };
+        let sig = FnSignature::new(
+            FnKind::Function,
+            item.sig,
+            ExportFnArgs::default(),
+            String::new(),
+        )
+        .unwrap();
+        let tokens = gen_ffi_function(&sig, None, false, None)
+            .unwrap()
+            .to_string();
+
+        assert!(tokens.contains("input_stream_events_init"));
+        assert!(tokens.contains("UNIFFI_INPUT_STREAM_CALLBACKS"));
+        assert!(tokens.contains("OnceCell"));
+        assert!(tokens.contains("from_foreign_callbacks"));
+        assert!(!tokens.contains("try_lift (events)"));
     }
 }
 

@@ -97,6 +97,9 @@
 {%- when Type::Map { key_type, value_type } %}
 {%- include "MapTemplate.swift" %}
 
+{%- when Type::InputStream { item_type, error_type, is_send } %}
+{%- include "InputStreamTemplate.swift" %}
+
 {%- else %}
 {%- endmatch %}
 {%- endfor %}
