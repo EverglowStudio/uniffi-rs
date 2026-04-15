@@ -37,7 +37,7 @@
 //! runtime — never a silent skip. Timestamp and duration are covered with
 //! explicit `Date` / millisecond lowering and lifting.
 
-use std::fmt::Write;
+use std::{collections::BTreeMap, fmt::Write};
 
 use heck::ToSnakeCase;
 use uniffi_bindgen::interface::{
@@ -99,10 +99,15 @@ pub fn render_wasm_rust(ci: &ComponentInterface) -> String {
     let has_cb_ifaces = !ci.callback_interface_definitions().is_empty();
     let has_callbacks = has_cb_objects || has_cb_ifaces;
 
+    let input_stream_types = collect_input_stream_types(ci);
+
     // Emit explicit `__lower_<name>` / `__lift_<name>` helpers for
-    // every record and non-error enum.
+    // every record and non-error enum. Input stream error enums also
+    // need lowering helpers so JS iterator throws can become typed Rust
+    // errors without serde.
     emit_value_helpers(&mut out, ci, &crate_ident);
     emit_temporal_helpers(&mut out);
+    emit_input_stream_helpers(&mut out, &crate_ident, &input_stream_types);
 
     if has_objects {
         emit_object_helpers(&mut out);
@@ -633,6 +638,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                     Lowering::Value { core_ty, .. } => core_ty.clone(),
                     Lowering::Object { rust_ty, .. } => format!("Arc<{rust_ty}>"),
                     Lowering::Callback { rust_ty, .. } => format!("Arc<{rust_ty}>"),
+                    Lowering::InputStream { core_ty, .. } => core_ty.clone(),
                     Lowering::Unsupported(_) => "JsValue".to_string(),
                 };
                 format!("{n}: {t}")
@@ -759,7 +765,8 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                     Some(Lowering::Native(_))
                     | Some(Lowering::Value { .. })
                     | Some(Lowering::Object { .. })
-                    | Some(Lowering::Callback { .. }) => {
+                    | Some(Lowering::Callback { .. })
+                    | Some(Lowering::InputStream { .. }) => {
                         let ty = m
                             .return_type()
                             .expect("ret_info Some implies return_type")
@@ -845,7 +852,8 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 Some(Lowering::Native(_))
                 | Some(Lowering::Value { .. })
                 | Some(Lowering::Object { .. })
-                | Some(Lowering::Callback { .. }) => {
+                | Some(Lowering::Callback { .. })
+                | Some(Lowering::InputStream { .. }) => {
                     let ty = m
                         .return_type()
                         .expect("ret_info Some implies return_type")
@@ -875,6 +883,7 @@ fn callback_return_core_ty(ty: &Type, crate_ident: &str) -> String {
         Lowering::Value { core_ty, .. } => core_ty,
         Lowering::Object { rust_ty, .. } => format!("Arc<{rust_ty}>"),
         Lowering::Callback { rust_ty, .. } => format!("Arc<{rust_ty}>"),
+        Lowering::InputStream { core_ty, .. } => core_ty,
         Lowering::Unsupported(_) => {
             unreachable!("unsupported callback return types are rejected before codegen")
         }
@@ -1262,6 +1271,365 @@ fn stream_item_lift_expr(info: &Lowering, item_type: &Type) -> String {
 }
 
 // ---------------------------------------------------------------------
+// Foreign input streams
+// ---------------------------------------------------------------------
+
+fn collect_input_stream_types(ci: &ComponentInterface) -> Vec<Type> {
+    let mut types = BTreeMap::new();
+    for f in ci.function_definitions() {
+        for arg in f.arguments() {
+            collect_input_stream_type(&arg.as_type(), &mut types);
+        }
+    }
+    for obj in ci.object_definitions() {
+        for c in obj.constructors() {
+            for arg in c.arguments() {
+                collect_input_stream_type(&arg.as_type(), &mut types);
+            }
+        }
+        for m in obj.methods() {
+            for arg in m.arguments() {
+                collect_input_stream_type(&arg.as_type(), &mut types);
+            }
+        }
+    }
+    for record in ci.record_definitions() {
+        for c in record.constructors() {
+            for arg in c.arguments() {
+                collect_input_stream_type(&arg.as_type(), &mut types);
+            }
+        }
+        for m in record.methods() {
+            for arg in m.arguments() {
+                collect_input_stream_type(&arg.as_type(), &mut types);
+            }
+        }
+    }
+    for enum_ in ci.enum_definitions() {
+        for c in enum_.constructors() {
+            for arg in c.arguments() {
+                collect_input_stream_type(&arg.as_type(), &mut types);
+            }
+        }
+        for m in enum_.methods() {
+            for arg in m.arguments() {
+                collect_input_stream_type(&arg.as_type(), &mut types);
+            }
+        }
+    }
+    types.into_values().collect()
+}
+
+fn collect_input_stream_type(ty: &Type, out: &mut BTreeMap<String, Type>) {
+    match ty {
+        Type::InputStream { .. } => {
+            out.insert(input_stream_suffix(ty), ty.clone());
+        }
+        Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+            collect_input_stream_type(inner_type, out);
+        }
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            collect_input_stream_type(key_type, out);
+            collect_input_stream_type(value_type, out);
+        }
+        Type::Custom { builtin, .. } => collect_input_stream_type(builtin, out),
+        _ => {}
+    }
+}
+
+fn emit_input_stream_helpers(out: &mut String, crate_ident: &str, input_stream_types: &[Type]) {
+    if input_stream_types.is_empty() {
+        return;
+    }
+
+    writeln!(out, "// --- foreign input stream lowering ---").unwrap();
+    out.push_str(
+        r#"const __UNIFFI_INPUT_STREAM_MAX_SAFE_HANDLE: u64 = 9_007_199_254_740_991;
+
+fn __uniffi_input_stream_handle_to_js(handle: ::uniffi::Handle) -> JsValue {
+    let raw = handle.as_raw();
+    if raw > __UNIFFI_INPUT_STREAM_MAX_SAFE_HANDLE {
+        panic!("uniffi input stream handle exceeds JavaScript safe integer range");
+    }
+    JsValue::from_f64(raw as f64)
+}
+
+fn __uniffi_input_stream_handle_from_js(value: &JsValue) -> Result<u64, JsError> {
+    let raw = value
+        .as_f64()
+        .ok_or_else(|| JsError::new("input stream marker `handle` is not numeric"))?;
+    if !raw.is_finite()
+        || raw <= 0.0
+        || raw.fract() != 0.0
+        || raw > __UNIFFI_INPUT_STREAM_MAX_SAFE_HANDLE as f64
+    {
+        return Err(JsError::new("input stream marker `handle` is invalid"));
+    }
+    Ok(raw as u64)
+}
+"#,
+    );
+    for ty in input_stream_types {
+        emit_typed_input_stream_helper(out, crate_ident, ty);
+        writeln!(out).unwrap();
+    }
+}
+
+fn emit_typed_input_stream_helper(out: &mut String, crate_ident: &str, ty: &Type) {
+    let Type::InputStream {
+        item_type,
+        error_type,
+        ..
+    } = ty
+    else {
+        unreachable!("emit_typed_input_stream_helper called for non-input stream");
+    };
+    let suffix = input_stream_suffix(ty);
+    let snake = input_stream_snake_suffix(ty);
+    let ops_name = input_stream_ops_name(ty);
+    let item_ty = core_ty_for(item_type, crate_ident);
+    let error_ty = core_ty_for(error_type, crate_ident);
+    let item_lower = lower_expr("__value", item_type, 0);
+    let error_lower = lower_expr("__error", error_type, 0);
+
+    writeln!(
+        out,
+        "struct {ops_name} {{\n    \
+         next: ::js_sys::Function,\n    \
+         cancel: ::js_sys::Function,\n    \
+         _phantom: ::std::marker::PhantomData<fn() -> ({item_ty}, {error_ty})>,\n\
+         }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "impl ::uniffi::ForeignInputStreamOps<{item_ty}, {error_ty}> for {ops_name} {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    fn next(&self, handle: ::uniffi::Handle) -> ::uniffi::ForeignInputStreamNextFuture<{item_ty}, {error_ty}> {{"
+    )
+    .unwrap();
+    writeln!(out, "        let __next = self.next.clone();").unwrap();
+    writeln!(out, "        Box::pin(async move {{").unwrap();
+    writeln!(
+        out,
+        "            let __handle = __uniffi_input_stream_handle_to_js(handle);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            let __next_result = __next.call1(&JsValue::NULL, &__handle).unwrap_or_else(|__err| panic!(\"uniffi input stream {suffix} next() threw before returning a Promise: {{:?}}\", __err));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            let __promise: ::js_sys::Promise = if __next_result.is_instance_of::<::js_sys::Promise>() {{\n                __next_result.dyn_into().unwrap_or_else(|_| panic!(\"uniffi input stream {suffix} next() returned an invalid Promise\"))\n            }} else {{\n                ::js_sys::Promise::resolve(&__next_result)\n            }};"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            let __envelope = ::wasm_bindgen_futures::JsFuture::from(__promise).await.unwrap_or_else(|__err| panic!(\"uniffi input stream {suffix} next() Promise rejected before typed envelope lowering: {{:?}}\", __err));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            let __obj: ::js_sys::Object = __envelope.dyn_into().unwrap_or_else(|_| panic!(\"uniffi input stream {suffix} next() returned a non-object envelope\"));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            let __ok_js = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"ok\")).unwrap_or_else(|_| panic!(\"uniffi input stream {suffix} envelope missing `ok`\"));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            let __ok = __ok_js.as_bool().unwrap_or_else(|| panic!(\"uniffi input stream {suffix} envelope `ok` is not boolean\"));"
+    )
+    .unwrap();
+    writeln!(out, "            if !__ok {{").unwrap();
+    writeln!(
+        out,
+        "                let __error = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"error\")).unwrap_or_else(|_| panic!(\"uniffi input stream {suffix} error envelope missing `error`\"));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "                return Err((|| -> ::std::result::Result<{error_ty}, JsError> {{ {error_lower} }})().unwrap_or_else(|__err| panic!(\"uniffi input stream {suffix} failed to lower typed error: {{:?}}\", __err)));"
+    )
+    .unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(
+        out,
+        "            let __done_js = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"done\")).unwrap_or_else(|_| panic!(\"uniffi input stream {suffix} success envelope missing `done`\"));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            let __done = __done_js.as_bool().unwrap_or_else(|| panic!(\"uniffi input stream {suffix} success envelope `done` is not boolean\"));"
+    )
+    .unwrap();
+    writeln!(out, "            if __done {{").unwrap();
+    writeln!(out, "                return Ok(None);").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(
+        out,
+        "            let __value = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"value\")).unwrap_or_else(|_| panic!(\"uniffi input stream {suffix} value envelope missing `value`\"));"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "            let __value = (|| -> ::std::result::Result<{item_ty}, JsError> {{ {item_lower} }})().unwrap_or_else(|__err| panic!(\"uniffi input stream {suffix} failed to lower item value: {{:?}}\", __err));"
+    )
+    .unwrap();
+    writeln!(out, "            Ok(Some(__value))").unwrap();
+    writeln!(out, "        }})").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    fn cancel(&self, handle: ::uniffi::Handle) {{").unwrap();
+    writeln!(
+        out,
+        "        let __handle = __uniffi_input_stream_handle_to_js(handle);"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "        let _ = self.cancel.call1(&JsValue::NULL, &__handle);"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "#[allow(dead_code)]\n\
+         fn __lower_input_stream_{snake}(__js: JsValue) -> Result<::uniffi::UniFfiInputStream<{item_ty}, {error_ty}>, JsError> {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let __obj: ::js_sys::Object = __js.dyn_into().map_err(|_| JsError::new(\"expected object for uniffi input stream marker\"))?;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let __marker = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffiInputStream\")).map_err(|_| JsError::new(\"input stream marker missing `__uniffiInputStream`\"))?;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    if __marker.as_bool() != Some(true) {{\n        return Err(JsError::new(\"expected uniffi input stream marker\"));\n    }}"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let __handle_js = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"handle\")).map_err(|_| JsError::new(\"input stream marker missing `handle`\"))?;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let __handle = __uniffi_input_stream_handle_from_js(&__handle_js)?;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let __next_js = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"next\")).map_err(|_| JsError::new(\"input stream marker missing `next`\"))?;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let __next: ::js_sys::Function = __next_js.dyn_into().map_err(|_| JsError::new(\"input stream marker `next` is not a function\"))?;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let __cancel_js = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"cancel\")).map_err(|_| JsError::new(\"input stream marker missing `cancel`\"))?;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    let __cancel: ::js_sys::Function = __cancel_js.dyn_into().map_err(|_| JsError::new(\"input stream marker `cancel` is not a function\"))?;"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    Ok::<_, JsError>(::uniffi::UniFfiInputStream::from_handle_and_ops(\n        \
+         ::uniffi::Handle::from_raw_unchecked(__handle),\n        \
+         Arc::new({ops_name} {{\n            next: __next,\n            cancel: __cancel,\n            _phantom: ::std::marker::PhantomData,\n        }}),\n    ))"
+    )
+    .unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+fn input_stream_lower_expr(expr: &str, ty: &Type) -> String {
+    let snake = input_stream_snake_suffix(ty);
+    format!("__lower_input_stream_{snake}({expr})")
+}
+
+fn input_stream_ops_name(ty: &Type) -> String {
+    format!("__UniffiInputStream{}Ops", input_stream_suffix(ty))
+}
+
+fn input_stream_suffix(ty: &Type) -> String {
+    match ty {
+        Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => format!("{}{}", type_suffix(item_type), type_suffix(error_type)),
+        _ => type_suffix(ty),
+    }
+}
+
+fn input_stream_snake_suffix(ty: &Type) -> String {
+    input_stream_suffix(ty).to_snake_case()
+}
+
+fn type_suffix(ty: &Type) -> String {
+    match ty {
+        Type::UInt8 => "UInt8".into(),
+        Type::Int8 => "Int8".into(),
+        Type::UInt16 => "UInt16".into(),
+        Type::Int16 => "Int16".into(),
+        Type::UInt32 => "UInt32".into(),
+        Type::Int32 => "Int32".into(),
+        Type::UInt64 => "UInt64".into(),
+        Type::Int64 => "Int64".into(),
+        Type::Float32 => "Float32".into(),
+        Type::Float64 => "Float64".into(),
+        Type::Boolean => "Boolean".into(),
+        Type::String => "String".into(),
+        Type::Bytes => "Bytes".into(),
+        Type::Timestamp => "Timestamp".into(),
+        Type::Duration => "Duration".into(),
+        Type::Record { name, .. } | Type::Enum { name, .. } | Type::Custom { name, .. } => {
+            name.clone()
+        }
+        Type::Object { name, .. } | Type::CallbackInterface { name, .. } => name.clone(),
+        Type::Optional { inner_type } => format!("Optional{}", type_suffix(inner_type)),
+        Type::Sequence { inner_type } => format!("Sequence{}", type_suffix(inner_type)),
+        Type::Map {
+            key_type,
+            value_type,
+        } => format!("Map{}{}", type_suffix(key_type), type_suffix(value_type)),
+        Type::Stream {
+            item_type,
+            error_type,
+            ..
+        } => format!(
+            "Stream{}{}",
+            type_suffix(item_type),
+            type_suffix(error_type)
+        ),
+        Type::InputStream { .. } => format!("InputStream{}", input_stream_suffix(ty)),
+    }
+}
+
+// ---------------------------------------------------------------------
 // Shared emit helpers
 // ---------------------------------------------------------------------
 
@@ -1273,6 +1641,7 @@ fn param_list(arg_info: &[(String, Lowering)]) -> String {
             Lowering::Value { .. } => format!("{n}: JsValue"),
             Lowering::Object { .. } => format!("{n}: u32"),
             Lowering::Callback { .. } => format!("{n}: u32"),
+            Lowering::InputStream { .. } => format!("{n}: JsValue"),
             Lowering::Unsupported(_) => unreachable!(),
         })
         .collect::<Vec<_>>()
@@ -1304,6 +1673,10 @@ fn emit_arg_decoders(out: &mut String, arg_info: &[(String, Lowering)]) {
                         .unwrap()
                 )
                 .unwrap();
+            }
+            Lowering::InputStream { core_ty, ty } => {
+                let lower = input_stream_lower_expr(n, ty);
+                writeln!(out, "    let {n}: {core_ty} = ({lower})?;").unwrap();
             }
             Lowering::Unsupported(_) => unreachable!(),
         }
@@ -1342,6 +1715,7 @@ fn return_type(ret_info: &Option<Lowering>, throws: bool) -> String {
         Some(Lowering::Value { .. }) => "Result<JsValue, JsError>".to_string(),
         Some(Lowering::Object { .. }) => "Result<u32, JsError>".to_string(),
         Some(Lowering::Callback { .. }) => "Result<u32, JsError>".to_string(),
+        Some(Lowering::InputStream { .. }) => "Result<JsValue, JsError>".to_string(),
         Some(Lowering::Unsupported(_)) => unreachable!(),
     }
     .tap(|_| {
@@ -1393,6 +1767,13 @@ fn emit_return(out: &mut String, ret_info: &Option<Lowering>, bound: &str) {
             )
             .unwrap();
         }
+        Some(Lowering::InputStream { .. }) => {
+            writeln!(
+                out,
+                "    Err(JsError::new(\"returning input streams from wasm is not supported\"))"
+            )
+            .unwrap();
+        }
         Some(Lowering::Unsupported(_)) => unreachable!(),
     }
 }
@@ -1425,6 +1806,8 @@ enum Lowering {
         snake: String,
         rust_ty: String,
     },
+    /// Foreign input stream marker object from common/runtime.ts.
+    InputStream { core_ty: String, ty: Type },
     /// Type we know we haven't wired up yet. The reason is embedded in
     /// the generated code so the skip is diagnosable at runtime.
     Unsupported(String),
@@ -1529,9 +1912,34 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
         Type::Stream { .. } => {
             Unsupported("native streams are not wired into wasm codegen yet".into())
         }
-        Type::InputStream { .. } => {
-            Unsupported("input streams are not wired into wasm codegen yet".into())
+        Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => {
+            let item = classify(item_type, crate_ident);
+            if let Some(reason) = input_stream_payload_unsupported_reason(&item) {
+                return Unsupported(format!("input stream item: {reason}"));
+            }
+            let error = classify(error_type, crate_ident);
+            if let Some(reason) = input_stream_payload_unsupported_reason(&error) {
+                return Unsupported(format!("input stream error: {reason}"));
+            }
+            InputStream {
+                core_ty: core_ty_for(ty, crate_ident),
+                ty: ty.clone(),
+            }
         }
+    }
+}
+
+fn input_stream_payload_unsupported_reason(info: &Lowering) -> Option<String> {
+    match info {
+        Lowering::Native(_) | Lowering::Value { .. } => None,
+        Lowering::Object { .. } => Some("opaque objects are not supported".into()),
+        Lowering::Callback { .. } => Some("callback traits are not supported".into()),
+        Lowering::InputStream { .. } => Some("nested input streams are not supported".into()),
+        Lowering::Unsupported(reason) => Some(reason.clone()),
     }
 }
 
@@ -1547,6 +1955,7 @@ fn emit_value_helpers(out: &mut String, ci: &ComponentInterface, crate_ident: &s
     let records = ci.record_definitions();
     let enums = ci.enum_definitions();
     let callback_error_enums = crate::callback_metadata::callback_error_enum_names(ci);
+    let input_stream_enum_helpers = input_stream_enum_helper_names(ci);
     if records.is_empty() && enums.is_empty() {
         return;
     }
@@ -1559,12 +1968,52 @@ fn emit_value_helpers(out: &mut String, ci: &ComponentInterface, crate_ident: &s
         emit_record_helpers(out, r, crate_ident);
     }
     for e in enums {
-        if ci.is_name_used_as_error(e.name()) && !callback_error_enums.contains(e.name()) {
+        if ci.is_name_used_as_error(e.name())
+            && !callback_error_enums.contains(e.name())
+            && !input_stream_enum_helpers.contains_key(e.name())
+        {
             continue;
         }
         emit_enum_helpers(out, e, crate_ident);
     }
     writeln!(out).unwrap();
+}
+
+fn input_stream_enum_helper_names(ci: &ComponentInterface) -> BTreeMap<String, ()> {
+    let mut out = BTreeMap::new();
+    for ty in collect_input_stream_types(ci) {
+        let Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } = ty
+        else {
+            continue;
+        };
+        collect_lowered_enum_names(&item_type, &mut out);
+        collect_lowered_enum_names(&error_type, &mut out);
+    }
+    out
+}
+
+fn collect_lowered_enum_names(ty: &Type, out: &mut BTreeMap<String, ()>) {
+    match ty {
+        Type::Enum { name, .. } => {
+            out.insert(name.clone(), ());
+        }
+        Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+            collect_lowered_enum_names(inner_type, out);
+        }
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            collect_lowered_enum_names(key_type, out);
+            collect_lowered_enum_names(value_type, out);
+        }
+        Type::Custom { builtin, .. } => collect_lowered_enum_names(builtin, out),
+        _ => {}
+    }
 }
 
 fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
@@ -1875,9 +2324,7 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
         Type::Stream { .. } => {
             "Err(JsError::new(\"native streams are not wired into wasm lowering yet\"))".into()
         }
-        Type::InputStream { .. } => {
-            "Err(JsError::new(\"input streams are not wired into wasm lowering yet\"))".into()
-        }
+        Type::InputStream { .. } => input_stream_lower_expr(expr, ty),
         Type::Object { name, imp, .. } => match imp {
             ObjectImpl::Struct | ObjectImpl::Trait => {
                 let snake = name.to_snake_case();
@@ -2125,6 +2572,15 @@ fn core_ty_for(ty: &Type, crate_ident: &str) -> String {
             core_ty_for(value_type, crate_ident)
         ),
         Type::Custom { name, .. } => format!("::{crate_ident}::{name}"),
+        Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => format!(
+            "::uniffi::UniFfiInputStream<{}, {}>",
+            core_ty_for(item_type, crate_ident),
+            core_ty_for(error_type, crate_ident)
+        ),
         _ => "::wasm_bindgen::JsValue".into(),
     }
 }
@@ -2135,6 +2591,7 @@ fn type_debug(l: &Lowering) -> &'static str {
         Lowering::Value { .. } => "value",
         Lowering::Object { .. } => "object",
         Lowering::Callback { .. } => "callback",
+        Lowering::InputStream { .. } => "input stream",
         Lowering::Unsupported(_) => "unsupported",
     }
 }
