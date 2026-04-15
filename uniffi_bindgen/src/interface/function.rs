@@ -313,6 +313,65 @@ pub trait Callable {
             .name()
             .to_owned()
     }
+
+    fn is_stream(&self) -> bool {
+        matches!(self.return_type(), Some(Type::Stream { .. }))
+    }
+
+    fn stream_item_type(&self) -> Option<&Type> {
+        match self.return_type() {
+            Some(Type::Stream { item_type, .. }) => Some(item_type),
+            _ => None,
+        }
+    }
+
+    fn stream_error_type(&self) -> Option<&Type> {
+        match self.return_type() {
+            Some(Type::Stream { error_type, .. }) => Some(error_type),
+            _ => None,
+        }
+    }
+
+    fn stream_next_return_type(&self) -> Option<Type> {
+        self.stream_item_type().map(|item_type| Type::Optional {
+            inner_type: Box::new(item_type.clone()),
+        })
+    }
+
+    fn ffi_stream_next_func(&self) -> String {
+        format!("{}_stream_next", self.ffi_func().name())
+    }
+
+    fn ffi_stream_cancel_func(&self) -> String {
+        format!("{}_stream_cancel", self.ffi_func().name())
+    }
+
+    fn ffi_stream_next_rust_future_poll(&self, ci: &ComponentInterface) -> String {
+        let return_type = self
+            .stream_next_return_type()
+            .expect("stream_next_return_type called on a non-stream callable");
+        ci.ffi_rust_future_poll(Some((&return_type).into()))
+            .name()
+            .to_owned()
+    }
+
+    fn ffi_stream_next_rust_future_complete(&self, ci: &ComponentInterface) -> String {
+        let return_type = self
+            .stream_next_return_type()
+            .expect("stream_next_return_type called on a non-stream callable");
+        ci.ffi_rust_future_complete(Some((&return_type).into()))
+            .name()
+            .to_owned()
+    }
+
+    fn ffi_stream_next_rust_future_free(&self, ci: &ComponentInterface) -> String {
+        let return_type = self
+            .stream_next_return_type()
+            .expect("stream_next_return_type called on a non-stream callable");
+        ci.ffi_rust_future_free(Some((&return_type).into()))
+            .name()
+            .to_owned()
+    }
 }
 
 impl Callable for Function {

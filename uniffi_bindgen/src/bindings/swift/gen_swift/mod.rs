@@ -760,7 +760,7 @@ impl SwiftCodeOracle {
                 value_type,
             } => Box::new(compounds::MapCodeType::new(*key_type, *value_type)),
             Type::Set { inner_type } => Box::new(compounds::SetCodeType::new(*inner_type)),
-            Type::Stream { .. } => Box::new(primitives::UInt64CodeType),
+            Type::Stream { item_type, .. } => Box::new(compounds::StreamCodeType::new(*item_type)),
             Type::Custom { name, builtin, .. } => Box::new(custom::CustomCodeType::new(
                 name,
                 self.create_code_type(*builtin),
@@ -1191,5 +1191,167 @@ pub mod filters {
         _: &dyn askama::Values,
     ) -> Result<(String, String), askama::Error> {
         Ok(SwiftCodeOracle.object_names(obj))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::BTreeSet, fs, process::Command};
+    use uniffi_meta::{
+        EnumMetadata, EnumShape, FieldMetadata, FnMetadata, FnParamMetadata, Metadata,
+        MetadataGroup, NamespaceMetadata, RecordMetadata, Type, VariantMetadata,
+    };
+
+    fn stream_component_interface() -> ComponentInterface {
+        let module_path = "stream_core";
+        let stream_event_type = Type::Record {
+            module_path: module_path.to_owned(),
+            name: "StreamEvent".to_owned(),
+        };
+        let stream_error_type = Type::Enum {
+            module_path: module_path.to_owned(),
+            name: "StreamError".to_owned(),
+        };
+        let mut items = BTreeSet::new();
+        items.insert(Metadata::Record(RecordMetadata {
+            module_path: module_path.to_owned(),
+            name: "StreamEvent".to_owned(),
+            remote: false,
+            fields: vec![FieldMetadata {
+                name: "value".to_owned(),
+                ty: Type::UInt32,
+                default: None,
+                docstring: None,
+            }],
+            docstring: None,
+        }));
+        items.insert(Metadata::Enum(EnumMetadata {
+            module_path: module_path.to_owned(),
+            name: "StreamError".to_owned(),
+            shape: EnumShape::Error { flat: true },
+            remote: false,
+            variants: vec![VariantMetadata {
+                name: "Boom".to_owned(),
+                discr: None,
+                fields: vec![],
+                docstring: None,
+            }],
+            discr_type: None,
+            non_exhaustive: false,
+            docstring: None,
+        }));
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: "count_events".to_owned(),
+            is_async: false,
+            inputs: vec![FnParamMetadata {
+                name: "count".to_owned(),
+                ty: Type::UInt32,
+                by_ref: false,
+                optional: false,
+                default: None,
+            }],
+            return_type: Some(Type::Stream {
+                item_type: Box::new(stream_event_type),
+                error_type: Box::new(stream_error_type),
+                is_send: true,
+            }),
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }));
+        let mut ci = ComponentInterface::from_metadata(MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.to_owned(),
+                name: module_path.to_owned(),
+            },
+            namespace_docstring: None,
+            items,
+        })
+        .unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        ci
+    }
+
+    fn stream_bindings() -> Bindings {
+        generate_bindings(
+            &Config {
+                module_name: Some("StreamCore".to_owned()),
+                ..Config::default()
+            },
+            &stream_component_interface(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn swift_stream_async_throwing_stream_static_contract() {
+        let bindings = stream_bindings();
+        let swift = bindings.library;
+        let header = bindings.header;
+
+        assert!(swift.contains(
+            "public func countEvents(count: UInt32) -> AsyncThrowingStream<StreamEvent, Error>"
+        ));
+        assert!(!swift.contains("public func countEvents(count: UInt32) -> UInt64"));
+        assert!(swift.contains("let __streamHandle ="));
+        assert!(swift.contains("uniffi_stream_core_fn_func_count_events("));
+        assert!(
+            swift.contains("uniffi_stream_core_fn_func_count_events_stream_next(__streamHandle)")
+        );
+        assert!(
+            swift.contains("uniffi_stream_core_fn_func_count_events_stream_cancel(__streamHandle)")
+        );
+        assert!(swift.contains("try await uniffiRustCallAsync("));
+        assert!(swift.contains("liftFunc: FfiConverterOption"));
+        assert!(swift.contains(".lift"));
+        assert!(swift.contains("errorHandler: FfiConverter") && swift.contains("StreamError_lift"));
+        assert!(swift.contains("continuation.yield(__streamValue)"));
+        assert!(swift.contains("continuation.finish()"));
+        assert!(swift.contains("continuation.finish(throwing: error)"));
+        assert!(swift.contains("continuation.onTermination = { @Sendable _ in"));
+        assert!(swift.contains("__streamTask.cancel()"));
+
+        assert!(header.contains("uniffi_stream_core_fn_func_count_events("));
+        assert!(header.contains("uniffi_stream_core_fn_func_count_events_stream_next("));
+        assert!(header.contains("uniffi_stream_core_fn_func_count_events_stream_cancel("));
+    }
+
+    #[test]
+    fn swift_stream_wrapper_typechecks_when_swiftc_available() {
+        if Command::new("swiftc").arg("--version").output().is_err() {
+            eprintln!(
+                "SKIP swift_stream_wrapper_typechecks_when_swiftc_available: swiftc unavailable"
+            );
+            return;
+        }
+
+        let bindings = stream_bindings();
+        let tmp = tempfile::tempdir().unwrap();
+        let swift_path = tmp.path().join("StreamCore.swift");
+        let header_path = tmp.path().join("StreamCoreFFI.h");
+        let modulemap_path = tmp.path().join("StreamCoreFFI.modulemap");
+        fs::write(&swift_path, bindings.library).unwrap();
+        fs::write(&header_path, bindings.header).unwrap();
+        fs::write(&modulemap_path, bindings.modulemap.unwrap()).unwrap();
+
+        let output = Command::new("swiftc")
+            .arg("-typecheck")
+            .arg("-swift-version")
+            .arg("5")
+            .arg("-I")
+            .arg(tmp.path())
+            .arg("-Xcc")
+            .arg(format!("-fmodule-map-file={}", modulemap_path.display()))
+            .arg(&swift_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "swiftc -typecheck failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
