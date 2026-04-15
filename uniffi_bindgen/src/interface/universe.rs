@@ -180,6 +180,15 @@ fn normalize_type_module_path(ty: &Type) -> Type {
         Type::Set { inner_type } => Type::Set {
             inner_type: Box::new(normalize_type_module_path(inner_type)),
         },
+        Type::Stream {
+            item_type,
+            error_type,
+            is_send,
+        } => Type::Stream {
+            item_type: Box::new(normalize_type_module_path(item_type)),
+            error_type: Box::new(normalize_type_module_path(error_type)),
+            is_send: *is_send,
+        },
         Type::Custom {
             name,
             builtin,

@@ -22,6 +22,14 @@ pub fn fn_symbol_name(module_path: &str, name: &str) -> String {
     format!("uniffi_{namespace}_fn_func_{name}")
 }
 
+pub fn fn_stream_next_symbol_name(module_path: &str, name: &str) -> String {
+    format!("{}_stream_next", fn_symbol_name(module_path, name))
+}
+
+pub fn fn_stream_cancel_symbol_name(module_path: &str, name: &str) -> String {
+    format!("{}_stream_cancel", fn_symbol_name(module_path, name))
+}
+
 /// FFI symbol name for an object constructor
 pub fn constructor_symbol_name(module_path: &str, object_name: &str, name: &str) -> String {
     let namespace = crate_name(module_path).replace("::", "__");

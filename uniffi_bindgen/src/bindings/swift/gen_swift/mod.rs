@@ -760,6 +760,7 @@ impl SwiftCodeOracle {
                 value_type,
             } => Box::new(compounds::MapCodeType::new(*key_type, *value_type)),
             Type::Set { inner_type } => Box::new(compounds::SetCodeType::new(*inner_type)),
+            Type::Stream { .. } => Box::new(primitives::UInt64CodeType),
             Type::Custom { name, builtin, .. } => Box::new(custom::CustomCodeType::new(
                 name,
                 self.create_code_type(*builtin),

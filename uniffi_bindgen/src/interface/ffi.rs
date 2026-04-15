@@ -137,6 +137,7 @@ impl From<&Type> for FfiType {
             | Type::Set { .. }
             | Type::Timestamp
             | Type::Duration => FfiType::RustBuffer(None),
+            Type::Stream { .. } => FfiType::Handle,
             Type::Custom {
                 builtin,
                 name,

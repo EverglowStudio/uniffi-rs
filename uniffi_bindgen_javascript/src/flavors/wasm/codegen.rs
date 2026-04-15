@@ -1348,6 +1348,9 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
                 }
             }
         }
+        Type::Stream { .. } => {
+            Unsupported("native streams are not wired into wasm codegen yet".into())
+        }
     }
 }
 
@@ -1687,6 +1690,9 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
             format!(
                 "{{ let __obj{depth}: ::js_sys::Object = {expr}.dyn_into().map_err(|_| JsError::new(\"expected object for map\"))?; let __keys{depth} = ::js_sys::Object::keys(&__obj{depth}); let mut __out{depth} = ::std::collections::HashMap::new(); for __i{depth} in 0..__keys{depth}.length() {{ let {key}: JsValue = __keys{depth}.get(__i{depth}); let {value}: JsValue = ::js_sys::Reflect::get(&__obj{depth}, &{key}).map_err(|_| JsError::new(\"reflect get map value failed\"))?; __out{depth}.insert(({key_lower})?, ({value_lower})?); }} Ok::<_, JsError>(__out{depth}) }}"
             )
+        }
+        Type::Stream { .. } => {
+            "Err(JsError::new(\"native streams are not wired into wasm lowering yet\"))".into()
         }
         Type::Object { name, imp, .. } => match imp {
             ObjectImpl::Struct | ObjectImpl::Trait => {

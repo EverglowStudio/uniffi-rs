@@ -368,6 +368,13 @@ impl<'a> Generator<'a> {
                 self.ensure_type_supported(key_type, TypeUsage::Value, label)?;
                 self.ensure_type_supported(value_type, TypeUsage::Value, label)
             }
+            Type::Stream { .. } => {
+                ensure!(
+                    matches!(usage, TypeUsage::Return),
+                    "{label} native stream is only supported as a direct return value"
+                );
+                bail!("{label} native stream wrapper generation is not implemented yet")
+            }
             Type::Timestamp | Type::Duration => Ok(()),
             Type::CallbackInterface { name, .. } => {
                 ensure!(
@@ -1894,6 +1901,7 @@ impl<'a> Generator<'a> {
                 let value = self.bridge_value_type(value_type)?;
                 Ok(quote!(std::collections::HashMap<#key, #value>))
             }
+            Type::Stream { .. } => bail!("native streams are not wired into napi bridge types yet"),
             Type::Timestamp => Ok(quote!(__UniffiTimestamp)),
             Type::Duration => Ok(quote!(__UniffiDuration)),
             Type::CallbackInterface { name, .. } => {
@@ -1995,6 +2003,7 @@ impl<'a> Generator<'a> {
                         .collect()
                 ))
             }
+            Type::Stream { .. } => bail!("native streams are not wired into napi lowering yet"),
             Type::Timestamp => Ok(quote!(#expr.0)),
             Type::Duration => Ok(quote!(#expr.0)),
             Type::CallbackInterface { name, .. } => {
@@ -2065,6 +2074,7 @@ impl<'a> Generator<'a> {
                         .collect()
                 ))
             }
+            Type::Stream { .. } => bail!("native streams are not wired into napi lifting yet"),
             Type::Timestamp => Ok(quote!(__UniffiTimestamp(#expr))),
             Type::Duration => Ok(quote!(__UniffiDuration(#expr))),
             Type::CallbackInterface { name, .. } => {
@@ -2240,6 +2250,9 @@ impl<'a> Generator<'a> {
                         .collect()
                 ))
             }
+            Type::Stream { .. } => {
+                bail!("native streams are not supported in callback values yet")
+            }
             Type::Timestamp => Ok(quote!(#expr.0)),
             Type::Duration => Ok(quote!(#expr.0)),
             Type::CallbackInterface { .. } => {
@@ -2360,6 +2373,9 @@ impl<'a> Generator<'a> {
                 let key = self.core_callback_return_type(key_type)?;
                 let value = self.core_callback_return_type(value_type)?;
                 Ok(quote!(std::collections::HashMap<#key, #value>))
+            }
+            Type::Stream { .. } => {
+                bail!("native streams are not supported in callback returns yet")
             }
             Type::Timestamp => Ok(quote!(::std::time::SystemTime)),
             Type::Duration => Ok(quote!(::std::time::Duration)),

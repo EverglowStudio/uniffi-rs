@@ -105,6 +105,7 @@ pub fn type_name(ty: &Type, context: &Context) -> Result<String> {
         Type::Set { inner_type } => {
             format!("typing.Set[{}]", type_name(inner_type, context)?)
         }
+        Type::Stream { .. } => "int".to_string(),
     })
 }
 
@@ -136,6 +137,7 @@ pub fn type_annotation(ty: &Type, context: &Context) -> Result<String> {
             "typing.Set[{}]",
             type_annotation(inner_type, context)?
         )),
+        Type::Stream { .. } => type_name(ty, context),
         _ => type_name(ty, context),
     }
 }

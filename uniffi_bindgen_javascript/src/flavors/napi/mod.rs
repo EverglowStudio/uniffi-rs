@@ -524,6 +524,9 @@ fn ohos_native_ts_type(ty: &Type) -> String {
         Type::Map { value_type, .. } => {
             format!("Record<string, {}>", ohos_native_ts_type(value_type))
         }
+        Type::Stream { item_type, .. } => {
+            format!("AsyncIterable<{}>", ohos_native_ts_type(item_type))
+        }
         Type::Timestamp | Type::Duration => "number".to_string(),
         Type::Custom { builtin, .. } => ohos_native_ts_type(builtin),
     }

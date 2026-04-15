@@ -16,6 +16,7 @@ pub mod handle;
 pub mod rustbuffer;
 pub mod rustcalls;
 pub mod rustfuture;
+pub mod ruststream;
 
 pub use callbackinterface::*;
 pub use ffidefault::FfiDefault;
@@ -28,3 +29,4 @@ pub use handle::*;
 pub use rustbuffer::*;
 pub use rustcalls::*;
 pub use rustfuture::*;
+pub use ruststream::*;

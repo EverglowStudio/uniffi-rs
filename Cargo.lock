@@ -2698,6 +2698,7 @@ dependencies = [
  "async-compat",
  "async-trait",
  "bytes",
+ "futures-core",
  "once_cell",
  "static_assertions",
 ]
