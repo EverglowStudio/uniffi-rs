@@ -551,7 +551,7 @@ fn type_contains_stream_path(ty: &Type) -> bool {
             path.path
                 .segments
                 .iter()
-                .any(|segment| segment.ident == "Stream")
+                .any(|segment| segment.ident == "Stream" || segment.ident == "UniFfiStream")
                 || path.path.segments.iter().any(|segment| {
                     if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                         args.args.iter().any(|arg| match arg {
@@ -586,6 +586,12 @@ fn stream_return_type(return_type: &ReturnType) -> syn::Result<Option<StreamRetu
     let ReturnType::Type(_, ty) = return_type else {
         return Ok(None);
     };
+    if let Some((item_ty, error_ty)) = uniffi_stream_alias_args(ty)? {
+        return Ok(Some(StreamReturnType {
+            item_ty: quote! { #item_ty },
+            error_ty: quote! { #error_ty },
+        }));
+    }
     if !type_contains_stream_path(ty) {
         return Ok(None);
     }
@@ -646,6 +652,41 @@ fn stream_return_type(return_type: &ReturnType) -> syn::Result<Option<StreamRetu
         item_ty: quote! { #item_ty },
         error_ty: quote! { #error_ty },
     }))
+}
+
+fn uniffi_stream_alias_args(ty: &Type) -> syn::Result<Option<(&Type, &Type)>> {
+    let Type::Path(path) = strip_grouped_type(ty) else {
+        return Ok(None);
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return Ok(None);
+    };
+    if segment.ident != "UniFfiStream" {
+        return Ok(None);
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "UniFfiStream returns must use UniFfiStream<T, E>",
+        ));
+    };
+    let mut type_args = args.args.iter().filter_map(|arg| match arg {
+        syn::GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    let item_ty = type_args.next().ok_or_else(|| {
+        syn::Error::new_spanned(ty, "UniFfiStream returns must use UniFfiStream<T, E>")
+    })?;
+    let error_ty = type_args.next().ok_or_else(|| {
+        syn::Error::new_spanned(ty, "UniFfiStream returns must use UniFfiStream<T, E>")
+    })?;
+    if type_args.next().is_some() {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "UniFfiStream returns must have exactly two type arguments",
+        ));
+    }
+    Ok(Some((item_ty, error_ty)))
 }
 
 fn strip_grouped_type(ty: &Type) -> &Type {
@@ -772,6 +813,29 @@ mod tests {
         let stream = stream_return_type(&return_type).unwrap().unwrap();
         assert_eq!(stream.item_ty.to_string(), quote! { u32 }.to_string());
         assert_eq!(stream.error_ty.to_string(), quote! { MyError }.to_string());
+    }
+
+    #[test]
+    fn parses_uniffi_stream_return_alias() {
+        let return_type: syn::ReturnType = parse_quote! {
+            -> uniffi::UniFfiStream<u32, MyError>
+        };
+        let stream = stream_return_type(&return_type).unwrap().unwrap();
+        assert_eq!(stream.item_ty.to_string(), quote! { u32 }.to_string());
+        assert_eq!(stream.error_ty.to_string(), quote! { MyError }.to_string());
+    }
+
+    #[test]
+    fn parses_bare_uniffi_stream_return_alias() {
+        let return_type: syn::ReturnType = parse_quote! {
+            -> UniFfiStream<MyRecord, crate::MyError>
+        };
+        let stream = stream_return_type(&return_type).unwrap().unwrap();
+        assert_eq!(stream.item_ty.to_string(), quote! { MyRecord }.to_string());
+        assert_eq!(
+            stream.error_ty.to_string(),
+            quote! { crate :: MyError }.to_string()
+        );
     }
 
     #[test]
