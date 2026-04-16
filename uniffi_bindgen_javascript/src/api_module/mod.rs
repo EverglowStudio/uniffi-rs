@@ -94,7 +94,7 @@ fn render_records(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut has_async = false;
     for record in ci.record_definitions() {
         for field in record.fields() {
-            usage.see(&field.as_type(), UsagePos::Arg, config);
+            usage.see(ci, &field.as_type(), UsagePos::TypeOnly, config);
         }
         for constructor in record.constructors() {
             if constructor.is_async() {
@@ -103,9 +103,9 @@ fn render_records(ci: &ComponentInterface, config: &JsConfig) -> String {
                 has_sync = true;
             }
             for arg in constructor.arguments() {
-                usage.see(&arg.as_type(), UsagePos::Arg, config);
+                usage.see(ci, &arg.as_type(), UsagePos::Arg, config);
             }
-            usage.see(&record.as_type(), UsagePos::Ret, config);
+            usage.see(ci, &record.as_type(), UsagePos::Ret, config);
         }
         for method in record.methods() {
             if method.is_async() {
@@ -113,12 +113,12 @@ fn render_records(ci: &ComponentInterface, config: &JsConfig) -> String {
             } else {
                 has_sync = true;
             }
-            usage.see(&record.as_type(), UsagePos::Arg, config);
+            usage.see(ci, &record.as_type(), UsagePos::Arg, config);
             for arg in method.arguments() {
-                usage.see(&arg.as_type(), UsagePos::Arg, config);
+                usage.see(ci, &arg.as_type(), UsagePos::Arg, config);
             }
             if let Some(ret) = method.return_type() {
-                usage.see(ret, UsagePos::Ret, config);
+                usage.see(ci, ret, UsagePos::Ret, config);
             }
         }
     }
@@ -190,7 +190,7 @@ fn render_enums(ci: &ComponentInterface, config: &JsConfig) -> String {
     {
         for variant in enum_.variants() {
             for field in variant.fields() {
-                usage.see(&field.as_type(), UsagePos::Arg, config);
+                usage.see(ci, &field.as_type(), UsagePos::TypeOnly, config);
             }
         }
         for constructor in enum_.constructors() {
@@ -200,9 +200,9 @@ fn render_enums(ci: &ComponentInterface, config: &JsConfig) -> String {
                 has_sync = true;
             }
             for arg in constructor.arguments() {
-                usage.see(&arg.as_type(), UsagePos::Arg, config);
+                usage.see(ci, &arg.as_type(), UsagePos::Arg, config);
             }
-            usage.see(&enum_.as_type(), UsagePos::Ret, config);
+            usage.see(ci, &enum_.as_type(), UsagePos::Ret, config);
         }
         for method in enum_.methods() {
             if method.is_async() {
@@ -210,12 +210,12 @@ fn render_enums(ci: &ComponentInterface, config: &JsConfig) -> String {
             } else {
                 has_sync = true;
             }
-            usage.see(&enum_.as_type(), UsagePos::Arg, config);
+            usage.see(ci, &enum_.as_type(), UsagePos::Arg, config);
             for arg in method.arguments() {
-                usage.see(&arg.as_type(), UsagePos::Arg, config);
+                usage.see(ci, &arg.as_type(), UsagePos::Arg, config);
             }
             if let Some(ret) = method.return_type() {
-                usage.see(ret, UsagePos::Ret, config);
+                usage.see(ci, ret, UsagePos::Ret, config);
             }
         }
     }
@@ -638,22 +638,22 @@ fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
     {
         for method in obj.methods() {
             for arg in method.arguments() {
-                usage.see(&arg.as_type(), UsagePos::Arg, config);
+                usage.see(ci, &arg.as_type(), UsagePos::Arg, config);
             }
             if let Some(ret) = method.return_type() {
                 needs_callback_return_unwrap |= needs_object_callback_return_unwrap(ret);
-                usage.see(ret, UsagePos::Ret, config);
+                usage.see(ci, ret, UsagePos::Ret, config);
             }
         }
     }
     for callback in ci.callback_interface_definitions() {
         for method in callback.methods() {
             for arg in method.arguments() {
-                usage.see(&arg.as_type(), UsagePos::Arg, config);
+                usage.see(ci, &arg.as_type(), UsagePos::Arg, config);
             }
             if let Some(ret) = method.return_type() {
                 needs_callback_return_unwrap |= needs_object_callback_return_unwrap(ret);
-                usage.see(ret, UsagePos::Ret, config);
+                usage.see(ci, ret, UsagePos::Ret, config);
             }
         }
     }
@@ -891,7 +891,7 @@ fn render_objects(ci: &ComponentInterface, config: &JsConfig) -> String {
                 has_sync = true;
             }
             for a in c.arguments() {
-                usage.see(&a.as_type(), UsagePos::Arg, config);
+                usage.see(ci, &a.as_type(), UsagePos::Arg, config);
             }
         }
         for m in obj.methods() {
@@ -901,10 +901,10 @@ fn render_objects(ci: &ComponentInterface, config: &JsConfig) -> String {
                 has_sync = true;
             }
             for a in m.arguments() {
-                usage.see(&a.as_type(), UsagePos::Arg, config);
+                usage.see(ci, &a.as_type(), UsagePos::Arg, config);
             }
             if let Some(t) = m.return_type() {
-                usage.see(t, UsagePos::Ret, config);
+                usage.see(ci, t, UsagePos::Ret, config);
             }
         }
     }
@@ -1151,10 +1151,10 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
             has_sync = true;
         }
         for a in f.arguments() {
-            usage.see(&a.as_type(), UsagePos::Arg, config);
+            usage.see(ci, &a.as_type(), UsagePos::Arg, config);
         }
         if let Some(t) = f.return_type() {
-            usage.see(t, UsagePos::Ret, config);
+            usage.see(ci, t, UsagePos::Ret, config);
         }
     }
 
@@ -1762,6 +1762,7 @@ fn call_generic(ty: Option<&Type>) -> &'static str {
 enum UsagePos {
     Arg,
     Ret,
+    TypeOnly,
 }
 
 /// Scan over the types referenced by a set of function-like signatures
@@ -1781,10 +1782,11 @@ struct Usage {
     /// emits `{Name}.__fromHandle(...)`.
     objects_in_ret: BTreeSet<String>,
     customs: BTreeSet<String>,
+    seen_arg_payloads: BTreeSet<String>,
 }
 
 impl Usage {
-    fn see(&mut self, ty: &Type, pos: UsagePos, config: &JsConfig) {
+    fn see(&mut self, ci: &ComponentInterface, ty: &Type, pos: UsagePos, config: &JsConfig) {
         match ty {
             Type::Int64 => {
                 if matches!(pos, UsagePos::Arg) {
@@ -1816,26 +1818,29 @@ impl Usage {
             }
             Type::Record { name, .. } | Type::Enum { name, .. } => {
                 self.named.insert(name.clone());
+                if matches!(pos, UsagePos::Arg) {
+                    self.see_named_payloads(ci, name, config);
+                }
             }
             Type::Custom { name, builtin, .. } => {
                 if config.custom_type(name).is_some() {
                     self.customs.insert(name.clone());
                 }
-                self.see(builtin, pos, config);
+                self.see(ci, builtin, pos, config);
             }
             Type::Optional { inner_type } | Type::Sequence { inner_type } => {
-                self.see(inner_type, pos, config)
+                self.see(ci, inner_type, pos, config)
             }
             Type::Map {
                 key_type,
                 value_type,
             } => {
-                self.see(key_type, pos, config);
-                self.see(value_type, pos, config);
+                self.see(ci, key_type, pos, config);
+                self.see(ci, value_type, pos, config);
             }
             Type::Stream { item_type, .. } => {
                 self.needs_stream = true;
-                self.see(item_type, pos, config);
+                self.see(ci, item_type, pos, config);
             }
             Type::InputStream {
                 item_type,
@@ -1843,8 +1848,77 @@ impl Usage {
                 ..
             } => {
                 self.needs_input_stream = true;
-                self.see(item_type, pos, config);
-                self.see(error_type, pos, config);
+                self.see(ci, item_type, pos, config);
+                self.see(ci, error_type, pos, config);
+            }
+            _ => {}
+        }
+    }
+
+    fn see_named_payloads(&mut self, ci: &ComponentInterface, name: &str, config: &JsConfig) {
+        if !self.seen_arg_payloads.insert(name.to_string()) {
+            return;
+        }
+
+        if let Some(record) = ci
+            .record_definitions()
+            .iter()
+            .find(|record| record.name() == name)
+        {
+            for field in record.fields() {
+                self.see_lower_helpers(ci, &field.as_type(), config);
+            }
+            return;
+        }
+
+        if let Some(enum_) = ci
+            .enum_definitions()
+            .iter()
+            .find(|enum_| enum_.name() == name)
+        {
+            for variant in enum_.variants() {
+                for field in variant.fields() {
+                    self.see_lower_helpers(ci, &field.as_type(), config);
+                }
+            }
+        }
+    }
+
+    fn see_lower_helpers(&mut self, ci: &ComponentInterface, ty: &Type, config: &JsConfig) {
+        match ty {
+            Type::Int64 => self.needs_to_i64 = true,
+            Type::UInt64 => self.needs_to_u64 = true,
+            Type::Custom { name, builtin, .. } => {
+                if config.custom_type(name).is_some() {
+                    self.customs.insert(name.clone());
+                }
+                self.see_lower_helpers(ci, builtin, config);
+            }
+            Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+                self.see_lower_helpers(ci, inner_type, config)
+            }
+            Type::Map {
+                key_type,
+                value_type,
+            } => {
+                self.see_lower_helpers(ci, key_type, config);
+                self.see_lower_helpers(ci, value_type, config);
+            }
+            Type::Record { name, .. } | Type::Enum { name, .. } => {
+                self.see_named_payloads(ci, name, config);
+            }
+            Type::Stream { item_type, .. } => {
+                self.needs_stream = true;
+                self.see_lower_helpers(ci, item_type, config);
+            }
+            Type::InputStream {
+                item_type,
+                error_type,
+                ..
+            } => {
+                self.needs_input_stream = true;
+                self.see_lower_helpers(ci, item_type, config);
+                self.see_lower_helpers(ci, error_type, config);
             }
             _ => {}
         }
