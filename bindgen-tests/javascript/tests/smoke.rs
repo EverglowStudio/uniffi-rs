@@ -490,14 +490,15 @@ fn api_ts_has_explicit_imports_and_strict_safe_calls() {
     // Minimal UDL crate. Deliberately includes:
     // - `dictionary Shape` (record) used in a free-function signature
     // - `enum Event` (non-error enum) — the name collides with DOM global
-    // - `dictionary GreetOptions` (record) used as an arg
+    // - `dictionary GreetOptions` (record) used as an arg, with nested i64
+    //   lowering that must import toI64 in common/api.ts, not records.ts
     // - `callback interface Logger` used as an arg
     // - a free function returning i64 (to exercise bigint return flow)
     let biz = root.join("biz");
     std::fs::create_dir_all(biz.join("src")).unwrap();
     let udl = r#"
 dictionary Shape { string label; u32 sides; };
-dictionary GreetOptions { string prefix; boolean loud; };
+dictionary GreetOptions { string prefix; boolean loud; sequence<i64> dims; };
 enum Event { "Start", "Tick", "Stop" };
 callback interface Logger { void log(string msg); };
 
@@ -575,14 +576,33 @@ crate-type = ["rlib"]
         "common/api.ts expected a `__call<bigint>` on the i64 return path, got:\n{api}"
     );
 
-    // 3. No unused runtime imports. This fixture does not touch u64
-    //    args, so `toU64` must not be imported. `fromI64`/`fromU64` are
-    //    also not used any more (bigint-first contract).
     let import_block: String = api
         .lines()
         .filter(|l| l.starts_with("import ") && l.contains("./runtime.ts"))
         .collect::<Vec<_>>()
         .join("\n");
+
+    // 3. Nested i64 fields in a record argument must be lowered by api.ts,
+    //    because record declarations are just TypeScript interfaces.
+    assert!(
+        import_block.contains("toI64"),
+        "common/api.ts should import toI64 for nested i64 fields in record args:\n{import_block}\n\n{api}"
+    );
+
+    let records = std::fs::read_to_string(gen_dir.join("common/records.ts")).unwrap();
+    let records_runtime_imports: String = records
+        .lines()
+        .filter(|l| l.starts_with("import ") && l.contains("./runtime.ts"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !records_runtime_imports.contains("toI64"),
+        "common/records.ts must not import toI64 for plain interface fields:\n{records_runtime_imports}\n\n{records}"
+    );
+
+    // 4. No unused runtime imports. This fixture does not touch u64
+    //    args, so `toU64` must not be imported. `fromI64`/`fromU64` are
+    //    also not used any more (bigint-first contract).
     for unused in ["toU64", "fromU64", "fromI64"] {
         assert!(
             !import_block.contains(unused),
@@ -603,7 +623,7 @@ crate-type = ["rlib"]
         "common/api.ts should lower callback-trait args as tagged marker:\n{api_body}"
     );
 
-    // 4. `common/objects.ts` must not carry a dangling runtime import
+    // 5. `common/objects.ts` must not carry a dangling runtime import
     //    when there are no non-callback-trait objects at all.
     let objects = std::fs::read_to_string(gen_dir.join("common/objects.ts")).unwrap();
     assert!(
@@ -611,7 +631,7 @@ crate-type = ["rlib"]
         "common/objects.ts has unused runtime import (no objects in this fixture):\n{objects}"
     );
 
-    // 5. Optional: if tsc is available, actually compile in strict
+    // 6. Optional: if tsc is available, actually compile in strict
     //    mode. This is the real guardrail — the string assertions
     //    above are only a faster early signal.
     if let Some(tsc) = which_tool("tsc") {
