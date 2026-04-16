@@ -1841,6 +1841,7 @@ dependencies = [
  "flate2",
  "serde_json",
  "tar",
+ "tokio",
  "trybuild",
  "uniffi_bindgen",
  "uniffi_bindgen_javascript",

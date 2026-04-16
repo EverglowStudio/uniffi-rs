@@ -25,8 +25,9 @@ default = []
 # Printout tracing information on FFI calls.  Useful for debugging issues with the bindings code.
 ffi-trace = []
 
-# Enable support for Tokio's futures.
-# This must still be opted into on a per-function basis using `#[uniffi::export(async_runtime = "tokio")]`.
+# Enable support for Tokio-backed futures, including stream next() futures.
+# Async exports still opt into Tokio through generated scaffolding or the
+# `uniffi/default-async-runtime-tokio` convenience feature.
 tokio = ["dep:async-compat"]
 
 # Enable support for the ffi buffer scaffolding functions
