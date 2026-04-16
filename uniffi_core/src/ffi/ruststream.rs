@@ -224,6 +224,8 @@ where
         handle: handle.as_raw(),
         inner: stream.map(RustStream::begin_next),
     };
+    #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+    let future = async_compat::Compat::new(future);
     rust_future_new(future, tag)
 }
 
