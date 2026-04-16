@@ -1256,15 +1256,15 @@ fn pretty_type_def(def: &TypeDefLine, ambient: bool) -> String {
         "string_enum" => {
             let values = def
                 .def
-                .split_once('=')
-                .map(|(_, rhs)| {
-                    rhs.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                })
-                .unwrap_or_else(|| def.def.clone());
+                .split(',')
+                .filter_map(|entry| entry.split_once('=').map(|(_, rhs)| rhs.trim()))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+            let values = if values.is_empty() {
+                def.def.clone()
+            } else {
+                values.join(" | ")
+            };
             out.push_str(&format!("export type {} = {};", def.name, values));
         }
         "type" => out.push_str(&format!("export type {} = \n{}", def.name, def.def)),
@@ -1534,6 +1534,16 @@ mod tests {
         let rendered = render_index_d_ts(vec![def]);
         assert!(rendered.contains("export declare function add(a: number): number;"));
         assert!(!rendered.contains("typeof import"));
+    }
+
+    #[test]
+    fn renders_ohos_string_enum_as_literal_union() {
+        let json = r#"type_def:{"kind":"string_enum","name":"LocalAiBackend","def":"Auto = 'Auto',\n Onnx = 'Onnx',\n Mlx = 'Mlx'","js_doc":null,"js_mod":null}"#;
+        let def = parse_type_def_line(json).unwrap().unwrap();
+        let rendered = render_index_d_ts(vec![def]);
+
+        assert!(rendered.contains("export type LocalAiBackend = 'Auto' | 'Onnx' | 'Mlx';"));
+        assert!(!rendered.contains("Onnx ="));
     }
 
     #[test]

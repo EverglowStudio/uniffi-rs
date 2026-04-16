@@ -6964,6 +6964,7 @@ fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
          pub fn current_job_state() -> JobState { JobState::Idle }\n\
          pub fn latest_event() -> Event { Event::Started }\n\
          pub async fn slow_add(a: u32, b: u32, _delay_ms: u64) -> u32 { a + b }\n\
+         pub async fn async_counter_value(counter: Arc<Counter>) -> i64 { counter.get() }\n\
          pub fn roundtrip_u64(a: u64) -> u64 { a }\n\
          pub fn roundtrip_i64(a: i64) -> i64 { a }\n\
          pub async fn async_roundtrip_u64(a: u64) -> u64 { a }\n\
@@ -6992,6 +6993,8 @@ fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
          \x20   Event latest_event();\n\
          \x20   [Async]\n\
          \x20   u32 slow_add(u32 a, u32 b, u64 delay_ms);\n\
+         \x20   [Async]\n\
+         \x20   i64 async_counter_value(Counter counter);\n\
          \x20   u64 roundtrip_u64(u64 a);\n\
          \x20   i64 roundtrip_i64(i64 a);\n\
          \x20   [Async]\n\
@@ -8354,6 +8357,15 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
     assert!(
         bridge.contains("napi::bindgen_prelude::BigInt"),
         "rich fixture should use napi::BigInt for u64/i64, got:\n{bridge}"
+    );
+    assert!(
+        bridge.contains("pub fn async_counter_value(")
+            && bridge.contains("__uniffi_env: Env,")
+            && bridge.contains("counter: ClassInstance<'_, Counter>,")
+            && bridge.contains("Result<PromiseRaw<'static, napi::bindgen_prelude::BigInt>>")
+            && bridge.contains("let __uniffi_counter = (*(counter)).0.clone();")
+            && bridge.contains(".spawn_future(async move"),
+        "async function with object args should lower ClassInstance before spawning a Promise:\n{bridge}"
     );
 
     let manifest = host_dir.join("napi/Cargo.toml");

@@ -1884,14 +1884,14 @@ impl<'a> Generator<'a> {
         if method.is_async() {
             Ok(quote! {
                 #[napi]
-                pub async fn #fn_ident(#receiver_ident: ClassInstance<#object_ident>, #(#args),*) -> Result<#output_ty> {
+                pub async fn #fn_ident(#receiver_ident: ClassInstance<'_, #object_ident>, #(#args),*) -> Result<#output_ty> {
                     #body
                 }
             })
         } else {
             Ok(quote! {
                 #[napi]
-                pub fn #fn_ident(#receiver_ident: ClassInstance<#object_ident>, #(#args),*) -> Result<#output_ty> {
+                pub fn #fn_ident(#receiver_ident: ClassInstance<'_, #object_ident>, #(#args),*) -> Result<#output_ty> {
                     #body
                 }
             })
@@ -2063,6 +2063,15 @@ impl<'a> Generator<'a> {
                 self.lower_arg_expr(arg_ident, &arg.as_type())
             })
             .collect::<Result<Vec<_>>>()?;
+        let has_class_instance_arg = function.arguments().into_iter().any(|arg| {
+            matches!(
+                arg.as_type(),
+                Type::Object {
+                    imp: ObjectImpl::Struct | ObjectImpl::Trait,
+                    ..
+                }
+            )
+        });
         let call = quote!(#fn_path(#(#lowered),*));
         let call = if function.is_async() {
             quote!(#call.await)
@@ -2076,12 +2085,49 @@ impl<'a> Generator<'a> {
         let body = self.render_result_body(call, function.return_type(), function.throws_type())?;
 
         if function.is_async() {
-            Ok(quote! {
-                #[napi]
-                pub async fn #fn_ident(#(#args),*) -> Result<#output_ty> {
-                    #body
-                }
-            })
+            if has_class_instance_arg {
+                let lowered_bindings = function
+                    .arguments()
+                    .into_iter()
+                    .map(|arg| {
+                        let arg_ident = rust_ident(arg.name());
+                        let lowered_ident = rust_ident(&format!("__uniffi_{}", arg.name()));
+                        let lowered_expr = self.lower_arg_expr(arg_ident, &arg.as_type())?;
+                        Ok(quote!(let #lowered_ident = #lowered_expr;))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let lowered_args = function
+                    .arguments()
+                    .into_iter()
+                    .map(|arg| rust_ident(&format!("__uniffi_{}", arg.name())))
+                    .collect::<Vec<_>>();
+                let call = quote!(#fn_path(#(#lowered_args),*).await);
+                let body =
+                    self.render_result_body(call, function.return_type(), function.throws_type())?;
+                Ok(quote! {
+                    #[napi]
+                    pub fn #fn_ident(__uniffi_env: Env, #(#args),*) -> Result<PromiseRaw<'static, #output_ty>> {
+                        #(#lowered_bindings)*
+                        let __uniffi_promise = __uniffi_env.spawn_future(async move {
+                            #body
+                        })?;
+                        Ok(unsafe {
+                            // The raw JS promise is returned immediately; the lifetime only
+                            // ties PromiseRaw to the Env used to create it.
+                            std::mem::transmute::<PromiseRaw<'_, #output_ty>, PromiseRaw<'static, #output_ty>>(
+                                __uniffi_promise,
+                            )
+                        })
+                    }
+                })
+            } else {
+                Ok(quote! {
+                    #[napi]
+                    pub async fn #fn_ident(#(#args),*) -> Result<#output_ty> {
+                        #body
+                    }
+                })
+            }
         } else {
             Ok(quote! {
                 #[napi]
@@ -2213,7 +2259,7 @@ impl<'a> Generator<'a> {
             Type::Object { name, imp, .. } => {
                 let ident = rust_ident(name);
                 match imp {
-                    ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!(ClassInstance<#ident>)),
+                    ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!(ClassInstance<'_, #ident>)),
                     ObjectImpl::CallbackTrait => Ok(quote!(#ident)),
                 }
             }
