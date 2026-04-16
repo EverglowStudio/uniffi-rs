@@ -84,6 +84,29 @@ impl Stream for PendingStream {
     }
 }
 
+#[cfg(feature = "tokio")]
+struct TokioProbeStream {
+    yielded: bool,
+}
+
+#[cfg(feature = "tokio")]
+impl Stream for TokioProbeStream {
+    type Item = Result<StreamEvent, StreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        assert!(
+            tokio::runtime::Handle::try_current().is_ok(),
+            "stream next was polled outside a Tokio runtime"
+        );
+        if self.yielded {
+            Poll::Ready(None)
+        } else {
+            self.yielded = true;
+            Poll::Ready(Some(Ok(StreamEvent { value: 42 })))
+        }
+    }
+}
+
 struct RunningSumStream {
     events: uniffi::UniFfiInputStream<StreamEvent, StreamError>,
     sum: u32,
@@ -135,6 +158,12 @@ pub fn error_after_one(
 pub fn pending_events(
 ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamError>> + Send + 'static>> {
     Box::pin(PendingStream)
+}
+
+#[cfg(feature = "tokio")]
+#[uniffi::export]
+pub fn tokio_probe_events() -> uniffi::UniFfiStream<StreamEvent, StreamError> {
+    Box::pin(TokioProbeStream { yielded: false })
 }
 
 #[uniffi::export]
@@ -195,6 +224,12 @@ fn next_error_after_one(
 
 fn next_alias(handle: uniffi::Handle) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
     let future = uniffi_uniffi_fn_func_count_events_alias_stream_next(handle);
+    complete_next_future(future)
+}
+
+#[cfg(feature = "tokio")]
+fn next_tokio_probe(handle: uniffi::Handle) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
+    let future = uniffi_uniffi_fn_func_tokio_probe_events_stream_next(handle);
     complete_next_future(future)
 }
 
@@ -386,6 +421,26 @@ fn stream_next_lowers_errors_through_fallible_path() {
     );
     assert_eq!(
         next_error_after_one(handle),
+        (uniffi::RustCallStatusCode::Success, None)
+    );
+}
+
+#[cfg(feature = "tokio")]
+#[test]
+fn stream_next_enters_tokio_runtime_when_tokio_feature_is_enabled() {
+    let mut status = uniffi::RustCallStatus::default();
+    let handle = uniffi_uniffi_fn_func_tokio_probe_events(&mut status);
+    assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
+
+    assert_eq!(
+        next_tokio_probe(handle.clone()),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(StreamEvent { value: 42 })
+        )
+    );
+    assert_eq!(
+        next_tokio_probe(handle),
         (uniffi::RustCallStatusCode::Success, None)
     );
 }
