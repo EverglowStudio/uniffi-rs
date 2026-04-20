@@ -330,6 +330,10 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "target-dir")]
     pub(crate) target_dir: Option<Utf8PathBuf>,
 
+    /// Cargo features enabled on the downstream core crate. May be repeated or comma-separated.
+    #[clap(long = "cargo-feature", value_delimiter = ',')]
+    pub(crate) cargo_features: Vec<String>,
+
     /// Copy static `.a` libraries in addition to shared `.so` artifacts.
     #[clap(long = "static")]
     pub(crate) copy_static: bool,
@@ -729,6 +733,7 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
 
     let mut build_core =
         cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
+    add_cargo_feature_args(&mut build_core, &args.cargo_features);
     run_command(
         &args.cargo_bin,
         &mut build_core,
@@ -798,6 +803,9 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         .clone()
         .or_else(|| args.artifact_dir.as_ref().map(|dir| dir.join("ohos/dist")))
         .unwrap_or_else(|| ohos_dir.join("dist"));
+    let mut ohos_cargo_args =
+        dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+    ohos_cargo_args.extend(args.cargo_args);
     super::ohos::build(super::ohos::BuildOptions {
         cargo_bin: args.cargo_bin.clone(),
         manifest_path: ohos_manifest,
@@ -808,7 +816,7 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         arches,
         target_dir: args.target_dir.clone(),
         release: args.release,
-        cargo_args: args.cargo_args,
+        cargo_args: ohos_cargo_args,
         copy_static: args.copy_static,
         skip_libs: args.skip_libs,
         dts_cache: args.dts_cache,
@@ -821,6 +829,57 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+fn add_cargo_feature_args(command: &mut Command, features: &[String]) {
+    if !features.is_empty() {
+        command.arg("--features").arg(features.join(","));
+    }
+}
+
+fn dependency_cargo_feature_args(package_name: &str, features: &[String]) -> Vec<String> {
+    if features.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            "--features".to_string(),
+            features
+                .iter()
+                .map(|feature| format!("{package_name}/{feature}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dependency_cargo_feature_args;
+
+    #[test]
+    fn ohos_dependency_feature_args_are_package_qualified() {
+        let args = dependency_cargo_feature_args(
+            "uni-core",
+            &[
+                "local-llm".to_string(),
+                "local-llm-vision".to_string(),
+                "local-llm-audio".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--features".to_string(),
+                "uni-core/local-llm,uni-core/local-llm-vision,uni-core/local-llm-audio".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ohos_dependency_feature_args_are_empty_without_features() {
+        assert!(dependency_cargo_feature_args("uni-core", &[]).is_empty());
+    }
 }
 
 fn run_wasm_bindgen_in_process(
@@ -1352,6 +1411,7 @@ fn relative_path_from_dir(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {
 
 struct CargoPackageMetadata {
     target_directory: Utf8PathBuf,
+    package_name: String,
     lib_target_name: String,
 }
 
@@ -1398,6 +1458,7 @@ fn cargo_package_metadata(manifest_path: &Utf8Path) -> Result<CargoPackageMetada
             metadata.target_directory.clone().into_std_path_buf(),
         )
         .map_err(|p| anyhow::anyhow!("cargo metadata target dir is not utf8: {}", p.display()))?,
+        package_name: package.name.to_string(),
         lib_target_name: lib_target.name.clone(),
     })
 }
