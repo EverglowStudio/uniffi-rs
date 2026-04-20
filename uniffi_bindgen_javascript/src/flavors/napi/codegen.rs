@@ -2378,10 +2378,13 @@ impl<'a> Generator<'a> {
                 }
                 __val
             })),
-            Type::Int64 => {
-                let lowered = self.lower_value_expr(quote!(#ident), &Type::Int64)?;
-                Ok(lowered)
-            }
+            Type::Int64 => Ok(quote!({
+                let (__val, __lossless) = #ident.get_i64();
+                if !__lossless {
+                    return Err(napi::Error::new(napi::Status::InvalidArg, "BigInt value does not fit into i64"));
+                }
+                __val
+            })),
             Type::Object { imp, .. } => match imp {
                 ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!((*(#ident)).0.clone())),
                 ObjectImpl::CallbackTrait => {
@@ -2424,10 +2427,10 @@ impl<'a> Generator<'a> {
                 let __big = #expr;
                 let (__sign, __val, __lossless) = __big.get_u64();
                 if __sign && __val != 0 {
-                    return Err(napi::Error::new(napi::Status::InvalidArg, "negative value cannot be converted to u64"));
+                    panic!("negative BigInt value cannot be converted to u64");
                 }
                 if !__lossless {
-                    return Err(napi::Error::new(napi::Status::InvalidArg, "BigInt value does not fit into u64"));
+                    panic!("BigInt value does not fit into u64");
                 }
                 __val
             })),
@@ -2436,7 +2439,7 @@ impl<'a> Generator<'a> {
                 let __big = #expr;
                 let (__val, __lossless) = __big.get_i64();
                 if !__lossless {
-                    return Err(napi::Error::new(napi::Status::InvalidArg, "BigInt value does not fit into i64"));
+                    panic!("BigInt value does not fit into i64");
                 }
                 __val
             })),

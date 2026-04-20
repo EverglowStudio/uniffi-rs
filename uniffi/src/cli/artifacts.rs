@@ -69,7 +69,7 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     release: bool,
 
-    /// Cargo features enabled when building native Apple/Android core artifacts. May be repeated or comma-separated.
+    /// Cargo features enabled when building native Apple/Android/Harmony core artifacts. May be repeated or comma-separated.
     #[clap(long = "cargo-feature", value_delimiter = ',')]
     cargo_features: Vec<String>,
 
@@ -1121,6 +1121,7 @@ impl BuildArgs {
             arch: self.ohos_arch.clone(),
             cargo_bin: self.cargo_bin.clone(),
             target_dir: self.ohos_target_dir.clone(),
+            cargo_features: self.cargo_features.clone(),
             release: self.release,
             copy_static: self.ohos_static,
             skip_libs: self.ohos_skip_libs,
