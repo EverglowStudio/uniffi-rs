@@ -675,10 +675,12 @@ fn build_arch(
         .join(arch.rust_target())
         .join(profile)
         .join(native_lib_filename(&package.lib_target_name));
+    let arch_dist = dist_dir.join(arch.dist_dir());
     copy_artifacts(
         &filter_artifacts(artifacts, options.copy_static, Some(expected)),
-        &dist_dir.join(arch.dist_dir()),
-    )
+        &arch_dist,
+    )?;
+    copy_ohos_cxx_shared(ohos_ndk, arch, &arch_dist)
 }
 
 fn cargo_args_for_arch(
@@ -858,6 +860,36 @@ fn copy_artifacts(artifacts: &BuiltArtifacts, arch_dist: &Utf8Path) -> Result<()
         std::fs::copy(artifact, arch_dist.join(file_name))
             .with_context(|| format!("copying OHOS artifact {artifact}"))?;
     }
+    Ok(())
+}
+
+fn ohos_cxx_shared_candidates(ohos_ndk: &str, arch: Arch) -> Vec<Utf8PathBuf> {
+    let lib_dir = Utf8Path::new(ohos_ndk)
+        .join("native")
+        .join("llvm")
+        .join("lib")
+        .join(arch.c_target());
+    vec![
+        lib_dir.join("libc++_shared.so"),
+        lib_dir.join("c++").join("libc++_shared.so"),
+    ]
+}
+
+fn copy_ohos_cxx_shared(ohos_ndk: &str, arch: Arch, arch_dist: &Utf8Path) -> Result<()> {
+    let Some(source) = ohos_cxx_shared_candidates(ohos_ndk, arch)
+        .into_iter()
+        .find(|path| path.exists())
+    else {
+        bail!(
+            "OHOS libc++_shared.so not found for {}; expected it under {}/native/llvm/lib/{}",
+            arch.c_target(),
+            ohos_ndk,
+            arch.c_target()
+        );
+    };
+    let dest = arch_dist.join("libc++_shared.so");
+    std::fs::copy(&source, &dest)
+        .with_context(|| format!("copying OHOS C++ runtime {source} -> {dest}"))?;
     Ok(())
 }
 
@@ -1601,6 +1633,29 @@ mod tests {
         assert!(libs.join("arm64-v8a/libuni_core_ohos.so").exists());
         assert!(libs.join("x86_64/libuni_core_ohos.so").exists());
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn copies_ohos_cxx_runtime_next_to_native_libs() {
+        let root = temp_test_dir("uniffi-ohos-copy-cxx-runtime");
+        let ndk = root.join("ndk");
+        let source_dir = ndk
+            .join("native")
+            .join("llvm")
+            .join("lib")
+            .join("aarch64-linux-ohos");
+        let arch_dist = root.join("dist").join("arm64-v8a");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&arch_dist).unwrap();
+        std::fs::write(source_dir.join("libc++_shared.so"), "cxx").unwrap();
+
+        copy_ohos_cxx_shared(ndk.as_str(), Arch::Arm64, &arch_dist).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(arch_dist.join("libc++_shared.so")).unwrap(),
+            "cxx"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
