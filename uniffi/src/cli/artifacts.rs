@@ -69,6 +69,10 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     release: bool,
 
+    /// Cargo features enabled when building native Apple/Android core artifacts. May be repeated or comma-separated.
+    #[clap(long = "cargo-feature", value_delimiter = ',')]
+    cargo_features: Vec<String>,
+
     /// Override the `cargo` binary to invoke.
     #[clap(long = "cargo-bin", default_value = "cargo")]
     cargo_bin: String,
@@ -778,6 +782,7 @@ fn build_android(args: &BuildArgs) -> Result<()> {
     if args.release {
         host_build.arg("--release");
     }
+    add_cargo_feature_args(&mut host_build, args);
     run_command(&args.cargo_bin, &mut host_build, "cargo")?;
 
     for abi in &abis {
@@ -804,6 +809,7 @@ fn build_android(args: &BuildArgs) -> Result<()> {
         if args.release {
             cargo.arg("--release");
         }
+        add_cargo_feature_args(&mut cargo, args);
         run_command(&args.cargo_bin, &mut cargo, "cargo")?;
 
         let lib = android_sharedlib_path(&meta, abi.rust_target, profile);
@@ -885,6 +891,7 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
     if args.release {
         host_build.arg("--release");
     }
+    add_cargo_feature_args(&mut host_build, args);
     run_command(&args.cargo_bin, &mut host_build, "cargo")?;
 
     for target in &targets {
@@ -899,9 +906,11 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
             .arg(args.manifest_path.as_str())
             .arg("--target")
             .arg(target);
+        add_apple_deployment_env(&mut cargo, target);
         if args.release {
             cargo.arg("--release");
         }
+        add_cargo_feature_args(&mut cargo, args);
         run_command(&args.cargo_bin, &mut cargo, "cargo")?;
     }
 
@@ -974,6 +983,12 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn add_cargo_feature_args(command: &mut Command, args: &BuildArgs) {
+    if !args.cargo_features.is_empty() {
+        command.arg("--features").arg(args.cargo_features.join(","));
+    }
 }
 
 fn expand_targets(targets: &[ArtifactTargetArg]) -> Result<ExpandedTargets> {
@@ -1133,6 +1148,19 @@ fn apple_targets(args: &BuildArgs) -> Vec<String> {
         ]
     } else {
         args.apple_target.clone()
+    }
+}
+
+fn add_apple_deployment_env(command: &mut Command, target: &str) {
+    if target.contains("apple-ios-sim") {
+        let value = std::env::var("IPHONESIMULATOR_DEPLOYMENT_TARGET")
+            .or_else(|_| std::env::var("IPHONEOS_DEPLOYMENT_TARGET"))
+            .unwrap_or_else(|_| "16.0".to_string());
+        command.env("IPHONESIMULATOR_DEPLOYMENT_TARGET", value);
+    } else if target.contains("apple-ios") {
+        let value =
+            std::env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "16.0".to_string());
+        command.env("IPHONEOS_DEPLOYMENT_TARGET", value);
     }
 }
 
@@ -1596,6 +1624,7 @@ mod tests {
             managed_layout: false,
             package_dir: None,
             release: false,
+            cargo_features: Vec::new(),
             cargo_bin: "cargo".to_string(),
             no_format: false,
             config: None,
