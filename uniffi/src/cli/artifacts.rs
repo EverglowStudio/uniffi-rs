@@ -12,6 +12,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::MetadataCommand;
 use clap::{Args, Subcommand, ValueEnum};
 use std::io::{Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::process::Command;
 use uniffi_bindgen::bindings::{generate, GenerateOptions, TargetLanguage};
 
@@ -928,6 +930,7 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
     let targets = apple_targets(args);
     let meta = cargo_package_metadata(&args.manifest_path)?;
     let profile = if args.release { "release" } else { "debug" };
+    let framework_name = apple_binary_target_name(&meta);
 
     let mut host_build = Command::new(&args.cargo_bin);
     host_build
@@ -999,22 +1002,50 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating XCFramework parent dir {parent}"))?;
     }
+    let framework_build_root = xcframework_out
+        .parent()
+        .unwrap_or_else(|| Utf8Path::new("."))
+        .join(".framework-build");
+    if framework_build_root.exists() {
+        std::fs::remove_dir_all(&framework_build_root)
+            .with_context(|| format!("removing stale framework build dir {framework_build_root}"))?;
+    }
+    std::fs::create_dir_all(&framework_build_root)
+        .with_context(|| format!("creating framework build dir {framework_build_root}"))?;
     if xcframework_out.exists() {
         std::fs::remove_dir_all(&xcframework_out)
             .with_context(|| format!("removing stale XCFramework {xcframework_out}"))?;
     }
 
-    let libs: Vec<_> = targets
+    let metallibs_required = targets
         .iter()
-        .map(|target| apple_staticlib_path(&meta, target, profile))
-        .collect();
+        .map(|target| apple_metallib_path(&meta, target, profile).exists())
+        .any(|exists| exists);
+    let frameworks: Vec<_> = targets
+        .iter()
+        .map(|target| {
+            stage_apple_framework_slice(
+                &meta,
+                target,
+                profile,
+                &headers_dir,
+                &framework_build_root,
+                &framework_name,
+                metallibs_required,
+            )
+        })
+        .collect::<Result<_>>()?;
     let mut xcodebuild = Command::new("xcodebuild");
     xcodebuild.args(xcodebuild_create_xcframework_args(
-        &libs,
-        &headers_dir,
+        &frameworks,
         &xcframework_out,
     ));
-    run_command("xcodebuild", &mut xcodebuild, "xcodebuild")?;
+    let build_result = run_command("xcodebuild", &mut xcodebuild, "xcodebuild");
+    if framework_build_root.exists() {
+        std::fs::remove_dir_all(&framework_build_root)
+            .with_context(|| format!("cleaning framework build dir {framework_build_root}"))?;
+    }
+    build_result?;
 
     if let Some(expected_name) = &args.apple_framework_name {
         let actual = xcframework_out
@@ -1029,6 +1060,49 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn stage_apple_framework_slice(
+    meta: &CargoPackageMetadata,
+    target: &str,
+    profile: &str,
+    headers_dir: &Utf8Path,
+    framework_build_root: &Utf8Path,
+    framework_name: &str,
+    metallibs_required: bool,
+) -> Result<Utf8PathBuf> {
+    let slice = apple_slice_name(target)?;
+    let framework_dir = framework_build_root.join(slice).join(format!("{framework_name}.framework"));
+    if framework_dir.exists() {
+        std::fs::remove_dir_all(&framework_dir)
+            .with_context(|| format!("removing stale framework dir {framework_dir}"))?;
+    }
+
+    let dylib_src = apple_cdylib_path(meta, target, profile);
+    if !dylib_src.exists() {
+        bail!("expected staged Apple dylib for {target} at {dylib_src}");
+    }
+
+    let metallib_src = apple_metallib_path(meta, target, profile);
+    if metallibs_required && !metallib_src.exists() {
+        bail!("expected staged mlx.metallib for {target} at {metallib_src}");
+    }
+
+    let (framework_bin, info_plist, metallib_dest) =
+        create_apple_framework_layout(target, &framework_dir, framework_name)?;
+    std::fs::copy(&dylib_src, &framework_bin)
+        .with_context(|| format!("copying Apple dylib {dylib_src} into {framework_bin}"))?;
+    rewrite_apple_framework_install_name(target, framework_name, &framework_bin)?;
+    if metallib_src.exists() {
+        let metallib_dest = metallib_dest.expect("metallib destination present");
+        std::fs::copy(&metallib_src, &metallib_dest).with_context(|| {
+            format!("copying Apple metallib {metallib_src} into framework slice {metallib_dest}")
+        })?;
+    }
+    copy_apple_framework_headers(headers_dir, &framework_dir, framework_name)?;
+    write_apple_framework_info_plist(target, framework_name, &info_plist)?;
+
+    Ok(framework_dir)
 }
 
 fn add_cargo_feature_args(command: &mut Command, args: &BuildArgs) {
@@ -1209,6 +1283,334 @@ fn add_apple_deployment_env(command: &mut Command, target: &str) {
             std::env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "16.0".to_string());
         command.env("IPHONEOS_DEPLOYMENT_TARGET", value);
     }
+}
+
+fn apple_slice_name(target: &str) -> Result<&'static str> {
+    match target {
+        "aarch64-apple-darwin" => Ok("macos-arm64"),
+        "aarch64-apple-ios" => Ok("ios-arm64"),
+        "aarch64-apple-ios-sim" => Ok("ios-arm64-simulator"),
+        _ => bail!("unsupported Apple target `{target}`"),
+    }
+}
+
+fn apple_sdk_name(target: &str) -> Result<&'static str> {
+    match target {
+        "aarch64-apple-darwin" => Ok("macosx"),
+        "aarch64-apple-ios" => Ok("iphoneos"),
+        "aarch64-apple-ios-sim" => Ok("iphonesimulator"),
+        _ => bail!("unsupported Apple target `{target}`"),
+    }
+}
+
+fn apple_sdk_platform_name(target: &str) -> Result<&'static str> {
+    apple_sdk_name(target)
+}
+
+fn apple_supported_platform_name(target: &str) -> Result<&'static str> {
+    match target {
+        "aarch64-apple-darwin" => Ok("MacOSX"),
+        "aarch64-apple-ios" => Ok("iPhoneOS"),
+        "aarch64-apple-ios-sim" => Ok("iPhoneSimulator"),
+        _ => bail!("unsupported Apple target `{target}`"),
+    }
+}
+
+fn apple_min_os(target: &str) -> Result<String> {
+    Ok(match target {
+        "aarch64-apple-darwin" => {
+            std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "15.0".to_string())
+        }
+        "aarch64-apple-ios" | "aarch64-apple-ios-sim" => {
+            std::env::var("IPHONEOS_DEPLOYMENT_TARGET")
+                .or_else(|_| std::env::var("IPHONESIMULATOR_DEPLOYMENT_TARGET"))
+                .unwrap_or_else(|_| "16.0".to_string())
+        }
+        _ => bail!("unsupported Apple target `{target}`"),
+    })
+}
+
+fn apple_cdylib_path(meta: &CargoPackageMetadata, target: &str, profile: &str) -> Utf8PathBuf {
+    meta.target_directory
+        .join(target)
+        .join(profile)
+        .join(format!("lib{}.dylib", meta.lib_target_name))
+}
+
+fn apple_metallib_path(meta: &CargoPackageMetadata, target: &str, profile: &str) -> Utf8PathBuf {
+    meta.target_directory
+        .join(target)
+        .join(profile)
+        .join("mlx.metallib")
+}
+
+fn create_apple_framework_layout(
+    target: &str,
+    framework_dir: &Utf8Path,
+    framework_name: &str,
+) -> Result<(Utf8PathBuf, Utf8PathBuf, Option<Utf8PathBuf>)> {
+    let framework_binary = framework_dir.join(framework_name);
+    if target == "aarch64-apple-darwin" {
+        let versions_dir = framework_dir.join("Versions");
+        let current_dir = versions_dir.join("Current");
+        let version_a_dir = versions_dir.join("A");
+        let resources_dir = version_a_dir.join("Resources");
+        std::fs::create_dir_all(&resources_dir)
+            .with_context(|| format!("creating macOS framework resources dir {resources_dir}"))?;
+        std::fs::create_dir_all(version_a_dir.join("Headers"))
+            .with_context(|| format!("creating macOS framework headers dir {}", version_a_dir.join("Headers")))?;
+        std::fs::create_dir_all(version_a_dir.join("Modules"))
+            .with_context(|| format!("creating macOS framework modules dir {}", version_a_dir.join("Modules")))?;
+        create_symlink("A", &current_dir)
+            .with_context(|| format!("creating framework symlink {current_dir} -> A"))?;
+        create_symlink(
+            format!("Versions/Current/{framework_name}"),
+            &framework_binary,
+        )
+        .with_context(|| format!("creating framework binary symlink {framework_binary}"))?;
+        create_symlink("Versions/Current/Headers", &framework_dir.join("Headers"))
+            .with_context(|| format!("creating framework headers symlink {}", framework_dir.join("Headers")))?;
+        create_symlink(
+            "Versions/Current/Resources",
+            &framework_dir.join("Resources"),
+        )
+        .with_context(|| format!("creating framework resources symlink {}", framework_dir.join("Resources")))?;
+        create_symlink("Versions/Current/Modules", &framework_dir.join("Modules"))
+            .with_context(|| format!("creating framework modules symlink {}", framework_dir.join("Modules")))?;
+        Ok((
+            version_a_dir.join(framework_name),
+            resources_dir.join("Info.plist"),
+            Some(resources_dir.join("default.metallib")),
+        ))
+    } else {
+        std::fs::create_dir_all(framework_dir.join("Headers"))
+            .with_context(|| format!("creating iOS framework headers dir {}", framework_dir.join("Headers")))?;
+        std::fs::create_dir_all(framework_dir.join("Modules"))
+            .with_context(|| format!("creating iOS framework modules dir {}", framework_dir.join("Modules")))?;
+        Ok((
+            framework_binary,
+            framework_dir.join("Info.plist"),
+            Some(framework_dir.join("mlx.metallib")),
+        ))
+    }
+}
+
+fn copy_apple_framework_headers(
+    headers_dir: &Utf8Path,
+    framework_dir: &Utf8Path,
+    framework_name: &str,
+) -> Result<()> {
+    let (dest_headers_dir, dest_modules_dir) = if framework_dir.join("Versions/A").exists() {
+        (
+            framework_dir.join("Versions/A/Headers"),
+            framework_dir.join("Versions/A/Modules"),
+        )
+    } else {
+        (framework_dir.join("Headers"), framework_dir.join("Modules"))
+    };
+    std::fs::create_dir_all(&dest_headers_dir)
+        .with_context(|| format!("creating framework headers dir {dest_headers_dir}"))?;
+    std::fs::create_dir_all(&dest_modules_dir)
+        .with_context(|| format!("creating framework modules dir {dest_modules_dir}"))?;
+
+    for entry in std::fs::read_dir(headers_dir)
+        .with_context(|| format!("reading staged Apple headers dir {headers_dir}"))?
+    {
+        let entry = entry?;
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|p| anyhow::anyhow!("Apple header path is not utf8: {}", p.display()))?;
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        if name == "module.modulemap" {
+            continue;
+        }
+        let destination = dest_headers_dir.join(name);
+        std::fs::copy(&path, &destination)
+            .with_context(|| format!("copying Apple framework support file {path} into {destination}"))?;
+    }
+    let modulemap = format!(
+        "framework module {framework_name} {{\n    umbrella header \"{framework_name}.h\"\n    export *\n    use \"Darwin\"\n    use \"_Builtin_stdbool\"\n    use \"_Builtin_stdint\"\n}}\n"
+    );
+    std::fs::write(dest_modules_dir.join("module.modulemap"), modulemap).with_context(|| {
+        format!(
+            "writing Apple framework modulemap for {} at {}",
+            framework_name,
+            dest_modules_dir.join("module.modulemap")
+        )
+    })?;
+    Ok(())
+}
+
+fn rewrite_apple_framework_install_name(
+    target: &str,
+    framework_name: &str,
+    framework_bin: &Utf8Path,
+) -> Result<()> {
+    let install_name = if target == "aarch64-apple-darwin" {
+        format!("@rpath/{framework_name}.framework/Versions/A/{framework_name}")
+    } else {
+        format!("@rpath/{framework_name}.framework/{framework_name}")
+    };
+    let mut command = Command::new("install_name_tool");
+    command.arg("-id").arg(&install_name).arg(framework_bin.as_str());
+    run_command("install_name_tool", &mut command, "install_name_tool")
+}
+
+fn write_apple_framework_info_plist(
+    target: &str,
+    framework_name: &str,
+    info_plist: &Utf8Path,
+) -> Result<()> {
+    let min_os = apple_min_os(target)?;
+    let sdk_name = apple_sdk_name(target)?;
+    let supported_platform = apple_supported_platform_name(target)?;
+    let platform_name = apple_sdk_platform_name(target)?;
+    let platform_version = command_stdout(
+        "xcrun",
+        &["--sdk", sdk_name, "--show-sdk-platform-version"],
+        "xcrun",
+    )?;
+    let sdk_build = command_stdout(
+        "xcrun",
+        &["--sdk", sdk_name, "--show-sdk-build-version"],
+        "xcrun",
+    )?;
+    let xcode_build = command_stdout("xcodebuild", &["-version"], "xcodebuild")?
+        .lines()
+        .find_map(|line| line.strip_prefix("Build version "))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("unable to determine Xcode build version"))?;
+    let xcode_marketing = command_stdout("xcodebuild", &["-version"], "xcodebuild")?
+        .lines()
+        .find_map(|line| line.strip_prefix("Xcode "))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("unable to determine Xcode version"))?;
+    let host_build =
+        command_stdout("sw_vers", &["-buildVersion"], "sw_vers").context("reading host build")?;
+    let xcode_numeric = apple_xcode_numeric_version(&xcode_marketing)?;
+    let extra_keys = match target {
+        "aarch64-apple-darwin" => format!(
+            "  <key>LSMinimumSystemVersion</key>\n  <string>{min_os}</string>\n"
+        ),
+        "aarch64-apple-ios" => format!(
+            "  <key>MinimumOSVersion</key>\n  <string>{min_os}</string>\n  <key>UIDeviceFamily</key>\n  <array>\n    <integer>1</integer>\n    <integer>2</integer>\n  </array>\n  <key>UIRequiredDeviceCapabilities</key>\n  <array>\n    <string>arm64</string>\n  </array>\n"
+        ),
+        "aarch64-apple-ios-sim" => format!(
+            "  <key>MinimumOSVersion</key>\n  <string>{min_os}</string>\n  <key>UIDeviceFamily</key>\n  <array>\n    <integer>1</integer>\n    <integer>2</integer>\n  </array>\n"
+        ),
+        _ => bail!("unsupported Apple target `{target}`"),
+    };
+    let bundle_id = format!(
+        "org.mozilla.uniffi.{}.{}",
+        apple_bundle_identifier_component(framework_name),
+        apple_bundle_identifier_component(platform_name)
+    );
+
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \x20\x20<key>BuildMachineOSBuild</key>\n\
+         \x20\x20<string>{host_build}</string>\n\
+         \x20\x20<key>CFBundleDevelopmentRegion</key>\n\
+         \x20\x20<string>en</string>\n\
+         \x20\x20<key>CFBundleExecutable</key>\n\
+         \x20\x20<string>{framework_name}</string>\n\
+         \x20\x20<key>CFBundleIdentifier</key>\n\
+         \x20\x20<string>{bundle_id}</string>\n\
+         \x20\x20<key>CFBundleInfoDictionaryVersion</key>\n\
+         \x20\x20<string>6.0</string>\n\
+         \x20\x20<key>CFBundleName</key>\n\
+         \x20\x20<string>{framework_name}</string>\n\
+         \x20\x20<key>CFBundlePackageType</key>\n\
+         \x20\x20<string>FMWK</string>\n\
+         \x20\x20<key>CFBundleSupportedPlatforms</key>\n\
+         \x20\x20<array>\n\
+         \x20\x20\x20\x20<string>{supported_platform}</string>\n\
+         \x20\x20</array>\n\
+         \x20\x20<key>CFBundleVersion</key>\n\
+         \x20\x20<string>1</string>\n\
+         \x20\x20<key>DTCompiler</key>\n\
+         \x20\x20<string>com.apple.compilers.llvm.clang.1_0</string>\n\
+         \x20\x20<key>DTPlatformBuild</key>\n\
+         \x20\x20<string>{sdk_build}</string>\n\
+         \x20\x20<key>DTPlatformName</key>\n\
+         \x20\x20<string>{platform_name}</string>\n\
+         \x20\x20<key>DTPlatformVersion</key>\n\
+         \x20\x20<string>{platform_version}</string>\n\
+         \x20\x20<key>DTSDKBuild</key>\n\
+         \x20\x20<string>{sdk_build}</string>\n\
+         \x20\x20<key>DTSDKName</key>\n\
+         \x20\x20<string>{platform_name}{platform_version}</string>\n\
+         \x20\x20<key>DTXcode</key>\n\
+         \x20\x20<string>{xcode_numeric}</string>\n\
+         \x20\x20<key>DTXcodeBuild</key>\n\
+         \x20\x20<string>{xcode_build}</string>\n\
+         {extra_keys}\
+         </dict>\n\
+         </plist>\n"
+    );
+    std::fs::write(info_plist, plist)
+        .with_context(|| format!("writing Apple framework Info.plist at {info_plist}"))?;
+    Ok(())
+}
+
+fn apple_xcode_numeric_version(version: &str) -> Result<String> {
+    let mut parts = version.split('.');
+    let major = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing Xcode major version"))?
+        .parse::<u32>()
+        .with_context(|| format!("parsing Xcode major version from `{version}`"))?;
+    let minor = parts
+        .next()
+        .unwrap_or("0")
+        .parse::<u32>()
+        .with_context(|| format!("parsing Xcode minor version from `{version}`"))?;
+    Ok(format!("{major}{minor:02}"))
+}
+
+fn apple_bundle_identifier_component(value: &str) -> String {
+    let lowered: String = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if lowered.is_empty() {
+        "artifact".to_string()
+    } else {
+        lowered
+    }
+}
+
+#[cfg(unix)]
+fn create_symlink(target: impl AsRef<std::path::Path>, link: &Utf8Path) -> Result<()> {
+    symlink(target.as_ref(), link.as_std_path())
+        .with_context(|| format!("creating symlink {}", link))
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: impl AsRef<std::path::Path>, link: &Utf8Path) -> Result<()> {
+    bail!("Apple framework symlink creation is only supported on unix hosts: {link}");
+}
+
+fn command_stdout(binary: &str, args: &[&str], tool_name: &str) -> Result<String> {
+    let mut command = Command::new(binary);
+    command.args(args);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .with_context(|| format!("{tool_name} invocation failed while spawning `{binary}`"))?;
+    if !output.status.success() {
+        bail!(
+            "{tool_name} command failed: {rendered}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn stage_swift_headers(swift_bindings_dir: &Utf8Path, headers_dir: &Utf8Path) -> Result<()> {
@@ -1470,24 +1872,14 @@ fn rust_identifier(package_name: &str) -> String {
     package_name.replace('-', "_")
 }
 
-fn apple_staticlib_path(meta: &CargoPackageMetadata, target: &str, profile: &str) -> Utf8PathBuf {
-    meta.target_directory
-        .join(target)
-        .join(profile)
-        .join(format!("lib{}.a", meta.lib_target_name))
-}
-
 fn xcodebuild_create_xcframework_args(
-    libs: &[Utf8PathBuf],
-    headers_dir: &Utf8Path,
+    frameworks: &[Utf8PathBuf],
     output: &Utf8Path,
 ) -> Vec<String> {
     let mut args = vec!["-create-xcframework".to_string()];
-    for lib in libs {
-        args.push("-library".to_string());
-        args.push(lib.to_string());
-        args.push("-headers".to_string());
-        args.push(headers_dir.to_string());
+    for framework in frameworks {
+        args.push("-framework".to_string());
+        args.push(framework.to_string());
     }
     args.push("-output".to_string());
     args.push(output.to_string());
@@ -2163,15 +2555,15 @@ name = "uni_core"
     }
 
     #[test]
-    fn computes_apple_staticlib_path() {
+    fn computes_apple_cdylib_path() {
         let meta = CargoPackageMetadata {
             target_directory: Utf8PathBuf::from("/repo/target"),
             package_name: "uni-core".to_string(),
             lib_target_name: "uni_core".to_string(),
         };
         assert_eq!(
-            apple_staticlib_path(&meta, "aarch64-apple-ios", "release"),
-            Utf8PathBuf::from("/repo/target/aarch64-apple-ios/release/libuni_core.a")
+            apple_cdylib_path(&meta, "aarch64-apple-ios", "release"),
+            Utf8PathBuf::from("/repo/target/aarch64-apple-ios/release/libuni_core.dylib")
         );
     }
 
@@ -2179,24 +2571,19 @@ name = "uni_core"
     fn renders_xcodebuild_create_xcframework_args() {
         let args = xcodebuild_create_xcframework_args(
             &[
-                Utf8PathBuf::from("/target/device/libuni_core.a"),
-                Utf8PathBuf::from("/target/sim/libuni_core.a"),
+                Utf8PathBuf::from("/target/device/uni_coreFFI.framework"),
+                Utf8PathBuf::from("/target/sim/uni_coreFFI.framework"),
             ],
-            Utf8Path::new("/headers"),
             Utf8Path::new("/out/uni_core.xcframework"),
         );
         assert_eq!(
             args,
             vec![
                 "-create-xcframework",
-                "-library",
-                "/target/device/libuni_core.a",
-                "-headers",
-                "/headers",
-                "-library",
-                "/target/sim/libuni_core.a",
-                "-headers",
-                "/headers",
+                "-framework",
+                "/target/device/uni_coreFFI.framework",
+                "-framework",
+                "/target/sim/uni_coreFFI.framework",
                 "-output",
                 "/out/uni_core.xcframework",
             ]
