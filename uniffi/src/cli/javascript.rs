@@ -93,6 +93,10 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     release: bool,
 
+    /// Cargo features enabled on the downstream core crate. May be repeated or comma-separated.
+    #[clap(long = "cargo-feature", value_delimiter = ',')]
+    cargo_features: Vec<String>,
+
     /// Do not try to format the generated bindings.
     #[clap(long, short)]
     no_format: bool,
@@ -142,6 +146,7 @@ impl BuildArgs {
             cargo_bin: self.cargo_bin.clone(),
             target_dir: self.target_dir.clone(),
             release: self.release,
+            cargo_features: self.cargo_features.clone(),
             no_format: self.no_format,
             config: self.config.clone(),
             crate_name: self.crate_name.clone(),
@@ -258,6 +263,10 @@ pub(crate) struct BuildNapiArgs {
     /// Build the downstream core crate and generated napi host crate in release mode.
     #[clap(long)]
     pub(crate) release: bool,
+
+    /// Cargo features enabled on the downstream core crate. May be repeated or comma-separated.
+    #[clap(long = "cargo-feature", value_delimiter = ',')]
+    pub(crate) cargo_features: Vec<String>,
 
     /// Do not try to format the generated bindings.
     #[clap(long, short)]
@@ -607,6 +616,7 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
 
     let mut build_core =
         cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
+    add_cargo_feature_args(&mut build_core, &args.cargo_features);
     run_command(
         &args.cargo_bin,
         &mut build_core,
@@ -676,8 +686,19 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
     }
 
     let target_dir = args.target_dir.as_ref().map(resolve_cwd_path).transpose()?;
-    let mut build_napi_host =
-        cargo_build_command(&args.cargo_bin, &napi_manifest, &[], args.release, None);
+    let napi_cargo_args =
+        dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+    let napi_cargo_args = napi_cargo_args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut build_napi_host = cargo_build_command(
+        &args.cargo_bin,
+        &napi_manifest,
+        &napi_cargo_args,
+        args.release,
+        None,
+    );
     if let Some(target_dir) = &target_dir {
         build_napi_host.env("CARGO_TARGET_DIR", target_dir.as_str());
     }
@@ -857,7 +878,7 @@ mod tests {
     use super::dependency_cargo_feature_args;
 
     #[test]
-    fn ohos_dependency_feature_args_are_package_qualified() {
+    fn napi_and_ohos_dependency_feature_args_are_package_qualified() {
         let args = dependency_cargo_feature_args(
             "uni-core",
             &[
@@ -877,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn ohos_dependency_feature_args_are_empty_without_features() {
+    fn napi_and_ohos_dependency_feature_args_are_empty_without_features() {
         assert!(dependency_cargo_feature_args("uni-core", &[]).is_empty());
     }
 }
