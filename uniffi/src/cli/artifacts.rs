@@ -71,7 +71,7 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     release: bool,
 
-    /// Cargo features enabled when building native Apple/Android/Harmony core artifacts. May be repeated or comma-separated.
+    /// Cargo features enabled when building native Apple/Android/Harmony/N-API core artifacts. May be repeated or comma-separated.
     #[clap(long = "cargo-feature", value_delimiter = ',')]
     cargo_features: Vec<String>,
 
@@ -1219,6 +1219,7 @@ impl BuildArgs {
             cargo_bin: self.cargo_bin.clone(),
             target_dir: self.napi_target_dir.clone(),
             release: self.release,
+            cargo_features: self.cargo_features.clone(),
             no_format: self.no_format,
             config: self.config.clone(),
             crate_name: self.crate_name.clone(),
