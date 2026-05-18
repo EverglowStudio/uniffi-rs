@@ -1410,7 +1410,7 @@ fn ts_lower_expr(
         Type::Int64 => format!("toI64({ident})"),
         Type::UInt64 => format!("toU64({ident})"),
         Type::Optional { inner_type } => format!(
-            "({ident} == null ? {ident} : {})",
+            "({ident} == null ? undefined : {})",
             ts_lower_expr(ci, config, inner_type, ident, depth + 1)
         ),
         Type::Sequence { inner_type } => {
