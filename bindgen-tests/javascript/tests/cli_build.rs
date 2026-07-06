@@ -92,7 +92,8 @@ fn write_cli_build_fixture(root: &std::path::Path) -> Utf8PathBuf {
              uniffi = {{ path = \"{}\" }}\n\n\
              [build-dependencies]\n\
              uniffi = {{ path = \"{}\", features = [\"build\"] }}\n\n\
-             [workspace]\n",
+             [workspace]\n\
+             resolver = \"3\"\n",
             uniffi_path, uniffi_path
         ),
     )
@@ -139,7 +140,8 @@ fn write_value_type_method_fixture(root: &std::path::Path) -> Utf8PathBuf {
              crate-type = [\"lib\", \"cdylib\"]\n\n\
              [dependencies]\n\
              uniffi = {{ path = \"{}\" }}\n\n\
-             [workspace]\n",
+             [workspace]\n\
+             resolver = \"3\"\n",
             uniffi_path
         ),
     )

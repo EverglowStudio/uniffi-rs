@@ -184,7 +184,8 @@ fn emit_wasm(
          strip = true\n\
          debug = false\n\
          \n\
-         [workspace]\n",
+         [workspace]\n\
+         resolver = \"3\"\n",
         package_name = package_name,
         core_name = meta.package_name,
         rel_core = rel_core,
@@ -246,7 +247,8 @@ fn emit_napi(
          [build-dependencies]\n\
          napi-build = \"2.3.1\"\n\
          \n\
-         [workspace]\n",
+         [workspace]\n\
+         resolver = \"3\"\n",
         package_name = package_name,
         core_name = meta.package_name,
         rel_core = rel_core,
@@ -324,7 +326,8 @@ fn emit_ohos(
          async-trait = \"0.1\"\n\
          {ohos_deps}\
          \n\
-         [workspace]\n",
+         [workspace]\n\
+         resolver = \"3\"\n",
         package_name = package_name,
         lib_name = lib_name,
         core_name = meta.package_name,

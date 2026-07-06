@@ -282,15 +282,26 @@ impl<'a> MetadataReader<'a> {
         let docstring = self.read_optional_long_string()?;
 
         let self_type = return_type
-            .clone()
-            .filter(|t| {
-                matches!(
-                    t,
-                    Type::Object { name, imp: ObjectImpl::Struct, .. }
-                    | Type::Record { name, .. }
-                    | Type::Enum { name, .. }
-                        if name == &self_name
-                )
+            .as_ref()
+            .and_then(|t| match t {
+                Type::Object {
+                    name,
+                    imp: ObjectImpl::Struct,
+                    ..
+                } if name == &self_name => Some(Type::Object {
+                    module_path: module_path.clone(),
+                    name: self_name.clone(),
+                    imp: ObjectImpl::Struct,
+                }),
+                Type::Record { name, .. } if name == &self_name => Some(Type::Record {
+                    module_path: module_path.clone(),
+                    name: self_name.clone(),
+                }),
+                Type::Enum { name, .. } if name == &self_name => Some(Type::Enum {
+                    module_path: module_path.clone(),
+                    name: self_name.clone(),
+                }),
+                _ => None,
             })
             .context("Constructor return type must be Self or Arc<Self>")?;
 

@@ -32,7 +32,7 @@ use heck::{ToSnakeCase, ToUpperCamelCase};
 use uniffi_bindgen::{
     interface::{
         AsType, ComponentInterface, Constructor, Enum, Function, Method, Object, ObjectImpl,
-        Record, Type,
+        Record, TraitKind, Type,
     },
     Component,
 };
@@ -631,11 +631,12 @@ fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut out = header("callbacks");
     let mut usage = Usage::default();
     let mut needs_callback_return_unwrap = false;
-    for obj in ci
-        .object_definitions()
-        .iter()
-        .filter(|obj| matches!(obj.imp(), ObjectImpl::CallbackTrait))
-    {
+    for obj in ci.object_definitions().iter().filter(|obj| {
+        matches!(
+            obj.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        )
+    }) {
         for method in obj.methods() {
             for arg in method.arguments() {
                 usage.see(ci, &arg.as_type(), UsagePos::Arg, config);
@@ -733,7 +734,10 @@ fn render_callbacks(ci: &ComponentInterface, config: &JsConfig) -> String {
         ));
     }
     for obj in ci.object_definitions() {
-        if !matches!(obj.imp(), ObjectImpl::CallbackTrait) {
+        if !matches!(
+            obj.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        ) {
             continue;
         }
         if !rendered.insert(obj.name().to_string()) {
@@ -754,7 +758,7 @@ fn needs_object_callback_return_unwrap(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Object {
-            imp: ObjectImpl::Struct | ObjectImpl::Trait,
+            imp: ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly),
             ..
         }
     )
@@ -831,7 +835,7 @@ fn render_callback_lowerer(
             if let Some(ret) = method.return_type() {
                 let lower = match ret {
                     Type::Object {
-                        imp: ObjectImpl::Struct | ObjectImpl::Trait,
+                        imp: ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly),
                         ..
                     } => "__uniffiUnwrapCallbackReturn(__ret)".to_string(),
                     _ => ts_lower_expr(ci, config, ret, "__ret", 0),
@@ -847,7 +851,7 @@ fn render_callback_lowerer(
         } else if let Some(ret) = method.return_type() {
             let lower = match ret {
                 Type::Object {
-                    imp: ObjectImpl::Struct | ObjectImpl::Trait,
+                    imp: ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly),
                     ..
                 } => "__uniffiUnwrapCallbackReturn(__ret)".to_string(),
                 _ => ts_lower_expr(ci, config, ret, "__ret", 0),
@@ -880,7 +884,10 @@ fn render_objects(ci: &ComponentInterface, config: &JsConfig) -> String {
     let mut has_async = false;
     let mut has_sync = false;
     for obj in ci.object_definitions() {
-        if matches!(obj.imp(), ObjectImpl::CallbackTrait) {
+        if matches!(
+            obj.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        ) {
             continue;
         }
         any_object = true;
@@ -1005,7 +1012,10 @@ fn render_objects(ci: &ComponentInterface, config: &JsConfig) -> String {
     out.push('\n');
 
     for obj in ci.object_definitions() {
-        if matches!(obj.imp(), ObjectImpl::CallbackTrait) {
+        if matches!(
+            obj.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        ) {
             continue;
         }
         out.push_str(&render_object_class(ci, obj, config));
@@ -1479,7 +1489,7 @@ fn ts_lower_expr(
         //         dispatching to the underlying napi addon
         // common/api.ts itself stays backend-agnostic.
         Type::Object {
-            imp: ObjectImpl::CallbackTrait,
+            imp: ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly),
             name,
             ..
         }
@@ -1532,7 +1542,13 @@ fn callback_async_methods(ci: &ComponentInterface, name: &str) -> Vec<String> {
     let methods = ci
         .object_definitions()
         .iter()
-        .find(|obj| obj.name() == name && matches!(obj.imp(), ObjectImpl::CallbackTrait))
+        .find(|obj| {
+            obj.name() == name
+                && matches!(
+                    obj.imp(),
+                    ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+                )
+        })
         .map(|obj| obj.methods())
         .or_else(|| {
             ci.callback_interface_definitions()
@@ -1552,7 +1568,13 @@ fn callback_return_methods(ci: &ComponentInterface, name: &str) -> Vec<String> {
     let methods = ci
         .object_definitions()
         .iter()
-        .find(|obj| obj.name() == name && matches!(obj.imp(), ObjectImpl::CallbackTrait))
+        .find(|obj| {
+            obj.name() == name
+                && matches!(
+                    obj.imp(),
+                    ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+                )
+        })
         .map(|obj| obj.methods())
         .or_else(|| {
             ci.callback_interface_definitions()
@@ -1576,7 +1598,13 @@ fn callback_fallible_methods(ci: &ComponentInterface, name: &str) -> Vec<(String
     let methods = ci
         .object_definitions()
         .iter()
-        .find(|obj| obj.name() == name && matches!(obj.imp(), ObjectImpl::CallbackTrait))
+        .find(|obj| {
+            obj.name() == name
+                && matches!(
+                    obj.imp(),
+                    ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+                )
+        })
         .map(|obj| obj.methods())
         .or_else(|| {
             ci.callback_interface_definitions()
@@ -1733,6 +1761,8 @@ fn ts_type(ty: &Type, config: &JsConfig) -> String {
             ts_type(key_type, config),
             ts_type(value_type, config)
         ),
+        Type::Box { inner_type } => ts_type(inner_type, config),
+        Type::Set { inner_type } => format!("Set<{}>", ts_type(inner_type, config)),
         Type::Stream { item_type, .. } => {
             format!("AsyncIterable<{}>", ts_type(item_type, config))
         }
@@ -1801,7 +1831,7 @@ impl Usage {
             }
             Type::Object {
                 name,
-                imp: ObjectImpl::CallbackTrait,
+                imp: ObjectImpl::Trait(TraitKind::ForeignOnly),
                 ..
             } => {
                 let _ = pos;
@@ -1946,11 +1976,13 @@ fn group_named_types(ci: &ComponentInterface, names: &BTreeSet<String>) -> Group
             g.records.push(n.clone());
         } else if ci.enum_definitions().iter().any(|e| e.name() == n) {
             g.enums.push(n.clone());
-        } else if ci
-            .object_definitions()
-            .iter()
-            .any(|o| o.name() == n && matches!(o.imp(), ObjectImpl::CallbackTrait))
-        {
+        } else if ci.object_definitions().iter().any(|o| {
+            o.name() == n
+                && matches!(
+                    o.imp(),
+                    ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+                )
+        }) {
             g.callbacks.push(n.clone());
         } else if ci.object_definitions().iter().any(|o| o.name() == n) {
             g.objects.push(n.clone());
@@ -2090,7 +2122,10 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
         .map(|c| c.name().to_string())
         .collect();
     for o in ci.object_definitions() {
-        if matches!(o.imp(), ObjectImpl::CallbackTrait) {
+        if matches!(
+            o.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        ) {
             callbacks.push(o.name().to_string());
         }
     }
@@ -2108,7 +2143,12 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
     let objects: Vec<String> = ci
         .object_definitions()
         .iter()
-        .filter(|o| !matches!(o.imp(), ObjectImpl::CallbackTrait))
+        .filter(|o| {
+            !matches!(
+                o.imp(),
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+            )
+        })
         .map(|o| o.name().to_string())
         .collect();
     if !objects.is_empty() {
@@ -2322,7 +2362,10 @@ fn function_custom_helpers(ci: &ComponentInterface, config: &JsConfig) -> BTreeS
 fn object_custom_helpers(ci: &ComponentInterface, config: &JsConfig) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for object in ci.object_definitions() {
-        if matches!(object.imp(), ObjectImpl::CallbackTrait) {
+        if matches!(
+            object.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        ) {
             continue;
         }
         for constructor in object.constructors() {
@@ -2449,7 +2492,10 @@ fn function_callback_helpers(ci: &ComponentInterface) -> BTreeSet<String> {
 fn object_callback_helpers(ci: &ComponentInterface) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for object in ci.object_definitions() {
-        if matches!(object.imp(), ObjectImpl::CallbackTrait) {
+        if matches!(
+            object.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        ) {
             continue;
         }
         for constructor in object.constructors() {
@@ -2508,11 +2554,12 @@ fn value_type_callback_helpers(ci: &ComponentInterface, local_module: &str) -> B
 
 fn callback_custom_helpers(ci: &ComponentInterface, config: &JsConfig) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    for object in ci
-        .object_definitions()
-        .iter()
-        .filter(|obj| matches!(obj.imp(), ObjectImpl::CallbackTrait))
-    {
+    for object in ci.object_definitions().iter().filter(|obj| {
+        matches!(
+            obj.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        )
+    }) {
         for method in object.methods() {
             for arg in method.arguments() {
                 collect_public_customs(ci, config, &arg.as_type(), &mut names, &mut HashSet::new());
@@ -2529,7 +2576,7 @@ fn collect_callback_helpers(ty: &Type, out: &mut BTreeSet<String>) {
     match ty {
         Type::Object {
             name,
-            imp: ObjectImpl::CallbackTrait,
+            imp: ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly),
             ..
         }
         | Type::CallbackInterface { name, .. } => {

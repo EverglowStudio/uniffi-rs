@@ -88,6 +88,10 @@ pub fn type_rs(ty: &Type, context: &Context) -> Result<String> {
         Type::Duration => "::std::time::Duration".into(),
         Type::Timestamp => "::std::time::SystemTime".into(),
         Type::Bytes => "::std::vec::Vec<::std::primitive::u8>".into(),
+        Type::Stream { .. } => bail!("Kotlin JNI bindings do not support stream types yet"),
+        Type::InputStream { .. } => {
+            bail!("Kotlin JNI bindings do not support input stream types yet")
+        }
     })
 }
 
@@ -147,6 +151,10 @@ pub fn type_kt(ty: &Type, context: &Context) -> Result<String> {
         Type::Duration => "java.time.Duration".into(),
         Type::Timestamp => "java.time.Instant".into(),
         Type::Bytes => "kotlin.ByteArray".into(),
+        Type::Stream { .. } => bail!("Kotlin JNI bindings do not support stream types yet"),
+        Type::InputStream { .. } => {
+            bail!("Kotlin JNI bindings do not support input stream types yet")
+        }
     })
 }
 

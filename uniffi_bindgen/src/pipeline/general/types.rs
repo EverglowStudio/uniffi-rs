@@ -200,14 +200,20 @@ pub fn type_for_custom_type(custom: &initial::CustomType, context: &Context) -> 
 mod tests {
     use super::*;
 
+    fn test_context_with_type(ty: &Type) -> Context {
+        let mut context = Context::new("test");
+        context.type_id_map.insert(ty.clone(), 0);
+        context
+    }
+
     #[test]
     fn maps_stream_type_into_general_ir() {
-        let context = Context::new("test");
         let stream_type = Type::Stream {
             item_type: Box::new(Type::UInt32),
             error_type: Box::new(Type::String),
             is_send: true,
         };
+        let context = test_context_with_type(&stream_type);
 
         let type_node: TypeNode = stream_type.map_node(&context).unwrap();
         assert_eq!(type_node.canonical_name, "StreamUInt32String");
@@ -224,12 +230,12 @@ mod tests {
 
     #[test]
     fn maps_input_stream_type_into_general_ir() {
-        let context = Context::new("test");
         let stream_type = Type::InputStream {
             item_type: Box::new(Type::UInt32),
             error_type: Box::new(Type::String),
             is_send: true,
         };
+        let context = test_context_with_type(&stream_type);
 
         let type_node: TypeNode = stream_type.map_node(&context).unwrap();
         assert_eq!(type_node.canonical_name, "InputStreamUInt32String");
