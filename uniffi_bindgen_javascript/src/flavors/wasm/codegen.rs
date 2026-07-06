@@ -42,7 +42,7 @@ use std::{collections::BTreeMap, fmt::Write};
 use heck::ToSnakeCase;
 use uniffi_bindgen::interface::{
     AsType, ComponentInterface, Constructor, Enum, Function, Method, Object, ObjectImpl, Record,
-    Type,
+    TraitKind, Type,
 };
 
 pub fn render_wasm_rust(ci: &ComponentInterface) -> String {
@@ -88,14 +88,18 @@ pub fn render_wasm_rust(ci: &ComponentInterface) -> String {
     .unwrap();
     writeln!(out).unwrap();
 
-    let has_objects = ci
-        .object_definitions()
-        .iter()
-        .any(|o| !matches!(o.imp(), ObjectImpl::CallbackTrait));
-    let has_cb_objects = ci
-        .object_definitions()
-        .iter()
-        .any(|o| matches!(o.imp(), ObjectImpl::CallbackTrait));
+    let has_objects = ci.object_definitions().iter().any(|o| {
+        !matches!(
+            o.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        )
+    });
+    let has_cb_objects = ci.object_definitions().iter().any(|o| {
+        matches!(
+            o.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        )
+    });
     let has_cb_ifaces = !ci.callback_interface_definitions().is_empty();
     let has_callbacks = has_cb_objects || has_cb_ifaces;
 
@@ -118,7 +122,10 @@ pub fn render_wasm_rust(ci: &ComponentInterface) -> String {
 
     // Registries + shims for opaque objects (struct / trait-interface).
     for obj in ci.object_definitions() {
-        if matches!(obj.imp(), ObjectImpl::CallbackTrait) {
+        if matches!(
+            obj.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        ) {
             continue;
         }
         render_object(&mut out, &crate_ident, obj);
@@ -138,7 +145,10 @@ pub fn render_wasm_rust(ci: &ComponentInterface) -> String {
         );
     }
     for obj in ci.object_definitions() {
-        if !matches!(obj.imp(), ObjectImpl::CallbackTrait) {
+        if !matches!(
+            obj.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        ) {
             continue;
         }
         render_callback_wrapper(
@@ -410,8 +420,7 @@ fn __uniffi_lift_duration(__dur: ::std::time::Duration) -> Result<JsValue, JsErr
 fn rust_ty_for_object(crate_ident: &str, obj: &Object) -> String {
     match obj.imp() {
         ObjectImpl::Struct => format!("::{crate_ident}::{}", obj.name()),
-        ObjectImpl::Trait => format!("dyn ::{crate_ident}::{}", obj.name()),
-        ObjectImpl::CallbackTrait => format!("dyn ::{crate_ident}::{}", obj.name()),
+        ObjectImpl::Trait(_) => format!("dyn ::{crate_ident}::{}", obj.name()),
     }
 }
 
@@ -1616,6 +1625,8 @@ fn type_suffix(ty: &Type) -> String {
             key_type,
             value_type,
         } => format!("Map{}{}", type_suffix(key_type), type_suffix(value_type)),
+        Type::Box { inner_type } => format!("Box{}", type_suffix(inner_type)),
+        Type::Set { inner_type } => format!("Set{}", type_suffix(inner_type)),
         Type::Stream {
             item_type,
             error_type,
@@ -1857,11 +1868,15 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
                 type_debug(&other)
             )),
         },
+        Type::Box { inner_type } => classify(inner_type, crate_ident),
+        Type::Set { .. } => Unsupported("Set is not wired into wasm codegen yet".into()),
         Type::Object { name, imp, .. } => {
             let snake = name.to_snake_case();
             let rust_ty = rust_ty_for_type(crate_ident, ty);
             match imp {
-                ObjectImpl::CallbackTrait => Callback { snake, rust_ty },
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
+                    Callback { snake, rust_ty }
+                }
                 _ => Object { snake, rust_ty },
             }
         }
@@ -2321,18 +2336,20 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
                 "{{ let __obj{depth}: ::js_sys::Object = {expr}.dyn_into().map_err(|_| JsError::new(\"expected object for map\"))?; let __keys{depth} = ::js_sys::Object::keys(&__obj{depth}); let mut __out{depth} = ::std::collections::HashMap::new(); for __i{depth} in 0..__keys{depth}.length() {{ let {key}: JsValue = __keys{depth}.get(__i{depth}); let {value}: JsValue = ::js_sys::Reflect::get(&__obj{depth}, &{key}).map_err(|_| JsError::new(\"reflect get map value failed\"))?; __out{depth}.insert(({key_lower})?, ({value_lower})?); }} Ok::<_, JsError>(__out{depth}) }}"
             )
         }
+        Type::Box { inner_type } => lower_expr(expr, inner_type, depth + 1),
+        Type::Set { .. } => "Err(JsError::new(\"Set is not wired into wasm lowering yet\"))".into(),
         Type::Stream { .. } => {
             "Err(JsError::new(\"native streams are not wired into wasm lowering yet\"))".into()
         }
         Type::InputStream { .. } => input_stream_lower_expr(expr, ty),
         Type::Object { name, imp, .. } => match imp {
-            ObjectImpl::Struct | ObjectImpl::Trait => {
+            ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
                 let snake = name.to_snake_case();
                 format!(
                     "{{ let __value: JsValue = {expr}; let __handle = if let Some(__handle) = __value.as_f64() {{ __handle }} else {{ let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected object handle or wrapper\"))?; let __uniffi = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffi\")).map_err(|_| JsError::new(\"object wrapper missing __uniffi\"))?; let __uniffi_obj: ::js_sys::Object = __uniffi.dyn_into().map_err(|_| JsError::new(\"object wrapper __uniffi is not an object\"))?; let __raw = ::js_sys::Reflect::get(&__uniffi_obj, &JsValue::from_str(\"raw\")).map_err(|_| JsError::new(\"object wrapper missing raw handle\"))?; __raw.as_f64().ok_or_else(|| JsError::new(\"object wrapper raw handle is not numeric\"))? }}; if !__handle.is_finite() || __handle < 0.0 || __handle.fract() != 0.0 || __handle > u32::MAX as f64 {{ Err(JsError::new(\"invalid object handle\")) }} else {{ __uniffi_{snake}_get(__handle as u32) }} }}"
                 )
             }
-            ObjectImpl::CallbackTrait => {
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                 format!(
                     "{{ let __value: JsValue = {expr}; let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected callback object\"))?; let __cb = if ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffiCallback\")).map_err(|_| JsError::new(\"failed to inspect callback marker\"))?.as_bool().unwrap_or(false) {{ ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"object\")).map_err(|_| JsError::new(\"callback marker missing object\"))? }} else {{ __obj.into() }}; let __handle = __uniffi_cb_register(__cb)?; Ok::<_, JsError>(Arc::new(__Js{name} {{ handle: __handle }})) }}"
                 )

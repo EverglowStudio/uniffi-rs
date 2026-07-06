@@ -12,7 +12,7 @@ use quote::{format_ident, quote};
 use syn::parse2;
 use uniffi_bindgen::interface::{
     Argument, AsType, Callable, ComponentInterface, Constructor, Enum, Field, Function, Method,
-    Object, ObjectImpl, Record, Type, Variant,
+    Object, ObjectImpl, Record, TraitKind, Type, Variant,
 };
 
 use crate::callback_metadata;
@@ -527,7 +527,7 @@ impl<'a> Generator<'a> {
                 bail!("remote object `{}` is not supported", object.name());
             }
             match object.imp() {
-                ObjectImpl::Struct | ObjectImpl::Trait => {
+                ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
                     for constructor in object.constructors() {
                         self.validate_callable(constructor, "constructor")?;
                     }
@@ -535,7 +535,7 @@ impl<'a> Generator<'a> {
                         self.validate_callable(method, "method")?;
                     }
                 }
-                ObjectImpl::CallbackTrait => {
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     ensure!(
                         object.constructors().is_empty(),
                         "callback trait `{}` constructors are not supported",
@@ -621,13 +621,13 @@ impl<'a> Generator<'a> {
                 Ok(())
             }
             Type::Object { name, imp, .. } => match imp {
-                ObjectImpl::Struct | ObjectImpl::Trait => {
+                ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
                     if matches!(usage, TypeUsage::Value | TypeUsage::CallbackArg) {
                         bail!("{label} type `{name}` is not supported in nested/value contexts");
                     }
                     Ok(())
                 }
-                ObjectImpl::CallbackTrait => {
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     ensure!(
                         matches!(usage, TypeUsage::Arg | TypeUsage::CallbackReturn),
                         "{label} type `{name}` is only supported as a direct function/method argument or callback return"
@@ -635,7 +635,10 @@ impl<'a> Generator<'a> {
                     Ok(())
                 }
             },
-            Type::Optional { inner_type } | Type::Sequence { inner_type } => {
+            Type::Optional { inner_type }
+            | Type::Sequence { inner_type }
+            | Type::Box { inner_type }
+            | Type::Set { inner_type } => {
                 ensure!(
                     !matches!(inner_type.as_ref(), Type::InputStream { .. }),
                     "{label} nested input stream types are not supported"
@@ -913,8 +916,12 @@ impl<'a> Generator<'a> {
 
     fn render_object(&self, object: &Object) -> Result<TokenStream> {
         match object.imp() {
-            ObjectImpl::Struct | ObjectImpl::Trait => self.render_object_class(object),
-            ObjectImpl::CallbackTrait => self.render_callback_trait(object),
+            ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
+                self.render_object_class(object)
+            }
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
+                self.render_callback_trait(object)
+            }
         }
     }
 
@@ -1103,7 +1110,12 @@ impl<'a> Generator<'a> {
         self.ci
             .object_definitions()
             .iter()
-            .filter(|object| matches!(object.imp(), ObjectImpl::CallbackTrait))
+            .filter(|object| {
+                matches!(
+                    object.imp(),
+                    ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+                )
+            })
             .flat_map(|object| {
                 object.methods().into_iter().map(|method| {
                     let ty = self.callback_registry_field_type(object, method)?;
@@ -2067,7 +2079,7 @@ impl<'a> Generator<'a> {
             matches!(
                 arg.as_type(),
                 Type::Object {
-                    imp: ObjectImpl::Struct | ObjectImpl::Trait,
+                    imp: ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly),
                     ..
                 }
             )
@@ -2259,8 +2271,12 @@ impl<'a> Generator<'a> {
             Type::Object { name, imp, .. } => {
                 let ident = rust_ident(name);
                 match imp {
-                    ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!(ClassInstance<'_, #ident>)),
-                    ObjectImpl::CallbackTrait => Ok(quote!(#ident)),
+                    ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
+                        Ok(quote!(ClassInstance<'_, #ident>))
+                    }
+                    ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
+                        Ok(quote!(#ident))
+                    }
                 }
             }
             Type::Optional { inner_type } => {
@@ -2324,11 +2340,11 @@ impl<'a> Generator<'a> {
                 Ok(quote!(#ident))
             }
             Type::Object { name, imp, .. } => match imp {
-                ObjectImpl::Struct | ObjectImpl::Trait => {
+                ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
                     let ident = rust_ident(name);
                     Ok(quote!(#ident))
                 }
-                ObjectImpl::CallbackTrait => {
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     bail!("callback trait `{name}` is not supported as a nested or return value")
                 }
             },
@@ -2347,6 +2363,11 @@ impl<'a> Generator<'a> {
                 let key = self.bridge_value_type(key_type)?;
                 let value = self.bridge_value_type(value_type)?;
                 Ok(quote!(std::collections::HashMap<#key, #value>))
+            }
+            Type::Box { inner_type } => self.bridge_value_type(inner_type),
+            Type::Set { inner_type } => {
+                let inner = self.bridge_value_type(inner_type)?;
+                Ok(quote!(std::collections::HashSet<#inner>))
             }
             Type::Stream { .. } => bail!("native streams are not wired into napi bridge types yet"),
             Type::InputStream { .. } => {
@@ -2386,8 +2407,10 @@ impl<'a> Generator<'a> {
                 __val
             })),
             Type::Object { imp, .. } => match imp {
-                ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!((*(#ident)).0.clone())),
-                ObjectImpl::CallbackTrait => {
+                ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
+                    Ok(quote!((*(#ident)).0.clone()))
+                }
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     let trait_path = self.core_type_path(ty.clone());
                     Ok(quote!(std::sync::Arc::new(#ident) as std::sync::Arc<dyn #trait_path>))
                 }
@@ -2446,8 +2469,12 @@ impl<'a> Generator<'a> {
             Type::Bytes => Ok(quote!(#expr.into())),
             Type::Record { .. } | Type::Enum { .. } => Ok(quote!(#expr.into())),
             Type::Object { imp, .. } => match imp {
-                ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!(#expr.0.clone())),
-                ObjectImpl::CallbackTrait => bail!("callback traits are not supported here"),
+                ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
+                    Ok(quote!(#expr.0.clone()))
+                }
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
+                    bail!("callback traits are not supported here")
+                }
             },
             Type::Optional { inner_type } => {
                 let inner = self.lower_value_expr(quote!(value), inner_type)?;
@@ -2469,6 +2496,11 @@ impl<'a> Generator<'a> {
                         .map(|(key, value)| ({ #key }, { #value }))
                         .collect()
                 ))
+            }
+            Type::Box { inner_type } => self.lower_value_expr(expr, inner_type),
+            Type::Set { inner_type } => {
+                let inner = self.lower_value_expr(quote!(value), inner_type)?;
+                Ok(quote!(#expr.into_iter().map(|value| { #inner }).collect()))
             }
             Type::Stream { .. } => bail!("native streams are not wired into napi lowering yet"),
             Type::InputStream { .. } => {
@@ -2515,11 +2547,11 @@ impl<'a> Generator<'a> {
             Type::Bytes => Ok(quote!(#expr.into())),
             Type::Record { .. } | Type::Enum { .. } => Ok(quote!(#expr.into())),
             Type::Object { name, imp, .. } => match imp {
-                ObjectImpl::Struct | ObjectImpl::Trait => {
+                ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
                     let ident = rust_ident(name);
                     Ok(quote!(#ident(#expr)))
                 }
-                ObjectImpl::CallbackTrait => bail!(
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => bail!(
                     "callback trait `{name}` cannot be returned to JavaScript in the napi bridge"
                 ),
             },
@@ -2543,6 +2575,11 @@ impl<'a> Generator<'a> {
                         .map(|(key, value)| ({ #key }, { #value }))
                         .collect()
                 ))
+            }
+            Type::Box { inner_type } => self.lift_value_expr(expr, inner_type),
+            Type::Set { inner_type } => {
+                let inner = self.lift_value_expr(quote!(value), inner_type)?;
+                Ok(quote!(#expr.into_iter().map(|value| { #inner }).collect()))
             }
             Type::Stream { .. } => bail!("native streams are not wired into napi lifting yet"),
             Type::InputStream { .. } => bail!("input streams are not wired into napi lifting yet"),
@@ -2647,11 +2684,11 @@ impl<'a> Generator<'a> {
                 Ok(quote!(std::collections::HashMap<#key, #value>))
             }
             Type::Object { name, imp, .. } => match imp {
-                ObjectImpl::Struct | ObjectImpl::Trait => {
+                ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
                     let ident = rust_ident(name);
                     Ok(quote!(napi::bindgen_prelude::ClassInstance<'static, #ident>))
                 }
-                ObjectImpl::CallbackTrait => {
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     let ident = rust_ident(name);
                     Ok(quote!(#ident))
                 }
@@ -2694,8 +2731,10 @@ impl<'a> Generator<'a> {
             Type::Bytes => Ok(quote!(#expr.into())),
             Type::Record { .. } | Type::Enum { .. } => Ok(quote!(#expr.into())),
             Type::Object { imp, .. } => match imp {
-                ObjectImpl::Struct | ObjectImpl::Trait => Ok(quote!((*(#expr)).0.clone())),
-                ObjectImpl::CallbackTrait => {
+                ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
+                    Ok(quote!((*(#expr)).0.clone()))
+                }
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     let core_path = self.core_type_path(ty.clone());
                     Ok(quote!(std::sync::Arc::new(#expr) as std::sync::Arc<dyn #core_path>))
                 }
@@ -2720,6 +2759,11 @@ impl<'a> Generator<'a> {
                         .map(|(key, value)| ({ #key }, { #value }))
                         .collect()
                 ))
+            }
+            Type::Box { inner_type } => self.lower_callback_value_expr(expr, inner_type),
+            Type::Set { inner_type } => {
+                let inner = self.lower_callback_value_expr(quote!(value), inner_type)?;
+                Ok(quote!(#expr.into_iter().map(|value| { #inner }).collect()))
             }
             Type::Stream { .. } => {
                 bail!("native streams are not supported in callback values yet")
@@ -2764,7 +2808,7 @@ impl<'a> Generator<'a> {
         match ty {
             Type::Object {
                 name,
-                imp: ObjectImpl::CallbackTrait,
+                imp: ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly),
                 ..
             }
             | Type::CallbackInterface { name, .. } => {
@@ -2827,7 +2871,7 @@ impl<'a> Generator<'a> {
                     let core_path = self.core_type_path(ty.clone());
                     Ok(quote!(std::sync::Arc<#core_path>))
                 }
-                ObjectImpl::Trait | ObjectImpl::CallbackTrait => {
+                ObjectImpl::Trait(_) => {
                     let core_path = self.core_type_path(ty.clone());
                     Ok(quote!(std::sync::Arc<dyn #core_path>))
                 }
@@ -2848,6 +2892,11 @@ impl<'a> Generator<'a> {
                 let value = self.core_callback_return_type(value_type)?;
                 Ok(quote!(std::collections::HashMap<#key, #value>))
             }
+            Type::Box { inner_type } => self.core_callback_return_type(inner_type),
+            Type::Set { inner_type } => {
+                let inner = self.core_callback_return_type(inner_type)?;
+                Ok(quote!(std::collections::HashSet<#inner>))
+            }
             Type::Stream { .. } => {
                 bail!("native streams are not supported in callback returns yet")
             }
@@ -2867,7 +2916,7 @@ impl<'a> Generator<'a> {
         let core_path = self.core_type_path(object.as_type());
         match object.imp() {
             ObjectImpl::Struct => quote!(std::sync::Arc<#core_path>),
-            ObjectImpl::Trait | ObjectImpl::CallbackTrait => {
+            ObjectImpl::Trait(_) => {
                 quote!(std::sync::Arc<dyn #core_path>)
             }
         }
@@ -2933,6 +2982,11 @@ impl<'a> Generator<'a> {
                 let key = self.core_value_type(key_type)?;
                 let value = self.core_value_type(value_type)?;
                 Ok(quote!(std::collections::HashMap<#key, #value>))
+            }
+            Type::Box { inner_type } => self.core_value_type(inner_type),
+            Type::Set { inner_type } => {
+                let inner = self.core_value_type(inner_type)?;
+                Ok(quote!(std::collections::HashSet<#inner>))
             }
             Type::Stream { .. } => bail!("nested native stream types are not supported"),
             Type::InputStream { .. } => bail!("nested input stream types are not supported"),
@@ -3027,6 +3081,8 @@ impl<'a> Generator<'a> {
                 self.type_suffix(key_type),
                 self.type_suffix(value_type)
             ),
+            Type::Box { inner_type } => format!("Box{}", self.type_suffix(inner_type)),
+            Type::Set { inner_type } => format!("Set{}", self.type_suffix(inner_type)),
             Type::Stream {
                 item_type,
                 error_type,

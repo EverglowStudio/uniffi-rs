@@ -110,7 +110,7 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
             bail!("No UniFFI metadata found for crate {crate_filter}");
         }
     }
-    let cis = loader.load_cis(metadata)?;
+    let cis = loader.load_cis(&options.source, metadata)?;
     let override_toml = load_override_toml(options.config_override.as_ref())?;
     let mut components: Vec<Component<JsConfig>> =
         loader.load_components(cis, |_ci, mut toml| {

@@ -854,6 +854,11 @@ mod test_function_metadata {
             ConstructorMetadata {
                 module_path: "uniffi_fixture_metadata::tests::test_function_metadata".into(),
                 self_name: "CalculatorRenamed".into(),
+                self_type: Some(Type::Object {
+                    module_path: "uniffi_fixture_metadata::tests::test_function_metadata".into(),
+                    name: "CalculatorRenamed".into(),
+                    imp: ObjectImpl::Struct,
+                }),
                 name: "new".into(),
                 orig_name: None,
                 is_async: false,
@@ -871,6 +876,11 @@ mod test_function_metadata {
             ConstructorMetadata {
                 module_path: "uniffi_fixture_metadata::tests::test_function_metadata".into(),
                 self_name: "CalculatorRenamed".into(),
+                self_type: Some(Type::Object {
+                    module_path: "uniffi_fixture_metadata::tests::test_function_metadata".into(),
+                    name: "CalculatorRenamed".into(),
+                    imp: ObjectImpl::Struct,
+                }),
                 name: "new_renamed".into(),
                 orig_name: Some("new2".into()),
                 is_async: false,

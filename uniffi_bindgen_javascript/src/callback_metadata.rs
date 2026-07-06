@@ -9,13 +9,13 @@
 
 use std::collections::BTreeSet;
 
-use uniffi_bindgen::interface::{ComponentInterface, ObjectImpl, Type};
+use uniffi_bindgen::interface::{ComponentInterface, ObjectImpl, TraitKind, Type};
 
 pub(crate) fn is_callback_return_type(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Object {
-            imp: ObjectImpl::CallbackTrait,
+            imp: ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly),
             ..
         } | Type::CallbackInterface { .. }
     )
@@ -24,7 +24,7 @@ pub(crate) fn is_callback_return_type(ty: &Type) -> bool {
 pub(crate) fn contains_callback_return_type(ty: &Type) -> bool {
     match ty {
         Type::Object {
-            imp: ObjectImpl::CallbackTrait,
+            imp: ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly),
             ..
         }
         | Type::CallbackInterface { .. } => true,
@@ -43,7 +43,12 @@ pub(crate) fn callback_error_enum_names(ci: &ComponentInterface) -> BTreeSet<Str
         .chain(
             ci.object_definitions()
                 .iter()
-                .filter(|obj| matches!(obj.imp(), ObjectImpl::CallbackTrait))
+                .filter(|obj| {
+                    matches!(
+                        obj.imp(),
+                        ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+                    )
+                })
                 .flat_map(|obj| obj.methods()),
         )
         .filter_map(|method| match method.throws_type() {

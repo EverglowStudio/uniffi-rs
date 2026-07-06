@@ -111,10 +111,29 @@ impl Constructor {
             None => (item_name, None),
             Some(name) => (name.clone(), Some(item_name)),
         };
+        let metadata_module_path = module_path.path_string();
+        let metadata_self_name = self_name.to_string();
+        let metadata_self_type = match self_ty {
+            uniffi_meta::Type::Object { imp, .. } => uniffi_meta::Type::Object {
+                module_path: metadata_module_path.clone(),
+                name: metadata_self_name.clone(),
+                imp: *imp,
+            },
+            uniffi_meta::Type::Record { .. } => uniffi_meta::Type::Record {
+                module_path: metadata_module_path.clone(),
+                name: metadata_self_name.clone(),
+            },
+            uniffi_meta::Type::Enum { .. } => uniffi_meta::Type::Enum {
+                module_path: metadata_module_path.clone(),
+                name: metadata_self_name.clone(),
+            },
+            _ => self_ty.clone(),
+        };
 
         Ok(uniffi_meta::ConstructorMetadata {
-            module_path: module_path.path_string(),
-            self_name: self_name.to_string(),
+            module_path: metadata_module_path,
+            self_name: metadata_self_name,
+            self_type: Some(metadata_self_type),
             name,
             orig_name,
             docstring: self.attrs.docstring.clone(),

@@ -198,6 +198,8 @@ mod tests {
             trait_methods: Default::default(),
             uniffi_traits: Default::default(),
             trait_impls: Default::default(),
+            orig_names: Default::default(),
+            callable_id_counter: Default::default(),
         };
         let ty = uniffi_meta::Type::Stream {
             item_type: Box::new(uniffi_meta::Type::UInt32),
@@ -224,6 +226,8 @@ mod tests {
             trait_methods: Default::default(),
             uniffi_traits: Default::default(),
             trait_impls: Default::default(),
+            orig_names: Default::default(),
+            callable_id_counter: Default::default(),
         };
         let ty = uniffi_meta::Type::InputStream {
             item_type: Box::new(uniffi_meta::Type::UInt32),

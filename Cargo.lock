@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi-bindgen-tests-javascript"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2665,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi_bindgen_javascript"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2771,7 +2771,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi_runtime_javascript"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "camino",
 ]
