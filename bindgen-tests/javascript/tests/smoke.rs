@@ -14,7 +14,7 @@
 
 use camino::Utf8PathBuf;
 use std::process::Command;
-use uniffi_bindgen::{BindgenLoader, BindgenPaths};
+use uniffi_bindgen::{BindgenLoader, BindgenPaths, GlobalConfig};
 use uniffi_bindgen_javascript::{generate, FlavorTarget, GenerateJsOptions, HostCrateOptions};
 
 const EMPTY_GENERATED_FILES: &[(&str, &str)] = &[];
@@ -33,7 +33,7 @@ fn contains_dynamic_type_word(source: &str) -> bool {
 fn generate_arithmetic(out_dir: &Utf8PathBuf) {
     let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");
     assert!(source.exists(), "fixture UDL missing: {source}");
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -98,7 +98,7 @@ namespace async_callback_return {
 
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -529,7 +529,7 @@ crate-type = ["rlib"]
 
     let gen_dir = root.join("gen");
     std::fs::create_dir_all(&gen_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -738,7 +738,7 @@ crate-type = ["rlib"]
     // 2. Generate JS bindings from the UDL into ./gen.
     let gen_dir = root.join("gen");
     std::fs::create_dir_all(&gen_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -806,7 +806,7 @@ wasm_scalar = { path = "../biz" }
     // Isolate from any parent workspace so the temp crates build standalone.
     std::fs::write(
         root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"biz\", \"shim\"]\nresolver = \"2\"\n",
+        "[workspace]\nmembers = [\"biz\", \"shim\"]\nresolver = \"3\"\n",
     )
     .unwrap();
 
@@ -2499,7 +2499,7 @@ fn custom_types_wasm_static_contract() {
 
     let gen_dir = root.join("generated-wasm");
     std::fs::create_dir_all(&gen_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -2677,7 +2677,7 @@ crate-type = ["rlib"]
     // Generate JS bindings.
     let gen_dir = root.join("gen");
     std::fs::create_dir_all(&gen_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     let config_override = spec.config_toml.map(|toml| {
         let path = root.join("uniffi.toml");
         std::fs::write(&path, toml).unwrap();
@@ -2758,7 +2758,7 @@ async-trait = "0.1"
     }
     std::fs::write(
         root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"biz\", \"shim\"]\nresolver = \"2\"\n",
+        "[workspace]\nmembers = [\"biz\", \"shim\"]\nresolver = \"3\"\n",
     )
     .unwrap();
 
@@ -2932,7 +2932,7 @@ crate-type = ["rlib"]
 
     let gen_dir = root.join("gen");
     std::fs::create_dir_all(&gen_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -3041,7 +3041,7 @@ crate-type = ["rlib"]
 
     let gen_dir = root.join("gen");
     std::fs::create_dir_all(&gen_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -3400,7 +3400,7 @@ crate-type = ["rlib"]
     .unwrap();
     std::fs::write(biz.join("src/lib.rs"), "// placeholder\n").unwrap();
 
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -3448,6 +3448,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 uniffi = {{ path = {:?}, features = ["wasm-unstable-single-threaded"] }}
+
+[workspace]
+resolver = "3"
 "#,
             uniffi_dep.as_str()
         ),
@@ -3569,7 +3572,7 @@ fn generate_stream_tree(
     host_crates: Option<Utf8PathBuf>,
     flavors: Vec<FlavorTarget>,
 ) {
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -3617,6 +3620,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 uniffi = {{ path = {:?}, features = ["tokio", "default-async-runtime-tokio", "wasm-unstable-single-threaded"] }}
+
+[workspace]
+resolver = "3"
 "#,
             uniffi_dep.as_str()
         ),
@@ -3765,7 +3771,7 @@ fn generate_input_stream_tree(
     host_crates: Option<Utf8PathBuf>,
     flavors: Vec<FlavorTarget>,
 ) {
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -5195,6 +5201,9 @@ crate-type = ["rlib"]
 
 [dependencies]
 uniffi = {{ path = {:?}, features = ["wasm-unstable-single-threaded"] }}
+
+[workspace]
+resolver = "3"
 "#,
             uniffi_dep.as_str()
         ),
@@ -5619,7 +5628,7 @@ console.log("ok");
 fn generate_arithmetic_with_host_crates(out_dir: &Utf8PathBuf, host_crates_dir: &Utf8PathBuf) {
     let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");
     let manifest = workspace_root().join("examples/arithmetic/Cargo.toml");
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -5726,7 +5735,7 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
     let out_dir = Utf8PathBuf::from_path_buf(out.path().join("generated")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -5814,7 +5823,7 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     std::fs::create_dir_all(&out_dir).unwrap();
     let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");
     let manifest = workspace_root().join("examples/arithmetic/Cargo.toml");
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -5889,7 +5898,7 @@ fn write_synthetic_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathB
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         core.join("Cargo.toml"),
-        "[package]\nname = \"tiny-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\nname = \"tiny\"\ncrate-type = [\"lib\"]\n\n[dependencies]\n\n[workspace]\n",
+        "[package]\nname = \"tiny-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\nname = \"tiny\"\ncrate-type = [\"lib\"]\n\n[dependencies]\n\n[workspace]\nresolver = \"3\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -5910,7 +5919,7 @@ fn generate_synthetic_with_host_crates(root: &std::path::Path) -> (Utf8PathBuf, 
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -6044,7 +6053,7 @@ fn generate_synthetic_gated(root: &std::path::Path, flavors: Vec<FlavorTarget>) 
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -6871,7 +6880,9 @@ fn write_cli_wasm_fixture(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) 
              uniffi = {{ path = \"{}\" }}\n\
              thiserror = \"2\"\n\n\
              [build-dependencies]\n\
-             uniffi = {{ path = \"{}\", features = [\"build\"] }}\n",
+             uniffi = {{ path = \"{}\", features = [\"build\"] }}\n\n\
+             [workspace]\n\
+             resolver = \"3\"\n",
             uniffi_path, uniffi_path
         ),
     )
@@ -6966,7 +6977,7 @@ fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
         core.join("Cargo.toml"),
         "[package]\nname = \"napi-compat-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
          [lib]\nname = \"napi_compat\"\ncrate-type = [\"lib\"]\n\n\
-         [dependencies]\n\n[workspace]\n",
+         [dependencies]\n\n[workspace]\nresolver = \"3\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -7035,7 +7046,7 @@ fn generate_rich_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -7067,7 +7078,7 @@ fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf
         format!(
             "[package]\nname = \"napi-callback-return-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
              [lib]\nname = \"napi_callback_return_core\"\ncrate-type = [\"lib\"]\n\n\
-             [dependencies]\nasync-trait = \"0.1\"\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\n",
+             [dependencies]\nasync-trait = \"0.1\"\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\nresolver = \"3\"\n",
             uniffi_path.as_str()
         ),
     )
@@ -7250,7 +7261,7 @@ fn generate_callback_return_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -7282,7 +7293,7 @@ fn write_async_callback_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8
         format!(
             "[package]\nname = \"napi-async-callback-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
              [lib]\nname = \"napi_async_callback_core\"\ncrate-type = [\"lib\"]\n\n\
-             [dependencies]\nasync-trait = \"0.1\"\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\n",
+             [dependencies]\nasync-trait = \"0.1\"\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\nresolver = \"3\"\n",
             uniffi_path.as_str()
         ),
     )
@@ -7345,7 +7356,7 @@ fn generate_async_callback_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -7377,7 +7388,7 @@ fn write_fallible_async_callback_core_crate(root: &std::path::Path) -> (Utf8Path
         format!(
             "[package]\nname = \"napi-fallible-async-callback-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
              [lib]\nname = \"napi_fallible_async_callback_core\"\ncrate-type = [\"lib\"]\n\n\
-             [dependencies]\nasync-trait = \"0.1\"\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\n",
+             [dependencies]\nasync-trait = \"0.1\"\nuniffi = {{ path = {:?}, default-features = false }}\n\n[workspace]\nresolver = \"3\"\n",
             uniffi_path.as_str()
         ),
     )
@@ -7466,7 +7477,7 @@ fn generate_fallible_async_callback_napi_host(root: &std::path::Path) -> Utf8Pat
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -7496,7 +7507,7 @@ fn write_temporal_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBu
         core.join("Cargo.toml"),
         "[package]\nname = \"napi-temporal-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
          [lib]\nname = \"napi_temporal_core\"\ncrate-type = [\"lib\"]\n\n\
-         [dependencies]\n\n[workspace]\n",
+         [dependencies]\n\n[workspace]\nresolver = \"3\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -7622,7 +7633,7 @@ fn generate_temporal_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -7674,6 +7685,7 @@ napi-derive = {{ version = "3.5.3", features = ["type-def"] }}
 napi-build = "2.3.1"
 
 [workspace]
+resolver = "3"
 "#,
             manifest.parent().unwrap().as_str(),
             uniffi_path.as_str()
@@ -7858,7 +7870,7 @@ fn generate_custom_napi_tree(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBu
     let (udl, config, manifest) = write_custom_core_crate(root);
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
-    let loader = BindgenLoader::new(BindgenPaths::default());
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
@@ -7918,6 +7930,7 @@ napi-derive = {{ version = "3.5.3", features = ["type-def"] }}
 napi-build = "2.3.1"
 
 [workspace]
+resolver = "3"
 "#,
             manifest.parent().unwrap().as_str(),
             uniffi_path.as_str()

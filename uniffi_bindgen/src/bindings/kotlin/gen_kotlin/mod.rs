@@ -1224,9 +1224,11 @@ mod test {
         items.insert(Metadata::Record(RecordMetadata {
             module_path: module_path.to_owned(),
             name: "StreamEvent".to_owned(),
+            orig_name: None,
             remote: false,
             fields: vec![FieldMetadata {
                 name: "value".to_owned(),
+                orig_name: None,
                 ty: Type::UInt32,
                 default: None,
                 docstring: None,
@@ -1236,10 +1238,12 @@ mod test {
         items.insert(Metadata::Enum(EnumMetadata {
             module_path: module_path.to_owned(),
             name: "StreamError".to_owned(),
+            orig_name: None,
             shape: EnumShape::Error { flat: true },
             remote: false,
             variants: vec![VariantMetadata {
                 name: "Boom".to_owned(),
+                orig_name: None,
                 discr: None,
                 fields: vec![],
                 docstring: None,
@@ -1251,6 +1255,7 @@ mod test {
         items.insert(Metadata::Func(FnMetadata {
             module_path: module_path.to_owned(),
             name: "count_events".to_owned(),
+            orig_name: None,
             is_async: false,
             inputs: vec![FnParamMetadata {
                 name: "count".to_owned(),
@@ -1307,9 +1312,11 @@ mod test {
         items.insert(Metadata::Record(RecordMetadata {
             module_path: module_path.to_owned(),
             name: "CounterEvent".to_owned(),
+            orig_name: None,
             remote: false,
             fields: vec![FieldMetadata {
                 name: "value".to_owned(),
+                orig_name: None,
                 ty: Type::UInt32,
                 default: None,
                 docstring: None,
@@ -1319,10 +1326,12 @@ mod test {
         items.insert(Metadata::Enum(EnumMetadata {
             module_path: module_path.to_owned(),
             name: "StreamError".to_owned(),
+            orig_name: None,
             shape: EnumShape::Error { flat: true },
             remote: false,
             variants: vec![VariantMetadata {
                 name: "Boom".to_owned(),
+                orig_name: None,
                 discr: None,
                 fields: vec![],
                 docstring: None,
@@ -1334,6 +1343,7 @@ mod test {
         items.insert(Metadata::Func(FnMetadata {
             module_path: module_path.to_owned(),
             name: "sum_events".to_owned(),
+            orig_name: None,
             is_async: true,
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),
@@ -1354,6 +1364,7 @@ mod test {
         items.insert(Metadata::Func(FnMetadata {
             module_path: module_path.to_owned(),
             name: "running_sum".to_owned(),
+            orig_name: None,
             is_async: false,
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),

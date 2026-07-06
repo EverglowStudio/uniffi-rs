@@ -8,7 +8,7 @@ use crate::{converters::convert_docstring, InterfaceCollector};
 use anyhow::{bail, Result};
 use std::collections::HashSet;
 use uniffi_meta::{
-    ConstructorMetadata, FnParamMetadata, MethodMetadata, ObjectMetadata, PassBy, Type,
+    ConstructorMetadata, FnParamMetadata, MethodMetadata, ObjectImpl, ObjectMetadata, PassBy, Type,
     UniffiTraitMetadata,
 };
 

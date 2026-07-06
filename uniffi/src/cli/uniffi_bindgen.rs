@@ -8,7 +8,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::fmt;
 use uniffi_bindgen::{
     bindings::{generate, python, GenerateOptions, TargetLanguage},
-    pipeline::initial,
     BindgenLoader, BindgenPaths, GlobalConfig,
 };
 use uniffi_bindgen_javascript::{FlavorTarget, GenerateJsOptions, HostCrateOptions};

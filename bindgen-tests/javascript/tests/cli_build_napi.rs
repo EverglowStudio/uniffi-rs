@@ -79,7 +79,8 @@ fn write_cli_napi_fixture(root: &std::path::Path) -> Utf8PathBuf {
              uniffi = {{ path = \"{}\" }}\n\n\
              [build-dependencies]\n\
              uniffi = {{ path = \"{}\", features = [\"build\"] }}\n\n\
-             [workspace]\n",
+             [workspace]\n\
+             resolver = \"3\"\n",
             uniffi_path, uniffi_path
         ),
     )

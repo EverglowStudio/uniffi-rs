@@ -13,8 +13,8 @@ use anyhow::Result;
 use camino::Utf8Path;
 use fs_err as fs;
 use heck::ToUpperCamelCase;
-use uniffi_bindgen::interface::ObjectImpl;
 use uniffi_bindgen::interface::{AsType, Method, Type};
+use uniffi_bindgen::interface::{ObjectImpl, TraitKind};
 use uniffi_bindgen::Component;
 
 use crate::JsConfig;
@@ -566,6 +566,8 @@ fn collect_ohos_type_names(ty: &Type, out: &mut std::collections::BTreeSet<Strin
         }
         Type::Optional { inner_type }
         | Type::Sequence { inner_type }
+        | Type::Box { inner_type }
+        | Type::Set { inner_type }
         | Type::Stream {
             item_type: inner_type,
             ..
@@ -615,7 +617,10 @@ fn render_ohos_extra_types(ci: &uniffi_bindgen::ComponentInterface) -> String {
         ));
     }
     for object in ci.object_definitions() {
-        if matches!(object.imp(), ObjectImpl::CallbackTrait) {
+        if matches!(
+            object.imp(),
+            ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly)
+        ) {
             out.push_str(&render_ohos_callback_type(object.name(), &object.methods()));
         }
     }
@@ -686,6 +691,8 @@ fn ohos_native_ts_type(ty: &Type) -> String {
         Type::Map { value_type, .. } => {
             format!("Record<string, {}>", ohos_native_ts_type(value_type))
         }
+        Type::Box { inner_type } => ohos_native_ts_type(inner_type),
+        Type::Set { inner_type } => format!("Set<{}>", ohos_native_ts_type(inner_type)),
         Type::Stream { item_type, .. } => {
             format!("AsyncIterable<{}>", ohos_native_ts_type(item_type))
         }

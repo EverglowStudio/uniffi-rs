@@ -1,6 +1,6 @@
 [package]
 name = "uniffi_runtime_javascript"
-version = "0.31.0"
+version = "0.32.0"
 description = "Bundled TypeScript runtime source consumed by uniffi_bindgen_javascript output"
 license = "MPL-2.0"
 edition = "2021"

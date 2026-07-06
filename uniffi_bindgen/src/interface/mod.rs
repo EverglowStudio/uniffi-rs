@@ -1757,6 +1757,7 @@ new definition: Enum {
             uniffi_meta::FnMetadata {
                 module_path: "stream_core".to_string(),
                 name: "events".to_string(),
+                orig_name: None,
                 is_async: false,
                 inputs: vec![],
                 return_type: Some(Type::Stream {
@@ -1797,6 +1798,7 @@ new definition: Enum {
             uniffi_meta::FnMetadata {
                 module_path: "stream_core".to_string(),
                 name: "sum_events".to_string(),
+                orig_name: None,
                 is_async: true,
                 inputs: vec![uniffi_meta::FnParamMetadata {
                     name: "events".to_string(),

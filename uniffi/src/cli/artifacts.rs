@@ -493,11 +493,8 @@ node_modules/\n\
         }
 
         let package_swift = package_root.join("Package.swift");
-        std::fs::write(
-            &package_swift,
-            apple_package_manifest_source(meta, args)?,
-        )
-        .with_context(|| format!("writing Apple package manifest {package_swift}"))?;
+        std::fs::write(&package_swift, apple_package_manifest_source(meta, args)?)
+            .with_context(|| format!("writing Apple package manifest {package_swift}"))?;
 
         Ok(())
     }
@@ -899,6 +896,10 @@ fn build_android(args: &BuildArgs) -> Result<()> {
         crate_filter: args.crate_name.clone(),
         metadata_no_deps: args.metadata_no_deps,
         format: !args.no_format,
+        features: args.cargo_features.clone(),
+        all_features: false,
+        no_default_features: false,
+        target: None,
     })?;
 
     if let Some(kotlin_out) = &args.android_kotlin_out {
@@ -989,6 +990,10 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
         crate_filter: args.crate_name.clone(),
         metadata_no_deps: args.metadata_no_deps,
         format: !args.no_format,
+        features: args.cargo_features.clone(),
+        all_features: false,
+        no_default_features: false,
+        target: None,
     })?;
 
     let headers_dir = out_dir.join("apple/headers");
@@ -1007,8 +1012,9 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
         .unwrap_or_else(|| Utf8Path::new("."))
         .join(".framework-build");
     if framework_build_root.exists() {
-        std::fs::remove_dir_all(&framework_build_root)
-            .with_context(|| format!("removing stale framework build dir {framework_build_root}"))?;
+        std::fs::remove_dir_all(&framework_build_root).with_context(|| {
+            format!("removing stale framework build dir {framework_build_root}")
+        })?;
     }
     std::fs::create_dir_all(&framework_build_root)
         .with_context(|| format!("creating framework build dir {framework_build_root}"))?;
@@ -1072,7 +1078,9 @@ fn stage_apple_framework_slice(
     metallibs_required: bool,
 ) -> Result<Utf8PathBuf> {
     let slice = apple_slice_name(target)?;
-    let framework_dir = framework_build_root.join(slice).join(format!("{framework_name}.framework"));
+    let framework_dir = framework_build_root
+        .join(slice)
+        .join(format!("{framework_name}.framework"));
     if framework_dir.exists() {
         std::fs::remove_dir_all(&framework_dir)
             .with_context(|| format!("removing stale framework dir {framework_dir}"))?;
@@ -1358,10 +1366,18 @@ fn create_apple_framework_layout(
         let resources_dir = version_a_dir.join("Resources");
         std::fs::create_dir_all(&resources_dir)
             .with_context(|| format!("creating macOS framework resources dir {resources_dir}"))?;
-        std::fs::create_dir_all(version_a_dir.join("Headers"))
-            .with_context(|| format!("creating macOS framework headers dir {}", version_a_dir.join("Headers")))?;
-        std::fs::create_dir_all(version_a_dir.join("Modules"))
-            .with_context(|| format!("creating macOS framework modules dir {}", version_a_dir.join("Modules")))?;
+        std::fs::create_dir_all(version_a_dir.join("Headers")).with_context(|| {
+            format!(
+                "creating macOS framework headers dir {}",
+                version_a_dir.join("Headers")
+            )
+        })?;
+        std::fs::create_dir_all(version_a_dir.join("Modules")).with_context(|| {
+            format!(
+                "creating macOS framework modules dir {}",
+                version_a_dir.join("Modules")
+            )
+        })?;
         create_symlink("A", &current_dir)
             .with_context(|| format!("creating framework symlink {current_dir} -> A"))?;
         create_symlink(
@@ -1369,25 +1385,50 @@ fn create_apple_framework_layout(
             &framework_binary,
         )
         .with_context(|| format!("creating framework binary symlink {framework_binary}"))?;
-        create_symlink("Versions/Current/Headers", &framework_dir.join("Headers"))
-            .with_context(|| format!("creating framework headers symlink {}", framework_dir.join("Headers")))?;
+        create_symlink("Versions/Current/Headers", &framework_dir.join("Headers")).with_context(
+            || {
+                format!(
+                    "creating framework headers symlink {}",
+                    framework_dir.join("Headers")
+                )
+            },
+        )?;
         create_symlink(
             "Versions/Current/Resources",
             &framework_dir.join("Resources"),
         )
-        .with_context(|| format!("creating framework resources symlink {}", framework_dir.join("Resources")))?;
-        create_symlink("Versions/Current/Modules", &framework_dir.join("Modules"))
-            .with_context(|| format!("creating framework modules symlink {}", framework_dir.join("Modules")))?;
+        .with_context(|| {
+            format!(
+                "creating framework resources symlink {}",
+                framework_dir.join("Resources")
+            )
+        })?;
+        create_symlink("Versions/Current/Modules", &framework_dir.join("Modules")).with_context(
+            || {
+                format!(
+                    "creating framework modules symlink {}",
+                    framework_dir.join("Modules")
+                )
+            },
+        )?;
         Ok((
             version_a_dir.join(framework_name),
             resources_dir.join("Info.plist"),
             Some(resources_dir.join("default.metallib")),
         ))
     } else {
-        std::fs::create_dir_all(framework_dir.join("Headers"))
-            .with_context(|| format!("creating iOS framework headers dir {}", framework_dir.join("Headers")))?;
-        std::fs::create_dir_all(framework_dir.join("Modules"))
-            .with_context(|| format!("creating iOS framework modules dir {}", framework_dir.join("Modules")))?;
+        std::fs::create_dir_all(framework_dir.join("Headers")).with_context(|| {
+            format!(
+                "creating iOS framework headers dir {}",
+                framework_dir.join("Headers")
+            )
+        })?;
+        std::fs::create_dir_all(framework_dir.join("Modules")).with_context(|| {
+            format!(
+                "creating iOS framework modules dir {}",
+                framework_dir.join("Modules")
+            )
+        })?;
         Ok((
             framework_binary,
             framework_dir.join("Info.plist"),
@@ -1427,8 +1468,9 @@ fn copy_apple_framework_headers(
             continue;
         }
         let destination = dest_headers_dir.join(name);
-        std::fs::copy(&path, &destination)
-            .with_context(|| format!("copying Apple framework support file {path} into {destination}"))?;
+        std::fs::copy(&path, &destination).with_context(|| {
+            format!("copying Apple framework support file {path} into {destination}")
+        })?;
     }
     let modulemap = format!(
         "framework module {framework_name} {{\n    umbrella header \"{framework_name}.h\"\n    export *\n    use \"Darwin\"\n    use \"_Builtin_stdbool\"\n    use \"_Builtin_stdint\"\n}}\n"
@@ -1454,7 +1496,10 @@ fn rewrite_apple_framework_install_name(
         format!("@rpath/{framework_name}.framework/{framework_name}")
     };
     let mut command = Command::new("install_name_tool");
-    command.arg("-id").arg(&install_name).arg(framework_bin.as_str());
+    command
+        .arg("-id")
+        .arg(&install_name)
+        .arg(framework_bin.as_str());
     run_command("install_name_tool", &mut command, "install_name_tool")
 }
 
@@ -1726,7 +1771,10 @@ fn apple_package_platform_lines(args: &BuildArgs) -> String {
             .unwrap_or_else(|_| "16.0".to_string());
         lines.push(format!("        .iOS(\"{deployment}\"),"));
     }
-    if targets.iter().any(|target| target == "aarch64-apple-darwin") {
+    if targets
+        .iter()
+        .any(|target| target == "aarch64-apple-darwin")
+    {
         let deployment =
             std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "15.0".to_string());
         lines.push(format!("        .macOS(\"{deployment}\"),"));
@@ -2450,8 +2498,8 @@ name = "uni_core"
             "artifacts/rust/ohos/Cargo.toml"
         );
 
-        let apple_package = std::fs::read_to_string(package_dir.join("artifacts/apple/Package.swift"))
-            .unwrap();
+        let apple_package =
+            std::fs::read_to_string(package_dir.join("artifacts/apple/Package.swift")).unwrap();
         assert!(apple_package.contains("name: \"UniCoreApple\""));
         assert!(apple_package.contains("name: \"uni_coreFFI\""));
         assert!(apple_package.contains("path: \"uni_core.xcframework\""));
@@ -2552,7 +2600,10 @@ name = "uni_core"
 
         assert_eq!(apple_package_product_name(&meta), "UniCoreApple");
         assert_eq!(apple_binary_target_name(&meta), "uni_coreFFI");
-        assert_eq!(upper_camel_case_identifier("hello-world_core"), "HelloWorldCore");
+        assert_eq!(
+            upper_camel_case_identifier("hello-world_core"),
+            "HelloWorldCore"
+        );
     }
 
     #[test]
