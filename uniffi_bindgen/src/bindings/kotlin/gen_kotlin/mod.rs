@@ -623,14 +623,10 @@ impl KotlinCodeOracle {
         }
     }
 
-    /// Kotlin/JNA direct mapping can mis-handle unsigned 8/16-bit direct return values
+    /// Kotlin/JNA direct mapping can mis-handle unsigned 8/16-bit direct values
     /// on some runtimes, so widen the raw carrier to Int and let the generated
-    /// converters lift it back into the public UByte/UShort API types.
-    fn ffi_type_label_for_direct_return(
-        &self,
-        ffi_type: &FfiType,
-        ci: &ComponentInterface,
-    ) -> String {
+    /// converters lift/lower through the public UByte/UShort API types.
+    fn ffi_type_label_for_direct(&self, ffi_type: &FfiType, ci: &ComponentInterface) -> String {
         match ffi_type {
             FfiType::UInt8 | FfiType::UInt16 => "Int".to_string(),
             _ => self.ffi_type_label_by_value(ffi_type, ci),
@@ -1008,7 +1004,16 @@ mod filters {
         _: &dyn askama::Values,
         ci: &ComponentInterface,
     ) -> Result<String, askama::Error> {
-        Ok(KotlinCodeOracle.ffi_type_label_for_direct_return(type_, ci))
+        Ok(KotlinCodeOracle.ffi_type_label_for_direct(type_, ci))
+    }
+
+    #[askama::filter_fn]
+    pub fn ffi_type_name_for_direct_arg(
+        type_: &FfiType,
+        _: &dyn askama::Values,
+        ci: &ComponentInterface,
+    ) -> Result<String, askama::Error> {
+        Ok(KotlinCodeOracle.ffi_type_label_for_direct(type_, ci))
     }
 
     #[askama::filter_fn]
@@ -1088,7 +1093,11 @@ mod filters {
         if arg.is_borrowed_bytes() {
             Ok("FfiConverterByRefBytes.lower".to_string())
         } else {
-            Ok(format!("{}.lower", arg.as_codetype().ffi_converter_name()))
+            match arg.as_type() {
+                Type::UInt8 => Ok("FfiConverterUByte.lowerForDirectCall".to_string()),
+                Type::UInt16 => Ok("FfiConverterUShort.lowerForDirectCall".to_string()),
+                _ => Ok(format!("{}.lower", arg.as_codetype().ffi_converter_name())),
+            }
         }
     }
 
@@ -1452,6 +1461,39 @@ mod test {
             !checksum_checks.contains(".toShort())"),
             "checksum comparisons should compare the widened Int carrier directly"
         );
+    }
+
+    #[test]
+    fn unsigned_int_args_use_direct_call_carriers() {
+        let mut ci = ComponentInterface::from_webidl(
+            r#"
+            namespace test_crate {
+                u32 byte_to_u32(u8 byte);
+                u32 short_to_u32(u16 value);
+            };
+            "#,
+            "test_crate",
+        )
+        .unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        let config = Config {
+            package_name: Some("uniffi.test_crate".to_string()),
+            cdylib_name: Some("test_crate".to_string()),
+            ..Config::default()
+        };
+
+        let bindings = generate_bindings(&config, &ci).unwrap();
+
+        assert!(
+            bindings.contains("`byte`: Int,"),
+            "u8 direct call arguments should use Int as the JNA carrier"
+        );
+        assert!(
+            bindings.contains("`value`: Int,"),
+            "u16 direct call arguments should use Int as the JNA carrier"
+        );
+        assert!(bindings.contains("FfiConverterUByte.lowerForDirectCall(`byte`)"));
+        assert!(bindings.contains("FfiConverterUShort.lowerForDirectCall(`value`)"));
     }
 
     #[test]

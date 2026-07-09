@@ -177,6 +177,7 @@ mod test {
             .arg(format!("-fmodule-map-file={tempdir}/combined.modulemap"))
             .arg("-L")
             .arg(tempdir)
+            .arg("-luniffi_bindgen_tests_swift")
             .arg("uniffi_bindgen_tests.swift")
             .arg("uniffi_bindgen_tests_external_types_source.swift");
         let status = command
@@ -203,7 +204,7 @@ mod test {
             .arg("-L")
             .arg(tempdir)
             .arg("-ltest_library")
-            .arg("-luniffi_bindgen_tests")
+            .arg("-luniffi_bindgen_tests_swift")
             .arg("-swift-version")
             .arg(swift_version())
             .arg("-Xcc")
