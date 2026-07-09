@@ -18,6 +18,10 @@ public object FfiConverterUShort: FfiConverter<UShort, Short> {
         return value.toShort()
     }
 
+    fun lowerForDirectCall(value: UShort): Int {
+        return value.toInt()
+    }
+
     override fun allocationSize(value: UShort) = 2UL
 
     override fun write(value: UShort, buf: ByteBuffer) {

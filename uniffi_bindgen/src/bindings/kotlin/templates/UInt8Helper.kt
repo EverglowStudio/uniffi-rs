@@ -18,6 +18,10 @@ public object FfiConverterUByte: FfiConverter<UByte, Byte> {
         return value.toByte()
     }
 
+    fun lowerForDirectCall(value: UByte): Int {
+        return value.toInt()
+    }
+
     override fun allocationSize(value: UByte) = 1UL
 
     override fun write(value: UByte, buf: ByteBuffer) {
