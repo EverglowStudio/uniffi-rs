@@ -25,8 +25,30 @@ pub fn render_napi_rust(ci: &ComponentInterface) -> Result<String> {
     Ok(prettyplease::unparse(&file))
 }
 
-pub fn render_ohos_rust(ci: &ComponentInterface) -> Result<String> {
-    let rust = render_napi_rust(ci)?;
+pub fn render_ohos_rust(
+    ci: &ComponentInterface,
+    identity_export: &str,
+    contract_digest: &str,
+) -> Result<String> {
+    ensure!(
+        identity_export == super::ohos_bridge_identity_export(contract_digest),
+        "invalid OHOS bridge identity export"
+    );
+    ensure!(
+        contract_digest.len() == 64 && contract_digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid OHOS facade contract digest"
+    );
+    let mut rust = render_napi_rust(ci)?;
+    let identity_ident = rust_ident(identity_export);
+    let identity_tokens = quote! {
+        #[allow(non_snake_case)]
+        #[napi]
+        pub fn #identity_ident() -> String {
+            #contract_digest.to_string()
+        }
+    };
+    let identity_file = parse2::<syn::File>(identity_tokens)?;
+    rust.push_str(&prettyplease::unparse(&identity_file));
     Ok(rust
         .replace("uniffi-bindgen-napi", "uniffi-bindgen-ohos")
         .replace("use napi_derive::napi;", "use napi_derive_ohos::napi;")
@@ -49,78 +71,8 @@ impl<'a> Generator<'a> {
             .any(|function| matches!(function.return_type(), Some(Type::Stream { .. })))
     }
 
-    fn input_stream_types(&self) -> Vec<Type> {
-        let mut out = std::collections::BTreeMap::new();
-        for function in self.ci.function_definitions() {
-            for arg in function.arguments() {
-                self.collect_input_stream_type(&arg.as_type(), &mut out);
-            }
-        }
-        for object in self.ci.object_definitions() {
-            for constructor in object.constructors() {
-                for arg in constructor.arguments() {
-                    self.collect_input_stream_type(&arg.as_type(), &mut out);
-                }
-            }
-            for method in object.methods() {
-                for arg in method.arguments() {
-                    self.collect_input_stream_type(&arg.as_type(), &mut out);
-                }
-            }
-        }
-        for record in self.ci.record_definitions() {
-            for constructor in record.constructors() {
-                for arg in constructor.arguments() {
-                    self.collect_input_stream_type(&arg.as_type(), &mut out);
-                }
-            }
-            for method in record.methods() {
-                for arg in method.arguments() {
-                    self.collect_input_stream_type(&arg.as_type(), &mut out);
-                }
-            }
-        }
-        for enum_ in self.ci.enum_definitions() {
-            for constructor in enum_.constructors() {
-                for arg in constructor.arguments() {
-                    self.collect_input_stream_type(&arg.as_type(), &mut out);
-                }
-            }
-            for method in enum_.methods() {
-                for arg in method.arguments() {
-                    self.collect_input_stream_type(&arg.as_type(), &mut out);
-                }
-            }
-        }
-        out.into_values().collect()
-    }
-
-    fn collect_input_stream_type(
-        &self,
-        ty: &Type,
-        out: &mut std::collections::BTreeMap<String, Type>,
-    ) {
-        match ty {
-            Type::InputStream { .. } => {
-                out.insert(self.input_stream_suffix(ty), ty.clone());
-            }
-            Type::Optional { inner_type } | Type::Sequence { inner_type } => {
-                self.collect_input_stream_type(inner_type, out)
-            }
-            Type::Map {
-                key_type,
-                value_type,
-            } => {
-                self.collect_input_stream_type(key_type, out);
-                self.collect_input_stream_type(value_type, out);
-            }
-            Type::Custom { builtin, .. } => self.collect_input_stream_type(builtin, out),
-            _ => {}
-        }
-    }
-
     fn render(&self) -> Result<TokenStream> {
-        let input_stream_types = self.input_stream_types();
+        let input_stream_descriptors = collect_input_stream_descriptors(self.ci)?;
         let records = self
             .ci
             .record_definitions()
@@ -145,7 +97,7 @@ impl<'a> Generator<'a> {
             .iter()
             .map(|function| self.render_function(function))
             .collect::<Result<Vec<_>>>()?;
-        let input_stream_helpers = self.render_input_stream_helpers(&input_stream_types)?;
+        let input_stream_helpers = self.render_input_stream_helpers(&input_stream_descriptors)?;
         let stream_helpers = if self.has_stream_functions() {
             quote! {
                 fn __uniffi_stream_handle_from_bigint(handle: BigInt) -> Result<::uniffi::Handle> {
@@ -298,13 +250,16 @@ impl<'a> Generator<'a> {
         })
     }
 
-    fn render_input_stream_helpers(&self, input_stream_types: &[Type]) -> Result<TokenStream> {
-        if input_stream_types.is_empty() {
+    fn render_input_stream_helpers(
+        &self,
+        input_stream_descriptors: &[InputStreamDescriptor],
+    ) -> Result<TokenStream> {
+        if input_stream_descriptors.is_empty() {
             return Ok(quote!());
         }
-        let typed_helpers = input_stream_types
+        let typed_helpers = input_stream_descriptors
             .iter()
-            .map(|ty| self.render_typed_input_stream_helper(ty))
+            .map(|descriptor| self.render_typed_input_stream_helper(descriptor))
             .collect::<Result<Vec<_>>>()?;
         Ok(quote! {
             pub struct __UniffiInputStream<NextResult: 'static + FromNapiValue> {
@@ -385,17 +340,14 @@ impl<'a> Generator<'a> {
         })
     }
 
-    fn render_typed_input_stream_helper(&self, ty: &Type) -> Result<TokenStream> {
-        let Type::InputStream {
-            item_type,
-            error_type,
-            ..
-        } = ty
-        else {
-            bail!("render_typed_input_stream_helper called with non-input-stream type")
-        };
-        let next_ident = self.input_stream_next_result_ident(ty);
-        let ops_ident = self.input_stream_ops_ident(ty);
+    fn render_typed_input_stream_helper(
+        &self,
+        descriptor: &InputStreamDescriptor,
+    ) -> Result<TokenStream> {
+        let item_type = descriptor.item_type();
+        let error_type = descriptor.error_type();
+        let next_ident = self.input_stream_next_result_ident(descriptor.input_type())?;
+        let ops_ident = self.input_stream_ops_ident(descriptor.input_type())?;
         let item_bridge_ty = self.bridge_return_type(item_type)?;
         let error_bridge_ty = self.bridge_return_type(error_type)?;
         let item_core_ty = self.core_value_type(item_type)?;
@@ -2265,7 +2217,7 @@ impl<'a> Generator<'a> {
     fn bridge_arg_type(&self, ty: &Type) -> Result<TokenStream> {
         match ty {
             Type::InputStream { .. } => {
-                let next_ident = self.input_stream_next_result_ident(ty);
+                let next_ident = self.input_stream_next_result_ident(ty)?;
                 Ok(quote!(__UniffiInputStream<#next_ident>))
             }
             Type::Object { name, imp, .. } => {
@@ -2416,7 +2368,7 @@ impl<'a> Generator<'a> {
                 }
             },
             Type::InputStream { .. } => {
-                let ops_ident = self.input_stream_ops_ident(ty);
+                let ops_ident = self.input_stream_ops_ident(ty)?;
                 Ok(quote!({
                     let __stream = #ident;
                     ::uniffi::UniFfiInputStream::from_handle_and_ops(
@@ -2427,6 +2379,22 @@ impl<'a> Generator<'a> {
                             _phantom: std::marker::PhantomData,
                         }),
                     )
+                }))
+            }
+            Type::Custom {
+                module_path,
+                builtin,
+                ..
+            } => {
+                let builtin_lower = self.lower_arg_expr(ident, builtin)?;
+                let builtin_ty = self.core_value_type(builtin)?;
+                let custom_ty = self.core_type_path(ty.clone());
+                let tag_ty = self.core_tag_path(module_path);
+                Ok(quote!({
+                    let __builtin = { #builtin_lower };
+                    let __ffi = <#builtin_ty as ::uniffi::Lower<#tag_ty>>::lower(__builtin);
+                    <#custom_ty as ::uniffi::Lift<#tag_ty>>::try_lift(__ffi)
+                        .map_err(into_napi_error)?
                 }))
             }
             _ => self.lower_value_expr(quote!(#ident), ty),
@@ -2517,7 +2485,7 @@ impl<'a> Generator<'a> {
                 ..
             } => {
                 let builtin_lower = self.lower_value_expr(expr, builtin)?;
-                let builtin_ty = self.bridge_value_type(builtin)?;
+                let builtin_ty = self.core_value_type(builtin)?;
                 let custom_ty = self.core_type_path(ty.clone());
                 let tag_ty = self.core_tag_path(module_path);
                 Ok(quote!({
@@ -2595,7 +2563,7 @@ impl<'a> Generator<'a> {
                     Type::Custom { builtin, .. } => builtin.as_ref(),
                     _ => unreachable!(),
                 };
-                let builtin_ty = self.bridge_value_type(builtin)?;
+                let builtin_ty = self.core_value_type(builtin)?;
                 let builtin_value = quote!({
                     let __builtin = <#builtin_ty as ::uniffi::Lift<#tag_ty>>::try_lift(
                         <#custom_ty as ::uniffi::Lower<#tag_ty>>::lower(#expr),
@@ -2783,7 +2751,7 @@ impl<'a> Generator<'a> {
                 ..
             } => {
                 let builtin_lower = self.lower_callback_value_expr(expr, builtin)?;
-                let builtin_ty = self.bridge_value_type(builtin)?;
+                let builtin_ty = self.core_value_type(builtin)?;
                 let custom_ty = self.core_type_path(ty.clone());
                 let tag_ty = self.core_tag_path(module_path);
                 Ok(quote!({
@@ -3026,75 +2994,518 @@ impl<'a> Generator<'a> {
         )
     }
 
-    fn input_stream_next_result_ident(&self, ty: &Type) -> syn::Ident {
-        format_ident!("__UniffiInputStream{}Next", self.input_stream_suffix(ty))
+    fn input_stream_next_result_ident(&self, ty: &Type) -> Result<syn::Ident> {
+        Ok(format_ident!(
+            "__UniffiInputStream{}Next",
+            describe_input_stream_type(ty)?.suffix()
+        ))
     }
 
-    fn input_stream_ops_ident(&self, ty: &Type) -> syn::Ident {
-        format_ident!("__UniffiInputStream{}Ops", self.input_stream_suffix(ty))
+    fn input_stream_ops_ident(&self, ty: &Type) -> Result<syn::Ident> {
+        Ok(format_ident!(
+            "__UniffiInputStream{}Ops",
+            describe_input_stream_type(ty)?.suffix()
+        ))
+    }
+}
+
+/// The single source of truth for an input stream bridge specialization.
+///
+/// `canonical` is a length-framed structural encoding of the item/error pair.
+/// It deliberately ignores the outer `is_send` bit because that bit does not
+/// change the foreign stream operations or their generated bridge types.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct InputStreamDescriptor {
+    input_type: Type,
+    item_type: Type,
+    error_type: Type,
+    canonical: String,
+    fingerprint: String,
+    suffix: String,
+}
+
+impl InputStreamDescriptor {
+    pub(super) fn input_type(&self) -> &Type {
+        &self.input_type
     }
 
-    fn input_stream_suffix(&self, ty: &Type) -> String {
-        match ty {
-            Type::InputStream {
-                item_type,
-                error_type,
-                ..
-            } => format!(
-                "{}{}",
-                self.type_suffix(item_type),
-                self.type_suffix(error_type)
-            ),
-            _ => self.type_suffix(ty),
+    pub(super) fn item_type(&self) -> &Type {
+        &self.item_type
+    }
+
+    pub(super) fn error_type(&self) -> &Type {
+        &self.error_type
+    }
+
+    pub(super) fn canonical(&self) -> &str {
+        &self.canonical
+    }
+
+    pub(super) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(super) fn suffix(&self) -> &str {
+        &self.suffix
+    }
+}
+
+/// Collect every input stream type accepted by the N-API generator.
+///
+/// Keep this callable list aligned with `Generator::validate`: top-level
+/// functions, Rust-owned object constructors/methods, and value-type
+/// constructors/methods are generated. Foreign callback methods are not
+/// included because input streams are not supported as callback arguments.
+pub(super) fn collect_input_stream_descriptors(
+    ci: &ComponentInterface,
+) -> Result<Vec<InputStreamDescriptor>> {
+    collect_input_stream_descriptors_with_builders(
+        ci,
+        stable_fingerprint,
+        build_input_stream_suffix,
+    )
+}
+
+/// Describe one direct input-stream argument using the same canonical rules as
+/// the component collector. This is used at individual lowering sites after
+/// the component-wide collector has performed collision validation.
+pub(super) fn describe_input_stream_type(ty: &Type) -> Result<InputStreamDescriptor> {
+    describe_input_stream_type_with_builders(ty, stable_fingerprint, build_input_stream_suffix)
+}
+
+fn collect_input_stream_descriptors_with_builders<Fingerprint, Suffix>(
+    ci: &ComponentInterface,
+    fingerprint_builder: Fingerprint,
+    suffix_builder: Suffix,
+) -> Result<Vec<InputStreamDescriptor>>
+where
+    Fingerprint: Fn(&str) -> String,
+    Suffix: Fn(&str, &str, &Type, &Type) -> String,
+{
+    let candidates = collect_input_stream_candidates(ci)?;
+    let mut by_canonical = std::collections::BTreeMap::<String, InputStreamDescriptor>::new();
+    let mut canonical_origins = std::collections::BTreeMap::<String, String>::new();
+    let mut fingerprint_owners = std::collections::BTreeMap::<String, (String, String)>::new();
+    let mut suffix_owners = std::collections::BTreeMap::<String, (String, String)>::new();
+
+    for (ty, origin) in candidates {
+        let descriptor =
+            describe_input_stream_type_with_builders(&ty, &fingerprint_builder, &suffix_builder)?;
+        if let Some(existing) = by_canonical.get(descriptor.canonical()) {
+            ensure!(
+                existing.item_type() == descriptor.item_type()
+                    && existing.error_type() == descriptor.error_type()
+                    && existing.fingerprint() == descriptor.fingerprint()
+                    && existing.suffix() == descriptor.suffix(),
+                "canonical input stream descriptor collision between `{}` and `{origin}` for `{}`",
+                canonical_origins
+                    .get(descriptor.canonical())
+                    .map(String::as_str)
+                    .unwrap_or("unknown callable"),
+                descriptor.canonical()
+            );
+            continue;
+        }
+
+        if let Some((owned_canonical, owned_origin)) =
+            fingerprint_owners.get(descriptor.fingerprint())
+        {
+            bail!(
+                "input stream descriptor fingerprint collision for `{}`: `{owned_origin}` uses `{owned_canonical}`, but `{origin}` uses `{}`",
+                descriptor.fingerprint(),
+                descriptor.canonical()
+            );
+        }
+
+        if let Some((owned_canonical, owned_origin)) = suffix_owners.get(descriptor.suffix()) {
+            bail!(
+                "input stream descriptor suffix collision for `{}`: `{owned_origin}` uses `{owned_canonical}`, but `{origin}` uses `{}`",
+                descriptor.suffix(),
+                descriptor.canonical()
+            );
+        }
+
+        suffix_owners.insert(
+            descriptor.suffix().to_string(),
+            (descriptor.canonical().to_string(), origin.clone()),
+        );
+        fingerprint_owners.insert(
+            descriptor.fingerprint().to_string(),
+            (descriptor.canonical().to_string(), origin.clone()),
+        );
+        canonical_origins.insert(descriptor.canonical().to_string(), origin);
+        by_canonical.insert(descriptor.canonical().to_string(), descriptor);
+    }
+
+    Ok(by_canonical.into_values().collect())
+}
+
+fn collect_input_stream_candidates(ci: &ComponentInterface) -> Result<Vec<(Type, String)>> {
+    let mut candidates = Vec::new();
+
+    for function in ci.function_definitions() {
+        collect_callable_input_stream_candidates(
+            function,
+            &format!("function `{}`", function.name()),
+            &mut candidates,
+        )?;
+    }
+
+    for object in ci.object_definitions() {
+        if !matches!(
+            object.imp(),
+            ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly)
+        ) {
+            continue;
+        }
+        for constructor in object.constructors() {
+            collect_callable_input_stream_candidates(
+                constructor,
+                &format!(
+                    "object `{}` constructor `{}`",
+                    object.name(),
+                    constructor.name()
+                ),
+                &mut candidates,
+            )?;
+        }
+        for method in object.methods() {
+            collect_callable_input_stream_candidates(
+                method,
+                &format!("object `{}` method `{}`", object.name(), method.name()),
+                &mut candidates,
+            )?;
         }
     }
 
-    fn type_suffix(&self, ty: &Type) -> String {
-        match ty {
-            Type::UInt8 => "UInt8".into(),
-            Type::Int8 => "Int8".into(),
-            Type::UInt16 => "UInt16".into(),
-            Type::Int16 => "Int16".into(),
-            Type::UInt32 => "UInt32".into(),
-            Type::Int32 => "Int32".into(),
-            Type::UInt64 => "UInt64".into(),
-            Type::Int64 => "Int64".into(),
-            Type::Float32 => "Float32".into(),
-            Type::Float64 => "Float64".into(),
-            Type::Boolean => "Boolean".into(),
-            Type::String => "String".into(),
-            Type::Bytes => "Bytes".into(),
-            Type::Timestamp => "Timestamp".into(),
-            Type::Duration => "Duration".into(),
-            Type::Record { name, .. }
-            | Type::Enum { name, .. }
-            | Type::Object { name, .. }
-            | Type::CallbackInterface { name, .. }
-            | Type::Custom { name, .. } => sanitize_ident(name).to_upper_camel_case(),
-            Type::Optional { inner_type } => format!("Optional{}", self.type_suffix(inner_type)),
-            Type::Sequence { inner_type } => format!("Sequence{}", self.type_suffix(inner_type)),
-            Type::Map {
-                key_type,
-                value_type,
-            } => format!(
-                "Map{}{}",
-                self.type_suffix(key_type),
-                self.type_suffix(value_type)
-            ),
-            Type::Box { inner_type } => format!("Box{}", self.type_suffix(inner_type)),
-            Type::Set { inner_type } => format!("Set{}", self.type_suffix(inner_type)),
-            Type::Stream {
-                item_type,
-                error_type,
-                ..
-            } => format!(
-                "Stream{}{}",
-                self.type_suffix(item_type),
-                self.type_suffix(error_type)
-            ),
-            Type::InputStream { .. } => format!("InputStream{}", self.input_stream_suffix(ty)),
+    for record in ci.record_definitions() {
+        for constructor in record.constructors() {
+            collect_callable_input_stream_candidates(
+                constructor,
+                &format!(
+                    "record `{}` constructor `{}`",
+                    record.name(),
+                    constructor.name()
+                ),
+                &mut candidates,
+            )?;
+        }
+        for method in record.methods() {
+            collect_callable_input_stream_candidates(
+                method,
+                &format!("record `{}` method `{}`", record.name(), method.name()),
+                &mut candidates,
+            )?;
         }
     }
+
+    for enum_ in ci.enum_definitions() {
+        for constructor in enum_.constructors() {
+            collect_callable_input_stream_candidates(
+                constructor,
+                &format!(
+                    "enum `{}` constructor `{}`",
+                    enum_.name(),
+                    constructor.name()
+                ),
+                &mut candidates,
+            )?;
+        }
+        for method in enum_.methods() {
+            collect_callable_input_stream_candidates(
+                method,
+                &format!("enum `{}` method `{}`", enum_.name(), method.name()),
+                &mut candidates,
+            )?;
+        }
+    }
+
+    Ok(candidates)
+}
+
+fn collect_callable_input_stream_candidates(
+    callable: &dyn Callable,
+    callable_label: &str,
+    out: &mut Vec<(Type, String)>,
+) -> Result<()> {
+    for argument in callable.arguments() {
+        let ty = argument.as_type();
+        if matches!(ty, Type::InputStream { .. }) {
+            out.push((
+                ty,
+                format!("{callable_label} argument `{}`", argument.name()),
+            ));
+            continue;
+        }
+        if ty
+            .iter_types()
+            .any(|nested| matches!(nested, Type::InputStream { .. }))
+        {
+            bail!(
+                "{callable_label} argument `{}` contains a nested input stream; input streams are only supported as direct arguments",
+                argument.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn describe_input_stream_type_with_builders<Fingerprint, Suffix>(
+    ty: &Type,
+    fingerprint_builder: Fingerprint,
+    suffix_builder: Suffix,
+) -> Result<InputStreamDescriptor>
+where
+    Fingerprint: Fn(&str) -> String,
+    Suffix: Fn(&str, &str, &Type, &Type) -> String,
+{
+    let Type::InputStream {
+        item_type,
+        error_type,
+        ..
+    } = ty
+    else {
+        bail!("input stream descriptor requested for a non-input-stream type")
+    };
+
+    let item_canonical = canonical_type(item_type);
+    let error_canonical = canonical_type(error_type);
+    let canonical = canonical_node(
+        "input-stream-descriptor",
+        &[item_canonical, error_canonical],
+    );
+    let fingerprint = fingerprint_builder(&canonical);
+    let suffix = suffix_builder(&canonical, &fingerprint, item_type, error_type);
+    ensure!(
+        suffix
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic()),
+        "input stream descriptor suffix must begin with an ASCII letter"
+    );
+    ensure!(
+        suffix
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "input stream descriptor suffix contains an invalid identifier character"
+    );
+
+    Ok(InputStreamDescriptor {
+        input_type: ty.clone(),
+        item_type: (**item_type).clone(),
+        error_type: (**error_type).clone(),
+        canonical,
+        fingerprint,
+        suffix,
+    })
+}
+
+fn build_input_stream_suffix(
+    _canonical: &str,
+    fingerprint: &str,
+    item_type: &Type,
+    error_type: &Type,
+) -> String {
+    const MAX_READABLE_LEN: usize = 64;
+    let readable = format!(
+        "Item{}Error{}",
+        readable_type_name(item_type),
+        readable_type_name(error_type)
+    );
+    let readable = readable.chars().take(MAX_READABLE_LEN).collect::<String>();
+    format!("{readable}Fingerprint{fingerprint}")
+}
+
+fn readable_type_name(ty: &Type) -> String {
+    match ty {
+        Type::UInt8 => "UInt8".into(),
+        Type::Int8 => "Int8".into(),
+        Type::UInt16 => "UInt16".into(),
+        Type::Int16 => "Int16".into(),
+        Type::UInt32 => "UInt32".into(),
+        Type::Int32 => "Int32".into(),
+        Type::UInt64 => "UInt64".into(),
+        Type::Int64 => "Int64".into(),
+        Type::Float32 => "Float32".into(),
+        Type::Float64 => "Float64".into(),
+        Type::Boolean => "Boolean".into(),
+        Type::String => "String".into(),
+        Type::Bytes => "Bytes".into(),
+        Type::Timestamp => "Timestamp".into(),
+        Type::Duration => "Duration".into(),
+        Type::Record { name, .. } => format!("Record{}", readable_named_type(name)),
+        Type::Enum { name, .. } => format!("Enum{}", readable_named_type(name)),
+        Type::Object { name, .. } => format!("Object{}", readable_named_type(name)),
+        Type::CallbackInterface { name, .. } => {
+            format!("Callback{}", readable_named_type(name))
+        }
+        Type::Custom { name, .. } => format!("Custom{}", readable_named_type(name)),
+        Type::Optional { inner_type } => {
+            format!("Optional{}", readable_type_name(inner_type))
+        }
+        Type::Sequence { inner_type } => {
+            format!("Sequence{}", readable_type_name(inner_type))
+        }
+        Type::Map {
+            key_type,
+            value_type,
+        } => format!(
+            "Map{}To{}",
+            readable_type_name(key_type),
+            readable_type_name(value_type)
+        ),
+        Type::Box { inner_type } => format!("Box{}", readable_type_name(inner_type)),
+        Type::Set { inner_type } => format!("Set{}", readable_type_name(inner_type)),
+        Type::Stream {
+            item_type,
+            error_type,
+            ..
+        } => format!(
+            "Stream{}Error{}",
+            readable_type_name(item_type),
+            readable_type_name(error_type)
+        ),
+        Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => format!(
+            "InputStream{}Error{}",
+            readable_type_name(item_type),
+            readable_type_name(error_type)
+        ),
+    }
+}
+
+fn readable_named_type(name: &str) -> String {
+    let name = sanitize_ident(name).to_upper_camel_case();
+    if name.is_empty() {
+        "Unnamed".to_string()
+    } else {
+        name
+    }
+}
+
+fn canonical_type(ty: &Type) -> String {
+    match ty {
+        Type::UInt8 => canonical_node("uint8", &[]),
+        Type::Int8 => canonical_node("int8", &[]),
+        Type::UInt16 => canonical_node("uint16", &[]),
+        Type::Int16 => canonical_node("int16", &[]),
+        Type::UInt32 => canonical_node("uint32", &[]),
+        Type::Int32 => canonical_node("int32", &[]),
+        Type::UInt64 => canonical_node("uint64", &[]),
+        Type::Int64 => canonical_node("int64", &[]),
+        Type::Float32 => canonical_node("float32", &[]),
+        Type::Float64 => canonical_node("float64", &[]),
+        Type::Boolean => canonical_node("boolean", &[]),
+        Type::String => canonical_node("string", &[]),
+        Type::Bytes => canonical_node("bytes", &[]),
+        Type::Timestamp => canonical_node("timestamp", &[]),
+        Type::Duration => canonical_node("duration", &[]),
+        Type::Record { module_path, name } => {
+            canonical_node("record", &[module_path.clone(), name.clone()])
+        }
+        Type::Enum { module_path, name } => {
+            canonical_node("enum", &[module_path.clone(), name.clone()])
+        }
+        Type::Object {
+            module_path,
+            name,
+            imp,
+        } => canonical_node(
+            "object",
+            &[
+                module_path.clone(),
+                name.clone(),
+                object_impl_canonical_name(*imp).to_string(),
+            ],
+        ),
+        Type::CallbackInterface { module_path, name } => {
+            canonical_node("callback-interface", &[module_path.clone(), name.clone()])
+        }
+        Type::Box { inner_type } => canonical_node("box", &[canonical_type(inner_type)]),
+        Type::Optional { inner_type } => canonical_node("optional", &[canonical_type(inner_type)]),
+        Type::Sequence { inner_type } => canonical_node("sequence", &[canonical_type(inner_type)]),
+        Type::Map {
+            key_type,
+            value_type,
+        } => canonical_node(
+            "map",
+            &[canonical_type(key_type), canonical_type(value_type)],
+        ),
+        Type::Set { inner_type } => canonical_node("set", &[canonical_type(inner_type)]),
+        Type::Stream {
+            item_type,
+            error_type,
+            is_send,
+        } => canonical_node(
+            "stream",
+            &[
+                canonical_type(item_type),
+                canonical_type(error_type),
+                bool_canonical_name(*is_send).to_string(),
+            ],
+        ),
+        Type::InputStream {
+            item_type,
+            error_type,
+            is_send,
+        } => canonical_node(
+            "input-stream",
+            &[
+                canonical_type(item_type),
+                canonical_type(error_type),
+                bool_canonical_name(*is_send).to_string(),
+            ],
+        ),
+        Type::Custom {
+            module_path,
+            name,
+            builtin,
+        } => canonical_node(
+            "custom",
+            &[module_path.clone(), name.clone(), canonical_type(builtin)],
+        ),
+    }
+}
+
+fn canonical_node(tag: &str, children: &[String]) -> String {
+    let mut out = format!("{}:{tag}{}:", tag.len(), children.len());
+    for child in children {
+        out.push_str(&format!("{}:{child}", child.len()));
+    }
+    out
+}
+
+fn object_impl_canonical_name(imp: ObjectImpl) -> &'static str {
+    match imp {
+        ObjectImpl::Struct => "struct",
+        ObjectImpl::Trait(TraitKind::RustOnly) => "trait-rust-only",
+        ObjectImpl::Trait(TraitKind::Both) => "trait-both",
+        ObjectImpl::Trait(TraitKind::ForeignOnly) => "trait-foreign-only",
+    }
+}
+
+fn bool_canonical_name(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn stable_fingerprint(value: &str) -> String {
+    // FNV-1a is intentionally implemented here rather than using
+    // `DefaultHasher`, whose output is not a stable serialization contract.
+    // The collector still checks the resulting suffix for collisions before
+    // generating any bridge specialization.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[derive(Clone, Copy)]
@@ -3122,4 +3533,381 @@ fn sanitize_ident(name: &str) -> String {
 fn rust_path(path: &str) -> TokenStream {
     let segments = path.split("::").map(rust_ident).collect::<Vec<_>>();
     quote!(#(#segments)::*)
+}
+
+#[cfg(test)]
+mod input_stream_descriptor_tests {
+    use super::*;
+    use serde_json::Value;
+    use uniffi_meta::{
+        ConstructorMetadata, EnumMetadata, EnumShape, FnMetadata, FnParamMetadata, MetadataGroup,
+        MethodMetadata, NamespaceMetadata, ObjectMetadata, RecordMetadata, VariantMetadata,
+    };
+
+    fn input_stream(item_type: Type, error_type: Type) -> Type {
+        Type::InputStream {
+            item_type: Box::new(item_type),
+            error_type: Box::new(error_type),
+            is_send: true,
+        }
+    }
+
+    fn argument(name: &str, ty: Type) -> FnParamMetadata {
+        FnParamMetadata::simple(name, ty)
+    }
+
+    fn callable_fixture() -> ComponentInterface {
+        let module_path = "descriptor_fixture";
+        let object_type = Type::Object {
+            module_path: module_path.to_string(),
+            name: "InputObject".to_string(),
+            imp: ObjectImpl::Struct,
+        };
+        let record_type = Type::Record {
+            module_path: module_path.to_string(),
+            name: "InputRecord".to_string(),
+        };
+        let enum_type = Type::Enum {
+            module_path: module_path.to_string(),
+            name: "InputEnum".to_string(),
+        };
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.to_string(),
+                name: module_path.to_string(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+
+        group.add_item(
+            ObjectMetadata {
+                module_path: module_path.to_string(),
+                name: "InputObject".to_string(),
+                orig_name: None,
+                remote: false,
+                imp: ObjectImpl::Struct,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            RecordMetadata {
+                module_path: module_path.to_string(),
+                name: "InputRecord".to_string(),
+                orig_name: None,
+                remote: false,
+                fields: vec![],
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            EnumMetadata {
+                module_path: module_path.to_string(),
+                name: "InputEnum".to_string(),
+                orig_name: None,
+                shape: EnumShape::Enum,
+                remote: false,
+                variants: vec![VariantMetadata {
+                    name: "Only".to_string(),
+                    orig_name: None,
+                    discr: None,
+                    fields: vec![],
+                    docstring: None,
+                }],
+                discr_type: None,
+                non_exhaustive: false,
+                docstring: None,
+            }
+            .into(),
+        );
+
+        group.add_item(
+            FnMetadata {
+                module_path: module_path.to_string(),
+                name: "consume_free".to_string(),
+                orig_name: None,
+                is_async: true,
+                inputs: vec![
+                    argument("first", input_stream(Type::UInt8, Type::String)),
+                    argument("second", input_stream(Type::UInt16, Type::String)),
+                    argument("duplicate", input_stream(Type::UInt8, Type::String)),
+                ],
+                return_type: None,
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+
+        for (self_name, self_type, constructor_item, method_item) in [
+            ("InputObject", object_type, Type::UInt32, Type::Int32),
+            ("InputRecord", record_type, Type::UInt64, Type::Int64),
+            ("InputEnum", enum_type, Type::Float32, Type::Float64),
+        ] {
+            group.add_item(
+                ConstructorMetadata {
+                    module_path: module_path.to_string(),
+                    self_name: self_name.to_string(),
+                    self_type: Some(self_type.clone()),
+                    name: "from_input".to_string(),
+                    orig_name: None,
+                    is_async: true,
+                    inputs: vec![argument(
+                        "source",
+                        input_stream(constructor_item, Type::String),
+                    )],
+                    throws: None,
+                    checksum: None,
+                    docstring: None,
+                }
+                .into(),
+            );
+            group.add_item(
+                MethodMetadata {
+                    module_path: module_path.to_string(),
+                    self_name: self_name.to_string(),
+                    name: "merge_input".to_string(),
+                    orig_name: None,
+                    is_async: true,
+                    inputs: vec![argument("source", input_stream(method_item, Type::String))],
+                    return_type: None,
+                    throws: None,
+                    takes_self_by_arc: false,
+                    checksum: None,
+                    docstring: None,
+                }
+                .into(),
+            );
+        }
+
+        ComponentInterface::from_metadata(group).expect("callable descriptor fixture")
+    }
+
+    #[test]
+    fn canonical_encoding_distinguishes_ambiguous_type_spellings() {
+        let sequence = describe_input_stream_type(&input_stream(
+            Type::Sequence {
+                inner_type: Box::new(Type::UInt8),
+            },
+            Type::String,
+        ))
+        .unwrap();
+        let sequence_named_record = describe_input_stream_type(&input_stream(
+            Type::Record {
+                module_path: "component_a::types".to_string(),
+                name: "SequenceUInt8".to_string(),
+            },
+            Type::String,
+        ))
+        .unwrap();
+        assert_ne!(sequence.canonical(), sequence_named_record.canonical());
+        assert_ne!(sequence.suffix(), sequence_named_record.suffix());
+
+        let foo_bar = describe_input_stream_type(&input_stream(
+            Type::Record {
+                module_path: "component_a::types".to_string(),
+                name: "FooBar".to_string(),
+            },
+            Type::String,
+        ))
+        .unwrap();
+        let foo_underscore_bar = describe_input_stream_type(&input_stream(
+            Type::Record {
+                module_path: "component_a::types".to_string(),
+                name: "Foo_Bar".to_string(),
+            },
+            Type::String,
+        ))
+        .unwrap();
+        assert_ne!(foo_bar.canonical(), foo_underscore_bar.canonical());
+        assert_ne!(foo_bar.suffix(), foo_underscore_bar.suffix());
+    }
+
+    #[test]
+    fn canonical_encoding_is_structural_stable_and_error_sensitive() {
+        let nested_item = Type::Map {
+            key_type: Box::new(Type::String),
+            value_type: Box::new(Type::Optional {
+                inner_type: Box::new(Type::Sequence {
+                    inner_type: Box::new(Type::Custom {
+                        module_path: "component_a::types".to_string(),
+                        name: "UserId".to_string(),
+                        builtin: Box::new(Type::UInt64),
+                    }),
+                }),
+            }),
+        };
+        let first = describe_input_stream_type(&input_stream(
+            nested_item.clone(),
+            Type::Enum {
+                module_path: "component_a::errors".to_string(),
+                name: "ReadError".to_string(),
+            },
+        ))
+        .unwrap();
+        let repeated = describe_input_stream_type(&input_stream(
+            nested_item.clone(),
+            Type::Enum {
+                module_path: "component_a::errors".to_string(),
+                name: "ReadError".to_string(),
+            },
+        ))
+        .unwrap();
+        let other_error = describe_input_stream_type(&input_stream(
+            nested_item,
+            Type::Enum {
+                module_path: "component_a::errors".to_string(),
+                name: "WriteError".to_string(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(first.fingerprint().len(), 16);
+        assert_ne!(first.canonical(), other_error.canonical());
+        assert_ne!(first.suffix(), other_error.suffix());
+        assert!(first
+            .suffix()
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'));
+
+        let mut local_outer = first.input_type().clone();
+        let Type::InputStream { is_send, .. } = &mut local_outer else {
+            unreachable!()
+        };
+        *is_send = false;
+        let local_outer = describe_input_stream_type(&local_outer).unwrap();
+        assert_eq!(first.canonical(), local_outer.canonical());
+        assert_eq!(first.suffix(), local_outer.suffix());
+    }
+
+    #[test]
+    fn canonical_encoding_uses_logical_module_identity_across_components() {
+        let first = describe_input_stream_type(&input_stream(
+            Type::Record {
+                module_path: "component_a::types".to_string(),
+                name: "Payload".to_string(),
+            },
+            Type::String,
+        ))
+        .unwrap();
+        let second = describe_input_stream_type(&input_stream(
+            Type::Record {
+                module_path: "component_b::types".to_string(),
+                name: "Payload".to_string(),
+            },
+            Type::String,
+        ))
+        .unwrap();
+        assert_ne!(first.canonical(), second.canonical());
+        assert_ne!(first.suffix(), second.suffix());
+        assert!(!first.canonical().contains("/Users/"));
+    }
+
+    #[test]
+    fn collector_covers_all_generated_callable_kinds_and_deduplicates() {
+        let ci = callable_fixture();
+        let descriptors = collect_input_stream_descriptors(&ci).unwrap();
+        assert_eq!(descriptors.len(), 8);
+
+        let item_types = descriptors
+            .iter()
+            .map(InputStreamDescriptor::item_type)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            item_types,
+            [
+                Type::UInt8,
+                Type::UInt16,
+                Type::UInt32,
+                Type::Int32,
+                Type::UInt64,
+                Type::Int64,
+                Type::Float32,
+                Type::Float64,
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let rust = render_napi_rust(&ci).unwrap();
+        for descriptor in &descriptors {
+            assert!(rust.contains(&format!(
+                "struct __UniffiInputStream{}Next",
+                descriptor.suffix()
+            )));
+        }
+
+        let contract = super::super::render_ohos_facade_contract(&ci).unwrap();
+        let contract: Value = serde_json::from_str(&contract).unwrap();
+        let contract_suffixes = contract["inputStreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["suffix"].as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let descriptor_suffixes = descriptors
+            .iter()
+            .map(|descriptor| descriptor.suffix().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(contract_suffixes, descriptor_suffixes);
+    }
+
+    #[test]
+    fn collector_rejects_suffix_collisions_instead_of_overwriting() {
+        let ci = callable_fixture();
+        let error = collect_input_stream_descriptors_with_builders(
+            &ci,
+            stable_fingerprint,
+            |_canonical, _fingerprint, _item_type, _error_type| "ForcedCollision".to_string(),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("suffix collision"), "{message}");
+        assert!(message.contains("ForcedCollision"), "{message}");
+    }
+
+    #[test]
+    fn collector_rejects_fingerprint_collisions_even_when_readable_names_differ() {
+        let ci = callable_fixture();
+        let error = collect_input_stream_descriptors_with_builders(
+            &ci,
+            |_canonical| "forcedfingerprint".to_string(),
+            build_input_stream_suffix,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("fingerprint collision"), "{message}");
+        assert!(message.contains("forcedfingerprint"), "{message}");
+    }
+
+    #[test]
+    fn custom_u64_conversion_uses_core_builtin_before_bigint_bridge() {
+        let ci = callable_fixture();
+        let generator = Generator::new(&ci);
+        let ty = Type::Custom {
+            module_path: "descriptor_fixture::types".into(),
+            name: "EventId".into(),
+            builtin: Box::new(Type::UInt64),
+        };
+        let lowered = generator
+            .lower_value_expr(quote!(value), &ty)
+            .unwrap()
+            .to_string();
+        let lifted = generator
+            .lift_value_expr(quote!(value), &ty)
+            .unwrap()
+            .to_string();
+        assert!(lowered.contains("< u64 as :: uniffi :: Lower"), "{lowered}");
+        assert!(
+            !lowered.contains("BigInt as :: uniffi :: Lower"),
+            "{lowered}"
+        );
+        assert!(lifted.contains("< u64 as :: uniffi :: Lift"), "{lifted}");
+        assert!(!lifted.contains("BigInt as :: uniffi :: Lift"), "{lifted}");
+        assert!(lifted.contains("BigInt :: from"), "{lifted}");
+    }
 }

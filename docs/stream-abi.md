@@ -165,33 +165,57 @@ their Gradle dependencies, matching the existing UniFFI async support requiremen
 
 ## Harmony / OpenHarmony
 
-The Harmony flavor keeps the standard JavaScript API from `common/api.ts`, so stream-returning
-functions still return `AsyncIterable<Item>` for environments that support `for await`.
+The standalone Harmony JavaScript flavor keeps the standard `common/api.ts` `AsyncIterable<Item>`
+API and its explicit pull compatibility helper in `harmony/stream.ts`. The compiled HAR adds a
+separate ArkTS-native facade at its package root. The facade is generated from a schema-versioned
+stream contract carried through the OHOS host build, checked against the actual N-API type
+definitions, and published in the same transaction as the native libraries. The normalized contract
+is available both in the dist and at `harmony-facade-contract.json` in the HAR package root. The
+generated host crate also owns a checksummed static facade bundle beside its `Cargo.toml`; every
+packager invocation reads that bundle directly, so a Cargo-fresh build cannot silently lose APIs.
 
-Harmony also emits `harmony/stream.ts` with an ArkTS-friendly fallback surface:
+For every stream-returning free function `foo`, the HAR exports both pull and event factories:
+
+```ts
+const pull = fooStream(args);
+const next = await pull.next();
+await pull.cancel();
+
+const events = fooEvents(args);
+events.on('data', (item) => { /* consume item */ });
+events.on('error', (error) => { /* BusinessError-compatible */ });
+events.on('done', () => { /* terminal */ });
+events.start();
+```
+
+`start()` is explicit and idempotent. It creates the Rust stream handle only on its first call and
+keeps at most one `next` request in flight. Listener dispatch uses a snapshot; one listener throwing
+or removing itself does not stop the other listeners or turn into a source error. Normal EOF emits
+`done` once. A source error emits one stable-code `BusinessError<UniFfiStreamErrorData<E>>` and then
+`done` once. `cancel()` is idempotent, calls the raw cancel function at most once, suppresses any
+late in-flight result, and emits `done` once.
+
+The output raw ABI carries the native error name and display detail, but not the original Rust enum
+variant. `UniFfiStreamErrorData` therefore exposes `errorType`, `nativeErrorName`, `detail`, and an
+unavailable typed `cause`; it does not guess a Rust variant from an N-API error name. Library-owned
+error categories are stable and distinct:
+
+- `1900001`: output source failure;
+- `1900002`: client misuse, currently concurrent pull `next()`;
+- `1900003`: caller-supplied typed input failure;
+- `1900004`: write attempted after input termination.
+
+The raw start/next/cancel exports remain public. The packaged pull interface is:
 
 ```ts
 export interface UniFfiStream<T> {
-    next(): Promise<IteratorResult<T>>;
+    next(): Promise<UniFfiStreamResult<T>>;
     cancel(): Promise<void>;
 }
-
-export function toUniFfiStream<T>(source: AsyncIterable<T>): UniFfiStream<T>;
 ```
 
-For every stream-returning free function, the Harmony flavor emits a wrapper named
-`<functionName>Stream`:
-
-```ts
-const stream = aiChatStreamPromptStream(state, config);
-const next = await stream.next();
-await stream.cancel();
-```
-
-The fallback wrapper delegates to the standard `AsyncIterable` internally but keeps the consumer call
-surface to explicit `next()` / `cancel()` methods. `cancel()` calls the underlying iterator
-`return()` at most once, so it triggers the same Rust-side stream cancel path as `break` in
-`for await`. Done closes the wrapper, and stream item errors remain rejected promises.
+The event and pull objects are confined to the ArkTS concurrency instance that creates them. They do
+not implement `Sendable` and must not be transferred to a Worker or TaskPool.
 
 ## Input Streams
 
@@ -211,9 +235,41 @@ The JavaScript target lowers an `AsyncIterable<T>` into an opaque input stream h
 that handle through registered `next` / `cancel` callbacks. Swift maps input streams from
 `AsyncSequence`, and Kotlin maps them from `Flow`.
 
-Input streams are intentionally limited to direct free-function arguments. They are not supported
-inside records, enums, options, sequences, maps, object methods, constructors, or error payloads.
-The input stream item and error must be UniFFI-supported types.
+The Harmony HAR additionally exports one named push channel per distinct item/error pair. The
+generated factory name contains a readable item/error prefix plus a stable canonical fingerprint;
+the example below aliases that generated factory as `createEventsInputChannel`:
+
+```ts
+const channel = createEventsInputChannel();
+const result = sumEvents(channel.source);
+await channel.writer.write({ value: 1 });
+channel.writer.end();
+await result;
+```
+
+`write()` resolves only after a native `next` callback takes that item. This one-item acknowledgement
+is the backpressure contract; awaiting `write()` before starting the native consumer intentionally
+waits. `end()`, typed `fail(new UniFfiInputFailure(...))`, and native cancellation settle any waiting
+`next`, reject unconsumed or subsequent writes with a stable BusinessError-compatible error, and
+never leave a writer promise pending. `fail()` resolves the native callback with a typed error
+envelope rather than rejecting its promise, so the existing UniFFI error lowerer receives the exact
+Rust error value.
+
+A source is one logical FIFO stream and may have multiple waiting native consumers. Each item is
+delivered to the oldest waiter. `end()` and native cancellation resolve every waiter with EOF;
+`fail()` broadcasts the typed error envelope to all waiters already present and later pulls observe
+EOF. A native cancellation from any consumer closes the shared logical source for every consumer.
+The callback handle is a non-zero object-local token used to reject mismatched callback invocations;
+it is not a process-global identity and may be reused after its 32-bit counter wraps.
+
+The Rust attribute frontend currently exposes input streams only as direct top-level function
+arguments. The N-API/Harmony descriptor collector uses one canonical path for every callable kind it
+can receive from component metadata, including Rust-owned object, record, and enum
+constructors/methods, so raw helpers and channels cannot drift if that metadata is supplied. Input
+streams remain unsupported inside records, enums, options, sequences, maps, callback methods, or
+error payloads. The input item and error must be UniFFI-supported types. A Harmony stream facade
+whose public boundary would require a TypeScript `Record`/index signature (currently a map value)
+fails during generation with a focused unsupported-type error instead of publishing invalid ArkTS.
 
 Cancellation is bidirectional:
 

@@ -8,6 +8,8 @@ publish = false
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-uniffi = { path = "../../..", default-features = false, features = ["macro-scaffolding"] }
+futures-util = "0.3"
+thiserror = "2"
+uniffi = { path = "../../..", default-features = false, features = ["macro-scaffolding", "default-async-runtime-tokio"] }
 
 [workspace]

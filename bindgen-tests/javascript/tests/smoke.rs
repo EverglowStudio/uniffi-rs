@@ -48,6 +48,7 @@ fn generate_arithmetic(out_dir: &Utf8PathBuf) {
                 FlavorTarget::Wasm,
                 FlavorTarget::Napi,
                 FlavorTarget::Electron,
+                FlavorTarget::Harmony,
             ],
         },
     )
@@ -154,10 +155,26 @@ fn emits_real_tree_for_all_flavors() {
         "electron/backend-napi.ts",
         "electron/preload.cjs",
         "electron/renderer.ts",
+        "harmony/index.ts",
+        "harmony/arithmetical.ohos-facade.json",
     ] {
         let p = out_dir.join(name);
         assert!(p.exists(), "expected output file missing: {p}");
     }
+
+    let harmony_contract: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out_dir.join("harmony/arithmetical.ohos-facade.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(harmony_contract["schemaVersion"], 2);
+    assert!(harmony_contract["outputStreams"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(harmony_contract["inputStreams"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
     assert!(
@@ -3472,6 +3489,20 @@ pub struct StreamEvent {
     pub value: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventId(pub u64);
+
+uniffi::custom_type!(EventId, u64, {
+    lower: |value| value.0,
+    try_lift: |value| Ok(EventId(value)),
+});
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct IdEnvelope {
+    pub primary: EventId,
+    pub others: Vec<EventId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
 pub enum StreamError {
     Boom,
@@ -3510,6 +3541,16 @@ struct ErrorAfterOne {
     next: u32,
 }
 
+struct PendingStream;
+
+impl Stream for PendingStream {
+    type Item = Result<StreamEvent, StreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
+    }
+}
+
 impl Stream for ErrorAfterOne {
     type Item = Result<StreamEvent, StreamError>;
 
@@ -3531,6 +3572,24 @@ pub fn count_events(count: u32) -> uniffi::UniFfiStream<StreamEvent, StreamError
 #[uniffi::export]
 pub fn error_after_one() -> Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamError>> + Send + 'static>> {
     Box::pin(ErrorAfterOne { next: 0 })
+}
+
+#[uniffi::export]
+pub fn pending_events() -> uniffi::UniFfiStream<StreamEvent, StreamError> {
+    Box::pin(PendingStream)
+}
+
+#[uniffi::export]
+pub fn roundtrip_event_id(value: EventId) -> EventId {
+    value
+}
+
+#[uniffi::export]
+pub fn event_id_envelope(value: EventId) -> IdEnvelope {
+    IdEnvelope {
+        primary: value.clone(),
+        others: vec![value, EventId(u64::MAX)],
+    }
 }
 
 uniffi::setup_scaffolding!();
@@ -4183,6 +4242,22 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
     std::fs::create_dir_all(&out_dir).unwrap();
     generate_stream_tree(&fixture, &out_dir, None, vec![FlavorTarget::Harmony]);
 
+    let contract: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out_dir.join("harmony/stream_core.ohos-facade.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(contract["schemaVersion"], 2);
+    assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        contract["outputStreams"][0]["eventsFactory"],
+        "countEventsEvents"
+    );
+    assert_eq!(
+        contract["outputStreams"][0]["streamFactory"],
+        "countEventsStream"
+    );
+    assert!(contract["inputStreams"].as_array().unwrap().is_empty());
+
     let index = std::fs::read_to_string(out_dir.join("harmony/index.ts")).unwrap();
     assert!(
         index.contains("export * from \"./stream.ts\";"),
@@ -4468,6 +4543,35 @@ fn input_stream_bidi_static_generation_contract() {
         ],
     );
 
+    let contract: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out_dir.join("harmony/input_stream_core.ohos-facade.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(contract["schemaVersion"], 2);
+    assert_eq!(contract["inputStreams"].as_array().unwrap().len(), 1);
+    let factory = contract["inputStreams"][0]["factory"].as_str().unwrap();
+    let input_suffix = contract["inputStreams"][0]["suffix"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let input_next_type = contract["inputStreams"][0]["nextType"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(factory.starts_with("createItemRecordCounterEventErrorEnumStreamErrorFingerprint"));
+    assert!(factory.ends_with("InputChannel"));
+    assert_eq!(contract["inputStreams"][0]["itemType"]["kind"], "named");
+    assert_eq!(contract["inputStreams"][0]["errorType"]["kind"], "named");
+    assert_eq!(
+        contract["outputStreams"][0]["eventsFactory"],
+        "runningSumEvents"
+    );
+    let extra_types =
+        std::fs::read_to_string(out_dir.join("harmony/input_stream_core.ohos-extra-types.d.ts"))
+            .unwrap();
+    assert!(extra_types.contains("export interface __UniffiInputStream<T>"));
+    assert!(extra_types.contains("next(error: Error | null, handle: number): Promise<T>"));
+
     let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
     for needle in [
         "createUniffiInputStream",
@@ -4505,20 +4609,24 @@ fn input_stream_bidi_static_generation_contract() {
     );
     let napi_rs = std::fs::read_to_string(out_dir.join("node/input_stream_core.rs")).unwrap();
     for needle in [
-        "pub struct __UniffiInputStream<NextResult: 'static + FromNapiValue>",
-        "__UniffiInputStreamCounterEventStreamErrorNext",
-        "impl ::uniffi::ForeignInputStreamOps",
-        "::uniffi::UniFfiInputStream::from_handle_and_ops",
-        "ThreadsafeFunctionCallMode::NonBlocking",
-        "pub fn running_sum(",
-        "__UniffiInputStream<__UniffiInputStreamCounterEventStreamErrorNext>",
-        "pub async fn running_sum_stream_next(",
+        "pub struct __UniffiInputStream<NextResult: 'static + FromNapiValue>".to_string(),
+        input_next_type.clone(),
+        "impl ::uniffi::ForeignInputStreamOps".to_string(),
+        "::uniffi::UniFfiInputStream::from_handle_and_ops".to_string(),
+        "ThreadsafeFunctionCallMode::NonBlocking".to_string(),
+        "pub fn running_sum(".to_string(),
+        "events: __UniffiInputStream<".to_string(),
+        "pub async fn running_sum_stream_next(".to_string(),
     ] {
         assert!(
-            napi_rs.contains(needle),
+            napi_rs.contains(&needle),
             "napi bridge missing input stream lowering `{needle}`:\n{napi_rs}"
         );
     }
+    assert!(
+        napi_rs.contains(&format!("__UniffiInputStream{input_suffix}Ops")),
+        "napi bridge must use the canonical contract suffix `{input_suffix}`:\n{napi_rs}"
+    );
     let wasm_rs = std::fs::read_to_string(out_dir.join("browser/input_stream_core.rs")).unwrap();
     for needle in [
         "__UniffiInputStreamCounterEventStreamErrorOps",
@@ -4590,7 +4698,7 @@ fn host_crates_napi_runs_stream_fixture() {
     std::fs::write(
         out_dir.join("stream-driver.ts"),
         r#"
-import { countEvents, errorAfterOne, UniffiError } from "./node/index.ts";
+import { countEvents, errorAfterOne, eventIdEnvelope, pendingEvents, roundtripEventId, UniffiError } from "./node/index.ts";
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -4621,6 +4729,26 @@ try {
 }
 assert(errorValues === 7, `napi stream error first value ${errorValues}`);
 assert(threw, "napi stream error should throw");
+
+const pendingManual = pendingEvents()[Symbol.asyncIterator]();
+const pendingNext = pendingManual.next();
+await pendingManual.return?.();
+const pendingResult = await Promise.race([
+  pendingNext,
+  new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); })
+]);
+assert(pendingResult !== "timeout" && pendingResult.done === true, "napi pending next should settle after cancel");
+assert((await pendingManual.next()).done === true, "napi pending registry should remain closed");
+
+const aboveSafe = 9007199254740993n;
+const u64Max = 18446744073709551615n;
+assert(roundtripEventId(aboveSafe) === aboveSafe, "napi custom u64 above safe integer");
+assert(roundtripEventId(u64Max) === u64Max, "napi custom u64 max");
+const idEnvelope = eventIdEnvelope(aboveSafe);
+assert(idEnvelope.primary === aboveSafe && idEnvelope.others[1] === u64Max, "napi composite custom u64");
+let overflowRejected = false;
+try { roundtripEventId(18446744073709551616n); } catch (_error) { overflowRejected = true; }
+assert(overflowRejected, "napi custom u64 overflow");
 
 console.log("ok");
 "#,
@@ -4739,6 +4867,37 @@ const one = await takeOneInputEvent(cancellable);
 assert(one === 41, `take one ${one}`);
 await new Promise((resolve) => setTimeout(resolve, 20));
 assert(returnCount === 1, `Rust drop should call iterator.return once, got ${returnCount}`);
+
+let sharedReturnCount = 0;
+let sharedIssued = false;
+let settleShared: ((value: IteratorResult<{ value: number }>) => void) | null = null;
+const sharedIterator: AsyncIterator<{ value: number }> = {
+  next(): Promise<IteratorResult<{ value: number }>> {
+    if (!sharedIssued) {
+      sharedIssued = true;
+      return Promise.resolve({ done: false, value: { value: 61 } });
+    }
+    return new Promise<IteratorResult<{ value: number }>>((resolve): void => { settleShared = resolve; });
+  },
+  return(): Promise<IteratorResult<{ value: number }>> {
+    sharedReturnCount += 1;
+    if (settleShared !== null) {
+      settleShared({ done: true, value: undefined as any });
+      settleShared = null;
+    }
+    return Promise.resolve({ done: true, value: undefined as any });
+  },
+};
+const sharedSource = { [Symbol.asyncIterator](): AsyncIterator<{ value: number }> { return sharedIterator; } };
+const sharedA = takeOneInputEvent(sharedSource);
+const sharedB = takeOneInputEvent(sharedSource);
+const sharedResults = await Promise.race([
+  Promise.all([sharedA, sharedB]),
+  new Promise<string>((resolve): void => { setTimeout((): void => resolve('timeout'), 1000); })
+]);
+assert(sharedResults !== 'timeout', 'two real Rust input consumers did not settle');
+assert((sharedResults as number[]).sort().join(',') === '0,61', `shared consumer results ${sharedResults}`);
+assert(sharedReturnCount >= 1, `shared logical input was not closed ${sharedReturnCount}`);
 
 let breakReturnCount = 0;
 const breakable = {
@@ -4948,6 +5107,37 @@ assert(one === 41, `wasm take one ${one}`);
 await new Promise((resolve) => setTimeout(resolve, 20));
 assert(returnCount === 1, `wasm Rust drop should call iterator.return once, got ${returnCount}`);
 
+let sharedReturnCount = 0;
+let sharedIssued = false;
+let settleShared: ((value: IteratorResult<{ value: number }>) => void) | null = null;
+const sharedIterator: AsyncIterator<{ value: number }> = {
+  next(): Promise<IteratorResult<{ value: number }>> {
+    if (!sharedIssued) {
+      sharedIssued = true;
+      return Promise.resolve({ done: false, value: { value: 61 } });
+    }
+    return new Promise<IteratorResult<{ value: number }>>((resolve): void => { settleShared = resolve; });
+  },
+  return(): Promise<IteratorResult<{ value: number }>> {
+    sharedReturnCount += 1;
+    if (settleShared !== null) {
+      settleShared({ done: true, value: undefined as any });
+      settleShared = null;
+    }
+    return Promise.resolve({ done: true, value: undefined as any });
+  },
+};
+const sharedSource = { [Symbol.asyncIterator](): AsyncIterator<{ value: number }> { return sharedIterator; } };
+const sharedA = takeOneInputEvent(sharedSource);
+const sharedB = takeOneInputEvent(sharedSource);
+const sharedResults = await Promise.race([
+  Promise.all([sharedA, sharedB]),
+  new Promise<string>((resolve): void => { setTimeout((): void => resolve('timeout'), 1000); })
+]);
+assert(sharedResults !== 'timeout', 'two real wasm Rust input consumers did not settle');
+assert((sharedResults as number[]).sort().join(',') === '0,61', `wasm shared consumer results ${sharedResults}`);
+assert(sharedReturnCount >= 1, `wasm shared logical input was not closed ${sharedReturnCount}`);
+
 let breakReturnCount = 0;
 const breakable = {
   [Symbol.asyncIterator](): AsyncIterator<{ value: number }> {
@@ -5109,7 +5299,7 @@ fn host_crates_wasm_runs_stream_fixture() {
         tmp.path().join("wasm-stream-driver.ts"),
         r#"
 import { createRequire } from "node:module";
-import { initBackend, countEvents, errorAfterOne, UniffiError } from "./generated/browser/index.ts";
+import { initBackend, countEvents, errorAfterOne, eventIdEnvelope, pendingEvents, roundtripEventId, UniffiError } from "./generated/browser/index.ts";
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/stream_core_wasm.js");
@@ -5144,6 +5334,26 @@ try {
 }
 assert(errorValues === 7, `wasm stream error first value ${errorValues}`);
 assert(threw, "wasm stream error should throw");
+
+const pendingManual = pendingEvents()[Symbol.asyncIterator]();
+const pendingNext = pendingManual.next();
+await pendingManual.return?.();
+const pendingResult = await Promise.race([
+  pendingNext,
+  new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); })
+]);
+assert(pendingResult !== "timeout" && pendingResult.done === true, "wasm pending next should settle after cancel");
+assert((await pendingManual.next()).done === true, "wasm pending registry should remain closed");
+
+const aboveSafe = 9007199254740993n;
+const u64Max = 18446744073709551615n;
+assert(roundtripEventId(aboveSafe) === aboveSafe, "wasm custom u64 above safe integer");
+assert(roundtripEventId(u64Max) === u64Max, "wasm custom u64 max");
+const idEnvelope = eventIdEnvelope(aboveSafe);
+assert(idEnvelope.primary === aboveSafe && idEnvelope.others[1] === u64Max, "wasm composite custom u64");
+let overflowRejected = false;
+try { roundtripEventId(18446744073709551616n); } catch (_error) { overflowRejected = true; }
+assert(overflowRejected, "wasm custom u64 overflow");
 
 console.log("ok");
 "#,
@@ -5879,7 +6089,21 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     }
     let build_rs = std::fs::read_to_string(host_dir.join("ohos/build.rs")).unwrap();
     assert!(build_rs.contains("napi_build_ohos::setup"));
-    assert!(build_rs.contains("ohos-extra-types.d.ts"));
+    assert!(!build_rs.contains("std::fs::write"));
+    assert!(!build_rs.contains("ohos-extra-types.d.ts"));
+    let bundle: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(host_dir.join("ohos/uniffi-ohos-facade-bundle.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bundle["schemaVersion"], 2);
+    assert!(bundle["fingerprint"]
+        .as_str()
+        .is_some_and(|value| value.len() == 64));
+    assert!(bundle["typeSidecars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["file"] == "arithmetical.ohos-extra-types.d.ts"));
     let lib_rs = std::fs::read_to_string(host_dir.join("ohos/src/lib.rs")).unwrap();
     assert!(
         lib_rs.contains("include!(") && lib_rs.contains("harmony/arithmetical.rs"),

@@ -463,16 +463,53 @@ fn stream_concurrent_next_is_rejected() {
     assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
 
     let pending = uniffi_uniffi_fn_func_pending_events_stream_next(handle.clone());
+    let pending_poll = AtomicI8::new(-1);
+    unsafe {
+        ffi_uniffi_rust_future_poll_rust_buffer(
+            pending.clone(),
+            capture_poll,
+            (&pending_poll as *const AtomicI8) as u64,
+        );
+    }
+    assert_eq!(pending_poll.load(Ordering::SeqCst), -1);
+
     let rejected = uniffi_uniffi_fn_func_pending_events_stream_next(handle.clone());
     let (status_code, value) = complete_next_future(rejected);
     assert_eq!(status_code, uniffi::RustCallStatusCode::UnexpectedError);
     assert_eq!(value, None);
 
+    // The client error belongs only to the second next call. The registry and
+    // first future must remain reachable so raw cancel can wake it to EOF.
+    uniffi_uniffi_fn_func_pending_events_stream_cancel(handle);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while pending_poll.load(Ordering::SeqCst) == -1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "raw stream cancel did not wake the first pending future"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(pending_poll.load(Ordering::SeqCst), 1);
+    pending_poll.store(-1, Ordering::SeqCst);
     unsafe {
-        ffi_uniffi_rust_future_cancel_rust_buffer(pending.clone());
+        ffi_uniffi_rust_future_poll_rust_buffer(
+            pending.clone(),
+            capture_poll,
+            (&pending_poll as *const AtomicI8) as u64,
+        );
+    }
+    assert_eq!(pending_poll.load(Ordering::SeqCst), 0);
+    let mut status = uniffi::RustCallStatus::default();
+    let buffer =
+        unsafe { ffi_uniffi_rust_future_complete_rust_buffer(pending.clone(), &mut status) };
+    unsafe {
         ffi_uniffi_rust_future_free_rust_buffer(pending);
     }
-    uniffi_uniffi_fn_func_pending_events_stream_cancel(handle);
+    assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
+    assert_eq!(
+        <Option<StreamEvent> as uniffi::Lift<UniFfiTag>>::try_lift(buffer).unwrap(),
+        None
+    );
 }
 
 #[test]

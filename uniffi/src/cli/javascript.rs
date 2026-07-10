@@ -314,6 +314,10 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "ohos-host-manifest-path")]
     pub(crate) ohos_host_manifest_path: Option<Utf8PathBuf>,
 
+    /// Build an explicitly raw-only custom host without a generated facade contract.
+    #[clap(long = "raw-only-facade", requires = "ohos_host_manifest_path")]
+    pub(crate) raw_only_facade: bool,
+
     /// Directory for built non-source artifacts. Defaults to `<host-crate>/dist` for OHOS output when omitted.
     #[clap(long = "artifact-dir")]
     pub(crate) artifact_dir: Option<Utf8PathBuf>,
@@ -953,6 +957,15 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     if !ohos_manifest.exists() {
         bail!("custom OHOS host manifest does not exist: {ohos_manifest}");
     }
+    let facade_mode = if args.raw_only_facade {
+        super::ohos::FacadeMode::RawOnly
+    } else {
+        let facade_bundle_path = ohos_manifest
+            .parent()
+            .context("OHOS host manifest has no parent for its facade bundle")?
+            .join("uniffi-ohos-facade-bundle.json");
+        super::ohos::FacadeMode::Required(facade_bundle_path)
+    };
 
     let arches = if args.arch.is_empty() {
         vec!["aarch".to_string(), "x64".to_string()]
@@ -970,6 +983,7 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         core_manifest_path: Some(manifest_path),
         additional_source_roots,
         manifest_path: ohos_manifest,
+        facade_mode,
         dist_dir,
         package_name: args.package_name,
         module_name: args.module_name,
