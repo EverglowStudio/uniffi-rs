@@ -22,6 +22,7 @@
 
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use cargo_metadata::MetadataCommand;
 use fs_err as fs;
 
 /// Caller-supplied metadata + CLI flags for host-crate emission.
@@ -42,6 +43,10 @@ pub struct HostCrateOptions {
 #[derive(Clone, Debug)]
 pub struct CoreCrateMetadata {
     pub package_name: String,
+    pub package_version: String,
+    pub description: Option<String>,
+    pub authors: Vec<String>,
+    pub license: Option<String>,
     pub crate_dir: Utf8PathBuf,
     pub uniffi_dep: Option<UniffiDependency>,
 }
@@ -65,12 +70,36 @@ pub fn load_metadata(manifest_path: &Utf8Path) -> Result<CoreCrateMetadata> {
         .with_context(|| format!("reading manifest at {manifest_path}"))?;
     let value: toml::Value =
         toml::from_str(&text).with_context(|| format!("parsing {manifest_path}"))?;
-    let package_name = value
-        .get("package")
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str())
-        .with_context(|| format!("{manifest_path} missing [package].name"))?
-        .to_string();
+    // Cargo owns workspace inheritance semantics.  Reading the package table
+    // directly would see `version.workspace = true` as a table and would also
+    // silently lose inherited optional metadata.  Use Cargo's resolved model
+    // for every field that can be inherited, while retaining the source TOML
+    // below only for rendering the original `uniffi` dependency declaration.
+    let cargo_metadata = MetadataCommand::new()
+        .manifest_path(manifest_path.as_std_path())
+        .no_deps()
+        .exec()
+        .with_context(|| format!("running cargo metadata for {manifest_path}"))?;
+    let canonical_manifest = manifest_path
+        .canonicalize_utf8()
+        .unwrap_or_else(|_| manifest_path.to_path_buf());
+    let package = cargo_metadata
+        .packages
+        .iter()
+        .find(|package| {
+            let package_manifest =
+                Utf8PathBuf::from_path_buf(package.manifest_path.clone().into_std_path_buf()).ok();
+            package_manifest
+                .map(|path| path.canonicalize_utf8().unwrap_or(path) == canonical_manifest)
+                .unwrap_or(false)
+        })
+        .or_else(|| cargo_metadata.root_package())
+        .with_context(|| format!("cargo metadata did not resolve package {manifest_path}"))?;
+    let package_name = package.name.to_string();
+    let package_version = package.version.to_string();
+    let description = package.description.clone();
+    let authors = package.authors.clone();
+    let license = package.license.clone();
     let uniffi_dep = resolve_uniffi_dependency(manifest_path, &value)?;
     let crate_dir = manifest_path
         .parent()
@@ -79,6 +108,10 @@ pub fn load_metadata(manifest_path: &Utf8Path) -> Result<CoreCrateMetadata> {
     let crate_dir = crate_dir.canonicalize_utf8().unwrap_or_else(|_| crate_dir);
     Ok(CoreCrateMetadata {
         package_name,
+        package_version,
+        description,
+        authors,
+        license,
         crate_dir,
         uniffi_dep,
     })
@@ -298,6 +331,7 @@ fn emit_ohos(
     let rel_core = relative_path(&crate_dir, &meta.crate_dir);
     let package_name = format!("{}-ohos", meta.package_name);
     let ohos_deps = render_ohos_dependencies(ohos_rs_dir, &crate_dir)?;
+    let package_metadata = render_ohos_package_metadata(meta);
     let lib_name = match namespaces {
         [namespace] => crate::js_names::ohos_native_library_stem(namespace),
         [] => bail!("OHOS host-crate emission requested but no component namespace was generated"),
@@ -312,7 +346,7 @@ fn emit_ohos(
          #   --manifest-path <core Cargo.toml> --out-dir <generated>`.\n\
          [package]\n\
          name = \"{package_name}\"\n\
-         version = \"0.0.0\"\n\
+         {package_metadata}\
          edition = \"2021\"\n\
          publish = false\n\
          \n\
@@ -329,6 +363,7 @@ fn emit_ohos(
          [workspace]\n\
          resolver = \"3\"\n",
         package_name = package_name,
+        package_metadata = package_metadata,
         lib_name = lib_name,
         core_name = meta.package_name,
         rel_core = rel_core,
@@ -373,6 +408,50 @@ fn emit_ohos(
     }
     fs::write(src_dir.join("lib.rs"), lib_rs)?;
     Ok(())
+}
+
+fn render_ohos_package_metadata(meta: &CoreCrateMetadata) -> String {
+    let mut out = format!("version = {}\n", toml_string_literal(&meta.package_version));
+    if let Some(description) = &meta.description {
+        out.push_str(&format!(
+            "description = {}\n",
+            toml_string_literal(description)
+        ));
+    }
+    if !meta.authors.is_empty() {
+        let authors = meta
+            .authors
+            .iter()
+            .map(|author| toml_string_literal(author))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("authors = [{authors}]\n"));
+    }
+    if let Some(license) = &meta.license {
+        out.push_str(&format!("license = {}\n", toml_string_literal(license)));
+    }
+    out
+}
+
+fn toml_string_literal(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                let _ = write!(out, "\\u{:04X}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('\"');
+    out
 }
 
 fn render_ohos_dependencies(
@@ -588,4 +667,170 @@ fn render_uniffi_dependency(
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!("uniffi = {{ {fields} }}\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "uniffi-js-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_minimal_lib(crate_dir: &std::path::Path) {
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    }
+
+    #[test]
+    fn carries_core_cargo_metadata_into_ohos_host_manifest() {
+        let root = test_root("host-meta");
+        std::fs::create_dir_all(&root).unwrap();
+        write_minimal_lib(&root);
+        let manifest = root.join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            r#"[package]
+name = "demo-core"
+version = "1.2.3"
+description = "quoted \"metadata\""
+authors = ["First Author <first@example.com>", "Second Author"]
+license = "MPL-2.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        let manifest = Utf8PathBuf::from_path_buf(manifest).unwrap();
+        let metadata = load_metadata(&manifest).unwrap();
+        assert_eq!(metadata.package_name, "demo-core");
+        assert_eq!(metadata.package_version, "1.2.3");
+        assert_eq!(metadata.description.as_deref(), Some("quoted \"metadata\""));
+        assert_eq!(
+            metadata.authors,
+            vec!["First Author <first@example.com>", "Second Author"]
+        );
+        assert_eq!(metadata.license.as_deref(), Some("MPL-2.0"));
+
+        let rendered = format!(
+            "[package]\nname = \"demo-core-ohos\"\n{}edition = \"2021\"\n",
+            render_ohos_package_metadata(&metadata)
+        );
+        let parsed: toml::Value = toml::from_str(&rendered).unwrap();
+        assert_eq!(parsed["package"]["version"].as_str(), Some("1.2.3"));
+        assert_eq!(
+            parsed["package"]["description"].as_str(),
+            Some("quoted \"metadata\"")
+        );
+        assert_eq!(parsed["package"]["authors"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["package"]["license"].as_str(), Some("MPL-2.0"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolves_workspace_inherited_metadata_into_real_ohos_host_manifest() {
+        let root = test_root("host-workspace-meta");
+        let core = root.join("core");
+        let out = root.join("generated");
+        let host = root.join("host");
+        write_minimal_lib(&core);
+        std::fs::create_dir_all(out.join("harmony")).unwrap();
+        std::fs::write(out.join("harmony/demo_core.rs"), "").unwrap();
+        for (name, body) in [
+            ("native-facade.ets", "export default {};\n"),
+            ("package-index.ets", "export default {};\n"),
+            ("demo_core.ohos-extra-types.d.ts", "export {};\n"),
+        ] {
+            std::fs::write(out.join("harmony").join(name), body).unwrap();
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["core"]
+resolver = "2"
+
+[workspace.package]
+version = "4.5.6"
+description = "inherited description"
+authors = ["Workspace Author <author@example.com>"]
+license = "Apache-2.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("Cargo.toml"),
+            r#"[package]
+name = "demo-core"
+version.workspace = true
+description.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+"#,
+        )
+        .unwrap();
+
+        let manifest = Utf8PathBuf::from_path_buf(core.join("Cargo.toml")).unwrap();
+        let metadata = load_metadata(&manifest).unwrap();
+        assert_eq!(metadata.package_version, "4.5.6");
+        assert_eq!(
+            metadata.description.as_deref(),
+            Some("inherited description")
+        );
+        assert_eq!(metadata.authors, ["Workspace Author <author@example.com>"]);
+        assert_eq!(metadata.license.as_deref(), Some("Apache-2.0"));
+
+        let host = Utf8PathBuf::from_path_buf(host).unwrap();
+        let out = Utf8PathBuf::from_path_buf(out).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        emit_ohos(
+            &host,
+            &out,
+            &["demo_core".to_string()],
+            &metadata,
+            None,
+            &["demo_core".to_string()],
+        )
+        .unwrap();
+        let generated: toml::Value =
+            toml::from_str(&std::fs::read_to_string(host.join("ohos/Cargo.toml")).unwrap())
+                .unwrap();
+        assert_eq!(generated["package"]["version"].as_str(), Some("4.5.6"));
+        assert_eq!(
+            generated["package"]["description"].as_str(),
+            Some("inherited description")
+        );
+        assert_eq!(generated["package"]["authors"].as_array().unwrap().len(), 1);
+        assert_eq!(generated["package"]["license"].as_str(), Some("Apache-2.0"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn leaves_missing_optional_cargo_metadata_absent() {
+        let root = test_root("host-minimal-meta");
+        write_minimal_lib(&root);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"minimal-core\"\nversion = \"0.7.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let manifest = Utf8PathBuf::from_path_buf(root.join("Cargo.toml")).unwrap();
+        let metadata = load_metadata(&manifest).unwrap();
+        assert_eq!(metadata.package_version, "0.7.0");
+        assert!(metadata.description.is_none());
+        assert!(metadata.authors.is_empty());
+        assert!(metadata.license.is_none());
+        let rendered = render_ohos_package_metadata(&metadata);
+        assert!(!rendered.contains("description ="));
+        assert!(!rendered.contains("authors ="));
+        assert!(!rendered.contains("license ="));
+        std::fs::remove_dir_all(root).ok();
+    }
 }

@@ -310,6 +310,10 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     pub(crate) host_crates_dir: Utf8PathBuf,
 
+    /// Build an existing OHOS host package or workspace instead of the generated single-package host manifest.
+    #[clap(long = "ohos-host-manifest-path")]
+    pub(crate) ohos_host_manifest_path: Option<Utf8PathBuf>,
+
     /// Directory for built non-source artifacts. Defaults to `<host-crate>/dist` for OHOS output when omitted.
     #[clap(long = "artifact-dir")]
     pub(crate) artifact_dir: Option<Utf8PathBuf>,
@@ -322,9 +326,53 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "package-name")]
     pub(crate) package_name: Option<String>,
 
+    /// Harmony module name override. Defaults to a stable normalization of the OHPM package name.
+    #[clap(long = "module-name")]
+    pub(crate) module_name: Option<String>,
+
+    /// Semantic version override for generated OHPM package metadata.
+    #[clap(long = "package-version")]
+    pub(crate) package_version: Option<String>,
+
+    /// Author override for generated OHPM package metadata.
+    #[clap(long = "author")]
+    pub(crate) author: Option<String>,
+
+    /// SPDX license override for generated OHPM package metadata.
+    #[clap(long = "license")]
+    pub(crate) license: Option<String>,
+
+    /// Description override for generated OHPM package metadata.
+    #[clap(long = "description")]
+    pub(crate) description: Option<String>,
+
+    /// Minimum compatible Harmony/OpenHarmony SDK version. Must be explicit for final HAR packaging.
+    #[clap(long = "compatible-sdk-version")]
+    pub(crate) compatible_sdk_version: Option<String>,
+
+    /// Compatible SDK type, such as HarmonyOS or OpenHarmony.
+    #[clap(long = "compatible-sdk-type")]
+    pub(crate) compatible_sdk_type: Option<String>,
+
+    /// Supported Harmony device type. May be repeated or comma-separated.
+    #[clap(long = "device-type", value_delimiter = ',')]
+    pub(crate) device_types: Vec<String>,
+
     /// Output `.har` path. Defaults to `<artifact-root>/<package>.har`.
     #[clap(long = "har-out")]
     pub(crate) har_out: Option<Utf8PathBuf>,
+
+    /// Hvigor wrapper used to build the final compiled HAR (falls back to HVIGORW or PATH).
+    #[clap(long = "hvigorw")]
+    pub(crate) hvigorw: Option<String>,
+
+    /// OHPM executable used to resolve and prepublish the final HAR (falls back to OHPM or PATH).
+    #[clap(long = "ohpm")]
+    pub(crate) ohpm: Option<String>,
+
+    /// DevEco SDK root used by Hvigor (falls back to DEVECO_SDK_HOME).
+    #[clap(long = "deveco-sdk-home")]
+    pub(crate) deveco_sdk_home: Option<Utf8PathBuf>,
 
     /// Skip final HAR packaging and keep only `dist/` intermediate outputs.
     #[clap(long = "no-har")]
@@ -405,6 +453,10 @@ pub(crate) struct BuildOhosArgs {
     /// Additional cargo args passed to the OHOS host cargo build after `--`.
     #[clap(last = true)]
     pub(crate) cargo_args: Vec<String>,
+
+    /// The caller already holds the managed Harmony output lock.
+    #[clap(skip)]
+    pub(crate) output_lock_held: bool,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -765,7 +817,84 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
 
 pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
+    let cwd = Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+        .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?;
+    let host_root = if args.host_crates_dir.is_absolute() {
+        args.host_crates_dir.clone()
+    } else {
+        cwd.join(&args.host_crates_dir)
+    };
+    let ohos_dir = host_root.join("ohos");
+    let custom_ohos_manifest = args
+        .ohos_host_manifest_path
+        .as_ref()
+        .map(|path| canonicalize_or_keep(path));
+    let dist_dir = args
+        .dist_dir
+        .clone()
+        .or_else(|| args.artifact_dir.as_ref().map(|dir| dir.join("ohos/dist")))
+        .unwrap_or_else(|| ohos_dir.join("dist"));
+    let mut protected_dist_paths = vec![
+        ("current working directory".to_string(), cwd),
+        (
+            "downstream core manifest".to_string(),
+            manifest_path.clone(),
+        ),
+        (
+            "generated JavaScript source root".to_string(),
+            args.out_dir.clone(),
+        ),
+        ("generated OHOS host root".to_string(), host_root.clone()),
+    ];
+    if let Some(custom_manifest) = &custom_ohos_manifest {
+        protected_dist_paths.push((
+            "custom OHOS host manifest".to_string(),
+            custom_manifest.clone(),
+        ));
+        if let Some(custom_root) = custom_manifest.parent() {
+            protected_dist_paths.push((
+                "custom OHOS host package or workspace".to_string(),
+                custom_root.to_path_buf(),
+            ));
+        }
+    }
+    if let Some(core_root) = manifest_path.parent() {
+        protected_dist_paths.push((
+            "downstream core package".to_string(),
+            core_root.to_path_buf(),
+        ));
+        protected_dist_paths.push((
+            "downstream core source directory".to_string(),
+            core_root.join("src"),
+        ));
+    }
+    if let Some(target_dir) = &args.target_dir {
+        protected_dist_paths.push((
+            "OHOS Cargo target directory".to_string(),
+            target_dir.clone(),
+        ));
+    }
+    super::ohos::preflight_dist_output_for_generation(&dist_dir, &protected_dist_paths)
+        .context("preflighting generator-owned OHOS dist before Cargo build")?;
+
+    // Resolve Cargo metadata only after the path-only preflight above: Cargo
+    // metadata may create/update a missing lockfile, so obviously dangerous
+    // outputs such as `--dist-dir .` must fail before invoking Cargo at all.
+    // Once metadata is available, repeat the preflight with the complete
+    // workspace/local-source set before the first actual core build.
     let core_meta = cargo_package_metadata(&manifest_path)?;
+    protected_dist_paths.push((
+        "downstream Cargo workspace".to_string(),
+        core_meta.workspace_root.clone(),
+    ));
+    protected_dist_paths.extend(
+        core_meta
+            .local_source_roots
+            .iter()
+            .map(|(name, path)| (format!("local Cargo source `{name}`"), path.clone())),
+    );
+    super::ohos::preflight_dist_output_for_generation(&dist_dir, &protected_dist_paths)
+        .context("preflighting generator-owned OHOS dist against Cargo workspace sources")?;
 
     let mut build_core =
         cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
@@ -811,22 +940,18 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         args.artifact_dir.clone(),
     )?;
 
-    let host_root = if args.host_crates_dir.is_absolute() {
-        args.host_crates_dir.clone()
-    } else {
-        Utf8PathBuf::from_path_buf(std::env::current_dir()?)
-            .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?
-            .join(&args.host_crates_dir)
-    };
-    let ohos_dir = host_root.join("ohos");
-    let ohos_manifest = ohos_dir.join("Cargo.toml");
-    if !ohos_manifest.exists() {
+    let generated_ohos_manifest = ohos_dir.join("Cargo.toml");
+    if !generated_ohos_manifest.exists() {
         bail!(
             "OHOS host crate was not emitted at {}",
-            ohos_manifest
+            generated_ohos_manifest
                 .parent()
                 .unwrap_or_else(|| Utf8Path::new("<unknown>"))
         );
+    }
+    let ohos_manifest = custom_ohos_manifest.unwrap_or(generated_ohos_manifest);
+    if !ohos_manifest.exists() {
+        bail!("custom OHOS host manifest does not exist: {ohos_manifest}");
     }
 
     let arches = if args.arch.is_empty() {
@@ -834,20 +959,31 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     } else {
         args.arch.clone()
     };
-    let dist_dir = args
-        .dist_dir
-        .clone()
-        .or_else(|| args.artifact_dir.as_ref().map(|dir| dir.join("ohos/dist")))
-        .unwrap_or_else(|| ohos_dir.join("dist"));
     let mut ohos_cargo_args =
         dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
     ohos_cargo_args.extend(args.cargo_args);
+    let mut additional_source_roots = core_meta.local_source_roots.clone();
+    additional_source_roots.push(("core-workspace".into(), core_meta.workspace_root.clone()));
+    additional_source_roots.push(("generated-bindings".into(), args.out_dir.clone()));
     super::ohos::build(super::ohos::BuildOptions {
         cargo_bin: args.cargo_bin.clone(),
+        core_manifest_path: Some(manifest_path),
+        additional_source_roots,
         manifest_path: ohos_manifest,
         dist_dir,
         package_name: args.package_name,
+        module_name: args.module_name,
+        package_version: args.package_version,
+        author: args.author,
+        license: args.license,
+        description: args.description,
+        compatible_sdk_version: args.compatible_sdk_version,
+        compatible_sdk_type: args.compatible_sdk_type,
+        device_types: args.device_types,
         har_out: args.har_out,
+        hvigorw: args.hvigorw,
+        ohpm: args.ohpm,
+        deveco_sdk_home: args.deveco_sdk_home,
         no_har: args.no_har,
         arches,
         target_dir: args.target_dir.clone(),
@@ -862,6 +998,7 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         package: args.package,
         skip_napi_check: args.skip_napi_check,
         soname: args.soname,
+        output_lock_held: args.output_lock_held,
     })?;
 
     Ok(())
@@ -1447,6 +1584,8 @@ fn relative_path_from_dir(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {
 
 struct CargoPackageMetadata {
     target_directory: Utf8PathBuf,
+    workspace_root: Utf8PathBuf,
+    local_source_roots: Vec<(String, Utf8PathBuf)>,
     package_name: String,
     lib_target_name: String,
 }
@@ -1489,11 +1628,32 @@ fn cargo_package_metadata(manifest_path: &Utf8Path) -> Result<CargoPackageMetada
                 .find(|target| target.kind.iter().any(|kind| kind.to_string() == "lib"))
         })
         .with_context(|| format!("package {} has no lib/cdylib target", package.name))?;
+    let workspace_root =
+        Utf8PathBuf::from_path_buf(metadata.workspace_root.clone().into_std_path_buf())
+            .map_err(|p| anyhow::anyhow!("cargo workspace root is not utf8: {}", p.display()))?;
+    let mut local_source_roots = metadata
+        .packages
+        .iter()
+        .filter(|package| package.source.is_none())
+        .filter_map(|package| {
+            let manifest =
+                Utf8PathBuf::from_path_buf(package.manifest_path.clone().into_std_path_buf())
+                    .ok()?;
+            Some((
+                format!("{}-{}", package.name, package.version),
+                manifest.parent()?.to_path_buf(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    local_source_roots.sort();
+    local_source_roots.dedup();
     Ok(CargoPackageMetadata {
         target_directory: Utf8PathBuf::from_path_buf(
             metadata.target_directory.clone().into_std_path_buf(),
         )
         .map_err(|p| anyhow::anyhow!("cargo metadata target dir is not utf8: {}", p.display()))?,
+        workspace_root,
+        local_source_roots,
         package_name: package.name.to_string(),
         lib_target_name: lib_target.name.clone(),
     })
