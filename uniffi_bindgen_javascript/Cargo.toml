@@ -9,6 +9,7 @@ keywords = ["ffi", "bindgen", "javascript", "typescript", "wasm", "napi"]
 [dependencies]
 anyhow = "1"
 camino = "1.0.8"
+cargo_metadata = "0.23.1"
 fs-err = "3.3.0"
 heck = "0.5"
 proc-macro2 = "1"
