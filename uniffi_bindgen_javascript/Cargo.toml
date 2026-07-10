@@ -16,6 +16,8 @@ proc-macro2 = "1"
 prettyplease = "0.2"
 quote = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 syn = { version = "2", features = ["full", "parsing"] }
 toml = "1.1.0"
 uniffi_bindgen = { path = "../uniffi_bindgen", version = "=0.32.0" }

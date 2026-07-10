@@ -958,6 +958,8 @@ node_modules/\n\
                         "har": harmony_archive.as_ref().map(|archive| self.rel(&self.artifact_root.join("harmony").join(archive))).transpose()?,
                         "dist": self.rel(&self.artifact_root.join("harmony/dist"))?,
                         "facade": self.rel(&self.artifact_root.join("harmony/dist/native-facade.ets"))?,
+                        "facadeContract": self.rel(&self.artifact_root.join("harmony/dist/harmony-facade-contract.json"))?,
+                        "packageFacadeContract": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/harmony-facade-contract.json"))?) },
                         "types": self.rel(&self.artifact_root.join("harmony/dist/index.d.ts"))?,
                         "package": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package"))?) },
                         "packageMetadata": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/oh-package.json5"))?) },
@@ -1848,6 +1850,7 @@ impl BuildArgs {
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir(),
             ohos_host_manifest_path: None,
+            raw_only_facade: false,
             artifact_dir: self.artifact_dir.clone(),
             dist_dir: self.ohos_dist_dir.clone(),
             package_name: self.ohos_package_name.clone(),
@@ -2950,6 +2953,7 @@ name = "uni_core"
         for file in [
             "index.d.ts",
             "Index.d.ets",
+            "harmony-facade-contract.json",
             "native-facade.ets",
             "package-index.ets",
         ] {
@@ -2978,6 +2982,11 @@ name = "uni_core"
         std::fs::write(
             package.join("oh-package.json5"),
             r#"{"name":"uni-core-ohos","version":"0.1.0","main":"Index.ets"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("harmony-facade-contract.json"),
+            format!("contract:{contents}\n"),
         )
         .unwrap();
         std::fs::write(
@@ -3145,7 +3154,12 @@ name = "uni_core"
         assert!(args.ohos_har_out.is_none());
         let dist = package_dir.join("artifacts/harmony/dist");
         std::fs::create_dir_all(&dist).unwrap();
-        for file in ["index.d.ts", "native-facade.ets", "package-index.ets"] {
+        for file in [
+            "index.d.ts",
+            "harmony-facade-contract.json",
+            "native-facade.ets",
+            "package-index.ets",
+        ] {
             std::fs::write(dist.join(file), "export {};\n").unwrap();
         }
         let meta = test_cargo_metadata(package_dir.join("target"));
@@ -3162,7 +3176,8 @@ name = "uni_core"
         assert!(harmony["moduleMetadata"].is_null());
         assert!(harmony["buildProfile"].is_null());
         assert!(harmony["metadata"].is_null());
-        for field in ["dist", "facade", "types"] {
+        assert!(harmony["packageFacadeContract"].is_null());
+        for field in ["dist", "facade", "facadeContract", "types"] {
             let path = package_dir.join(harmony[field].as_str().unwrap());
             assert!(
                 path.exists(),

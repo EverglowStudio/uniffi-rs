@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 /// Rust stream type supported by the first native stream ABI slice.
@@ -51,8 +51,13 @@ pub type RustStreamRegistry<T, E> = Lazy<Mutex<HashMap<u64, Arc<RustStream<T, E>
 
 enum RustStreamState<T, E> {
     Open {
-        stream: UniFfiStream<T, E>,
+        // The active `RustStreamNext` temporarily owns the stream while it is
+        // polling.  This keeps arbitrary `Stream::poll_next`/`Drop` code out
+        // of the state mutex and lets cancellation transition the shared
+        // state without deadlocking re-entrant user code.
+        stream: Option<UniFfiStream<T, E>>,
         next_pending: bool,
+        pending_waker: Option<Waker>,
     },
     Closed,
 }
@@ -76,48 +81,79 @@ impl<T, E> RustStream<T, E> {
     fn new(stream: UniFfiStream<T, E>) -> Self {
         Self {
             state: Mutex::new(RustStreamState::Open {
-                stream,
+                stream: Some(stream),
                 next_pending: false,
+                pending_waker: None,
             }),
         }
     }
 
     fn begin_next(self: Arc<Self>) -> RustStreamNext<T, E> {
-        let start_error = {
+        let (inner, start_error, stale_waker) = {
             let mut state = self.state.lock().unwrap();
             match &mut *state {
-                RustStreamState::Open { next_pending, .. } if *next_pending => {
-                    Some("concurrent stream next() is not supported")
-                }
-                RustStreamState::Open { next_pending, .. } => {
+                RustStreamState::Open { next_pending, .. } if *next_pending => (
+                    None,
+                    Some("concurrent stream next() is not supported"),
+                    None,
+                ),
+                RustStreamState::Open {
+                    stream,
+                    next_pending,
+                    pending_waker,
+                } => {
                     *next_pending = true;
-                    None
+                    let stale_waker = pending_waker.take();
+                    // `next_pending == false` guarantees the prior owner put
+                    // the stream back before another next operation begins.
+                    let inner = stream
+                        .take()
+                        .expect("open UniFFI stream has no active next owner");
+                    (Some(inner), None, stale_waker)
                 }
-                RustStreamState::Closed => None,
+                RustStreamState::Closed => (None, None, None),
             }
         };
+        // A stale RawWaker is an invariant cleanup, but its destructor may be
+        // user-controlled and must not run under the state mutex.
+        drop(stale_waker);
+
+        let active = inner.is_some() && start_error.is_none();
+        let owner = active.then_some(self);
 
         RustStreamNext {
-            stream: Some(self),
-            active: start_error.is_none(),
+            owner,
+            inner,
+            active,
             start_error,
         }
     }
 
     fn cancel(&self) {
-        *self.state.lock().unwrap() = RustStreamState::Closed;
-    }
-
-    fn clear_pending(&self) {
-        let mut state = self.state.lock().unwrap();
-        if let RustStreamState::Open { next_pending, .. } = &mut *state {
-            *next_pending = false;
+        let previous = {
+            let mut state = self.state.lock().unwrap();
+            std::mem::replace(&mut *state, RustStreamState::Closed)
+        };
+        let (idle_stream, pending_waker) = match previous {
+            RustStreamState::Open {
+                stream,
+                pending_waker,
+                ..
+            } => (stream, pending_waker),
+            RustStreamState::Closed => (None, None),
+        };
+        // Both operations may execute arbitrary user code.  The state mutex
+        // has been released before either one runs.
+        if let Some(waker) = pending_waker {
+            waker.wake();
         }
+        drop(idle_stream);
     }
 }
 
 pub struct RustStreamNext<T, E> {
-    stream: Option<Arc<RustStream<T, E>>>,
+    owner: Option<Arc<RustStream<T, E>>>,
+    inner: Option<UniFfiStream<T, E>>,
     active: bool,
     start_error: Option<&'static str>,
 }
@@ -130,59 +166,170 @@ impl<T, E> Future for RustStreamNext<T, E> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(message) = self.start_error.take() {
             self.active = false;
-            self.stream = None;
+            self.owner = None;
+            let inner = self.inner.take();
+            drop(inner);
             return Poll::Ready(Err(LiftArgsError {
                 arg_name: "stream",
                 error: anyhow!(message),
             }));
         }
 
-        let Some(stream) = self.stream.as_ref().cloned() else {
+        let Some(owner) = self.owner.as_ref().cloned() else {
             return Poll::Ready(Ok(Ok(None)));
         };
 
-        let mut state = stream.state.lock().unwrap();
-        match &mut *state {
-            RustStreamState::Closed => {
-                self.active = false;
-                self.stream = None;
-                Poll::Ready(Ok(Ok(None)))
+        // Publish the current task waker before polling user code.  cancel()
+        // uses the same state mutex, so it either observes this waker and
+        // wakes it, or this poll observes Closed before invoking the stream.
+        // Cloning a custom RawWaker can execute user-controlled code too, so
+        // prepare the replacement before taking the stream-state mutex.
+        let mut candidate_waker = Some(cx.waker().clone());
+        let mut replaced_waker = None;
+        let open = {
+            let mut state = owner.state.lock().unwrap();
+            match &mut *state {
+                RustStreamState::Closed => false,
+                RustStreamState::Open { pending_waker, .. } => {
+                    if pending_waker
+                        .as_ref()
+                        .is_none_or(|registered| !registered.will_wake(cx.waker()))
+                    {
+                        replaced_waker = pending_waker.replace(
+                            candidate_waker
+                                .take()
+                                .expect("stream next replacement waker is available"),
+                        );
+                    }
+                    true
+                }
             }
-            RustStreamState::Open {
-                stream: inner,
-                next_pending,
-            } => match inner.as_mut().poll_next(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Some(Ok(value))) => {
-                    *next_pending = false;
+        };
+        // Dropping either custom RawWaker may execute arbitrary code.
+        drop(candidate_waker);
+        drop(replaced_waker);
+        if !open {
+            self.active = false;
+            self.owner = None;
+            let inner = self.inner.take();
+            drop(inner);
+            return Poll::Ready(Ok(Ok(None)));
+        }
+
+        // The stream is owned by this future, so user poll code runs without
+        // either the registry or stream-state mutex held.
+        let polled = self
+            .inner
+            .as_mut()
+            .expect("active UniFFI stream next has no stream")
+            .as_mut()
+            .poll_next(cx);
+
+        match polled {
+            Poll::Pending => {
+                let closed = matches!(*owner.state.lock().unwrap(), RustStreamState::Closed);
+                if closed {
                     self.active = false;
-                    self.stream = None;
+                    self.owner = None;
+                    let inner = self.inner.take();
+                    drop(inner);
+                    Poll::Ready(Ok(Ok(None)))
+                } else {
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(Some(Ok(value))) => {
+                let mut inner = self.inner.take();
+                let mut stale_waker = None;
+                let closed = {
+                    let mut state = owner.state.lock().unwrap();
+                    match &mut *state {
+                        RustStreamState::Closed => true,
+                        RustStreamState::Open {
+                            stream,
+                            next_pending,
+                            pending_waker,
+                        } => {
+                            *next_pending = false;
+                            stale_waker = pending_waker.take();
+                            *stream = inner.take();
+                            false
+                        }
+                    }
+                };
+                drop(stale_waker);
+                drop(inner);
+                self.active = false;
+                self.owner = None;
+                if closed {
+                    Poll::Ready(Ok(Ok(None)))
+                } else {
                     Poll::Ready(Ok(Ok(Some(value))))
                 }
-                Poll::Ready(Some(Err(error))) => {
-                    *state = RustStreamState::Closed;
-                    self.active = false;
-                    self.stream = None;
-                    Poll::Ready(Ok(Err(error)))
-                }
-                Poll::Ready(None) => {
-                    *state = RustStreamState::Closed;
-                    self.active = false;
-                    self.stream = None;
-                    Poll::Ready(Ok(Ok(None)))
-                }
-            },
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finish_terminal(&owner);
+                Poll::Ready(Ok(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.finish_terminal(&owner);
+                Poll::Ready(Ok(Ok(None)))
+            }
         }
+    }
+}
+
+impl<T, E> RustStreamNext<T, E> {
+    fn finish_terminal(&mut self, owner: &RustStream<T, E>) {
+        let previous = {
+            let mut state = owner.state.lock().unwrap();
+            std::mem::replace(&mut *state, RustStreamState::Closed)
+        };
+        let (idle_stream, pending_waker) = match previous {
+            RustStreamState::Open {
+                stream,
+                pending_waker,
+                ..
+            } => (stream, pending_waker),
+            RustStreamState::Closed => (None, None),
+        };
+        self.active = false;
+        self.owner = None;
+        let inner = self.inner.take();
+        // All user-controlled drops happen after the state mutex is released.
+        drop(pending_waker);
+        drop(idle_stream);
+        drop(inner);
     }
 }
 
 impl<T, E> Drop for RustStreamNext<T, E> {
     fn drop(&mut self) {
-        if self.active {
-            if let Some(stream) = &self.stream {
-                stream.clear_pending();
+        if !self.active {
+            return;
+        }
+        let Some(owner) = self.owner.take() else {
+            return;
+        };
+        let mut inner = self.inner.take();
+        let mut stale_waker = None;
+        {
+            let mut state = owner.state.lock().unwrap();
+            if let RustStreamState::Open {
+                stream,
+                next_pending,
+                pending_waker,
+            } = &mut *state
+            {
+                *next_pending = false;
+                stale_waker = pending_waker.take();
+                *stream = inner.take();
             }
         }
+        self.active = false;
+        // A canceled owner leaves `inner` populated; drop it outside the lock.
+        drop(stale_waker);
+        drop(inner);
     }
 }
 
@@ -251,7 +398,8 @@ where
     T: UniffiCompatibleStreamValue,
     E: UniffiCompatibleStreamValue,
 {
-    if let Some(stream) = registry.lock().unwrap().remove(&handle.as_raw()) {
+    let stream = { registry.lock().unwrap().remove(&handle.as_raw()) };
+    if let Some(stream) = stream {
         stream.cancel();
     }
 }
@@ -275,12 +423,423 @@ impl<T, E> Future for RustStreamRegistryNext<T, E> {
         match Pin::new(inner).poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(output) => {
-                if !matches!(output, Ok(Ok(Some(_)))) {
-                    self.registry.lock().unwrap().remove(&self.handle);
+                if matches!(output, Ok(Ok(None)) | Ok(Err(_))) {
+                    let removed = { self.registry.lock().unwrap().remove(&self.handle) };
+                    drop(removed);
                 }
                 self.inner = None;
                 Poll::Ready(output)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{mpsc, Barrier, Weak};
+    use std::task::{Wake, Waker};
+    use std::time::Duration;
+
+    struct AlwaysPending;
+
+    impl Stream for AlwaysPending {
+        type Item = Result<u32, String>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    struct GatedPending {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        first_poll: bool,
+    }
+
+    impl Stream for GatedPending {
+        type Item = Result<u32, String>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if self.first_poll {
+                self.first_poll = false;
+                self.entered.wait();
+                self.release.wait();
+            }
+            Poll::Pending
+        }
+    }
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    static PENDING_REGISTRY: RustStreamRegistry<u32, String> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    struct CancelOwnerOnWake {
+        owner: Arc<RustStream<u32, String>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct ProbeRegistryOnWake {
+        available: Arc<AtomicUsize>,
+    }
+
+    impl Wake for ProbeRegistryOnWake {
+        fn wake(self: Arc<Self>) {
+            let available = PENDING_REGISTRY.try_lock().is_ok();
+            self.available
+                .store(if available { 1 } else { 2 }, AtomicOrdering::SeqCst);
+        }
+    }
+
+    impl Wake for CancelOwnerOnWake {
+        fn wake(self: Arc<Self>) {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.owner.cancel();
+        }
+    }
+
+    struct CancelOwnerOnWakerDrop {
+        owner: Weak<RustStream<u32, String>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CancelOwnerOnWakerDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for CancelOwnerOnWakerDrop {
+        fn drop(&mut self) {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if let Some(owner) = self.owner.upgrade() {
+                owner.cancel();
+            }
+        }
+    }
+
+    struct ReentrantPollAndDropStream {
+        owner: Arc<Mutex<Option<Weak<RustStream<u32, String>>>>>,
+        poll_calls: Arc<AtomicUsize>,
+        drop_calls: Arc<AtomicUsize>,
+    }
+
+    impl Stream for ReentrantPollAndDropStream {
+        type Item = Result<u32, String>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.poll_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if let Some(owner) = self.owner.lock().unwrap().as_ref().and_then(Weak::upgrade) {
+                owner.cancel();
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for ReentrantPollAndDropStream {
+        fn drop(&mut self) {
+            self.drop_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if let Some(owner) = self.owner.lock().unwrap().as_ref().and_then(Weak::upgrade) {
+                owner.cancel();
+            }
+        }
+    }
+
+    struct CancelRegistryOnDropStream {
+        handle: Arc<Mutex<Option<Handle>>>,
+    }
+
+    impl Stream for CancelRegistryOnDropStream {
+        type Item = Result<u32, String>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(None)
+        }
+    }
+
+    impl Drop for CancelRegistryOnDropStream {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.lock().unwrap().clone() {
+                rust_stream_cancel(&PENDING_REGISTRY, handle);
+            }
+        }
+    }
+
+    fn completes_within_timeout(action: impl FnOnce() + Send + 'static) {
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            action();
+            sender.send(()).unwrap();
+        });
+        match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(()) => worker.join().unwrap(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => worker.join().unwrap(),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("re-entrant stream callback deadlocked for more than two seconds")
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_pending_next_wakes_and_completes_eof() {
+        let handle = rust_stream_new(&PENDING_REGISTRY, Box::pin(AlwaysPending));
+        let mut next = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, handle.clone()));
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(next.as_mut().poll(&mut cx), Poll::Pending));
+        rust_stream_cancel(&PENDING_REGISTRY, handle.clone());
+        assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            next.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(Ok(None)))
+        ));
+        assert!(!PENDING_REGISTRY
+            .lock()
+            .unwrap()
+            .contains_key(&handle.as_raw()));
+
+        // Repeated cancellation is idempotent and never emits a second wake.
+        rust_stream_cancel(&PENDING_REGISTRY, handle);
+        assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_next_lift_error_preserves_registry_for_pending_cancel() {
+        let handle = rust_stream_new(&PENDING_REGISTRY, Box::pin(AlwaysPending));
+        let mut first = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, handle.clone()));
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(first.as_mut().poll(&mut cx), Poll::Pending));
+
+        let mut concurrent = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, handle.clone()));
+        assert!(matches!(
+            concurrent.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+        assert!(PENDING_REGISTRY
+            .lock()
+            .unwrap()
+            .contains_key(&handle.as_raw()));
+
+        rust_stream_cancel(&PENDING_REGISTRY, handle.clone());
+        assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            first.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(Ok(None)))
+        ));
+        assert!(!PENDING_REGISTRY
+            .lock()
+            .unwrap()
+            .contains_key(&handle.as_raw()));
+    }
+
+    #[test]
+    fn cancel_wakes_after_releasing_registry_mutex() {
+        let handle = rust_stream_new(&PENDING_REGISTRY, Box::pin(AlwaysPending));
+        let mut next = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, handle.clone()));
+        let available = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(ProbeRegistryOnWake {
+            available: available.clone(),
+        }));
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(next.as_mut().poll(&mut cx), Poll::Pending));
+        rust_stream_cancel(&PENDING_REGISTRY, handle);
+        assert_eq!(available.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            next.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(Ok(None)))
+        ));
+    }
+
+    #[test]
+    fn wake_and_waker_drop_can_reenter_stream_state_without_deadlock() {
+        completes_within_timeout(|| {
+            let owner = Arc::new(RustStream::new(Box::pin(AlwaysPending)));
+            let wake_calls = Arc::new(AtomicUsize::new(0));
+            let mut next = Box::pin(owner.clone().begin_next());
+            let waker = Waker::from(Arc::new(CancelOwnerOnWake {
+                owner: owner.clone(),
+                calls: wake_calls.clone(),
+            }));
+            let mut cx = Context::from_waker(&waker);
+            assert!(matches!(next.as_mut().poll(&mut cx), Poll::Pending));
+            owner.cancel();
+            assert_eq!(wake_calls.load(AtomicOrdering::SeqCst), 1);
+            assert!(matches!(
+                next.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(Ok(None)))
+            ));
+
+            let owner = Arc::new(RustStream::new(Box::pin(AlwaysPending)));
+            let drop_calls = Arc::new(AtomicUsize::new(0));
+            let mut next = Box::pin(owner.clone().begin_next());
+            {
+                let waker = Waker::from(Arc::new(CancelOwnerOnWakerDrop {
+                    owner: Arc::downgrade(&owner),
+                    calls: drop_calls.clone(),
+                }));
+                let mut cx = Context::from_waker(&waker);
+                assert!(matches!(next.as_mut().poll(&mut cx), Poll::Pending));
+            }
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(matches!(
+                next.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(Ok(None)))
+            ));
+            assert_eq!(drop_calls.load(AtomicOrdering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn user_stream_poll_and_drop_can_reenter_state_without_deadlock() {
+        completes_within_timeout(|| {
+            let owner_slot = Arc::new(Mutex::new(None));
+            let poll_calls = Arc::new(AtomicUsize::new(0));
+            let drop_calls = Arc::new(AtomicUsize::new(0));
+            let owner = Arc::new(RustStream::new(Box::pin(ReentrantPollAndDropStream {
+                owner: owner_slot.clone(),
+                poll_calls: poll_calls.clone(),
+                drop_calls: drop_calls.clone(),
+            })));
+            *owner_slot.lock().unwrap() = Some(Arc::downgrade(&owner));
+            let mut next = Box::pin(owner.clone().begin_next());
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(matches!(
+                next.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(Ok(None)))
+            ));
+            assert_eq!(poll_calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(drop_calls.load(AtomicOrdering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn stream_drop_can_reenter_raw_cancel_without_registry_deadlock() {
+        completes_within_timeout(|| {
+            let handle_slot = Arc::new(Mutex::new(None));
+            let handle = rust_stream_new(
+                &PENDING_REGISTRY,
+                Box::pin(CancelRegistryOnDropStream {
+                    handle: handle_slot.clone(),
+                }),
+            );
+            *handle_slot.lock().unwrap() = Some(handle.clone());
+            let mut next = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, handle.clone()));
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(matches!(
+                next.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(Ok(None)))
+            ));
+            assert!(!PENDING_REGISTRY
+                .lock()
+                .unwrap()
+                .contains_key(&handle.as_raw()));
+        });
+    }
+
+    #[test]
+    fn cancel_before_poll_and_dropped_pending_next_release_state() {
+        let before_poll = rust_stream_new(&PENDING_REGISTRY, Box::pin(AlwaysPending));
+        let mut next = Box::pin(rust_stream_next_async(
+            &PENDING_REGISTRY,
+            before_poll.clone(),
+        ));
+        rust_stream_cancel(&PENDING_REGISTRY, before_poll);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            next.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(Ok(None)))
+        ));
+
+        let dropped = rust_stream_new(&PENDING_REGISTRY, Box::pin(AlwaysPending));
+        let mut first = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, dropped.clone()));
+        assert!(matches!(first.as_mut().poll(&mut cx), Poll::Pending));
+        drop(first);
+        let mut second = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, dropped.clone()));
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
+        rust_stream_cancel(&PENDING_REGISTRY, dropped);
+        assert!(matches!(
+            second.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(Ok(None)))
+        ));
+    }
+
+    #[test]
+    fn cancel_racing_with_pending_poll_has_no_lost_wake() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let handle = rust_stream_new(
+            &PENDING_REGISTRY,
+            Box::pin(GatedPending {
+                entered: entered.clone(),
+                release: release.clone(),
+                first_poll: true,
+            }),
+        );
+        let counter = Arc::new(WakeCounter::default());
+        let thread_counter = counter.clone();
+        let thread_handle = handle.clone();
+        let (first_poll_sender, first_poll_receiver) = mpsc::channel();
+        let (resume_sender, resume_receiver) = mpsc::channel();
+        let poller = std::thread::spawn(move || {
+            let mut next = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, thread_handle));
+            let waker = Waker::from(thread_counter);
+            let mut cx = Context::from_waker(&waker);
+            match next.as_mut().poll(&mut cx) {
+                Poll::Pending => {
+                    first_poll_sender.send(false).unwrap();
+                    resume_receiver
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    assert!(matches!(
+                        next.as_mut().poll(&mut cx),
+                        Poll::Ready(Ok(Ok(None)))
+                    ));
+                }
+                Poll::Ready(Ok(Ok(None))) => {
+                    // Cancellation won the race while user poll code was
+                    // gated, so this very poll observed Closed and settled.
+                    first_poll_sender.send(true).unwrap();
+                }
+                other => panic!("unexpected first racing poll result: {other:?}"),
+            }
+        });
+
+        entered.wait();
+        let cancel_started = Arc::new(Barrier::new(2));
+        let cancel_thread_started = cancel_started.clone();
+        let canceller = std::thread::spawn(move || {
+            cancel_thread_started.wait();
+            rust_stream_cancel(&PENDING_REGISTRY, handle);
+        });
+        cancel_started.wait();
+        release.wait();
+        let completed_in_first_poll = first_poll_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        canceller.join().unwrap();
+        assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 1);
+        if !completed_in_first_poll {
+            resume_sender.send(()).unwrap();
+        }
+        poller.join().unwrap();
     }
 }
