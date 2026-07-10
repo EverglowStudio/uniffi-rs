@@ -552,6 +552,12 @@ napi-derive-ohos = { version = "1.1.6", features = ["type-def"] }
 napi-build-ohos = "1.1.6"
 ```
 
+The emitted host keeps the `napi-ohos` Tokio cleanup hook safe when several
+native modules share one ArkTS process. HarmonyOS treats the hook argument as
+the registration key, so the host's OHOS-only linker wrapper replaces a null
+argument with a stable address owned by that native library. Non-null keys are
+left unchanged, and the same substitution is applied when removing a hook.
+
 The CLI orchestration command is:
 
 ```text

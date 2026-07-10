@@ -2295,8 +2295,8 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
         Type::Int16 => num_lower(expr, "i16"),
         Type::UInt32 => num_lower(expr, "u32"),
         Type::Int32 => num_lower(expr, "i32"),
-        Type::UInt64 => num_lower(expr, "u64"),
-        Type::Int64 => num_lower(expr, "i64"),
+        Type::UInt64 => bigint_lower(expr, "u64"),
+        Type::Int64 => bigint_lower(expr, "i64"),
         Type::Float32 => num_lower(expr, "f32"),
         Type::Float64 => format!(
             "{expr}.as_f64().ok_or_else(|| JsError::new(\"expected number\"))"
@@ -2386,6 +2386,12 @@ fn num_lower(expr: &str, rust_ty: &str) -> String {
     )
 }
 
+fn bigint_lower(expr: &str, rust_ty: &str) -> String {
+    format!(
+        "{{ let __big = ::js_sys::BigInt::new(&{expr}).map_err(|_| JsError::new(\"expected bigint\"))?; <{rust_ty} as ::std::convert::TryFrom<::js_sys::BigInt>>::try_from(__big).map_err(|_| JsError::new(\"BigInt value does not fit into {rust_ty}\")) }}"
+    )
+}
+
 fn timestamp_lower(expr: &str) -> String {
     format!("__uniffi_lower_timestamp({expr})")
 }
@@ -2406,10 +2412,11 @@ fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
         | Type::Int16
         | Type::UInt32
         | Type::Int32
-        | Type::UInt64
-        | Type::Int64
         | Type::Float32
         | Type::Float64 => format!("JsValue::from_f64({expr} as f64)"),
+        Type::UInt64 | Type::Int64 => {
+            format!("JsValue::from(::js_sys::BigInt::from({expr}))")
+        }
         Type::Bytes => format!("JsValue::from(::js_sys::Uint8Array::from(&{expr}[..]))"),
         Type::Timestamp => timestamp_lift_value(expr),
         Type::Duration => duration_lift_value(expr),
