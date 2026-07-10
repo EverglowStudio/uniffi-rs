@@ -11,6 +11,9 @@ use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::MetadataCommand;
 use clap::{Args, Subcommand, ValueEnum};
+use fs2::FileExt;
+use std::collections::BTreeSet;
+use std::fs::OpenOptions;
 use std::io::{Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -115,9 +118,53 @@ pub(crate) struct BuildArgs {
     #[clap(long = "ohos-package-name")]
     ohos_package_name: Option<String>,
 
+    /// Harmony module name override.
+    #[clap(long = "ohos-module-name")]
+    ohos_module_name: Option<String>,
+
+    /// Semantic version override for generated OHPM package metadata.
+    #[clap(long = "ohos-package-version")]
+    ohos_package_version: Option<String>,
+
+    /// Author override for generated OHPM package metadata.
+    #[clap(long = "ohos-author")]
+    ohos_author: Option<String>,
+
+    /// SPDX license override for generated OHPM package metadata.
+    #[clap(long = "ohos-license")]
+    ohos_license: Option<String>,
+
+    /// Description override for generated OHPM package metadata.
+    #[clap(long = "ohos-description")]
+    ohos_description: Option<String>,
+
+    /// Minimum compatible Harmony/OpenHarmony SDK version. Must be explicit for final HAR packaging.
+    #[clap(long = "ohos-compatible-sdk-version")]
+    ohos_compatible_sdk_version: Option<String>,
+
+    /// Compatible SDK type, such as HarmonyOS or OpenHarmony.
+    #[clap(long = "ohos-compatible-sdk-type")]
+    ohos_compatible_sdk_type: Option<String>,
+
+    /// Supported Harmony device type. May be repeated or comma-separated.
+    #[clap(long = "ohos-device-type", value_delimiter = ',')]
+    ohos_device_types: Vec<String>,
+
     /// Output `.har` path. Defaults to `<artifact-root>/<package>.har`.
     #[clap(long = "ohos-har-out")]
     ohos_har_out: Option<Utf8PathBuf>,
+
+    /// Hvigor wrapper used to build the final compiled HAR.
+    #[clap(long = "ohos-hvigorw")]
+    ohos_hvigorw: Option<String>,
+
+    /// OHPM executable used to resolve and prepublish the final HAR.
+    #[clap(long = "ohos-ohpm")]
+    ohos_ohpm: Option<String>,
+
+    /// DevEco SDK root used by the generated Hvigor project.
+    #[clap(long = "ohos-deveco-sdk-home")]
+    ohos_deveco_sdk_home: Option<Utf8PathBuf>,
 
     /// Skip final HAR packaging and keep only `dist/` intermediate outputs.
     #[clap(long = "ohos-no-har")]
@@ -251,6 +298,311 @@ struct ManagedLayout {
     manifest_path: Utf8PathBuf,
 }
 
+const MANAGED_HARMONY_OWNER_MARKER: &str = ".uniffi-managed-harmony-owner";
+const MANAGED_HARMONY_OWNER_KIND: &str = "uniffi-managed-harmony";
+
+struct ManagedHarmonyTransaction {
+    _lock: std::fs::File,
+    _private: tempfile::TempDir,
+    private_root: Utf8PathBuf,
+    public_root: Utf8PathBuf,
+    manifest_path: Utf8PathBuf,
+    captured_root: Option<super::ohos::OwnedTreeSnapshot>,
+    captured_manifest: Option<Vec<u8>>,
+    no_har: bool,
+    skip_libs: bool,
+    expected_har_name: Option<String>,
+}
+
+impl ManagedHarmonyTransaction {
+    fn begin(layout: &ManagedLayout, args: &mut BuildArgs) -> Result<Self> {
+        std::fs::create_dir_all(&layout.artifact_root)
+            .with_context(|| format!("creating managed artifact root {}", layout.artifact_root))?;
+        let lock_path = layout.artifact_root.join(".uniffi-harmony.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening managed Harmony lock {lock_path}"))?;
+        lock.lock_exclusive()
+            .with_context(|| format!("locking managed Harmony output {lock_path}"))?;
+
+        let public_root = layout.artifact_root.join("harmony");
+        let captured_root = match std::fs::symlink_metadata(&public_root) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!("managed Harmony output must be a real directory: {public_root}");
+                }
+                Some(super::ohos::validate_owned_tree(
+                    &public_root,
+                    MANAGED_HARMONY_OWNER_MARKER,
+                    MANAGED_HARMONY_OWNER_KIND,
+                )?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading managed Harmony output {public_root}"));
+            }
+        };
+        let captured_manifest = match std::fs::read(&layout.manifest_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("reading managed artifact manifest {}", layout.manifest_path)
+                });
+            }
+        };
+
+        let private = tempfile::Builder::new()
+            .prefix(".uniffi-harmony-build-")
+            .tempdir_in(&layout.artifact_root)
+            .with_context(|| {
+                format!(
+                    "creating invocation-private Harmony output under {}",
+                    layout.artifact_root
+                )
+            })?;
+        let private_dir =
+            Utf8PathBuf::from_path_buf(private.path().to_path_buf()).map_err(|path| {
+                anyhow::anyhow!("private Harmony output is not UTF-8: {}", path.display())
+            })?;
+        let private_root = private_dir.join("harmony");
+        std::fs::create_dir(&private_root)
+            .with_context(|| format!("creating private Harmony root {private_root}"))?;
+
+        let expected_har_name = args
+            .ohos_har_out
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(str::to_string);
+        args.ohos_dist_dir = Some(private_root.join("dist"));
+        args.ohos_har_out = if args.ohos_no_har {
+            None
+        } else {
+            Some(
+                private_root.join(
+                    expected_har_name
+                        .as_deref()
+                        .context("managed Harmony HAR path has no file name")?,
+                ),
+            )
+        };
+
+        Ok(Self {
+            _lock: lock,
+            _private: private,
+            private_root,
+            public_root,
+            manifest_path: layout.manifest_path.clone(),
+            captured_root,
+            captured_manifest,
+            no_har: args.ohos_no_har,
+            skip_libs: args.ohos_skip_libs,
+            expected_har_name,
+        })
+    }
+
+    fn private_root(&self) -> &Utf8Path {
+        &self.private_root
+    }
+
+    fn commit(mut self, manifest: &[u8]) -> Result<()> {
+        self.commit_with(
+            manifest,
+            |path, bytes| write_file_atomically(path, bytes),
+            |path| {
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("removing previous managed Harmony tree {path}"))
+            },
+        )
+    }
+
+    fn commit_with<WriteManifest, RemoveBackup>(
+        &mut self,
+        manifest: &[u8],
+        write_manifest: WriteManifest,
+        remove_backup: RemoveBackup,
+    ) -> Result<()>
+    where
+        WriteManifest: Fn(&Utf8Path, &[u8]) -> Result<()>,
+        RemoveBackup: Fn(&Utf8Path) -> Result<()>,
+    {
+        self.validate_private_root()?;
+        let next = super::ohos::write_owned_tree_marker(
+            &self.private_root,
+            MANAGED_HARMONY_OWNER_MARKER,
+            MANAGED_HARMONY_OWNER_KIND,
+        )?;
+        self.revalidate_capture()?;
+
+        let parent = self
+            .public_root
+            .parent()
+            .context("managed Harmony output has no parent")?;
+        let backup = parent.join(format!(".harmony.uniffi-backup-{}", next.generation()));
+        if backup.exists() {
+            bail!("managed Harmony backup path already exists: {backup}");
+        }
+        let had_public = self.public_root.exists();
+        if had_public {
+            std::fs::rename(&self.public_root, &backup).with_context(|| {
+                format!(
+                    "moving previous managed Harmony tree {} to {backup}",
+                    self.public_root
+                )
+            })?;
+        }
+        if let Err(error) = std::fs::rename(&self.private_root, &self.public_root) {
+            if had_public {
+                if let Err(restore_error) = std::fs::rename(&backup, &self.public_root) {
+                    bail!(
+                        "publishing private Harmony tree {} to {} failed: {error}; restoring the previous tree from {backup} also failed: {restore_error}",
+                        self.private_root,
+                        self.public_root
+                    );
+                }
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "publishing private Harmony tree {} to {}",
+                    self.private_root, self.public_root
+                )
+            });
+        }
+
+        // Everything before the manifest publication is reversible: the old
+        // tree is still complete in `backup`, so a failure can safely restore
+        // the captured tree and manifest generation.
+        let prepare_commit = (|| -> Result<()> {
+            if had_public {
+                let backup_snapshot = super::ohos::validate_owned_tree(
+                    &backup,
+                    MANAGED_HARMONY_OWNER_MARKER,
+                    MANAGED_HARMONY_OWNER_KIND,
+                )?;
+                if Some(&backup_snapshot) != self.captured_root.as_ref() {
+                    bail!("previous managed Harmony backup changed before commit: {backup}");
+                }
+            }
+            write_manifest(&self.manifest_path, manifest)
+                .context("publishing managed artifact manifest")?;
+            Ok(())
+        })();
+        if let Err(error) = prepare_commit {
+            let rollback = self.rollback_swap(&backup, had_public);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(anyhow::anyhow!(
+                    "managed Harmony transaction failed: {error:#}; rollback also failed: {rollback_error:#}; inspect {} and {backup}",
+                    self.public_root
+                )),
+            };
+        }
+
+        // The new public tree and manifest now form one committed generation.
+        // `remove_dir_all` may fail after deleting part of the old backup, so
+        // cleanup is deliberately post-commit and must never trigger rollback
+        // from a potentially incomplete backup.
+        if let Ok(parent_file) = std::fs::File::open(parent) {
+            let _ = parent_file.sync_all();
+        }
+        if had_public {
+            if let Err(error) = remove_backup(&backup) {
+                return Err(anyhow::anyhow!(
+                    "managed Harmony generation was committed, but cleanup of previous backup {backup} failed: {error:#}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_private_root(&self) -> Result<()> {
+        require_real_directory(&self.private_root, "private managed Harmony root")?;
+        require_real_directory(
+            &self.private_root.join("dist"),
+            "private managed Harmony dist",
+        )?;
+        if self.skip_libs {
+            ensure_tree_has_no_native_artifacts(&self.private_root.join("dist"))?;
+        }
+        let mut expected = BTreeSet::from(["dist".to_string()]);
+        if !self.no_har {
+            expected.insert("package".to_string());
+            expected.insert(
+                self.expected_har_name
+                    .clone()
+                    .context("managed HAR transaction has no archive name")?,
+            );
+        }
+        let actual = std::fs::read_dir(&self.private_root)?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().to_string()))
+            .collect::<std::io::Result<BTreeSet<_>>>()?;
+        if actual != expected {
+            bail!(
+                "private managed Harmony tree has unexpected top-level entries: expected {expected:?}, found {actual:?}"
+            );
+        }
+        Ok(())
+    }
+
+    fn revalidate_capture(&self) -> Result<()> {
+        let current_root = if self.public_root.exists() {
+            Some(super::ohos::validate_owned_tree(
+                &self.public_root,
+                MANAGED_HARMONY_OWNER_MARKER,
+                MANAGED_HARMONY_OWNER_KIND,
+            )?)
+        } else {
+            None
+        };
+        if current_root != self.captured_root {
+            bail!("managed Harmony public tree changed while the transaction lock was held");
+        }
+        let current_manifest = match std::fs::read(&self.manifest_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if current_manifest != self.captured_manifest {
+            bail!("managed artifact manifest changed while the Harmony transaction was running");
+        }
+        Ok(())
+    }
+
+    fn rollback_swap(&mut self, backup: &Utf8Path, had_public: bool) -> Result<()> {
+        let backup_name = backup
+            .file_name()
+            .context("managed Harmony backup has no file name")?;
+        let failed_new = self
+            .public_root
+            .parent()
+            .context("managed Harmony output has no parent")?
+            .join(format!(".{backup_name}.failed-new"));
+        if failed_new.exists() {
+            bail!("managed Harmony failed-new path already exists: {failed_new}");
+        }
+        std::fs::rename(&self.public_root, &failed_new)
+            .context("moving failed new managed Harmony tree aside")?;
+        if had_public {
+            std::fs::rename(backup, &self.public_root)
+                .context("restoring previous managed Harmony tree")?;
+        }
+        restore_file_atomically(&self.manifest_path, self.captured_manifest.as_deref())?;
+        super::ohos::validate_owned_tree(
+            &failed_new,
+            MANAGED_HARMONY_OWNER_MARKER,
+            MANAGED_HARMONY_OWNER_KIND,
+        )
+        .context("validating failed new managed Harmony tree before cleanup")?;
+        std::fs::remove_dir_all(&failed_new)
+            .context("removing failed new managed Harmony tree after rollback")?;
+        Ok(())
+    }
+}
+
 impl ManagedLayout {
     fn apply(args: &mut BuildArgs, targets: &ExpandedTargets) -> Result<Option<Self>> {
         if !args.managed_layout {
@@ -310,12 +662,15 @@ impl ManagedLayout {
         args.host_crates_dir = Some(host_crates_root.clone());
         args.artifact_dir = Some(artifact_root.clone());
         if targets.harmony {
-            let harmony_package = args
-                .ohos_package_name
-                .clone()
-                .unwrap_or_else(|| format!("{}-ohos", meta.package_name));
             args.ohos_dist_dir = Some(artifact_root.join("harmony/dist"));
-            args.ohos_har_out = Some(artifact_root.join(format!("harmony/{harmony_package}.har")));
+            if !args.ohos_no_har {
+                let harmony_package = args
+                    .ohos_package_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-ohos", meta.package_name));
+                let harmony_archive = harmony_archive_file_name(&harmony_package)?;
+                args.ohos_har_out = Some(artifact_root.join("harmony").join(harmony_archive));
+            }
         }
         if targets.apple {
             args.apple_xcframework_out = Some(
@@ -343,6 +698,18 @@ impl ManagedLayout {
         meta: &CargoPackageMetadata,
         args: &BuildArgs,
     ) -> Result<()> {
+        self.emit_supporting_files(targets, meta, args)?;
+        let manifest = self.render_manifest(targets, meta, args)?;
+        write_file_atomically(&self.manifest_path, manifest.as_bytes())?;
+        Ok(())
+    }
+
+    fn emit_supporting_files(
+        &self,
+        targets: &ExpandedTargets,
+        meta: &CargoPackageMetadata,
+        args: &BuildArgs,
+    ) -> Result<()> {
         if targets.wasm {
             self.emit_web_entrypoint()?;
         }
@@ -359,7 +726,6 @@ impl ManagedLayout {
             self.emit_apple_package(meta, args)?;
         }
         self.emit_gitignore()?;
-        self.emit_manifest(targets, meta, args)?;
         Ok(())
     }
 
@@ -499,12 +865,22 @@ node_modules/\n\
         Ok(())
     }
 
-    fn emit_manifest(
+    fn render_manifest(
         &self,
         targets: &ExpandedTargets,
         meta: &CargoPackageMetadata,
         args: &BuildArgs,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        self.render_manifest_with_harmony_root(targets, meta, args, None)
+    }
+
+    fn render_manifest_with_harmony_root(
+        &self,
+        targets: &ExpandedTargets,
+        meta: &CargoPackageMetadata,
+        args: &BuildArgs,
+        harmony_source_root: Option<&Utf8Path>,
+    ) -> Result<String> {
         let namespace = &meta.lib_target_name;
         let wasm_stem = format!("{}_wasm", rust_identifier(&meta.package_name));
         let node_env = format!("UNIFFI_{}_NAPI_PATH", namespace.to_ascii_uppercase());
@@ -512,6 +888,18 @@ node_modules/\n\
             .ohos_package_name
             .clone()
             .unwrap_or_else(|| format!("{}-ohos", meta.package_name));
+        let harmony_archive = if targets.harmony && !args.ohos_no_har {
+            Some(harmony_archive_file_name(&harmony_package)?)
+        } else {
+            None
+        };
+        let default_harmony_source_root = self.artifact_root.join("harmony");
+        let harmony_source_root = harmony_source_root.unwrap_or(&default_harmony_source_root);
+        let harmony_metadata = if targets.harmony && !args.ohos_no_har {
+            self.harmony_package_metadata(meta, args, &harmony_package, harmony_source_root)?
+        } else {
+            serde_json::Value::Null
+        };
         let manifest = serde_json::json!({
             "schemaVersion": 2,
             "generator": "uniffi-bindgen-javascript",
@@ -533,7 +921,9 @@ node_modules/\n\
                 "miniProgram": if targets.mini_program { serde_json::Value::String("src/index.mini-program.ts".to_string()) } else { serde_json::Value::Null },
                 "node": if targets.node { serde_json::Value::String("src/index.node.ts".to_string()) } else { serde_json::Value::Null },
                 "electron": if targets.electron { serde_json::Value::String("src/index.electron.ts".to_string()) } else { serde_json::Value::Null },
-                "harmony": serde_json::Value::Null,
+                "harmony": if targets.harmony {
+                    serde_json::Value::String(self.rel(&self.artifact_root.join(if args.ohos_no_har { "harmony/dist/package-index.ets" } else { "harmony/package/Index.ets" }))?)
+                } else { serde_json::Value::Null },
             },
             "artifacts": {
                 "wasm": if targets.wasm {
@@ -564,9 +954,16 @@ node_modules/\n\
                 } else { serde_json::Value::Null },
                 "harmony": if targets.harmony {
                     serde_json::json!({
-                        "har": self.rel(&self.artifact_root.join(format!("harmony/{harmony_package}.har")))?,
+                        "kind": if args.ohos_no_har { "dist" } else { "har" },
+                        "har": harmony_archive.as_ref().map(|archive| self.rel(&self.artifact_root.join("harmony").join(archive))).transpose()?,
                         "dist": self.rel(&self.artifact_root.join("harmony/dist"))?,
-                        "package": self.rel(&self.artifact_root.join("harmony/package"))?,
+                        "facade": self.rel(&self.artifact_root.join("harmony/dist/native-facade.ets"))?,
+                        "types": self.rel(&self.artifact_root.join("harmony/dist/index.d.ts"))?,
+                        "package": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package"))?) },
+                        "packageMetadata": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/oh-package.json5"))?) },
+                        "moduleMetadata": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/src/main/module.json5"))?) },
+                        "buildProfile": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/build-profile.json5"))?) },
+                        "metadata": harmony_metadata,
                     })
                 } else { serde_json::Value::Null },
                 "apple": if targets.apple {
@@ -591,9 +988,85 @@ node_modules/\n\
         });
         let manifest = self.merge_existing_manifest(manifest)?;
         let text = serde_json::to_string_pretty(&manifest)?;
-        std::fs::write(&self.manifest_path, format!("{text}\n"))
-            .with_context(|| format!("writing managed artifact manifest {}", self.manifest_path))?;
-        Ok(())
+        Ok(format!("{text}\n"))
+    }
+
+    fn harmony_package_metadata(
+        &self,
+        meta: &CargoPackageMetadata,
+        args: &BuildArgs,
+        package_name: &str,
+        harmony_source_root: &Utf8Path,
+    ) -> Result<serde_json::Value> {
+        let package_path = harmony_source_root.join("package/oh-package.json5");
+        let module_path = harmony_source_root.join("package/src/main/module.json5");
+        let profile_path = harmony_source_root.join("package/build-profile.json5");
+        if package_path.exists() && module_path.exists() && profile_path.exists() {
+            return Ok(serde_json::json!({
+                "package": read_generated_json5(&package_path)?,
+                "module": read_generated_json5(&module_path)?["module"].clone(),
+                "buildProfile": read_generated_json5(&profile_path)?,
+            }));
+        }
+
+        super::ohos::validate_oh_package_name(package_name)?;
+        let version = args
+            .ohos_package_version
+            .as_deref()
+            .unwrap_or(&meta.package_version);
+        super::ohos::validate_package_version(version)?;
+        let module_name = args
+            .ohos_module_name
+            .clone()
+            .unwrap_or(super::ohos::derive_module_name(package_name)?);
+        super::ohos::validate_module_name(&module_name)?;
+        let device_types = super::ohos::resolve_device_types(&args.ohos_device_types)?;
+
+        let mut package = serde_json::Map::new();
+        package.insert("name".into(), package_name.into());
+        package.insert("version".into(), version.into());
+        package.insert("main".into(), "Index.ets".into());
+        if let Some(description) = args.ohos_description.as_ref().or(meta.description.as_ref()) {
+            package.insert("description".into(), description.clone().into());
+        }
+        if let Some(author) = args
+            .ohos_author
+            .as_ref()
+            .or_else(|| meta.authors.iter().find(|author| !author.trim().is_empty()))
+        {
+            package.insert("author".into(), author.trim().to_string().into());
+        }
+        if let Some(license) = args.ohos_license.as_ref().or(meta.license.as_ref()) {
+            if !license.trim().is_empty() {
+                package.insert("license".into(), license.trim().to_string().into());
+            }
+        }
+        if let Some(sdk_version) = &args.ohos_compatible_sdk_version {
+            package.insert("compatibleSdkVersion".into(), sdk_version.clone().into());
+            package.insert(
+                "compatibleSdkType".into(),
+                args.ohos_compatible_sdk_type
+                    .clone()
+                    .context("--ohos-compatible-sdk-version requires --ohos-compatible-sdk-type when generated package metadata is unavailable")?
+                    .into(),
+            );
+        } else if args.ohos_compatible_sdk_type.is_some() {
+            bail!("--ohos-compatible-sdk-type requires --ohos-compatible-sdk-version when no package was staged");
+        }
+        package.insert("obfuscated".into(), false.into());
+        package.insert("artifactType".into(), "original".into());
+
+        Ok(serde_json::json!({
+            "package": serde_json::Value::Object(package),
+            "module": {
+                "name": module_name,
+                "type": "har",
+                "deviceTypes": device_types,
+            },
+            "buildProfile": {
+                "apiType": "stageMode"
+            }
+        }))
     }
 
     fn merge_existing_manifest(
@@ -616,9 +1089,17 @@ node_modules/\n\
             return Ok(manifest);
         }
 
+        let current_targets = manifest
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
         merge_manifest_targets(&mut manifest, &existing);
         for key in ["source", "entrypoints", "artifacts", "hostCrates"] {
-            merge_manifest_object_section(&mut manifest, &existing, key);
+            merge_manifest_object_section(&mut manifest, &existing, key, &current_targets);
         }
         Ok(manifest)
     }
@@ -685,6 +1166,84 @@ node_modules/\n\
     }
 }
 
+fn require_real_directory(path: &Utf8Path, label: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("{label} does not exist: {path}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("{label} must be a real directory: {path}");
+    }
+    Ok(())
+}
+
+fn ensure_tree_has_no_native_artifacts(root: &Utf8Path) -> Result<()> {
+    for entry in
+        std::fs::read_dir(root).with_context(|| format!("checking managed no-HAR dist {root}"))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+            anyhow::anyhow!("managed no-HAR dist path is not utf8: {}", path.display())
+        })?;
+        if file_type.is_symlink() {
+            bail!("managed no-HAR dist contains a symlink: {path}");
+        }
+        if file_type.is_dir() {
+            ensure_tree_has_no_native_artifacts(&path)?;
+        } else if file_type.is_file() && matches!(path.extension(), Some("so") | Some("a")) {
+            bail!("managed --ohos-skip-libs dist still contains a native artifact: {path}");
+        }
+    }
+    Ok(())
+}
+
+fn write_file_atomically(path: &Utf8Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("managed output path has no parent: {path}"))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating managed output directory {parent}"))?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".uniffi-managed-")
+        .tempfile_in(parent)
+        .with_context(|| format!("creating temporary managed output beside {path}"))?;
+    temp.write_all(bytes)
+        .with_context(|| format!("writing temporary managed output for {path}"))?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(path.as_std_path())
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically publishing managed output {path}"))?;
+    if let Ok(parent_file) = std::fs::File::open(parent) {
+        let _ = parent_file.sync_all();
+    }
+    Ok(())
+}
+
+fn restore_file_atomically(path: &Utf8Path, previous: Option<&[u8]>) -> Result<()> {
+    if let Some(previous) = previous {
+        write_file_atomically(path, previous)
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing newly written file {path}")),
+        }
+    }
+}
+
+fn harmony_archive_file_name(package_name: &str) -> Result<String> {
+    super::ohos::validate_oh_package_name(package_name)?;
+    let stem = package_name.trim_start_matches('@').replace('/', "-");
+    Ok(format!("{stem}.har"))
+}
+
+fn read_generated_json5(path: &Utf8Path) -> Result<serde_json::Value> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading generated Harmony metadata {path}"))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("parsing generated Harmony metadata {path}"))
+}
+
 fn merge_manifest_targets(manifest: &mut serde_json::Value, existing: &serde_json::Value) {
     let mut present = std::collections::BTreeSet::new();
     for value in existing
@@ -725,6 +1284,7 @@ fn merge_manifest_object_section(
     manifest: &mut serde_json::Value,
     existing: &serde_json::Value,
     key: &str,
+    current_targets: &BTreeSet<String>,
 ) {
     let Some(current) = manifest
         .get_mut(key)
@@ -737,6 +1297,25 @@ fn merge_manifest_object_section(
     };
 
     for (field, previous_value) in previous {
+        let current_target = match (key, field.as_str()) {
+            ("source" | "entrypoints" | "artifacts", "miniProgram") => "mini-program",
+            ("source" | "entrypoints" | "artifacts", field) => field,
+            ("hostCrates", "wasm")
+                if current_targets.contains("wasm") || current_targets.contains("mini-program") =>
+            {
+                continue
+            }
+            ("hostCrates", "napi")
+                if current_targets.contains("node") || current_targets.contains("electron") =>
+            {
+                continue
+            }
+            ("hostCrates", "ohos") if current_targets.contains("harmony") => continue,
+            _ => "",
+        };
+        if !current_target.is_empty() && current_targets.contains(current_target) {
+            continue;
+        }
         if current
             .get(field)
             .map(|value| !value.is_null())
@@ -794,18 +1373,44 @@ fn build(mut args: BuildArgs) -> Result<()> {
         build_napi(args.to_napi_args(napi_flavors)?).context("building N-API artifact target")?;
     }
 
-    if targets.harmony {
-        build_ohos(args.to_ohos_args()?).context("building Harmony/OpenHarmony artifact target")?;
-    }
+    let public_args = args.clone();
+    let mut harmony_transaction = if targets.harmony {
+        managed_layout
+            .as_ref()
+            .map(|layout| ManagedHarmonyTransaction::begin(layout, &mut args))
+            .transpose()?
+    } else {
+        None
+    };
+    (|| -> Result<()> {
+        if targets.harmony {
+            build_ohos(args.to_ohos_args()?)
+                .context("building Harmony/OpenHarmony artifact target")?;
+        }
 
-    if let Some(layout) = managed_layout {
-        let meta = cargo_package_metadata(&args.manifest_path)?;
-        layout
-            .emit(&targets, &meta, &args)
-            .context("emitting managed artifact layout")?;
-    }
-
-    Ok(())
+        if let Some(layout) = managed_layout.as_ref() {
+            let meta = cargo_package_metadata(&args.manifest_path)?;
+            if let Some(transaction) = harmony_transaction.take() {
+                layout
+                    .emit_supporting_files(&targets, &meta, &public_args)
+                    .context("emitting managed artifact support files")?;
+                let manifest = layout.render_manifest_with_harmony_root(
+                    &targets,
+                    &meta,
+                    &public_args,
+                    Some(transaction.private_root()),
+                )?;
+                transaction
+                    .commit(manifest.as_bytes())
+                    .context("committing managed Harmony artifact transaction")?;
+            } else {
+                layout
+                    .emit(&targets, &meta, &public_args)
+                    .context("emitting managed artifact layout")?;
+            }
+        }
+        Ok(())
+    })()
 }
 
 fn build_android(args: &BuildArgs) -> Result<()> {
@@ -1242,10 +1847,22 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir(),
+            ohos_host_manifest_path: None,
             artifact_dir: self.artifact_dir.clone(),
             dist_dir: self.ohos_dist_dir.clone(),
             package_name: self.ohos_package_name.clone(),
+            module_name: self.ohos_module_name.clone(),
+            package_version: self.ohos_package_version.clone(),
+            author: self.ohos_author.clone(),
+            license: self.ohos_license.clone(),
+            description: self.ohos_description.clone(),
+            compatible_sdk_version: self.ohos_compatible_sdk_version.clone(),
+            compatible_sdk_type: self.ohos_compatible_sdk_type.clone(),
+            device_types: self.ohos_device_types.clone(),
             har_out: self.ohos_har_out.clone(),
+            hvigorw: self.ohos_hvigorw.clone(),
+            ohpm: self.ohos_ohpm.clone(),
+            deveco_sdk_home: self.ohos_deveco_sdk_home.clone(),
             no_har: self.ohos_no_har,
             arch: self.ohos_arch.clone(),
             cargo_bin: self.cargo_bin.clone(),
@@ -1266,6 +1883,7 @@ impl BuildArgs {
             crate_name: self.crate_name.clone(),
             metadata_no_deps: self.metadata_no_deps,
             cargo_args: self.ohos_cargo_args.clone(),
+            output_lock_held: self.managed_layout,
         })
     }
 }
@@ -1864,6 +2482,10 @@ fn relative_path_from_dir(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {
 struct CargoPackageMetadata {
     target_directory: Utf8PathBuf,
     package_name: String,
+    package_version: String,
+    description: Option<String>,
+    authors: Vec<String>,
+    license: Option<String>,
     lib_target_name: String,
 }
 
@@ -1897,6 +2519,10 @@ fn cargo_package_metadata(manifest_path: &Utf8Path) -> Result<CargoPackageMetada
         )
         .map_err(|p| anyhow::anyhow!("cargo metadata target dir is not utf8: {}", p.display()))?,
         package_name: package.name.to_string(),
+        package_version: package.version.to_string(),
+        description: package.description.clone(),
+        authors: package.authors.clone(),
+        license: package.license.clone(),
         lib_target_name: lib_target.name.clone(),
     })
 }
@@ -2211,7 +2837,18 @@ mod tests {
             napi_target_dir: None,
             ohos_dist_dir: None,
             ohos_package_name: None,
+            ohos_module_name: None,
+            ohos_package_version: None,
+            ohos_author: None,
+            ohos_license: None,
+            ohos_description: None,
+            ohos_compatible_sdk_version: None,
+            ohos_compatible_sdk_type: None,
+            ohos_device_types: Vec::new(),
             ohos_har_out: None,
+            ohos_hvigorw: None,
+            ohos_ohpm: None,
+            ohos_deveco_sdk_home: None,
             ohos_no_har: false,
             ohos_arch: Vec::new(),
             ohos_target_dir: None,
@@ -2239,6 +2876,18 @@ mod tests {
         }
     }
 
+    fn test_cargo_metadata(target_directory: Utf8PathBuf) -> CargoPackageMetadata {
+        CargoPackageMetadata {
+            target_directory,
+            package_name: "uni-core".to_string(),
+            package_version: "0.1.0".to_string(),
+            description: Some("Uni Core test package".to_string()),
+            authors: vec!["Uni Core Team".to_string()],
+            license: Some("MPL-2.0".to_string()),
+            lib_target_name: "uni_core".to_string(),
+        }
+    }
+
     fn unique_tmp_dir(name: &str) -> Utf8PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2248,6 +2897,32 @@ mod tests {
             std::env::temp_dir().join(format!("uniffi-{name}-{}-{nanos}", std::process::id())),
         )
         .unwrap()
+    }
+
+    fn regular_file_snapshot(root: &Utf8Path) -> std::collections::BTreeMap<Utf8PathBuf, Vec<u8>> {
+        fn visit(
+            root: &Utf8Path,
+            current: &Utf8Path,
+            snapshot: &mut std::collections::BTreeMap<Utf8PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(current).unwrap() {
+                let entry = entry.unwrap();
+                let path = Utf8PathBuf::from_path_buf(entry.path()).unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut snapshot = std::collections::BTreeMap::new();
+        if root.exists() {
+            visit(root, root, &mut snapshot);
+        }
+        snapshot
     }
 
     fn write_test_manifest(package_dir: &Utf8Path) -> Utf8PathBuf {
@@ -2268,6 +2943,56 @@ name = "uni_core"
         )
         .unwrap();
         manifest
+    }
+
+    fn write_owned_harmony_dist(dist: &Utf8Path, contents: &str) {
+        std::fs::create_dir_all(dist).unwrap();
+        for file in [
+            "index.d.ts",
+            "Index.d.ets",
+            "native-facade.ets",
+            "package-index.ets",
+        ] {
+            std::fs::write(dist.join(file), format!("{file}:{contents}\n")).unwrap();
+        }
+        super::super::ohos::write_owned_tree_marker(
+            dist,
+            ".uniffi-ohos-dist-owner",
+            "uniffi-ohos-dist",
+        )
+        .unwrap();
+    }
+
+    fn populate_private_harmony(
+        transaction: &ManagedHarmonyTransaction,
+        args: &BuildArgs,
+        contents: &str,
+    ) {
+        let root = transaction.private_root();
+        write_owned_harmony_dist(&root.join("dist"), contents);
+        if args.ohos_no_har {
+            return;
+        }
+        let package = root.join("package");
+        std::fs::create_dir_all(package.join("src/main")).unwrap();
+        std::fs::write(
+            package.join("oh-package.json5"),
+            r#"{"name":"uni-core-ohos","version":"0.1.0","main":"Index.ets"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("src/main/module.json5"),
+            r#"{"module":{"name":"uni_core_ohos","type":"har","deviceTypes":["phone"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("build-profile.json5"),
+            r#"{"apiType":"stageMode"}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("Index.ets"), "export {};\n").unwrap();
+        let har = root.join(args.ohos_har_out.as_ref().unwrap().file_name().unwrap());
+        std::fs::write(har, format!("HAR:{contents}")).unwrap();
     }
 
     #[test]
@@ -2380,6 +3105,362 @@ name = "uni_core"
     }
 
     #[test]
+    fn managed_layout_uses_safe_archive_name_for_scoped_ohpm_package() {
+        let mut args = empty_build_args();
+        let package_dir = unique_tmp_dir("managed-layout-scoped-harmony");
+        args.manifest_path = write_test_manifest(&package_dir);
+        args.managed_layout = true;
+        args.package_dir = Some(package_dir.clone());
+        args.out_dir = None;
+        args.target = vec![ArtifactTargetArg::Harmony];
+        args.ohos_package_name = Some("@scope/uni-core".into());
+
+        let targets = expand_targets(&args.target).unwrap();
+        ManagedLayout::apply(&mut args, &targets).unwrap().unwrap();
+        assert_eq!(
+            args.ohos_har_out.as_ref().unwrap(),
+            &package_dir.join("artifacts/harmony/scope-uni-core.har")
+        );
+        let _ = std::fs::remove_dir_all(package_dir.as_std_path());
+    }
+
+    #[test]
+    fn managed_no_har_manifest_only_declares_current_dist_outputs() {
+        let mut args = empty_build_args();
+        let package_dir = unique_tmp_dir("managed-layout-no-har");
+        args.manifest_path = write_test_manifest(&package_dir);
+        args.managed_layout = true;
+        args.package_dir = Some(package_dir.clone());
+        args.out_dir = None;
+        args.target = vec![ArtifactTargetArg::Harmony];
+        args.ohos_no_har = true;
+        // Package-only validation must not constrain a pure native dist run.
+        args.ohos_package_name = Some("NOT-A-PACKAGE".into());
+        args.ohos_package_version = Some("not-semver".into());
+
+        let targets = expand_targets(&args.target).unwrap();
+        let layout = ManagedLayout::apply(&mut args, &targets)
+            .unwrap()
+            .expect("managed layout should resolve");
+        assert!(args.ohos_har_out.is_none());
+        let dist = package_dir.join("artifacts/harmony/dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        for file in ["index.d.ts", "native-facade.ets", "package-index.ets"] {
+            std::fs::write(dist.join(file), "export {};\n").unwrap();
+        }
+        let meta = test_cargo_metadata(package_dir.join("target"));
+        layout.emit(&targets, &meta, &args).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(package_dir.join("artifact-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let harmony = &manifest["artifacts"]["harmony"];
+        assert_eq!(harmony["kind"], "dist");
+        assert!(harmony["har"].is_null());
+        assert!(harmony["package"].is_null());
+        assert!(harmony["packageMetadata"].is_null());
+        assert!(harmony["moduleMetadata"].is_null());
+        assert!(harmony["buildProfile"].is_null());
+        assert!(harmony["metadata"].is_null());
+        for field in ["dist", "facade", "types"] {
+            let path = package_dir.join(harmony[field].as_str().unwrap());
+            assert!(
+                path.exists(),
+                "manifest {field} path does not exist: {path}"
+            );
+        }
+        let entry = package_dir.join(manifest["entrypoints"]["harmony"].as_str().unwrap());
+        assert!(entry.exists());
+        let _ = std::fs::remove_dir_all(package_dir.as_std_path());
+    }
+
+    #[test]
+    fn managed_directory_transaction_switches_har_to_clean_no_har_state() {
+        let package_dir = unique_tmp_dir("managed-harmony-switch");
+        let meta = test_cargo_metadata(package_dir.join("target"));
+        let targets = expand_targets(&[ArtifactTargetArg::Harmony]).unwrap();
+
+        let mut har_args = empty_build_args();
+        har_args.manifest_path = write_test_manifest(&package_dir);
+        har_args.managed_layout = true;
+        har_args.package_dir = Some(package_dir.clone());
+        har_args.out_dir = None;
+        har_args.target = vec![ArtifactTargetArg::Harmony];
+        let layout = ManagedLayout::apply(&mut har_args, &targets)
+            .unwrap()
+            .unwrap();
+        let public_har_args = har_args.clone();
+        let transaction = ManagedHarmonyTransaction::begin(&layout, &mut har_args).unwrap();
+        populate_private_harmony(&transaction, &public_har_args, "har-state");
+        let manifest = layout
+            .render_manifest_with_harmony_root(
+                &targets,
+                &meta,
+                &public_har_args,
+                Some(transaction.private_root()),
+            )
+            .unwrap();
+        transaction.commit(manifest.as_bytes()).unwrap();
+
+        let mut no_har_args = public_har_args.clone();
+        no_har_args.ohos_no_har = true;
+        no_har_args.ohos_skip_libs = true;
+        no_har_args.ohos_har_out = None;
+        let public_no_har_args = no_har_args.clone();
+        let transaction = ManagedHarmonyTransaction::begin(&layout, &mut no_har_args).unwrap();
+        populate_private_harmony(&transaction, &public_no_har_args, "dist-only-state");
+        let manifest = layout
+            .render_manifest_with_harmony_root(
+                &targets,
+                &meta,
+                &public_no_har_args,
+                Some(transaction.private_root()),
+            )
+            .unwrap();
+        transaction.commit(manifest.as_bytes()).unwrap();
+
+        let harmony_root = package_dir.join("artifacts/harmony");
+        let entries = std::fs::read_dir(&harmony_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            entries,
+            BTreeSet::from(["dist".to_string(), MANAGED_HARMONY_OWNER_MARKER.to_string()])
+        );
+        ensure_tree_has_no_native_artifacts(&harmony_root).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(package_dir.join("artifact-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["artifacts"]["harmony"]["kind"], "dist");
+        assert!(manifest["artifacts"]["harmony"]["har"].is_null());
+        assert!(manifest["artifacts"]["harmony"]["package"].is_null());
+        assert!(std::fs::read_dir(package_dir.join("artifacts"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("backup")));
+        let _ = std::fs::remove_dir_all(package_dir.as_std_path());
+    }
+
+    #[test]
+    fn managed_transaction_rolls_back_before_commit_and_never_restores_partial_cleanup() {
+        let package_dir = unique_tmp_dir("managed-harmony-rollback");
+        let meta = test_cargo_metadata(package_dir.join("target"));
+        let targets = expand_targets(&[ArtifactTargetArg::Harmony]).unwrap();
+        let mut args = empty_build_args();
+        args.manifest_path = write_test_manifest(&package_dir);
+        args.managed_layout = true;
+        args.package_dir = Some(package_dir.clone());
+        args.out_dir = None;
+        args.target = vec![ArtifactTargetArg::Harmony];
+        args.ohos_no_har = true;
+        args.ohos_skip_libs = true;
+        let layout = ManagedLayout::apply(&mut args, &targets).unwrap().unwrap();
+        let public_args = args.clone();
+
+        let transaction = ManagedHarmonyTransaction::begin(&layout, &mut args).unwrap();
+        populate_private_harmony(&transaction, &public_args, "old-state");
+        let manifest = layout
+            .render_manifest_with_harmony_root(
+                &targets,
+                &meta,
+                &public_args,
+                Some(transaction.private_root()),
+            )
+            .unwrap();
+        transaction.commit(manifest.as_bytes()).unwrap();
+
+        let harmony_root = package_dir.join("artifacts/harmony");
+        let manifest_path = package_dir.join("artifact-manifest.json");
+        let old_tree = regular_file_snapshot(&harmony_root);
+        let old_manifest = std::fs::read(&manifest_path).unwrap();
+
+        let mut manifest_args = public_args.clone();
+        let mut transaction =
+            ManagedHarmonyTransaction::begin(&layout, &mut manifest_args).unwrap();
+        populate_private_harmony(&transaction, &public_args, "manifest-failure");
+        let result = transaction.commit_with(
+            b"{\"phase\":\"manifest-failure\"}\n",
+            |_, _| bail!("injected manifest failure"),
+            |path| {
+                std::fs::remove_dir_all(path)?;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        drop(transaction);
+        assert_eq!(regular_file_snapshot(&harmony_root), old_tree);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), old_manifest);
+
+        let mut cleanup_args = public_args.clone();
+        let mut transaction = ManagedHarmonyTransaction::begin(&layout, &mut cleanup_args).unwrap();
+        populate_private_harmony(&transaction, &public_args, "cleanup-failure");
+        let next_manifest = b"{\"phase\":\"cleanup-failure\"}\n";
+        let result = transaction.commit_with(
+            next_manifest,
+            |path, bytes| write_file_atomically(path, bytes),
+            |backup| {
+                let victim = regular_file_snapshot(backup)
+                    .keys()
+                    .find(|path| path.as_str() != MANAGED_HARMONY_OWNER_MARKER)
+                    .cloned()
+                    .context("backup fixture has no removable inventory file")?;
+                std::fs::remove_file(backup.join(victim))?;
+                bail!("injected partial backup cleanup failure")
+            },
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("generation was committed"), "{error}");
+        drop(transaction);
+        assert_ne!(regular_file_snapshot(&harmony_root), old_tree);
+        super::super::ohos::validate_owned_tree(
+            &harmony_root,
+            MANAGED_HARMONY_OWNER_MARKER,
+            MANAGED_HARMONY_OWNER_KIND,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), next_manifest);
+        assert!(std::fs::read_dir(package_dir.join("artifacts"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains("backup")));
+        let _ = std::fs::remove_dir_all(package_dir.as_std_path());
+    }
+
+    #[test]
+    fn managed_transaction_refuses_unowned_public_tree_without_mutation() {
+        let package_dir = unique_tmp_dir("managed-harmony-unowned");
+        let mut args = empty_build_args();
+        args.manifest_path = write_test_manifest(&package_dir);
+        args.managed_layout = true;
+        args.package_dir = Some(package_dir.clone());
+        args.out_dir = None;
+        args.target = vec![ArtifactTargetArg::Harmony];
+        args.ohos_no_har = true;
+        let targets = expand_targets(&args.target).unwrap();
+        let layout = ManagedLayout::apply(&mut args, &targets).unwrap().unwrap();
+        let harmony = package_dir.join("artifacts/harmony");
+        std::fs::create_dir_all(&harmony).unwrap();
+        std::fs::write(harmony.join("user.har"), b"user-owned").unwrap();
+        let before = regular_file_snapshot(&harmony);
+        assert!(ManagedHarmonyTransaction::begin(&layout, &mut args).is_err());
+        assert_eq!(regular_file_snapshot(&harmony), before);
+        let _ = std::fs::remove_dir_all(package_dir.as_std_path());
+    }
+
+    #[test]
+    fn managed_harmony_lock_child() {
+        let Some(package_dir) = std::env::var_os("UNIFFI_MANAGED_LOCK_CHILD_PACKAGE") else {
+            return;
+        };
+        let package_dir = Utf8PathBuf::from_path_buf(package_dir.into()).unwrap();
+        let mut args = empty_build_args();
+        args.manifest_path = package_dir.join("Cargo.toml");
+        args.managed_layout = true;
+        args.package_dir = Some(package_dir.clone());
+        args.out_dir = None;
+        args.target = vec![ArtifactTargetArg::Harmony];
+        let mode = std::env::var("UNIFFI_MANAGED_LOCK_CHILD_MODE").unwrap();
+        args.ohos_no_har = mode != "har";
+        args.ohos_skip_libs = true;
+        let targets = expand_targets(&args.target).unwrap();
+        let layout = ManagedLayout::apply(&mut args, &targets).unwrap().unwrap();
+        let public_args = args.clone();
+        let transaction = ManagedHarmonyTransaction::begin(&layout, &mut args).unwrap();
+        let acquired = std::env::var_os("UNIFFI_MANAGED_LOCK_CHILD_ACQUIRED").unwrap();
+        let release = std::env::var_os("UNIFFI_MANAGED_LOCK_CHILD_RELEASE").unwrap();
+        std::fs::write(acquired, b"acquired").unwrap();
+        for _ in 0..1_000 {
+            if std::path::Path::new(&release).exists() {
+                if mode == "fail" {
+                    return;
+                }
+                let meta = test_cargo_metadata(package_dir.join("target"));
+                populate_private_harmony(&transaction, &public_args, &mode);
+                let manifest = layout
+                    .render_manifest_with_harmony_root(
+                        &targets,
+                        &meta,
+                        &public_args,
+                        Some(transaction.private_root()),
+                    )
+                    .unwrap();
+                transaction.commit(manifest.as_bytes()).unwrap();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for managed lock release");
+    }
+
+    #[test]
+    fn managed_harmony_os_lock_serializes_concurrent_processes() {
+        use std::time::{Duration, Instant};
+
+        fn wait_for(path: &Utf8Path, timeout: Duration) {
+            let started = Instant::now();
+            while !path.exists() {
+                assert!(started.elapsed() < timeout, "timed out waiting for {path}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let package_dir = unique_tmp_dir("managed-harmony-lock");
+        write_test_manifest(&package_dir);
+        let executable = std::env::current_exe().unwrap();
+        let spawn_child = |acquired: &Utf8Path, release: &Utf8Path, mode: &str| {
+            Command::new(&executable)
+                .args([
+                    "--exact",
+                    "cli::artifacts::tests::managed_harmony_lock_child",
+                    "--nocapture",
+                ])
+                .env("UNIFFI_MANAGED_LOCK_CHILD_PACKAGE", &package_dir)
+                .env("UNIFFI_MANAGED_LOCK_CHILD_ACQUIRED", acquired)
+                .env("UNIFFI_MANAGED_LOCK_CHILD_RELEASE", release)
+                .env("UNIFFI_MANAGED_LOCK_CHILD_MODE", mode)
+                .spawn()
+                .unwrap()
+        };
+
+        for (index, first_mode, second_mode) in [(0, "no-har", "fail"), (1, "har", "no-har")] {
+            let first_acquired = package_dir.join(format!("{index}-first-acquired"));
+            let first_release = package_dir.join(format!("{index}-first-release"));
+            let second_acquired = package_dir.join(format!("{index}-second-acquired"));
+            let second_release = package_dir.join(format!("{index}-second-release"));
+            let mut first = spawn_child(&first_acquired, &first_release, first_mode);
+            wait_for(&first_acquired, Duration::from_secs(10));
+            let mut second = spawn_child(&second_acquired, &second_release, second_mode);
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(
+                !second_acquired.exists(),
+                "second managed invocation acquired the output lock concurrently"
+            );
+            std::fs::write(&first_release, b"release").unwrap();
+            wait_for(&second_acquired, Duration::from_secs(10));
+            std::fs::write(&second_release, b"release").unwrap();
+            assert!(first.wait().unwrap().success());
+            assert!(second.wait().unwrap().success());
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(package_dir.join("artifact-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["artifacts"]["harmony"]["kind"], "dist");
+        let harmony_root = package_dir.join("artifacts/harmony");
+        ensure_tree_has_no_native_artifacts(&harmony_root).unwrap();
+        super::super::ohos::validate_owned_tree(
+            &harmony_root,
+            MANAGED_HARMONY_OWNER_MARKER,
+            MANAGED_HARMONY_OWNER_KIND,
+        )
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(package_dir.as_std_path());
+    }
+
+    #[test]
     fn managed_layout_emits_entries_and_relative_manifest() {
         let mut args = empty_build_args();
         let package_dir = unique_tmp_dir("managed-layout-manifest");
@@ -2401,11 +3482,7 @@ name = "uni_core"
         let layout = ManagedLayout::apply(&mut args, &targets)
             .unwrap()
             .expect("managed layout should resolve");
-        let meta = CargoPackageMetadata {
-            target_directory: package_dir.join("target"),
-            package_name: "uni-core".to_string(),
-            lib_target_name: "uni_core".to_string(),
-        };
+        let meta = test_cargo_metadata(package_dir.join("target"));
         layout.emit(&targets, &meta, &args).unwrap();
 
         let web = std::fs::read_to_string(package_dir.join("src/index.web.ts")).unwrap();
@@ -2460,6 +3537,10 @@ name = "uni_core"
         assert_eq!(manifest["source"]["kotlin"], "src/ffi/kotlin");
         assert_eq!(manifest["entrypoints"]["electron"], "src/index.electron.ts");
         assert_eq!(
+            manifest["entrypoints"]["harmony"],
+            "artifacts/harmony/package/Index.ets"
+        );
+        assert_eq!(
             manifest["entrypoints"]["miniProgram"],
             "src/index.mini-program.ts"
         );
@@ -2482,6 +3563,27 @@ name = "uni_core"
         assert_eq!(
             manifest["artifacts"]["harmony"]["har"],
             "artifacts/harmony/uni-core-ohos.har"
+        );
+        assert_eq!(manifest["artifacts"]["harmony"]["kind"], "har");
+        assert_eq!(
+            manifest["artifacts"]["harmony"]["packageMetadata"],
+            "artifacts/harmony/package/oh-package.json5"
+        );
+        assert_eq!(
+            manifest["artifacts"]["harmony"]["metadata"]["package"]["name"],
+            "uni-core-ohos"
+        );
+        assert_eq!(
+            manifest["artifacts"]["harmony"]["metadata"]["package"]["version"],
+            "0.1.0"
+        );
+        assert_eq!(
+            manifest["artifacts"]["harmony"]["metadata"]["module"]["name"],
+            "uni_core_ohos"
+        );
+        assert_eq!(
+            manifest["artifacts"]["harmony"]["metadata"]["module"]["deviceTypes"],
+            serde_json::json!(["phone", "tablet", "2in1"])
         );
         assert_eq!(
             manifest["artifacts"]["apple"]["xcframework"],
@@ -2516,11 +3618,7 @@ name = "uni_core"
     #[test]
     fn managed_manifest_merges_incremental_target_runs() {
         let package_dir = unique_tmp_dir("managed-layout-merge");
-        let meta = CargoPackageMetadata {
-            target_directory: package_dir.join("target"),
-            package_name: "uni-core".to_string(),
-            lib_target_name: "uni_core".to_string(),
-        };
+        let meta = test_cargo_metadata(package_dir.join("target"));
 
         let mut js_args = empty_build_args();
         js_args.manifest_path = write_test_manifest(&package_dir);
@@ -2592,11 +3690,7 @@ name = "uni_core"
 
     #[test]
     fn apple_helpers_derive_package_contract_names() {
-        let meta = CargoPackageMetadata {
-            target_directory: Utf8PathBuf::from("/repo/target"),
-            package_name: "uni-core".to_string(),
-            lib_target_name: "uni_core".to_string(),
-        };
+        let meta = test_cargo_metadata(Utf8PathBuf::from("/repo/target"));
 
         assert_eq!(apple_package_product_name(&meta), "UniCoreApple");
         assert_eq!(apple_binary_target_name(&meta), "uni_coreFFI");
@@ -2608,11 +3702,7 @@ name = "uni_core"
 
     #[test]
     fn computes_apple_cdylib_path() {
-        let meta = CargoPackageMetadata {
-            target_directory: Utf8PathBuf::from("/repo/target"),
-            package_name: "uni-core".to_string(),
-            lib_target_name: "uni_core".to_string(),
-        };
+        let meta = test_cargo_metadata(Utf8PathBuf::from("/repo/target"));
         assert_eq!(
             apple_cdylib_path(&meta, "aarch64-apple-ios", "release"),
             Utf8PathBuf::from("/repo/target/aarch64-apple-ios/release/libuni_core.dylib")
@@ -2669,11 +3759,7 @@ name = "uni_core"
 
     #[test]
     fn computes_android_sharedlib_path() {
-        let meta = CargoPackageMetadata {
-            target_directory: Utf8PathBuf::from("/repo/target"),
-            package_name: "uni-core".to_string(),
-            lib_target_name: "uni_core".to_string(),
-        };
+        let meta = test_cargo_metadata(Utf8PathBuf::from("/repo/target"));
         assert_eq!(
             android_sharedlib_path(&meta, "aarch64-linux-android", "debug"),
             Utf8PathBuf::from("/repo/target/aarch64-linux-android/debug/libuni_core.so")
@@ -2736,7 +3822,15 @@ name = "uni_core"
         let artifacts_src = include_str!("artifacts.rs");
         for required in [
             concat!("ohos-package", "-name"),
+            concat!("ohos-module", "-name"),
+            concat!("ohos-package", "-version"),
+            concat!("ohos-compatible-sdk", "-version"),
+            concat!("ohos-compatible-sdk", "-type"),
+            concat!("ohos-device", "-type"),
             concat!("ohos-har", "-out"),
+            concat!("ohos-hvigor", "w"),
+            concat!("ohos-oh", "pm"),
+            concat!("ohos-deveco-sdk", "-home"),
             concat!("ohos-no", "-har"),
         ] {
             assert!(
@@ -2748,7 +3842,15 @@ name = "uni_core"
         let javascript_src = include_str!("javascript.rs");
         for required in [
             concat!("package", "-name"),
+            concat!("module", "-name"),
+            concat!("package", "-version"),
+            concat!("compatible-sdk", "-version"),
+            concat!("compatible-sdk", "-type"),
+            concat!("device", "-type"),
             concat!("har", "-out"),
+            concat!("hvigor", "w"),
+            concat!("oh", "pm"),
+            concat!("deveco-sdk", "-home"),
             concat!("no", "-har"),
         ] {
             assert!(
