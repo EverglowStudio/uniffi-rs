@@ -35,6 +35,15 @@ pub struct HostCrateOptions {
     /// `wasm/`, `napi/`, and/or `ohos/` subcrates. Resolved relative to
     /// the current working directory if not absolute.
     pub host_crates_dir: Utf8PathBuf,
+    /// Logical publication directory used when generated Cargo manifests
+    /// compute path dependencies. Invocation-private artifact builds write to
+    /// `host_crates_dir` but must retain paths valid after the tree is moved to
+    /// this final location.
+    pub logical_host_crates_dir: Option<Utf8PathBuf>,
+    /// Logical publication root for generated bridge files. Invocation-private
+    /// coordinators use this to emit `include!` paths that remain valid after
+    /// the host crate and bindings are published.
+    pub logical_out_dir: Option<Utf8PathBuf>,
     /// Optional local checkout of `ohos-rs`; when set, the OHOS host crate
     /// uses path dependencies instead of crates.io versions.
     pub ohos_rs_dir: Option<Utf8PathBuf>,
@@ -156,17 +165,47 @@ pub fn emit(
     let host_dir_abs = host_dir
         .canonicalize_utf8()
         .with_context(|| format!("canonicalizing {host_dir}"))?;
+    let logical_host_dir = options
+        .logical_host_crates_dir
+        .clone()
+        .unwrap_or_else(|| host_dir_abs.clone());
+    let logical_host_dir = if logical_host_dir.is_absolute() {
+        logical_host_dir
+    } else {
+        Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+            .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?
+            .join(logical_host_dir)
+    };
+    let logical_out_dir = options
+        .logical_out_dir
+        .clone()
+        .unwrap_or_else(|| out_dir_abs.clone());
 
     if want_wasm {
-        emit_wasm(&host_dir_abs, &out_dir_abs, crate_names, meta)?;
+        emit_wasm(
+            &host_dir_abs,
+            &logical_host_dir,
+            &logical_out_dir,
+            crate_names,
+            meta,
+        )?;
     }
     if want_napi {
-        emit_napi(&host_dir_abs, &out_dir_abs, crate_names, meta)?;
+        emit_napi(
+            &host_dir_abs,
+            &logical_host_dir,
+            &out_dir_abs,
+            &logical_out_dir,
+            crate_names,
+            meta,
+        )?;
     }
     if want_ohos {
         emit_ohos(
             &host_dir_abs,
+            &logical_host_dir,
             &out_dir_abs,
+            &logical_out_dir,
             crate_names,
             meta,
             options.ohos_rs_dir.as_ref(),
@@ -178,15 +217,18 @@ pub fn emit(
 
 fn emit_wasm(
     host_dir: &Utf8Path,
+    logical_host_dir: &Utf8Path,
     out_dir: &Utf8Path,
     crate_names: &[String],
     meta: &CoreCrateMetadata,
 ) -> Result<()> {
     let crate_dir = host_dir.join("wasm");
+    let logical_crate_dir = logical_host_dir.join("wasm");
     let src_dir = crate_dir.join("src");
+    let logical_src_dir = logical_crate_dir.join("src");
     fs::create_dir_all(&src_dir)?;
 
-    let rel_core = relative_path(&crate_dir, &meta.crate_dir);
+    let rel_core = relative_path(&logical_crate_dir, &meta.crate_dir);
     let package_name = format!("{}-wasm", meta.package_name);
 
     let cargo_toml = format!(
@@ -223,7 +265,7 @@ fn emit_wasm(
         package_name = package_name,
         core_name = meta.package_name,
         rel_core = rel_core,
-        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &crate_dir)?,
+        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
     );
     fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -236,7 +278,7 @@ fn emit_wasm(
     );
     for crate_name in crate_names {
         let rs_path = out_dir.join("browser").join(format!("{crate_name}.rs"));
-        let rel = relative_path(&src_dir, &rs_path);
+        let rel = relative_path(&logical_src_dir, &rs_path);
         lib_rs.push_str(&format!("include!(\"{rel}\");\n"));
     }
     fs::write(src_dir.join("lib.rs"), lib_rs)?;
@@ -245,15 +287,19 @@ fn emit_wasm(
 
 fn emit_napi(
     host_dir: &Utf8Path,
-    out_dir: &Utf8Path,
+    logical_host_dir: &Utf8Path,
+    actual_out_dir: &Utf8Path,
+    logical_out_dir: &Utf8Path,
     crate_names: &[String],
     meta: &CoreCrateMetadata,
 ) -> Result<()> {
     let crate_dir = host_dir.join("napi");
+    let logical_crate_dir = logical_host_dir.join("napi");
     let src_dir = crate_dir.join("src");
+    let logical_src_dir = logical_crate_dir.join("src");
     fs::create_dir_all(&src_dir)?;
 
-    let rel_core = relative_path(&crate_dir, &meta.crate_dir);
+    let rel_core = relative_path(&logical_crate_dir, &meta.crate_dir);
     let package_name = format!("{}-napi", meta.package_name);
 
     let cargo_toml = format!(
@@ -286,7 +332,7 @@ fn emit_napi(
         package_name = package_name,
         core_name = meta.package_name,
         rel_core = rel_core,
-        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &crate_dir)?,
+        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
     );
     fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -303,14 +349,16 @@ fn emit_napi(
          // final `.node` cdylib consumed by the generated `backend-napi.ts`.\n\n",
     );
     for crate_name in crate_names {
-        let node_rs_path = out_dir.join("node").join(format!("{crate_name}.rs"));
-        let electron_rs_path = out_dir.join("electron").join(format!("{crate_name}.rs"));
-        let rs_path = if node_rs_path.exists() {
-            node_rs_path
+        let actual_node_rs_path = actual_out_dir.join("node").join(format!("{crate_name}.rs"));
+        let flavor = if actual_node_rs_path.exists() {
+            "node"
         } else {
-            electron_rs_path
+            "electron"
         };
-        let rel = relative_path(&src_dir, &rs_path);
+        let rs_path = logical_out_dir
+            .join(flavor)
+            .join(format!("{crate_name}.rs"));
+        let rel = relative_path(&logical_src_dir, &rs_path);
         lib_rs.push_str(&format!("include!(\"{rel}\");\n"));
     }
     fs::write(src_dir.join("lib.rs"), lib_rs)?;
@@ -319,19 +367,23 @@ fn emit_napi(
 
 fn emit_ohos(
     host_dir: &Utf8Path,
-    out_dir: &Utf8Path,
+    logical_host_dir: &Utf8Path,
+    actual_out_dir: &Utf8Path,
+    logical_out_dir: &Utf8Path,
     crate_names: &[String],
     meta: &CoreCrateMetadata,
     ohos_rs_dir: Option<&Utf8PathBuf>,
     namespaces: &[String],
 ) -> Result<()> {
     let crate_dir = host_dir.join("ohos");
+    let logical_crate_dir = logical_host_dir.join("ohos");
     let src_dir = crate_dir.join("src");
+    let logical_src_dir = logical_crate_dir.join("src");
     fs::create_dir_all(&src_dir)?;
 
-    let rel_core = relative_path(&crate_dir, &meta.crate_dir);
+    let rel_core = relative_path(&logical_crate_dir, &meta.crate_dir);
     let package_name = format!("{}-ohos", meta.package_name);
-    let ohos_deps = render_ohos_dependencies(ohos_rs_dir, &crate_dir)?;
+    let ohos_deps = render_ohos_dependencies(ohos_rs_dir, &logical_crate_dir)?;
     let package_metadata = render_ohos_package_metadata(meta);
     let lib_name = match namespaces {
         [namespace] => crate::js_names::ohos_native_library_stem(namespace),
@@ -368,7 +420,7 @@ fn emit_ohos(
         lib_name = lib_name,
         core_name = meta.package_name,
         rel_core = rel_core,
-        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &crate_dir)?,
+        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
         ohos_deps = ohos_deps,
     );
     fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
@@ -382,7 +434,7 @@ fn emit_ohos(
     let mut components = Vec::new();
     for crate_name in crate_names {
         let contract_file = format!("{crate_name}.ohos-facade.json");
-        let contract_path = out_dir.join("harmony").join(&contract_file);
+        let contract_path = actual_out_dir.join("harmony").join(&contract_file);
         let contract_content = fs::read_to_string(&contract_path)
             .with_context(|| format!("reading generated OHOS facade contract {contract_path}"))?;
         let contract_digest = sha256_text(&contract_content);
@@ -399,7 +451,7 @@ fn emit_ohos(
         }));
 
         let sidecar_file = format!("{crate_name}.ohos-extra-types.d.ts");
-        let sidecar_path = out_dir.join("harmony").join(&sidecar_file);
+        let sidecar_path = actual_out_dir.join("harmony").join(&sidecar_file);
         let sidecar_content = fs::read_to_string(&sidecar_path)
             .with_context(|| format!("reading generated OHOS type sidecar {sidecar_path}"))?;
         type_sidecars.push(serde_json::json!({
@@ -533,8 +585,10 @@ mod __uniffi_napi_cleanup_hook_key {
 "#,
     );
     for crate_name in crate_names {
-        let rs_path = out_dir.join("harmony").join(format!("{crate_name}.rs"));
-        let rel = relative_path(&src_dir, &rs_path);
+        let rs_path = logical_out_dir
+            .join("harmony")
+            .join(format!("{crate_name}.rs"));
+        let rel = relative_path(&logical_src_dir, &rs_path);
         lib_rs.push_str(&format!("include!(\"{rel}\");\n"));
     }
     fs::write(src_dir.join("lib.rs"), lib_rs)?;
@@ -934,10 +988,14 @@ edition.workspace = true
 
         let host = Utf8PathBuf::from_path_buf(host).unwrap();
         let out = Utf8PathBuf::from_path_buf(out).unwrap();
+        let logical_host = Utf8PathBuf::from_path_buf(root.join("published/host")).unwrap();
+        let logical_out = Utf8PathBuf::from_path_buf(root.join("published/generated")).unwrap();
         std::fs::create_dir_all(&host).unwrap();
         emit_ohos(
             &host,
+            &logical_host,
             &out,
+            &logical_out,
             &["demo_core".to_string()],
             &metadata,
             None,
@@ -962,6 +1020,10 @@ edition.workspace = true
         assert!(lib_rs.contains("__wrap_napi_add_env_cleanup_hook"));
         assert!(lib_rs.contains("__wrap_napi_remove_env_cleanup_hook"));
         assert!(lib_rs.contains("unique_arg(fun, arg)"));
+        assert!(
+            lib_rs.contains("include!(\"../../../generated/harmony/demo_core.rs\");"),
+            "logical publication paths were not used for include!: {lib_rs}"
+        );
         let bundle_path = host.join("ohos/uniffi-ohos-facade-bundle.json");
         let bundle: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&bundle_path).unwrap()).unwrap();

@@ -3644,6 +3644,8 @@ fn generate_stream_tree(
             host_crates: host_crates.map(|host_crates_dir| HostCrateOptions {
                 manifest_path: fixture.crate_dir.join("Cargo.toml"),
                 host_crates_dir,
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors,
@@ -3843,6 +3845,8 @@ fn generate_input_stream_tree(
             host_crates: host_crates.map(|host_crates_dir| HostCrateOptions {
                 manifest_path: fixture.crate_dir.join("Cargo.toml"),
                 host_crates_dir,
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors,
@@ -5851,6 +5855,8 @@ fn generate_arithmetic_with_host_crates(out_dir: &Utf8PathBuf, host_crates_dir: 
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_crates_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors: vec![
@@ -6046,6 +6052,8 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Harmony],
@@ -6156,6 +6164,8 @@ fn generate_synthetic_with_host_crates(root: &std::path::Path) -> (Utf8PathBuf, 
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Wasm, FlavorTarget::Napi],
@@ -6290,6 +6300,8 @@ fn generate_synthetic_gated(root: &std::path::Path, flavors: Vec<FlavorTarget>) 
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors,
@@ -6887,7 +6899,7 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "managed manifest must be relative-only:\n{manifest_text}"
     );
     let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
-    assert_eq!(manifest_json["schemaVersion"], 2);
+    assert_eq!(manifest_json["schemaVersion"], 3);
     assert_eq!(
         manifest_json["targets"],
         serde_json::json!(["wasm", "mini-program", "node"])
@@ -7283,6 +7295,8 @@ fn generate_rich_napi_host(root: &std::path::Path) -> Utf8PathBuf {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
@@ -7498,6 +7512,8 @@ fn generate_callback_return_napi_host(root: &std::path::Path) -> Utf8PathBuf {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
@@ -7593,6 +7609,8 @@ fn generate_async_callback_napi_host(root: &std::path::Path) -> Utf8PathBuf {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
@@ -7714,6 +7732,8 @@ fn generate_fallible_async_callback_napi_host(root: &std::path::Path) -> Utf8Pat
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
@@ -7870,6 +7890,8 @@ fn generate_temporal_napi_host(root: &std::path::Path) -> Utf8PathBuf {
             host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
                 ohos_rs_dir: None,
             }),
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],

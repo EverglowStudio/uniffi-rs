@@ -12,4 +12,7 @@ futures-util = "0.3"
 thiserror = "2"
 uniffi = { path = "../../..", default-features = false, features = ["macro-scaffolding", "default-async-runtime-tokio"] }
 
+[features]
+wasm-streams = ["uniffi/wasm-unstable-single-threaded"]
+
 [workspace]

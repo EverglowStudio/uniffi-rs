@@ -92,6 +92,10 @@ pub(crate) struct BuildArgs {
     #[clap(long = "target-dir")]
     target_dir: Option<Utf8PathBuf>,
 
+    /// Cargo target directory for the generated wasm host build.
+    #[clap(long = "wasm-target-dir")]
+    wasm_target_dir: Option<Utf8PathBuf>,
+
     /// Build the downstream core crate and generated host crates in release mode.
     #[clap(long)]
     release: bool,
@@ -125,11 +129,15 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir.clone(),
+            logical_host_crates_dir: None,
             artifact_dir: self.artifact_dir.clone(),
             wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
             wasm_bindgen_target: self.wasm_bindgen_target,
             cargo_bin: self.cargo_bin.clone(),
+            core_target_dir: self.wasm_target_dir.as_ref().map(|root| root.join("core")),
+            target_dir: self.wasm_target_dir.as_ref().map(|root| root.join("host")),
             release: self.release,
+            cargo_features: self.cargo_features.clone(),
             no_format: self.no_format,
             config: self.config.clone(),
             crate_name: self.crate_name.clone(),
@@ -144,6 +152,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir.clone(),
+            logical_host_crates_dir: None,
             artifact_dir: self.artifact_dir.clone(),
             flavor: self.napi_flavor.clone(),
             cargo_bin: self.cargo_bin.clone(),
@@ -184,6 +193,9 @@ pub(crate) struct BuildWasmArgs {
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     pub(crate) host_crates_dir: Utf8PathBuf,
 
+    #[clap(skip)]
+    pub(crate) logical_host_crates_dir: Option<Utf8PathBuf>,
+
     /// Directory for built non-source artifacts. Defaults to `<out-dir>/browser/pkg` for wasm-bindgen output when omitted.
     #[clap(long = "artifact-dir")]
     pub(crate) artifact_dir: Option<Utf8PathBuf>,
@@ -200,9 +212,22 @@ pub(crate) struct BuildWasmArgs {
     #[clap(long = "cargo-bin", default_value = "cargo")]
     pub(crate) cargo_bin: String,
 
+    /// Cargo target directory for the generated wasm host build.
+    #[clap(long = "target-dir")]
+    pub(crate) target_dir: Option<Utf8PathBuf>,
+
+    /// Cargo target directory for the downstream core build. Artifact
+    /// coordinators always set this outside the generation mirror.
+    #[clap(long = "core-target-dir")]
+    pub(crate) core_target_dir: Option<Utf8PathBuf>,
+
     /// Build the downstream core crate and generated wasm host crate in release mode.
     #[clap(long)]
     pub(crate) release: bool,
+
+    /// Cargo features enabled on the downstream core crate. May be repeated or comma-separated.
+    #[clap(long = "cargo-feature", value_delimiter = ',')]
+    pub(crate) cargo_features: Vec<String>,
 
     /// Do not try to format the generated bindings.
     #[clap(long, short)]
@@ -246,6 +271,9 @@ pub(crate) struct BuildNapiArgs {
     /// Directory (default `rust_modules`) in which to emit the generated napi host crate.
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     pub(crate) host_crates_dir: Utf8PathBuf,
+
+    #[clap(skip)]
+    pub(crate) logical_host_crates_dir: Option<Utf8PathBuf>,
 
     /// Directory for built non-source artifacts. Defaults to copying `.node` addons next to generated backend files when omitted.
     #[clap(long = "artifact-dir")]
@@ -310,6 +338,9 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     pub(crate) host_crates_dir: Utf8PathBuf,
 
+    #[clap(skip)]
+    pub(crate) logical_host_crates_dir: Option<Utf8PathBuf>,
+
     /// Build an existing OHOS host package or workspace instead of the generated single-package host manifest.
     #[clap(long = "ohos-host-manifest-path")]
     pub(crate) ohos_host_manifest_path: Option<Utf8PathBuf>,
@@ -350,7 +381,7 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "description")]
     pub(crate) description: Option<String>,
 
-    /// Minimum compatible Harmony/OpenHarmony SDK version. Must be explicit for final HAR packaging.
+    /// Minimum compatible Harmony/OpenHarmony SDK version. Must be explicit for final HAR/HSP packaging.
     #[clap(long = "compatible-sdk-version")]
     pub(crate) compatible_sdk_version: Option<String>,
 
@@ -362,15 +393,39 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "device-type", value_delimiter = ',')]
     pub(crate) device_types: Vec<String>,
 
+    /// Final Harmony package kind. HAR remains the backward-compatible default.
+    #[clap(long = "package-type", value_enum, default_value = "har")]
+    pub(crate) package_kind: super::ohos::PackageKind,
+
+    /// Build an app-independent integrated HSP. Only valid with --package-type hsp.
+    #[clap(long = "integrated-hsp")]
+    pub(crate) integrated_hsp: bool,
+
+    /// Host application bundleName for a non-integrated HSP.
+    #[clap(long = "hsp-bundle-name")]
+    pub(crate) hsp_bundle_name: Option<String>,
+
     /// Output `.har` path. Defaults to `<artifact-root>/<package>.har`.
     #[clap(long = "har-out")]
     pub(crate) har_out: Option<Utf8PathBuf>,
+
+    /// Standalone runtime HSP extracted byte-for-byte from the release tgz.
+    #[clap(long = "runtime-hsp-out")]
+    pub(crate) runtime_hsp_out: Option<Utf8PathBuf>,
+
+    /// Standalone Interface HAR extracted byte-for-byte from the release tgz.
+    #[clap(long = "interface-har-out")]
+    pub(crate) interface_har_out: Option<Utf8PathBuf>,
+
+    /// Original release tgz emitted by Hvigor assembleHsp.
+    #[clap(long = "tgz-out")]
+    pub(crate) tgz_out: Option<Utf8PathBuf>,
 
     /// Hvigor wrapper used to build the final compiled HAR (falls back to HVIGORW or PATH).
     #[clap(long = "hvigorw")]
     pub(crate) hvigorw: Option<String>,
 
-    /// OHPM executable used to resolve and prepublish the final HAR (falls back to OHPM or PATH).
+    /// OHPM executable used to resolve and prepublish the final Harmony package (falls back to OHPM or PATH).
     #[clap(long = "ohpm")]
     pub(crate) ohpm: Option<String>,
 
@@ -566,18 +621,498 @@ fn build(args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn build_wasm(args: BuildWasmArgs) -> Result<()> {
+pub(crate) fn build_wasm(mut args: BuildWasmArgs) -> Result<()> {
+    if args.core_target_dir.is_some() && args.target_dir.is_some() {
+        let guard = WasmTargetIsolationGuard::prepare(&args)?;
+        let result = build_wasm_inner(args, Some(&guard));
+        guard.finish(result)?;
+        return Ok(());
+    }
+    let mut invocation =
+        super::ohos::IdentityBoundInvocationRoot::create("uniffi-javascript-wasm-invocation")
+            .context("creating standalone JavaScript wasm build roots")?;
+    let build_root = invocation.build_root().join("wasm");
+    if args.core_target_dir.is_none() {
+        args.core_target_dir = Some(build_root.join("core"));
+    }
+    if args.target_dir.is_none() {
+        args.target_dir = Some(build_root.join("host"));
+    }
+    let guard = WasmTargetIsolationGuard::prepare(&args)?;
+    let result = guard.finish(build_wasm_inner(args, Some(&guard)));
+    if result.is_ok() {
+        invocation.seal()?;
+    }
+    invocation.finish(result, "standalone JavaScript wasm")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WasmGuardedDirectory {
+    path: Utf8PathBuf,
+    identity: super::ohos::PersistentFsIdentity,
+    /// Cargo is expected to mutate the target root itself.  Its stable parent
+    /// token detects a root A->B->A rename, while ancestors that Cargo must not
+    /// touch retain their own mutation epoch as well.
+    mutation: Option<String>,
+}
+
+struct WasmTargetIsolationGuard {
+    directories: Vec<WasmGuardedDirectory>,
+}
+
+fn wasm_guard_identity(path: &Utf8Path) -> Result<super::ohos::PersistentFsIdentity> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading guarded wasm target directory {path}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("wasm target path component must be a real directory: {path}");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            bail!("wasm target path component must not be a reparse point: {path}");
+        }
+    }
+    super::ohos::persistent_fs_identity(path, true)
+}
+
+fn wasm_absolute_lexical_path(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    if path
+        .components()
+        .any(|component| matches!(component.as_str(), "." | ".."))
+    {
+        bail!("wasm target/output paths must not contain `.` or `..`: {path}");
+    }
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+            .map_err(|path| anyhow::anyhow!("cwd is not utf8: {}", path.display()))?
+            .join(path)
+    };
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn windows_wasm_semantic_path_key(path: &Utf8Path) -> Result<String> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.as_std_path().components();
+    let mut key = String::new();
+    match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                key.push_str("disk:");
+                key.push((drive as char).to_ascii_lowercase());
+            }
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                key.push_str("unc:");
+                key.push_str(&server.to_string_lossy().to_lowercase());
+                key.push('/');
+                key.push_str(&share.to_string_lossy().to_lowercase());
+            }
+            Prefix::DeviceNS(device) => {
+                key.push_str("device:");
+                key.push_str(&device.to_string_lossy().to_lowercase());
+            }
+            Prefix::Verbatim(value) => {
+                key.push_str("verbatim:");
+                key.push_str(&value.to_string_lossy().to_lowercase());
+            }
+        },
+        Some(other) => {
+            bail!("Windows wasm path has no DOS/UNC prefix: {path} ({other:?})");
+        }
+        None => bail!("Windows wasm path is empty"),
+    }
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => {
+                key.push('/');
+                key.push_str(&value.to_string_lossy().to_lowercase());
+            }
+            Component::CurDir | Component::ParentDir => {
+                bail!("Windows wasm path key contains a relative component: {path}")
+            }
+            Component::Prefix(_) => bail!("Windows wasm path has a nested prefix: {path}"),
+        }
+    }
+    Ok(key)
+}
+
+fn wasm_preflight_nofollow(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    let path = wasm_absolute_lexical_path(path)?;
+    let mut current = path.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("wasm target/output path traverses a symlink: {current}");
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if metadata.file_attributes() & 0x400 != 0 {
+                        bail!("wasm target/output path traverses a reparse point: {current}");
+                    }
+                }
+                if !missing.is_empty() && !metadata.is_dir() {
+                    bail!("wasm target/output ancestor is not a directory: {current}");
+                }
+                let canonical = current
+                    .canonicalize_utf8()
+                    .with_context(|| format!("canonicalizing wasm path ancestor {current}"))?;
+                let expected_macos_alias = if cfg!(target_os = "macos") {
+                    [
+                        (Utf8Path::new("/var"), Utf8Path::new("/private/var")),
+                        (Utf8Path::new("/tmp"), Utf8Path::new("/private/tmp")),
+                    ]
+                    .into_iter()
+                    .any(|(logical, physical)| {
+                        current
+                            .strip_prefix(logical)
+                            .is_ok_and(|suffix| canonical == physical.join(suffix))
+                    })
+                } else {
+                    false
+                };
+                #[cfg(windows)]
+                let canonical_matches_current = windows_wasm_semantic_path_key(&canonical)?
+                    == windows_wasm_semantic_path_key(current)?;
+                #[cfg(not(windows))]
+                let canonical_matches_current = canonical == current;
+                if !canonical_matches_current && !expected_macos_alias {
+                    bail!(
+                        "wasm target/output path has a non-canonical or aliased ancestor: {current} -> {canonical}"
+                    );
+                }
+                let mut resolved = canonical;
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    current
+                        .file_name()
+                        .with_context(|| format!("wasm path has no existing ancestor: {path}"))?
+                        .to_string(),
+                );
+                current = current
+                    .parent()
+                    .with_context(|| format!("wasm path has no existing ancestor: {path}"))?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("preflighting wasm path {current}"))
+            }
+        }
+    }
+}
+
+fn wasm_paths_alias_or_overlap(left: &Utf8Path, right: &Utf8Path) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let left = Utf8PathBuf::from(windows_wasm_semantic_path_key(left)?);
+        let right = Utf8PathBuf::from(windows_wasm_semantic_path_key(right)?);
+        return Ok(left == right || left.starts_with(&right) || right.starts_with(&left));
+    }
+    #[cfg(not(windows))]
+    let normalize = |path: &Utf8Path| {
+        let value = path.as_str().replace('\\', "/");
+        if cfg!(target_os = "macos") {
+            Utf8PathBuf::from(value.to_ascii_lowercase())
+        } else {
+            Utf8PathBuf::from(value)
+        }
+    };
+    #[cfg(not(windows))]
+    let left = normalize(left);
+    #[cfg(not(windows))]
+    let right = normalize(right);
+    #[cfg(not(windows))]
+    Ok(left == right || left.starts_with(&right) || right.starts_with(&left))
+}
+
+fn validate_existing_wasm_directory_endpoint(path: &Utf8Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            wasm_guard_identity(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("preflighting wasm endpoint {path}")),
+    }
+}
+
+fn materialize_wasm_directories(paths: &[Utf8PathBuf]) -> Result<()> {
+    // Validate every endpoint before the first mutation. In particular, an
+    // existing regular file at a later endpoint must not leave earlier
+    // generated/output roots behind.
+    for path in paths {
+        validate_existing_wasm_directory_endpoint(path)?;
+    }
+
+    let mut created = Vec::<WasmGuardedDirectory>::new();
+    let result = (|| -> Result<()> {
+        for path in paths {
+            let mut missing = Vec::new();
+            let mut current = path.as_path();
+            loop {
+                match std::fs::symlink_metadata(current) {
+                    Ok(_) => {
+                        wasm_guard_identity(current)?;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        missing.push(current.to_path_buf());
+                        current = current.parent().with_context(|| {
+                            format!("wasm directory has no existing ancestor: {path}")
+                        })?;
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("reading wasm directory {current}"));
+                    }
+                }
+            }
+            for directory in missing.into_iter().rev() {
+                match std::fs::create_dir(&directory) {
+                    Ok(()) => created.push(WasmGuardedDirectory {
+                        identity: wasm_guard_identity(&directory)?,
+                        path: directory,
+                        mutation: None,
+                    }),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        wasm_guard_identity(&directory)?;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("creating guarded wasm directory {directory}")
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let mut cleanup_errors = Vec::new();
+        for directory in created.iter().rev() {
+            let cleanup = (|| -> Result<()> {
+                if wasm_guard_identity(&directory.path)? != directory.identity {
+                    bail!(
+                        "created wasm directory was replaced; preserving {}",
+                        directory.path
+                    );
+                }
+                if std::fs::read_dir(&directory.path)?.next().is_some() {
+                    bail!(
+                        "created wasm directory is no longer empty; preserving {}",
+                        directory.path
+                    );
+                }
+                std::fs::remove_dir(&directory.path)
+                    .with_context(|| format!("removing created wasm directory {}", directory.path))
+            })();
+            if let Err(cleanup) = cleanup {
+                cleanup_errors.push(format!("{cleanup:#}"));
+            }
+        }
+        if cleanup_errors.is_empty() {
+            return Err(error);
+        }
+        bail!(
+            "guarded wasm directory setup failed: {error:#}; identity-bound cleanup also failed: {}",
+            cleanup_errors.join("; ")
+        );
+    }
+    Ok(())
+}
+
+impl WasmTargetIsolationGuard {
+    fn prepare(args: &BuildWasmArgs) -> Result<Self> {
+        let core = wasm_preflight_nofollow(
+            args.core_target_dir
+                .as_deref()
+                .context("wasm core target directory was not resolved")?,
+        )?;
+        let host = wasm_preflight_nofollow(
+            args.target_dir
+                .as_deref()
+                .context("wasm host target directory was not resolved")?,
+        )?;
+        let mut published = vec![
+            wasm_preflight_nofollow(&args.out_dir)?,
+            wasm_preflight_nofollow(&args.host_crates_dir)?,
+        ];
+        for path in [
+            args.artifact_dir.as_deref(),
+            args.wasm_bindgen_out_dir.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            published.push(wasm_preflight_nofollow(path)?);
+        }
+        if wasm_paths_alias_or_overlap(&core, &host)? {
+            bail!(
+                "wasm isolated paths alias or overlap: core Cargo target `{core}` vs host Cargo target `{host}`"
+            );
+        }
+        for output in &published {
+            for (label, target) in [
+                ("core Cargo target", core.as_path()),
+                ("host Cargo target", host.as_path()),
+            ] {
+                if wasm_paths_alias_or_overlap(target, output)? {
+                    bail!(
+                        "wasm isolated paths alias or overlap: {label} `{target}` vs generated/published output `{output}`"
+                    );
+                }
+            }
+        }
+        // Materialize every legal publication root before capturing the
+        // explicit target's parent mutation epoch.  Mixed explicit/default
+        // layouts commonly place `explicit-core`, `generated`, `host`, and
+        // `artifacts` as siblings.  Creating those expected sibling roots
+        // after the guard is armed would be indistinguishable from a target
+        // root rename in the shared parent and would reject a normal build.
+        // Writes below the pre-created roots do not mutate that shared parent,
+        // while target A->B->A still does.
+        let materialized = published
+            .iter()
+            .cloned()
+            .chain([core.clone(), host.clone()])
+            .collect::<Vec<_>>();
+        materialize_wasm_directories(&materialized)?;
+        let mut directories = Vec::new();
+        for target in [&core, &host] {
+            let mutation_parent = target
+                .parent()
+                .context("guarded wasm Cargo target has no parent")?
+                .to_path_buf();
+            let mut current = Some(target.as_path());
+            while let Some(path) = current {
+                if path.exists() {
+                    let guarded = WasmGuardedDirectory {
+                        path: path.to_path_buf(),
+                        identity: wasm_guard_identity(path)?,
+                        // Only the immediate parent is the rename authority
+                        // for this target root. Guarding global ancestors such
+                        // as /tmp would turn unrelated concurrent builds into
+                        // false positives.
+                        mutation: (path == mutation_parent)
+                            .then(|| super::ohos::directory_mutation_token_for_owner(path))
+                            .transpose()?,
+                    };
+                    if !directories
+                        .iter()
+                        .any(|value: &WasmGuardedDirectory| value.path == path)
+                    {
+                        directories.push(guarded);
+                    }
+                }
+                current = path.parent();
+            }
+        }
+        let guard = Self { directories };
+        guard.validate()?;
+        Ok(guard)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for guarded in &self.directories {
+            if wasm_guard_identity(&guarded.path)? != guarded.identity {
+                bail!(
+                    "wasm target directory/ancestor identity changed while Cargo was running: {}",
+                    guarded.path
+                );
+            }
+            if let Some(expected) = &guarded.mutation {
+                let actual = super::ohos::directory_mutation_token_for_owner(&guarded.path)?;
+                if &actual != expected {
+                    bail!(
+                        "wasm target ancestor mutation epoch changed while Cargo was running: {}",
+                        guarded.path
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish<T>(&self, result: Result<T>) -> Result<T> {
+        match (result, self.validate()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(identity)) => Err(identity),
+            (Err(error), Err(identity)) => Err(anyhow::anyhow!(
+                "standalone wasm build failed: {error:#}; explicit target identity validation also failed: {identity:#}"
+            )),
+        }
+    }
+}
+
+fn build_wasm_inner(
+    args: BuildWasmArgs,
+    target_guard: Option<&WasmTargetIsolationGuard>,
+) -> Result<()> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let core_meta = cargo_package_metadata(&manifest_path)?;
 
+    let core_target_dir = args
+        .core_target_dir
+        .as_ref()
+        .map(|path| resolve_cwd_path(path))
+        .transpose()?;
+    let target_dir = args.target_dir.as_ref().map(resolve_cwd_path).transpose()?;
+    if let (Some(core), Some(host)) = (&core_target_dir, &target_dir) {
+        if wasm_paths_alias_or_overlap(core, host)? {
+            bail!("wasm core and generated-host target directories must not alias or overlap");
+        }
+        let mut published = vec![
+            resolve_cwd_path(&args.out_dir)?,
+            resolve_cwd_path(&args.host_crates_dir)?,
+        ];
+        for path in [
+            args.artifact_dir.as_ref(),
+            args.wasm_bindgen_out_dir.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            published.push(resolve_cwd_path(path)?);
+        }
+        for path in published {
+            if wasm_paths_alias_or_overlap(core, &path)?
+                || wasm_paths_alias_or_overlap(host, &path)?
+            {
+                bail!("wasm Cargo target directory aliases generated/published output: {path}");
+            }
+        }
+    }
+
     let mut build_core =
         cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
+    add_cargo_feature_args(&mut build_core, &args.cargo_features);
+    if let Some(target_dir) = &core_target_dir {
+        build_core
+            .env("CARGO_TARGET_DIR", target_dir.as_str())
+            .env("CARGO_INCREMENTAL", "0");
+    }
     run_command(
         &args.cargo_bin,
         &mut build_core,
         "cargo",
         "install Rust's cargo toolchain or pass --cargo-bin <path>",
     )?;
+    if let Some(guard) = target_guard {
+        guard.validate()?;
+    }
 
     let generation_source = if let Some(source) = &args.source {
         canonicalize_or_keep(source)
@@ -586,7 +1121,12 @@ pub(crate) fn build_wasm(args: BuildWasmArgs) -> Result<()> {
             .library_path
             .clone()
             .map(|p| canonicalize_or_keep(&p))
-            .unwrap_or_else(|| core_meta.host_cdylib_path(args.release));
+            .unwrap_or_else(|| {
+                core_target_dir
+                    .as_deref()
+                    .map(|target| core_meta.host_cdylib_path_in(target, args.release))
+                    .unwrap_or_else(|| core_meta.host_cdylib_path(args.release))
+            });
         if !library_path.exists() {
             bail!(
                 "built library not found at {}. Ensure the downstream crate declares a cdylib target, pass --library-path <path>, or pass --source <udl-or-library>",
@@ -607,6 +1147,8 @@ pub(crate) fn build_wasm(args: BuildWasmArgs) -> Result<()> {
         Some(HostCrateOptions {
             manifest_path: manifest_path.clone(),
             host_crates_dir: args.host_crates_dir.clone(),
+            logical_host_crates_dir: args.logical_host_crates_dir.clone(),
+            logical_out_dir: None,
             ohos_rs_dir: None,
         }),
         vec![FlavorTarget::Wasm],
@@ -630,22 +1172,43 @@ pub(crate) fn build_wasm(args: BuildWasmArgs) -> Result<()> {
         );
     }
 
+    let wasm_cargo_args =
+        dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+    let wasm_cargo_args = wasm_cargo_args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let mut build_wasm_host = cargo_build_command(
         &args.cargo_bin,
         &wasm_manifest,
-        &["--target", "wasm32-unknown-unknown"],
+        &wasm_cargo_args,
         args.release,
         None,
     );
+    build_wasm_host
+        .arg("--target")
+        .arg("wasm32-unknown-unknown");
+    if let Some(target_dir) = &target_dir {
+        build_wasm_host
+            .env("CARGO_TARGET_DIR", target_dir.as_str())
+            .env("CARGO_INCREMENTAL", "0");
+    }
     run_command(
         &args.cargo_bin,
         &mut build_wasm_host,
         "cargo",
         "install Rust's wasm32-unknown-unknown target with `rustup target add wasm32-unknown-unknown`",
     )?;
+    if let Some(guard) = target_guard {
+        guard.validate()?;
+    }
 
     let wasm_meta = cargo_package_metadata(&wasm_manifest)?;
-    let wasm_artifact = wasm_meta.wasm_artifact_path(args.release);
+    let wasm_artifact = if let Some(target_dir) = &target_dir {
+        wasm_meta.wasm_artifact_path_in(target_dir, args.release)
+    } else {
+        wasm_meta.wasm_artifact_path(args.release)
+    };
     if !wasm_artifact.exists() {
         bail!(
             "built wasm artifact not found at {} after cargo build",
@@ -733,6 +1296,8 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
         Some(HostCrateOptions {
             manifest_path: manifest_path.clone(),
             host_crates_dir: args.host_crates_dir.clone(),
+            logical_host_crates_dir: args.logical_host_crates_dir.clone(),
+            logical_out_dir: None,
             ohos_rs_dir: None,
         }),
         flavors.clone(),
@@ -771,7 +1336,9 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
         None,
     );
     if let Some(target_dir) = &target_dir {
-        build_napi_host.env("CARGO_TARGET_DIR", target_dir.as_str());
+        build_napi_host
+            .env("CARGO_TARGET_DIR", target_dir.as_str())
+            .env("CARGO_INCREMENTAL", "0");
     }
     run_command(
         &args.cargo_bin,
@@ -820,6 +1387,337 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
 }
 
 pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
+    if args.package_kind == super::ohos::PackageKind::Hsp && !args.output_lock_held {
+        return build_direct_ohos_hsp(args);
+    }
+    if let Some(prepared) = build_ohos_internal(args, false)? {
+        prepared.commit()?;
+    }
+    Ok(())
+}
+
+/// Build every direct JavaScript HSP generation in a private source/host
+/// mirror, then publish the generic and HSP participants under one complete
+/// owner.  In particular, an OHOS Cargo/arch failure can never expose freshly
+/// generated common/Harmony sources without the matching HSP generation.
+fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
+    super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
+        package_kind: public.package_kind,
+        integrated_hsp: public.integrated_hsp,
+        hsp_bundle_name: public.hsp_bundle_name.as_deref(),
+        has_har_output: public.har_out.is_some(),
+        has_hsp_output: public.runtime_hsp_out.is_some()
+            || public.interface_har_out.is_some()
+            || public.tgz_out.is_some(),
+        no_har: public.no_har,
+        skip_libs: public.skip_libs,
+        compatible_sdk_version: public.compatible_sdk_version.as_deref(),
+        compatible_sdk_type: public.compatible_sdk_type.as_deref(),
+        bisheng: public.bisheng,
+        hvigorw: public.hvigorw.as_deref(),
+        ohpm: public.ohpm.as_deref(),
+        deveco_sdk_home: public.deveco_sdk_home.as_deref(),
+    })?;
+    super::ohos::preflight_hsp_arches(&public.arch)
+        .context("validating Harmony HSP architectures before publication planning")?;
+    let outputs = planned_direct_ohos_hsp_outputs(&public)?;
+    let cwd = Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+        .map_err(|path| anyhow::anyhow!("cwd is not utf8: {}", path.display()))?;
+    let public_out = if public.out_dir.is_absolute() {
+        public.out_dir.clone()
+    } else {
+        cwd.join(&public.out_dir)
+    };
+    let public_host = if public.host_crates_dir.is_absolute() {
+        public.host_crates_dir.clone()
+    } else {
+        cwd.join(&public.host_crates_dir)
+    };
+    let public_ohos = public_host.join("ohos");
+    let mut specifications = vec![super::ohos::InvocationOutputSpec {
+        label: "generated JavaScript source root".into(),
+        path: public_out,
+        is_directory: true,
+    }];
+    for (label, relative, is_directory) in [
+        ("OHOS host Cargo manifest", "Cargo.toml", false),
+        ("OHOS host Cargo lock", "Cargo.lock", false),
+        ("OHOS host build script", "build.rs", false),
+        (
+            "OHOS facade bundle",
+            "uniffi-ohos-facade-bundle.json",
+            false,
+        ),
+        ("OHOS host source", "src", true),
+    ] {
+        specifications.push(super::ohos::InvocationOutputSpec {
+            label: label.into(),
+            path: public_ohos.join(relative),
+            is_directory,
+        });
+    }
+    let mut plan = super::ohos::GenericPublicationPlan::new(specifications, &outputs)
+        .context("planning complete direct JavaScript HSP publication")?;
+    // Declared before both staged participants so locks outlive every rollback
+    // and identity-bound cleanup guard.
+    let _union_locks = plan
+        .take_output_locks()
+        .context("direct JavaScript HSP coordinator lost its union lock")?;
+    let mut invocation =
+        super::ohos::IdentityBoundInvocationRoot::create("uniffi-javascript-hsp-invocation")
+            .context("creating private JavaScript HSP invocation")?;
+    let result = (|| -> Result<()> {
+        let mirror = invocation.mirror_root().to_path_buf();
+        let build_root = invocation.build_root().to_path_buf();
+        let private_out = mirror.join("generated");
+        let private_host = mirror.join("host");
+        let private_ohos = private_host.join("ohos");
+        let mut private = public.clone();
+        private.out_dir = private_out.clone();
+        private.host_crates_dir = private_host;
+        private.logical_host_crates_dir = Some(public_host.clone());
+        private.target_dir = Some(build_root.join("ohos"));
+        private.output_lock_held = true;
+
+        let mut sources = vec![private_out];
+        for relative in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "build.rs",
+            "uniffi-ohos-facade-bundle.json",
+            "src",
+        ] {
+            sources.push(private_ohos.join(relative));
+        }
+        let prepared = build_ohos_internal(private, true)?
+            .context("private JavaScript HSP build did not return a deferred generation")?;
+        if prepared.output_paths() != outputs {
+            bail!("direct JavaScript HSP output plan changed during private generation");
+        }
+        // No later step may write the private source/build tree. Seal it before
+        // staging reads any source so cleanup rejects replacement or ABA.
+        invocation.seal()?;
+        let mut hsp_publication = plan.stage_hsp(prepared)?;
+        let mut generic_publication = plan.stage(&sources)?;
+        if let Err(error) =
+            generic_publication.register_complete_candidates(&hsp_publication.next_entries())
+        {
+            let hsp_candidates = if generic_publication.requires_control_preservation() {
+                Err(anyhow::anyhow!(
+                    "HSP candidates are preserved because candidate-record durability is uncertain"
+                ))
+            } else {
+                hsp_publication.cleanup_unpublished_candidates()
+            };
+            let controls = generic_publication.rollback();
+            return match (hsp_candidates, controls) {
+                (Ok(()), Ok(())) => {
+                    Err(error).context("registering complete direct JavaScript candidates")
+                }
+                (hsp, controls) => Err(anyhow::anyhow!(
+                    "registering complete direct JavaScript candidates failed: {error:#}; HSP candidate cleanup={hsp:?}; generic/control cleanup={controls:?}"
+                )),
+            };
+        }
+        if let Err(error) = generic_publication.publish_hsp(&mut hsp_publication) {
+            let controls = generic_publication.rollback();
+            return match controls {
+                Ok(()) => Err(error),
+                Err(controls) => Err(anyhow::anyhow!(
+                    "publishing direct JavaScript HSP participant failed: {error:#}; control cleanup also failed: {controls:#}"
+                )),
+            };
+        }
+        if let Err(error) = generic_publication.publish() {
+            let hsp_recovery = if generic_publication.complete_owner_recovery_finished() {
+                hsp_publication.mark_recovered_by_complete_owner();
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "complete-owner durable recovery did not finish; HSP state is preserved"
+                ))
+            };
+            let controls = generic_publication.abort_controls_after_rollback();
+            return match (hsp_recovery, controls) {
+                (Ok(()), Ok(())) => {
+                    Err(error).context("publishing direct JavaScript HSP sources")
+                }
+                (recovery, controls) => Err(anyhow::anyhow!(
+                    "direct JavaScript HSP source publication failed: {error:#}; HSP complete-owner recovery={recovery:?}; control cleanup={controls:?}"
+                )),
+            };
+        }
+        match generic_publication.commit_record(&hsp_publication.next_entries()) {
+            Err(error) => {
+                let generic_rollback = generic_publication.rollback_outputs_only();
+                let hsp_recovery = if generic_rollback.is_ok()
+                    && generic_publication.complete_owner_recovery_finished()
+                {
+                    hsp_publication.mark_recovered_by_complete_owner();
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "complete-owner durable recovery did not finish; HSP state is preserved"
+                    ))
+                };
+                let controls = generic_publication.abort_controls_after_rollback();
+                match (generic_rollback, hsp_recovery, controls) {
+                    (Ok(()), Ok(()), Ok(())) => Err(error),
+                    (generic, hsp, controls) => Err(anyhow::anyhow!(
+                        "direct JavaScript final owner failed before commit: {error:#}; complete-owner recovery={generic:?}; HSP recovery state={hsp:?}; control cleanup={controls:?}"
+                    )),
+                }
+            }
+            Ok(super::ohos::DirectCommitOutcome::Verified) => {
+                generic_publication.finalize_hsp(hsp_publication)?;
+                generic_publication.finalize()
+            }
+            Ok(super::ohos::DirectCommitOutcome::CommittedNeedsAudit(error)) => {
+                hsp_publication.preserve_previous_backups();
+                let _ = hsp_publication.finalize();
+                let _ = generic_publication.finalize();
+                Err(error)
+            }
+        }
+    })();
+    // Keep the complete union lock alive through explicit identity-bound
+    // cleanup, including ordinary generation/publication failures.
+    invocation.finish(result, "JavaScript HSP")
+}
+
+fn planned_direct_ohos_hsp_outputs(
+    args: &BuildOhosArgs,
+) -> Result<Vec<super::ohos::HspOutputPaths>> {
+    let manifest_path = canonicalize_or_keep(&args.manifest_path);
+    let cwd = Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+        .map_err(|path| anyhow::anyhow!("cwd is not utf8: {}", path.display()))?;
+    let host_root = if args.host_crates_dir.is_absolute() {
+        args.host_crates_dir.clone()
+    } else {
+        cwd.join(&args.host_crates_dir)
+    };
+    let ohos_dir = host_root.join("ohos");
+    let dist_dir = args
+        .dist_dir
+        .clone()
+        .or_else(|| {
+            args.artifact_dir
+                .as_ref()
+                .map(|root| root.join("ohos/dist"))
+        })
+        .unwrap_or_else(|| ohos_dir.join("dist"));
+    let core_meta = cargo_package_metadata(&manifest_path)?;
+    if let Some(custom_manifest) = args
+        .ohos_host_manifest_path
+        .as_ref()
+        .map(|path| canonicalize_or_keep(path))
+    {
+        let facade_mode = if args.raw_only_facade {
+            super::ohos::FacadeMode::RawOnly
+        } else {
+            super::ohos::FacadeMode::Required(
+                custom_manifest
+                    .parent()
+                    .context("custom OHOS host manifest has no parent")?
+                    .join("uniffi-ohos-facade-bundle.json"),
+            )
+        };
+        let mut cargo_args =
+            dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+        cargo_args.extend(args.cargo_args.clone());
+        let mut additional_source_roots = core_meta.local_source_roots.clone();
+        additional_source_roots.push(("core-workspace".into(), core_meta.workspace_root.clone()));
+        additional_source_roots.push(("generated-bindings".into(), args.out_dir.clone()));
+        return super::ohos::planned_hsp_host_build_outputs(&super::ohos::BuildOptions {
+            cargo_bin: args.cargo_bin.clone(),
+            core_manifest_path: Some(manifest_path),
+            additional_source_roots,
+            manifest_path: custom_manifest,
+            facade_mode,
+            dist_dir,
+            package_name: args.package_name.clone(),
+            module_name: args.module_name.clone(),
+            package_version: args.package_version.clone(),
+            author: args.author.clone(),
+            license: args.license.clone(),
+            description: args.description.clone(),
+            compatible_sdk_version: args.compatible_sdk_version.clone(),
+            compatible_sdk_type: args.compatible_sdk_type.clone(),
+            device_types: args.device_types.clone(),
+            package_kind: args.package_kind,
+            integrated_hsp: args.integrated_hsp,
+            hsp_bundle_name: args.hsp_bundle_name.clone(),
+            har_out: args.har_out.clone(),
+            runtime_hsp_out: args.runtime_hsp_out.clone(),
+            interface_har_out: args.interface_har_out.clone(),
+            tgz_out: args.tgz_out.clone(),
+            hvigorw: args.hvigorw.clone(),
+            ohpm: args.ohpm.clone(),
+            deveco_sdk_home: args.deveco_sdk_home.clone(),
+            no_har: args.no_har,
+            arches: if args.arch.is_empty() {
+                vec!["aarch".into(), "x64".into()]
+            } else {
+                args.arch.clone()
+            },
+            target_dir: args.target_dir.clone(),
+            release: args.release,
+            cargo_args,
+            copy_static: args.copy_static,
+            skip_libs: args.skip_libs,
+            dts_cache: args.dts_cache,
+            skip_check: args.skip_check,
+            zigbuild: args.zigbuild,
+            bisheng: args.bisheng,
+            package: args.package.clone(),
+            skip_napi_check: args.skip_napi_check,
+            soname: args.soname.clone(),
+            output_lock_held: true,
+            frontend_hsp_preflight_done: true,
+        });
+    }
+
+    let generated_host_package = format!("{}-ohos", core_meta.package_name);
+    Ok(vec![super::ohos::planned_generated_hsp_outputs(
+        super::ohos::GeneratedHspOutputPreflight {
+            dist_dir: &dist_dir,
+            generated_host_package_name: &generated_host_package,
+            package_name: args.package_name.as_deref(),
+            runtime_hsp_out: args.runtime_hsp_out.as_deref(),
+            interface_har_out: args.interface_har_out.as_deref(),
+            tgz_out: args.tgz_out.as_deref(),
+        },
+    )?])
+}
+
+pub(crate) fn build_ohos_deferred(
+    args: BuildOhosArgs,
+) -> Result<super::ohos::PreparedHspInvocation> {
+    build_ohos_internal(args, true)?
+        .context("deferred JavaScript OHOS build did not produce an HSP invocation")
+}
+
+fn build_ohos_internal(
+    args: BuildOhosArgs,
+    defer_hsp_publication: bool,
+) -> Result<Option<super::ohos::PreparedHspInvocation>> {
+    super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
+        package_kind: args.package_kind,
+        integrated_hsp: args.integrated_hsp,
+        hsp_bundle_name: args.hsp_bundle_name.as_deref(),
+        has_har_output: args.har_out.is_some(),
+        has_hsp_output: args.runtime_hsp_out.is_some()
+            || args.interface_har_out.is_some()
+            || args.tgz_out.is_some(),
+        no_har: args.no_har,
+        skip_libs: args.skip_libs,
+        compatible_sdk_version: args.compatible_sdk_version.as_deref(),
+        compatible_sdk_type: args.compatible_sdk_type.as_deref(),
+        bisheng: args.bisheng,
+        hvigorw: args.hvigorw.as_deref(),
+        ohpm: args.ohpm.as_deref(),
+        deveco_sdk_home: args.deveco_sdk_home.as_deref(),
+    })?;
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let cwd = Utf8PathBuf::from_path_buf(std::env::current_dir()?)
         .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?;
@@ -900,6 +1798,90 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     super::ohos::preflight_dist_output_for_generation(&dist_dir, &protected_dist_paths)
         .context("preflighting generator-owned OHOS dist against Cargo workspace sources")?;
 
+    if args.package_kind == super::ohos::PackageKind::Hsp {
+        if let Some(custom_manifest) = custom_ohos_manifest.as_ref() {
+            let facade_mode = if args.raw_only_facade {
+                super::ohos::FacadeMode::RawOnly
+            } else {
+                super::ohos::FacadeMode::Required(
+                    custom_manifest
+                        .parent()
+                        .context("custom OHOS host manifest has no parent")?
+                        .join("uniffi-ohos-facade-bundle.json"),
+                )
+            };
+            let arches = if args.arch.is_empty() {
+                vec!["aarch".to_string(), "x64".to_string()]
+            } else {
+                args.arch.clone()
+            };
+            let mut ohos_cargo_args =
+                dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+            ohos_cargo_args.extend(args.cargo_args.clone());
+            let mut additional_source_roots = core_meta.local_source_roots.clone();
+            additional_source_roots
+                .push(("core-workspace".into(), core_meta.workspace_root.clone()));
+            additional_source_roots.push(("generated-bindings".into(), args.out_dir.clone()));
+            super::ohos::preflight_hsp_host_build(&super::ohos::BuildOptions {
+                cargo_bin: args.cargo_bin.clone(),
+                core_manifest_path: Some(manifest_path.clone()),
+                additional_source_roots,
+                manifest_path: custom_manifest.clone(),
+                facade_mode,
+                dist_dir: dist_dir.clone(),
+                package_name: args.package_name.clone(),
+                module_name: args.module_name.clone(),
+                package_version: args.package_version.clone(),
+                author: args.author.clone(),
+                license: args.license.clone(),
+                description: args.description.clone(),
+                compatible_sdk_version: args.compatible_sdk_version.clone(),
+                compatible_sdk_type: args.compatible_sdk_type.clone(),
+                device_types: args.device_types.clone(),
+                package_kind: args.package_kind,
+                integrated_hsp: args.integrated_hsp,
+                hsp_bundle_name: args.hsp_bundle_name.clone(),
+                har_out: args.har_out.clone(),
+                runtime_hsp_out: args.runtime_hsp_out.clone(),
+                interface_har_out: args.interface_har_out.clone(),
+                tgz_out: args.tgz_out.clone(),
+                hvigorw: args.hvigorw.clone(),
+                ohpm: args.ohpm.clone(),
+                deveco_sdk_home: args.deveco_sdk_home.clone(),
+                no_har: args.no_har,
+                arches,
+                target_dir: args.target_dir.clone(),
+                release: args.release,
+                cargo_args: ohos_cargo_args,
+                copy_static: args.copy_static,
+                skip_libs: args.skip_libs,
+                dts_cache: args.dts_cache,
+                skip_check: args.skip_check,
+                zigbuild: args.zigbuild,
+                bisheng: args.bisheng,
+                package: args.package.clone(),
+                skip_napi_check: args.skip_napi_check,
+                soname: args.soname.clone(),
+                output_lock_held: args.output_lock_held,
+                frontend_hsp_preflight_done: true,
+            })
+            .context("preflighting custom multi-package HSP host before core generation")?;
+        } else {
+            let generated_host_package = format!("{}-ohos", core_meta.package_name);
+            super::ohos::preflight_generated_hsp_outputs(
+                super::ohos::GeneratedHspOutputPreflight {
+                    dist_dir: &dist_dir,
+                    generated_host_package_name: &generated_host_package,
+                    package_name: args.package_name.as_deref(),
+                    runtime_hsp_out: args.runtime_hsp_out.as_deref(),
+                    interface_har_out: args.interface_har_out.as_deref(),
+                    tgz_out: args.tgz_out.as_deref(),
+                },
+            )
+            .context("preflighting generated HSP output plan before core generation")?;
+        }
+    }
+
     let mut build_core =
         cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
     add_cargo_feature_args(&mut build_core, &args.cargo_features);
@@ -938,6 +1920,8 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         Some(HostCrateOptions {
             manifest_path: manifest_path.clone(),
             host_crates_dir: args.host_crates_dir.clone(),
+            logical_host_crates_dir: args.logical_host_crates_dir.clone(),
+            logical_out_dir: None,
             ohos_rs_dir: None,
         }),
         vec![FlavorTarget::Harmony],
@@ -978,7 +1962,7 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     let mut additional_source_roots = core_meta.local_source_roots.clone();
     additional_source_roots.push(("core-workspace".into(), core_meta.workspace_root.clone()));
     additional_source_roots.push(("generated-bindings".into(), args.out_dir.clone()));
-    super::ohos::build(super::ohos::BuildOptions {
+    let options = super::ohos::BuildOptions {
         cargo_bin: args.cargo_bin.clone(),
         core_manifest_path: Some(manifest_path),
         additional_source_roots,
@@ -994,7 +1978,13 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         compatible_sdk_version: args.compatible_sdk_version,
         compatible_sdk_type: args.compatible_sdk_type,
         device_types: args.device_types,
+        package_kind: args.package_kind,
+        integrated_hsp: args.integrated_hsp,
+        hsp_bundle_name: args.hsp_bundle_name,
         har_out: args.har_out,
+        runtime_hsp_out: args.runtime_hsp_out,
+        interface_har_out: args.interface_har_out,
+        tgz_out: args.tgz_out,
         hvigorw: args.hvigorw,
         ohpm: args.ohpm,
         deveco_sdk_home: args.deveco_sdk_home,
@@ -1013,9 +2003,13 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
         skip_napi_check: args.skip_napi_check,
         soname: args.soname,
         output_lock_held: args.output_lock_held,
-    })?;
-
-    Ok(())
+        frontend_hsp_preflight_done: true,
+    };
+    if defer_hsp_publication {
+        return super::ohos::build_deferred_hsp(options).map(Some);
+    }
+    super::ohos::build(options)?;
+    Ok(None)
 }
 
 fn add_cargo_feature_args(command: &mut Command, features: &[String]) {
@@ -1041,7 +2035,36 @@ fn dependency_cargo_feature_args(package_name: &str, features: &[String]) -> Vec
 
 #[cfg(test)]
 mod tests {
-    use super::dependency_cargo_feature_args;
+    use super::{
+        dependency_cargo_feature_args, rebase_mini_program_auto_entrypoint, BuildWasmArgs,
+        WasmBindgenTargetArg, WasmTargetIsolationGuard,
+    };
+    #[cfg(windows)]
+    use super::{wasm_preflight_nofollow, windows_wasm_semantic_path_key};
+    use camino::Utf8PathBuf;
+
+    fn guarded_wasm_args(root: &camino::Utf8Path) -> BuildWasmArgs {
+        BuildWasmArgs {
+            manifest_path: root.join("core/Cargo.toml"),
+            out_dir: root.join("published/generated"),
+            library_path: None,
+            source: None,
+            host_crates_dir: root.join("published/host"),
+            logical_host_crates_dir: None,
+            artifact_dir: Some(root.join("published/artifacts")),
+            wasm_bindgen_out_dir: Some(root.join("published/wasm-bindgen")),
+            wasm_bindgen_target: WasmBindgenTargetArg::Web,
+            cargo_bin: "cargo".into(),
+            target_dir: Some(root.join("targets/host")),
+            core_target_dir: Some(root.join("targets/core")),
+            release: false,
+            cargo_features: Vec::new(),
+            no_format: true,
+            config: None,
+            crate_name: None,
+            metadata_no_deps: false,
+        }
+    }
 
     #[test]
     fn napi_and_ohos_dependency_feature_args_are_package_qualified() {
@@ -1066,6 +2089,199 @@ mod tests {
     #[test]
     fn napi_and_ohos_dependency_feature_args_are_empty_without_features() {
         assert!(dependency_cargo_feature_args("uni-core", &[]).is_empty());
+    }
+
+    #[test]
+    fn explicit_wasm_guard_allows_cargo_writes_but_rejects_root_aba() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let args = guarded_wasm_args(&root);
+        let guard = WasmTargetIsolationGuard::prepare(&args).unwrap();
+        let core = args.core_target_dir.as_ref().unwrap();
+
+        // Cargo must be able to populate the target root without invalidating
+        // the isolation guard.
+        std::fs::write(core.join("cargo-output"), b"ok").unwrap();
+        guard.validate().unwrap();
+
+        // Moving the same root object away and back preserves its inode but
+        // mutates the guarded parent epoch, so the cross-invocation ABA is not
+        // mistaken for an untouched target root.
+        let displaced = root.join("targets/core-displaced");
+        std::fs::rename(core, &displaced).unwrap();
+        std::fs::rename(&displaced, core).unwrap();
+        assert!(guard.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_wasm_guard_rejects_dotdot_overlap_and_symlink_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+
+        let mut dotdot = guarded_wasm_args(&root);
+        dotdot.core_target_dir = Some(root.join("targets/../core"));
+        assert!(WasmTargetIsolationGuard::prepare(&dotdot).is_err());
+
+        let mut overlap = guarded_wasm_args(&root);
+        overlap.target_dir = Some(root.join("targets/core/host"));
+        assert!(WasmTargetIsolationGuard::prepare(&overlap).is_err());
+
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(root.join("real-targets")).unwrap();
+            std::os::unix::fs::symlink(root.join("real-targets"), root.join("alias-targets"))
+                .unwrap();
+            let mut alias = guarded_wasm_args(&root);
+            alias.core_target_dir = Some(root.join("alias-targets/core"));
+            assert!(WasmTargetIsolationGuard::prepare(&alias).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_verbatim_spelling(path: &camino::Utf8Path) -> Utf8PathBuf {
+        use std::path::{Component, Prefix};
+
+        let mut components = path.as_std_path().components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            panic!("test verbatim spelling requires an absolute DOS/UNC path: {path}");
+        };
+        match prefix.kind() {
+            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) => path.to_path_buf(),
+            Prefix::Disk(_) => Utf8PathBuf::from(format!(r"\\?\{}", path.as_str())),
+            Prefix::UNC(_, _) => {
+                let unc = path
+                    .as_str()
+                    .strip_prefix(r"\\")
+                    .expect("ordinary UNC path has its leading separators");
+                Utf8PathBuf::from(format!(r"\\?\UNC\{unc}"))
+            }
+            other => panic!("test verbatim spelling rejects unsupported prefix {other:?}: {path}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wasm_path_key_normalizes_dos_unc_verbatim_and_case() {
+        let drive = camino::Utf8Path::new(r"C:\Work\Target");
+        let verbatim_drive = windows_verbatim_spelling(drive);
+        assert_eq!(verbatim_drive, camino::Utf8Path::new(r"\\?\C:\Work\Target"));
+        assert_eq!(windows_verbatim_spelling(&verbatim_drive), verbatim_drive);
+        assert_eq!(
+            windows_wasm_semantic_path_key(drive).unwrap(),
+            windows_wasm_semantic_path_key(camino::Utf8Path::new(r"\\?\c:\work\TARGET")).unwrap()
+        );
+        let unc = camino::Utf8Path::new(r"\\Server\Share\Work\Target");
+        let verbatim_unc = windows_verbatim_spelling(unc);
+        assert_eq!(
+            verbatim_unc,
+            camino::Utf8Path::new(r"\\?\UNC\Server\Share\Work\Target")
+        );
+        assert_eq!(windows_verbatim_spelling(&verbatim_unc), verbatim_unc);
+        assert_eq!(
+            windows_wasm_semantic_path_key(unc).unwrap(),
+            windows_wasm_semantic_path_key(camino::Utf8Path::new(
+                r"\\?\UNC\server\share\work\TARGET"
+            ))
+            .unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wasm_preflight_accepts_normal_and_verbatim_equivalents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let canonical = root.canonicalize_utf8().unwrap();
+        assert_eq!(
+            windows_verbatim_spelling(&windows_verbatim_spelling(&canonical)),
+            windows_verbatim_spelling(&canonical),
+            "verbatim conversion must be idempotent for Rust canonical paths"
+        );
+        let normal = wasm_preflight_nofollow(&root.join("ordinary/missing")).unwrap();
+        let verbatim = wasm_preflight_nofollow(
+            &windows_verbatim_spelling(&canonical).join("ordinary/missing"),
+        )
+        .unwrap();
+        assert_eq!(
+            windows_wasm_semantic_path_key(&normal).unwrap(),
+            windows_wasm_semantic_path_key(&verbatim).unwrap()
+        );
+
+        // When the native test workspace itself is on a UNC share, exercise
+        // the real filesystem preflight in both UNC spellings as well.
+        if root.as_str().starts_with(r"\\") {
+            let unc = wasm_preflight_nofollow(&root.join("unc/missing")).unwrap();
+            let verbatim_unc =
+                wasm_preflight_nofollow(&windows_verbatim_spelling(&root).join("unc/missing"))
+                    .unwrap();
+            assert_eq!(
+                windows_wasm_semantic_path_key(&unc).unwrap(),
+                windows_wasm_semantic_path_key(&verbatim_unc).unwrap()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wasm_preflight_rejects_junction_reparse_points() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let target = root.join("real-target");
+        let junction = root.join("junction-target");
+        std::fs::create_dir(&target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(junction.as_std_path())
+            .arg(target.as_std_path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to create a test junction");
+        let error = wasm_preflight_nofollow(&junction.join("child")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reparse point"),
+            "unexpected junction rejection: {error:#}"
+        );
+    }
+
+    #[test]
+    fn explicit_wasm_guard_preflights_every_endpoint_before_creating_any_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let args = guarded_wasm_args(&root);
+        std::fs::create_dir(root.join("published")).unwrap();
+        std::fs::write(&args.host_crates_dir, b"not-a-directory").unwrap();
+
+        assert!(WasmTargetIsolationGuard::prepare(&args).is_err());
+        assert!(
+            !args.out_dir.exists()
+                && !args.artifact_dir.as_ref().unwrap().exists()
+                && !args.wasm_bindgen_out_dir.as_ref().unwrap().exists()
+                && !args.core_target_dir.as_ref().unwrap().exists()
+                && !args.target_dir.as_ref().unwrap().exists(),
+            "failed endpoint preflight left a guarded wasm root behind"
+        );
+        assert_eq!(
+            std::fs::read(&args.host_crates_dir).unwrap(),
+            b"not-a-directory"
+        );
+    }
+
+    #[test]
+    fn mini_program_entrypoint_rebases_private_write_to_public_artifact_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let actual_out = root.join("private/generated");
+        let logical_out = root.join("public/generated");
+        let logical_mini = root.join("public/artifacts/mini-program");
+        rebase_mini_program_auto_entrypoint(&actual_out, &logical_out, &logical_mini, "demo_wasm")
+            .unwrap();
+        let entry =
+            std::fs::read_to_string(actual_out.join("browser/index.mini-program.ts")).unwrap();
+        assert!(
+            entry.contains("import * as glue from \"../../artifacts/mini-program/demo_wasm.js\";"),
+            "private entrypoint did not encode its public relative import: {entry}"
+        );
+        assert!(!entry.contains("private"));
     }
 }
 
@@ -1309,9 +2525,9 @@ pub(crate) fn emit_mini_program_wasm_runtime(
     if snippets_source.exists() {
         let snippets_dest = mini_program_out_dir.join("snippets");
         if snippets_dest.exists() {
-            std::fs::remove_dir_all(&snippets_dest).with_context(|| {
-                format!("removing stale Mini Program snippets dir {snippets_dest}")
-            })?;
+            bail!(
+                "fresh Mini Program snippets path unexpectedly exists without its creation-time witness: {snippets_dest}"
+            );
         }
         copy_dir_contents(&snippets_source, &snippets_dest).with_context(|| {
             format!("copying wasm-bindgen snippets {snippets_source} to {snippets_dest}")
@@ -1498,19 +2714,50 @@ fn emit_mini_program_auto_entrypoint(
     mini_program_out_dir: &Utf8Path,
     wasm_bindgen_stem: &str,
 ) -> Result<()> {
-    let browser_dir = out_dir.join("browser");
+    let logical_out_dir = out_dir
+        .canonicalize_utf8()
+        .with_context(|| format!("canonicalizing Mini Program generated root {out_dir}"))?;
+    let logical_mini_program_out_dir =
+        mini_program_out_dir.canonicalize_utf8().with_context(|| {
+            format!("canonicalizing Mini Program artifact dir {mini_program_out_dir}")
+        })?;
+    write_mini_program_auto_entrypoint(
+        out_dir,
+        &logical_out_dir,
+        &logical_mini_program_out_dir,
+        wasm_bindgen_stem,
+    )
+}
+
+pub(crate) fn rebase_mini_program_auto_entrypoint(
+    actual_out_dir: &Utf8Path,
+    logical_out_dir: &Utf8Path,
+    logical_mini_program_out_dir: &Utf8Path,
+    wasm_bindgen_stem: &str,
+) -> Result<()> {
+    write_mini_program_auto_entrypoint(
+        actual_out_dir,
+        logical_out_dir,
+        logical_mini_program_out_dir,
+        wasm_bindgen_stem,
+    )
+}
+
+fn write_mini_program_auto_entrypoint(
+    actual_out_dir: &Utf8Path,
+    logical_out_dir: &Utf8Path,
+    logical_mini_program_out_dir: &Utf8Path,
+    wasm_bindgen_stem: &str,
+) -> Result<()> {
+    let browser_dir = actual_out_dir.join("browser");
     let entrypoint = browser_dir.join("index.mini-program.ts");
     std::fs::create_dir_all(&browser_dir)
         .with_context(|| format!("creating browser output dir {browser_dir}"))?;
-    let browser_dir_abs = browser_dir
-        .canonicalize_utf8()
-        .with_context(|| format!("canonicalizing browser dir {browser_dir}"))?;
-    let mini_program_out_dir_abs = mini_program_out_dir.canonicalize_utf8().with_context(|| {
-        format!("canonicalizing Mini Program artifact dir {mini_program_out_dir}")
-    })?;
-    let rel_artifact_dir = relative_path_from_dir(&browser_dir_abs, &mini_program_out_dir_abs)
-        .to_string()
-        .replace('\\', "/");
+    let logical_browser_dir = logical_out_dir.join("browser");
+    let rel_artifact_dir =
+        relative_path_from_dir(&logical_browser_dir, logical_mini_program_out_dir)
+            .to_string()
+            .replace('\\', "/");
     let rel_artifact_dir = if rel_artifact_dir.is_empty() {
         ".".to_string()
     } else if rel_artifact_dir.starts_with('.') {
@@ -1616,7 +2863,11 @@ impl CargoPackageMetadata {
     }
 
     fn wasm_artifact_path(&self, release: bool) -> Utf8PathBuf {
-        self.target_directory
+        self.wasm_artifact_path_in(&self.target_directory, release)
+    }
+
+    fn wasm_artifact_path_in(&self, target_directory: &Utf8Path, release: bool) -> Utf8PathBuf {
+        target_directory
             .join("wasm32-unknown-unknown")
             .join(if release { "release" } else { "debug" })
             .join(format!("{}.wasm", self.lib_target_name))
