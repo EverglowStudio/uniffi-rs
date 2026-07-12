@@ -37,6 +37,7 @@ tempfile = { version = "3", optional = true }
 fs2 = { version = "0.4", optional = true }
 sha2 = { version = "0.10", optional = true }
 libc = { version = "0.2", optional = true }
+goblin = { version = "0.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [ "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem" ], optional = true }
@@ -59,7 +60,7 @@ cargo-metadata = ["dep:cargo_metadata", "uniffi_bindgen?/cargo-metadata"]
 
 # Support for `uniffi_bindgen_main()`. Enable this feature for your
 # `uniffi-bindgen` binaries.
-cli = [ "bindgen", "dep:clap", "dep:camino", "dep:cargo_metadata", "dep:cargo-config2", "dep:serde", "dep:serde_json", "dep:uniffi_bindgen_javascript", "dep:wasm-bindgen-cli-support", "dep:zip", "dep:flate2", "dep:tar", "dep:toml", "dep:tempfile", "dep:fs2", "dep:sha2", "dep:libc", "dep:windows-sys" ]
+cli = [ "bindgen", "dep:clap", "dep:camino", "dep:cargo_metadata", "dep:cargo-config2", "dep:serde", "dep:serde_json", "dep:uniffi_bindgen_javascript", "dep:wasm-bindgen-cli-support", "dep:zip", "dep:flate2", "dep:tar", "dep:toml", "dep:tempfile", "dep:fs2", "dep:sha2", "dep:libc", "dep:goblin", "dep:windows-sys" ]
 # Support for running example/fixture tests for `uniffi-bindgen`.  You probably
 # don't need to enable this.
 bindgen-tests = [ "dep:uniffi_bindgen", "uniffi_bindgen?/bindgen-tests" ]
