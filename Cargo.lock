@@ -2099,6 +2099,7 @@ dependencies = [
  "clap",
  "flate2",
  "fs2",
+ "goblin",
  "libc",
  "serde",
  "serde_json",

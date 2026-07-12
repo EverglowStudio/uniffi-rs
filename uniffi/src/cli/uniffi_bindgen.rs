@@ -347,6 +347,8 @@ pub fn run_main() -> anyhow::Result<()> {
                                 host_crates_dir: host_crates_dir
                                     .clone()
                                     .unwrap_or_else(|| Utf8PathBuf::from("rust_modules")),
+                                logical_host_crates_dir: None,
+                                logical_out_dir: None,
                                 ohos_rs_dir: None,
                             })
                         } else {
