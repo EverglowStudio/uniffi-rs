@@ -8,6 +8,17 @@ pub struct CounterEvent {
     pub value: u32,
 }
 
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum CounterSignal {
+    Tick { event: CounterEvent },
+    Complete,
+}
+
+#[uniffi::export(with_foreign)]
+pub trait CounterObserver: Send + Sync {
+    fn observe(&self, signal: CounterSignal);
+}
+
 #[derive(Clone, Debug, thiserror::Error, uniffi::Error)]
 pub enum StreamError {
     #[error("stream failed")]

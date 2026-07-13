@@ -173,6 +173,9 @@ definitions, and published in the same transaction as the native libraries. The 
 is available both in the dist and at `harmony-facade-contract.json` in the HAR package root. The
 generated host crate also owns a checksummed static facade bundle beside its `Cargo.toml`; every
 packager invocation reads that bundle directly, so a Cargo-fresh build cannot silently lose APIs.
+The package entry explicitly re-exports the raw public types and the Harmony stream interfaces, so
+HAR consumers and integrated-HSP Interface HAR consumers import both values and types from the
+stable package root rather than from internal native-facade or `.so` declaration paths.
 
 For every stream-returning free function `foo`, the HAR exports both pull and event factories:
 

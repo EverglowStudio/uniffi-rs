@@ -6492,6 +6492,7 @@ impl FacadeExports {
             out.push_str(&format!("}} from \"{native_module}\";\n\n"));
         }
         out.push_str(&self.streams.render_imports(native_module));
+        append_explicit_type_reexport(&mut out, &self.streams.native_types, native_module);
         if !self.classes.is_empty() {
             out.push_str("export {\n");
             for class in &self.classes {
@@ -6529,7 +6530,20 @@ impl FacadeExports {
             }
             out.push_str("} from \"./src/main/ets/native\";\n");
         }
+        let type_exports = self.type_exports();
+        append_explicit_type_reexport(&mut out, &type_exports, "./src/main/ets/native");
         out
+    }
+
+    fn type_exports(&self) -> Vec<String> {
+        self.streams
+            .native_types
+            .iter()
+            .cloned()
+            .chain(self.streams.type_exports())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     fn render_stream_declarations(&self) -> String {
@@ -6539,6 +6553,20 @@ impl FacadeExports {
     fn render_contract_inventory(&self) -> Result<String> {
         self.streams.render_contract_inventory()
     }
+}
+
+fn append_explicit_type_reexport(out: &mut String, names: &[String], module: &str) {
+    if names.is_empty() {
+        return;
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("export type {\n");
+    for name in names {
+        out.push_str(&format!("  {name},\n"));
+    }
+    out.push_str(&format!("}} from \"{module}\";\n"));
 }
 
 fn render_callable_function_type(def: &TypeDefLine) -> Result<String> {
@@ -7698,6 +7726,17 @@ impl HarmonyStreamFacade {
             values.insert(input.factory.clone());
         }
         values.into_iter().collect()
+    }
+
+    fn type_exports(&self) -> Vec<String> {
+        if !self.has_streams() {
+            return Vec::new();
+        }
+        vec![
+            "UniFfiInputFailureData".to_string(),
+            "UniFfiStream".to_string(),
+            "UniFfiStreamErrorData".to_string(),
+        ]
     }
 
     fn has_streams(&self) -> bool {
@@ -9307,3 +9346,7 @@ fn indent(src: &str, spaces: usize) -> String {
 #[cfg(test)]
 #[path = "artifact_transaction/ohos_characterization_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ohos_type_exports_tests.rs"]
+mod type_export_tests;
