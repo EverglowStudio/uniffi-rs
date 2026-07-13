@@ -544,6 +544,13 @@ import * as native from "lib<namespace>_ohos.so";
 definitions into a HAR by default. Consumers should depend on the generated HAR
 package instead of manually copying `.so` and `.d.ts` files.
 
+The package entry uses explicit value and type re-exports. Records, enums,
+callback interfaces, errors, stream item types, and the public Harmony stream
+interfaces are therefore imported from the stable package root, just like
+functions and classes. Integrated HSP builds preserve the same root contract in
+the generated Interface HAR; consumers must not import implementation files
+under `src/main/ets` or the native module's type directory.
+
 The generated OHOS host crate uses `ohos-rs` package names:
 
 ```toml

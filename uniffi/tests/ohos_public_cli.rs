@@ -2480,14 +2480,41 @@ export default class EntryAbility extends UIAbility {
         root,
         "entry/src/main/ets/pages/Index.ets",
         format!(
-            r#"import {{
+            r#"import type {{
+  CounterEvent,
+  CounterObject,
+  CounterObserver,
+  CounterSignal,
+  StreamError,
+  UniFfiStream,
+  UniFfiStreamErrorData
+}} from '{package_name}';
+import {{
   CountEventsEventsStream,
   add,
-  countEventsEvents
+  countEventsEvents,
+  countEventsStream
 }} from '{package_name}';
 
 const RESULT: number = add(20, 22);
+const COUNTER: CounterObject | null = null;
+const EVENT: CounterEvent = {{
+  value: COUNTER === null ? 1 : 0
+}};
+const SIGNAL: CounterSignal = {{ type: 'Tick', event: EVENT }};
+class ConsumerObserver implements CounterObserver {{
+  observe(signal: CounterSignal): void {{
+    console.info(`UNIFFI_PUBLIC_HSP_SIGNAL:${{signal.type}}`);
+  }}
+}}
+const OBSERVER: CounterObserver = new ConsumerObserver();
+OBSERVER.observe?.(SIGNAL);
+const PULL: UniFfiStream<CounterEvent> = countEventsStream(EVENT.value);
+PULL.cancel();
 const EVENTS: CountEventsEventsStream = countEventsEvents(2);
+EVENTS.on('error', (error: BusinessError<UniFfiStreamErrorData<StreamError>>): void => {{
+  console.error(`UNIFFI_PUBLIC_HSP_ERROR:${{error.data?.errorType}}`);
+}});
 EVENTS.on('done', (): void => {{
   console.info(`UNIFFI_PUBLIC_HSP_DONE:${{RESULT}}`);
 }});
@@ -2812,7 +2839,14 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         std::str::from_utf8(interface_files.get("package/Index.d.ets").unwrap()).unwrap();
     for public_symbol in [
         "add",
+        "CounterEvent",
+        "CounterObject",
+        "CounterObserver",
+        "CounterSignal",
         "CountEventsEventsStream",
+        "StreamError",
+        "UniFfiStream",
+        "UniFfiStreamErrorData",
         "countEventsEvents",
         "uniffiHarmonyFacadeContract",
         "UNIFFI_HARMONY_FACADE_CONTRACT_SHA256",
