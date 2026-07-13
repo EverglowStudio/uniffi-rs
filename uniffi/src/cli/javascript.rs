@@ -628,9 +628,10 @@ pub(crate) fn build_wasm(mut args: BuildWasmArgs) -> Result<()> {
         guard.finish(result)?;
         return Ok(());
     }
-    let mut invocation =
-        super::ohos::IdentityBoundInvocationRoot::create("uniffi-javascript-wasm-invocation")
-            .context("creating standalone JavaScript wasm build roots")?;
+    let mut invocation = super::artifact_transaction::IdentityBoundInvocationRoot::create(
+        "uniffi-javascript-wasm-invocation",
+    )
+    .context("creating standalone JavaScript wasm build roots")?;
     let build_root = invocation.build_root().join("wasm");
     if args.core_target_dir.is_none() {
         args.core_target_dir = Some(build_root.join("core"));
@@ -649,7 +650,7 @@ pub(crate) fn build_wasm(mut args: BuildWasmArgs) -> Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WasmGuardedDirectory {
     path: Utf8PathBuf,
-    identity: super::ohos::PersistentFsIdentity,
+    identity: super::artifact_transaction::PersistentFsIdentity,
     /// Cargo is expected to mutate the target root itself.  Its stable parent
     /// token detects a root A->B->A rename, while ancestors that Cargo must not
     /// touch retain their own mutation epoch as well.
@@ -660,7 +661,9 @@ struct WasmTargetIsolationGuard {
     directories: Vec<WasmGuardedDirectory>,
 }
 
-fn wasm_guard_identity(path: &Utf8Path) -> Result<super::ohos::PersistentFsIdentity> {
+fn wasm_guard_identity(
+    path: &Utf8Path,
+) -> Result<super::artifact_transaction::PersistentFsIdentity> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("reading guarded wasm target directory {path}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -674,7 +677,7 @@ fn wasm_guard_identity(path: &Utf8Path) -> Result<super::ohos::PersistentFsIdent
             bail!("wasm target path component must not be a reparse point: {path}");
         }
     }
-    super::ohos::persistent_fs_identity(path, true)
+    super::artifact_transaction::persistent_fs_identity(path, true)
 }
 
 fn wasm_absolute_lexical_path(path: &Utf8Path) -> Result<Utf8PathBuf> {
@@ -1006,7 +1009,11 @@ impl WasmTargetIsolationGuard {
                         // as /tmp would turn unrelated concurrent builds into
                         // false positives.
                         mutation: (path == mutation_parent)
-                            .then(|| super::ohos::directory_mutation_token_for_owner(path))
+                            .then(|| {
+                                super::artifact_transaction::directory_mutation_token_for_owner(
+                                    path,
+                                )
+                            })
                             .transpose()?,
                     };
                     if !directories
@@ -1033,7 +1040,8 @@ impl WasmTargetIsolationGuard {
                 );
             }
             if let Some(expected) = &guarded.mutation {
-                let actual = super::ohos::directory_mutation_token_for_owner(&guarded.path)?;
+                let actual =
+                    super::artifact_transaction::directory_mutation_token_for_owner(&guarded.path)?;
                 if &actual != expected {
                     bail!(
                         "wasm target ancestor mutation epoch changed while Cargo was running: {}",
@@ -1434,7 +1442,7 @@ fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
         cwd.join(&public.host_crates_dir)
     };
     let public_ohos = public_host.join("ohos");
-    let mut specifications = vec![super::ohos::InvocationOutputSpec {
+    let mut specifications = vec![super::artifact_transaction::InvocationOutputSpec {
         label: "generated JavaScript source root".into(),
         path: public_out,
         is_directory: true,
@@ -1450,22 +1458,27 @@ fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
         ),
         ("OHOS host source", "src", true),
     ] {
-        specifications.push(super::ohos::InvocationOutputSpec {
+        specifications.push(super::artifact_transaction::InvocationOutputSpec {
             label: label.into(),
             path: public_ohos.join(relative),
             is_directory,
         });
     }
-    let mut plan = super::ohos::GenericPublicationPlan::new(specifications, &outputs)
-        .context("planning complete direct JavaScript HSP publication")?;
+    let mut plan = super::artifact_transaction::GenericPublicationPlan::new(
+        specifications,
+        &outputs,
+        super::ohos::publication_hooks(),
+    )
+    .context("planning complete direct JavaScript HSP publication")?;
     // Declared before both staged participants so locks outlive every rollback
     // and identity-bound cleanup guard.
     let _union_locks = plan
         .take_output_locks()
         .context("direct JavaScript HSP coordinator lost its union lock")?;
-    let mut invocation =
-        super::ohos::IdentityBoundInvocationRoot::create("uniffi-javascript-hsp-invocation")
-            .context("creating private JavaScript HSP invocation")?;
+    let mut invocation = super::artifact_transaction::IdentityBoundInvocationRoot::create(
+        "uniffi-javascript-hsp-invocation",
+    )
+    .context("creating private JavaScript HSP invocation")?;
     let result = (|| -> Result<()> {
         let mirror = invocation.mirror_root().to_path_buf();
         let build_root = invocation.build_root().to_path_buf();
@@ -1568,11 +1581,11 @@ fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
                     )),
                 }
             }
-            Ok(super::ohos::DirectCommitOutcome::Verified) => {
+            Ok(super::artifact_transaction::DirectCommitOutcome::Verified) => {
                 generic_publication.finalize_hsp(hsp_publication)?;
                 generic_publication.finalize()
             }
-            Ok(super::ohos::DirectCommitOutcome::CommittedNeedsAudit(error)) => {
+            Ok(super::artifact_transaction::DirectCommitOutcome::CommittedNeedsAudit(error)) => {
                 hsp_publication.preserve_previous_backups();
                 let _ = hsp_publication.finalize();
                 let _ = generic_publication.finalize();
@@ -1587,7 +1600,7 @@ fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
 
 fn planned_direct_ohos_hsp_outputs(
     args: &BuildOhosArgs,
-) -> Result<Vec<super::ohos::HspOutputPaths>> {
+) -> Result<Vec<super::artifact_transaction::HspOutputPaths>> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let cwd = Utf8PathBuf::from_path_buf(std::env::current_dir()?)
         .map_err(|path| anyhow::anyhow!("cwd is not utf8: {}", path.display()))?;
@@ -1692,7 +1705,7 @@ fn planned_direct_ohos_hsp_outputs(
 
 pub(crate) fn build_ohos_deferred(
     args: BuildOhosArgs,
-) -> Result<super::ohos::PreparedHspInvocation> {
+) -> Result<super::artifact_transaction::PreparedHspInvocation> {
     build_ohos_internal(args, true)?
         .context("deferred JavaScript OHOS build did not produce an HSP invocation")
 }
@@ -1700,7 +1713,7 @@ pub(crate) fn build_ohos_deferred(
 fn build_ohos_internal(
     args: BuildOhosArgs,
     defer_hsp_publication: bool,
-) -> Result<Option<super::ohos::PreparedHspInvocation>> {
+) -> Result<Option<super::artifact_transaction::PreparedHspInvocation>> {
     super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
         package_kind: args.package_kind,
         integrated_hsp: args.integrated_hsp,
