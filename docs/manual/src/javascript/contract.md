@@ -220,7 +220,7 @@ export interface <Name> { <method>(<args>): <Ret> | Promise<<Ret>>; }
   forwards the wrapped value and each backend rehydrates it through its own
   object registry or callback-wrapper path.
 
-Support is still intentionally scoped: cancellation and the remaining
+Support is still intentionally scoped: callback cancellation and the remaining
 non-string-key map shapes are not part of contract v1.
 
 ## Async
@@ -228,7 +228,9 @@ non-string-key map shapes are not part of contract v1.
 - Async Rust exports surface as `Promise<T>` in TypeScript.
 - The public API does not expose polling primitives.
 - `async-rust-call.ts` adapts backend-specific async mechanics to `Promise`.
-- Cancellation is not part of contract v1.
+- General async-function cancellation is not part of contract v1. Stream
+  handles have the explicit cancellation contract documented in
+  `docs/stream-abi.md`.
 
 ## Generated entrypoints
 
@@ -278,9 +280,13 @@ When `--artifact-dir` is set:
 - wasm-bindgen output defaults to `<artifact-dir>/browser/pkg`
 - Node addons default to `<artifact-dir>/node/<namespace>.node`
 - Electron addons default to `<artifact-dir>/electron/<namespace>.node`
-- Harmony/OpenHarmony dist output defaults to `<artifact-dir>/ohos/dist` (intermediate native output)
-- Harmony/OpenHarmony HAR staging defaults to `<artifact-dir>/ohos/package`
-- Harmony/OpenHarmony final HAR defaults to `<artifact-dir>/ohos/<package>.har`
+- Harmony/OpenHarmony native dist output defaults to
+  `<artifact-dir>/ohos/dist` and remains an intermediate
+- Harmony package sources default to `<artifact-dir>/ohos/package`
+- the compatibility HAR defaults to `<artifact-dir>/ohos/<package-stem>.har`
+- HSP mode defaults to `<artifact-dir>/ohos/<package-stem>.tgz`,
+  `<package-stem>.hsp`, `<package-stem>-interface.har`, and
+  `<artifact-dir>/ohos/module-project`
 
 Generated source entrypoints contain relative default load paths back to those
 artifact locations, while environment override variables remain available for
@@ -301,23 +307,28 @@ uniffi-bindgen artifacts build \
 
 Managed mode derives these paths from `--package-dir`:
 
-- generated source: `src/generated/uniffi`
-- build artifacts: `target/uniffi-artifacts/js`
-- generated host crates: `target/uniffi-artifacts/rust`
+- generated source: `src/ffi`
+- build artifacts: `artifacts`
+- generated host crates: `artifacts/rust`
 - manifest: `artifact-manifest.json`
 - web entrypoint: `src/index.web.ts` when `--target wasm` is requested
+- Mini Program entrypoint: `src/index.mini-program.ts`
 - node entrypoint: `src/index.node.ts` when `--target node` is requested
+- Electron entrypoint: `src/index.electron.ts`
+- Harmony package entrypoint: `artifacts/harmony/package/Index.ets`; with
+  `--ohos-no-har`, the dist-only entry is
+  `artifacts/harmony/dist/package-index.ets`
 
 The generated package entrypoints are thin re-export facades:
 
 ```ts
 // src/index.web.ts
-export * from "./generated/uniffi/browser/index.web.ts";
-export type * from "./generated/uniffi/common/public-types.ts";
+export * from "./ffi/browser/index.web.ts";
+export type * from "./ffi/common/public-types.ts";
 
 // src/index.node.ts
-export * from "./generated/uniffi/node/index.ts";
-export type * from "./generated/uniffi/common/public-types.ts";
+export * from "./ffi/node/index.ts";
+export type * from "./ffi/common/public-types.ts";
 ```
 
 The web happy path becomes:
@@ -337,56 +348,83 @@ import { welcomeAgent } from "./src/index.node.ts";
 console.log(welcomeAgent("Ada"));
 ```
 
-Managed mode emits deterministic `artifact-manifest.json` for build tools. The
-manifest is metadata, not the public runtime API:
+Managed mode emits deterministic schema-3 `artifact-manifest.json` metadata for
+build tools. The manifest is not the public runtime API. The following excerpt
+shows the fields that bind an integrated HSP generation to its sources and
+artifacts:
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "generator": "uniffi-bindgen-javascript",
   "namespace": "my_core",
-  "targets": ["wasm", "mini-program", "node"],
+  "targets": ["harmony"],
   "source": {
-    "root": "src/generated/uniffi",
-    "publicTypes": "src/generated/uniffi/common/public-types.ts"
+    "root": "src/ffi",
+    "common": "src/ffi/common",
+    "harmony": "src/ffi/harmony",
+    "publicTypes": "src/ffi/common/public-types.ts"
   },
   "entrypoints": {
-    "web": "src/index.web.ts",
-    "miniProgram": "src/index.mini-program.ts",
-    "node": "src/index.node.ts",
-    "electron": null,
-    "harmony": null
+    "harmony": "artifacts/harmony/package/Index.ets"
   },
   "artifacts": {
-    "wasm": {
-      "glue": "target/uniffi-artifacts/js/browser/pkg/my_core_wasm.js",
-      "wasm": "target/uniffi-artifacts/js/browser/pkg/my_core_wasm_bg.wasm",
-      "dts": "target/uniffi-artifacts/js/browser/pkg/my_core_wasm.d.ts"
-    },
-    "miniProgram": {
-      "glue": "target/uniffi-artifacts/js/mini-program/my_core_wasm.js",
-      "wasm": "target/uniffi-artifacts/js/mini-program/my_core_wasm_bg.wasm",
-      "defaultWasmPath": "/assets/my_core_wasm_bg.wasm"
-    },
-    "node": {
-      "addon": "target/uniffi-artifacts/js/node/my_core.node",
-      "env": "UNIFFI_MY_CORE_NAPI_PATH"
-    },
-    "electron": null,
-    "harmony": null
+    "harmony": {
+      "kind": "hsp",
+      "integrated": true,
+      "har": null,
+      "runtimeHsp": "artifacts/harmony/my-core-ohos.hsp",
+      "interfaceHar": "artifacts/harmony/my-core-ohos-interface.har",
+      "tgz": "artifacts/harmony/my-core-ohos.tgz",
+      "dist": "artifacts/harmony/dist",
+      "facade": "artifacts/harmony/dist/native-facade.ets",
+      "facadeContract": "artifacts/harmony/dist/harmony-facade-contract.json",
+      "packageFacadeContract": "artifacts/harmony/package/harmony-facade-contract.json",
+      "types": "artifacts/harmony/dist/index.d.ts",
+      "package": "artifacts/harmony/package",
+      "moduleProject": "artifacts/harmony/module-project",
+      "moduleSource": "artifacts/harmony/module-project/library",
+      "usage": "artifacts/harmony/my-core-ohos-HSP_USAGE.md",
+      "packageMetadata": "artifacts/harmony/package/oh-package.json5",
+      "moduleMetadata": "artifacts/harmony/package/src/main/module.json5",
+      "buildProfile": "artifacts/harmony/package/build-profile.json5"
+    }
   },
   "hostCrates": {
-    "wasm": "target/uniffi-artifacts/rust/wasm/Cargo.toml",
-    "napi": "target/uniffi-artifacts/rust/napi/Cargo.toml",
-    "ohos": null
+    "ohos": "artifacts/rust/ohos/Cargo.toml"
   }
 }
 ```
 
-When `--target harmony` is requested, the manifest's `artifacts.harmony.har`
-points at the generated HAR, for example
-`target/uniffi-artifacts/js/ohos/my-core-ohos.har`. Managed mode does not
-generate package.json exports or npm publishing metadata.
+Each selected target adds only the fields applicable to it to the same
+generation. Web, Mini Program, Node, Electron, and Harmony have their
+corresponding entrypoints; host-crate paths exist only for wasm, N-API, and
+OHOS. Apple and Android add their applicable source and artifact fields without
+entrypoints or host-crate paths. Harmony's `kind`, `integrated`, archive paths,
+facade contracts, package/module/profile paths, and resolved package metadata
+describe the exact HAR or HSP generation; unselected and inapplicable fields
+are `null`. Managed mode does not generate `package.json` exports or npm
+publishing metadata.
+
+### Managed artifact transaction boundary
+
+Schema-3 publication uses the standalone `artifact_transaction` module shared
+by the managed artifact CLI and the OHOS packager. A committed owner sidecar
+binds the public package identity and inventory. Destination locks, durable
+journal/record files, private candidates, and pre-commit backups let the next
+UniFFI invocation recover an interrupted cross-path generation before it makes
+new writes; ambiguous or invalid state fails closed. Platform builders call
+this stable API and do not add their own states or recovery paths.
+
+Cooperating UniFFI invocations are serialized, and recovery preserves the
+current all-participant transaction semantics. This is not a promise of
+instantaneous global atomic visibility between unrelated destination paths: a
+hard process termination can leave them briefly mixed. On the next invocation,
+recovery restores the complete old generation if the interruption happened
+before the final owner commit; if it happened after that commit, recovery
+completes cleanup and preserves the committed new generation. Unverifiable
+identity or state fails closed. The owner and journal checks do not authorize
+deleting, adopting, or recovering unrelated or unowned filesystem content.
 
 ## Electron preload ↔ renderer message shape
 
@@ -540,16 +578,12 @@ imports the raw native module through the Harmony native module specifier:
 import * as native from "lib<namespace>_ohos.so";
 ```
 
-`artifacts build --target harmony` now packages these native libraries and type
-definitions into a HAR by default. Consumers should depend on the generated HAR
-package instead of manually copying `.so` and `.d.ts` files.
-
-The package entry uses explicit value and type re-exports. Records, enums,
-callback interfaces, errors, stream item types, and the public Harmony stream
-interfaces are therefore imported from the stable package root, just like
-functions and classes. Integrated HSP builds preserve the same root contract in
-the generated Interface HAR; consumers must not import implementation files
-under `src/main/ets` or the native module's type directory.
+The package root uses explicit value and type exports. Functions, classes,
+records, enums, callback interfaces, errors, stream item types, raw stream
+helpers, pull wrappers, event wrappers, and input-channel interfaces are all
+imported from that root. HAR and HSP Interface HAR consumers must not import
+implementation files under `src/main/ets` or the native module's declaration
+directory.
 
 The generated OHOS host crate uses `ohos-rs` package names:
 
@@ -565,56 +599,125 @@ the registration key, so the host's OHOS-only linker wrapper replaces a null
 argument with a stable address owned by that native library. Non-null keys are
 left unchanged, and the same substitution is applied when removing a hook.
 
-The CLI orchestration command is:
+### Build entrypoints and parameters
 
-```text
-uniffi-bindgen artifacts build \
+The direct orchestration entrypoint is `javascript build-ohos`. It generates
+`common/`, `harmony/`, and the OHOS host crate, then invokes UniFFI's built-in
+OHOS builder. It does not require an `ohrs` executable or an `ohos-rs` source
+checkout. A representative integrated HSP invocation is:
+
+```bash
+uniffi-bindgen javascript build-ohos \
   --manifest-path <core Cargo.toml> \
   --out-dir <generated> \
   --artifact-dir <artifact-root> \
-  --target harmony \
-  --ohos-arch aarch \
-  --ohos-arch x64 \
-  [--ohos-package-name <ohpm-name>] \
-  [--ohos-har-out <path/to/output.har>] \
-  [--ohos-no-har] \
-  [--release] \
-  [--ohos-static] \
-  [--ohos-skip-libs] \
-  [--ohos-dts-cache] \
-  [--ohos-skip-check] \
-  [--ohos-zigbuild] \
-  [--ohos-bisheng] \
-  [--ohos-package <package>] \
-  [--ohos-skip-napi-check] \
-  [--ohos-soname <libname-or-libname.so>] \
-  [-- --no-default-features --features ohos]
+  --package-name <ohpm-name> \
+  --module-name <module-name> \
+  --compatible-sdk-version 12 \
+  --compatible-sdk-type HarmonyOS \
+  --device-type phone \
+  --package-type hsp \
+  --integrated-hsp \
+  --release
 ```
 
-The command emits `common/`, `harmony/`, and `rust_modules/ohos`, then uses
-UniFFI's built-in OHOS builder against the generated host crate. Callers do not
-need an `ohrs` binary or an `ohos-rs` source checkout. The default architecture
-list is `aarch` and `x64`, matching the common OHOS aliases for `arm64-v8a` and
-`x86_64`. A real native build still requires the OHOS SDK/NDK environment and
-Rust OHOS target support. The built-in builder mirrors the common `ohrs build`
-controls for static library copying, skipped lib copy, d.ts cache reuse,
-zigbuild/BiSheng toolchain selection, package filtering, SONAME, and trailing
-cargo arguments.
+Package metadata flags are `--package-name`, `--module-name`,
+`--package-version`, `--author`, `--license`, `--description`,
+`--compatible-sdk-version`, `--compatible-sdk-type`, and repeatable or
+comma-separated `--device-type`. Package selection and build controls include
+`--package/-p`, `--cargo-feature`, `--arch`, `--cargo-bin`, `--target-dir`,
+`--static`, `--skip-libs`, `--dts-cache`, `--skip-check`, `--zigbuild`,
+`--bisheng`, `--skip-napi-check`, `--soname`, `--release`, and trailing Cargo
+arguments after `--`. Existing host workspaces can be selected with
+`--ohos-host-manifest-path`; `--raw-only-facade` is the explicit opt-out for a
+custom host that does not carry the generated facade contract.
 
-By default each selected OHOS package is staged to:
+Package-kind and output flags are `--package-type har|hsp`,
+`--integrated-hsp`, `--hsp-bundle-name`, `--har-out`, `--runtime-hsp-out`,
+`--interface-har-out`, and `--tgz-out`. `--hvigorw`, `--ohpm`, and
+`--deveco-sdk-home` select the packaging tools and SDK. In
+`artifacts build --target harmony`, the same controls use the `--ohos-`
+prefix, for example `--ohos-package-name`, `--ohos-package-type`,
+`--ohos-integrated-hsp`, and `--ohos-tgz-out`.
 
-- `package/oh-package.json5`
-- `package/index.ets`
-- `package/src/main/module.json5`
-- `package/libs/index.d.ts`
-- `package/libs/<arch>/lib<namespace>_ohos.so`
+HAR is the compatibility default. HAR mode accepts `--no-har` for dist-only
+output and can omit native libraries with `--skip-libs`; it rejects HSP mode
+and output flags. HSP mode rejects `--no-har`, `--skip-libs`, and `--har-out`,
+and requires the final runtime HSP, Interface HAR, and tgz to remain one
+generation. `--integrated-hsp` is valid only for HSP and is mutually exclusive
+with `--hsp-bundle-name`; a non-integrated HSP requires the host bundle name.
 
-and then archived to a `.har` with `tar + gzip` under `<artifact-root>/ohos`.
-The tar root directory is always `package/`. `--ohos-dist-dir` remains the
-intermediate native output directory and is not the final published artifact.
-When multiple OHOS packages are selected, UniFFI emits one HAR per package; if
-you need a single custom HAR name/path, pass `--ohos-package` to build one
-package explicitly.
+Final HAR and HSP packaging requires an explicit minimum compatible SDK
+version. The SDK type must match the selected SDK and may be resolved from that
+SDK when it is not overridden. HSP requires API 12 or newer and a DevEco
+compile SDK at API 12 or newer. Integrated HSP additionally requires the Stage
+model and normalized OHM URLs. The default architectures are `aarch` and
+`x64`, corresponding to `arm64-v8a` and `x86_64`; real native builds still
+require the matching OHOS SDK/NDK and Rust targets.
+
+### Package metadata and source layout
+
+Unless overridden, the OHPM package name, version, description, first
+non-empty author, and license come from Cargo metadata. Managed layout defaults
+the Harmony package name to `<cargo-package>-ohos`. The module name is a stable
+normalization of the package name. Package names may be unscoped or
+`@scope/name`; package and module names are validated separately, versions must
+be semantic versions, and package descriptions are bounded. Device types
+default to `phone`, `tablet`, and `2in1`; supported explicit values are
+`phone`, `tablet`, `2in1`, `tv`, `wearable`, and `car`.
+
+The staged package root has this public shape:
+
+```text
+package/
+  Index.ets
+  Index.d.ets
+  harmony-facade-contract.json
+  oh-package.json5
+  build-profile.json5
+  src/main/module.json5
+  src/main/ets/native.ets
+  src/main/ets/harmonyFacadeContract.ets  # HSP
+  src/main/cpp/types/lib<namespace>_ohos/index.d.ts
+  src/main/cpp/types/lib<namespace>_ohos/oh-package.json5
+  libs/index.d.ts
+  libs/<abi>/*.so
+```
+
+`oh-package.json5` points `main` and `types` at `Index.ets` and `Index.d.ets`,
+records the compatible SDK and native component metadata, and keeps the package
+unobfuscated and original. HSP sources declare `packageType: InterfaceHar`.
+`module.json5` uses `type: har` for HAR and `type: shared` plus
+`deliveryWithInstall: true` for HSP. The HSP build profile sets
+`generateSharedTgz: true` and
+`nativeLib.excludeSoFromInterfaceHar: true`; integrated mode also sets
+`arkOptions.integratedHsp: true`, while its generated project enables
+`buildOption.strictMode.useNormalizedOHMUrl: true`.
+
+### Published HAR and HSP artifacts
+
+The compatibility HAR is the output of the generated Hvigor `harTasks` build
+and OHPM prepublish validation, not a synthetic archive assembled by the
+caller. It contains the package metadata, compiled ArkTS surface, native
+declarations, and selected ABI libraries. `dist/` remains an intermediate and
+is not the published package.
+
+HSP mode runs the generated Hvigor `hspTasks` release build. The published tgz
+contains exactly one runtime `.hsp` and one Interface `.har`; the separately
+reported runtime HSP and Interface HAR are extracted byte-for-byte from that
+same tgz. The runtime HSP owns the selected ABI `.so` files. Because
+`excludeSoFromInterfaceHar` is enabled, the Interface HAR contains no target
+native library, and a consuming HAP must not duplicate those libraries. The
+Interface HAR preserves the same explicit package-root values and types as HAR.
+
+Consumers declare the generated tgz with the exact OHPM package name as the
+dependency key. They must not depend on the extracted runtime `.hsp` or
+Interface `.har` separately. Integrated consumers enable normalized OHM URLs;
+Hvigor binds the consumer bundle name and signing identity during the build.
+Non-integrated consumers must match the application binding used to build the
+HSP. HSP dependencies are not transitive, circular HSP dependencies are
+forbidden, and a HAR that depends on an HSP is application-internal rather than
+publishable to a second- or third-party repository.
 
 ## Versioning
 
@@ -631,6 +734,6 @@ fast rather than run with mixed assumptions.
 
 - `Map<K, V>` / `Set<T>` representation details
 - non-string keyed record-like structures
-- cancellation / `AbortSignal`
+- `AbortSignal` integration for ordinary async calls and stream facades
 
 These are future contract extensions rather than v1 guarantees.

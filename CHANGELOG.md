@@ -8,6 +8,29 @@
 
 [All changes in [[UnreleasedUniFFIVersion]]](https://github.com/mozilla/uniffi-rs/compare/v0.32.0...HEAD).
 
+### Fork-local JavaScript and Harmony changes
+
+- Added the JavaScript target's managed schema-3 package layout for browser,
+  Mini Program, Node, Electron, Harmony, Apple, and Android artifacts, with
+  generated public facades and a deterministic artifact manifest.
+- Added UniFFI's built-in OHOS builder, validated OHPM/Cargo package metadata,
+  and real Hvigor HAR and HSP packaging. HSP output includes one runtime HSP,
+  one SO-free Interface HAR, and their original release tgz; integrated and
+  application-bound HSP modes enforce their respective SDK, bundle, signing,
+  and normalized-OHM-URL constraints.
+- Added explicit Harmony package-root value/type exports, BusinessError-shaped
+  event streams, and named backpressured input channels. The raw stream ABI,
+  standard JavaScript `AsyncIterable`, and Harmony pull facade remain supported
+  compatibility surfaces.
+- Kept HAR as the default compatibility package while making HSP an additive
+  package kind. The `--no-har` dist-only path remains an explicit opt-in and
+  is not HSP output. A `--raw-only-facade` custom host only opts out of the
+  generated facade contract and can still produce a real HSP when it satisfies
+  the selected package kind's remaining constraints.
+- Moved managed and OHOS publication behind the standalone
+  `artifact_transaction` module without changing its cross-path owner,
+  journal, rollback, or fail-closed recovery semantics.
+
 ## v0.32.0 (backend crates: v0.32.0) - (_2026-06-30_)
 
 ### ⚠️ Breaking Changes ⚠️
