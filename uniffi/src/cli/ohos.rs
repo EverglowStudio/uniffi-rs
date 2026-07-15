@@ -3430,12 +3430,7 @@ fn validate_runtime_hsp(
     expected_contract_sha256: &str,
 ) -> Result<()> {
     let entries = read_bounded_zip_entries(bytes, "runtime HSP")?;
-    for required in [
-        "module.json",
-        "pack.info",
-        "pkgContextInfo.json",
-        "ets/modules.abc",
-    ] {
+    for required in ["module.json", "pack.info", "ets/modules.abc"] {
         let data = entries
             .get(required)
             .and_then(|value| value.as_ref())
@@ -3445,6 +3440,13 @@ fn validate_runtime_hsp(
         if required == "ets/modules.abc" && data.is_empty() {
             bail!("runtime HSP ArkTS bytecode ets/modules.abc is empty");
         }
+    }
+    if integrated
+        && !entries
+            .get("pkgContextInfo.json")
+            .is_some_and(|value| value.is_some())
+    {
+        bail!("integrated runtime HSP is missing required regular file `pkgContextInfo.json`");
     }
     let module: Value = serde_json::from_slice(
         entries["module.json"]
