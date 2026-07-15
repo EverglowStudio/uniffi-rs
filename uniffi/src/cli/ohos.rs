@@ -3115,17 +3115,19 @@ fn write_hvigor_hsp_project(
         }))?,
     )?;
     let mut product = render_hvigor_product(&tools.compile_sdk, sdk)?;
-    if integrated {
-        product
-            .as_object_mut()
-            .expect("Hvigor product is an object")
-            .insert(
-                "buildOption".into(),
-                serde_json::json!({
-                    "strictMode": { "useNormalizedOHMUrl": true }
-                }),
-            );
-    }
+    // Packaged HSP bytecode must use the same normalized OHM URL mode as its
+    // consumer. Modern Harmony applications enable this mode, and Hvigor
+    // rejects an HSP compiled with the legacy default before dependency
+    // resolution. This applies to host-bound and integrated HSPs alike.
+    product
+        .as_object_mut()
+        .expect("Hvigor product is an object")
+        .insert(
+            "buildOption".into(),
+            serde_json::json!({
+                "strictMode": { "useNormalizedOHMUrl": true }
+            }),
+        );
     std::fs::write(
         project_root.join("build-profile.json5"),
         render_json5(serde_json::json!({
