@@ -8525,6 +8525,58 @@ fn renders_integrated_hsp_module_and_package_templates() {
 }
 
 #[test]
+fn hsp_projects_enable_normalized_ohm_urls_in_both_packaging_modes() {
+    let root = temp_test_dir("uniffi-hsp-normalized-ohm-url");
+    let metadata = test_package_metadata();
+    let sdk = SdkCompatibility {
+        version: "5.0.1(13)".into(),
+        sdk_type: RuntimeSdkType::HarmonyOs,
+    };
+    let tools = HarmonyHarTools {
+        hvigorw: "hvigorw".into(),
+        ohpm: "ohpm".into(),
+        sdk_home: root.join("sdk"),
+        node_home: None,
+        ohos_base_sdk_home: None,
+        model_version: "5.0.0".into(),
+        compile_sdk: CompileSdk {
+            api_level: 13,
+            platform_version: "5.0.1".into(),
+        },
+    };
+
+    for (integrated, bundle_name) in [(true, None), (false, Some("com.example.host"))] {
+        let project = root.join(if integrated {
+            "integrated"
+        } else {
+            "host-bound"
+        });
+        let module = project.join("library");
+        std::fs::create_dir_all(&module).unwrap();
+        write_hvigor_hsp_project(
+            &project,
+            &module,
+            &metadata,
+            &sdk,
+            &tools,
+            integrated,
+            bundle_name,
+        )
+        .unwrap();
+        let profile: Value = serde_json::from_str(
+            &std::fs::read_to_string(project.join("build-profile.json5")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            profile["app"]["products"][0]["buildOption"]["strictMode"]["useNormalizedOHMUrl"],
+            true
+        );
+    }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership() {
     let metadata = test_package_metadata();
     let package = test_host_package("demo-host", "1.2.3", "demo");
