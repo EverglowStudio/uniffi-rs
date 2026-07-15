@@ -8143,6 +8143,24 @@ fn test_runtime_hsp_with_override(
     contract_sha256: &str,
     override_so: Option<(&str, Vec<u8>)>,
 ) -> Vec<u8> {
+    test_runtime_hsp_with_shape(
+        metadata,
+        bundle_name,
+        so_files,
+        contract_sha256,
+        override_so,
+        true,
+    )
+}
+
+fn test_runtime_hsp_with_shape(
+    metadata: &OhosPackageMetadata,
+    bundle_name: &str,
+    so_files: &[(&str, &str)],
+    contract_sha256: &str,
+    override_so: Option<(&str, Vec<u8>)>,
+    include_pkg_context: bool,
+) -> Vec<u8> {
     let cursor = Cursor::new(Vec::new());
     let mut archive = zip::ZipWriter::new(cursor);
     let options = zip::write::FileOptions::default()
@@ -8159,12 +8177,15 @@ fn test_runtime_hsp_with_override(
         }
     }))
     .unwrap();
-    for (name, data) in [
+    let mut required = vec![
         ("module.json", module.as_slice()),
         ("pack.info", b"{}".as_slice()),
-        ("pkgContextInfo.json", b"{}".as_slice()),
         ("ets/modules.abc", contract_sha256.as_bytes()),
-    ] {
+    ];
+    if include_pkg_context {
+        required.push(("pkgContextInfo.json", b"{}".as_slice()));
+    }
+    for (name, data) in required {
         archive.start_file(name, options).unwrap();
         archive.write_all(data).unwrap();
     }
@@ -8582,6 +8603,31 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &expected_runtime,
         true,
         None,
+        &"a".repeat(64),
+    )
+    .unwrap();
+    let host_bundle = "com.example.host";
+    let host_runtime = test_runtime_hsp_with_shape(
+        &metadata,
+        host_bundle,
+        &[
+            ("arm64-v8a", "libdemo_core.so"),
+            ("arm64-v8a", "libdemo.so"),
+            ("arm64-v8a", "libc++_shared.so"),
+        ],
+        &"a".repeat(64),
+        None,
+        false,
+    );
+    validate_runtime_hsp(
+        &host_runtime,
+        &package,
+        &metadata,
+        root.join("libs").as_path(),
+        &expected,
+        &expected_runtime,
+        false,
+        Some(host_bundle),
         &"a".repeat(64),
     )
     .unwrap();
