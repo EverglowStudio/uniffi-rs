@@ -8631,22 +8631,19 @@ export class {pull_class} extends __UniFfiPullStream<{item_type}, {error_type}> 
 {assignments}    this.setHandle(native.{function}({call_args}));
   }}
 
-  protected nextNative(handle: bigint): Promise<UniFfiStreamResult<{item_type}>> {{
-    return native.{next_function}(handle).then(
-      (result: {next_type}): UniFfiStreamResult<{item_type}> => {{
-        if (result.error !== undefined && result.error !== null) {{
-          throw new UniFfiStreamBusinessError<{error_type}>(
-            __UNIFFI_STREAM_SOURCE_ERROR_CODE,
-            'UniFFI stream source reported a typed error',
-            {error_type_name},
-            'TypedStreamError',
-            'UniFFI stream source reported a typed error',
-            result.error
-          );
-        }}
-        return new UniFfiStreamResult<{item_type}>(result.done, result.value);
-      }}
-    );
+  protected async nextNative(handle: bigint): Promise<UniFfiStreamResult<{item_type}>> {{
+    const result: {next_type} = await native.{next_function}(handle);
+    if (result.error !== undefined && result.error !== null) {{
+      return Promise.reject(new UniFfiStreamBusinessError<{error_type}>(
+        __UNIFFI_STREAM_SOURCE_ERROR_CODE,
+        'UniFFI stream source reported a typed error',
+        {error_type_name},
+        'TypedStreamError',
+        'UniFFI stream source reported a typed error',
+        result.error
+      ));
+    }}
+    return new UniFfiStreamResult<{item_type}>(result.done, result.value);
   }}
 
   protected cancelNative(handle: bigint): void {{
@@ -8671,22 +8668,19 @@ export class {events_class} extends __UniFfiEventsStream<{item_type}, {error_typ
     return native.{function}({this_call_args});
   }}
 
-  protected nextNative(handle: bigint): Promise<UniFfiStreamResult<{item_type}>> {{
-    return native.{next_function}(handle).then(
-      (result: {next_type}): UniFfiStreamResult<{item_type}> => {{
-        if (result.error !== undefined && result.error !== null) {{
-          throw new UniFfiStreamBusinessError<{error_type}>(
-            __UNIFFI_STREAM_SOURCE_ERROR_CODE,
-            'UniFFI stream source reported a typed error',
-            {error_type_name},
-            'TypedStreamError',
-            'UniFFI stream source reported a typed error',
-            result.error
-          );
-        }}
-        return new UniFfiStreamResult<{item_type}>(result.done, result.value);
-      }}
-    );
+  protected async nextNative(handle: bigint): Promise<UniFfiStreamResult<{item_type}>> {{
+    const result: {next_type} = await native.{next_function}(handle);
+    if (result.error !== undefined && result.error !== null) {{
+      return Promise.reject(new UniFfiStreamBusinessError<{error_type}>(
+        __UNIFFI_STREAM_SOURCE_ERROR_CODE,
+        'UniFFI stream source reported a typed error',
+        {error_type_name},
+        'TypedStreamError',
+        'UniFFI stream source reported a typed error',
+        result.error
+      ));
+    }}
+    return new UniFfiStreamResult<{item_type}>(result.done, result.value);
   }}
 
   protected cancelNative(handle: bigint): void {{
