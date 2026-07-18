@@ -2130,7 +2130,9 @@ impl<'a> Generator<'a> {
         let item_core_ty = self.core_value_type(item_type)?;
         let error_core_ty = self.core_value_type(error_type)?;
         let item_bridge_ty = self.bridge_return_type(item_type)?;
+        let error_bridge_ty = self.bridge_return_type(error_type)?;
         let lifted_value = self.lift_value_expr(quote!(value), item_type)?;
+        let lifted_error = self.lift_value_expr(quote!(err), error_type)?;
 
         Ok(quote! {
             static #registry_ident: ::uniffi::RustStreamRegistry<#item_core_ty, #error_core_ty> =
@@ -2140,6 +2142,7 @@ impl<'a> Generator<'a> {
             pub struct #next_struct_ident {
                 pub done: bool,
                 pub value: Option<#item_bridge_ty>,
+                pub error: Option<#error_bridge_ty>,
             }
 
             #[napi]
@@ -2161,12 +2164,18 @@ impl<'a> Generator<'a> {
                     Ok(Ok(Some(value))) => Ok(#next_struct_ident {
                         done: false,
                         value: Some(#lifted_value),
+                        error: None,
                     }),
                     Ok(Ok(None)) => Ok(#next_struct_ident {
                         done: true,
                         value: None,
+                        error: None,
                     }),
-                    Ok(Err(err)) => Err(into_napi_error(err)),
+                    Ok(Err(err)) => Ok(#next_struct_ident {
+                        done: false,
+                        value: None,
+                        error: Some(#lifted_error),
+                    }),
                     Err(err) => Err(Error::new(Status::GenericFailure, format!("{err:?}"))),
                 }
             }
@@ -3684,6 +3693,73 @@ mod input_stream_descriptor_tests {
         }
 
         ComponentInterface::from_metadata(group).expect("callable descriptor fixture")
+    }
+
+    fn output_stream_fixture() -> ComponentInterface {
+        let module_path = "stream_error_fixture";
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.to_string(),
+                name: module_path.to_string(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            EnumMetadata {
+                module_path: module_path.to_string(),
+                name: "ReadError".to_string(),
+                orig_name: None,
+                shape: EnumShape::Enum,
+                remote: false,
+                variants: vec![VariantMetadata {
+                    name: "StorageInvalidated".to_string(),
+                    orig_name: None,
+                    discr: None,
+                    fields: vec![],
+                    docstring: None,
+                }],
+                discr_type: None,
+                non_exhaustive: false,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            FnMetadata {
+                module_path: module_path.to_string(),
+                name: "observe".to_string(),
+                orig_name: None,
+                is_async: false,
+                inputs: vec![],
+                return_type: Some(Type::Stream {
+                    item_type: Box::new(Type::UInt32),
+                    error_type: Box::new(Type::Enum {
+                        module_path: module_path.to_string(),
+                        name: "ReadError".to_string(),
+                    }),
+                    is_send: true,
+                }),
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        ComponentInterface::from_metadata(group).expect("output stream error fixture")
+    }
+
+    #[test]
+    fn output_stream_business_error_is_lifted_into_the_next_envelope() {
+        let rust = render_napi_rust(&output_stream_fixture()).unwrap();
+        assert!(
+            rust.contains("pub error: Option<ReadError>"),
+            "generated output stream next envelope lost its typed error:\n{rust}"
+        );
+        assert!(
+            rust.contains("error: Some(err.into())"),
+            "generated output stream next path did not lift its typed error:\n{rust}"
+        );
     }
 
     #[test]
