@@ -943,7 +943,7 @@ edition = "2021"
             ("demo_core.ohos-extra-types.d.ts", "export {};\n"),
             (
                 "demo_core.ohos-facade.json",
-                "{\"schemaVersion\":2,\"component\":\"demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
+                "{\"schemaVersion\":3,\"component\":\"demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
             ),
         ] {
             std::fs::write(out.join("harmony").join(name), body).unwrap();

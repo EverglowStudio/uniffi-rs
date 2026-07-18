@@ -3078,7 +3078,7 @@ fn write_fake_dist(root: &Utf8Path, lib_target_name: &str) -> Utf8PathBuf {
         .unwrap();
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"schemaVersion\":2,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"schemaVersion\":3,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
     )
     .unwrap();
     std::fs::write(dist.join("arm64-v8a").join(native), "fake").unwrap();
@@ -3105,7 +3105,7 @@ fn write_invocation_dist(dist: &Utf8Path, arches: &[&str], with_native: bool) ->
         )?;
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"schemaVersion\":2,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"schemaVersion\":3,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
     )?;
     if with_native {
         for arch in arches {
@@ -4513,7 +4513,11 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
                 "countEventsStreamCancel",
                 "function countEventsStreamCancel(handle: bigint): void",
             ),
-            def("interface", "FixtureNext", "done: boolean\nvalue?: number"),
+            def(
+                "interface",
+                "FixtureNext",
+                "done: boolean\nvalue?: number\nerror?: string",
+            ),
             def(
                 "fn",
                 "echoEvents",
@@ -4627,6 +4631,8 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
             "export function createNumberStringFingerprint8b30e3aa815a2f4aInputChannel()",
             "implements __UniffiInputStream<__UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext>",
             "readonly next = (_error: Error | null, handle: number)",
+            "result.error !== undefined && result.error !== null",
+            "result.error",
         ] {
             assert!(facade.contains(needle), "missing `{needle}` in:\n{facade}");
         }
@@ -6538,6 +6544,7 @@ fn harmony_stream_facade_runtime_state_machines() {
     let native_stub = r#"interface FixtureNext {
   done: boolean;
   value?: number;
+  error?: string;
 }
 interface InputNext {
   ok: boolean;
@@ -6560,6 +6567,7 @@ class __StubState {
   primitiveReject: boolean = false;
   neverSettles: boolean = false;
   cancelThrows: boolean = false;
+  typedError: string | null = null;
   matrixFailureKind: number = -1;
   matrixPromiseReject: boolean = false;
   source: __UniffiInputStream<InputNext> | null = null;
@@ -6595,6 +6603,8 @@ const native = {
     } else if (count === 66) {
       state.cancelThrows = true;
       state.values.push(1);
+    } else if (count === 98) {
+      state.typedError = 'StorageInvalidated';
     } else if (count >= 100 && count < 105) {
       state.matrixFailureKind = count - 100;
     } else if (count >= 110 && count < 115) {
@@ -6633,6 +6643,11 @@ const native = {
     }
     if (state.errorAt === state.calls) {
       return Promise.reject(new Error('fixture boom'));
+    }
+    if (state.typedError !== null) {
+      const result: FixtureNext = { done: false, error: state.typedError };
+      state.typedError = null;
+      return Promise.resolve(result);
     }
     const result: FixtureNext = { done: state.values.length === 0 };
     if (!result.done) {
@@ -6768,6 +6783,35 @@ for (let index: number = 0; index < matrixMessages.length; index += 1) {
   await assertEventsReason(110 + index, matrixMessages[index]);
   await assertPullReason(110 + index, matrixMessages[index]);
 }
+
+const typedEvents = countEventsEvents(98);
+let typedEventsCause: string | null = null;
+let typedEventsMessage: string = '';
+const typedEventsDone = new Promise<void>((resolve): void => {
+  typedEvents.on('error', (error): void => {
+    typedEventsCause = error.data?.cause as string;
+    typedEventsMessage = error.message;
+  });
+  typedEvents.on('done', (): void => resolve());
+});
+typedEvents.start();
+await typedEventsDone;
+assert(typedEventsCause === 'StorageInvalidated', `typed Events cause ${typedEventsCause}`);
+assert(typedEventsMessage === 'UniFFI stream source reported a typed error',
+  `typed Events message ${typedEventsMessage}`);
+
+const typedPull = countEventsStream(98);
+let typedPullCause: string | null = null;
+let typedPullMessage: string = '';
+try {
+  await typedPull.next();
+} catch (error) {
+  typedPullCause = (error as BusinessError<{ cause: string }>).data?.cause as string;
+  typedPullMessage = (error as Error).message;
+}
+assert(typedPullCause === 'StorageInvalidated', `typed Pull cause ${typedPullCause}`);
+assert(typedPullMessage === 'UniFFI stream source reported a typed error',
+  `typed Pull message ${typedPullMessage}`);
 
 const normal = countEventsEvents(3);
 const normalValues: Array<number> = new Array<number>();
@@ -7345,7 +7389,7 @@ fn generates_har_with_package_root_and_no_absolute_paths() {
         .unwrap();
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"schemaVersion\":2,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"schemaVersion\":3,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
     )
     .unwrap();
     std::fs::write(dist.join("arm64-v8a/libdemo_ohos.so"), "fake").unwrap();
