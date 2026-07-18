@@ -665,7 +665,7 @@ fn render_ohos_extra_types(ci: &uniffi_bindgen::ComponentInterface) -> Result<St
     Ok(out)
 }
 
-const OHOS_FACADE_SCHEMA_VERSION: u32 = 2;
+const OHOS_FACADE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
