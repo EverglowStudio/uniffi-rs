@@ -36,7 +36,7 @@ pub(super) const DIST_OWNER_MARKER: &str = ".uniffi-ohos-dist-owner";
 pub(super) const DIST_OWNER_KIND: &str = "uniffi-ohos-dist";
 const RUSTC_APPEND_ARGS_ENV: &str = "UNIFFI_OHOS_RUSTC_APPEND_ARGS";
 const DEFAULT_DEVICE_TYPES: &[&str] = &["phone", "tablet", "2in1"];
-const ALLOWED_DEVICE_TYPES: &[&str] = &["phone", "tablet", "2in1", "tv", "wearable", "car"];
+const ALLOWED_DEVICE_TYPES: &[&str] = &["default", "phone", "tablet", "2in1", "tv", "wearable", "car"];
 const MIN_HSP_API: u32 = 12;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -4536,7 +4536,7 @@ pub(crate) fn resolve_device_types(overrides: &[String]) -> Result<Vec<String>> 
     for value in values {
         if !ALLOWED_DEVICE_TYPES.contains(&value.as_str()) {
             bail!(
-                "unsupported Harmony device type `{value}`; use one of phone, tablet, 2in1, tv, wearable, or car (`default` builds but cannot be published)"
+                "unsupported Harmony device type `{value}`; use one of default, phone, tablet, 2in1, tv, wearable, or car (`default` is the OpenHarmony universal device type)"
             );
         }
         if !deduped.contains(&value) {
