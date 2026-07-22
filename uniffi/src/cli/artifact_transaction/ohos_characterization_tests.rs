@@ -3815,10 +3815,24 @@ fn renders_hvigor_sdk_products_for_runtime_and_api_generation() {
         version: "13".into(),
         sdk_type: RuntimeSdkType::OpenHarmony,
     };
+    let open_harmony_20 = SdkCompatibility {
+        version: "20".into(),
+        sdk_type: RuntimeSdkType::OpenHarmony,
+    };
+    let api_20 = CompileSdk {
+        api_level: 20,
+        platform_version: "5.1.0".into(),
+    };
     let api_25 = CompileSdk {
         api_level: 25,
         platform_version: "6.0.3".into(),
     };
+
+    let product = render_hvigor_product(&api_20, &open_harmony_20).unwrap();
+    assert_eq!(product["runtimeOS"], "OpenHarmony");
+    assert_eq!(product["compileSdkVersion"], 20);
+    assert_eq!(product["targetSdkVersion"], 20);
+    assert_eq!(product["compatibleSdkVersion"], 20);
 
     let product = render_hvigor_product(&api_25, &harmony).unwrap();
     assert_eq!(product["runtimeOS"], "HarmonyOS");
@@ -6702,6 +6716,7 @@ const native = {
 };
 export function __testStartCalls(): number { return __startCalls; }
 export function __testCancelCalls(): number { return __cancelCalls; }
+export function __testRegistrySize(): number { return __states.size; }
 "#;
     facade = facade.replace("import native from \"libfixture.so\";\n\n", native_stub);
     facade = facade.replace(
@@ -6717,6 +6732,7 @@ export function __testCancelCalls(): number { return __cancelCalls; }
   createNumberStringFingerprint8b30e3aa815a2f4aInputChannel,
   echoEventsEvents,
   __testCancelCalls,
+  __testRegistrySize,
   __testStartCalls
 } from './facade.ts';
 
@@ -6750,6 +6766,7 @@ async function assertEventsReason(count: number, expectedMessage: string): Promi
     `Events reason ${count} code ${(observed as BusinessError<void>).code}`);
   assert(__testCancelCalls() === cancelBefore + 1,
     `Events reason ${count} raw cancel count`);
+  assert(__testRegistrySize() === 0, `Events reason ${count} leaked a native registry entry`);
 }
 
 async function assertPullReason(count: number, expectedMessage: string): Promise<void> {
@@ -6768,6 +6785,7 @@ async function assertPullReason(count: number, expectedMessage: string): Promise
     `Pull reason ${count} code ${(observed as BusinessError<void>).code}`);
   assert(__testCancelCalls() === cancelBefore + 1,
     `Pull reason ${count} raw cancel count`);
+  assert(__testRegistrySize() === 0, `Pull reason ${count} leaked a native registry entry`);
 }
 
 const matrixMessages: Array<string> = [
@@ -6831,6 +6849,7 @@ const normalDone = new Promise<void>((resolve): void => {
   normal.on('done', (): void => { doneCalls += 1; resolve(); });
 });
 const startsBefore: number = __testStartCalls();
+const normalCancelBefore: number = __testCancelCalls();
 normal.start();
 normal.start();
 await normalDone;
@@ -6839,6 +6858,27 @@ assert(normalValues.join(',') === '0,1,2', `normal values ${normalValues}`);
 assert(selfCalls === 2, `snapshot self-removal calls ${selfCalls}`);
 assert(sourceErrors === 0, 'listener error escaped as source error');
 assert(doneCalls === 1, `normal done count ${doneCalls}`);
+assert(__testCancelCalls() === normalCancelBefore + 1,
+  'normal Events completion did not explicitly close native exactly once');
+assert(__testRegistrySize() === 0, 'normal Events completion leaked a native registry entry');
+
+const normalPull = countEventsStream(2);
+const normalPullCancelBefore: number = __testCancelCalls();
+const normalPullValues: Array<number> = new Array<number>();
+for (;;) {
+  const result = await normalPull.next();
+  if (result.done) {
+    break;
+  }
+  normalPullValues.push(result.value as number);
+}
+assert(normalPullValues.join(',') === '0,1', `normal Pull values ${normalPullValues}`);
+assert(__testCancelCalls() === normalPullCancelBefore + 1,
+  'normal Pull completion did not explicitly close native exactly once');
+await normalPull.cancel();
+assert(__testCancelCalls() === normalPullCancelBefore + 1,
+  'normal Pull post-completion cancel closed native twice');
+assert(__testRegistrySize() === 0, 'normal Pull completion leaked a native registry entry');
 
 const failing = countEventsEvents(99);
 let failureValues: number = 0;
@@ -6977,6 +7017,7 @@ const neverResult = await Promise.race<UniFfiStreamResult<number> | string>([
 ]);
 assert(neverResult !== 'timeout' && neverResult.done === true, 'never-settling raw Pull did not settle on cancel');
 assert(__testCancelCalls() === neverCancelBefore + 1, 'never-settling Pull cancel count');
+assert(__testRegistrySize() === 0, 'never-settling Pull cancel leaked a native registry entry');
 
 const throwingCancel = countEventsEvents(66);
 let throwingCancelDone: number = 0;
@@ -6991,6 +7032,7 @@ assert(__testCancelCalls() === throwingPullCancelBefore + 1,
   'raw Pull cancel throw did not call native exactly once');
 assert((await throwingPull.next()).done === true,
   'raw Pull cancel throw broke local termination');
+assert(__testRegistrySize() === 0, 'never-polled Pull dispose leaked a native registry entry');
 await delay(0);
 assert(unhandledRejections === 0, `unhandled stream rejections ${unhandledRejections}`);
 
