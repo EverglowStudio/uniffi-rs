@@ -4863,7 +4863,13 @@ fn render_build_profile_json5(
             );
         }
     }
-    let mut target = serde_json::json!({ "name": "default" });
+    let device_types = serde_json::to_value(&metadata.device_types)?;
+    let mut target = serde_json::json!({
+        "name": "default",
+        "config": {
+            "deviceType": device_types
+        }
+    });
     if kind == PackageKind::Hsp {
         let runtime = metadata
             .sdk
