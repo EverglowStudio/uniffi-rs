@@ -7242,6 +7242,10 @@ fn renders_har_package_metadata_and_entry_templates() {
     .unwrap();
     assert_eq!(profile["apiType"], "stageMode");
     assert_eq!(profile["targets"][0]["name"], "default");
+    assert_eq!(
+        profile["targets"][0]["config"]["deviceType"],
+        serde_json::json!(["phone", "tablet", "2in1"])
+    );
 }
 
 #[test]
@@ -8594,6 +8598,10 @@ fn renders_integrated_hsp_module_and_package_templates() {
     .unwrap();
     assert_eq!(profile["apiType"], "stageMode");
     assert_eq!(profile["targets"][0]["runtimeOS"], "HarmonyOS");
+    assert_eq!(
+        profile["targets"][0]["config"]["deviceType"],
+        serde_json::json!(["phone", "tablet", "2in1"])
+    );
     assert_eq!(profile["buildOption"]["generateSharedTgz"], true);
     assert_eq!(
         profile["buildOption"]["nativeLib"]["excludeSoFromInterfaceHar"],
