@@ -36,7 +36,9 @@ pub(super) const DIST_OWNER_MARKER: &str = ".uniffi-ohos-dist-owner";
 pub(super) const DIST_OWNER_KIND: &str = "uniffi-ohos-dist";
 const RUSTC_APPEND_ARGS_ENV: &str = "UNIFFI_OHOS_RUSTC_APPEND_ARGS";
 const DEFAULT_DEVICE_TYPES: &[&str] = &["phone", "tablet", "2in1"];
-const ALLOWED_DEVICE_TYPES: &[&str] = &["default", "phone", "tablet", "2in1", "tv", "wearable", "car"];
+const ALLOWED_DEVICE_TYPES: &[&str] = &[
+    "default", "phone", "tablet", "2in1", "tv", "wearable", "car",
+];
 const MIN_HSP_API: u32 = 12;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -7993,6 +7995,7 @@ abstract class __UniFfiEventsStream<T, E> {
         }
         if (result.done) {
           this.closed = true;
+          this.closeNativeOnce();
           this.emitDone();
           return;
         }
@@ -8167,6 +8170,7 @@ abstract class __UniFfiPullStream<T, E> implements UniFfiStream<T> {
           }
           if (result.done) {
             this.closed = true;
+            this.closeNativeOnce();
           }
           local.complete(result);
         },
