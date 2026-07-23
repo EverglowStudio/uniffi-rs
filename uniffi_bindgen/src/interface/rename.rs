@@ -167,6 +167,7 @@ mod tests {
             module_path: "test_crate".to_string(),
             name: "OldRecord".to_string(),
             orig_name: None,
+            rust_path: None,
             remote: false,
             fields: vec![FieldMetadata {
                 name: "field".to_string(),
@@ -202,6 +203,7 @@ mod tests {
             module_path: "test_crate".to_string(),
             name: "OldEnum".to_string(),
             orig_name: None,
+            rust_path: None,
             shape: EnumShape::Enum,
             discr_type: None,
             non_exhaustive: false,
