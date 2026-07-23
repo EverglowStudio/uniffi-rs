@@ -59,6 +59,7 @@ impl Enum {
             module_path: names.module_path,
             name: names.name,
             orig_name: names.orig_name,
+            rust_path: self.attrs.rust_path.clone(),
             remote: self.attrs.remote,
             non_exhaustive: self.attrs.non_exhaustive,
             discr_type: self.attrs.discr_type.clone(),

@@ -661,18 +661,22 @@ impl<'a> Generator<'a> {
             .fields()
             .iter()
             .map(|field| {
-                let field_ident = rust_ident(field.name());
-                let expr = self.lower_value_expr(quote!(value.#field_ident), &field.as_type())?;
-                Ok(quote!(#field_ident: #expr))
+                let bridge_field_ident = rust_ident(field.name());
+                let core_field_ident = rust_ident(field.rust_name());
+                let expr =
+                    self.lower_value_expr(quote!(value.#bridge_field_ident), &field.as_type())?;
+                Ok(quote!(#core_field_ident: #expr))
             })
             .collect::<Result<Vec<_>>>()?;
         let from_core_fields = record
             .fields()
             .iter()
             .map(|field| {
-                let field_ident = rust_ident(field.name());
-                let expr = self.lift_value_expr(quote!(value.#field_ident), &field.as_type())?;
-                Ok(quote!(#field_ident: #expr))
+                let bridge_field_ident = rust_ident(field.name());
+                let core_field_ident = rust_ident(field.rust_name());
+                let expr =
+                    self.lift_value_expr(quote!(value.#core_field_ident), &field.as_type())?;
+                Ok(quote!(#bridge_field_ident: #expr))
             })
             .collect::<Result<Vec<_>>>()?;
         let core_path = self.core_type_path(record.as_type());
@@ -813,9 +817,12 @@ impl<'a> Generator<'a> {
     fn render_into_core_variant(&self, enum_: &Enum, variant: &Variant) -> Result<TokenStream> {
         let bridge_enum = rust_ident(enum_.name());
         let core_enum = self.core_type_path(enum_.as_type());
-        let variant_ident = rust_ident(variant.name());
+        let bridge_variant_ident = rust_ident(variant.name());
+        let core_variant_ident = rust_ident(variant.rust_name());
         if variant.fields().is_empty() {
-            return Ok(quote!(#bridge_enum::#variant_ident => #core_enum::#variant_ident));
+            return Ok(
+                quote!(#bridge_enum::#bridge_variant_ident => #core_enum::#core_variant_ident),
+            );
         }
         let bindings = variant
             .fields()
@@ -826,13 +833,14 @@ impl<'a> Generator<'a> {
             .fields()
             .iter()
             .map(|field| {
-                let field_ident = rust_ident(field.name());
-                let expr = self.lower_value_expr(quote!(#field_ident), &field.as_type())?;
-                Ok(quote!(#field_ident: #expr))
+                let bridge_field_ident = rust_ident(field.name());
+                let core_field_ident = rust_ident(field.rust_name());
+                let expr = self.lower_value_expr(quote!(#bridge_field_ident), &field.as_type())?;
+                Ok(quote!(#core_field_ident: #expr))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(quote!(
-            #bridge_enum::#variant_ident { #(#bindings),* } => #core_enum::#variant_ident {
+            #bridge_enum::#bridge_variant_ident { #(#bindings),* } => #core_enum::#core_variant_ident {
                 #(#lowers),*
             }
         ))
@@ -841,26 +849,30 @@ impl<'a> Generator<'a> {
     fn render_from_core_variant(&self, enum_: &Enum, variant: &Variant) -> Result<TokenStream> {
         let bridge_enum = rust_ident(enum_.name());
         let core_enum = self.core_type_path(enum_.as_type());
-        let variant_ident = rust_ident(variant.name());
+        let bridge_variant_ident = rust_ident(variant.name());
+        let core_variant_ident = rust_ident(variant.rust_name());
         if variant.fields().is_empty() {
-            return Ok(quote!(#core_enum::#variant_ident => #bridge_enum::#variant_ident));
+            return Ok(
+                quote!(#core_enum::#core_variant_ident => #bridge_enum::#bridge_variant_ident),
+            );
         }
         let bindings = variant
             .fields()
             .iter()
-            .map(|field| rust_ident(field.name()))
+            .map(|field| rust_ident(field.rust_name()))
             .collect::<Vec<_>>();
         let lifts = variant
             .fields()
             .iter()
             .map(|field| {
-                let field_ident = rust_ident(field.name());
-                let expr = self.lift_value_expr(quote!(#field_ident), &field.as_type())?;
-                Ok(quote!(#field_ident: #expr))
+                let core_field_ident = rust_ident(field.rust_name());
+                let bridge_field_ident = rust_ident(field.name());
+                let expr = self.lift_value_expr(quote!(#core_field_ident), &field.as_type())?;
+                Ok(quote!(#bridge_field_ident: #expr))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(quote!(
-            #core_enum::#variant_ident { #(#bindings),* } => #bridge_enum::#variant_ident {
+            #core_enum::#core_variant_ident { #(#bindings),* } => #bridge_enum::#bridge_variant_ident {
                 #(#lifts),*
             }
         ))
@@ -2905,11 +2917,38 @@ impl<'a> Generator<'a> {
         quote!(#module::#ident)
     }
 
+    fn core_public_item_path(&self, module_path: &str, public_path: &str) -> TokenStream {
+        let crate_root = module_path.split("::").next().unwrap_or(module_path);
+        let crate_ident = rust_ident(crate_root);
+        let public_path = rust_path(public_path);
+        quote!(#crate_ident::#public_path)
+    }
+
+    fn core_record_path(&self, module_path: &str, name: &str) -> TokenStream {
+        let Some(record) = self.ci.get_record_definition(name) else {
+            return self.core_item_path(module_path, name);
+        };
+        match record.rust_path() {
+            Some(public_path) => self.core_public_item_path(module_path, public_path),
+            None => self.core_item_path(module_path, record.rust_name()),
+        }
+    }
+
+    fn core_enum_path(&self, module_path: &str, name: &str) -> TokenStream {
+        let Some(enum_) = self.ci.get_enum_definition(name) else {
+            return self.core_item_path(module_path, name);
+        };
+        match enum_.rust_path() {
+            Some(public_path) => self.core_public_item_path(module_path, public_path),
+            None => self.core_item_path(module_path, enum_.rust_name()),
+        }
+    }
+
     fn core_type_path(&self, ty: Type) -> TokenStream {
         match ty {
-            Type::Record { module_path, name }
-            | Type::Enum { module_path, name }
-            | Type::CallbackInterface { module_path, name }
+            Type::Record { module_path, name } => self.core_record_path(&module_path, &name),
+            Type::Enum { module_path, name } => self.core_enum_path(&module_path, &name),
+            Type::CallbackInterface { module_path, name }
             | Type::Object {
                 module_path, name, ..
             }
@@ -3545,6 +3584,210 @@ fn rust_path(path: &str) -> TokenStream {
 }
 
 #[cfg(test)]
+mod renamed_record_core_path_tests {
+    use super::super::ohos_bridge_identity_export;
+    use super::*;
+    use uniffi_meta::{
+        EnumMetadata, EnumShape, FieldMetadata, FnMetadata, MetadataGroup, NamespaceMetadata,
+        RecordMetadata, VariantMetadata,
+    };
+
+    const MODULE_PATH: &str = "dual_model_fixture";
+
+    fn named_record(name: &str) -> Type {
+        Type::Record {
+            module_path: MODULE_PATH.into(),
+            name: name.into(),
+        }
+    }
+
+    fn named_enum(name: &str) -> Type {
+        Type::Enum {
+            module_path: MODULE_PATH.into(),
+            name: name.into(),
+        }
+    }
+
+    fn field(name: &str, orig_name: Option<&str>, ty: Type) -> FieldMetadata {
+        FieldMetadata {
+            name: name.into(),
+            orig_name: orig_name.map(Into::into),
+            ty,
+            default: None,
+            docstring: None,
+        }
+    }
+
+    fn record(
+        name: &str,
+        orig_name: &str,
+        rust_path: &str,
+        fields: Vec<FieldMetadata>,
+    ) -> RecordMetadata {
+        RecordMetadata {
+            module_path: MODULE_PATH.into(),
+            name: name.into(),
+            orig_name: Some(orig_name.into()),
+            rust_path: Some(rust_path.into()),
+            remote: false,
+            fields,
+            docstring: None,
+        }
+    }
+
+    fn dual_model_fixture() -> ComponentInterface {
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: MODULE_PATH.into(),
+                name: MODULE_PATH.into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+
+        group.add_item(
+            EnumMetadata {
+                module_path: MODULE_PATH.into(),
+                name: "DolphinConversationRoute".into(),
+                orig_name: Some("ConversationRouteKind".into()),
+                rust_path: Some("ffi_types::DolphinConversationRoute".into()),
+                shape: EnumShape::Enum,
+                remote: false,
+                variants: vec![
+                    VariantMetadata {
+                        name: "DirectRoute".into(),
+                        orig_name: Some("Direct".into()),
+                        discr: None,
+                        fields: vec![],
+                        docstring: None,
+                    },
+                    VariantMetadata {
+                        name: "GroupRoute".into(),
+                        orig_name: Some("Group".into()),
+                        discr: None,
+                        fields: vec![],
+                        docstring: None,
+                    },
+                ],
+                discr_type: None,
+                non_exhaustive: false,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            record(
+                "DolphinConversationRow",
+                "Model",
+                "ffi_types::DolphinConversationRow",
+                vec![
+                    field("rowRevision", Some("revision"), Type::Int64),
+                    field("route", None, named_enum("DolphinConversationRoute")),
+                ],
+            )
+            .into(),
+        );
+        group.add_item(
+            record(
+                "DolphinMessageRow",
+                "Model",
+                "ffi_types::DolphinMessageRow",
+                vec![field("content", None, Type::String)],
+            )
+            .into(),
+        );
+        group.add_item(
+            record(
+                "DolphinConversationPage",
+                "Page",
+                "ffi_types::DolphinConversationPage",
+                vec![
+                    field(
+                        "items",
+                        None,
+                        Type::Sequence {
+                            inner_type: Box::new(named_record("DolphinConversationRow")),
+                        },
+                    ),
+                    field(
+                        "nextMessage",
+                        Some("next_message"),
+                        Type::Optional {
+                            inner_type: Box::new(named_record("DolphinMessageRow")),
+                        },
+                    ),
+                ],
+            )
+            .into(),
+        );
+        group.add_item(
+            FnMetadata {
+                module_path: MODULE_PATH.into(),
+                name: "load_conversations".into(),
+                orig_name: None,
+                is_async: false,
+                inputs: vec![],
+                return_type: Some(named_record("DolphinConversationPage")),
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+
+        ComponentInterface::from_metadata(group).expect("dual Model fixture metadata")
+    }
+
+    #[test]
+    fn napi_and_ohos_use_foreign_names_at_the_bridge_and_public_rust_paths_in_core() {
+        let ci = dual_model_fixture();
+        let napi = render_napi_rust(&ci).expect("NAPI codegen must succeed");
+        let digest = "0".repeat(64);
+        let identity = ohos_bridge_identity_export(&digest);
+        let ohos = render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed");
+
+        for generated in [&napi, &ohos] {
+            for core_path in [
+                "dual_model_fixture::ffi_types::DolphinConversationRow",
+                "dual_model_fixture::ffi_types::DolphinMessageRow",
+                "dual_model_fixture::ffi_types::DolphinConversationPage",
+                "dual_model_fixture::ffi_types::DolphinConversationRoute",
+            ] {
+                assert!(
+                    generated.contains(core_path),
+                    "generated bridge omitted public core path `{core_path}`:\n{generated}"
+                );
+            }
+            assert!(
+                generated.contains("revision: {") && generated.contains("value.rowRevision"),
+                "foreign record field must lower into its Rust field name:\n{generated}"
+            );
+            assert!(
+                generated.contains("rowRevision:")
+                    && generated.contains("BigInt::from(value.revision)"),
+                "Rust record field must lift into its foreign field name:\n{generated}"
+            );
+            assert!(
+                generated.contains("DolphinConversationRoute::DirectRoute =>")
+                    && generated.contains(
+                        "dual_model_fixture::ffi_types::DolphinConversationRoute::Direct"
+                    ),
+                "foreign enum variant must lower into its Rust variant name:\n{generated}"
+            );
+            assert!(
+                generated
+                    .contains("dual_model_fixture::ffi_types::DolphinConversationRoute::Direct =>")
+                    && generated.contains("DolphinConversationRoute::DirectRoute"),
+                "Rust enum variant must lift into its foreign variant name:\n{generated}"
+            );
+            assert!(generated.contains("pub items: Vec<DolphinConversationRow>"));
+            assert!(generated.contains("pub nextMessage: Option<DolphinMessageRow>"));
+        }
+        assert!(ohos.contains("use napi_ohos::bindgen_prelude::*;"));
+    }
+}
+
+#[cfg(test)]
 mod input_stream_descriptor_tests {
     use super::*;
     use serde_json::Value;
@@ -3605,6 +3848,7 @@ mod input_stream_descriptor_tests {
                 module_path: module_path.to_string(),
                 name: "InputRecord".to_string(),
                 orig_name: None,
+                rust_path: None,
                 remote: false,
                 fields: vec![],
                 docstring: None,
@@ -3616,6 +3860,7 @@ mod input_stream_descriptor_tests {
                 module_path: module_path.to_string(),
                 name: "InputEnum".to_string(),
                 orig_name: None,
+                rust_path: None,
                 shape: EnumShape::Enum,
                 remote: false,
                 variants: vec![VariantMetadata {
@@ -3710,6 +3955,7 @@ mod input_stream_descriptor_tests {
                 module_path: module_path.to_string(),
                 name: "ReadError".to_string(),
                 orig_name: None,
+                rust_path: None,
                 shape: EnumShape::Enum,
                 remote: false,
                 variants: vec![VariantMetadata {

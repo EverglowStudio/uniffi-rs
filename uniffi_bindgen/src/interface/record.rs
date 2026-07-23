@@ -61,7 +61,11 @@ use super::{
 #[derive(Debug, Clone, Checksum)]
 pub struct Record {
     pub(super) name: String,
+    #[checksum_ignore]
+    pub(super) orig_name: String,
     pub(super) module_path: String,
+    #[checksum_ignore]
+    pub(super) rust_path: Option<String>,
     pub(super) remote: bool,
     pub(super) fields: Vec<Field>,
     pub(super) constructors: Vec<Constructor>,
@@ -74,6 +78,16 @@ pub struct Record {
 impl Record {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Name of the Rust struct that implements this foreign record.
+    pub fn rust_name(&self) -> &str {
+        &self.orig_name
+    }
+
+    /// Public path, relative to the component crate root, for native hosts.
+    pub fn rust_path(&self) -> Option<&str> {
+        self.rust_path.as_deref()
     }
 
     pub fn rename(&mut self, name: String) {
@@ -169,6 +183,8 @@ impl TryFrom<uniffi_meta::RecordMetadata> for Record {
 
     fn try_from(meta: uniffi_meta::RecordMetadata) -> Result<Self> {
         Ok(Self {
+            orig_name: meta.orig_name.unwrap_or_else(|| meta.name.clone()),
+            rust_path: meta.rust_path,
             name: meta.name,
             module_path: meta.module_path,
             remote: meta.remote,
@@ -189,6 +205,8 @@ impl TryFrom<uniffi_meta::RecordMetadata> for Record {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Checksum)]
 pub struct Field {
     pub(super) name: String,
+    #[checksum_ignore]
+    pub(super) orig_name: String,
     pub(super) type_: Type,
     pub(super) default: Option<DefaultValue>,
     #[checksum_ignore]
@@ -198,6 +216,11 @@ pub struct Field {
 impl Field {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Name of the field on the Rust core type.
+    pub fn rust_name(&self) -> &str {
+        &self.orig_name
     }
 
     pub fn rename(&mut self, name: String) {
@@ -227,11 +250,13 @@ impl TryFrom<uniffi_meta::FieldMetadata> for Field {
     type Error = anyhow::Error;
 
     fn try_from(meta: uniffi_meta::FieldMetadata) -> Result<Self> {
+        let orig_name = meta.orig_name.unwrap_or_else(|| meta.name.clone());
         let name = meta.name;
         let type_ = meta.ty;
         let default = meta.default;
         Ok(Self {
             name,
+            orig_name,
             type_,
             default,
             docstring: meta.docstring.clone(),

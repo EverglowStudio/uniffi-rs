@@ -23,6 +23,7 @@ impl APIConverter<EnumMetadata> for weedle::EnumDefinition<'_> {
             module_path: ci.module_path(),
             name: self.identifier.0.to_string(),
             orig_name: None,
+            rust_path: None,
             shape,
             remote: attributes.contains_remote(),
             discr_type: None,
@@ -76,6 +77,7 @@ impl APIConverter<EnumMetadata> for weedle::InterfaceDefinition<'_> {
             module_path: ci.module_path(),
             name: self.identifier.0.to_string(),
             orig_name: None,
+            rust_path: None,
             shape,
             remote: attributes.contains_remote(),
             variants: self

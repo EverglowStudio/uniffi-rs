@@ -1234,6 +1234,7 @@ mod test {
             module_path: module_path.to_owned(),
             name: "StreamEvent".to_owned(),
             orig_name: None,
+            rust_path: None,
             remote: false,
             fields: vec![FieldMetadata {
                 name: "value".to_owned(),
@@ -1248,6 +1249,7 @@ mod test {
             module_path: module_path.to_owned(),
             name: "StreamError".to_owned(),
             orig_name: None,
+            rust_path: None,
             shape: EnumShape::Error { flat: true },
             remote: false,
             variants: vec![VariantMetadata {
@@ -1322,6 +1324,7 @@ mod test {
             module_path: module_path.to_owned(),
             name: "CounterEvent".to_owned(),
             orig_name: None,
+            rust_path: None,
             remote: false,
             fields: vec![FieldMetadata {
                 name: "value".to_owned(),
@@ -1336,6 +1339,7 @@ mod test {
             module_path: module_path.to_owned(),
             name: "StreamError".to_owned(),
             orig_name: None,
+            rust_path: None,
             shape: EnumShape::Error { flat: true },
             remote: false,
             variants: vec![VariantMetadata {

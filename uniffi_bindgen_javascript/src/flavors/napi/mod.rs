@@ -1382,6 +1382,7 @@ mod ohos_facade_type_tests {
             module_path: module_path.to_string(),
             name: name.to_string(),
             orig_name: None,
+            rust_path: None,
             remote: false,
             fields,
             docstring: None,
@@ -1471,6 +1472,7 @@ mod ohos_facade_type_tests {
                 module_path: "facade_graph".to_string(),
                 name: "MapEvent".to_string(),
                 orig_name: None,
+                rust_path: None,
                 shape: EnumShape::Enum,
                 remote: false,
                 variants: vec![VariantMetadata {

@@ -348,6 +348,7 @@ impl<'a> MetadataReader<'a> {
             module_path: self.read_string()?,
             name: self.read_string()?,
             orig_name: self.read_optional_string()?,
+            rust_path: self.read_optional_string()?,
             remote: false, // only used when generating scaffolding from UDL
             fields: self.read_fields()?,
             docstring: self.read_optional_long_string()?,
@@ -358,6 +359,7 @@ impl<'a> MetadataReader<'a> {
         let module_path = self.read_string()?;
         let name = self.read_string()?;
         let orig_name = self.read_optional_string()?;
+        let rust_path = self.read_optional_string()?;
         let shape = EnumShape::from(self.read_u8()?)?;
         let discr_type = if self.read_bool()? {
             Some(self.read_type()?)
@@ -373,6 +375,7 @@ impl<'a> MetadataReader<'a> {
             module_path,
             name,
             orig_name,
+            rust_path,
             shape,
             remote: false, // only used when generating scaffolding from UDL
             discr_type,

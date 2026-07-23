@@ -177,7 +177,11 @@ use super::{
 #[derive(Debug, Clone, Checksum)]
 pub struct Enum {
     pub(super) name: String,
+    #[checksum_ignore]
+    pub(super) orig_name: String,
     pub(super) module_path: String,
+    #[checksum_ignore]
+    pub(super) rust_path: Option<String>,
     pub(super) remote: bool,
     pub(super) discr_type: Option<Type>,
     pub(super) variants: Vec<Variant>,
@@ -194,6 +198,16 @@ pub struct Enum {
 impl Enum {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Name of the Rust enum that implements this foreign enum.
+    pub fn rust_name(&self) -> &str {
+        &self.orig_name
+    }
+
+    /// Public path, relative to the component crate root, for native hosts.
+    pub fn rust_path(&self) -> Option<&str> {
+        self.rust_path.as_deref()
     }
 
     pub fn rename(&mut self, name: String) {
@@ -336,6 +350,8 @@ impl TryFrom<uniffi_meta::EnumMetadata> for Enum {
 
     fn try_from(meta: uniffi_meta::EnumMetadata) -> Result<Self> {
         Ok(Self {
+            orig_name: meta.orig_name.unwrap_or_else(|| meta.name.clone()),
+            rust_path: meta.rust_path,
             name: meta.name,
             module_path: meta.module_path,
             remote: meta.remote,
@@ -370,6 +386,8 @@ impl AsType for Enum {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Checksum)]
 pub struct Variant {
     pub(super) name: String,
+    #[checksum_ignore]
+    pub(super) orig_name: String,
     pub(super) discr: Option<Literal>,
     pub(super) fields: Vec<Field>,
     #[checksum_ignore]
@@ -379,6 +397,11 @@ pub struct Variant {
 impl Variant {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Name of this variant in the Rust core enum.
+    pub fn rust_name(&self) -> &str {
+        &self.orig_name
     }
 
     pub fn rename(&mut self, new_name: String) {
@@ -411,6 +434,7 @@ impl TryFrom<uniffi_meta::VariantMetadata> for Variant {
 
     fn try_from(meta: uniffi_meta::VariantMetadata) -> Result<Self> {
         Ok(Self {
+            orig_name: meta.orig_name.unwrap_or_else(|| meta.name.clone()),
             name: meta.name,
             discr: meta.discr,
             fields: meta
@@ -722,6 +746,7 @@ mod test {
     fn variant(val: Option<u64>) -> Variant {
         Variant {
             name: "v".to_string(),
+            orig_name: "v".to_string(),
             discr: val.map(Literal::new_uint),
             fields: vec![],
             docstring: None,
@@ -744,6 +769,8 @@ mod test {
         let mut e = Enum {
             module_path: "test".to_string(),
             name: "test".to_string(),
+            orig_name: "test".to_string(),
+            rust_path: None,
             remote: false,
             discr_type: None,
             variants: vec![],

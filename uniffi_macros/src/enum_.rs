@@ -124,6 +124,18 @@ impl EnumItem {
         orig_name_metadata(self.attr.name.is_some(), &self.ident)
     }
 
+    pub fn rust_path_metadata(&self) -> TokenStream {
+        match &self.attr.rust_path {
+            Some(rust_path) => quote! {
+                .concat_bool(true)
+                .concat_str(#rust_path)
+            },
+            None => quote! {
+                .concat_bool(false)
+            },
+        }
+    }
+
     pub fn is_flat_error(&self) -> bool {
         self.attr.flat_error.is_some()
     }
@@ -274,6 +286,7 @@ fn enum_or_error_ffi_converter_impl(
 pub(crate) fn enum_meta_static_var(item: &EnumItem) -> syn::Result<TokenStream> {
     let name = &item.foreign_name();
     let orig_name_calls = &item.orig_name_metadata();
+    let rust_path_calls = &item.rust_path_metadata();
     let non_exhaustive = item.is_non_exhaustive();
     let docstring = item.docstring();
     let shape = EnumShape::Enum.as_u8();
@@ -283,6 +296,7 @@ pub(crate) fn enum_meta_static_var(item: &EnumItem) -> syn::Result<TokenStream> 
             .concat_str(module_path!())
             .concat_str(#name)
             #orig_name_calls
+            #rust_path_calls
             .concat_value(#shape)
     };
     metadata_expr.extend(match item.discr_type() {
@@ -419,6 +433,7 @@ pub struct EnumAttr {
     pub flat_error: Option<kw::flat_error>,
     pub with_try_read: Option<kw::with_try_read>,
     pub name: Option<String>,
+    pub rust_path: Option<String>,
 }
 
 impl UniffiAttributeArgs for EnumAttr {
@@ -445,6 +460,14 @@ impl UniffiAttributeArgs for EnumAttr {
                 name,
                 ..Self::default()
             })
+        } else if lookahead.peek(kw::rust_path) {
+            let _: kw::rust_path = input.parse()?;
+            let _: Token![=] = input.parse()?;
+            let rust_path = Some(input.parse::<LitStr>()?.value());
+            Ok(Self {
+                rust_path,
+                ..Self::default()
+            })
         } else {
             Err(lookahead.error())
         }
@@ -455,6 +478,7 @@ impl UniffiAttributeArgs for EnumAttr {
             flat_error: either_attribute_arg(self.flat_error, other.flat_error)?,
             with_try_read: either_attribute_arg(self.with_try_read, other.with_try_read)?,
             name: either_attribute_arg(self.name, other.name)?,
+            rust_path: either_attribute_arg(self.rust_path, other.rust_path)?,
         })
     }
 }

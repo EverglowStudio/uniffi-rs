@@ -10,7 +10,7 @@ use uniffi_meta::*;
 
 mod person {
     #[derive(uniffi::Record, Debug)]
-    #[uniffi(name = "PersonRenamed")]
+    #[uniffi(name = "PersonRenamed", rust_path = "ffi_types::PersonRenamed")]
     pub struct Person {
         #[uniffi(default = "test", name = "name_renamed")]
         name: String,
@@ -22,7 +22,7 @@ mod person {
 
 mod weapon {
     #[derive(uniffi::Enum, Debug)]
-    #[uniffi(name = "WeaponRenamed")]
+    #[uniffi(name = "WeaponRenamed", rust_path = "ffi_types::WeaponRenamed")]
     pub enum Weapon {
         Rock,
         Paper,
@@ -217,6 +217,7 @@ mod test_metadata {
                 module_path: "uniffi_fixture_metadata::tests::person".into(),
                 name: "PersonRenamed".into(),
                 orig_name: Some("Person".into()),
+                rust_path: Some("ffi_types::PersonRenamed".into()),
                 remote: false,
                 fields: vec![
                     FieldMetadata {
@@ -258,6 +259,7 @@ mod test_metadata {
                 module_path: "uniffi_fixture_metadata::tests::weapon".into(),
                 name: "WeaponRenamed".into(),
                 orig_name: Some("Weapon".into()),
+                rust_path: Some("ffi_types::WeaponRenamed".into()),
                 shape: EnumShape::Enum,
                 remote: false,
                 discr_type: None,
@@ -298,6 +300,7 @@ mod test_metadata {
                 module_path: "uniffi_fixture_metadata::tests::state".into(),
                 name: "State".into(),
                 orig_name: None,
+                rust_path: None,
                 shape: EnumShape::Enum,
                 remote: false,
                 discr_type: None,
@@ -353,6 +356,7 @@ mod test_metadata {
                 module_path: "uniffi_fixture_metadata::tests::enum_repr".into(),
                 name: "ReprU8".into(),
                 orig_name: None,
+                rust_path: None,
                 shape: EnumShape::Enum,
                 remote: false,
                 discr_type: Some(Type::UInt8),
@@ -393,6 +397,7 @@ mod test_metadata {
                 module_path: "uniffi_fixture_metadata::tests::enum_repr".into(),
                 name: "NoRepr".into(),
                 orig_name: None,
+                rust_path: None,
                 shape: EnumShape::Enum,
                 remote: false,
                 discr_type: None,
@@ -439,6 +444,7 @@ mod test_metadata {
                 module_path: "uniffi_fixture_metadata::tests::error".into(),
                 name: "FlatError".into(),
                 orig_name: None,
+                rust_path: None,
                 shape: EnumShape::Error { flat: true },
                 remote: false,
                 discr_type: None,
@@ -472,6 +478,7 @@ mod test_metadata {
                 module_path: "uniffi_fixture_metadata::tests::error".into(),
                 name: "ComplexError".into(),
                 orig_name: None,
+                rust_path: None,
                 shape: EnumShape::Error { flat: false },
                 remote: false,
                 discr_type: None,

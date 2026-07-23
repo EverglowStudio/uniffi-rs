@@ -17,6 +17,7 @@ use crate::{
 pub struct EnumAttributes {
     pub shape: EnumShape,
     pub name: Option<String>,
+    pub rust_path: Option<String>,
     pub docstring: Option<String>,
     pub non_exhaustive: bool,
     pub discr_type: Option<uniffi_meta::Type>,
@@ -33,6 +34,7 @@ impl EnumAttributes {
         attrs: &[Attribute],
     ) -> syn::Result<Option<Self>> {
         let mut name = None;
+        let mut rust_path = None;
         let mut docstring = None;
         let mut non_exhaustive = false;
         let mut discr_type = None;
@@ -65,6 +67,11 @@ impl EnumAttributes {
                             meta.value()?;
                             let name_lit: LitStr = meta.input.parse()?;
                             name = Some(name_lit.value());
+                            Ok(())
+                        } else if meta.path.is_ident("rust_path") {
+                            meta.value()?;
+                            let rust_path_lit: LitStr = meta.input.parse()?;
+                            rust_path = Some(rust_path_lit.value());
                             Ok(())
                         } else if meta.path.is_ident("flat_error") {
                             if let EnumShape::Error { flat } = &mut shape {
@@ -114,6 +121,7 @@ impl EnumAttributes {
         Ok(Some(EnumAttributes {
             shape,
             name,
+            rust_path,
             docstring,
             non_exhaustive,
             discr_type,

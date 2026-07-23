@@ -337,6 +337,9 @@ pub struct RecordMetadata {
     pub name: String,
     // Original name, if this was renamed
     pub orig_name: Option<String>,
+    // Public Rust path relative to the component crate root, if the generated
+    // native host must not use the item's defining module path.
+    pub rust_path: Option<String>,
     pub remote: bool, // only used when generating scaffolding from UDL
     pub fields: Vec<FieldMetadata>,
     pub docstring: Option<String>,
@@ -387,6 +390,9 @@ pub struct EnumMetadata {
     pub name: String,
     // Original name, if this was renamed
     pub orig_name: Option<String>,
+    // Public Rust path relative to the component crate root, if the generated
+    // native host must not use the item's defining module path.
+    pub rust_path: Option<String>,
     pub shape: EnumShape,
     pub remote: bool, // only used when generating scaffolding from UDL
     pub variants: Vec<VariantMetadata>,

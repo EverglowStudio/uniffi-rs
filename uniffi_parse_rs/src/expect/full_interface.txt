@@ -202,6 +202,7 @@
             orig_name: Some(
                 "Record",
             ),
+            rust_path: None,
             remote: false,
             fields: [
                 FieldMetadata {
@@ -280,6 +281,7 @@
             orig_name: Some(
                 "Enum",
             ),
+            rust_path: None,
             shape: Enum,
             remote: false,
             variants: [
@@ -342,6 +344,7 @@
             module_path: "full_interface",
             name: "Error",
             orig_name: None,
+            rust_path: None,
             shape: Error {
                 flat: false,
             },
@@ -357,6 +360,7 @@
             module_path: "full_interface",
             name: "FlatError",
             orig_name: None,
+            rust_path: None,
             shape: Error {
                 flat: true,
             },
@@ -387,6 +391,7 @@
             module_path: "full_interface",
             name: "U8Enum",
             orig_name: None,
+            rust_path: None,
             shape: Enum,
             remote: false,
             variants: [
@@ -430,6 +435,7 @@
             module_path: "full_interface",
             name: "i8Enum",
             orig_name: None,
+            rust_path: None,
             shape: Enum,
             remote: false,
             variants: [
