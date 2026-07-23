@@ -1052,6 +1052,7 @@ pub mod tests {
                 module_path: "raw_idents".into(),
                 name: "Record".into(),
                 orig_name: None,
+                rust_path: None,
                 remote: false,
                 fields: vec![],
                 docstring: None,

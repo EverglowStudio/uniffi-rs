@@ -52,6 +52,7 @@ impl Record {
             module_path: names.module_path,
             name: names.name,
             orig_name: names.orig_name,
+            rust_path: self.attrs.rust_path.clone(),
             remote: self.attrs.remote,
             docstring: self.attrs.docstring.clone(),
             fields: self

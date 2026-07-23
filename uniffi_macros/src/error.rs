@@ -173,6 +173,7 @@ fn flat_error_ffi_converter_impl(item: &EnumItem, options: &DeriveOptions) -> To
 pub(crate) fn error_meta_static_var(item: &EnumItem) -> syn::Result<TokenStream> {
     let name = &item.foreign_name();
     let orig_name_calls = &item.orig_name_metadata();
+    let rust_path_calls = &item.rust_path_metadata();
     let non_exhaustive = item.is_non_exhaustive();
     let docstring = item.docstring();
     let flat = item.is_flat_error();
@@ -182,6 +183,7 @@ pub(crate) fn error_meta_static_var(item: &EnumItem) -> syn::Result<TokenStream>
                 .concat_str(module_path!())
                 .concat_str(#name)
                 #orig_name_calls
+                #rust_path_calls
                 .concat_value(#shape)
                 .concat_bool(false) // discr_type: None
     };

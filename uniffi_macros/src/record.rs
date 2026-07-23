@@ -17,6 +17,7 @@ use crate::{
 #[derive(Clone, Default)]
 pub struct RecordAttr {
     pub name: Option<String>,
+    pub rust_path: Option<String>,
 }
 
 impl UniffiAttributeArgs for RecordAttr {
@@ -26,7 +27,18 @@ impl UniffiAttributeArgs for RecordAttr {
             let _: kw::name = input.parse()?;
             let _: Token![=] = input.parse()?;
             let name = Some(input.parse::<LitStr>()?.value());
-            Ok(Self { name })
+            Ok(Self {
+                name,
+                ..Self::default()
+            })
+        } else if lookahead.peek(kw::rust_path) {
+            let _: kw::rust_path = input.parse()?;
+            let _: Token![=] = input.parse()?;
+            let rust_path = Some(input.parse::<LitStr>()?.value());
+            Ok(Self {
+                rust_path,
+                ..Self::default()
+            })
         } else {
             Err(syn::Error::new(
                 input.span(),
@@ -38,6 +50,7 @@ impl UniffiAttributeArgs for RecordAttr {
     fn merge(self, other: Self) -> syn::Result<Self> {
         Ok(Self {
             name: either_attribute_arg(self.name, other.name)?,
+            rust_path: either_attribute_arg(self.rust_path, other.rust_path)?,
         })
     }
 }
@@ -190,6 +203,15 @@ impl UniffiAttributeArgs for FieldAttributeArguments {
 fn record_meta_static_var(record: &RecordItem) -> syn::Result<TokenStream> {
     let name = &record.foreign_name();
     let rec_orig_name_metadata = orig_name_metadata(record.attr.name.is_some(), &record.ident);
+    let rust_path_metadata = match &record.attr.rust_path {
+        Some(rust_path) => quote! {
+            .concat_bool(true)
+            .concat_str(#rust_path)
+        },
+        None => quote! {
+            .concat_bool(false)
+        },
+    };
     let docstring = record.docstring();
     let fields_len = try_metadata_value_from_usize(
         record.struct_().fields.len(),
@@ -237,6 +259,7 @@ fn record_meta_static_var(record: &RecordItem) -> syn::Result<TokenStream> {
                 .concat_str(module_path!())
                 .concat_str(#name)
                 #rec_orig_name_metadata
+                #rust_path_metadata
                 .concat_value(#fields_len)
                 #concat_fields
                 .concat_long_str(#docstring)

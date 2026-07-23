@@ -115,6 +115,7 @@ impl APIConverter<RecordMetadata> for weedle::DictionaryDefinition<'_> {
             module_path: ci.module_path(),
             name: self.identifier.0.to_string(),
             orig_name: None,
+            rust_path: None,
             remote: attributes.contains_remote(),
             fields: self.members.body.convert(ci)?,
             docstring: self.docstring.as_ref().map(|v| convert_docstring(&v.0)),

@@ -1616,18 +1616,22 @@ mod test {
             "Mismatching definition for enum `Testing`!
 existing definition: Enum {
     name: \"Testing\",
+    orig_name: \"Testing\",
     module_path: \"crate_name\",
+    rust_path: None,
     remote: false,
     discr_type: None,
     variants: [
         Variant {
             name: \"one\",
+            orig_name: \"one\",
             discr: None,
             fields: [],
             docstring: None,
         },
         Variant {
             name: \"two\",
+            orig_name: \"two\",
             discr: None,
             fields: [],
             docstring: None,
@@ -1642,18 +1646,22 @@ existing definition: Enum {
 },
 new definition: Enum {
     name: \"Testing\",
+    orig_name: \"Testing\",
     module_path: \"crate_name\",
+    rust_path: None,
     remote: false,
     discr_type: None,
     variants: [
         Variant {
             name: \"three\",
+            orig_name: \"three\",
             discr: None,
             fields: [],
             docstring: None,
         },
         Variant {
             name: \"four\",
+            orig_name: \"four\",
             discr: None,
             fields: [],
             docstring: None,

@@ -13,6 +13,7 @@ use crate::{
 #[derive(Clone, Default)]
 pub struct RecordAttributes {
     pub name: Option<String>,
+    pub rust_path: Option<String>,
     pub docstring: Option<String>,
     pub remote: bool,
     pub utraits: UniffiTraitAttrs,
@@ -48,6 +49,11 @@ impl RecordAttributes {
                             meta.value()?;
                             let name: LitStr = meta.input.parse()?;
                             parsed.name = Some(name.value());
+                            Ok(())
+                        } else if meta.path.is_ident("rust_path") {
+                            meta.value()?;
+                            let rust_path: LitStr = meta.input.parse()?;
+                            parsed.rust_path = Some(rust_path.value());
                             Ok(())
                         } else {
                             Err(meta.error("Invalid attribute"))
