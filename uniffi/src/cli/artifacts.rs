@@ -159,6 +159,10 @@ pub(crate) struct BuildArgs {
     #[clap(long = "ohos-compatible-sdk-version")]
     ohos_compatible_sdk_version: Option<String>,
 
+    /// Target Harmony/OpenHarmony SDK version. Defaults to the resolved compile SDK.
+    #[clap(long = "ohos-target-sdk-version")]
+    ohos_target_sdk_version: Option<String>,
+
     /// Compatible SDK type, such as HarmonyOS or OpenHarmony.
     #[clap(long = "ohos-compatible-sdk-type")]
     ohos_compatible_sdk_type: Option<String>,
@@ -2228,6 +2232,7 @@ fn build(mut args: BuildArgs) -> Result<()> {
             no_har: args.ohos_no_har,
             skip_libs: args.ohos_skip_libs,
             compatible_sdk_version: args.ohos_compatible_sdk_version.as_deref(),
+            target_sdk_version: args.ohos_target_sdk_version.as_deref(),
             compatible_sdk_type: args.ohos_compatible_sdk_type.as_deref(),
             bisheng: args.ohos_bisheng,
             hvigorw: args.ohos_hvigorw.as_deref(),
@@ -2752,6 +2757,7 @@ impl BuildArgs {
             license: self.ohos_license.clone(),
             description: self.ohos_description.clone(),
             compatible_sdk_version: self.ohos_compatible_sdk_version.clone(),
+            target_sdk_version: self.ohos_target_sdk_version.clone(),
             compatible_sdk_type: self.ohos_compatible_sdk_type.clone(),
             device_types: self.ohos_device_types.clone(),
             package_kind: self.ohos_package_kind,
