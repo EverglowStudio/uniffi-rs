@@ -2990,6 +2990,7 @@ fn test_build_options() -> BuildOptions {
         license: None,
         description: None,
         compatible_sdk_version: None,
+        target_sdk_version: None,
         compatible_sdk_type: None,
         device_types: Vec::new(),
         package_kind: PackageKind::Har,
@@ -3828,19 +3829,45 @@ fn renders_hvigor_sdk_products_for_runtime_and_api_generation() {
         platform_version: "6.0.3".into(),
     };
 
-    let product = render_hvigor_product(&api_20, &open_harmony_20).unwrap();
+    let product = render_hvigor_product(&api_20, &open_harmony_20, None).unwrap();
     assert_eq!(product["runtimeOS"], "OpenHarmony");
     assert_eq!(product["compileSdkVersion"], 20);
     assert_eq!(product["targetSdkVersion"], 20);
     assert_eq!(product["compatibleSdkVersion"], 20);
 
-    let product = render_hvigor_product(&api_25, &harmony).unwrap();
+    let product = render_hvigor_product(&api_25, &harmony, None).unwrap();
     assert_eq!(product["runtimeOS"], "HarmonyOS");
     assert_eq!(product["targetSdkVersion"], "6.0.3(25)");
     assert_eq!(product["compatibleSdkVersion"], "5.0.0(12)");
     assert!(product.get("compileSdkVersion").is_none());
 
-    let product = render_hvigor_product(&api_25, &open_harmony).unwrap();
+    let harmony_20 = SdkCompatibility {
+        version: "6.0.0(20)".into(),
+        sdk_type: RuntimeSdkType::HarmonyOs,
+    };
+    for (api_level, platform_version) in [
+        (20, "6.0.0"),
+        (21, "6.0.1"),
+        (22, "6.0.2"),
+        (23, "6.1.0"),
+        (24, "6.1.1"),
+        (26, "26.0.0"),
+    ] {
+        let compile = CompileSdk {
+            api_level,
+            platform_version: platform_version.into(),
+        };
+        let product = render_hvigor_product(&compile, &harmony_20, Some("6.0.0(20)")).unwrap();
+        assert_eq!(product["targetSdkVersion"], "6.0.0(20)");
+        assert_eq!(product["compatibleSdkVersion"], "6.0.0(20)");
+        if api_level >= 26 {
+            assert_eq!(product["compileSdkVersion"], "26.0.0");
+        } else {
+            assert!(product.get("compileSdkVersion").is_none());
+        }
+    }
+
+    let product = render_hvigor_product(&api_25, &open_harmony, None).unwrap();
     assert_eq!(product["runtimeOS"], "OpenHarmony");
     assert_eq!(product["compileSdkVersion"], 25);
     assert_eq!(product["targetSdkVersion"], 25);
@@ -3851,7 +3878,7 @@ fn renders_hvigor_sdk_products_for_runtime_and_api_generation() {
         platform_version: "26.0.0".into(),
     };
     for sdk in [&harmony, &open_harmony] {
-        let product = render_hvigor_product(&api_26, sdk).unwrap();
+        let product = render_hvigor_product(&api_26, sdk, None).unwrap();
         assert_eq!(product["compileSdkVersion"], "26.0.0");
         assert_eq!(product["targetSdkVersion"], "26.0.0");
         assert!(product["compatibleSdkVersion"].is_string());
@@ -3862,7 +3889,29 @@ fn renders_hvigor_sdk_products_for_runtime_and_api_generation() {
         version: "5.0.0(13)".into(),
         sdk_type: RuntimeSdkType::OpenHarmony,
     };
-    assert!(render_hvigor_product(&api_25, &invalid_open_harmony).is_err());
+    assert!(render_hvigor_product(&api_25, &invalid_open_harmony, None).is_err());
+
+    let target_above_compile = format!(
+        "{:#}",
+        render_hvigor_product(&api_20, &harmony_20, Some("6.0.1(21)")).unwrap_err()
+    );
+    assert!(
+        target_above_compile.contains("target SDK API 21 exceeds compile SDK API 20"),
+        "{target_above_compile}"
+    );
+
+    let harmony_21 = SdkCompatibility {
+        version: "6.0.1(21)".into(),
+        sdk_type: RuntimeSdkType::HarmonyOs,
+    };
+    let target_below_compatible = format!(
+        "{:#}",
+        render_hvigor_product(&api_25, &harmony_21, Some("6.0.0(20)")).unwrap_err()
+    );
+    assert!(
+        target_below_compatible.contains("target SDK API 20 is lower than compatible SDK API 21"),
+        "{target_below_compatible}"
+    );
 }
 
 #[test]
@@ -8653,6 +8702,7 @@ fn hsp_projects_enable_normalized_ohm_urls_in_both_packaging_modes() {
             &metadata,
             &sdk,
             &tools,
+            None,
             integrated,
             bundle_name,
         )
