@@ -66,6 +66,7 @@ pub(crate) struct HspFrontendPreflight<'a> {
     pub no_har: bool,
     pub skip_libs: bool,
     pub compatible_sdk_version: Option<&'a str>,
+    pub target_sdk_version: Option<&'a str>,
     pub compatible_sdk_type: Option<&'a str>,
     pub bisheng: bool,
     pub hvigorw: Option<&'a str>,
@@ -87,6 +88,7 @@ pub(crate) struct BuildOptions {
     pub license: Option<String>,
     pub description: Option<String>,
     pub compatible_sdk_version: Option<String>,
+    pub target_sdk_version: Option<String>,
     pub compatible_sdk_type: Option<String>,
     pub device_types: Vec<String>,
     pub package_kind: PackageKind,
@@ -1054,6 +1056,7 @@ pub(crate) fn preflight_hsp_frontend(options: HspFrontendPreflight<'_>) -> Resul
             tools.compile_sdk.api_level
         );
     }
+    resolve_target_sdk_version(&tools.compile_sdk, &sdk, options.target_sdk_version)?;
     preflight_harmony_tools(&tools)
 }
 
@@ -2368,6 +2371,7 @@ fn build_hsp_candidate(
         metadata,
         sdk,
         &tools,
+        options.target_sdk_version.as_deref(),
         options.integrated_hsp,
         options.hsp_bundle_name.as_deref(),
     )?;
@@ -2652,6 +2656,11 @@ where
         "final Harmony packaging requires an explicit --compatible-sdk-version; the compile SDK API is not a minimum runtime compatibility value"
     })?;
     let mut tools = resolve_harmony_har_tools(options)?;
+    resolve_target_sdk_version(
+        &tools.compile_sdk,
+        sdk,
+        options.target_sdk_version.as_deref(),
+    )?;
     let mut project_guard = IdentityBoundInvocationRoot::create("uniffi-ohos-har-invocation")
         .context("creating identity-bound Hvigor HAR project")?;
     let invocation_root = project_guard.root.clone();
@@ -2688,7 +2697,14 @@ where
         }
         let module_dir = project_root.join("library");
         copy_dir_recursive(package_dir, &module_dir)?;
-        write_hvigor_har_project(&project_root, &module_dir, metadata, sdk, &tools)?;
+        write_hvigor_har_project(
+            &project_root,
+            &module_dir,
+            metadata,
+            sdk,
+            &tools,
+            options.target_sdk_version.as_deref(),
+        )?;
 
         run(
             &tools,
@@ -2772,6 +2788,16 @@ fn preflight_hsp_environment<'a>(
             tools.compile_sdk.api_level
         );
     }
+    for value in metadata {
+        resolve_target_sdk_version(
+            &tools.compile_sdk,
+            value
+                .sdk
+                .as_ref()
+                .expect("HSP compatible SDK was validated above"),
+            options.target_sdk_version.as_deref(),
+        )?;
+    }
     preflight_harmony_tools(&tools)
 }
 
@@ -2798,33 +2824,37 @@ fn preflight_harmony_tools(tools: &HarmonyHarTools) -> Result<()> {
 }
 
 fn compatible_sdk_api_level(sdk: &SdkCompatibility) -> Result<u32> {
-    let value = sdk.version.trim();
+    sdk_version_api_level(&sdk.version, "compatible")
+}
+
+fn sdk_version_api_level(value: &str, label: &str) -> Result<u32> {
+    let value = value.trim();
     if let Some(open) = value.rfind('(') {
         let suffix = value
             .strip_suffix(')')
-            .with_context(|| format!("compatible SDK version `{value}` has an unmatched `(`"))?;
+            .with_context(|| format!("{label} SDK version `{value}` has an unmatched `(`"))?;
         return suffix[open + 1..].parse::<u32>().with_context(|| {
-            format!("compatible SDK version `{value}` has a non-numeric API suffix")
+            format!("{label} SDK version `{value}` has a non-numeric API suffix")
         });
     }
     if value.bytes().all(|byte| byte.is_ascii_digit()) {
         return value
             .parse::<u32>()
-            .with_context(|| format!("compatible SDK API `{value}` is out of range"));
+            .with_context(|| format!("{label} SDK API `{value}` is out of range"));
     }
     let major = value
         .split('.')
         .next()
-        .context("compatible SDK version is empty")?
+        .with_context(|| format!("{label} SDK version is empty"))?
         .parse::<u32>()
         .with_context(|| {
             format!(
-                "compatible SDK version `{value}` does not expose a numeric API level; use the official `platform(api)` spelling before API 26"
+                "{label} SDK version `{value}` does not expose a numeric API level; use the official `platform(api)` spelling before API 26"
             )
         })?;
     if major < 26 {
         bail!(
-            "compatible SDK version `{value}` does not expose a numeric API level; use the official `platform(api)` spelling before API 26"
+            "{label} SDK version `{value}` does not expose a numeric API level; use the official `platform(api)` spelling before API 26"
         );
     }
     Ok(major)
@@ -2993,6 +3023,7 @@ fn write_hvigor_har_project(
     metadata: &OhosPackageMetadata,
     sdk: &SdkCompatibility,
     tools: &HarmonyHarTools,
+    target_sdk_version: Option<&str>,
 ) -> Result<()> {
     std::fs::create_dir_all(project_root.join("AppScope"))?;
     std::fs::create_dir_all(project_root.join("hvigor"))?;
@@ -3032,7 +3063,7 @@ fn write_hvigor_har_project(
             "execution": { "daemon": false, "incremental": false }
         }))?,
     )?;
-    let product = render_hvigor_product(&tools.compile_sdk, sdk)?;
+    let product = render_hvigor_product(&tools.compile_sdk, sdk, target_sdk_version)?;
     std::fs::write(
         project_root.join("build-profile.json5"),
         render_json5(serde_json::json!({
@@ -3055,6 +3086,7 @@ fn write_hvigor_hsp_project(
     metadata: &OhosPackageMetadata,
     sdk: &SdkCompatibility,
     tools: &HarmonyHarTools,
+    target_sdk_version: Option<&str>,
     integrated: bool,
     bundle_name: Option<&str>,
 ) -> Result<()> {
@@ -3116,7 +3148,7 @@ fn write_hvigor_hsp_project(
             "execution": { "daemon": false, "incremental": false, "parallel": false }
         }))?,
     )?;
-    let mut product = render_hvigor_product(&tools.compile_sdk, sdk)?;
+    let mut product = render_hvigor_product(&tools.compile_sdk, sdk, target_sdk_version)?;
     // Packaged HSP bytecode must use the same normalized OHM URL mode as its
     // consumer. Modern Harmony applications enable this mode, and Hvigor
     // rejects an HSP compiled with the legacy default before dependency
@@ -4009,21 +4041,26 @@ fn validate_interface_har(
     Ok(())
 }
 
-fn render_hvigor_product(compile_sdk: &CompileSdk, sdk: &SdkCompatibility) -> Result<Value> {
+fn render_hvigor_product(
+    compile_sdk: &CompileSdk,
+    sdk: &SdkCompatibility,
+    target_sdk_version: Option<&str>,
+) -> Result<Value> {
     let mut product = serde_json::Map::new();
     product.insert("name".into(), Value::String("default".into()));
     product.insert(
         "runtimeOS".into(),
         Value::String(sdk.sdk_type.as_str().into()),
     );
+    let target = resolve_target_sdk_version(compile_sdk, sdk, target_sdk_version)?;
 
     if compile_sdk.api_level >= 26 {
         // API 26 unifies HarmonyOS and OpenHarmony build-profile SDK fields as
         // strings.  platformVersion is the SDK's canonical unified version and
         // no longer uses the legacy `platform(api)` spelling.
         let compile = Value::String(compile_sdk.platform_version.clone());
-        product.insert("compileSdkVersion".into(), compile.clone());
-        product.insert("targetSdkVersion".into(), compile);
+        product.insert("compileSdkVersion".into(), compile);
+        product.insert("targetSdkVersion".into(), target);
         product.insert(
             "compatibleSdkVersion".into(),
             Value::String(sdk.version.clone()),
@@ -4032,15 +4069,9 @@ fn render_hvigor_product(compile_sdk: &CompileSdk, sdk: &SdkCompatibility) -> Re
         match sdk.sdk_type {
             RuntimeSdkType::HarmonyOs => {
                 // HarmonyOS compileSdkVersion is optional before API 26.  Keep
-                // the already toolchain-verified target spelling and preserve
-                // the caller's explicit minimum-compatible version verbatim.
-                product.insert(
-                    "targetSdkVersion".into(),
-                    Value::String(format!(
-                        "{}({})",
-                        compile_sdk.platform_version, compile_sdk.api_level
-                    )),
-                );
+                // the requested target spelling and preserve the caller's
+                // explicit minimum-compatible version verbatim.
+                product.insert("targetSdkVersion".into(), target);
                 product.insert(
                     "compatibleSdkVersion".into(),
                     Value::String(sdk.version.clone()),
@@ -4054,8 +4085,8 @@ fn render_hvigor_product(compile_sdk: &CompileSdk, sdk: &SdkCompatibility) -> Re
                     )
                 })?;
                 let compile = Value::Number(u64::from(compile_sdk.api_level).into());
-                product.insert("compileSdkVersion".into(), compile.clone());
-                product.insert("targetSdkVersion".into(), compile);
+                product.insert("compileSdkVersion".into(), compile);
+                product.insert("targetSdkVersion".into(), target);
                 product.insert(
                     "compatibleSdkVersion".into(),
                     Value::Number(u64::from(compatible).into()),
@@ -4064,6 +4095,66 @@ fn render_hvigor_product(compile_sdk: &CompileSdk, sdk: &SdkCompatibility) -> Re
         }
     }
     Ok(Value::Object(product))
+}
+
+fn resolve_target_sdk_version(
+    compile_sdk: &CompileSdk,
+    sdk: &SdkCompatibility,
+    explicit: Option<&str>,
+) -> Result<Value> {
+    let compatible_api = compatible_sdk_api_level(sdk)?;
+    let (target_api, target) = if let Some(explicit) = explicit {
+        let value = validate_sdk_version_metadata_value(explicit, "target")?;
+        let api = sdk_version_api_level(value, "target")?;
+        let rendered = match sdk.sdk_type {
+            RuntimeSdkType::HarmonyOs => {
+                if api < 26 && !(value.contains('(') && value.ends_with(')')) {
+                    bail!(
+                        "HarmonyOS target SDK version `{value}` must use the official `platform(api)` spelling before API 26"
+                    );
+                }
+                Value::String(value.to_string())
+            }
+            RuntimeSdkType::OpenHarmony if compile_sdk.api_level < 26 => {
+                let numeric = value.parse::<u32>().with_context(|| {
+                    format!(
+                        "OpenHarmony target SDK `{value}` must be a numeric API level before API 26"
+                    )
+                })?;
+                Value::Number(u64::from(numeric).into())
+            }
+            RuntimeSdkType::OpenHarmony => Value::String(value.to_string()),
+        };
+        (api, rendered)
+    } else {
+        let rendered = if compile_sdk.api_level >= 26 {
+            Value::String(compile_sdk.platform_version.clone())
+        } else {
+            match sdk.sdk_type {
+                RuntimeSdkType::HarmonyOs => Value::String(format!(
+                    "{}({})",
+                    compile_sdk.platform_version, compile_sdk.api_level
+                )),
+                RuntimeSdkType::OpenHarmony => {
+                    Value::Number(u64::from(compile_sdk.api_level).into())
+                }
+            }
+        };
+        (compile_sdk.api_level, rendered)
+    };
+
+    if target_api < compatible_api {
+        bail!(
+            "target SDK API {target_api} is lower than compatible SDK API {compatible_api}; expected compatible SDK <= target SDK <= compile SDK"
+        );
+    }
+    if target_api > compile_sdk.api_level {
+        bail!(
+            "target SDK API {target_api} exceeds compile SDK API {}; expected compatible SDK <= target SDK <= compile SDK",
+            compile_sdk.api_level
+        );
+    }
+    Ok(target)
 }
 
 fn discover_compiled_har(module_dir: &Utf8Path) -> Result<Utf8PathBuf> {
@@ -4319,9 +4410,13 @@ fn discover_sdk_type(ohos_ndk: &str, bisheng: bool) -> Result<Option<RuntimeSdkT
 }
 
 fn validate_sdk_metadata_value(value: &str) -> Result<&str> {
+    validate_sdk_version_metadata_value(value, "compatible")
+}
+
+fn validate_sdk_version_metadata_value<'a>(value: &'a str, label: &str) -> Result<&'a str> {
     let value = value.trim();
     if value.is_empty() || utf16_len(value) > 64 || value.chars().any(char::is_control) {
-        bail!("OHOS compatible SDK metadata must be 1-64 plain-text UTF-16 code units");
+        bail!("OHOS {label} SDK metadata must be 1-64 plain-text UTF-16 code units");
     }
     Ok(value)
 }

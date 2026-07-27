@@ -385,6 +385,10 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "compatible-sdk-version")]
     pub(crate) compatible_sdk_version: Option<String>,
 
+    /// Target Harmony/OpenHarmony SDK version. Defaults to the resolved compile SDK.
+    #[clap(long = "target-sdk-version")]
+    pub(crate) target_sdk_version: Option<String>,
+
     /// Compatible SDK type, such as HarmonyOS or OpenHarmony.
     #[clap(long = "compatible-sdk-type")]
     pub(crate) compatible_sdk_type: Option<String>,
@@ -1420,6 +1424,7 @@ fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
         no_har: public.no_har,
         skip_libs: public.skip_libs,
         compatible_sdk_version: public.compatible_sdk_version.as_deref(),
+        target_sdk_version: public.target_sdk_version.as_deref(),
         compatible_sdk_type: public.compatible_sdk_type.as_deref(),
         bisheng: public.bisheng,
         hvigorw: public.hvigorw.as_deref(),
@@ -1655,6 +1660,7 @@ fn planned_direct_ohos_hsp_outputs(
             license: args.license.clone(),
             description: args.description.clone(),
             compatible_sdk_version: args.compatible_sdk_version.clone(),
+            target_sdk_version: args.target_sdk_version.clone(),
             compatible_sdk_type: args.compatible_sdk_type.clone(),
             device_types: args.device_types.clone(),
             package_kind: args.package_kind,
@@ -1725,6 +1731,7 @@ fn build_ohos_internal(
         no_har: args.no_har,
         skip_libs: args.skip_libs,
         compatible_sdk_version: args.compatible_sdk_version.as_deref(),
+        target_sdk_version: args.target_sdk_version.as_deref(),
         compatible_sdk_type: args.compatible_sdk_type.as_deref(),
         bisheng: args.bisheng,
         hvigorw: args.hvigorw.as_deref(),
@@ -1849,6 +1856,7 @@ fn build_ohos_internal(
                 license: args.license.clone(),
                 description: args.description.clone(),
                 compatible_sdk_version: args.compatible_sdk_version.clone(),
+                target_sdk_version: args.target_sdk_version.clone(),
                 compatible_sdk_type: args.compatible_sdk_type.clone(),
                 device_types: args.device_types.clone(),
                 package_kind: args.package_kind,
@@ -1989,6 +1997,7 @@ fn build_ohos_internal(
         license: args.license,
         description: args.description,
         compatible_sdk_version: args.compatible_sdk_version,
+        target_sdk_version: args.target_sdk_version,
         compatible_sdk_type: args.compatible_sdk_type,
         device_types: args.device_types,
         package_kind: args.package_kind,

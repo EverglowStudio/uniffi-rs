@@ -2633,6 +2633,68 @@ fn artifacts_hsp_preflight_is_zero_residue_for_harmony_and_multi_target_calls() 
     }
 }
 
+#[test]
+fn artifacts_hsp_target_sdk_order_is_validated_before_output_generation() {
+    for (compatible, target, expected) in [
+        (
+            "6.0.0(20)",
+            "6.0.3(25)",
+            "target SDK API 25 exceeds compile SDK API 24",
+        ),
+        (
+            "6.0.1(21)",
+            "6.0.0(20)",
+            "target SDK API 20 is lower than compatible SDK API 21",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let fake_ndk = root.join("fake-ndk");
+        let fake_sdk = root.join("fake-sdk");
+        std::fs::create_dir(&fake_ndk).unwrap();
+        std::fs::create_dir_all(fake_sdk.join("default")).unwrap();
+        std::fs::write(
+            fake_sdk.join("default/sdk-pkg.json"),
+            r#"{"data":{"platformVersion":"6.0.2","apiVersion":"24"}}"#,
+        )
+        .unwrap();
+        let before = snapshot(root);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_uniffi-bindgen"));
+        command
+            .current_dir(repository_root())
+            .args(["artifacts", "build", "--manifest-path"])
+            .arg(core_manifest())
+            .args(["--target", "harmony", "--managed-layout", "--package-dir"])
+            .arg(root.join("package"))
+            .args([
+                "--ohos-package-type",
+                "hsp",
+                "--ohos-integrated-hsp",
+                "--ohos-compatible-sdk-version",
+                compatible,
+                "--ohos-target-sdk-version",
+                target,
+                "--ohos-compatible-sdk-type",
+                "HarmonyOS",
+                "--ohos-deveco-sdk-home",
+            ])
+            .arg(&fake_sdk)
+            .arg("--no-format")
+            .env("OHOS_NDK_HOME", &fake_ndk);
+
+        let output = command.output().unwrap();
+        let log = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success());
+        assert!(log.contains(expected), "{log}");
+        assert_eq!(snapshot(root), before, "invalid target SDK left residue");
+    }
+}
+
 fn codelinter_bin() -> PathBuf {
     if let Some(path) = std::env::var_os("CODELINTER") {
         return PathBuf::from(path);
@@ -2734,6 +2796,8 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         .args([
             "--target",
             "wasm",
+            "--ohos-target-sdk-version",
+            "6.0.0(20)",
             "--cargo-feature",
             "wasm-streams",
             "--cargo-bin",
@@ -2815,6 +2879,7 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
     assert_eq!(runtime_module["module"]["type"], "shared");
     assert_eq!(runtime_module["module"]["packageName"], package_name);
     assert_eq!(runtime_module["module"]["compileMode"], "esmodule");
+    assert_eq!(runtime_module["app"]["targetAPIVersion"], 60_000_020);
     let runtime_so = runtime_files
         .keys()
         .filter(|name| name.ends_with(".so"))
