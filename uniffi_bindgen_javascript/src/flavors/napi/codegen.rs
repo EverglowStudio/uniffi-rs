@@ -1840,31 +1840,65 @@ impl<'a> Generator<'a> {
                 self.lower_arg_expr(arg_ident, &arg.as_type())
             })
             .collect::<Result<Vec<_>>>()?;
-        let receiver = if method.takes_self_by_arc() {
-            quote!((*(#receiver_ident)).0.clone())
-        } else {
-            quote!((*(#receiver_ident)).0.as_ref())
-        };
-        let call = quote!(#receiver.#method_ident(#(#lowered),*));
-        let call = if method.is_async() {
-            quote!(#call.await)
-        } else {
-            call
-        };
         let output_ty = match method.return_type() {
             Some(return_type) => self.bridge_return_type(return_type)?,
             None => quote!(()),
         };
-        let body = self.render_result_body(call, method.return_type(), method.throws_type())?;
 
         if method.is_async() {
+            // `ClassInstance` contains N-API state and is not `Send`.  The
+            // synchronous N-API entrypoint lowers all arguments, clones the
+            // core `Arc`, and releases the receiver before it creates the
+            // Send future that will cross an async suspension.
+            let lowered_bindings = method
+                .arguments()
+                .into_iter()
+                .map(|arg| {
+                    let arg_ident = rust_ident(arg.name());
+                    let lowered_ident = rust_ident(&format!("__uniffi_{}", arg.name()));
+                    let lowered_expr = self.lower_arg_expr(arg_ident, &arg.as_type())?;
+                    Ok(quote!(let #lowered_ident = #lowered_expr;))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let lowered_args = method
+                .arguments()
+                .into_iter()
+                .map(|arg| rust_ident(&format!("__uniffi_{}", arg.name())))
+                .collect::<Vec<_>>();
+            let async_receiver = if method.takes_self_by_arc() {
+                quote!(__uniffi_core)
+            } else {
+                quote!(__uniffi_core.as_ref())
+            };
+            let call = quote!(#async_receiver.#method_ident(#(#lowered_args),*).await);
+            let body = self.render_result_body(call, method.return_type(), method.throws_type())?;
             Ok(quote! {
                 #[napi]
-                pub async fn #fn_ident(#receiver_ident: ClassInstance<'_, #object_ident>, #(#args),*) -> Result<#output_ty> {
-                    #body
+                pub fn #fn_ident(__uniffi_env: Env, #receiver_ident: ClassInstance<'_, #object_ident>, #(#args),*) -> Result<PromiseRaw<'static, #output_ty>> {
+                    #(#lowered_bindings)*
+                    let __uniffi_core = (*(#receiver_ident)).0.clone();
+                    let __uniffi_future = async move {
+                        #body
+                    };
+                    drop(#receiver_ident);
+                    let __uniffi_promise = __uniffi_env.spawn_future(__uniffi_future)?;
+                    Ok(unsafe {
+                        // The raw JS promise is returned immediately; the lifetime only
+                        // ties PromiseRaw to the Env used to create it.
+                        std::mem::transmute::<PromiseRaw<'_, #output_ty>, PromiseRaw<'static, #output_ty>>(
+                            __uniffi_promise,
+                        )
+                    })
                 }
             })
         } else {
+            let receiver = if method.takes_self_by_arc() {
+                quote!((*(#receiver_ident)).0.clone())
+            } else {
+                quote!((*(#receiver_ident)).0.as_ref())
+            };
+            let call = quote!(#receiver.#method_ident(#(#lowered),*));
+            let body = self.render_result_body(call, method.return_type(), method.throws_type())?;
             Ok(quote! {
                 #[napi]
                 pub fn #fn_ident(#receiver_ident: ClassInstance<'_, #object_ident>, #(#args),*) -> Result<#output_ty> {
@@ -2303,7 +2337,9 @@ impl<'a> Generator<'a> {
             Type::UInt32 => Ok(quote!(u32)),
             Type::Int32 => Ok(quote!(i32)),
             Type::UInt64 | Type::Int64 => Ok(quote!(napi::bindgen_prelude::BigInt)),
-            Type::Float32 => Ok(quote!(f32)),
+            // N-API (including napi-ohos) exposes JavaScript numbers as f64.
+            // Keep f32 in the core API and convert at the bridge boundary.
+            Type::Float32 => Ok(quote!(f64)),
             Type::Float64 => Ok(quote!(f64)),
             Type::Boolean => Ok(quote!(bool)),
             Type::String => Ok(quote!(String)),
@@ -2430,10 +2466,14 @@ impl<'a> Generator<'a> {
             | Type::Int16
             | Type::UInt32
             | Type::Int32
-            | Type::Float32
             | Type::Float64
             | Type::Boolean
             | Type::String => Ok(expr),
+            // JavaScript numbers reach the N-API bridge as f64. Rust's `as`
+            // conversion preserves the existing JS binding behavior for NaN
+            // and infinities while applying the required IEEE-754 f32 rounding
+            // (or overflow to infinity) for the core contract.
+            Type::Float32 => Ok(quote!(#expr as f32)),
             // BigInt → u64: reject negative and out-of-range values.
             Type::UInt64 => Ok(quote!({
                 let __big = #expr;
@@ -2527,10 +2567,12 @@ impl<'a> Generator<'a> {
             | Type::Int16
             | Type::UInt32
             | Type::Int32
-            | Type::Float32
             | Type::Float64
             | Type::Boolean
             | Type::String => Ok(expr),
+            // N-API has no f32 value conversion; JavaScript observes every
+            // number as f64 while the core API remains f32.
+            Type::Float32 => Ok(quote!(#expr as f64)),
             // u64/i64 → BigInt for JS `bigint`.
             Type::UInt64 | Type::Int64 => Ok(quote!(napi::bindgen_prelude::BigInt::from(#expr))),
             Type::Bytes => Ok(quote!(#expr.into())),
@@ -2694,10 +2736,10 @@ impl<'a> Generator<'a> {
             | Type::Int16
             | Type::UInt32
             | Type::Int32
-            | Type::Float32
             | Type::Float64
             | Type::Boolean
             | Type::String => Ok(expr),
+            Type::Float32 => Ok(quote!(#expr as f32)),
             Type::UInt64 => Ok(quote!({
                 let __big = #expr;
                 let (__sign, __val, __lossless) = __big.get_u64();
@@ -3784,6 +3826,188 @@ mod renamed_record_core_path_tests {
             assert!(generated.contains("pub nextMessage: Option<DolphinMessageRow>"));
         }
         assert!(ohos.contains("use napi_ohos::bindgen_prelude::*;"));
+    }
+}
+
+#[cfg(test)]
+mod async_object_receiver_tests {
+    use super::super::ohos_bridge_identity_export;
+    use super::*;
+    use uniffi_meta::{MetadataGroup, MethodMetadata, NamespaceMetadata, ObjectMetadata};
+
+    fn fixture() -> ComponentInterface {
+        let module_path = "async_object_receiver_fixture";
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.into(),
+                name: module_path.into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            ObjectMetadata {
+                module_path: module_path.into(),
+                name: "AsyncService".into(),
+                orig_name: None,
+                remote: false,
+                imp: ObjectImpl::Struct,
+                docstring: None,
+            }
+            .into(),
+        );
+        for (name, takes_self_by_arc) in [("borrowed_async", false), ("arc_async", true)] {
+            group.add_item(
+                MethodMetadata {
+                    module_path: module_path.into(),
+                    self_name: "AsyncService".into(),
+                    name: name.into(),
+                    orig_name: None,
+                    is_async: true,
+                    inputs: vec![],
+                    return_type: Some(Type::String),
+                    throws: None,
+                    takes_self_by_arc,
+                    checksum: None,
+                    docstring: None,
+                }
+                .into(),
+            );
+        }
+        ComponentInterface::from_metadata(group).expect("async object receiver fixture metadata")
+    }
+
+    #[test]
+    fn async_object_methods_drop_napi_receivers_before_awaiting_core_futures() {
+        let ci = fixture();
+        let digest = "0".repeat(64);
+        let identity = ohos_bridge_identity_export(&digest);
+        let rendered = [
+            render_napi_rust(&ci).expect("NAPI codegen must succeed"),
+            render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed"),
+        ];
+
+        for source in rendered {
+            let compact = source.split_whitespace().collect::<String>();
+            assert!(
+                compact.contains("pubfnasync_service_borrowed_async(__uniffi_env:Env,handle:ClassInstance<'_,AsyncService>,)->Result<PromiseRaw<'static,String>>"),
+                "async object receiver must start a synchronous N-API Promise boundary:\n{source}"
+            );
+            assert!(
+                compact.contains("let__uniffi_core=(*(handle)).0.clone();"),
+                "async object receiver did not clone the core Arc:\n{source}"
+            );
+            assert!(
+                compact.contains("let__uniffi_future=asyncmove{Ok(__uniffi_core.as_ref().borrowed_async().await)}"),
+                "&self async object receiver changed semantics:\n{source}"
+            );
+            assert!(
+                compact
+                    .contains("let__uniffi_future=asyncmove{Ok(__uniffi_core.arc_async().await)}"),
+                "Arc<Self> async object receiver changed semantics:\n{source}"
+            );
+            assert_eq!(
+                compact
+                    .matches("drop(handle);let__uniffi_promise=__uniffi_env.spawn_future(__uniffi_future)?;")
+                    .count(),
+                2,
+                "N-API ClassInstance must be released before creating the Send future:\n{source}"
+            );
+            assert!(
+                !compact.contains("unsafeimplSend"),
+                "the bridge must not mark N-API state Send:\n{source}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod float32_bridge_tests {
+    use super::super::ohos_bridge_identity_export;
+    use super::*;
+    use uniffi_meta::{
+        FieldMetadata, FnMetadata, FnParamMetadata, MetadataGroup, NamespaceMetadata,
+        RecordMetadata,
+    };
+
+    const MODULE_PATH: &str = "float32_bridge_fixture";
+
+    fn fixture() -> ComponentInterface {
+        let record_type = Type::Record {
+            module_path: MODULE_PATH.into(),
+            name: "Float32Record".into(),
+        };
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: MODULE_PATH.into(),
+                name: MODULE_PATH.into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            RecordMetadata {
+                module_path: MODULE_PATH.into(),
+                name: "Float32Record".into(),
+                orig_name: None,
+                rust_path: None,
+                remote: false,
+                fields: vec![FieldMetadata {
+                    name: "speed".into(),
+                    orig_name: None,
+                    ty: Type::Float32,
+                    default: None,
+                    docstring: None,
+                }],
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            FnMetadata {
+                module_path: MODULE_PATH.into(),
+                name: "roundtrip_float32_record".into(),
+                orig_name: None,
+                is_async: false,
+                inputs: vec![FnParamMetadata::simple("value", record_type.clone())],
+                return_type: Some(record_type),
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        ComponentInterface::from_metadata(group).expect("float32 record fixture metadata")
+    }
+
+    #[test]
+    fn float32_record_uses_js_number_f64_and_preserves_core_f32_contract() {
+        let ci = fixture();
+        let digest = "0".repeat(64);
+        let identity = ohos_bridge_identity_export(&digest);
+        let rendered = [
+            render_napi_rust(&ci).expect("NAPI codegen must succeed"),
+            render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed"),
+        ];
+
+        for source in rendered {
+            assert!(
+                source.contains("pub speed: f64"),
+                "N-API record fields must use the JavaScript number bridge type:\n{source}"
+            );
+            assert!(
+                source.contains("speed: value.speed as f32"),
+                "record lowering must narrow the JS number at the core boundary:\n{source}"
+            );
+            assert!(
+                source.contains("speed: value.speed as f64"),
+                "record lifting must widen the core f32 at the JS boundary:\n{source}"
+            );
+            assert!(
+                !source.contains("pub speed: f32"),
+                "N-API must not expose an unsupported f32 field:\n{source}"
+            );
+        }
     }
 }
 
