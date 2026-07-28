@@ -6175,6 +6175,61 @@ fn generate_synthetic_with_host_crates(root: &std::path::Path) -> (Utf8PathBuf, 
     (out_dir, host_dir)
 }
 
+fn write_float32_record_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
+    let core = root.join("float32_record_core");
+    let src = core.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        core.join("Cargo.toml"),
+        "[package]\nname = \"float32-record-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\nname = \"float32_record_core\"\ncrate-type = [\"lib\"]\n\n[dependencies]\n\n[workspace]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "#[derive(Clone, Debug)]\npub struct Float32Record {\n    pub speed: f32,\n}\n\npub fn roundtrip_float32_record(value: Float32Record) -> Float32Record {\n    value\n}\n\npub struct AsyncService;\n\nimpl AsyncService {\n    pub fn new() -> std::sync::Arc<Self> {\n        std::sync::Arc::new(Self)\n    }\n\n    pub async fn greet(&self, message: String) -> String {\n        message\n    }\n}\n",
+    )
+    .unwrap();
+    let udl = src.join("float32_record_core.udl");
+    std::fs::write(
+        &udl,
+        "dictionary Float32Record {\n    float speed;\n};\n\ninterface AsyncService {\n    constructor();\n    [Async]\n    string greet(string message);\n};\n\nnamespace float32_record_core {\n    Float32Record roundtrip_float32_record(Float32Record value);\n};\n",
+    )
+    .unwrap();
+    (
+        Utf8PathBuf::from_path_buf(udl).unwrap(),
+        Utf8PathBuf::from_path_buf(core.join("Cargo.toml")).unwrap(),
+    )
+}
+
+fn generate_float32_record_hosts(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
+    let (udl, manifest) = write_float32_record_core_crate(root);
+    let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: udl,
+            out_dir: out_dir.clone(),
+            artifact_dir: None,
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: Some(HostCrateOptions {
+                manifest_path: manifest,
+                host_crates_dir: host_dir.clone(),
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
+                ohos_rs_dir: None,
+            }),
+            flavors: vec![FlavorTarget::Napi, FlavorTarget::Harmony],
+        },
+    )
+    .expect("float32 record host generation should succeed");
+    (out_dir, host_dir)
+}
+
 fn run_cargo_check(
     manifest: &Utf8PathBuf,
     extra: &[&str],
@@ -6187,6 +6242,35 @@ fn run_cargo_check(
         .env("CARGO_TARGET_DIR", target_dir)
         .env_remove("RUSTFLAGS");
     cmd.output()
+}
+
+// `cargo` is selected by rustup using this test process's working directory,
+// which is under the workspace `rust-toolchain.toml`.  Resolve the probe
+// rustc through that same override (or Cargo's explicit RUSTC override), not
+// through an arbitrary PATH `rustc`; otherwise a target installed for stable
+// can incorrectly green-light a cargo check performed by the pinned toolchain.
+fn cargo_target_libdir(target: &str) -> std::io::Result<Option<std::path::PathBuf>> {
+    let rustc = match std::env::var_os("RUSTC") {
+        Some(value) if !value.is_empty() => std::path::PathBuf::from(value),
+        _ => {
+            let output = Command::new("rustup").args(["which", "rustc"]).output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "rustup could not resolve the rustc used by cargo: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        }
+    };
+    let output = Command::new(rustc)
+        .args(["--print", "target-libdir", "--target", target])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let libdir = std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Ok(libdir.is_dir().then_some(libdir))
 }
 
 fn run_cargo_build(
@@ -6233,6 +6317,79 @@ fn host_crates_napi_passes_cargo_check() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+}
+
+#[test]
+fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (out_dir, host_dir) = generate_float32_record_hosts(tmp.path());
+
+    for bridge in [
+        out_dir.join("node/float32_record_core.rs"),
+        out_dir.join("harmony/float32_record_core.rs"),
+    ] {
+        let source = std::fs::read_to_string(&bridge).unwrap();
+        assert!(
+            source.contains("pub speed: f64")
+                && source.contains("speed: value.speed as f32")
+                && source.contains("speed: value.speed as f64"),
+            "float32 bridge must adapt JS number at the FFI boundary: {source}"
+        );
+        assert!(
+            !source.contains("pub speed: f32"),
+            "the host crate must not ask N-API to marshal f32 directly: {source}"
+        );
+        assert!(
+            source.contains("pub fn async_service_greet(")
+                && source.contains("__uniffi_env: Env,")
+                && source.contains("handle: ClassInstance<'_, AsyncService>,")
+                && source.contains("let __uniffi_core = (*(handle)).0.clone();")
+                && source.contains("drop(handle);")
+                && source.contains("spawn_future(__uniffi_future)"),
+            "async object receivers must lower before entering the Send promise future: {source}"
+        );
+        assert!(
+            !source.contains("pub async fn async_service_greet("),
+            "an async N-API function would capture ClassInstance before its body can drop it: {source}"
+        );
+    }
+
+    let napi_manifest = host_dir.join("napi/Cargo.toml");
+    let napi_target = tmp.path().join("cargo-target-float32-napi");
+    let napi_output = run_cargo_check(&napi_manifest, &[], &napi_target)
+        .expect("cargo must be available for the N-API f32 host regression");
+    assert!(
+        napi_output.status.success(),
+        "cargo check on f32 N-API host crate failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&napi_output.stdout),
+        String::from_utf8_lossy(&napi_output.stderr),
+    );
+
+    let target = "aarch64-unknown-linux-ohos";
+    let Some(target_libdir) = cargo_target_libdir(target)
+        .expect("the rustc selected by cargo must be available for the OHOS f32 host regression")
+    else {
+        eprintln!(
+            "SKIP host_crates_napi_and_ohos_compile_float32_record_fixture: {target} standard library is not installed for Cargo's rust toolchain"
+        );
+        return;
+    };
+    assert!(
+        target_libdir.is_dir(),
+        "Cargo's target libdir must exist before compiling the OHOS host: {}",
+        target_libdir.display()
+    );
+
+    let ohos_manifest = host_dir.join("ohos/Cargo.toml");
+    let ohos_target = tmp.path().join("cargo-target-float32-ohos");
+    let ohos_output = run_cargo_check(&ohos_manifest, &["--target", target], &ohos_target)
+        .expect("cargo must be available for the OHOS f32 host regression");
+    assert!(
+        ohos_output.status.success(),
+        "cargo check on f32 OHOS host crate failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ohos_output.stdout),
+        String::from_utf8_lossy(&ohos_output.stderr),
+    );
 }
 
 #[test]
