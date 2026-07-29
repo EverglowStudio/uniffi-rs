@@ -1149,10 +1149,11 @@ impl<'a> Generator<'a> {
     ) -> TokenStream {
         if self.async_callbacks_return_directly() {
             // `napi-ohos` invokes a TSFN with the direct synchronous return
-            // value.  `false` also prevents napi-rs from prepending Node's
-            // error-first argument, which ArkTS callback sidecars do not use.
+            // value. Keep the default error-first convention enabled: ArkTS
+            // completes the direct TSFN return callback only through this
+            // `CalleeHandled=true` path.
             quote!(
-                ThreadsafeFunction<#tsfn_args, #result_ty, #tsfn_args, napi::Status, false>
+                ThreadsafeFunction<#tsfn_args, #result_ty, #tsfn_args, napi::Status, true>
             )
         } else {
             quote!(ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>)
@@ -1175,7 +1176,7 @@ impl<'a> Generator<'a> {
         let result_type_annotation = result_ty.map(|ty| quote!(: #ty));
         if self.async_callbacks_return_directly() {
             quote! {
-                let #result_ident #result_type_annotation = #callback.call_async(#call_value).await.unwrap_or_else(|err| {
+                let #result_ident #result_type_annotation = #callback.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
                     panic!(#dispatch_error, #object_name, #method_name, err);
                 });
             }
@@ -4080,10 +4081,11 @@ mod ohos_async_callback_return_tests {
             "Node async callback ABI must remain Promise + two awaits:\n{node}"
         );
         assert!(
-            ohos_compact.contains("ThreadsafeFunction<u32,u32,u32,napi_ohos::Status,false>")
-                && ohos_compact.contains("call_async(value).await")
+            ohos_compact.contains("ThreadsafeFunction<u32,u32,u32,napi_ohos::Status,true>")
+                && ohos_compact.contains("call_async(Ok(value)).await")
+                && ohos_compact.contains("call_async(Ok(())).await")
                 && !ohos_compact.contains("__callback_promise.await"),
-            "OHOS direct callback ABI must use a concrete return and one await:\n{ohos}"
+            "OHOS direct callback ABI must use error-first concrete returns and one await:\n{ohos}"
         );
         assert!(
             ohos.contains("__uniffi_registry_child_worker_read")
@@ -4092,8 +4094,9 @@ mod ohos_async_callback_return_tests {
         );
         assert!(
             ohos_compact.contains("__UniffiAsyncWorkerCheckedCallbackResult")
-                && ohos_compact.contains("napi_ohos::Status,false"),
-            "OHOS fallible async callbacks must use direct typed envelopes:\n{ohos}"
+                && ohos_compact.contains("napi_ohos::Status,true")
+                && !ohos_compact.contains("napi_ohos::Status,false"),
+            "OHOS fallible async callbacks must use error-first direct typed envelopes:\n{ohos}"
         );
         assert!(
             node.contains("pub value: Option<Option<u32>>")
