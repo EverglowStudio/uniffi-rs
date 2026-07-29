@@ -18,7 +18,7 @@ use uniffi_bindgen::interface::{
 use crate::callback_metadata;
 
 pub fn render_napi_rust(ci: &ComponentInterface) -> Result<String> {
-    let generator = Generator::new(ci);
+    let generator = Generator::new(ci, CallbackAsyncReturn::Promise);
     generator.validate()?;
     let tokens = generator.render()?;
     let file = parse2::<syn::File>(tokens)?;
@@ -38,7 +38,11 @@ pub fn render_ohos_rust(
         contract_digest.len() == 64 && contract_digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "invalid OHOS facade contract digest"
     );
-    let mut rust = render_napi_rust(ci)?;
+    let generator = Generator::new(ci, CallbackAsyncReturn::Direct);
+    generator.validate()?;
+    let tokens = generator.render()?;
+    let file = parse2::<syn::File>(tokens)?;
+    let mut rust = prettyplease::unparse(&file);
     let identity_ident = rust_ident(identity_export);
     let identity_tokens = quote! {
         #[allow(non_snake_case)]
@@ -57,11 +61,31 @@ pub fn render_ohos_rust(
 
 pub(crate) struct Generator<'a> {
     ci: &'a ComponentInterface,
+    callback_async_return: CallbackAsyncReturn,
+}
+
+/// How an async foreign callback returns through a threadsafe function.
+///
+/// Node N-API gives us a JavaScript Promise as the direct callback result,
+/// while ArkTS' N-API implementation only completes the TSFN return callback
+/// for a concrete value.  Keep that platform distinction in the generator so
+/// the two bridge ABIs cannot silently drift through post-generation edits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallbackAsyncReturn {
+    Promise,
+    Direct,
 }
 
 impl<'a> Generator<'a> {
-    fn new(ci: &'a ComponentInterface) -> Self {
-        Self { ci }
+    fn new(ci: &'a ComponentInterface, callback_async_return: CallbackAsyncReturn) -> Self {
+        Self {
+            ci,
+            callback_async_return,
+        }
+    }
+
+    fn async_callbacks_return_directly(&self) -> bool {
+        self.callback_async_return == CallbackAsyncReturn::Direct
     }
 
     fn has_stream_functions(&self) -> bool {
@@ -982,21 +1006,12 @@ impl<'a> Generator<'a> {
         if method.is_async() {
             if method.throws_type().is_some() {
                 let result_ty = self.callback_result_ident(object, method);
-                Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
-                })
+                Ok(self.callback_async_tsfn_type(tsfn_args, quote!(#result_ty)))
             } else if let Some(return_type) = method.return_type() {
                 let bridge_return_ty = self.callback_async_bridge_type(return_type)?;
-                Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
-                })
+                Ok(self.callback_async_tsfn_type(tsfn_args, bridge_return_ty))
             } else {
-                Ok(quote! {
-                    ThreadsafeFunction<
-                        #tsfn_args,
-                        napi::bindgen_prelude::Promise<()>,
-                    >
-                })
+                Ok(self.callback_async_tsfn_type(tsfn_args, quote!(())))
             }
         } else if method.throws_type().is_some() {
             let result_ty = self.callback_result_ident(object, method);
@@ -1109,18 +1124,12 @@ impl<'a> Generator<'a> {
         if method.is_async() {
             if method.throws_type().is_some() {
                 let result_ty = self.callback_result_ident(object, method);
-                Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
-                })
+                Ok(self.callback_async_tsfn_type(tsfn_args, quote!(#result_ty)))
             } else if let Some(return_type) = method.return_type() {
                 let bridge_return_ty = self.callback_async_bridge_type(return_type)?;
-                Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
-                })
+                Ok(self.callback_async_tsfn_type(tsfn_args, bridge_return_ty))
             } else {
-                Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<()>>
-                })
+                Ok(self.callback_async_tsfn_type(tsfn_args, quote!(())))
             }
         } else if method.throws_type().is_some() {
             let result_ty = self.callback_result_ident(object, method);
@@ -1130,6 +1139,55 @@ impl<'a> Generator<'a> {
             Ok(quote!(ThreadsafeFunction<#tsfn_args, #bridge_return_ty>))
         } else {
             Ok(quote!(ThreadsafeFunction<#tsfn_args>))
+        }
+    }
+
+    fn callback_async_tsfn_type(
+        &self,
+        tsfn_args: TokenStream,
+        result_ty: TokenStream,
+    ) -> TokenStream {
+        if self.async_callbacks_return_directly() {
+            // `napi-ohos` invokes a TSFN with the direct synchronous return
+            // value.  `false` also prevents napi-rs from prepending Node's
+            // error-first argument, which ArkTS callback sidecars do not use.
+            quote!(
+                ThreadsafeFunction<#tsfn_args, #result_ty, #tsfn_args, napi::Status, false>
+            )
+        } else {
+            quote!(ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>)
+        }
+    }
+
+    fn render_async_callback_await(
+        &self,
+        result_ident: &syn::Ident,
+        result_ty: Option<TokenStream>,
+        callback: TokenStream,
+        call_value: TokenStream,
+        dispatch_error: &str,
+        rejected_error: &str,
+        object_name: &str,
+        method_name: &str,
+    ) -> TokenStream {
+        let dispatch_error = format!("callback trait `{{}}`.{{}} {dispatch_error}: {{}}");
+        let rejected_error = format!("callback trait `{{}}`.{{}} {rejected_error}: {{}}");
+        let result_type_annotation = result_ty.map(|ty| quote!(: #ty));
+        if self.async_callbacks_return_directly() {
+            quote! {
+                let #result_ident #result_type_annotation = #callback.call_async(#call_value).await.unwrap_or_else(|err| {
+                    panic!(#dispatch_error, #object_name, #method_name, err);
+                });
+            }
+        } else {
+            quote! {
+                let __callback_promise = #callback.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
+                    panic!(#dispatch_error, #object_name, #method_name, err);
+                });
+                let #result_ident #result_type_annotation = __callback_promise.await.unwrap_or_else(|err| {
+                    panic!(#rejected_error, #object_name, #method_name, err);
+                });
+            }
         }
     }
 
@@ -1145,12 +1203,28 @@ impl<'a> Generator<'a> {
                 .expect("result structs are only rendered for fallible callbacks"),
         )?;
         let value_field = if let Some(return_type) = method.return_type() {
-            let value_ty = if method.is_async() {
-                self.callback_async_bridge_type(return_type)?
+            if let Some(inner_type) = self.ohos_async_callback_optional_return_inner(method) {
+                // A `#[napi(object)]` field of `Option<Option<T>>` cannot
+                // distinguish an envelope field whose value is `null` from
+                // an envelope field that is missing altogether.  The former
+                // is a valid `None` callback result, while the latter must
+                // remain a malformed callback-envelope diagnostic.
+                //
+                // Keep the result value singly optional and make its
+                // presence explicit for the OHOS direct-return ABI.
+                let value_ty = self.callback_async_bridge_type(inner_type)?;
+                quote!(
+                    pub has_value: bool,
+                    pub value: Option<#value_ty>,
+                )
             } else {
-                self.callback_bridge_type(return_type)?
-            };
-            quote!(pub value: Option<#value_ty>,)
+                let value_ty = if method.is_async() {
+                    self.callback_async_bridge_type(return_type)?
+                } else {
+                    self.callback_bridge_type(return_type)?
+                };
+                quote!(pub value: Option<#value_ty>,)
+            }
         } else {
             quote!()
         };
@@ -1184,7 +1258,8 @@ impl<'a> Generator<'a> {
         let registry_field_ident = self.callback_registry_field_ident(object.name(), method.name());
         if method.is_async() {
             if method.throws_type().is_some() {
-                let result_ident = self.callback_result_ident(object, method);
+                let result_ty = self.callback_result_ident(object, method);
+                let result_ident = format_ident!("__callback_result");
                 let error_ty = self.core_type_path(
                     method
                         .throws_type()
@@ -1196,17 +1271,48 @@ impl<'a> Generator<'a> {
                     None => quote!(()),
                 };
                 let success = if let Some(return_type) = method.return_type() {
-                    let lowered = self
-                        .lower_async_callback_value_expr(quote!(__callback_value), return_type)?;
-                    quote! {
-                        let __callback_value = __callback_result.value.unwrap_or_else(|| {
-                            panic!(
-                                "callback trait `{}`.{} returned ok without a value",
-                                #object_name,
-                                #method_name
-                            );
-                        });
-                        Ok(#lowered)
+                    if let Some(inner_type) = self.ohos_async_callback_optional_return_inner(method)
+                    {
+                        let lowered = self.lower_async_callback_value_expr(
+                            quote!(__callback_value),
+                            inner_type,
+                        )?;
+                        quote! {
+                            if __callback_result.has_value {
+                                let __callback_value = __callback_result.value.unwrap_or_else(|| {
+                                    panic!(
+                                        "callback trait `{}`.{} returned ok with hasValue=true but without a value",
+                                        #object_name,
+                                        #method_name
+                                    );
+                                });
+                                Ok(Some(#lowered))
+                            } else {
+                                if __callback_result.value.is_some() {
+                                    panic!(
+                                        "callback trait `{}`.{} returned ok with hasValue=false but with a value",
+                                        #object_name,
+                                        #method_name
+                                    );
+                                }
+                                Ok(None)
+                            }
+                        }
+                    } else {
+                        let lowered = self.lower_async_callback_value_expr(
+                            quote!(__callback_value),
+                            return_type,
+                        )?;
+                        quote! {
+                            let __callback_value = __callback_result.value.unwrap_or_else(|| {
+                                panic!(
+                                    "callback trait `{}`.{} returned ok without a value",
+                                    #object_name,
+                                    #method_name
+                                );
+                            });
+                            Ok(#lowered)
+                        }
                     }
                 } else {
                     quote!(Ok(()))
@@ -1215,6 +1321,26 @@ impl<'a> Generator<'a> {
                     quote!(__callback_error),
                     method.throws_type().unwrap(),
                 )?;
+                let registry_await = self.render_async_callback_await(
+                    &result_ident,
+                    Some(quote!(#result_ty)),
+                    quote!(__registry),
+                    registry_call_value.clone(),
+                    "failed to dispatch returned async JS callback",
+                    "returned async JS callback rejected",
+                    &object_name,
+                    &method_name,
+                );
+                let direct_await = self.render_async_callback_await(
+                    &result_ident,
+                    Some(quote!(#result_ty)),
+                    quote!(__callback),
+                    call_value.clone(),
+                    "failed to call async JS callback",
+                    "async JS callback rejected",
+                    &object_name,
+                    &method_name,
+                );
                 return Ok(quote! {
                     async fn #method_ident(&self, #(#args),*) -> std::result::Result<#return_ty, #error_ty> {
                         if let Some(__id) = self.__uniffi_callback_registry_id {
@@ -1225,22 +1351,7 @@ impl<'a> Generator<'a> {
                                     #method_name
                                 );
                             });
-                            let __callback_promise = __registry.call_async(Ok(#registry_call_value)).await.unwrap_or_else(|err| {
-                                panic!(
-                                    "callback trait `{}`.{} failed to dispatch returned async JS callback: {}",
-                                    #object_name,
-                                    #method_name,
-                                    err
-                                );
-                            });
-                            let __callback_result: #result_ident = __callback_promise.await.unwrap_or_else(|err| {
-                                panic!(
-                                    "callback trait `{}`.{} returned async JS callback rejected: {}",
-                                    #object_name,
-                                    #method_name,
-                                    err
-                                );
-                            });
+                            #registry_await
                             if __callback_result.ok {
                                 #success
                             } else {
@@ -1261,22 +1372,7 @@ impl<'a> Generator<'a> {
                                 #method_name
                             );
                         });
-                        let __callback_promise = __callback.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
-                            panic!(
-                                "callback trait `{}`.{} failed to call async JS callback: {}",
-                                #object_name,
-                                #method_name,
-                                err
-                            );
-                        });
-                        let __callback_result: #result_ident = __callback_promise.await.unwrap_or_else(|err| {
-                            panic!(
-                                "callback trait `{}`.{} async JS callback rejected: {}",
-                                #object_name,
-                                #method_name,
-                                err
-                            );
-                        });
+                        #direct_await
                         if __callback_result.ok {
                             #success
                         } else {
@@ -1300,6 +1396,26 @@ impl<'a> Generator<'a> {
                         quote!(#return_value_ident),
                         return_type,
                     )?;
+                    let registry_await = self.render_async_callback_await(
+                        &return_value_ident,
+                        None,
+                        quote!(__registry),
+                        registry_call_value.clone(),
+                        "failed to dispatch returned async JS callback",
+                        "returned async JS callback rejected",
+                        &object_name,
+                        &method_name,
+                    );
+                    let direct_await = self.render_async_callback_await(
+                        &return_value_ident,
+                        None,
+                        quote!(__callback),
+                        call_value.clone(),
+                        "failed to call async JS callback",
+                        "async JS callback rejected",
+                        &object_name,
+                        &method_name,
+                    );
                     Ok(quote! {
                         async fn #method_ident(&self, #(#args),*) -> #return_ty {
                             if let Some(__id) = self.__uniffi_callback_registry_id {
@@ -1310,22 +1426,7 @@ impl<'a> Generator<'a> {
                                         #method_name
                                     );
                                 });
-                                let __callback_promise = __registry.call_async(Ok(#registry_call_value)).await.unwrap_or_else(|err| {
-                                    panic!(
-                                        "callback trait `{}`.{} failed to dispatch returned async JS callback: {}",
-                                        #object_name,
-                                        #method_name,
-                                        err
-                                    );
-                                });
-                                let #return_value_ident = __callback_promise.await.unwrap_or_else(|err| {
-                                    panic!(
-                                        "callback trait `{}`.{} returned async JS callback rejected: {}",
-                                        #object_name,
-                                        #method_name,
-                                        err
-                                    );
-                                });
+                                #registry_await
                                 #lowered
                             } else {
                             let __callback = self.#method_ident.as_ref().unwrap_or_else(|| {
@@ -1335,28 +1436,35 @@ impl<'a> Generator<'a> {
                                     #method_name
                                 );
                             });
-                            let __callback_promise = __callback.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
-                                panic!(
-                                    "callback trait `{}`.{} failed to call async JS callback: {}",
-                                    #object_name,
-                                    #method_name,
-                                    err
-                                );
-                            });
-                            let #return_value_ident = __callback_promise.await.unwrap_or_else(|err| {
-                                panic!(
-                                    "callback trait `{}`.{} async JS callback rejected: {}",
-                                    #object_name,
-                                    #method_name,
-                                    err
-                                );
-                            });
+                            #direct_await
                             #lowered
                             }
                         }
                     })
                 }
-                None => Ok(quote! {
+                None => {
+                    let completion_ident = format_ident!("__callback_completion");
+                    let registry_await = self.render_async_callback_await(
+                        &completion_ident,
+                        None,
+                        quote!(__registry),
+                        registry_call_value,
+                        "failed to dispatch returned async JS callback",
+                        "returned async JS callback rejected",
+                        &object_name,
+                        &method_name,
+                    );
+                    let direct_await = self.render_async_callback_await(
+                        &completion_ident,
+                        None,
+                        quote!(__callback),
+                        call_value,
+                        "failed to call async JS callback",
+                        "async JS callback rejected",
+                        &object_name,
+                        &method_name,
+                    );
+                    Ok(quote! {
                     async fn #method_ident(&self, #(#args),*) {
                         if let Some(__id) = self.__uniffi_callback_registry_id {
                             let __registry = self.#registry_field_ident.as_ref().unwrap_or_else(|| {
@@ -1366,22 +1474,7 @@ impl<'a> Generator<'a> {
                                     #method_name
                                 );
                             });
-                            let __callback_promise = __registry.call_async(Ok(#registry_call_value)).await.unwrap_or_else(|err| {
-                                panic!(
-                                    "callback trait `{}`.{} failed to dispatch returned async JS callback: {}",
-                                    #object_name,
-                                    #method_name,
-                                    err
-                                );
-                            });
-                            __callback_promise.await.unwrap_or_else(|err| {
-                                panic!(
-                                    "callback trait `{}`.{} returned async JS callback rejected: {}",
-                                    #object_name,
-                                    #method_name,
-                                    err
-                                );
-                            });
+                            #registry_await
                         } else {
                         let __callback = self.#method_ident.as_ref().unwrap_or_else(|| {
                             panic!(
@@ -1390,25 +1483,11 @@ impl<'a> Generator<'a> {
                                 #method_name
                             );
                         });
-                        let __callback_promise = __callback.call_async(Ok(#call_value)).await.unwrap_or_else(|err| {
-                            panic!(
-                                "callback trait `{}`.{} failed to call async JS callback: {}",
-                                #object_name,
-                                #method_name,
-                                err
-                            );
-                        });
-                        __callback_promise.await.unwrap_or_else(|err| {
-                            panic!(
-                                "callback trait `{}`.{} async JS callback rejected: {}",
-                                #object_name,
-                                #method_name,
-                                err
-                            );
-                        });
+                        #direct_await
                         }
                     }
-                }),
+                    })
+                }
             };
         }
         if let Some(throws_type) = method.throws_type() {
@@ -2684,6 +2763,26 @@ impl<'a> Generator<'a> {
         })
     }
 
+    /// Returns the inner type when an OHOS direct-return fallible async
+    /// callback has a top-level optional success value.
+    ///
+    /// The callback envelope itself needs an optional `value` field for
+    /// fallible methods.  Representing an optional success value directly
+    /// would otherwise generate `Option<Option<T>>`, which N-API cannot
+    /// faithfully reconstruct from JavaScript `null` versus a missing field.
+    fn ohos_async_callback_optional_return_inner<'b>(
+        &self,
+        method: &'b Method,
+    ) -> Option<&'b Type> {
+        if !self.async_callbacks_return_directly() || !method.is_async() {
+            return None;
+        }
+        match method.return_type() {
+            Some(Type::Optional { inner_type }) => Some(inner_type),
+            _ => None,
+        }
+    }
+
     fn callback_async_bridge_type(&self, ty: &Type) -> Result<TokenStream> {
         if callback_metadata::is_callback_return_type(ty) {
             Ok(quote!(__UniffiCallbackHandle))
@@ -3830,6 +3929,202 @@ mod renamed_record_core_path_tests {
 }
 
 #[cfg(test)]
+mod ohos_async_callback_return_tests {
+    use super::super::ohos_bridge_identity_export;
+    use super::*;
+    use uniffi_meta::{
+        EnumMetadata, EnumShape, FnParamMetadata, MetadataGroup, MethodMetadata, NamespaceMetadata,
+        ObjectMetadata, VariantMetadata,
+    };
+
+    const MODULE_PATH: &str = "ohos_async_callback_fixture";
+
+    fn callback_object(name: &str) -> Type {
+        Type::Object {
+            module_path: MODULE_PATH.into(),
+            name: name.into(),
+            imp: ObjectImpl::Trait(TraitKind::ForeignOnly),
+        }
+    }
+
+    fn async_method(
+        self_name: &str,
+        name: &str,
+        inputs: Vec<FnParamMetadata>,
+        return_type: Option<Type>,
+        throws: Option<Type>,
+    ) -> MethodMetadata {
+        MethodMetadata {
+            module_path: MODULE_PATH.into(),
+            self_name: self_name.into(),
+            name: name.into(),
+            orig_name: None,
+            is_async: true,
+            inputs,
+            return_type,
+            throws,
+            takes_self_by_arc: false,
+            checksum: None,
+            docstring: None,
+        }
+    }
+
+    fn fixture() -> ComponentInterface {
+        let callback_error = Type::Enum {
+            module_path: MODULE_PATH.into(),
+            name: "CallbackFailure".into(),
+        };
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: MODULE_PATH.into(),
+                name: MODULE_PATH.into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        for name in ["AsyncWorker", "ChildWorker"] {
+            group.add_item(
+                ObjectMetadata {
+                    module_path: MODULE_PATH.into(),
+                    name: name.into(),
+                    orig_name: None,
+                    remote: false,
+                    imp: ObjectImpl::Trait(TraitKind::ForeignOnly),
+                    docstring: None,
+                }
+                .into(),
+            );
+        }
+        group.add_item(
+            EnumMetadata {
+                module_path: MODULE_PATH.into(),
+                name: "CallbackFailure".into(),
+                orig_name: None,
+                rust_path: None,
+                shape: EnumShape::Enum,
+                remote: false,
+                variants: vec![VariantMetadata {
+                    name: "Failed".into(),
+                    orig_name: None,
+                    discr: None,
+                    fields: vec![],
+                    docstring: None,
+                }],
+                discr_type: None,
+                non_exhaustive: false,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            async_method(
+                "AsyncWorker",
+                "compute",
+                vec![FnParamMetadata::simple("value", Type::UInt32)],
+                Some(Type::UInt32),
+                None,
+            )
+            .into(),
+        );
+        group.add_item(
+            async_method(
+                "AsyncWorker",
+                "checked",
+                vec![FnParamMetadata::simple("value", Type::UInt32)],
+                Some(Type::UInt32),
+                Some(callback_error.clone()),
+            )
+            .into(),
+        );
+        group.add_item(
+            async_method(
+                "AsyncWorker",
+                "checked_optional",
+                vec![FnParamMetadata::simple("value", Type::UInt32)],
+                Some(Type::Optional {
+                    inner_type: Box::new(Type::UInt32),
+                }),
+                Some(callback_error),
+            )
+            .into(),
+        );
+        group.add_item(
+            async_method(
+                "AsyncWorker",
+                "make_child",
+                vec![],
+                Some(callback_object("ChildWorker")),
+                None,
+            )
+            .into(),
+        );
+        group
+            .add_item(async_method("ChildWorker", "read", vec![], Some(Type::UInt32), None).into());
+        ComponentInterface::from_metadata(group).expect("async callback fixture metadata")
+    }
+
+    #[test]
+    fn ohos_async_callbacks_return_direct_values_while_node_keeps_promises() {
+        let ci = fixture();
+        let digest = "0".repeat(64);
+        let identity = ohos_bridge_identity_export(&digest);
+        let node = render_napi_rust(&ci).expect("Node N-API codegen must succeed");
+        let ohos = render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed");
+        let node_compact = node.split_whitespace().collect::<String>();
+        let ohos_compact = ohos.split_whitespace().collect::<String>();
+
+        assert!(
+            node_compact.contains("ThreadsafeFunction<u32,napi::bindgen_prelude::Promise<u32>>")
+                && node_compact.contains("call_async(Ok(value)).await")
+                && node_compact.contains("__callback_promise.await"),
+            "Node async callback ABI must remain Promise + two awaits:\n{node}"
+        );
+        assert!(
+            ohos_compact.contains("ThreadsafeFunction<u32,u32,u32,napi_ohos::Status,false>")
+                && ohos_compact.contains("call_async(value).await")
+                && !ohos_compact.contains("__callback_promise.await"),
+            "OHOS direct callback ABI must use a concrete return and one await:\n{ohos}"
+        );
+        assert!(
+            ohos.contains("__uniffi_registry_child_worker_read")
+                && !ohos_compact.contains("napi_ohos::bindgen_prelude::Promise"),
+            "OHOS returned-callback registry must use the same direct return ABI:\n{ohos}"
+        );
+        assert!(
+            ohos_compact.contains("__UniffiAsyncWorkerCheckedCallbackResult")
+                && ohos_compact.contains("napi_ohos::Status,false"),
+            "OHOS fallible async callbacks must use direct typed envelopes:\n{ohos}"
+        );
+        assert!(
+            node.contains("pub value: Option<Option<u32>>")
+                && !node.contains("pub has_value: bool"),
+            "Node fallible async callback envelopes must preserve their Promise ABI:\n{node}"
+        );
+        assert!(
+            ohos.contains("pub has_value: bool")
+                && ohos.contains("pub value: Option<u32>")
+                && !ohos.contains("pub value: Option<Option<u32>>")
+                && ohos.contains("if __callback_result.has_value")
+                && ohos.contains("Ok(Some(")
+                && ohos.contains("Ok(None)")
+                && ohos.contains("hasValue=true but without a value")
+                && ohos.contains("hasValue=false but with a value"),
+            "OHOS optional fallible async callbacks must use hasValue plus a single optional value:\n{ohos}"
+        );
+        let sidecar = super::super::render_ohos_extra_types(&ci)
+            .expect("OHOS callback type sidecar must render");
+        assert!(
+            sidecar.contains("compute?: (value: number) => number")
+                && sidecar.contains(
+                    "checked?: (value: number) => UniffiAsyncWorkerCheckedCallbackResult"
+                )
+                && !sidecar.contains("Promise<"),
+            "OHOS callback sidecar must expose synchronous callback returns:\n{sidecar}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod async_object_receiver_tests {
     use super::super::ohos_bridge_identity_export;
     use super::*;
@@ -4433,7 +4728,7 @@ mod input_stream_descriptor_tests {
     #[test]
     fn custom_u64_conversion_uses_core_builtin_before_bigint_bridge() {
         let ci = callable_fixture();
-        let generator = Generator::new(&ci);
+        let generator = Generator::new(&ci, CallbackAsyncReturn::Promise);
         let ty = Type::Custom {
             module_path: "descriptor_fixture::types".into(),
             name: "EventId".into(),

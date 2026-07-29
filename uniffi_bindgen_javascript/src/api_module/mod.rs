@@ -841,11 +841,11 @@ fn render_callback_lowerer(
                     _ => ts_lower_expr(ci, config, ret, "__ret", 0),
                 };
                 out.push_str(&format!(
-                    "        {method_name}({args}): Promise<any> {{\n            return Promise.resolve(__uniffiCallbackObject.{method_name}({pass})).then((__ret) => {{ return {lower}; }});\n        }},\n"
+                    "        {method_name}({args}): any {{\n            const __ret = __uniffiCallbackObject.{method_name}({pass});\n            if (__ret !== null && typeof __ret === \"object\" && typeof (__ret as {{ then?: unknown }}).then === \"function\") {{\n                return (__ret as Promise<unknown>).then((__resolved) => {{\n                    const __ret = __resolved;\n                    return {lower};\n                }});\n            }}\n            return {lower};\n        }},\n"
                 ));
             } else {
                 out.push_str(&format!(
-                    "        {method_name}({args}): Promise<void> {{\n            return Promise.resolve(__uniffiCallbackObject.{method_name}({pass})).then(() => undefined);\n        }},\n"
+                    "        {method_name}({args}): any {{\n            const __ret = __uniffiCallbackObject.{method_name}({pass});\n            if (__ret !== null && typeof __ret === \"object\" && typeof (__ret as {{ then?: unknown }}).then === \"function\") {{\n                return (__ret as Promise<unknown>).then(() => undefined);\n            }}\n            return undefined;\n        }},\n"
                 ));
             }
         } else if let Some(ret) = method.return_type() {

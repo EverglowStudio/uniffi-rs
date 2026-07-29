@@ -9453,7 +9453,8 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
             && callbacks.contains("compute(a: number, b: number): number | Promise<number>;")
             && callbacks
                 .contains("makeRecord(a: number, b: number): WorkRecord | Promise<WorkRecord>;")
-            && callbacks.contains("Promise.resolve(__uniffiCallbackObject.compute"),
+            && callbacks.contains("const __ret = __uniffiCallbackObject.compute(a, b);")
+            && callbacks.contains("return (__ret as Promise<unknown>).then((__resolved) => {"),
         "common/callbacks.ts should expose and lower async callback methods:\n{callbacks}"
     );
     let api = std::fs::read_to_string(generated.join("common/api.ts")).unwrap();
@@ -9634,7 +9635,8 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
         "checkedVoid(fail: boolean): void | Promise<void>;",
         "checkedValue(fail: boolean): number | Promise<number>;",
         "checkedRecord(fail: boolean): Payload | Promise<Payload>;",
-        "Promise.resolve(__uniffiCallbackObject.checkedValue",
+        "const __ret = __uniffiCallbackObject.checkedValue(fail);",
+        "return (__ret as Promise<unknown>).then((__resolved) => {",
     ] {
         assert!(
             callbacks.contains(needle),
