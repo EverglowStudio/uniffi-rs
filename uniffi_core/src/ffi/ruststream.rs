@@ -437,6 +437,7 @@ impl<T, E> Future for RustStreamRegistryNext<T, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Lower;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{mpsc, Barrier, Weak};
     use std::task::{Wake, Waker};
@@ -486,6 +487,20 @@ mod tests {
 
     static PENDING_REGISTRY: RustStreamRegistry<u32, String> =
         Lazy::new(|| Mutex::new(HashMap::new()));
+    static OPTIONAL_STREAM_REGISTRY: RustStreamRegistry<Option<u32>, String> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    struct OptionalItemSequence {
+        values: std::collections::VecDeque<Result<Option<u32>, String>>,
+    }
+
+    impl Stream for OptionalItemSequence {
+        type Item = Result<Option<u32>, String>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.values.pop_front())
+        }
+    }
 
     struct CancelOwnerOnWake {
         owner: Arc<RustStream<u32, String>>,
@@ -589,6 +604,69 @@ mod tests {
                 panic!("re-entrant stream callback deadlocked for more than two seconds")
             }
         }
+    }
+
+    #[test]
+    fn stream_next_outer_option_tag_preserves_optional_items_and_errors() {
+        // `None` is Done. `Some(None)` is a yielded Optional item, so the
+        // outer and inner Option discriminators must remain independently
+        // visible to bindings that lift the RustBuffer.
+        assert_eq!(
+            <Option<Option<u32>> as Lower<crate::UniFfiTag>>::lower(None).destroy_into_vec(),
+            vec![0]
+        );
+        assert_eq!(
+            <Option<Option<u32>> as Lower<crate::UniFfiTag>>::lower(Some(None)).destroy_into_vec(),
+            vec![1, 0]
+        );
+        assert_eq!(
+            <Option<Option<u32>> as Lower<crate::UniFfiTag>>::lower(Some(Some(1)))
+                .destroy_into_vec(),
+            vec![1, 1, 0, 0, 0, 1]
+        );
+
+        let handle = rust_stream_new(
+            &OPTIONAL_STREAM_REGISTRY,
+            Box::pin(OptionalItemSequence {
+                values: [Ok(Some(1)), Ok(None), Err("boom".to_owned())]
+                    .into_iter()
+                    .collect(),
+            }),
+        );
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let mut first = Box::pin(rust_stream_next_async(
+            &OPTIONAL_STREAM_REGISTRY,
+            handle.clone(),
+        ));
+        assert!(matches!(
+            first.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(Ok(Some(Some(1)))))
+        ));
+        let mut nullable_item = Box::pin(rust_stream_next_async(
+            &OPTIONAL_STREAM_REGISTRY,
+            handle.clone(),
+        ));
+        assert!(matches!(
+            nullable_item.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(Ok(Some(None))))
+        ));
+        let mut error = Box::pin(rust_stream_next_async(
+            &OPTIONAL_STREAM_REGISTRY,
+            handle.clone(),
+        ));
+        assert!(matches!(
+            error.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(Err(message))) if message == "boom"
+        ));
+        assert!(
+            !OPTIONAL_STREAM_REGISTRY
+                .lock()
+                .unwrap()
+                .contains_key(&handle.as_raw()),
+            "an Error is terminal but is not a Done value"
+        );
     }
 
     #[test]

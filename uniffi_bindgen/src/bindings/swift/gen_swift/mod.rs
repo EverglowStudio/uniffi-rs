@@ -1410,6 +1410,23 @@ mod tests {
             }],
             return_type: Some(Type::Stream {
                 item_type: Box::new(stream_event_type),
+                error_type: Box::new(stream_error_type.clone()),
+                is_send: true,
+            }),
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }));
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: "optional_events".to_owned(),
+            orig_name: None,
+            is_async: false,
+            inputs: vec![],
+            return_type: Some(Type::Stream {
+                item_type: Box::new(Type::Optional {
+                    inner_type: Box::new(Type::UInt32),
+                }),
                 error_type: Box::new(stream_error_type),
                 is_send: true,
             }),
@@ -1563,8 +1580,14 @@ mod tests {
             swift.contains("uniffi_stream_core_fn_func_count_events_stream_cancel(__streamHandle)")
         );
         assert!(swift.contains("try await uniffiRustCallAsync("));
-        assert!(swift.contains("liftFunc: FfiConverterOption"));
-        assert!(swift.contains(".lift"));
+        assert!(swift.contains("liftFunc: { try __uniffiLiftStreamNext($0) { reader in"));
+        assert!(swift.contains("try FfiConverterTypeStreamEvent.read(from: &reader)"));
+        assert!(swift.contains("case let .item(__streamValue):"));
+        assert!(!swift.contains("guard let __streamValue = __streamNext else"));
+        assert!(
+            swift.contains("public func optionalEvents() -> AsyncThrowingStream<UInt32?, Error>")
+        );
+        assert!(swift.contains("try FfiConverterOptionUInt32.read(from: &reader)"));
         assert!(swift.contains("errorHandler: FfiConverter") && swift.contains("StreamError_lift"));
         assert!(swift.contains("continuation.yield(__streamValue)"));
         assert!(swift.contains("continuation.finish()"));
