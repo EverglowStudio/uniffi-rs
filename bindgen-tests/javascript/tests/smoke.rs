@@ -166,7 +166,7 @@ fn emits_real_tree_for_all_flavors() {
         &std::fs::read(out_dir.join("harmony/arithmetical.ohos-facade.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(harmony_contract["schemaVersion"], 2);
+    assert_eq!(harmony_contract["schemaVersion"], 3);
     assert!(harmony_contract["outputStreams"]
         .as_array()
         .unwrap()
@@ -4250,7 +4250,7 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         &std::fs::read(out_dir.join("harmony/stream_core.ohos-facade.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(contract["schemaVersion"], 2);
+    assert_eq!(contract["schemaVersion"], 3);
     assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 3);
     assert_eq!(
         contract["outputStreams"][0]["eventsFactory"],
@@ -4551,7 +4551,7 @@ fn input_stream_bidi_static_generation_contract() {
         &std::fs::read(out_dir.join("harmony/input_stream_core.ohos-facade.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(contract["schemaVersion"], 2);
+    assert_eq!(contract["schemaVersion"], 3);
     assert_eq!(contract["inputStreams"].as_array().unwrap().len(), 1);
     let factory = contract["inputStreams"][0]["factory"].as_str().unwrap();
     let input_suffix = contract["inputStreams"][0]["suffix"]
