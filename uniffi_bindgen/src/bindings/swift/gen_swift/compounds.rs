@@ -105,7 +105,7 @@ impl StreamCodeType {
 impl CodeType for StreamCodeType {
     fn type_label(&self) -> String {
         format!(
-            "AsyncThrowingStream<{}, Error>",
+            "UniffiAsyncStream<{}>",
             super::SwiftCodeOracle.find(&self.item).type_label()
         )
     }

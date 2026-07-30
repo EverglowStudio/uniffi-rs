@@ -39,11 +39,58 @@ private func __uniffiLiftStreamNext<T>(
 
 fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
 
+// Rust future handles may be touched by a Swift task's cancellation handler while the
+// task is polling or completing. Keep cancellation and final release behind one lock so
+// that `rust_future_free` is never called twice or before a cancellation handler has
+// finished with the handle.
+fileprivate final class UniffiRustFutureHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private let handle: UInt64
+    private let cancelFunc: (UInt64) -> ()
+    private let freeFunc: (UInt64) -> ()
+    private var cancelled = false
+    private var freed = false
+
+    init(
+        handle: UInt64,
+        cancelFunc: @escaping (UInt64) -> (),
+        freeFunc: @escaping (UInt64) -> ()
+    ) {
+        self.handle = handle
+        self.cancelFunc = cancelFunc
+        self.freeFunc = freeFunc
+    }
+
+    func cancel() {
+        lock.withLock {
+            guard !cancelled && !freed else {
+                return
+            }
+            cancelled = true
+            // Keep the FFI call inside the lifecycle lock. `rust_future_cancel`
+            // may synchronously wake the awaiting Swift task, whose deferred free
+            // can otherwise race ahead and invalidate this handle.
+            cancelFunc(handle)
+        }
+    }
+
+    func free() {
+        lock.withLock {
+            guard !freed else {
+                return
+            }
+            freed = true
+            freeFunc(handle)
+        }
+    }
+}
+
 fileprivate func uniffiRustCallAsync<F, T>(
     rustFutureFunc: () -> UInt64,
     pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
+    cancelFunc: @escaping (UInt64) -> (),
     completeFunc: (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
-    freeFunc: (UInt64) -> (),
+    freeFunc: @escaping (UInt64) -> (),
     liftFunc: (F) throws -> T,
     errorHandler: ((RustBuffer) throws -> Swift.Error)?
 ) async throws -> T {
@@ -51,26 +98,221 @@ fileprivate func uniffiRustCallAsync<F, T>(
     // RustCallStatus param, so doesn't use makeRustCall()
     {{ ensure_init_fn_name }}()
     let rustFuture = rustFutureFunc()
-    defer {
-        freeFunc(rustFuture)
-    }
-    var pollResult: Int8;
-    repeat {
-        pollResult = await withUnsafeContinuation {
-            pollFunc(
-                rustFuture,
-                { handle, pollResult in
-                    uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult)
-                },
-                uniffiContinuationHandleMap.insert(obj: $0)
-            )
+    let rustFutureHandle = UniffiRustFutureHandle(
+        handle: rustFuture,
+        cancelFunc: cancelFunc,
+        freeFunc: freeFunc
+    )
+    return try await withTaskCancellationHandler(operation: {
+        defer {
+            rustFutureHandle.free()
         }
-    } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
+        var pollResult: Int8
+        repeat {
+            pollResult = await withUnsafeContinuation {
+                pollFunc(
+                    rustFuture,
+                    { handle, pollResult in
+                        uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult)
+                    },
+                    uniffiContinuationHandleMap.insert(obj: $0)
+                )
+            }
+        } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
 
-    return try liftFunc(makeRustCall(
-        { completeFunc(rustFuture, $0) },
-        errorHandler: errorHandler
-    ))
+        return try liftFunc(makeRustCall(
+            { completeFunc(rustFuture, $0) },
+            errorHandler: errorHandler
+        ))
+    }, onCancel: {
+        rustFutureHandle.cancel()
+    })
+}
+
+// Output streams use a pull-based custom AsyncSequence instead of an
+// AsyncThrowingStream continuation. A native `stream_next` future is created only
+// from Iterator.next(), so a slow Swift consumer cannot cause background prefetch.
+public struct UniffiAsyncStream<Element>: AsyncSequence {
+    public struct Iterator: AsyncIteratorProtocol {
+        fileprivate let lifetime: UniffiAsyncStreamIteratorLifetime<Element>
+
+        public mutating func next() async throws -> Element? {
+            try await lifetime.next()
+        }
+    }
+
+    fileprivate let state: UniffiAsyncStreamState<Element>
+
+    fileprivate init(
+        next: @escaping () async throws -> __UniffiStreamNext<Element>,
+        cancel: @escaping () -> ()
+    ) {
+        state = UniffiAsyncStreamState(next: next, cancel: cancel)
+    }
+
+    public func makeAsyncIterator() -> Iterator {
+        Iterator(lifetime: UniffiAsyncStreamIteratorLifetime(state: state))
+    }
+}
+
+fileprivate final class UniffiAsyncStreamIteratorLifetime<Element> {
+    private let state: UniffiAsyncStreamState<Element>
+    private let accepted: Bool
+
+    init(state: UniffiAsyncStreamState<Element>) {
+        self.state = state
+        accepted = state.claimIterator()
+    }
+
+    deinit {
+        if accepted {
+            state.cancel()
+        }
+    }
+
+    func next() async throws -> Element? {
+        guard accepted else {
+            throw UniffiInternalError.streamConsumed
+        }
+        return try await state.next()
+    }
+}
+
+fileprivate final class UniffiAsyncStreamState<Element>: @unchecked Sendable {
+    private enum NextStart {
+        case next
+        case done
+        case concurrent
+    }
+
+    private let lock = NSLock()
+    private let nextFunc: () async throws -> __UniffiStreamNext<Element>
+    private let cancelFunc: () -> ()
+    private var iteratorClaimed = false
+    private var nextInFlight = false
+    private var terminal = false
+    private var cancelled = false
+
+    init(
+        next: @escaping () async throws -> __UniffiStreamNext<Element>,
+        cancel: @escaping () -> ()
+    ) {
+        nextFunc = next
+        cancelFunc = cancel
+    }
+
+    deinit {
+        cancel()
+    }
+
+    func claimIterator() -> Bool {
+        lock.withLock {
+            guard !iteratorClaimed else {
+                return false
+            }
+            iteratorClaimed = true
+            return true
+        }
+    }
+
+    func next() async throws -> Element? {
+        let start = lock.withLock { () -> NextStart in
+            if terminal || cancelled {
+                return .done
+            }
+            if nextInFlight {
+                return .concurrent
+            }
+            nextInFlight = true
+            return .next
+        }
+
+        switch start {
+        case .done:
+            return nil
+        case .concurrent:
+            throw UniffiInternalError.concurrentStreamNext
+        case .next:
+            break
+        }
+
+        if Task.isCancelled {
+            finishCancelledNext()
+            throw CancellationError()
+        }
+
+        do {
+            let result = try await withTaskCancellationHandler(operation: {
+                try await nextFunc()
+            }, onCancel: {
+                self.cancel()
+            })
+            if Task.isCancelled {
+                finishCancelledNext()
+                throw CancellationError()
+            }
+            return finish(result)
+        } catch {
+            finishFailedNext()
+            throw error
+        }
+    }
+
+    private func finish(_ result: __UniffiStreamNext<Element>) -> Element? {
+        lock.withLock {
+            nextInFlight = false
+            if cancelled {
+                return nil
+            }
+            switch result {
+            case .done:
+                terminal = true
+                return nil
+            case let .item(item):
+                // `Element?` adds an outer optional here. In particular, when
+                // Element is Optional<T>, this returns `.some(nil)` for Item(None).
+                return .some(item)
+            }
+        }
+    }
+
+    private func finishFailedNext() {
+        let cancel = lock.withLock { () -> (() -> ())? in
+            nextInFlight = false
+            guard !terminal && !cancelled else {
+                return nil
+            }
+            terminal = true
+            cancelled = true
+            return cancelFunc
+        }
+        cancel?()
+    }
+
+    private func finishCancelledNext() {
+        let cancel = lock.withLock { () -> (() -> ())? in
+            nextInFlight = false
+            guard !terminal && !cancelled else {
+                return nil
+            }
+            terminal = true
+            cancelled = true
+            return cancelFunc
+        }
+        cancel?()
+    }
+
+    func cancel() {
+        let cancel = lock.withLock { () -> (() -> ())? in
+            guard !terminal && !cancelled else {
+                return nil
+            }
+            terminal = true
+            cancelled = true
+            return cancelFunc
+        }
+        cancel?()
+    }
 }
 
 // Callback handlers for an async calls.  These are invoked by Rust when the future is ready.  They

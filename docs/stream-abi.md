@@ -121,9 +121,10 @@ lowering/lifting helpers and does not introduce `serde` or `serde-wasm-bindgen`.
 AbortSignal integration is not part of this phase. Call `return()` or break out of `for await` to
 cancel.
 
-## Swift AsyncThrowingStream
+## Swift UniffiAsyncStream
 
-The Swift target wraps stream-returning free functions as `AsyncThrowingStream<Item, Error>`:
+The Swift target wraps stream-returning free functions as `UniffiAsyncStream<Item>`, a generated
+public `AsyncSequence` with a throwing iterator:
 
 ```swift
 for try await item in countEvents(count: 3) {
@@ -131,25 +132,37 @@ for try await item in countEvents(count: 3) {
 }
 ```
 
-The public Swift API does not expose the raw stream handle. Generated code calls the low-level
-start function synchronously to create the handle, then starts a Swift `Task` that repeatedly awaits
-the hidden `foo_stream_next(handle)` Rust future through the existing `uniffiRustCallAsync` helper.
-The wrapper reads the outer RustBuffer optional tag before lifting the item. It maps outer Item to
-`continuation.yield(item)` (including `.item(nil)` for optional items), outer Done to
-`continuation.finish()`, and stream item errors to `continuation.finish(throwing:)`.
+The public Swift API does not expose the raw stream handle. Generated code calls the low-level start
+function synchronously to create that handle, but does not create a native `next` future until a
+consumer calls `Iterator.next()`. Each iterator call creates and awaits at most one hidden
+`foo_stream_next(handle)` Rust future through `uniffiRustCallAsync`; there is no background producer,
+continuation buffering, or prefetch while a consumer is paused.
 
-`continuation.onTermination` cancels the Swift task and calls the hidden `foo_stream_cancel(handle)`.
-The Rust-side cancel path is idempotent, so this is safe if Rust has already released the stream after
-done or error. A consumer breaking out of `for try await` or otherwise terminating the stream triggers
-the same cancel path.
+The wrapper reads the outer RustBuffer optional tag before lifting the item. Outer Item returns an
+outer Swift optional containing the item, so `Stream<Option<T>>` returns `.some(nil)` for Item(None).
+Only outer Done returns the `nil` which `AsyncIteratorProtocol` uses as EOF. A stream error is thrown
+once through Swift's standard `Error` channel, then the iterator is terminal; later `next()` calls
+return `nil` without another native pull.
 
-Each call to a stream-returning function owns one Rust stream handle. Treat the returned
-`AsyncThrowingStream` as a single-consumer sequence; if multiple independent consumers are needed,
-call the Rust function again to create independent handles.
+Each generated stream is single-consumer. A second iterator throws an internal consumed-stream error,
+and overlapping `next()` calls throw an internal concurrent-next error before reaching Rust. Done is
+terminal and later `next()` calls return `nil` without entering native code. Iterator and sequence
+release are best-effort cancellation points, so breaking from a `for try await` loop or dropping an
+unfinished stream calls the hidden `foo_stream_cancel(handle)` exactly once. Rust's cancel operation
+remains idempotent.
 
-Typed stream error preservation is intentionally deferred. Swift currently exposes the stream as
-`AsyncThrowingStream<Item, Error>` and throws the lifted UniFFI error value through the standard Swift
-`Error` channel.
+Swift task cancellation is propagated to both normal generated async calls and a pending stream next:
+the generated helper receives the type-specialized `rust_future_cancel` symbol, calls it from a task
+cancellation handler, and serializes native cancel/free under one lifecycle lock. A Rust cancelled
+status becomes Swift `CancellationError`; the future free operation still runs exactly once. Cancelling
+a pending stream next also best-effort cancels its stream handle, so no late item is delivered after
+the task has been cancelled.
+
+`UniffiAsyncStream` deliberately has no public `Sendable` conformance; consume it in the concurrency
+context that created it. This is a generated Swift API change from the previous
+`AsyncThrowingStream<Item, Error>` return type, so downstream bindings must be regenerated and Swift
+call sites which named the old concrete type must migrate. The native stream ABI and exported symbols
+are unchanged.
 
 ## Kotlin Flow
 
@@ -324,7 +337,7 @@ pub fn running_sum(
 
 This shape is the UniFFI equivalent of a simple bidirectional stream: the foreign side supplies an
 input stream, Rust consumes it, and Rust returns an output stream. JavaScript consumes the result as
-`AsyncIterable<T>`, Swift as `AsyncThrowingStream<T, Error>`, and Kotlin as `Flow<T>`.
+`AsyncIterable<T>`, Swift as `UniffiAsyncStream<T>`, and Kotlin as `Flow<T>`.
 
 The same single-consumer rules apply on both sides. Breaking out of the output stream cancels the
 Rust output stream, which drops the Rust input stream and triggers the foreign input cancellation

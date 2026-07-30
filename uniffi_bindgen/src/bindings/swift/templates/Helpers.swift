@@ -9,6 +9,8 @@ fileprivate enum UniffiInternalError: LocalizedError {
     case unexpectedRustCallStatusCode
     case unexpectedRustCallError
     case unexpectedStaleHandle
+    case streamConsumed
+    case concurrentStreamNext
     case rustPanic(_ message: String)
 
     public var errorDescription: String? {
@@ -21,6 +23,8 @@ fileprivate enum UniffiInternalError: LocalizedError {
         case .unexpectedRustCallStatusCode: return "Unexpected RustCallStatus code"
         case .unexpectedRustCallError: return "CALL_ERROR but no errorClass specified"
         case .unexpectedStaleHandle: return "The object in the handle map has been dropped already"
+        case .streamConsumed: return "UniFFI output streams may only be consumed once"
+        case .concurrentStreamNext: return "UniFFI output stream received a concurrent next() call"
         case let .rustPanic(message): return message
         }
     }
@@ -102,7 +106,7 @@ private func uniffiCheckCallStatus<E: Swift.Error>(
             }
 
         case CALL_CANCELLED:
-            fatalError("Cancellation not supported yet")
+            throw CancellationError()
 
         default:
             throw UniffiInternalError.unexpectedRustCallStatusCode
