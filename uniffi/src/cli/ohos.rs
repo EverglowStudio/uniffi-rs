@@ -6479,10 +6479,7 @@ fn emit_index_d_ts(dist_dir: &Utf8Path, type_dir: &Utf8Path, lib_target_name: &s
     let mut exports = FacadeExports::from_type_defs_and_contracts(&defs, contracts)?;
     exports.streams.host_composite_identity = inventory.host_composite_identity.clone();
     exports.streams.component_identities = inventory.components.clone();
-    let public_defs = defs
-        .into_iter()
-        .filter(|def| !(def.kind == "fn" && def.name.starts_with("uniffiohosbridgeidentity")))
-        .collect();
+    let public_defs = exports.package_public_defs(defs);
     let mut declarations = render_index_d_ts(public_defs);
     if !exports.streams.declaration_imports().is_empty() {
         declarations = declarations.replacen(
@@ -6624,7 +6621,11 @@ impl FacadeExports {
         let mut names = self
             .classes
             .iter()
-            .chain(&self.callables)
+            .chain(
+                self.callables
+                    .iter()
+                    .filter(|name| !self.streams.hides_package_value(name)),
+            )
             .cloned()
             .collect::<Vec<_>>();
         names.extend(self.streams.value_exports());
@@ -6646,10 +6647,20 @@ impl FacadeExports {
         self.streams
             .native_types
             .iter()
+            .filter(|name| !self.streams.hides_package_type_name(name))
             .cloned()
             .chain(self.streams.type_exports())
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .collect()
+    }
+
+    fn package_public_defs(&self, defs: Vec<TypeDefLine>) -> Vec<TypeDefLine> {
+        defs.into_iter()
+            .filter(|def| {
+                !(def.kind == "fn" && def.name.starts_with("uniffiohosbridgeidentity"))
+                    && !self.streams.hides_package_def(def)
+            })
             .collect()
     }
 
@@ -6862,6 +6873,7 @@ fn is_ts_declaration_name(bytes: &[u8], token_start: usize, token_end: usize) ->
 struct HarmonyStreamFacade {
     contracts: Vec<HarmonyFacadeContract>,
     native_types: Vec<String>,
+    package_hidden_next_envelopes: Vec<TypeDefLine>,
     host_composite_identity: String,
     component_identities: Vec<HostFacadeComponentIdentity>,
 }
@@ -7758,6 +7770,7 @@ impl HarmonyStreamFacade {
         let mut generated_names = BTreeSet::new();
         let mut input_by_suffix = BTreeMap::<String, HarmonyInputStreamContract>::new();
         let mut components = BTreeSet::new();
+        let mut package_hidden_next_envelopes = Vec::new();
 
         let has_streams = contracts.iter().any(|contract| {
             !contract.output_streams.is_empty() || !contract.input_streams.is_empty()
@@ -7836,6 +7849,10 @@ impl HarmonyStreamFacade {
                         output.function,
                         output.next_type
                     );
+                }
+                let next_envelope = require_unique_type_def(defs, &output.next_type)?;
+                if !package_hidden_next_envelopes.contains(next_envelope) {
+                    package_hidden_next_envelopes.push(next_envelope.clone());
                 }
                 for value in [
                     &output.stream_factory,
@@ -7919,6 +7936,7 @@ impl HarmonyStreamFacade {
         Ok(Self {
             contracts,
             native_types,
+            package_hidden_next_envelopes,
             host_composite_identity: String::new(),
             component_identities: Vec::new(),
         })
@@ -7963,6 +7981,34 @@ impl HarmonyStreamFacade {
         self.contracts.iter().any(|contract| {
             !contract.output_streams.is_empty() || !contract.input_streams.is_empty()
         })
+    }
+
+    fn hides_package_value(&self, name: &str) -> bool {
+        self.outputs().into_iter().any(|output| {
+            [
+                output.function.as_str(),
+                output.next_function.as_str(),
+                output.cancel_function.as_str(),
+            ]
+            .contains(&name)
+        })
+    }
+
+    fn hides_package_def(&self, def: &TypeDefLine) -> bool {
+        (def.kind == "fn" && self.hides_package_value(&def.name))
+            || self
+                .package_hidden_next_envelopes
+                .iter()
+                .any(|envelope| envelope == def)
+    }
+
+    fn hides_package_type_name(&self, name: &str) -> bool {
+        self.outputs()
+            .into_iter()
+            .any(|output| output.next_type == name)
+            || self.package_hidden_next_envelopes.iter().any(|envelope| {
+                envelope.name == name || envelope.original_name.as_deref() == Some(name)
+            })
     }
 
     fn outputs(&self) -> Vec<&HarmonyOutputStreamContract> {
@@ -8093,13 +8139,10 @@ abstract class __UniFfiEventsStream<T, E> {
   private closed: boolean = false;
   private cancelSent: boolean = false;
   private doneSent: boolean = false;
-  private hasHandle: boolean = false;
   private inFlight: boolean = false;
-  private handle: bigint = 0n;
+  private pull: UniFfiStream<T> | null = null;
 
-  protected abstract startNative(): bigint;
-  protected abstract nextNative(handle: bigint): Promise<UniFfiStreamResult<T>>;
-  protected abstract cancelNative(handle: bigint): void;
+  protected abstract createPull(): UniFfiStream<T>;
   protected abstract errorTypeName(): string;
 
   on(type: 'data', callback: Callback<T>): void;
@@ -8166,8 +8209,7 @@ abstract class __UniFfiEventsStream<T, E> {
     }
     this.started = true;
     try {
-      this.handle = this.startNative();
-      this.hasHandle = true;
+      this.pull = this.createPull();
     } catch (reason) {
       this.finishWithError(__uniffiNormalizeReason(reason as Error));
       return;
@@ -8180,18 +8222,18 @@ abstract class __UniFfiEventsStream<T, E> {
       return;
     }
     this.closed = true;
-    this.closeNativeOnce();
+    this.closePullOnce();
     this.emitDone();
   }
 
   private pump(): void {
-    if (this.closed || !this.hasHandle || this.inFlight) {
+    if (this.closed || this.pull === null || this.inFlight) {
       return;
     }
     this.inFlight = true;
     let pending: Promise<UniFfiStreamResult<T>>;
     try {
-      pending = this.nextNative(this.handle);
+      pending = this.pull.next();
     } catch (reason) {
       this.inFlight = false;
       this.finishWithError(__uniffiNormalizeReason(reason as Error));
@@ -8205,7 +8247,7 @@ abstract class __UniFfiEventsStream<T, E> {
         }
         if (result.done) {
           this.closed = true;
-          this.closeNativeOnce();
+          this.closePullOnce();
           this.emitDone();
           return;
         }
@@ -8244,7 +8286,7 @@ abstract class __UniFfiEventsStream<T, E> {
       return;
     }
     this.closed = true;
-    this.closeNativeOnce();
+    this.closePullOnce();
     const error: BusinessError<UniFfiStreamErrorData<E>> =
       reason instanceof UniFfiStreamBusinessError ?
         reason as UniFfiStreamBusinessError<E> :
@@ -8267,13 +8309,13 @@ abstract class __UniFfiEventsStream<T, E> {
     this.emitDone();
   }
 
-  private closeNativeOnce(): void {
-    if (!this.hasHandle || this.cancelSent) {
+  private closePullOnce(): void {
+    if (this.pull === null || this.cancelSent) {
       return;
     }
     this.cancelSent = true;
     try {
-      this.cancelNative(this.handle);
+      this.pull.cancel().catch((_ignored: Error): void => {});
     } catch (_ignored) {
     }
   }
@@ -8878,27 +8920,8 @@ export class {events_class} extends __UniFfiEventsStream<{item_type}, {error_typ
     super();
 {assignments}  }}
 
-  protected startNative(): bigint {{
-    return native.{function}({this_call_args});
-  }}
-
-  protected async nextNative(handle: bigint): Promise<UniFfiStreamResult<{item_type}>> {{
-    const result: {next_type} = await native.{next_function}(handle);
-    if (result.error !== undefined && result.error !== null) {{
-      return Promise.reject(new UniFfiStreamBusinessError<{error_type}>(
-        __UNIFFI_STREAM_SOURCE_ERROR_CODE,
-        'UniFFI stream source reported a typed error',
-        {error_type_name},
-        'TypedStreamError',
-        'UniFFI stream source reported a typed error',
-        result.error
-      ));
-    }}
-    return new UniFfiStreamResult<{item_type}>(result.done, result.value);
-  }}
-
-  protected cancelNative(handle: bigint): void {{
-    native.{cancel_function}(handle);
+  protected createPull(): UniFfiStream<{item_type}> {{
+    return new {pull_class}({this_call_args});
   }}
 
   protected errorTypeName(): string {{

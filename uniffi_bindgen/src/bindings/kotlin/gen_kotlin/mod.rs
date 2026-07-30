@@ -478,6 +478,9 @@ impl<'a> KotlinWrapper<'a> {
             imports.insert(ImportRequirement::Import {
                 name: "kotlinx.coroutines.flow.flow".to_owned(),
             });
+            imports.insert(ImportRequirement::Import {
+                name: "java.util.concurrent.atomic.AtomicBoolean".to_owned(),
+            });
         }
         if self.ci.has_input_stream_fns() {
             for name in [
@@ -1523,9 +1526,29 @@ mod test {
 
         assert!(kotlin.contains("import kotlinx.coroutines.flow.Flow"));
         assert!(kotlin.contains("import kotlinx.coroutines.flow.flow"));
+        assert!(kotlin.contains("import java.util.concurrent.atomic.AtomicBoolean"));
         assert!(kotlin.contains("fun `countEvents`("));
         assert!(kotlin.contains(") : Flow<StreamEvent>"));
         assert!(!kotlin.contains("fun `countEvents`(`count`: kotlin.UInt) : ULong"));
+        let stream_owner = kotlin
+            .find("val __streamConsumed = AtomicBoolean(false)")
+            .expect("output stream must own one collection claim");
+        let stream_flow = kotlin
+            .find("return flow {")
+            .expect("output stream must remain a lazy Flow");
+        let stream_claim = kotlin
+            .find("if (!__streamConsumed.compareAndSet(false, true))")
+            .expect("output stream must claim its only collector");
+        let stream_start = kotlin
+            .find("UniffiLib.uniffi_stream_core_fn_func_count_events(")
+            .expect("output stream must start natively");
+        assert!(
+            stream_owner < stream_flow && stream_flow < stream_claim && stream_claim < stream_start,
+            "output stream ownership must be captured outside the lazy Flow and claimed before argument lowering/native start:\n{kotlin}"
+        );
+        assert!(kotlin.contains(
+            "throw InternalException(\"UniFFI output streams may only be consumed once\")"
+        ));
         assert!(kotlin.contains("return flow {"));
         assert!(kotlin.contains("val __streamHandle ="));
         assert!(kotlin.contains("UniffiLib.uniffi_stream_core_fn_func_count_events("));
@@ -1547,6 +1570,31 @@ mod test {
         assert!(kotlin.contains("fun `optionalEvents`() : Flow<kotlin.UInt?>"));
         assert!(kotlin.contains("FfiConverterOptionalUInt.read(buffer)"));
         assert!(kotlin.contains("} finally {"));
+    }
+
+    #[test]
+    fn kotlin_stream_claim_import_requires_an_output_stream() {
+        let ci = ComponentInterface::from_webidl(
+            r#"
+            namespace test_crate {
+                u16 get_value();
+            };
+            "#,
+            "test_crate",
+        )
+        .unwrap();
+        let kotlin = generate_bindings(
+            &Config {
+                package_name: Some("uniffi.test_crate".to_owned()),
+                cdylib_name: Some("test_crate".to_owned()),
+                ..Config::default()
+            },
+            &ci,
+        )
+        .unwrap();
+
+        assert!(!kotlin.contains("import java.util.concurrent.atomic.AtomicBoolean"));
+        assert!(!kotlin.contains("AtomicBoolean(false)"));
     }
 
     #[test]
@@ -1601,6 +1649,7 @@ mod test {
 
         assert!(kotlin.contains("import kotlinx.coroutines.flow.Flow"));
         assert!(kotlin.contains("import kotlinx.coroutines.flow.flow"));
+        assert!(kotlin.contains("import java.util.concurrent.atomic.AtomicBoolean"));
         assert!(kotlin.contains("fun `runningSum`("));
         assert!(kotlin.contains("`events`: Flow<CounterEvent>"));
         assert!(kotlin.contains(") : Flow<CounterEvent>"));
@@ -1613,6 +1662,25 @@ mod test {
             kotlin.contains("lib.uniffi_stream_core_fn_func_running_sum_input_stream_events_init(")
         );
         assert!(kotlin.contains("UniffiLib.uniffi_stream_core_fn_func_running_sum("));
+        let stream_owner = kotlin
+            .find("val __streamConsumed = AtomicBoolean(false)")
+            .expect("output stream must own one collection claim");
+        let stream_flow = kotlin
+            .find("return flow {")
+            .expect("output stream must remain a lazy Flow");
+        let stream_claim = kotlin
+            .find("if (!__streamConsumed.compareAndSet(false, true))")
+            .expect("output stream must claim its only collector");
+        let stream_start = kotlin
+            .find("UniffiLib.uniffi_stream_core_fn_func_running_sum(")
+            .expect("output stream must start natively");
+        assert!(
+            stream_owner < stream_flow && stream_flow < stream_claim && stream_claim < stream_start,
+            "output stream ownership must be captured outside the lazy Flow and claimed before argument lowering/native start:\n{kotlin}"
+        );
+        assert!(kotlin.contains(
+            "throw InternalException(\"UniFFI output streams may only be consumed once\")"
+        ));
         assert!(kotlin.contains(
             "UniffiLib.uniffi_stream_core_fn_func_running_sum_stream_next(__streamHandle)"
         ));
