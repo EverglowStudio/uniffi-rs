@@ -3781,7 +3781,7 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
     assert!(facade.contains("export function countEventsEvents"));
     assert!(facade.contains("export function echoEventsEvents"));
     assert!(declarations.contains("export interface __UniffiInputStream<T>"));
-    assert_eq!(contract["schemaVersion"], 2);
+    assert_eq!(contract["schemaVersion"], 3);
     assert!(contract["hostCompositeIdentity"]
         .as_str()
         .is_some_and(|value| value.len() == 64));
