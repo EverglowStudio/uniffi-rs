@@ -4737,11 +4737,7 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
     let (defs, contracts) = test_harmony_stream_contract();
     let exports = FacadeExports::from_type_defs_and_contracts(&defs, contracts).unwrap();
     let facade = exports.render_native_facade("libfixture.so");
-    let declarations = format!(
-        "{}{}",
-        render_index_d_ts(exports.package_public_defs(defs.clone())),
-        exports.render_stream_declarations()
-    );
+    let declarations = render_harmony_declaration_surfaces(&defs, &exports).package_public;
     let index = exports.render_package_index();
     let inventory = exports.render_contract_inventory().unwrap();
 
@@ -4852,6 +4848,68 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
         last_import < first_export,
         "ArkTS requires every import before declarations and exports:\n{facade}"
     );
+}
+
+#[test]
+fn native_declarations_retain_output_raw_contract_while_package_stays_public() {
+    let (mut defs, contracts) = test_harmony_stream_contract();
+    defs.push(TypeDefLine {
+        kind: "fn".into(),
+        name: "greeting".into(),
+        original_name: None,
+        def: "function greeting(name: string): string".into(),
+        js_doc: None,
+        js_mod: None,
+        extends: None,
+    });
+    let exports = FacadeExports::from_type_defs_and_contracts(&defs, contracts).unwrap();
+    let declarations = render_harmony_declaration_surfaces(&defs, &exports);
+
+    for raw in [
+        "countEvents",
+        "countEventsStreamNext",
+        "countEventsStreamCancel",
+        "echoEvents",
+        "echoEventsStreamNext",
+        "echoEventsStreamCancel",
+    ] {
+        assert!(
+            declarations.native.contains(&format!("function {raw}(")),
+            "native declarations must retain output raw `{raw}`:\n{}",
+            declarations.native
+        );
+        assert!(
+            !declarations
+                .package_public
+                .contains(&format!("function {raw}(")),
+            "package declarations must hide output raw `{raw}`:\n{}",
+            declarations.package_public
+        );
+    }
+    for raw_type in ["FixtureNext", "__FixtureNext"] {
+        assert!(
+            declarations.native.contains(raw_type),
+            "native declarations must retain output next envelope `{raw_type}`:\n{}",
+            declarations.native
+        );
+        assert!(
+            !declarations.package_public.contains(raw_type),
+            "package declarations must hide output next envelope `{raw_type}`:\n{}",
+            declarations.package_public
+        );
+    }
+    for public in [
+        "export declare function greeting(",
+        "export declare function countEventsEvents(",
+        "export declare function countEventsStream(",
+        "export declare function createNumberStringFingerprint8b30e3aa815a2f4aInputChannel()",
+    ] {
+        assert!(
+            declarations.package_public.contains(public),
+            "package declarations must retain public `{public}`:\n{}",
+            declarations.package_public
+        );
+    }
 }
 
 #[test]
