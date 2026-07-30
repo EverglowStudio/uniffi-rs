@@ -6479,19 +6479,10 @@ fn emit_index_d_ts(dist_dir: &Utf8Path, type_dir: &Utf8Path, lib_target_name: &s
     let mut exports = FacadeExports::from_type_defs_and_contracts(&defs, contracts)?;
     exports.streams.host_composite_identity = inventory.host_composite_identity.clone();
     exports.streams.component_identities = inventory.components.clone();
-    let public_defs = exports.package_public_defs(defs);
-    let mut declarations = render_index_d_ts(public_defs);
-    if !exports.streams.declaration_imports().is_empty() {
-        declarations = declarations.replacen(
-            TYPE_HEADER,
-            &format!("{}{}", TYPE_HEADER, exports.streams.declaration_imports()),
-            1,
-        );
-    }
-    declarations.push_str(&exports.render_stream_declarations());
-    std::fs::write(dist_dir.join("index.d.ts"), &declarations)
+    let declarations = render_harmony_declaration_surfaces(&defs, &exports);
+    std::fs::write(dist_dir.join("index.d.ts"), declarations.native)
         .with_context(|| format!("writing OHOS index.d.ts in {dist_dir}"))?;
-    std::fs::write(dist_dir.join("Index.d.ets"), declarations)
+    std::fs::write(dist_dir.join("Index.d.ets"), declarations.package_public)
         .with_context(|| format!("writing Harmony package declarations in {dist_dir}"))?;
     let native = native_lib_filename(lib_target_name);
     std::fs::write(
@@ -6655,12 +6646,17 @@ impl FacadeExports {
             .collect()
     }
 
-    fn package_public_defs(&self, defs: Vec<TypeDefLine>) -> Vec<TypeDefLine> {
-        defs.into_iter()
-            .filter(|def| {
-                !(def.kind == "fn" && def.name.starts_with("uniffiohosbridgeidentity"))
-                    && !self.streams.hides_package_def(def)
-            })
+    fn native_type_defs(&self, defs: &[TypeDefLine]) -> Vec<TypeDefLine> {
+        defs.iter()
+            .filter(|def| !(def.kind == "fn" && def.name.starts_with("uniffiohosbridgeidentity")))
+            .cloned()
+            .collect()
+    }
+
+    fn package_public_defs(&self, defs: &[TypeDefLine]) -> Vec<TypeDefLine> {
+        self.native_type_defs(defs)
+            .into_iter()
+            .filter(|def| !self.streams.hides_package_def(def))
             .collect()
     }
 
@@ -6670,6 +6666,31 @@ impl FacadeExports {
 
     fn render_contract_inventory(&self) -> Result<String> {
         self.streams.render_contract_inventory()
+    }
+}
+
+struct HarmonyDeclarationSurfaces {
+    native: String,
+    package_public: String,
+}
+
+fn render_harmony_declaration_surfaces(
+    defs: &[TypeDefLine],
+    exports: &FacadeExports,
+) -> HarmonyDeclarationSurfaces {
+    let native = render_index_d_ts(exports.native_type_defs(defs));
+    let mut package_public = render_index_d_ts(exports.package_public_defs(defs));
+    if !exports.streams.declaration_imports().is_empty() {
+        package_public = package_public.replacen(
+            TYPE_HEADER,
+            &format!("{}{}", TYPE_HEADER, exports.streams.declaration_imports()),
+            1,
+        );
+    }
+    package_public.push_str(&exports.render_stream_declarations());
+    HarmonyDeclarationSurfaces {
+        native,
+        package_public,
     }
 }
 
