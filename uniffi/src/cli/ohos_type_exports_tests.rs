@@ -63,6 +63,7 @@ fn package_entry_reexports_public_harmony_stream_interfaces() {
             input_streams: Vec::new(),
         }],
         native_types: vec!["EventsStreamNext".to_string()],
+        package_hidden_next_envelopes: Vec::new(),
         host_composite_identity: String::new(),
         component_identities: Vec::new(),
     };
@@ -76,7 +77,6 @@ fn package_entry_reexports_public_harmony_stream_interfaces() {
     assert_eq!(
         exports.type_exports(),
         vec![
-            "EventsStreamNext",
             "UniFfiInputFailureData",
             "UniFfiStream",
             "UniFfiStreamErrorData",
@@ -84,7 +84,6 @@ fn package_entry_reexports_public_harmony_stream_interfaces() {
     );
     let package = exports.render_package_index();
     for name in [
-        "EventsStreamNext",
         "UniFfiInputFailureData",
         "UniFfiStream",
         "UniFfiStreamErrorData",
@@ -92,6 +91,17 @@ fn package_entry_reexports_public_harmony_stream_interfaces() {
         assert!(
             package.contains(&format!("  {name},\n")),
             "missing package-root type export for {name}:\n{package}"
+        );
+    }
+    for raw in [
+        "events",
+        "eventsStreamNext",
+        "eventsStreamCancel",
+        "EventsStreamNext",
+    ] {
+        assert!(
+            !package.contains(&format!("  {raw},\n")),
+            "package root must hide output raw `{raw}`:\n{package}"
         );
     }
     for class in ["EventsEventsStream", "EventsPullStream"] {

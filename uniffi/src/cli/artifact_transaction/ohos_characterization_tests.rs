@@ -4613,7 +4613,7 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
         js_mod: None,
         extends: None,
     };
-    let defs = vec![
+    let mut defs = vec![
             def(
                 "fn",
                 "countEvents",
@@ -4668,6 +4668,10 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
                 "ok: boolean\ndone?: boolean\nvalue?: number\nerror?: string",
             ),
         ];
+    defs.iter_mut()
+        .find(|def| def.name == "FixtureNext")
+        .expect("fixture output next envelope exists")
+        .original_name = Some("__FixtureNext".into());
     let input = HarmonyInputStreamContract {
         suffix: INPUT_SUFFIX.into(),
         canonical: INPUT_CANONICAL.into(),
@@ -4735,10 +4739,11 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
     let facade = exports.render_native_facade("libfixture.so");
     let declarations = format!(
         "{}{}",
-        render_index_d_ts(defs),
+        render_index_d_ts(exports.package_public_defs(defs.clone())),
         exports.render_stream_declarations()
     );
     let index = exports.render_package_index();
+    let inventory = exports.render_contract_inventory().unwrap();
 
     for needle in [
             "export function countEventsEvents(count: number): CountEventsEventsStream",
@@ -4772,6 +4777,60 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
         assert!(
             index.contains(name),
             "package index omits `{name}`:\n{index}"
+        );
+    }
+    for raw in [
+        "countEvents",
+        "countEventsStreamNext",
+        "countEventsStreamCancel",
+        "echoEvents",
+        "echoEventsStreamNext",
+        "echoEventsStreamCancel",
+    ] {
+        assert!(
+            facade.contains(&format!("export const {raw}:")),
+            "native facade must retain output raw `{raw}`:\n{facade}"
+        );
+        assert!(
+            inventory.contains(raw),
+            "contract inventory must retain output raw `{raw}`:\n{inventory}"
+        );
+        assert!(
+            !index.contains(&format!("  {raw},\n"))
+                && !declarations.contains(&format!("function {raw}(")),
+            "package root must hide output raw `{raw}`:\nindex:\n{index}\ndeclarations:\n{declarations}"
+        );
+    }
+    for raw_type in ["FixtureNext", "__FixtureNext"] {
+        assert!(
+            facade.contains(raw_type),
+            "native facade must retain output next envelope `{raw_type}`:\n{facade}"
+        );
+        assert!(
+            !index.contains(&format!("  {raw_type},\n")) && !declarations.contains(raw_type),
+            "package root must hide output next envelope `{raw_type}` and its aliases:\nindex:\n{index}\ndeclarations:\n{declarations}"
+        );
+    }
+    let events_start = facade
+        .find("export class CountEventsEventsStream")
+        .expect("generated Event class exists");
+    let events_end = facade[events_start..]
+        .find("export function countEventsEvents")
+        .map(|offset| events_start + offset)
+        .expect("generated Event factory exists");
+    let events = &facade[events_start..events_end];
+    assert!(events.contains("protected createPull(): UniFfiStream<number>"));
+    for forbidden in [
+        "startNative",
+        "nextNative",
+        "cancelNative",
+        "native.countEvents",
+        "native.countEventsStreamNext",
+        "native.countEventsStreamCancel",
+    ] {
+        assert!(
+            !events.contains(forbidden),
+            "Event adapter must delegate through Pull, found `{forbidden}`:\n{events}"
         );
     }
     for forbidden in [
@@ -5164,7 +5223,9 @@ fn stream_argument_names_are_mangled_away_from_state_machine_members() {
         );
     }
     assert!(
-        facade.contains("native.countEvents(this.__arg0, this.__arg1, this.__arg2, this.__arg3)"),
+        facade.contains(
+            "return new CountEventsPullStream(this.__arg0, this.__arg1, this.__arg2, this.__arg3)"
+        ),
         "{facade}"
     );
     for name in ["handle", "nextNative", "cancelNative", "source"] {

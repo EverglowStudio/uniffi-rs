@@ -112,6 +112,11 @@ Runtime semantics:
   iterator, and best-effort cancels the native handle without creating an unhandled cleanup rejection.
 - Done closes the iterator. Later `next()` returns `{ done: true }`.
 - `throw(error)` best-effort cancels the handle, then rejects with the caller-supplied error.
+- The iterable and every iterator obtained from it share one lifetime owner. When an unconsumed
+  iterable or abandoned iterator becomes unreachable, a best-effort `FinalizationRegistry` cleanup
+  unregisters the owner and cancels the native handle at most once. Finalization timing is not a
+  correctness guarantee; callers must still use `return()`, `throw()`, or loop `break` for prompt
+  cleanup. Finalizer cleanup swallows synchronous failures and rejected cancellation promises.
 
 N-API, Electron, and wasm-bindgen backends all emit start / next / cancel exports for stream-returning
 free functions. Electron marks only `*_stream_next` as async; start and cancel remain synchronous so
@@ -174,12 +179,16 @@ countEvents(count = 3u).collect { item ->
 }
 ```
 
-The public Kotlin API does not expose the raw stream handle. Generated code returns a cold `flow {}`:
-each collection synchronously calls the low-level start function to create a new Rust stream handle,
-then repeatedly awaits the hidden `foo_stream_next(handle)` Rust future through the existing
-`uniffiRustCallAsync` helper. The wrapper reads the outer RustBuffer optional tag before it lifts
-the item: Item is emitted (including `null` for an optional item), Done ends the flow, and stream
-item errors are thrown to the collector through the standard Kotlin exception path.
+The public Kotlin API does not expose the raw stream handle. Generated code returns a cold `flow {}`
+whose stream object is single-use: the first collection synchronously calls the low-level start
+function to create one Rust stream handle, then repeatedly awaits the hidden
+`foo_stream_next(handle)` Rust future through the existing `uniffiRustCallAsync` helper. A
+thread-safe collect claim is captured outside `flow {}`; a sequential or concurrent second
+collection fails with `InternalException("UniFFI output streams may only be consumed once")` before
+argument lowering or native start, so it cannot create another handle. The first collection remains
+lazy until collection begins. The wrapper reads the outer RustBuffer optional tag before it lifts the
+item: Item is emitted (including `null` for an optional item), Done ends the flow, and stream item
+errors are thrown to the collector through the standard Kotlin exception path.
 
 The generated flow body always calls hidden `foo_stream_cancel(handle)` from `finally`. This covers
 normal completion, collector cancellation, and exceptions. The Rust-side cancel path is idempotent,
@@ -200,10 +209,14 @@ definitions. The normalized contract is available in dist and as
 static facade bundle beside its `Cargo.toml`, so a Cargo-fresh packaging build uses the same API
 contract.
 
-`Index.ets` and `Index.d.ets` explicitly export the raw start/next/cancel helpers, pull and event
-factories, input-channel factories, and all supporting values and types. The same root surface is
-present in the HSP Interface HAR. Consumers import from that stable package root rather than from
-the native facade, `src/main/ets`, or `.so` declaration paths.
+`Index.ets`, `index.d.ts`, and `Index.d.ets` expose pull and event factories, input-channel
+factories, and their public supporting values and types. The raw output start/next/cancel helpers
+and each output next-envelope type (including its generated original-name alias) are deliberately
+absent from that package-root surface. They remain in `native-facade.ets` and the normalized
+`harmony-facade-contract.json` inventory for generated Pull implementation only. Input-stream raw
+helpers, ordinary callables, and classes remain package-root exports. Consumers import supported
+APIs from the stable package root rather than reaching into the native facade, `src/main/ets`, or
+`.so` declaration paths.
 
 For every stream-returning free function `foo`, the package exports both pull and event factories:
 
@@ -219,15 +232,22 @@ events.on('done', () => { /* terminal */ });
 events.start();
 ```
 
-`start()` is explicit and idempotent. It creates the Rust stream handle only on its first call and
-keeps at most one `next` request in flight. Listener dispatch uses a snapshot; one listener throwing
-or removing itself does not stop the other listeners or turn into a source error. Calling
+`fooStream(args)` synchronously starts the native output stream and returns the primary
+`UniFfiStream<T>` pull facade. Its owner must explicitly call `await cancel()` when it stops before
+Done or Error: ArkTS API 20 has no lifecycle finalizer available to provide an abandoned-object
+fallback. `fooEvents(args)` is a compatibility adapter over that same Pull facade: it creates the
+Pull object only on its first explicit, idempotent `start()`; cancelling before `start()` creates no
+native handle. Its pump performs at most one Pull `next()` at a time, and Done, Error, and
+`cancel()` all converge through Pull `cancel()`. Listener dispatch uses a snapshot; one listener
+throwing or removing itself does not stop the other listeners or turn into a source error. Calling
 `cancel()` from a data listener stops later data listeners for that item and prevents another pull.
 `off(event)` removes every listener for that event, while `off(event, listener)` removes the selected
-listener. Normal EOF
-emits `done` once. A source error emits one stable-code
+listener. Normal EOF emits `done` once. A source error emits one stable-code
 `BusinessError<UniFfiStreamErrorData<E>>` and then `done` once. `cancel()` is idempotent, calls the
-raw cancel function at most once, suppresses any late in-flight result, and emits `done` once.
+underlying Pull cancellation at most once, suppresses any late in-flight result, and emits `done`
+once. Event delivery actively pumps the Pull stream and therefore does not provide strict consumer
+backpressure; use Pull for core or high-throughput data paths and reserve Event for compatibility
+and UI notification use cases.
 
 The output raw ABI carries the native error name and display detail, but not the original Rust enum
 variant. `UniFfiStreamBusinessError<E>` extends `Error` and implements the Harmony
@@ -241,7 +261,7 @@ from an N-API error name. Library-owned error categories are stable and distinct
 - `1900003`: caller-supplied typed input failure;
 - `1900004`: write attempted after input termination.
 
-The raw start/next/cancel exports remain public. The packaged pull interface is:
+The packaged pull interface is:
 
 ```ts
 export interface UniFfiStream<T> {
