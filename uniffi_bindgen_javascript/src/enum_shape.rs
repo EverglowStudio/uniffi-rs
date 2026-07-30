@@ -36,45 +36,85 @@
 //! there is exactly one source of truth. The helper is plain JS (no
 //! TS types), so it works unchanged inside `preload.cjs`.
 
-/// TypeScript flavour of the helpers for `backend-napi.ts`. Strict-mode
-/// clean: everything is typed `unknown`.
-pub fn helper_ts() -> &'static str {
-    r#"// ---- enum shape bridge (tag <-> type) -----------------------------
+/// TypeScript flavour of the helpers for generated backend adapters.
+///
+/// `dynamic_value_type` is selected by the target renderer.  Node uses
+/// `unknown`, while ArkTS uses its local `UniffiValue` alias instead of a
+/// post-render text rewrite.
+pub fn helper_ts(dynamic_value_type: &str) -> String {
+    let mut out = String::from(
+        r#"// ---- enum shape bridge (tag <-> type) -----------------------------
 // See uniffi_bindgen_javascript/src/enum_shape.rs for the rationale.
-function __uniffiIsPlainObject(v: unknown): v is Record<string, unknown> {
+function __uniffiIsPlainObject(v: "#,
+    );
+    out.push_str(dynamic_value_type);
+    out.push_str(r#"): v is Record<string, "#);
+    out.push_str(dynamic_value_type);
+    out.push_str(
+        r#"> {
     if (v === null || typeof v !== "object") return false;
     if (Array.isArray(v)) return false;
     const proto = Object.getPrototypeOf(v);
     return proto === Object.prototype || proto === null;
 }
-function __uniffiLowerShape(v: unknown): unknown {
+function __uniffiLowerShape(v: "#,
+    );
+    out.push_str(dynamic_value_type);
+    out.push_str(r#"): "#);
+    out.push_str(dynamic_value_type);
+    out.push_str(
+        r#" {
     if (Array.isArray(v)) return v.map(__uniffiLowerShape);
     if (__uniffiIsPlainObject(v)) {
-        const out: Record<string, unknown> = {};
+        const out: Record<string, "#,
+    );
+    out.push_str(dynamic_value_type);
+    out.push_str(
+        r#"> = {};
         const hasType = Object.prototype.hasOwnProperty.call(v, "type");
         for (const k of Object.keys(v)) {
             const nk = k === "tag" && !hasType ? "type" : k;
-            out[nk] = __uniffiLowerShape((v as Record<string, unknown>)[k]);
+            out[nk] = __uniffiLowerShape((v as Record<string, "#,
+    );
+    out.push_str(dynamic_value_type);
+    out.push_str(
+        r#">)[k]);
         }
         return out;
     }
     return v;
 }
-function __uniffiLiftShape(v: unknown): unknown {
+function __uniffiLiftShape(v: "#,
+    );
+    out.push_str(dynamic_value_type);
+    out.push_str(r#"): "#);
+    out.push_str(dynamic_value_type);
+    out.push_str(
+        r#" {
     if (Array.isArray(v)) return v.map(__uniffiLiftShape);
     if (__uniffiIsPlainObject(v)) {
-        const out: Record<string, unknown> = {};
+        const out: Record<string, "#,
+    );
+    out.push_str(dynamic_value_type);
+    out.push_str(
+        r#"> = {};
         const hasTag = Object.prototype.hasOwnProperty.call(v, "tag");
         for (const k of Object.keys(v)) {
             const nk = k === "type" && !hasTag ? "tag" : k;
-            out[nk] = __uniffiLiftShape((v as Record<string, unknown>)[k]);
+            out[nk] = __uniffiLiftShape((v as Record<string, "#,
+    );
+    out.push_str(dynamic_value_type);
+    out.push_str(
+        r#">)[k]);
         }
         return out;
     }
     return v;
 }
 // -------------------------------------------------------------------
-"#
+"#,
+    );
+    out
 }
 
 /// Plain-JS flavour for `preload.cjs` (no TS syntax).
