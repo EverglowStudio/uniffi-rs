@@ -71,6 +71,7 @@
 {%- macro stream_func_decl(func_decl, callable, indent) %}
     {%- call docstring(callable, indent) %}{% endcall %}
 
+    {%- if let Some(stream_item_type) = callable.stream_item_type() %}
     {%- if let Some(stream_error_type) = callable.stream_error_type() %}
     {%- if let Some(stream_next_return_type) = callable.stream_next_return_type() %}
     {{ func_decl }} fun {{ callable.name()|fn_name }}(
@@ -85,23 +86,24 @@
                         { future, callback, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_poll(ci) }}(future, callback, continuation) },
                         { future, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_complete(ci) }}(future, continuation) },
                         { future -> UniffiLib.{{ callable.ffi_stream_next_rust_future_free(ci) }}(future) },
-                        { {{ stream_next_return_type|lift_fn }}(it) },
+                        { __uniffiLiftStreamNext(it) { buffer -> {{ stream_item_type|read_fn }}(buffer) } },
                         {%- if ci.is_external(stream_error_type) %}
                         {{ stream_error_type|type_name(ci) }}ExternalErrorHandler,
                         {%- else %}
                         {{ stream_error_type|type_name(ci) }}.ErrorHandler,
                         {%- endif %}
                     )
-                    if (__streamNext == null) {
-                        break
+                    when (__streamNext) {
+                        is __UniffiStreamNext.Item -> emit(__streamNext.value)
+                        __UniffiStreamNext.Done -> break
                     }
-                    emit(__streamNext)
                 }
             } finally {
                 UniffiLib.{{ callable.ffi_stream_cancel_func() }}(__streamHandle)
             }
         }
     }
+    {%- endif %}
     {%- endif %}
     {%- endif %}
 {% endmacro %}

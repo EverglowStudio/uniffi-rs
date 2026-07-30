@@ -1,6 +1,42 @@
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
+// The Rust output-stream ABI completes `Result<Option<Item>, Error>` as a
+// RustBuffer. Decode its outer Option tag before lifting Item: when Item is
+// Optional, an inner `.none` is a valid item rather than stream completion.
+private enum __UniffiStreamNext<T> {
+    case item(T)
+    case done
+}
+
+private func __uniffiLiftStreamNext<T>(
+    _ rustBuffer: RustBuffer,
+    readItem: (inout (data: Data, offset: Data.Index)) throws -> T
+) throws -> __UniffiStreamNext<T> {
+    defer {
+        rustBuffer.deallocate()
+    }
+    guard rustBuffer.len > 0, rustBuffer.data != nil else {
+        throw UniffiInternalError.bufferOverflow
+    }
+    var reader = createReader(data: Data(rustBuffer: rustBuffer))
+    switch try readInt(&reader) as Int8 {
+    case 0:
+        guard !hasRemaining(reader) else {
+            throw UniffiInternalError.incompleteData
+        }
+        return .done
+    case 1:
+        let item = try readItem(&reader)
+        guard !hasRemaining(reader) else {
+            throw UniffiInternalError.incompleteData
+        }
+        return .item(item)
+    default:
+        throw UniffiInternalError.unexpectedOptionalTag
+    }
+}
+
 fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
 
 fileprivate func uniffiRustCallAsync<F, T>(

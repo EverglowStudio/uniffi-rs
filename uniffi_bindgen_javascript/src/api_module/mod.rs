@@ -1189,6 +1189,8 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
     }
     if usage.needs_stream {
         runtime.push("createUniffiAsyncIterable");
+        runtime.push("UniffiError");
+        runtime.push("type UniffiStreamNext");
     }
     if usage.needs_input_stream {
         runtime.push("createUniffiInputStream");
@@ -1321,10 +1323,22 @@ fn render_free_function(ci: &ComponentInterface, config: &JsConfig, f: &Function
              const __handle = __call<any>(\"{rust_name}\"{sep}{arg_pass});\n    \
              return createUniffiAsyncIterable<{item_ts}>({{\n        \
              handle: __handle,\n        \
-             next: async (__streamHandle: unknown): Promise<{item_ts} | null> => {{\n            \
-             const __next = await __callAsync<{{ done: boolean; value?: {item_call_g} }}>(\"{next_name}\", __streamHandle);\n            \
-             if (__next == null || __next.done === true) return null;\n            \
-             return {item_lift} as {item_ts};\n        \
+             next: async (__streamHandle: unknown): Promise<UniffiStreamNext<{item_ts}>> => {{\n            \
+             const __next = await __callAsync<{{ done?: unknown; value?: {item_call_g}; error?: unknown }}>(\"{next_name}\", __streamHandle);\n            \
+             if (__next === null || typeof __next !== \"object\" || typeof __next.done !== \"boolean\") {{\n                \
+             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream next returned an invalid native envelope\" }});\n            \
+             }}\n            \
+             if (__next.done) {{\n                \
+             if (__next.error !== null && __next.error !== undefined) {{\n                    \
+             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream Done envelope contained an error\" }});\n                \
+             }}\n                \
+             return {{ done: true }};\n            \
+             }}\n            \
+             if (__next.error !== null && __next.error !== undefined) throw __next.error;\n            \
+             if (!Object.prototype.hasOwnProperty.call(__next, \"value\")) {{\n                \
+             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream Item envelope omitted value\" }});\n            \
+             }}\n            \
+             return {{ done: false, value: {item_lift} as {item_ts} }};\n        \
              }},\n        \
              cancel: (__streamHandle: unknown): void => {{\n            \
              __call<void>(\"{cancel_name}\", __streamHandle);\n        \

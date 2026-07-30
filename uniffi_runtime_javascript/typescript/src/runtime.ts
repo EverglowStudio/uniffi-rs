@@ -132,9 +132,19 @@ export async function __callAsync<T>(fn: string, ...args: unknown[]): Promise<T>
 // Native stream wrapper
 // ---------------------------------------------------------------------------
 
+/**
+ * Binding-internal result of one native output-stream pull.
+ *
+ * `done` is the sole completion discriminator. In particular, an item value
+ * may be `null` when Rust yields `Some(None)` from `Stream<Option<T>>`.
+ */
+export type UniffiStreamNext<T> =
+    | { done: false; value: T }
+    | { done: true; value?: undefined };
+
 export interface UniffiAsyncIterableOptions<T> {
     handle: unknown;
-    next: (handle: unknown) => Promise<T | null | undefined>;
+    next: (handle: unknown) => Promise<UniffiStreamNext<T>>;
     cancel: (handle: unknown) => void | Promise<void>;
 }
 
@@ -186,14 +196,36 @@ export function createUniffiAsyncIterable<T>(
                     }
                     pending = true;
                     try {
-                        const value = await options.next(options.handle);
-                        if (value == null) {
+                        const result = await options.next(options.handle);
+                        if (
+                            result === null ||
+                            typeof result !== "object" ||
+                            typeof result.done !== "boolean" ||
+                            (!result.done &&
+                                !Object.prototype.hasOwnProperty.call(
+                                    result,
+                                    "value",
+                                ))
+                        ) {
+                            throw new UniffiError({
+                                errorName: "UniffiStreamProtocolError",
+                                message:
+                                    "uniffi stream next returned an invalid result envelope",
+                            });
+                        }
+                        // A concurrent return()/throw() may cancel a pending native pull.
+                        // Never surface a late item after that terminal transition.
+                        if (closed || result.done) {
                             closed = true;
                             return { done: true, value: undefined };
                         }
-                        return { done: false, value };
+                        return { done: false, value: result.value };
                     } catch (raw) {
                         closed = true;
+                        // Native error paths must close the registry entry. Cancellation is
+                        // best-effort here so a cleanup failure cannot replace the stream error
+                        // or become an unhandled rejection.
+                        void closeWithCancel().catch(() => {});
                         throw wrapError(raw);
                     } finally {
                         pending = false;
@@ -202,6 +234,15 @@ export function createUniffiAsyncIterable<T>(
                 async return(): Promise<IteratorResult<T>> {
                     await closeWithCancel();
                     return { done: true, value: undefined };
+                },
+                async throw(error?: unknown): Promise<IteratorResult<T>> {
+                    try {
+                        await closeWithCancel();
+                    } catch {
+                        // AsyncIterator.throw() must reject with the caller-supplied error,
+                        // even if best-effort native cleanup fails.
+                    }
+                    throw error;
                 },
             };
         },

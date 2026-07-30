@@ -1273,6 +1273,23 @@ mod test {
             }],
             return_type: Some(Type::Stream {
                 item_type: Box::new(stream_event_type),
+                error_type: Box::new(stream_error_type.clone()),
+                is_send: true,
+            }),
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }));
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: "optional_events".to_owned(),
+            orig_name: None,
+            is_async: false,
+            inputs: vec![],
+            return_type: Some(Type::Stream {
+                item_type: Box::new(Type::Optional {
+                    inner_type: Box::new(Type::UInt32),
+                }),
                 error_type: Box::new(stream_error_type),
                 is_send: true,
             }),
@@ -1519,10 +1536,16 @@ mod test {
             "UniffiLib.uniffi_stream_core_fn_func_count_events_stream_cancel(__streamHandle)"
         ));
         assert!(kotlin.contains("val __streamNext = uniffiRustCallAsync("));
-        assert!(kotlin.contains("FfiConverterOptionalTypeStreamEvent.lift(it)"));
+        assert!(kotlin.contains(
+            "__uniffiLiftStreamNext(it) { buffer -> FfiConverterTypeStreamEvent.read(buffer) }"
+        ));
         assert!(kotlin.contains("StreamException.ErrorHandler"));
-        assert!(kotlin.contains("if (__streamNext == null)"));
-        assert!(kotlin.contains("emit(__streamNext)"));
+        assert!(kotlin.contains("is __UniffiStreamNext.Item -> emit(__streamNext.value)"));
+        assert!(kotlin.contains("__UniffiStreamNext.Done -> break"));
+        assert!(!kotlin.contains("if (__streamNext == null)"));
+        assert!(!kotlin.contains("emit(__streamNext)"));
+        assert!(kotlin.contains("fun `optionalEvents`() : Flow<kotlin.UInt?>"));
+        assert!(kotlin.contains("FfiConverterOptionalUInt.read(buffer)"));
         assert!(kotlin.contains("} finally {"));
     }
 

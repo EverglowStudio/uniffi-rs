@@ -77,14 +77,18 @@
                         pollFunc: {{ callable.ffi_stream_next_rust_future_poll(ci) }},
                         completeFunc: {{ callable.ffi_stream_next_rust_future_complete(ci) }},
                         freeFunc: {{ callable.ffi_stream_next_rust_future_free(ci) }},
-                        liftFunc: {{ stream_next_return_type|lift_fn }},
+                        liftFunc: { try __uniffiLiftStreamNext($0) { reader in
+                            try {{ stream_item_type|read_fn }}(from: &reader)
+                        } },
                         errorHandler: {{ stream_error_type|ffi_error_converter_name }}_lift
                     )
-                    guard let __streamValue = __streamNext else {
+                    switch __streamNext {
+                    case .done:
                         continuation.finish()
                         return
+                    case let .item(__streamValue):
+                        continuation.yield(__streamValue)
                     }
-                    continuation.yield(__streamValue)
                 }
                 continuation.finish()
             } catch {
