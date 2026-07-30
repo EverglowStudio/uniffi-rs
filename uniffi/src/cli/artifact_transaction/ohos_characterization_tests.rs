@@ -4413,6 +4413,59 @@ fn renders_type_defs_from_ohos_json_lines() {
 }
 
 #[test]
+fn ohos_type_renderer_rewrites_only_buffer_type_tokens() {
+    let def = |kind: &str, name: &str, body: &str, js_doc: Option<&str>| TypeDefLine {
+        kind: kind.into(),
+        name: name.into(),
+        original_name: None,
+        def: body.into(),
+        js_doc: js_doc.map(Into::into),
+        js_mod: None,
+        extends: None,
+    };
+    let defs = vec![
+        def(
+            "interface",
+            "BufferPool",
+            "Buffer: Buffer\nBufferPool: BufferPool\nqualified: Custom.Buffer\nliteral: \"Buffer\"",
+            Some("/** unknown napi:: .node Buffer */\n"),
+        ),
+        def(
+            "fn",
+            "napi_service",
+            "function napi_service(Buffer: Buffer, BufferPool: BufferPool, qualified: Custom.Buffer): Buffer;",
+            None,
+        ),
+        def(
+            "enum",
+            "napi_ohos_bridge",
+            "Buffer = 0, BufferPool = 1",
+            None,
+        ),
+        def(
+            "type",
+            "runtime_unknown_value",
+            "{ payload: Buffer, literal: \"Buffer\", qualified: Custom.Buffer }",
+            None,
+        ),
+    ];
+
+    let rendered = render_index_d_ts(defs);
+    assert!(rendered.contains("/** unknown napi:: .node Buffer */"));
+    assert!(rendered.contains("export interface BufferPool"));
+    assert!(rendered.contains("Buffer: ArrayBuffer"));
+    assert!(rendered.contains("BufferPool: BufferPool"));
+    assert!(rendered.contains("qualified: Custom.Buffer"));
+    assert!(rendered.contains("literal: \"Buffer\""));
+    assert!(rendered.contains(
+        "export declare function napi_service(Buffer: ArrayBuffer, BufferPool: BufferPool, qualified: Custom.Buffer): ArrayBuffer;"
+    ));
+    assert!(rendered.contains("export declare const enum napi_ohos_bridge"));
+    assert!(rendered.contains("Buffer = 0, BufferPool = 1"));
+    assert!(rendered.contains("payload: ArrayBuffer"));
+}
+
+#[test]
 fn renders_ohos_string_enum_as_literal_union() {
     let json = r#"type_def:{"kind":"string_enum","name":"LocalAiBackend","def":"Auto = 'Auto',\n Onnx = 'Onnx',\n Mlx = 'Mlx'","js_doc":null,"js_mod":null}"#;
     let def = parse_type_def_line(json).unwrap().unwrap();

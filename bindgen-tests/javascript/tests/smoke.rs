@@ -6225,14 +6225,14 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
 
     let ohos_rs = std::fs::read_to_string(out_dir.join("harmony/arithmetical.rs")).unwrap();
     assert!(
-        ohos_rs.contains("use napi_ohos::bindgen_prelude::*;")
+        ohos_rs.contains("extern crate napi_ohos as napi;")
             && ohos_rs.contains("use napi_derive_ohos::napi;")
-            && ohos_rs.contains("napi_ohos::bindgen_prelude::BigInt"),
-        "harmony bridge must use ohos-rs imports:\n{ohos_rs}"
+            && ohos_rs.contains("napi::bindgen_prelude::BigInt"),
+        "harmony bridge must bind internal napi paths to ohos-rs directly:\n{ohos_rs}"
     );
     assert!(
-        !ohos_rs.contains("napi::"),
-        "harmony bridge must not reference ordinary napi-rs:\n{ohos_rs}"
+        !ohos_rs.contains("use napi_derive::napi;"),
+        "harmony bridge must not import the ordinary napi-rs derive crate:\n{ohos_rs}"
     );
 
     let backend = std::fs::read_to_string(out_dir.join("harmony/backend-ohos.ts")).unwrap();

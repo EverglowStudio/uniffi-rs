@@ -6746,7 +6746,116 @@ fn render_callable_function_type(def: &TypeDefLine) -> Result<String> {
     if return_type.is_empty() {
         bail!("Harmony callable `{}` has an empty return type", def.name);
     }
-    Ok(format!("({parameters}) => {return_type}").replace("Buffer", "ArrayBuffer"))
+    Ok(format!(
+        "({}) => {}",
+        render_ohos_type_fragment(parameters),
+        render_ohos_type_fragment(return_type)
+    ))
+}
+
+/// Render the portions of a generated declaration that contain TypeScript
+/// type syntax for the ArkTS surface.
+///
+/// Byte buffers are represented by `Buffer` in the N-API declaration source
+/// but by `ArrayBuffer` in ArkTS.  This deliberately scans type tokens before
+/// a declaration is combined with its JSDoc or public name: rewriting a final
+/// declaration string would also mutate user-provided documentation, string
+/// literals, and identifiers such as `BufferPool`.
+fn render_ohos_type_fragment(fragment: &str) -> String {
+    let bytes = fragment.as_bytes();
+    let mut out = String::with_capacity(fragment.len());
+    let mut copied_until = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'\"' | b'`' => {
+                index = skip_ts_quoted_literal(bytes, index);
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            byte if is_ts_identifier_byte(byte) => {
+                let start = index;
+                index += 1;
+                while index < bytes.len() && is_ts_identifier_byte(bytes[index]) {
+                    index += 1;
+                }
+                if &fragment[start..index] == "Buffer"
+                    && !is_ts_declaration_name(bytes, start, index)
+                {
+                    out.push_str(&fragment[copied_until..start]);
+                    out.push_str("ArrayBuffer");
+                    copied_until = index;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    out.push_str(&fragment[copied_until..]);
+    out
+}
+
+fn is_ts_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn skip_ts_quoted_literal(bytes: &[u8], quote_start: usize) -> usize {
+    let quote = bytes[quote_start];
+    let mut index = quote_start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes[index] == quote {
+            return index + 1;
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+/// A `Buffer` after `.` is a user-qualified type name. A `Buffer` immediately
+/// before `:` (including optional/definite-assignment modifiers) is a property
+/// or parameter name rather than a type reference. A `Buffer` immediately
+/// before `(` is a callable name. Leave all of them intact.
+fn is_ts_declaration_name(bytes: &[u8], token_start: usize, token_end: usize) -> bool {
+    let mut previous = token_start;
+    while previous > 0 && bytes[previous - 1].is_ascii_whitespace() {
+        previous -= 1;
+    }
+    if previous > 0 && bytes[previous - 1] == b'.' {
+        return true;
+    }
+
+    let mut index = token_end;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        index += 1;
+    }
+    while matches!(bytes.get(index), Some(b'?' | b'!')) {
+        index += 1;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+    }
+    matches!(bytes.get(index), Some(b':' | b'('))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -9246,52 +9355,57 @@ fn render_index_d_ts(defs: Vec<TypeDefLine>) -> String {
             out.push_str("}\n");
         }
     }
-    out.replace("Buffer", "ArrayBuffer")
-        .replace("ExternalObject<", "ExternalObject<")
+    out
 }
 
 fn pretty_type_def(def: &TypeDefLine, ambient: bool) -> String {
     let mut out = def.js_doc.clone().unwrap_or_default();
     let declare = if ambient { "export" } else { "export declare" };
+    let definition = match def.kind.as_str() {
+        // These definitions contain TypeScript type positions. Do not run
+        // enum/string-enum members through the mapper: `Buffer = ...` is a
+        // user-visible member name, not a byte-buffer type.
+        "interface" | "type" | "struct" | "fn" => render_ohos_type_fragment(&def.def),
+        _ => def.def.clone(),
+    };
     match def.kind.as_str() {
         "interface" => out.push_str(&format!(
             "export interface {} {{\n{}\n}}",
-            def.name, def.def
+            def.name, definition
         )),
         "enum" => out.push_str(&format!(
             "{declare} const enum {} {{\n{}\n}}",
-            def.name, def.def
+            def.name, definition
         )),
         "string_enum" => {
-            let values = def
-                .def
+            let values = definition
                 .split(',')
                 .filter_map(|entry| entry.split_once('=').map(|(_, rhs)| rhs.trim()))
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>();
             let values = if values.is_empty() {
-                def.def.clone()
+                definition.clone()
             } else {
                 values.join(" | ")
             };
             out.push_str(&format!("export type {} = {};", def.name, values));
         }
         "type" => {
-            if let Some(rendered) = render_arkts_payload_union(&def.name, &def.def) {
+            if let Some(rendered) = render_arkts_payload_union(&def.name, &definition) {
                 out.push_str(&rendered);
             } else {
-                out.push_str(&format!("export type {} = \n{}", def.name, def.def));
+                out.push_str(&format!("export type {} = \n{}", def.name, definition));
             }
         }
         "struct" => {
             let extends = def
                 .extends
                 .as_ref()
-                .map(|extends| format!(" extends {extends}"))
+                .map(|extends| format!(" extends {}", render_ohos_type_fragment(extends)))
                 .unwrap_or_default();
             out.push_str(&format!(
                 "{declare} class {}{} {{\n{}\n}}",
-                def.name, extends, def.def
+                def.name, extends, definition
             ));
             if let Some(original_name) = &def.original_name {
                 if original_name != &def.name {
@@ -9299,9 +9413,9 @@ fn pretty_type_def(def: &TypeDefLine, ambient: bool) -> String {
                 }
             }
         }
-        "fn" => out.push_str(&format!("{declare} {}", def.def)),
-        "raw" => out.push_str(&def.def),
-        _ => out.push_str(&def.def),
+        "fn" => out.push_str(&format!("{declare} {definition}")),
+        "raw" => out.push_str(&definition),
+        _ => out.push_str(&definition),
     }
     if def.kind != "struct" {
         if let Some(original_name) = &def.original_name {

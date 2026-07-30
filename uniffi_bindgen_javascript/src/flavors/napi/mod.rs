@@ -40,7 +40,7 @@ pub fn emit(
     //    it under the names the high-level common/*.ts layer expects. The
     //    adapter is intentionally thin: every non-trivial conversion lives
     //    in `uniffi_runtime_javascript`.
-    let adapter = render_backend_adapter(ci, default_addon_path);
+    let adapter = render_backend_adapter(ci, BackendAdapterTarget::Node { default_addon_path });
     fs::write(dir.join("backend-napi.ts"), adapter)?;
 
     // 3. Flavor entry point — the only file the application imports.
@@ -102,71 +102,146 @@ pub(crate) fn ohos_bridge_identity_export(contract_digest: &str) -> String {
     format!("uniffiohosbridgeidentity{encoded}")
 }
 
+enum BackendAdapterTarget<'a> {
+    Node { default_addon_path: Option<&'a str> },
+    Ohos { native_module: &'a str },
+}
+
+impl BackendAdapterTarget<'_> {
+    fn banner(&self) -> &'static str {
+        match self {
+            Self::Node { .. } => "napi flavor",
+            Self::Ohos { .. } => "harmony/ohos flavor",
+        }
+    }
+
+    fn bridge_label(&self) -> &'static str {
+        match self {
+            Self::Node { .. } => "N-API bridge",
+            Self::Ohos { .. } => "NAPI-OHOS bridge",
+        }
+    }
+
+    fn native_artifact(&self) -> &'static str {
+        match self {
+            Self::Node { .. } => "compiled `.node` addon",
+            Self::Ohos { .. } => "compiled `lib*.so` native module",
+        }
+    }
+
+    fn runtime_label(&self) -> &'static str {
+        match self {
+            Self::Node { .. } => "napi-rs",
+            Self::Ohos { .. } => "napi-ohos",
+        }
+    }
+
+    fn backend_kind(&self) -> &'static str {
+        match self {
+            Self::Node { .. } => "napi",
+            Self::Ohos { .. } => "ohos",
+        }
+    }
+
+    fn dynamic_value_type(&self) -> &'static str {
+        match self {
+            Self::Node { .. } => "unknown",
+            Self::Ohos { .. } => "UniffiValue",
+        }
+    }
+
+    fn prelude(&self, namespace: &str) -> String {
+        match self {
+            Self::Node { default_addon_path } => {
+                let env_var = napi_path_env_var(namespace);
+                let default_addon_path = default_addon_path
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("./{namespace}.node"));
+                format!(
+                    "import {{ createRequire }} from \"node:module\";\n\
+                     import {{ resolve }} from \"node:path\";\n\
+                     const require = createRequire(import.meta.url);\n\
+                     const __uniffiNamespace = \"{namespace}\";\n\
+                     const __uniffiSpecificNapiPathEnv = \"{env_var}\";\n\
+                     const __uniffiDefaultAddonPath = \"{default_addon_path}\";\n\
+                     \n\
+                     function __uniffiResolveEnvAddonPath(path: string): string {{\n\
+                         return path.startsWith(\"/\") || /^[A-Za-z]:[\\\\/]/.test(path) ? path : resolve(path);\n\
+                     }}\n\
+                     \n\
+                     function __uniffiAddonCandidate(): {{ label: string; specifier: string }} {{\n\
+                         const specific = process.env[__uniffiSpecificNapiPathEnv];\n\
+                         if (specific && specific.length > 0) {{\n\
+                             return {{ label: __uniffiSpecificNapiPathEnv, specifier: __uniffiResolveEnvAddonPath(specific) }};\n\
+                         }}\n\
+                         const generic = process.env.UNIFFI_NAPI_PATH;\n\
+                         if (generic && generic.length > 0) {{\n\
+                             return {{ label: \"UNIFFI_NAPI_PATH\", specifier: __uniffiResolveEnvAddonPath(generic) }};\n\
+                         }}\n\
+                         return {{ label: \"default\", specifier: __uniffiDefaultAddonPath }};\n\
+                     }}\n\
+                     \n\
+                     function __uniffiLoadNativeAddon(): Record<string, unknown> {{\n\
+                         const candidate = __uniffiAddonCandidate();\n\
+                         try {{\n\
+                             return require(candidate.specifier) as Record<string, unknown>;\n\
+                         }} catch (error) {{\n\
+                             const cause = error instanceof Error ? `${{error.name}}: ${{error.message}}` : String(error);\n\
+                             throw new Error(\n\
+                                 `failed to load UniFFI N-API addon for namespace \"${{__uniffiNamespace}}\" from ${{candidate.label}} (${{candidate.specifier}}). ` +\n\
+                                     `Run \"uniffi-bindgen javascript build-napi --manifest-path <Cargo.toml> --out-dir <generated>\" ` +\n\
+                                     `so ${{__uniffiDefaultAddonPath}} exists, or set ${{__uniffiSpecificNapiPathEnv}}=/absolute/path/to/${{__uniffiNamespace}}.node ` +\n\
+                                     `or UNIFFI_NAPI_PATH=/absolute/path/to/addon.node. Cause: ${{cause}}`,\n\
+                             );\n\
+                         }}\n\
+                     }}\n\
+                     \n\
+                     const native = __uniffiLoadNativeAddon();\n\n"
+                )
+            }
+            Self::Ohos { native_module } => format!(
+                "import * as native from \"{native_module}\";\n\
+                 \n\
+                 type UniffiPrimitive = null | undefined | string | number | boolean | bigint;\n\
+                 type UniffiValue = UniffiPrimitive | object;\n\
+                 \n\
+                 // Harmony/OpenHarmony loads NAPI-OHOS modules through native\n\
+                 // `lib*.so` imports declared in the consuming application's oh-package.json5.\n\n"
+            ),
+        }
+    }
+}
+
 fn render_backend_adapter(
     ci: &uniffi_bindgen::ComponentInterface,
-    default_addon_path: Option<&str>,
+    target: BackendAdapterTarget<'_>,
 ) -> String {
     let namespace = ci.namespace();
-    let env_var = napi_path_env_var(namespace);
-    let default_addon_path = default_addon_path
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("./{namespace}.node"));
+    let banner = target.banner();
+    let bridge_label = target.bridge_label();
+    let native_artifact = target.native_artifact();
+    let runtime_label = target.runtime_label();
+    let backend_kind = target.backend_kind();
+    let dynamic_type = target.dynamic_value_type();
+    let prelude = target.prelude(namespace);
     let name_map_literal =
         crate::name_map::render_name_map_js_literal(&crate::name_map::collect(ci));
-    let enum_shape_helpers = crate::enum_shape::helper_ts();
+    let enum_shape_helpers = crate::enum_shape::helper_ts(dynamic_type);
     format!(
-        "// AUTOGENERATED by uniffi_bindgen_javascript (napi flavor).\n\
+        "// AUTOGENERATED by uniffi_bindgen_javascript ({banner}).\n\
          //\n\
-         // This file loads the compiled `.node` addon produced from the\n\
-         // generated `{namespace}.rs` bridge and exposes its symbols under\n\
+         // This file loads the {native_artifact} produced from the\n\
+         // generated `{namespace}.rs` {bridge_label} and exposes its symbols under\n\
          // the low-level FFI contract defined in\n\
          // `uniffi_runtime_javascript`. The high-level API in\n\
          // `../common/api.ts` is identical to every other flavor and\n\
          // imports this adapter only through that contract.\n\
          \n\
-         import {{ createRequire }} from \"node:module\";\n\
-         import {{ resolve }} from \"node:path\";\n\
-         const require = createRequire(import.meta.url);\n\
-         const __uniffiNamespace = \"{namespace}\";\n\
-         const __uniffiSpecificNapiPathEnv = \"{env_var}\";\n\
-         const __uniffiDefaultAddonPath = \"{default_addon_path}\";\n\
-         \n\
-         function __uniffiResolveEnvAddonPath(path: string): string {{\n\
-             return path.startsWith(\"/\") || /^[A-Za-z]:[\\\\/]/.test(path) ? path : resolve(path);\n\
-         }}\n\
-         \n\
-         function __uniffiAddonCandidate(): {{ label: string; specifier: string }} {{\n\
-             const specific = process.env[__uniffiSpecificNapiPathEnv];\n\
-             if (specific && specific.length > 0) {{\n\
-                 return {{ label: __uniffiSpecificNapiPathEnv, specifier: __uniffiResolveEnvAddonPath(specific) }};\n\
-             }}\n\
-             const generic = process.env.UNIFFI_NAPI_PATH;\n\
-             if (generic && generic.length > 0) {{\n\
-                 return {{ label: \"UNIFFI_NAPI_PATH\", specifier: __uniffiResolveEnvAddonPath(generic) }};\n\
-             }}\n\
-             return {{ label: \"default\", specifier: __uniffiDefaultAddonPath }};\n\
-         }}\n\
-         \n\
-         function __uniffiLoadNativeAddon(): Record<string, unknown> {{\n\
-             const candidate = __uniffiAddonCandidate();\n\
-             try {{\n\
-                 return require(candidate.specifier) as Record<string, unknown>;\n\
-             }} catch (error) {{\n\
-                 const cause = error instanceof Error ? `${{error.name}}: ${{error.message}}` : String(error);\n\
-                 throw new Error(\n\
-                     `failed to load UniFFI N-API addon for namespace \"${{__uniffiNamespace}}\" from ${{candidate.label}} (${{candidate.specifier}}). ` +\n\
-                         `Run \"uniffi-bindgen javascript build-napi --manifest-path <Cargo.toml> --out-dir <generated>\" ` +\n\
-                         `so ${{__uniffiDefaultAddonPath}} exists, or set ${{__uniffiSpecificNapiPathEnv}}=/absolute/path/to/${{__uniffiNamespace}}.node ` +\n\
-                         `or UNIFFI_NAPI_PATH=/absolute/path/to/addon.node. Cause: ${{cause}}`,\n\
-                 );\n\
-             }}\n\
-         }}\n\
-         \n\
-         const native = __uniffiLoadNativeAddon();\n\
+         {prelude}\
          \n\
          // Generator-computed map from `common/api.ts` low-level\n\
          // snake_case dispatch keys to the `lowerCamelCase` names that\n\
-         // napi-rs actually exports on the `.node` addon. Keeping this\n\
+         // {runtime_label} actually exports on the native module. Keeping this\n\
          // as a static literal (not a runtime heuristic) means the two\n\
          // sides can't drift: `name_map::collect` walks the same IR\n\
          // shape `api_module/mod.rs` walks.\n\
@@ -178,9 +253,9 @@ fn render_backend_adapter(
              return name.startsWith(\"__uniffi_\") && name.endsWith(\"_object_free\");\n\
          }}\n\
          \n\
-         function __uniffiCallbackErrorPayload(error: unknown, shape: unknown): unknown {{\n\
+         function __uniffiCallbackErrorPayload(error: {dynamic_type}, shape: {dynamic_type}): {dynamic_type} {{\n\
              if (error !== null && typeof error === \"object\") {{\n\
-                 const raw = error as Record<string, unknown>;\n\
+                 const raw = error as Record<string, {dynamic_type}>;\n\
                  if (shape === \"flat\") {{\n\
                      if (typeof raw.variant === \"string\") return raw.variant;\n\
                      if (typeof raw.tag === \"string\") return raw.tag;\n\
@@ -191,9 +266,9 @@ fn render_backend_adapter(
                  }}\n\
                  if (typeof raw.variant === \"string\") {{\n\
                      const data = raw.data;\n\
-                     const payload: Record<string, unknown> = {{ tag: raw.variant }};\n\
+                     const payload: Record<string, {dynamic_type}> = {{ tag: raw.variant }};\n\
                      if (data !== null && typeof data === \"object\" && !Array.isArray(data)) {{\n\
-                         Object.assign(payload, data as Record<string, unknown>);\n\
+                         Object.assign(payload, data as Record<string, {dynamic_type}>);\n\
                      }}\n\
                      return __uniffiLowerShape(payload);\n\
                  }}\n\
@@ -201,10 +276,10 @@ fn render_backend_adapter(
              throw error;\n\
          }}\n\
          \n\
-         const __uniffiReturnedCallbacks = new Map<number, Record<string, unknown>>();\n\
+         const __uniffiReturnedCallbacks = new Map<number, Record<string, {dynamic_type}>>();\n\
          let __uniffiNextReturnedCallbackId = 1;\n\
          \n\
-         function __uniffiDispatchReturnedCallback(...rawArgs: unknown[]): unknown {{\n\
+         function __uniffiDispatchReturnedCallback(...rawArgs: {dynamic_type}[]): {dynamic_type} {{\n\
              const args = rawArgs.length >= 3 && (rawArgs[0] === null || rawArgs[0] === undefined || rawArgs[0] instanceof Error)\n\
                  ? rawArgs.slice(1)\n\
                  : rawArgs;\n\
@@ -221,35 +296,35 @@ fn render_backend_adapter(
              if (typeof fn !== \"function\") {{\n\
                  throw new Error(`uniffi returned callback ${{id}} has no method ${{method}}`);\n\
              }}\n\
-             return (fn as (...a: unknown[]) => unknown)(...args.slice(2).map(__uniffiLiftShape));\n\
+             return (fn as (...a: {dynamic_type}[]) => {dynamic_type})(...args.slice(2).map(__uniffiLiftShape));\n\
          }}\n\
          \n\
-         function __uniffiStoreCallbackReturn(value: unknown): {{ id: number }} {{\n\
+         function __uniffiStoreCallbackReturn(value: {dynamic_type}): {{ id: number }} {{\n\
              const marker = value !== null && typeof value === \"object\" && (value as {{ __uniffiCallback?: boolean }}).__uniffiCallback === true\n\
-                 ? value as {{ object: unknown, fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }}\n\
+                 ? value as {{ object: {dynamic_type}, fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }}\n\
                  : undefined;\n\
              const obj = marker === undefined\n\
                  ? __uniffiNormalizeCallbackObject(value)\n\
                  : __uniffiNormalizeCallbackObject(marker.object, marker);\n\
              const id = __uniffiNextReturnedCallbackId++;\n\
-             __uniffiReturnedCallbacks.set(id, obj as Record<string, unknown>);\n\
+             __uniffiReturnedCallbacks.set(id, obj as Record<string, {dynamic_type}>);\n\
              return {{ id }};\n\
          }}\n\
          \n\
-         function __uniffiNormalizeCallbackObject(obj: unknown, marker?: {{ fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }}): unknown {{\n\
+         function __uniffiNormalizeCallbackObject(obj: {dynamic_type}, marker?: {{ fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }}): {dynamic_type} {{\n\
              if (obj === null || typeof obj !== \"object\") return obj;\n\
              const fallibleMethods = marker?.fallibleMethods ?? {{}};\n\
              const asyncMethods = marker?.asyncMethods ?? {{}};\n\
              const callbackReturnMethods = marker?.callbackReturnMethods ?? {{}};\n\
-             const out: Record<string, unknown> = {{}};\n\
-             for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {{\n\
+             const out: Record<string, {dynamic_type}> = {{}};\n\
+             for (const [k, v] of Object.entries(obj as Record<string, {dynamic_type}>)) {{\n\
                  if (typeof v === \"function\") {{\n\
-                     out[k] = (...args: unknown[]) => {{\n\
+                     out[k] = (...args: {dynamic_type}[]) => {{\n\
                          const callArgs = args.length >= 2 && (args[0] === null || args[0] === undefined || args[0] instanceof Error)\n\
                              ? args.slice(1)\n\
                              : args;\n\
                          const liftedArgs = callArgs.map(__uniffiLiftShape);\n\
-                         const fn = v as (...a: unknown[]) => unknown;\n\
+                         const fn = v as (...a: {dynamic_type}[]) => {dynamic_type};\n\
                          const errorShape = fallibleMethods[k];\n\
                          const isAsync = asyncMethods[k] === true;\n\
                          const returnsCallback = callbackReturnMethods[k] === true;\n\
@@ -280,17 +355,17 @@ fn render_backend_adapter(
          }}\n\
          \n\
          // Unwrap the tagged callback marker emitted by `common/api.ts`.\n\
-         // For napi, `#[napi(object)]` structs with `ThreadsafeFunction`\n\
+         // For the {bridge_label}, `#[napi(object)]` structs with `ThreadsafeFunction`\n\
          // fields want the raw JS object (e.g. `{{ log: fn }}`), not a\n\
          // numeric handle. Other backends (wasm) translate the marker\n\
          // differently; see their adapters.\n\
-         const __uniffiCoerce = (a: unknown): unknown => {{\n\
+         const __uniffiCoerce = (a: {dynamic_type}): {dynamic_type} => {{\n\
              if (\n\
                  a !== null &&\n\
                  typeof a === \"object\" &&\n\
                  (a as {{ __uniffiInputStream?: boolean }}).__uniffiInputStream === true\n\
              ) {{\n\
-                 const marker = a as {{ handle: number; next: unknown; cancel: unknown }};\n\
+                 const marker = a as {{ handle: number; next: {dynamic_type}; cancel: {dynamic_type} }};\n\
                  return {{ handle: marker.handle, next: marker.next, cancel: marker.cancel }};\n\
              }}\n\
              if (\n\
@@ -298,42 +373,42 @@ fn render_backend_adapter(
                  typeof a === \"object\" &&\n\
                  (a as {{ __uniffiCallback?: boolean }}).__uniffiCallback === true\n\
              ) {{\n\
-                 return __uniffiNormalizeCallbackObject((a as {{ object: unknown }}).object, a as {{ fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }});\n\
+                 return __uniffiNormalizeCallbackObject((a as {{ object: {dynamic_type} }}).object, a as {{ fallibleMethods?: Record<string, string>, asyncMethods?: Record<string, boolean>, callbackReturnMethods?: Record<string, boolean> }});\n\
              }}\n\
              return a;\n\
          }};\n\
          \n\
-         const backend: Record<string, unknown> = new Proxy(\n\
-             {{}} as Record<string, unknown>,\n\
+         const backend: Record<string, {dynamic_type}> = new Proxy(\n\
+             {{}} as Record<string, {dynamic_type}>,\n\
              {{\n\
                  get(_t, name: string) {{\n\
                      // `common/objects.ts` uses the wasm registry destructor\n\
                      // key for every flavor. N-API object wrappers are native\n\
-                     // class instances whose lifetime is owned by napi-rs/V8,\n\
+                     // class instances whose lifetime is owned by {runtime_label},\n\
                      // so the generated backend intentionally treats those\n\
                      // destructor calls as idempotent no-ops.\n\
-                     if (__uniffiIsObjectFreeKey(name)) return (_handle: unknown): void => {{}};\n\
+                     if (__uniffiIsObjectFreeKey(name)) return (_handle: {dynamic_type}): void => {{}};\n\
                      // Translate low-level key → addon export name. Fall\n\
                      // back to the raw name so anything the generator didn't\n\
                      // put in the map still surfaces a clear `undefined`\n\
                      // rather than silently hitting an unrelated member.\n\
                      const exportName = __uniffiNameMap[name] ?? name;\n\
-                     const v = (native as Record<string, unknown>)[exportName];\n\
+                     const v = (native as Record<string, {dynamic_type}>)[exportName];\n\
                      if (typeof v !== \"function\") return v;\n\
-                     const fn = v as (...args: unknown[]) => unknown;\n\
-                     return (...args: unknown[]) => {{\n\
-                         // Lower args on the way in: tag -> type for any\n\
+                     const fn = v as (...args: {dynamic_type}[]) => {dynamic_type};\n\
+                     return (...args: {dynamic_type}[]) => {{\n\
+                         // Lower args on the way in: tag -> type for each\n\
                          // plain object (enum, nested in seq/opt/record).\n\
                          // Callback markers are still unwrapped first so\n\
                          // the lowering skips the `object` payload.\n\
                          const lowered = args.map((a) =>\n\
                              __uniffiLowerShape(__uniffiCoerce(a)),\n\
                          );\n\
-                         let result: unknown;\n\
+                         let result: {dynamic_type};\n\
                          try {{\n\
                              result = fn.apply(native, lowered);\n\
                          }} catch (err) {{\n\
-                             // napi errors carry an enum payload with `type`;\n\
+                             // {bridge_label} errors can carry an enum payload with `type`;\n\
                              // lift it symmetrically so `common/errors.ts`\n\
                              // consumers see `tag`.\n\
                              throw __uniffiLiftShape(err);\n\
@@ -341,9 +416,9 @@ fn render_backend_adapter(
                          if (\n\
                              result !== null &&\n\
                              typeof result === \"object\" &&\n\
-                             typeof (result as {{ then?: unknown }}).then === \"function\"\n\
+                             typeof (result as {{ then?: {dynamic_type} }}).then === \"function\"\n\
                          ) {{\n\
-                             return (result as Promise<unknown>).then(\n\
+                             return (result as Promise<{dynamic_type}>).then(\n\
                                  (value) => __uniffiLiftShape(value),\n\
                                  (err) => {{\n\
                                      throw __uniffiLiftShape(err);\n\
@@ -358,7 +433,7 @@ fn render_backend_adapter(
          \n\
          export default backend;\n\
          export {{ native as __uniffiNativeAddon }};\n\
-         export const __uniffiBackendKind = \"napi\" as const;\n"
+         export const __uniffiBackendKind = \"{backend_kind}\" as const;\n"
     )
 }
 
@@ -368,58 +443,12 @@ fn render_ohos_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> Strin
         "lib{}.so",
         crate::js_names::ohos_native_library_stem(namespace)
     );
-    let mut adapter = render_backend_adapter(ci, None)
-        .replace(
-            "// AUTOGENERATED by uniffi_bindgen_javascript (napi flavor).",
-            "// AUTOGENERATED by uniffi_bindgen_javascript (harmony/ohos flavor).",
-        )
-        .replace(
-            "generated `{namespace}.rs` bridge",
-            "generated `{namespace}.rs` OHOS bridge",
-        )
-        .replace(
-            "`../common/api.ts` is identical to every other flavor",
-            "`../common/api.ts` is identical to every other flavor",
-        )
-        .replace(
-            "export const __uniffiBackendKind = \"napi\" as const;",
-            "export const __uniffiBackendKind = \"ohos\" as const;",
-        );
-
-    let start = adapter
-        .find("import { createRequire } from \"node:module\";")
-        .expect("napi adapter prelude marker should exist");
-    let marker = "const native = __uniffiLoadNativeAddon();";
-    let end = adapter
-        .find(marker)
-        .map(|idx| idx + marker.len())
-        .expect("napi adapter native-load marker should exist");
-    let harmony_prelude = format!(
-        "import * as native from \"{native_module}\";\n\
-         \n\
-         type UniffiPrimitive = null | undefined | string | number | boolean | bigint;\n\
-         type UniffiValue = UniffiPrimitive | object;\n\
-         \n\
-         // Harmony/OpenHarmony loads Node-API modules through native\n\
-         // `lib*.so` imports declared in the consuming application's\n\
-         // oh-package.json5, not through Node's createRequire/process.env.\n"
-    );
-    adapter.replace_range(start..end, &harmony_prelude);
-    adapter = adapter
-        .replace("compiled `.node` addon", "compiled `lib*.so` native module")
-        .replace(
-            "`lib*.so` imports declared in the consuming application's\n// oh-package.json5, not through Node's createRequire/process.env.",
-            "`lib*.so` imports declared in the consuming application's\n// oh-package.json5.",
-        )
-        .replace("`.node` addon", "`lib*.so` native module")
-        .replace(".node", ".so");
-
-    // Harmony's ArkTS checker rejects explicit `unknown`/`any` in generated
-    // TypeScript. Keep the Node adapter strict, but narrow Harmony's dynamic
-    // adapter boundary to a generator-owned structural alias.
-    adapter
-        .replace("unknown", "UniffiValue")
-        .replace("type for any\n", "type for each\n")
+    render_backend_adapter(
+        ci,
+        BackendAdapterTarget::Ohos {
+            native_module: &native_module,
+        },
+    )
 }
 
 pub(crate) fn napi_path_env_var(namespace: &str) -> String {
@@ -1662,5 +1691,60 @@ mod ohos_facade_type_tests {
         );
         assert!(error.contains("external_values"), "{error}");
         assert!(!error.contains("field `id`"), "{error}");
+    }
+
+    #[test]
+    fn backend_adapter_targets_keep_hostile_user_identifiers_and_runtime_types_separate() {
+        let mut metadata = group("unknown_chat");
+        for name in ["napi_service", "napi_ohos_bridge", "runtime_unknown_value"] {
+            metadata.add_item(function(name, Vec::new(), Some(Type::String)).into());
+        }
+        let ci = ComponentInterface::from_metadata(metadata).unwrap();
+
+        let node = render_backend_adapter(
+            &ci,
+            BackendAdapterTarget::Node {
+                default_addon_path: None,
+            },
+        );
+        assert!(node.contains("import { createRequire } from \"node:module\";"));
+        assert!(node.contains("process.env"));
+        assert!(node.contains("./unknown_chat.node"));
+        assert!(node.contains("Record<string, unknown>"));
+        assert!(node.contains("__uniffiBackendKind = \"napi\""));
+
+        let ohos = render_ohos_backend_adapter(&ci);
+        assert!(ohos.contains("import * as native from \"libunknown_chat_ohos.so\";"));
+        assert!(ohos.contains("type UniffiValue = UniffiPrimitive | object;"));
+        assert!(ohos.contains("__uniffiBackendKind = \"ohos\""));
+        for node_loader_token in ["createRequire", "process.env", ".node"] {
+            assert!(
+                !ohos.contains(node_loader_token),
+                "OHOS adapter unexpectedly contains `{node_loader_token}`:\n{ohos}"
+            );
+        }
+        for node_dynamic_type in [": unknown", "Record<string, unknown>", ": any"] {
+            assert!(
+                !ohos.contains(node_dynamic_type),
+                "OHOS adapter unexpectedly contains `{node_dynamic_type}`:\n{ohos}"
+            );
+        }
+
+        // These are user-controlled IR names, not target/runtime vocabulary.
+        for identifier in [
+            "unknown_chat",
+            "napi_service",
+            "napi_ohos_bridge",
+            "runtime_unknown_value",
+        ] {
+            assert!(
+                node.contains(identifier),
+                "missing from node adapter: {identifier}"
+            );
+            assert!(
+                ohos.contains(identifier),
+                "missing from OHOS adapter: {identifier}"
+            );
+        }
     }
 }
