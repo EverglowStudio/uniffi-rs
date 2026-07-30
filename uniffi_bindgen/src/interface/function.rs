@@ -375,6 +375,15 @@ pub trait Callable {
             .to_owned()
     }
 
+    fn ffi_stream_next_rust_future_cancel(&self, ci: &ComponentInterface) -> String {
+        let return_type = self
+            .stream_next_return_type()
+            .expect("stream_next_return_type called on a non-stream callable");
+        ci.ffi_rust_future_cancel(Some((&return_type).into()))
+            .name()
+            .to_owned()
+    }
+
     fn ffi_stream_next_rust_future_complete(&self, ci: &ComponentInterface) -> String {
         let return_type = self
             .stream_next_return_type()

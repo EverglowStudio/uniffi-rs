@@ -56,7 +56,7 @@
 }
 {%- endmacro %}
 
-// eg, `public func events() -> AsyncThrowingStream<Event, Error> { body }`
+// eg, `public func events() -> UniffiAsyncStream<Event> { body }`
 {%- macro stream_func_decl(func_decl, callable, indent) %}
 {%- call docstring(callable, indent) %}{% endcall %}
 {%- if let Some(stream_item_type) = callable.stream_item_type() %}
@@ -66,40 +66,26 @@
     {%- call arg_list_decl(callable) %}{% endcall -%}) -> {{ callable.return_type().unwrap()|type_name }}{{ callable|input_stream_where_clause }} {
     let __streamHandle =
         {% call to_ffi_call(callable) %}{% endcall %}
-    return AsyncThrowingStream<{{ stream_item_type|type_name }}, Error> { continuation in
-        let __streamTask = Task {
-            do {
-                while !Task.isCancelled {
-                    let __streamNext = try await uniffiRustCallAsync(
-                        rustFutureFunc: {
-                            {{ callable.ffi_stream_next_func() }}(__streamHandle)
-                        },
-                        pollFunc: {{ callable.ffi_stream_next_rust_future_poll(ci) }},
-                        completeFunc: {{ callable.ffi_stream_next_rust_future_complete(ci) }},
-                        freeFunc: {{ callable.ffi_stream_next_rust_future_free(ci) }},
-                        liftFunc: { try __uniffiLiftStreamNext($0) { reader in
-                            try {{ stream_item_type|read_fn }}(from: &reader)
-                        } },
-                        errorHandler: {{ stream_error_type|ffi_error_converter_name }}_lift
-                    )
-                    switch __streamNext {
-                    case .done:
-                        continuation.finish()
-                        return
-                    case let .item(__streamValue):
-                        continuation.yield(__streamValue)
-                    }
-                }
-                continuation.finish()
-            } catch {
-                continuation.finish(throwing: error)
-            }
-        }
-        continuation.onTermination = { @Sendable _ in
-            __streamTask.cancel()
+    return UniffiAsyncStream(
+        next: {
+            try await uniffiRustCallAsync(
+                rustFutureFunc: {
+                    {{ callable.ffi_stream_next_func() }}(__streamHandle)
+                },
+                pollFunc: {{ callable.ffi_stream_next_rust_future_poll(ci) }},
+                cancelFunc: {{ callable.ffi_stream_next_rust_future_cancel(ci) }},
+                completeFunc: {{ callable.ffi_stream_next_rust_future_complete(ci) }},
+                freeFunc: {{ callable.ffi_stream_next_rust_future_free(ci) }},
+                liftFunc: { try __uniffiLiftStreamNext($0) { reader in
+                    try {{ stream_item_type|read_fn }}(from: &reader)
+                } },
+                errorHandler: {{ stream_error_type|ffi_error_converter_name }}_lift
+            )
+        },
+        cancel: {
             {{ callable.ffi_stream_cancel_func() }}(__streamHandle)
         }
-    }
+    )
 }
 {%- endif %}
 {%- endif %}
@@ -158,6 +144,7 @@ public convenience init(
                 )
             },
             pollFunc: {{ callable.ffi_rust_future_poll(ci) }},
+            cancelFunc: {{ callable.ffi_rust_future_cancel(ci) }},
             completeFunc: {{ callable.ffi_rust_future_complete(ci) }},
             freeFunc: {{ callable.ffi_rust_future_free(ci) }},
             {%- match callable.return_type() %}

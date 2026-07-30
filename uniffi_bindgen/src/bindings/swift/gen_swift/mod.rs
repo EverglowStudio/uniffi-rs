@@ -1562,15 +1562,15 @@ mod tests {
     }
 
     #[test]
-    fn swift_stream_async_throwing_stream_static_contract() {
+    fn swift_stream_pull_static_contract() {
         let bindings = stream_bindings();
         let swift = bindings.library;
         let header = bindings.header;
 
-        assert!(swift.contains(
-            "public func countEvents(count: UInt32) -> AsyncThrowingStream<StreamEvent, Error>"
-        ));
+        assert!(swift
+            .contains("public func countEvents(count: UInt32) -> UniffiAsyncStream<StreamEvent>"));
         assert!(!swift.contains("public func countEvents(count: UInt32) -> UInt64"));
+        assert!(!swift.contains("AsyncThrowingStream<StreamEvent, Error>"));
         assert!(swift.contains("let __streamHandle ="));
         assert!(swift.contains("uniffi_stream_core_fn_func_count_events("));
         assert!(
@@ -1580,20 +1580,21 @@ mod tests {
             swift.contains("uniffi_stream_core_fn_func_count_events_stream_cancel(__streamHandle)")
         );
         assert!(swift.contains("try await uniffiRustCallAsync("));
+        assert!(swift.contains("cancelFunc: ffi_stream_core_rust_future_cancel_rust_buffer"));
         assert!(swift.contains("liftFunc: { try __uniffiLiftStreamNext($0) { reader in"));
         assert!(swift.contains("try FfiConverterTypeStreamEvent.read(from: &reader)"));
-        assert!(swift.contains("case let .item(__streamValue):"));
         assert!(!swift.contains("guard let __streamValue = __streamNext else"));
-        assert!(
-            swift.contains("public func optionalEvents() -> AsyncThrowingStream<UInt32?, Error>")
-        );
+        assert!(swift.contains("public func optionalEvents() -> UniffiAsyncStream<UInt32?>"));
         assert!(swift.contains("try FfiConverterOptionUInt32.read(from: &reader)"));
         assert!(swift.contains("errorHandler: FfiConverter") && swift.contains("StreamError_lift"));
-        assert!(swift.contains("continuation.yield(__streamValue)"));
-        assert!(swift.contains("continuation.finish()"));
-        assert!(swift.contains("continuation.finish(throwing: error)"));
-        assert!(swift.contains("continuation.onTermination = { @Sendable _ in"));
-        assert!(swift.contains("__streamTask.cancel()"));
+        assert!(swift.contains("public struct UniffiAsyncStream<Element>: AsyncSequence"));
+        assert!(swift.contains("public mutating func next() async throws -> Element?"));
+        assert!(swift.contains("throw UniffiInternalError.concurrentStreamNext"));
+        assert!(swift.contains("throw UniffiInternalError.streamConsumed"));
+        assert!(swift.contains("withTaskCancellationHandler(operation:"));
+        assert!(!swift.contains("let __streamTask = Task"));
+        assert!(!swift.contains("continuation.yield("));
+        assert!(!swift.contains("continuation.onTermination"));
 
         assert!(header.contains("uniffi_stream_core_fn_func_count_events("));
         assert!(header.contains("uniffi_stream_core_fn_func_count_events_stream_next("));
@@ -1626,6 +1627,7 @@ mod tests {
         assert!(swift.contains("if let typedError = error as? StreamError"));
         assert!(swift.contains("return FfiConverterTypeStreamError_lower(typedError)"));
         assert!(swift.contains("errorHandler: FfiConverterTypeStreamError_lift"));
+        assert!(swift.contains("cancelFunc: ffi_stream_core_rust_future_cancel_u64"));
         assert!(swift.contains("private func uniffiInitInputStreamSumEventsEvents()"));
         assert!(swift.contains("uniffi_stream_core_fn_func_sum_events_input_stream_events_init("));
         assert!(swift.contains("uniffiInputStreamNextCallback"));
@@ -1654,7 +1656,7 @@ mod tests {
 
         assert!(
             swift.contains(
-                "public func runningSum<S0>(events: S0) -> AsyncThrowingStream<CounterEvent, Error> where S0: AsyncSequence, S0.Element == CounterEvent"
+                "public func runningSum<S0>(events: S0) -> UniffiAsyncStream<CounterEvent> where S0: AsyncSequence, S0.Element == CounterEvent"
             ),
             "{swift}"
         );
@@ -1670,7 +1672,8 @@ mod tests {
         assert!(
             swift.contains("uniffi_stream_core_fn_func_running_sum_stream_cancel(__streamHandle)")
         );
-        assert!(swift.contains("continuation.finish(throwing: error)"));
+        assert!(swift.contains("cancelFunc: ffi_stream_core_rust_future_cancel_rust_buffer"));
+        assert!(!swift.contains("continuation.finish(throwing: error)"));
 
         assert!(header.contains("uniffi_stream_core_fn_func_running_sum("));
         assert!(header.contains("uniffi_stream_core_fn_func_running_sum_stream_next("));
@@ -1756,6 +1759,414 @@ mod tests {
             "swiftc -typecheck failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn swift_stream_runtime_behavior_when_swiftc_available() {
+        if Command::new("swiftc").arg("--version").output().is_err() {
+            eprintln!(
+                "SKIP swift_stream_runtime_behavior_when_swiftc_available: swiftc unavailable"
+            );
+            return;
+        }
+
+        let swift = stream_bindings().library;
+        let future_runtime_start = swift
+            .find("fileprivate let uniffiContinuationHandleMap")
+            .unwrap();
+        let stream_runtime_start = swift
+            .find("// Output streams use a pull-based custom AsyncSequence")
+            .unwrap();
+        let callback_start = swift
+            .find("// Callback handlers for an async calls.")
+            .unwrap();
+        let future_runtime = &swift[future_runtime_start..stream_runtime_start];
+        let stream_runtime = &swift[stream_runtime_start..callback_start];
+
+        let fixture = [
+            r#"
+import Foundation
+
+fileprivate extension NSLock {
+    func withLock<T>(f: () throws -> T) rethrows -> T {
+        lock()
+        defer { unlock() }
+        return try f()
+    }
+}
+
+fileprivate enum UniffiInternalError: Error {
+    case unexpectedStaleHandle
+    case streamConsumed
+    case concurrentStreamNext
+}
+
+private enum __UniffiStreamNext<T> {
+    case item(T)
+    case done
+}
+
+private struct RustBuffer {}
+private struct RustCallStatus {}
+private typealias UniffiRustFutureContinuationCallback = (UInt64, Int8) -> ()
+private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
+
+private final class UniffiHandleMap<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [UInt64: T] = [:]
+    private var nextHandle: UInt64 = 1
+
+    func insert(obj: T) -> UInt64 {
+        lock.withLock {
+            let handle = nextHandle
+            nextHandle += 2
+            entries[handle] = obj
+            return handle
+        }
+    }
+
+    func remove(handle: UInt64) throws -> T {
+        try lock.withLock {
+            guard let value = entries.removeValue(forKey: handle) else {
+                throw UniffiInternalError.unexpectedStaleHandle
+            }
+            return value
+        }
+    }
+}
+
+private func uniffiEnsureStreamCoreInitialized() {}
+
+private func makeRustCall<T>(
+    _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
+    errorHandler: ((RustBuffer) throws -> Swift.Error)?
+) throws -> T {
+    var status = RustCallStatus()
+    return callback(&status)
+}
+"#,
+            future_runtime,
+            stream_runtime,
+            r#"
+private func uniffiFutureContinuationCallback(handle: UInt64, pollResult: Int8) {
+    if let continuation = try? uniffiContinuationHandleMap.remove(handle: handle) {
+        continuation.resume(returning: pollResult)
+    }
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() {
+        lock.withLock { value += 1 }
+    }
+
+    func get() -> Int {
+        lock.withLock { value }
+    }
+}
+
+private final class Results: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [__UniffiStreamNext<Int?>]
+    private var count = 0
+
+    init(_ values: [__UniffiStreamNext<Int?>]) {
+        self.values = values
+    }
+
+    func next() -> __UniffiStreamNext<Int?> {
+        lock.withLock {
+            count += 1
+            return values.removeFirst()
+        }
+    }
+
+    func nextCount() -> Int {
+        lock.withLock { count }
+    }
+}
+
+private final class FutureProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callback: ((UInt64, Int8) -> ())?
+    private var callbackData: UInt64 = 0
+
+    func install(_ callback: @escaping (UInt64, Int8) -> (), data: UInt64) {
+        lock.withLock {
+            self.callback = callback
+            callbackData = data
+        }
+    }
+
+    func installed() -> Bool {
+        lock.withLock { callback != nil }
+    }
+
+    func resumeReady() {
+        let callback = lock.withLock { () -> ((UInt64, Int8) -> ())? in
+            let callback = self.callback
+            self.callback = nil
+            return callback
+        }
+        callback?(callbackData, 0)
+    }
+}
+
+private final class PendingStreamNext: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<__UniffiStreamNext<Int>, Never>?
+
+    func next() async -> __UniffiStreamNext<Int> {
+        await withCheckedContinuation { continuation in
+            lock.withLock {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func started() -> Bool {
+        lock.withLock { continuation != nil }
+    }
+
+    func resume(_ value: __UniffiStreamNext<Int>) {
+        let continuation = lock.withLock { () -> CheckedContinuation<__UniffiStreamNext<Int>, Never>? in
+            let continuation = self.continuation
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.resume(returning: value)
+    }
+}
+
+private enum FixtureError: Error {
+    case boom
+}
+
+private func waitUntil(_ condition: @escaping () -> Bool) async {
+    for _ in 0..<10_000 {
+        if condition() {
+            return
+        }
+        await Task.yield()
+    }
+    fatalError("timed out waiting for fixture state")
+}
+
+private func consumeOneAndDrop(_ stream: UniffiAsyncStream<Int>) async throws {
+    var iterator = stream.makeAsyncIterator()
+    guard try await iterator.next() == 1 else {
+        fatalError("expected stream item")
+    }
+}
+
+@main
+private struct StreamRuntimeFixture {
+    static func main() async {
+        // Returning a stream and waiting for a slow consumer must not pull anything.
+        let values = Results([.item(1), .item(nil), .item(2), .done])
+        let normalCancel = Counter()
+        let stream = UniffiAsyncStream<Int?>(next: { values.next() }, cancel: {
+            normalCancel.increment()
+        })
+        precondition(values.nextCount() == 0)
+        await Task.yield()
+        precondition(values.nextCount() == 0)
+
+        var iterator = stream.makeAsyncIterator()
+        let first = try! await iterator.next()
+        guard case let .some(firstValue) = first, firstValue == 1 else {
+            fatalError("expected Item(Some(1))")
+        }
+        precondition(values.nextCount() == 1)
+        await Task.yield()
+        precondition(values.nextCount() == 1)
+
+        let second = try! await iterator.next()
+        guard case .some(.none) = second else {
+            fatalError("expected Item(None), not Done")
+        }
+        let third = try! await iterator.next()
+        guard case let .some(thirdValue) = third, thirdValue == 2 else {
+            fatalError("expected Item(Some(2))")
+        }
+        let done = try! await iterator.next()
+        precondition(done == nil)
+        precondition(values.nextCount() == 4)
+        let doneAgain = try! await iterator.next()
+        precondition(doneAgain == nil)
+        precondition(values.nextCount() == 4)
+        precondition(normalCancel.get() == 0)
+
+        // Error transitions to terminal and releases the native stream only once.
+        let errorCancel = Counter()
+        let errorStream = UniffiAsyncStream<Int>(next: { throw FixtureError.boom }, cancel: {
+            errorCancel.increment()
+        })
+        var errorIterator = errorStream.makeAsyncIterator()
+        do {
+            _ = try await errorIterator.next()
+            fatalError("expected stream error")
+        } catch FixtureError.boom {}
+        catch {
+            fatalError("unexpected stream error: \(error)")
+        }
+        let errorDone = try! await errorIterator.next()
+        precondition(errorDone == nil)
+        precondition(errorCancel.get() == 1)
+
+        // Dropping an unfinished iterator after an early break performs one cancel.
+        let earlyCancel = Counter()
+        let earlyStream = UniffiAsyncStream<Int>(next: { .item(1) }, cancel: {
+            earlyCancel.increment()
+        })
+        try! await consumeOneAndDrop(earlyStream)
+        await Task.yield()
+        precondition(earlyCancel.get() == 1)
+
+        // A pending next observes task cancellation, cancels its stream once, and
+        // never returns a late item after the pending operation is released.
+        let pending = PendingStreamNext()
+        let cancellationCount = Counter()
+        let cancellationStream = UniffiAsyncStream<Int>(next: { await pending.next() }, cancel: {
+            cancellationCount.increment()
+        })
+        var cancellationIterator = cancellationStream.makeAsyncIterator()
+        let cancellationTask = Task { () throws -> Int? in
+            try await cancellationIterator.next()
+        }
+        await waitUntil { pending.started() }
+        cancellationTask.cancel()
+        await waitUntil { cancellationCount.get() == 1 }
+        pending.resume(.done)
+        do {
+            _ = try await cancellationTask.value
+            fatalError("cancelled next() unexpectedly succeeded")
+        } catch is CancellationError {}
+        catch {
+            fatalError("unexpected cancellation error: \(error)")
+        }
+        precondition(cancellationCount.get() == 1)
+
+        // Two copies of an iterator share the same state; a second pending next is
+        // rejected before it reaches the native pull closure.
+        let concurrentPending = PendingStreamNext()
+        let concurrentStream = UniffiAsyncStream<Int>(next: { await concurrentPending.next() }, cancel: {})
+        var firstConcurrentIterator = concurrentStream.makeAsyncIterator()
+        var secondConcurrentIterator = firstConcurrentIterator
+        let firstConcurrentTask = Task { () throws -> Int? in
+            try await firstConcurrentIterator.next()
+        }
+        await waitUntil { concurrentPending.started() }
+        do {
+            _ = try await secondConcurrentIterator.next()
+            fatalError("expected concurrent next() to fail")
+        } catch UniffiInternalError.concurrentStreamNext {}
+        catch {
+            fatalError("unexpected concurrent next() error: \(error)")
+        }
+        concurrentPending.resume(.done)
+        let concurrentDone = try! await firstConcurrentTask.value
+        precondition(concurrentDone == nil)
+
+        // A Rust future cancellation handler must invoke cancel before free. The
+        // blocked cancel closure makes a premature free observable.
+        let lifecycleCancel = Counter()
+        let lifecycleFree = Counter()
+        let cancelEntered = DispatchSemaphore(value: 0)
+        let allowCancel = DispatchSemaphore(value: 0)
+        let cancelFinished = DispatchSemaphore(value: 0)
+        let freeFinished = DispatchSemaphore(value: 0)
+        let lifecycle = UniffiRustFutureHandle(
+            handle: 1,
+            cancelFunc: { _ in
+                lifecycleCancel.increment()
+                cancelEntered.signal()
+                _ = allowCancel.wait(timeout: .now() + 1)
+            },
+            freeFunc: { _ in lifecycleFree.increment() }
+        )
+        DispatchQueue.global().async {
+            lifecycle.cancel()
+            cancelFinished.signal()
+        }
+        precondition(cancelEntered.wait(timeout: .now() + 1) == .success)
+        DispatchQueue.global().async {
+            lifecycle.free()
+            freeFinished.signal()
+        }
+        usleep(50_000)
+        precondition(lifecycleFree.get() == 0)
+        allowCancel.signal()
+        precondition(cancelFinished.wait(timeout: .now() + 1) == .success)
+        precondition(freeFinished.wait(timeout: .now() + 1) == .success)
+        lifecycle.cancel()
+        lifecycle.free()
+        precondition(lifecycleCancel.get() == 1)
+        precondition(lifecycleFree.get() == 1)
+
+        // Execute the actual generated async helper under task cancellation and
+        // verify its Rust future cancel and final free callbacks are each single-use.
+        let futureProbe = FutureProbe()
+        let futureCancel = Counter()
+        let futureFree = Counter()
+        let futureTask = Task { () throws -> Int in
+            try await uniffiRustCallAsync(
+                rustFutureFunc: { 7 },
+                pollFunc: { _, callback, callbackData in
+                    futureProbe.install(callback, data: callbackData)
+                },
+                cancelFunc: { _ in
+                    futureCancel.increment()
+                    futureProbe.resumeReady()
+                },
+                completeFunc: { _, _ in 42 },
+                freeFunc: { _ in futureFree.increment() },
+                liftFunc: { $0 },
+                errorHandler: nil
+            )
+        }
+        await waitUntil { futureProbe.installed() }
+        futureTask.cancel()
+        let futureValue = try! await futureTask.value
+        precondition(futureValue == 42)
+        precondition(futureCancel.get() == 1)
+        precondition(futureFree.get() == 1)
+    }
+}
+"#,
+        ]
+        .join("\n");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let swift_path = tmp.path().join("StreamRuntimeFixture.swift");
+        let executable_path = tmp.path().join("StreamRuntimeFixture");
+        fs::write(&swift_path, fixture).unwrap();
+
+        let compile = Command::new("swiftc")
+            .arg("-swift-version")
+            .arg("5")
+            .arg("-parse-as-library")
+            .arg(&swift_path)
+            .arg("-o")
+            .arg(&executable_path)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "swiftc fixture compile failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable_path).output().unwrap();
+        assert!(
+            run.status.success(),
+            "Swift stream runtime fixture failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
         );
     }
 
