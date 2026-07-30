@@ -3933,12 +3933,68 @@ export function countEvents(count: number): AsyncIterable<StreamEvent> {
     std::fs::write(
         root.join("driver.ts"),
         r#"
-import { __installBackend, createUniffiAsyncIterable, UniffiError } from "./common/runtime.ts";
-import { countEvents } from "./common/api.ts";
+class FakeFinalizationRegistry {
+  static readonly registries: FakeFinalizationRegistry[] = [];
+  private readonly callback: (heldValue: unknown) => void;
+  private registrations: Array<{
+    target: object;
+    heldValue: unknown;
+    unregisterToken?: object;
+  }> = [];
+
+  constructor(callback: (heldValue: unknown) => void) {
+    this.callback = callback;
+    FakeFinalizationRegistry.registries.push(this);
+  }
+
+  register(target: object, heldValue: unknown, unregisterToken?: object): void {
+    this.registrations.push({ target, heldValue, unregisterToken });
+  }
+
+  unregister(unregisterToken: object): boolean {
+    const before = this.registrations.length;
+    this.registrations = this.registrations.filter(
+      (registration) => registration.unregisterToken !== unregisterToken,
+    );
+    return this.registrations.length !== before;
+  }
+
+  static trigger(target: object): void {
+    for (const registry of FakeFinalizationRegistry.registries) {
+      const matching = registry.registrations.filter(
+        (registration) => registration.target === target,
+      );
+      registry.registrations = registry.registrations.filter(
+        (registration) => registration.target !== target,
+      );
+      for (const registration of matching) {
+        registry.callback(registration.heldValue);
+      }
+    }
+  }
+}
+
+// runtime.ts constructs its registries at module evaluation time, so install the
+// deterministic fake before importing it. These tests never depend on real GC.
+(globalThis as { FinalizationRegistry?: unknown }).FinalizationRegistry =
+  FakeFinalizationRegistry;
+
+const { __installBackend, createUniffiAsyncIterable, UniffiError } =
+  await import("./common/runtime.ts");
+const { countEvents } = await import("./common/api.ts");
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
 }
+
+async function flushFinalizerWork(): Promise<void> {
+  await Promise.resolve();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+const unhandledRejections: unknown[] = [];
+(globalThis as { process?: { on?: (event: string, listener: (reason: unknown) => void) => void } })
+  .process?.on?.("unhandledRejection", (reason) => unhandledRejections.push(reason));
 
 let cancelCount = 0;
 let nextId = 1;
@@ -3979,6 +4035,86 @@ await manual.return?.();
 await manual.return?.();
 assert(cancelCount === beforeBreak + 2, "manual return should be idempotent");
 assert((await manual.next()).done === true, "next after return done");
+FakeFinalizationRegistry.trigger(manual);
+await flushFinalizerWork();
+assert(cancelCount === beforeBreak + 2, "return should unregister finalizer");
+
+const doneIterable = createUniffiAsyncIterable<number>({
+  handle: "done",
+  next: async () => ({ done: true }),
+  cancel: () => { cancelCount += 1; },
+});
+const doneIterator = doneIterable[Symbol.asyncIterator]();
+const beforeDone = cancelCount;
+assert((await doneIterator.next()).done === true, "normal done result");
+await doneIterator.return?.();
+assert(cancelCount === beforeDone, "return after normal done should not cancel");
+FakeFinalizationRegistry.trigger(doneIterator);
+await flushFinalizerWork();
+assert(cancelCount === beforeDone, "normal done should unregister without cancel");
+
+const activeIterable = createUniffiAsyncIterable<number>({
+  handle: "active",
+  next: async () => ({ done: false, value: 7 }),
+  cancel: () => { cancelCount += 1; },
+});
+const activeIterator = activeIterable[Symbol.asyncIterator]();
+const beforeIterableCollection = cancelCount;
+FakeFinalizationRegistry.trigger(activeIterable);
+await flushFinalizerWork();
+assert(cancelCount === beforeIterableCollection, "collecting iterable must not cancel active iterator");
+assert((await activeIterator.next()).value === 7, "active iterator remains usable");
+await activeIterator.return?.();
+assert(cancelCount === beforeIterableCollection + 1, "active iterator return cancels once");
+
+let finalizerCancellationCount = 0;
+const abandoned = createUniffiAsyncIterable<number>({
+  handle: "abandoned",
+  next: async () => ({ done: true }),
+  cancel: () => {
+    finalizerCancellationCount += 1;
+    return Promise.reject(new Error("finalizer rejection must be observed"));
+  },
+});
+FakeFinalizationRegistry.trigger(abandoned);
+await flushFinalizerWork();
+assert(finalizerCancellationCount === 1, "abandoned iterable finalizer cancels once");
+FakeFinalizationRegistry.trigger(abandoned);
+await flushFinalizerWork();
+assert(finalizerCancellationCount === 1, "finalizer cancellation remains one-shot");
+
+let syncFinalizerCancellationCount = 0;
+const syncFailingAbandoned = createUniffiAsyncIterable<number>({
+  handle: "sync-finalizer-failure",
+  next: async () => ({ done: true }),
+  cancel: () => {
+    syncFinalizerCancellationCount += 1;
+    throw new Error("finalizer synchronous failure must be swallowed");
+  },
+});
+FakeFinalizationRegistry.trigger(syncFailingAbandoned);
+await flushFinalizerWork();
+assert(syncFinalizerCancellationCount === 1, "finalizer swallows synchronous cleanup failure");
+assert(unhandledRejections.length === 0, "finalizer must not leave unhandled rejections");
+
+const callerError = new Error("caller error");
+const throwingIterator = createUniffiAsyncIterable<number>({
+  handle: "throwing",
+  next: async () => ({ done: true }),
+  cancel: () => { cancelCount += 1; },
+})[Symbol.asyncIterator]();
+const beforeThrow = cancelCount;
+let threwCallerError = false;
+try {
+  await throwingIterator.throw?.(callerError);
+} catch (error) {
+  threwCallerError = error === callerError;
+}
+assert(threwCallerError, "iterator throw should reject with the caller error");
+assert(cancelCount === beforeThrow + 1, "iterator throw cancels once");
+FakeFinalizationRegistry.trigger(throwingIterator);
+await flushFinalizerWork();
+assert(cancelCount === beforeThrow + 1, "iterator throw should unregister finalizer");
 
 __installBackend({
   count_events() { return "err"; },
@@ -3988,14 +4124,21 @@ __installBackend({
   count_events_stream_cancel() { cancelCount += 1; },
 });
 let threw = false;
+const errorIterator = countEvents(1)[Symbol.asyncIterator]();
+const beforeStreamError = cancelCount;
 try {
-  for await (const _ of countEvents(1)) {}
+  await errorIterator.next();
 } catch (error) {
   threw = true;
   assert(error instanceof UniffiError, "stream error type");
-  assert((error as UniffiError).errorName === "StreamError", "stream error name");
+  assert((error as { errorName: string }).errorName === "StreamError", "stream error name");
 }
 assert(threw, "stream error should throw");
+await flushFinalizerWork();
+assert(cancelCount === beforeStreamError + 1, "stream error should cancel once");
+FakeFinalizationRegistry.trigger(errorIterator);
+await flushFinalizerWork();
+assert(cancelCount === beforeStreamError + 1, "stream error should unregister finalizer");
 
 let resolvePending: ((value: unknown) => void) | null = null;
 __installBackend({
@@ -4013,7 +4156,7 @@ try {
 } catch (error) {
   concurrentRejected = true;
   assert(error instanceof UniffiError, "concurrent next error type");
-  assert((error as UniffiError).errorName === "UniffiStreamConcurrentNext", "concurrent next error name");
+  assert((error as { errorName: string }).errorName === "UniffiStreamConcurrentNext", "concurrent next error name");
 }
 assert(concurrentRejected, "concurrent next should reject");
 resolvePending?.({ done: false, value: { value: 99 } });
@@ -4028,7 +4171,7 @@ try {
 } catch (error) {
   consumedRejected = true;
   assert(error instanceof UniffiError, "consumed error type");
-  assert((error as UniffiError).errorName === "UniffiStreamConsumed", "consumed error name");
+  assert((error as { errorName: string }).errorName === "UniffiStreamConsumed", "consumed error name");
 }
 assert(consumedRejected, "second iterator should throw");
 
@@ -4043,7 +4186,7 @@ try {
   await malformed.next();
 } catch (error) {
   malformedRejected = error instanceof UniffiError
-    && (error as UniffiError).errorName === "UniffiStreamProtocolError";
+    && (error as { errorName: string }).errorName === "UniffiStreamProtocolError";
 }
 assert(malformedRejected, "malformed envelope must reject rather than become Done");
 assert(cancelCount === beforeMalformed + 1, "malformed envelope should clean up once");

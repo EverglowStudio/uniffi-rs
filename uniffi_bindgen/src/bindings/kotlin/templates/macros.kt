@@ -77,7 +77,11 @@
     {{ func_decl }} fun {{ callable.name()|fn_name }}(
         {%- call arg_list(callable, callable.self_type().is_none()) %}{% endcall -%}
     ) : {{ callable.return_type().unwrap()|type_name(ci) }} {
+        val __streamConsumed = AtomicBoolean(false)
         return flow {
+            if (!__streamConsumed.compareAndSet(false, true)) {
+                throw InternalException("UniFFI output streams may only be consumed once")
+            }
             val __streamHandle = {% call to_ffi_call(callable) %}{% endcall %}
             try {
                 while (true) {

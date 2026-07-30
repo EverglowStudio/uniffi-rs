@@ -2000,6 +2000,43 @@ private struct StreamRuntimeFixture {
         precondition(values.nextCount() == 4)
         precondition(normalCancel.get() == 0)
 
+        // A stream accepts only one independently-created iterator. Rejection
+        // must happen before a native pull or cancellation is attempted.
+        let consumedNext = Counter()
+        let consumedCancel = Counter()
+        do {
+            let consumedStream = UniffiAsyncStream<Int>(next: {
+                consumedNext.increment()
+                return .item(1)
+            }, cancel: {
+                consumedCancel.increment()
+            })
+            var acceptedIterator = consumedStream.makeAsyncIterator()
+            var rejectedIterator = consumedStream.makeAsyncIterator()
+            do {
+                _ = try await rejectedIterator.next()
+                fatalError("expected second iterator to be rejected")
+            } catch UniffiInternalError.streamConsumed {}
+            catch {
+                fatalError("unexpected second iterator error: \(error)")
+            }
+            precondition(consumedNext.get() == 0)
+            precondition(consumedCancel.get() == 0)
+            _ = acceptedIterator
+        }
+        precondition(consumedCancel.get() == 1)
+
+        // Even an unconsumed sequence owns a native stream handle and must
+        // release it through its state lifetime exactly once.
+        let neverConsumedCancel = Counter()
+        do {
+            let neverConsumed = UniffiAsyncStream<Int>(next: { .done }, cancel: {
+                neverConsumedCancel.increment()
+            })
+            withExtendedLifetime(neverConsumed) {}
+        }
+        precondition(neverConsumedCancel.get() == 1)
+
         // Error transitions to terminal and releases the native stream only once.
         let errorCancel = Counter()
         let errorStream = UniffiAsyncStream<Int>(next: { throw FixtureError.boom }, cancel: {
