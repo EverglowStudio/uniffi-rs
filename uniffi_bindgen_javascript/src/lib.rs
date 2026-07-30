@@ -102,7 +102,6 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
     if options.flavors.is_empty() {
         bail!("uniffi-bindgen javascript: at least one --flavor must be specified");
     }
-    fs::create_dir_all(&options.out_dir)?;
 
     let metadata = loader.load_metadata(&options.source)?;
     if let Some(crate_filter) = &options.crate_filter {
@@ -110,7 +109,10 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
             bail!("No UniFFI metadata found for crate {crate_filter}");
         }
     }
-    let cis = loader.load_cis(&options.source, metadata)?;
+    let mut cis = loader.load_cis(&options.source, metadata)?;
+    if let Some(crate_filter) = &options.crate_filter {
+        cis.retain(|ci| ci.crate_name() == crate_filter);
+    }
     let override_toml = load_override_toml(options.config_override.as_ref())?;
     let mut components: Vec<Component<JsConfig>> =
         loader.load_components(cis, |_ci, mut toml| {
@@ -119,18 +121,34 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
             }
             JsConfig::from_root_toml(toml)
         })?;
+    generate_components(&mut components, &options)
+}
+
+/// Perform the part of JavaScript generation that owns the output tree.
+///
+/// Keeping selection, ownership validation, and the first filesystem mutation
+/// together makes the no-partial-output guarantee testable independently of
+/// metadata loading.
+fn generate_components(
+    components: &mut Vec<Component<JsConfig>>,
+    options: &GenerateJsOptions,
+) -> Result<()> {
+    if let Some(crate_filter) = &options.crate_filter {
+        components.retain(|component| component.ci.crate_name() == crate_filter);
+    }
+    if components.is_empty() {
+        bail!("No UniFFI components selected for JavaScript generation");
+    }
     for c in components.iter_mut() {
         c.ci.derive_ffi_funcs()?;
     }
 
+    preflight_output_ownership(components, &options.flavors)?;
+    fs::create_dir_all(&options.out_dir)?;
+
     let mut emitted_crate_names: Vec<String> = Vec::new();
     let mut emitted_namespaces: Vec<String> = Vec::new();
-    for component in &components {
-        if let Some(crate_filter) = &options.crate_filter {
-            if component.ci.crate_name() != crate_filter {
-                continue;
-            }
-        }
+    for component in &*components {
         emit_component(component, &options)?;
         emitted_crate_names.push(component.ci.crate_name().to_string());
         emitted_namespaces.push(component.ci.namespace().to_string());
@@ -154,6 +172,154 @@ pub fn generate(loader: &BindgenLoader, options: GenerateJsOptions) -> Result<()
         )?;
     }
     Ok(())
+}
+
+/// A stable component description suitable for deterministic preflight
+/// diagnostics. Deliberately excludes source paths and loader ordering.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ComponentIdentity {
+    crate_name: String,
+    namespace: String,
+}
+
+impl ComponentIdentity {
+    fn from_component(component: &Component<JsConfig>) -> Self {
+        Self {
+            crate_name: component.ci.crate_name().to_string(),
+            namespace: component.ci.namespace().to_string(),
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "crate `{}`, namespace `{}`",
+            self.crate_name, self.namespace
+        )
+    }
+}
+
+/// Reject multiple components before they can overwrite the fixed JavaScript
+/// output tree. The current public layout has shared `common/*` files and
+/// fixed flavor entrypoints, so safe composition needs a future namespaced
+/// layout rather than a best-effort merge here.
+fn preflight_output_ownership(
+    components: &[Component<JsConfig>],
+    flavors: &[FlavorTarget],
+) -> Result<()> {
+    let identities = components
+        .iter()
+        .map(ComponentIdentity::from_component)
+        .collect::<Vec<_>>();
+
+    let mut namespace_owners = BTreeMap::<String, Vec<ComponentIdentity>>::new();
+    for identity in &identities {
+        namespace_owners
+            .entry(identity.namespace.clone())
+            .or_default()
+            .push(identity.clone());
+    }
+    let duplicate_namespaces = namespace_owners
+        .into_iter()
+        .filter_map(|(namespace, mut owners)| {
+            (owners.len() > 1).then(|| {
+                owners.sort();
+                (namespace, owners)
+            })
+        })
+        .collect::<Vec<_>>();
+    if !duplicate_namespaces.is_empty() {
+        let mut message = String::from("duplicate UniFFI component namespace(s):\n");
+        for (namespace, owners) in duplicate_namespaces {
+            let owners = owners
+                .iter()
+                .map(ComponentIdentity::describe)
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!("- namespace `{namespace}`: {owners}\n"));
+        }
+        bail!("{message}");
+    }
+
+    let mut path_owners = BTreeMap::<String, std::collections::BTreeSet<ComponentIdentity>>::new();
+    for component in components {
+        let owner = ComponentIdentity::from_component(component);
+        for path in component_output_claims(component, flavors) {
+            path_owners.entry(path).or_default().insert(owner.clone());
+        }
+    }
+    let conflicts = path_owners
+        .into_iter()
+        .filter(|(_, owners)| owners.len() > 1)
+        .collect::<Vec<_>>();
+    if !conflicts.is_empty() {
+        let mut message = String::from("conflicting UniFFI JavaScript output path ownership:\n");
+        for (path, owners) in conflicts {
+            let owners = owners
+                .iter()
+                .map(ComponentIdentity::describe)
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!("- `{path}`: {owners}\n"));
+        }
+        bail!("{message}");
+    }
+    Ok(())
+}
+
+/// Return every path emitted below `out_dir` for one component and the
+/// requested flavors. A set intentionally collapses duplicate flavor flags
+/// for the same owner.
+fn component_output_claims(
+    component: &Component<JsConfig>,
+    flavors: &[FlavorTarget],
+) -> std::collections::BTreeSet<String> {
+    const COMMON_FILES: &[&str] = &[
+        "runtime.ts",
+        "custom-types.ts",
+        "records.ts",
+        "enums.ts",
+        "errors.ts",
+        "callbacks.ts",
+        "objects.ts",
+        "api.ts",
+        "public-types.ts",
+    ];
+
+    let mut claims = COMMON_FILES
+        .iter()
+        .map(|file| format!("common/{file}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let crate_name = component.ci.crate_name();
+    for flavor in flavors {
+        match flavor {
+            FlavorTarget::Wasm => {
+                claims.insert(format!("browser/{crate_name}.rs"));
+                claims.insert("browser/backend-wasm.ts".to_string());
+                claims.insert("browser/index.ts".to_string());
+            }
+            FlavorTarget::Napi => {
+                claims.insert(format!("node/{crate_name}.rs"));
+                claims.insert("node/backend-napi.ts".to_string());
+                claims.insert("node/index.ts".to_string());
+            }
+            FlavorTarget::Electron => {
+                claims.insert(format!("electron/{crate_name}.rs"));
+                claims.insert("electron/backend-napi.ts".to_string());
+                claims.insert("electron/index.ts".to_string());
+                claims.insert("electron/preload.cjs".to_string());
+                claims.insert("electron/renderer.ts".to_string());
+            }
+            FlavorTarget::Harmony => {
+                claims.insert(format!("harmony/{crate_name}.rs"));
+                claims.insert("harmony/backend-ohos.ts".to_string());
+                claims.insert(format!("harmony/{crate_name}.ohos-extra-types.d.ts"));
+                claims.insert(format!("harmony/{crate_name}.ohos-facade.json"));
+                claims.insert("harmony/stream.ts".to_string());
+                claims.insert("harmony/index.ts".to_string());
+            }
+        }
+    }
+    claims
 }
 
 fn emit_component(component: &Component<JsConfig>, options: &GenerateJsOptions) -> Result<()> {
@@ -344,5 +510,199 @@ fn merge_toml(into: &mut toml::Value, from: toml::Value) {
             }
         }
         (into, from) => *into = from,
+    }
+}
+
+#[cfg(test)]
+mod output_ownership_tests {
+    use super::*;
+    use uniffi_bindgen::interface::ComponentInterface;
+    use uniffi_meta::{MetadataGroup, NamespaceMetadata};
+
+    fn component(crate_name: &str, namespace: &str) -> Component<JsConfig> {
+        let ci = ComponentInterface::from_metadata(MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: crate_name.to_string(),
+                name: namespace.to_string(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        })
+        .unwrap();
+        Component {
+            ci,
+            config: JsConfig::default(),
+        }
+    }
+
+    fn components() -> Vec<Component<JsConfig>> {
+        vec![
+            component("component_a", "namespace_a"),
+            component("component_b", "namespace_b"),
+        ]
+    }
+
+    fn test_path(label: &str) -> Utf8PathBuf {
+        let unique = format!(
+            "uniffi-js-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        Utf8PathBuf::from_path_buf(std::env::temp_dir().join(unique)).unwrap()
+    }
+
+    fn options(out_dir: Utf8PathBuf, crate_filter: Option<&str>) -> GenerateJsOptions {
+        GenerateJsOptions {
+            source: Utf8PathBuf::from("multi-component-test.udl"),
+            out_dir,
+            artifact_dir: None,
+            config_override: None,
+            crate_filter: crate_filter.map(str::to_string),
+            metadata_no_deps: true,
+            flavors: vec![FlavorTarget::Napi],
+            host_crates: None,
+        }
+    }
+
+    #[test]
+    fn multi_component_conflicts_are_stable_and_list_all_owners_and_paths() {
+        let forward = preflight_output_ownership(&components(), &[FlavorTarget::Napi])
+            .unwrap_err()
+            .to_string();
+        let mut reverse = components();
+        reverse.reverse();
+        let reversed = preflight_output_ownership(&reverse, &[FlavorTarget::Napi])
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(forward, reversed);
+        assert!(forward.contains("conflicting UniFFI JavaScript output path ownership"));
+        assert!(forward.contains("`common/api.ts`"));
+        assert!(forward.contains("`node/backend-napi.ts`"));
+        for owner in [
+            "crate `component_a`, namespace `namespace_a`",
+            "crate `component_b`, namespace `namespace_b`",
+        ] {
+            assert!(
+                forward.contains(owner),
+                "missing owner `{owner}`:\n{forward}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_component_duplicate_namespace_is_explicit_and_stable() {
+        let forward = vec![
+            component("component_a", "shared_namespace"),
+            component("component_b", "shared_namespace"),
+        ];
+        let reversed = vec![
+            component("component_b", "shared_namespace"),
+            component("component_a", "shared_namespace"),
+        ];
+
+        let forward_error = preflight_output_ownership(&forward, &[FlavorTarget::Harmony])
+            .unwrap_err()
+            .to_string();
+        let reversed_error = preflight_output_ownership(&reversed, &[FlavorTarget::Harmony])
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(forward_error, reversed_error);
+        assert!(forward_error.contains("duplicate UniFFI component namespace(s)"));
+        assert!(forward_error.contains("namespace `shared_namespace`"));
+        assert!(forward_error.contains("crate `component_a`, namespace `shared_namespace`"));
+        assert!(forward_error.contains("crate `component_b`, namespace `shared_namespace`"));
+    }
+
+    #[test]
+    fn multi_component_preflight_happens_before_output_mutation() {
+        let missing_out_dir = test_path("missing-output");
+        let error = generate_components(&mut components(), &options(missing_out_dir.clone(), None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conflicting UniFFI JavaScript output path ownership"));
+        assert!(
+            !missing_out_dir.exists(),
+            "preflight failure must not create {missing_out_dir}"
+        );
+
+        let existing_out_dir = test_path("sentinel-output");
+        fs::create_dir_all(&existing_out_dir).unwrap();
+        let sentinel = existing_out_dir.join("sentinel.txt");
+        fs::write(&sentinel, "preserve me").unwrap();
+        let error =
+            generate_components(&mut components(), &options(existing_out_dir.clone(), None))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("conflicting UniFFI JavaScript output path ownership"));
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "preserve me");
+        let entries = fs::read_dir(&existing_out_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, ["sentinel.txt"]);
+    }
+
+    #[test]
+    fn crate_filter_selects_one_component_before_preflight_and_emits_normally() {
+        let out_dir = test_path("crate-filter");
+        generate_components(
+            &mut components(),
+            &options(out_dir.clone(), Some("component_a")),
+        )
+        .unwrap();
+
+        assert!(out_dir.join("common/api.ts").is_file());
+        assert!(out_dir.join("node/component_a.rs").is_file());
+        assert!(!out_dir.join("node/component_b.rs").exists());
+    }
+
+    #[test]
+    fn component_output_claims_match_all_flavor_emitters() {
+        let component = component("fixture", "fixture_namespace");
+        preflight_output_ownership(
+            std::slice::from_ref(&component),
+            &[FlavorTarget::Harmony, FlavorTarget::Harmony],
+        )
+        .unwrap();
+        let claims = component_output_claims(
+            &component,
+            &[
+                FlavorTarget::Wasm,
+                FlavorTarget::Napi,
+                FlavorTarget::Electron,
+                FlavorTarget::Harmony,
+                FlavorTarget::Harmony,
+            ],
+        );
+        for path in [
+            "common/api.ts",
+            "common/runtime.ts",
+            "browser/fixture.rs",
+            "browser/backend-wasm.ts",
+            "node/fixture.rs",
+            "node/backend-napi.ts",
+            "electron/fixture.rs",
+            "electron/backend-napi.ts",
+            "electron/preload.cjs",
+            "electron/renderer.ts",
+            "harmony/fixture.rs",
+            "harmony/backend-ohos.ts",
+            "harmony/fixture.ohos-extra-types.d.ts",
+            "harmony/fixture.ohos-facade.json",
+            "harmony/stream.ts",
+            "harmony/index.ts",
+        ] {
+            assert!(claims.contains(path), "missing output claim `{path}`");
+        }
+        assert_eq!(
+            claims.len(),
+            26,
+            "duplicate flavors must not add duplicate claims: {claims:#?}"
+        );
     }
 }
