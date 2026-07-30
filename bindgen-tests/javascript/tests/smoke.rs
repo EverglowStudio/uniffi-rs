@@ -3477,6 +3477,7 @@ resolver = "3"
         src.join("lib.rs"),
         r#"
 use std::{
+    collections::VecDeque,
     fmt,
     pin::Pin,
     task::{Context, Poll},
@@ -3543,6 +3544,10 @@ struct ErrorAfterOne {
 
 struct PendingStream;
 
+struct OptionalEvents {
+    values: VecDeque<Option<u32>>,
+}
+
 impl Stream for PendingStream {
     type Item = Result<StreamEvent, StreamError>;
 
@@ -3564,6 +3569,14 @@ impl Stream for ErrorAfterOne {
     }
 }
 
+impl Stream for OptionalEvents {
+    type Item = Result<Option<u32>, StreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.values.pop_front().map(Ok))
+    }
+}
+
 #[uniffi::export]
 pub fn count_events(count: u32) -> uniffi::UniFfiStream<StreamEvent, StreamError> {
     Box::pin(CountStream { next: 0, end: count })
@@ -3577,6 +3590,27 @@ pub fn error_after_one() -> Pin<Box<dyn Stream<Item = Result<StreamEvent, Stream
 #[uniffi::export]
 pub fn pending_events() -> uniffi::UniFfiStream<StreamEvent, StreamError> {
     Box::pin(PendingStream)
+}
+
+#[uniffi::export]
+pub fn optional_events() -> uniffi::UniFfiStream<Option<u32>, StreamError> {
+    Box::pin(OptionalEvents {
+        values: VecDeque::from([Some(1), None, Some(2)]),
+    })
+}
+
+#[uniffi::export]
+pub fn empty_optional_events() -> uniffi::UniFfiStream<Option<u32>, StreamError> {
+    Box::pin(OptionalEvents {
+        values: VecDeque::new(),
+    })
+}
+
+#[uniffi::export]
+pub fn single_optional_event() -> uniffi::UniFfiStream<Option<u32>, StreamError> {
+    Box::pin(OptionalEvents {
+        values: VecDeque::from([None]),
+    })
 }
 
 #[uniffi::export]
@@ -3883,10 +3917,10 @@ export function countEvents(count: number): AsyncIterable<StreamEvent> {
   const __handle = __call<any>("count_events", count);
   return createUniffiAsyncIterable<StreamEvent>({
     handle: __handle,
-    next: async (__streamHandle: unknown): Promise<StreamEvent | null> => {
+    next: async (__streamHandle: unknown) => {
       const __next = await __callAsync<{ done: boolean; value?: any }>("count_events_stream_next", __streamHandle);
-      if (__next == null || __next.done === true) return null;
-      return { value: __next.value.value } as StreamEvent;
+      if (__next == null || __next.done === true) return { done: true };
+      return { done: false, value: { value: __next.value.value } as StreamEvent };
     },
     cancel: (__streamHandle: unknown): void => {
       __call<void>("count_events_stream_cancel", __streamHandle);
@@ -3899,7 +3933,7 @@ export function countEvents(count: number): AsyncIterable<StreamEvent> {
     std::fs::write(
         root.join("driver.ts"),
         r#"
-import { __installBackend, UniffiError } from "./common/runtime.ts";
+import { __installBackend, createUniffiAsyncIterable, UniffiError } from "./common/runtime.ts";
 import { countEvents } from "./common/api.ts";
 
 function assert(cond: boolean, label: string): void {
@@ -3998,6 +4032,23 @@ try {
 }
 assert(consumedRejected, "second iterator should throw");
 
+const beforeMalformed = cancelCount;
+const malformed = createUniffiAsyncIterable<number>({
+  handle: "malformed",
+  next: async () => ({} as any),
+  cancel: () => { cancelCount += 1; },
+})[Symbol.asyncIterator]();
+let malformedRejected = false;
+try {
+  await malformed.next();
+} catch (error) {
+  malformedRejected = error instanceof UniffiError
+    && (error as UniffiError).errorName === "UniffiStreamProtocolError";
+}
+assert(malformedRejected, "malformed envelope must reject rather than become Done");
+assert(cancelCount === beforeMalformed + 1, "malformed envelope should clean up once");
+assert((await malformed.next()).done === true, "malformed iterator should be terminal");
+
 console.log("ok");
 "#,
     )
@@ -4049,15 +4100,23 @@ fn js_async_iterable_stream_stub_contract() {
     for needle in [
         "createUniffiAsyncIterable<StreamEvent>",
         "__call<any>(\"count_events\"",
-        "__callAsync<{ done: boolean; value?: any }>(\"count_events_stream_next\"",
+        "type UniffiStreamNext",
+        "Promise<UniffiStreamNext<StreamEvent>>",
+        "__callAsync<{ done?: unknown; value?: any; error?: unknown }>(\"count_events_stream_next\"",
         "__call<void>(\"count_events_stream_cancel\"",
-        "return { value: __next.value.value } as StreamEvent;",
+        "if (__next.done)",
+        "Object.prototype.hasOwnProperty.call(__next, \"value\")",
+        "return { done: false, value: { value: __next.value.value } as StreamEvent };",
     ] {
         assert!(
             api.contains(needle),
             "common/api.ts should expose stream async iterable contract via `{needle}`:\n{api}"
         );
     }
+    assert!(
+        api.contains("export function optionalEvents(): AsyncIterable<number | null>"),
+        "common/api.ts should retain an optional stream item type:\n{api}"
+    );
     assert!(
         !api.contains("StreamError"),
         "common/api.ts should not import unused stream error types:\n{api}"
@@ -4078,14 +4137,17 @@ fn js_async_iterable_stream_stub_contract() {
     assert!(
         wasm_rs.contains("RustStreamRegistry")
             && wasm_rs.contains("pub async fn count_events_stream_next")
-            && wasm_rs.contains("pub fn count_events_stream_cancel"),
+            && wasm_rs.contains("pub fn count_events_stream_cancel")
+            && wasm_rs.contains("Reflect::set(&__obj, &JsValue::from_str(\"done\")"),
         "wasm shim should emit stream start/next/cancel:\n{wasm_rs}"
     );
     let napi_rs = std::fs::read_to_string(out_dir.join("node/stream_core.rs")).unwrap();
     assert!(
         napi_rs.contains("RustStreamRegistry")
             && napi_rs.contains("pub async fn count_events_stream_next")
-            && napi_rs.contains("pub fn count_events_stream_cancel"),
+            && napi_rs.contains("pub fn count_events_stream_cancel")
+            && napi_rs.contains("pub done: bool,")
+            && napi_rs.contains("pub value: Option<"),
         "napi shim should emit stream start/next/cancel:\n{napi_rs}"
     );
 
@@ -4093,7 +4155,7 @@ fn js_async_iterable_stream_stub_contract() {
         out_dir.join("driver.ts"),
         r#"
 import { __installBackend, UniffiError } from "./common/runtime.ts";
-import { countEvents, errorAfterOne } from "./common/api.ts";
+import { countEvents, emptyOptionalEvents, errorAfterOne, optionalEvents, singleOptionalEvent } from "./common/api.ts";
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -4101,6 +4163,7 @@ function assert(cond: boolean, label: string): void {
 
 let cancelCount = 0;
 let nextId = 1;
+let errorNextCalls = 0;
 const streams = new Map<string, { values: Array<unknown>; errorAt?: number; nextCalls: number }>();
 
 __installBackend({
@@ -4123,6 +4186,52 @@ __installBackend({
     cancelCount += 1;
     streams.delete(handle);
   },
+  optional_events() {
+    const handle = `o${nextId++}`;
+    streams.set(handle, { values: [1, null, 2], nextCalls: 0 });
+    return handle;
+  },
+  async optional_events_stream_next(handle: string) {
+    const stream = streams.get(handle);
+    if (!stream) return { done: true };
+    stream.nextCalls += 1;
+    if (stream.values.length === 0) return { done: true };
+    return { done: false, value: stream.values.shift() };
+  },
+  optional_events_stream_cancel(handle: string) {
+    cancelCount += 1;
+    streams.delete(handle);
+  },
+  empty_optional_events() {
+    const handle = `oe${nextId++}`;
+    streams.set(handle, { values: [], nextCalls: 0 });
+    return handle;
+  },
+  async empty_optional_events_stream_next(handle: string) {
+    const stream = streams.get(handle);
+    if (!stream || stream.values.length === 0) return { done: true };
+    stream.nextCalls += 1;
+    return { done: false, value: stream.values.shift() };
+  },
+  empty_optional_events_stream_cancel(handle: string) {
+    cancelCount += 1;
+    streams.delete(handle);
+  },
+  single_optional_event() {
+    const handle = `os${nextId++}`;
+    streams.set(handle, { values: [null], nextCalls: 0 });
+    return handle;
+  },
+  async single_optional_event_stream_next(handle: string) {
+    const stream = streams.get(handle);
+    if (!stream || stream.values.length === 0) return { done: true };
+    stream.nextCalls += 1;
+    return { done: false, value: stream.values.shift() };
+  },
+  single_optional_event_stream_cancel(handle: string) {
+    cancelCount += 1;
+    streams.delete(handle);
+  },
   error_after_one() {
     const handle = `e${nextId++}`;
     streams.set(handle, { values: [{ value: 7 }], errorAt: 2, nextCalls: 0 });
@@ -4131,6 +4240,7 @@ __installBackend({
   async error_after_one_stream_next(handle: string) {
     const stream = streams.get(handle);
     if (!stream) return { done: true };
+    errorNextCalls += 1;
     stream.nextCalls += 1;
     if (stream.errorAt === stream.nextCalls) {
       throw new UniffiError({ errorName: "StreamError", variant: "Boom", message: "boom" });
@@ -4150,17 +4260,43 @@ for await (const event of countEvents(3)) {
 }
 assert(values.join(",") === "0,1,2", `for-await values ${values}`);
 
+const optionalValues: Array<number | null> = [];
+for await (const value of optionalEvents()) {
+  optionalValues.push(value);
+}
+assert(optionalValues.length === 3, `optional stream item count ${optionalValues.length}`);
+assert(optionalValues[0] === 1 && optionalValues[1] === null && optionalValues[2] === 2,
+  `optional stream values ${optionalValues}`);
+
+const emptyOptionalValues: Array<number | null> = [];
+for await (const value of emptyOptionalEvents()) {
+  emptyOptionalValues.push(value);
+}
+assert(emptyOptionalValues.length === 0, `empty optional stream values ${emptyOptionalValues}`);
+
+const singleOptionalValues: Array<number | null> = [];
+for await (const value of singleOptionalEvent()) {
+  singleOptionalValues.push(value);
+}
+assert(singleOptionalValues.length === 1 && singleOptionalValues[0] === null,
+  `single optional stream values ${singleOptionalValues}`);
+
+const errorIterator = errorAfterOne()[Symbol.asyncIterator]();
+const errorFirst = await errorIterator.next();
+assert(errorFirst.done === false && errorFirst.value.value === 7, "stream error first item");
+const beforeError = cancelCount;
 let threw = false;
 try {
-  for await (const event of errorAfterOne()) {
-    values.push(event.value);
-  }
+  await errorIterator.next();
 } catch (error) {
   threw = true;
   assert(error instanceof UniffiError, "stream error should be wrapped");
   assert((error as UniffiError).errorName === "StreamError", "stream error name");
 }
 assert(threw, "stream error should throw");
+assert(cancelCount === beforeError + 1, "stream error should cancel once");
+assert((await errorIterator.next()).done === true, "error iterator should be terminal");
+assert(errorNextCalls === 2, `error after terminal next calls ${errorNextCalls}`);
 
 const beforeBreak = cancelCount;
 for await (const event of countEvents(10)) {
@@ -4175,6 +4311,19 @@ await manual.return?.();
 await manual.return?.();
 assert(cancelCount === beforeBreak + 2, "manual return should be idempotent");
 assert((await manual.next()).done === true, "next after return done");
+
+const thrown = countEvents(10)[Symbol.asyncIterator]();
+const callerError = new Error("caller error");
+const beforeThrow = cancelCount;
+let callerErrorPreserved = false;
+try {
+  await thrown.throw?.(callerError);
+} catch (error) {
+  callerErrorPreserved = error === callerError;
+}
+assert(callerErrorPreserved, "throw should reject the caller error");
+await thrown.return?.();
+assert(cancelCount === beforeThrow + 1, "throw cleanup should be idempotent");
 
 let resolvePending: ((value: unknown) => void) | null = null;
 __installBackend({
@@ -4210,6 +4359,24 @@ try {
   assert((error as UniffiError).errorName === "UniffiStreamConsumed", "consumed error name");
 }
 assert(consumedRejected, "second iterator should throw");
+
+const beforeMalformed = cancelCount;
+__installBackend({
+  optional_events() { return "malformed"; },
+  async optional_events_stream_next() { return {}; },
+  optional_events_stream_cancel() { cancelCount += 1; },
+});
+const malformed = optionalEvents()[Symbol.asyncIterator]();
+let malformedRejected = false;
+try {
+  await malformed.next();
+} catch (error) {
+  malformedRejected = error instanceof UniffiError
+    && (error as UniffiError).errorName === "UniffiStreamProtocolError";
+}
+assert(malformedRejected, "malformed envelope must reject rather than become Done");
+assert(cancelCount === beforeMalformed + 1, "malformed envelope should clean up once");
+assert((await malformed.next()).done === true, "malformed iterator should be terminal");
 
 console.log("ok");
 "#,
@@ -4251,7 +4418,7 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
     )
     .unwrap();
     assert_eq!(contract["schemaVersion"], 3);
-    assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 3);
+    assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 6);
     assert_eq!(
         contract["outputStreams"][0]["eventsFactory"],
         "countEventsEvents"
@@ -4279,6 +4446,7 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         "export function countEventsStream(count: number): UniFfiStream<StreamEvent>",
         "return toUniFfiStream(countEvents(count));",
         "export function errorAfterOneStream(): UniFfiStream<StreamEvent>",
+        "export function optionalEventsStream(): UniFfiStream<number | null>",
         "import type { StreamEvent } from \"../common/public-types.ts\";",
     ] {
         assert!(
@@ -4333,6 +4501,28 @@ await stream.cancel();
 assert(returnCount === 1, `cancel idempotent ${returnCount}`);
 const afterCancel = await stream.next();
 assert(afterCancel.done === true, "next after cancel done");
+
+const nullable = toUniFfiStream<number | null>({
+  [Symbol.asyncIterator](): AsyncIterator<number | null> {
+    let nextValue = 0;
+    return {
+      async next(): Promise<IteratorResult<number | null>> {
+        if (nextValue === 0) { nextValue += 1; return { done: false, value: 1 }; }
+        if (nextValue === 1) { nextValue += 1; return { done: false, value: null }; }
+        if (nextValue === 2) { nextValue += 1; return { done: false, value: 2 }; }
+        return { done: true, value: undefined as number | null };
+      },
+    };
+  },
+});
+const nullableValues: Array<number | null> = [];
+for (;;) {
+  const result = await nullable.next();
+  if (result.done) break;
+  nullableValues.push(result.value);
+}
+assert(nullableValues.length === 3 && nullableValues[1] === null,
+  `nullable Harmony stream values ${nullableValues}`);
 
 let threw = false;
 const bad = toUniFfiStream({
@@ -4702,7 +4892,7 @@ fn host_crates_napi_runs_stream_fixture() {
     std::fs::write(
         out_dir.join("stream-driver.ts"),
         r#"
-import { countEvents, errorAfterOne, eventIdEnvelope, pendingEvents, roundtripEventId, UniffiError } from "./node/index.ts";
+import { countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, roundtripEventId, singleOptionalEvent, UniffiError } from "./node/index.ts";
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -4713,6 +4903,27 @@ for await (const event of countEvents(3)) {
   values.push(event.value);
 }
 assert(values.join(",") === "0,1,2", `napi stream values ${values}`);
+
+const optionalValues: Array<number | null> = [];
+for await (const value of optionalEvents()) {
+  optionalValues.push(value);
+}
+assert(optionalValues.length === 3, `napi optional stream item count ${optionalValues.length}`);
+assert(optionalValues[0] === 1 && optionalValues[1] === null && optionalValues[2] === 2,
+  `napi optional stream values ${optionalValues}`);
+
+const emptyOptionalValues: Array<number | null> = [];
+for await (const value of emptyOptionalEvents()) {
+  emptyOptionalValues.push(value);
+}
+assert(emptyOptionalValues.length === 0, `napi empty optional stream values ${emptyOptionalValues}`);
+
+const singleOptionalValues: Array<number | null> = [];
+for await (const value of singleOptionalEvent()) {
+  singleOptionalValues.push(value);
+}
+assert(singleOptionalValues.length === 1 && singleOptionalValues[0] === null,
+  `napi single optional stream values ${singleOptionalValues}`);
 
 const manual = countEvents(2)[Symbol.asyncIterator]();
 assert((await manual.next()).value.value === 0, "manual first");
@@ -5303,7 +5514,7 @@ fn host_crates_wasm_runs_stream_fixture() {
         tmp.path().join("wasm-stream-driver.ts"),
         r#"
 import { createRequire } from "node:module";
-import { initBackend, countEvents, errorAfterOne, eventIdEnvelope, pendingEvents, roundtripEventId, UniffiError } from "./generated/browser/index.ts";
+import { initBackend, countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, roundtripEventId, singleOptionalEvent, UniffiError } from "./generated/browser/index.ts";
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/stream_core_wasm.js");
@@ -5318,6 +5529,27 @@ for await (const event of countEvents(3)) {
   values.push(event.value);
 }
 assert(values.join(",") === "0,1,2", `wasm stream values ${values}`);
+
+const optionalValues: Array<number | null> = [];
+for await (const value of optionalEvents()) {
+  optionalValues.push(value);
+}
+assert(optionalValues.length === 3, `wasm optional stream item count ${optionalValues.length}`);
+assert(optionalValues[0] === 1 && optionalValues[1] === null && optionalValues[2] === 2,
+  `wasm optional stream values ${optionalValues}`);
+
+const emptyOptionalValues: Array<number | null> = [];
+for await (const value of emptyOptionalEvents()) {
+  emptyOptionalValues.push(value);
+}
+assert(emptyOptionalValues.length === 0, `wasm empty optional stream values ${emptyOptionalValues}`);
+
+const singleOptionalValues: Array<number | null> = [];
+for await (const value of singleOptionalEvent()) {
+  singleOptionalValues.push(value);
+}
+assert(singleOptionalValues.length === 1 && singleOptionalValues[0] === null,
+  `wasm single optional stream values ${singleOptionalValues}`);
 
 const manual = countEvents(2)[Symbol.asyncIterator]();
 assert((await manual.next()).value.value === 0, "manual first");

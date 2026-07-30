@@ -57,6 +57,12 @@ the same `rust_future_*` functions used for async Rust functions. The completed 
 - `Ok(None)` when the stream is done, cancelled, or the handle is already closed.
 - `Err(error)` when the Rust stream yields an expected error.
 
+The future result remains the existing `Result<Option<Item>, Error>` ABI. Its successful RustBuffer
+payload uses the normal optional discriminator: outer `0` is Done and outer `1` is Item. If `Item`
+is itself optional, the payload has a second tag, so `Stream<Option<u32>>` distinguishes Done
+(`0`), Item(None) (`1, 0`), and Item(Some(1)) (`1, 1, 0, 0, 0, 1`). Expected errors remain on the
+Rust call-status error channel and are never encoded as Done.
+
 `foo_stream_cancel` is idempotent. It removes the stream from the registry, marks the stream closed,
 and wakes/drops pending state through the existing future cancellation path.
 
@@ -88,8 +94,11 @@ return createUniffiAsyncIterable({
 });
 ```
 
-The backend `next` result is an object `{ done: boolean, value?: Item }`, not a bare optional item.
-This keeps `Stream<Item = Option<T>>` distinguishable from stream completion.
+The backend `next` result is an envelope carrying `done`, `value`, and where applicable `error`.
+The generated wrapper validates that envelope and converts it to the binding-internal discriminated
+result `{ done: false, value: Item } | { done: true }`; it never treats `null` or `undefined` as EOF.
+This keeps `Stream<Item = Option<T>>` distinguishable from stream completion. Missing or malformed
+envelopes reject with `UniffiStreamProtocolError` instead of silently ending the stream.
 
 Runtime semantics:
 
@@ -99,9 +108,10 @@ Runtime semantics:
   rejects concurrent low-level pulls.
 - `break` and manual `return()` call `cancel(handle)` exactly once. Repeated `return()` is
   idempotent.
-- A stream item error rejects `next()` through the existing `UniffiError` wrapping path and closes
-  the iterator.
+- A stream item error rejects `next()` through the existing `UniffiError` wrapping path, closes the
+  iterator, and best-effort cancels the native handle without creating an unhandled cleanup rejection.
 - Done closes the iterator. Later `next()` returns `{ done: true }`.
+- `throw(error)` best-effort cancels the handle, then rejects with the caller-supplied error.
 
 N-API, Electron, and wasm-bindgen backends all emit start / next / cancel exports for stream-returning
 free functions. Electron marks only `*_stream_next` as async; start and cancel remain synchronous so
@@ -124,7 +134,8 @@ for try await item in countEvents(count: 3) {
 The public Swift API does not expose the raw stream handle. Generated code calls the low-level
 start function synchronously to create the handle, then starts a Swift `Task` that repeatedly awaits
 the hidden `foo_stream_next(handle)` Rust future through the existing `uniffiRustCallAsync` helper.
-The wrapper maps `Ok(Some(item))` to `continuation.yield(item)`, `Ok(None)` to
+The wrapper reads the outer RustBuffer optional tag before lifting the item. It maps outer Item to
+`continuation.yield(item)` (including `.item(nil)` for optional items), outer Done to
 `continuation.finish()`, and stream item errors to `continuation.finish(throwing:)`.
 
 `continuation.onTermination` cancels the Swift task and calls the hidden `foo_stream_cancel(handle)`.
@@ -153,8 +164,9 @@ countEvents(count = 3u).collect { item ->
 The public Kotlin API does not expose the raw stream handle. Generated code returns a cold `flow {}`:
 each collection synchronously calls the low-level start function to create a new Rust stream handle,
 then repeatedly awaits the hidden `foo_stream_next(handle)` Rust future through the existing
-`uniffiRustCallAsync` helper. `Some(item)` is emitted, `None` ends the flow, and stream item errors
-are thrown to the collector through the standard Kotlin exception path.
+`uniffiRustCallAsync` helper. The wrapper reads the outer RustBuffer optional tag before it lifts
+the item: Item is emitted (including `null` for an optional item), Done ends the flow, and stream
+item errors are thrown to the collector through the standard Kotlin exception path.
 
 The generated flow body always calls hidden `foo_stream_cancel(handle)` from `finally`. This covers
 normal completion, collector cancellation, and exceptions. The Rust-side cancel path is idempotent,
