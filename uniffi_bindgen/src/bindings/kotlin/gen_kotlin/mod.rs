@@ -1620,6 +1620,11 @@ mod test {
             "UniffiLib.uniffi_stream_core_fn_func_running_sum_stream_cancel(__streamHandle)"
         ));
         assert!(kotlin.contains("StreamException.ErrorHandler"));
-        assert!(kotlin.contains("emit(__streamNext)"));
+        assert!(kotlin.contains(
+            "__uniffiLiftStreamNext(it) { buffer -> FfiConverterTypeCounterEvent.read(buffer) }"
+        ));
+        assert!(kotlin.contains("is __UniffiStreamNext.Item -> emit(__streamNext.value)"));
+        assert!(kotlin.contains("__UniffiStreamNext.Done -> break"));
+        assert!(!kotlin.contains("emit(__streamNext)"));
     }
 }
