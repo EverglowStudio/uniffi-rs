@@ -3,6 +3,13 @@
 //! This keeps the productized `uniffi-bindgen javascript build-wasm`
 //! flow covered without editing the larger `smoke.rs` harness.
 
+mod support;
+
+#[path = "support/shared.rs"]
+mod shared;
+
+use shared::*;
+
 use camino::Utf8PathBuf;
 use std::process::Command;
 
@@ -227,5 +234,83 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
             && web_entry.contains("export const ready: Promise<void> = init();")
             && web_entry.contains("export * from \"./index.ts\";"),
         "browser auto-entrypoint should import the real wasm-bindgen output and re-export the explicit entrypoint:\n{web_entry}"
+    );
+}
+#[test]
+fn cli_build_wasm_orchestrates_arithmetic_fixture() {
+    let Some(cargo) = which_tool("cargo") else {
+        eprintln!("SKIP cli_build_wasm_orchestrates_arithmetic_fixture: cargo unavailable");
+        return;
+    };
+    if !has_wasm32_target(&cargo) {
+        eprintln!(
+            "SKIP cli_build_wasm_orchestrates_arithmetic_fixture: wasm32-unknown-unknown target not installed"
+        );
+        return;
+    }
+    let root = workspace_root();
+    let cli = build_uniffi_bindgen_cli(&cargo);
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let pkg_dir = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
+    let (manifest, source) = shared::write_cli_wasm_fixture(tmp.path());
+
+    let output = Command::new(cli.as_std_path())
+        .current_dir(&root)
+        .arg("javascript")
+        .arg("build-wasm")
+        .arg("--manifest-path")
+        .arg(manifest.as_str())
+        .arg("--source")
+        .arg(source.as_str())
+        .arg("--out-dir")
+        .arg(out_dir.as_str())
+        .arg("--host-crates-dir")
+        .arg(host_dir.as_str())
+        .arg("--wasm-bindgen-out-dir")
+        .arg(pkg_dir.as_str())
+        .output()
+        .expect("failed to invoke uniffi-bindgen javascript build-wasm");
+    if !output.status.success() {
+        panic!(
+            "javascript build-wasm failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    for path in [
+        "common/api.ts",
+        "browser/index.ts",
+        "browser/backend-wasm.ts",
+    ] {
+        let file = out_dir.join(path);
+        assert!(file.exists(), "missing generated JS file: {file}");
+    }
+    assert!(
+        host_dir.join("wasm/Cargo.toml").exists(),
+        "missing generated wasm host crate"
+    );
+    assert!(
+        pkg_dir.exists(),
+        "missing wasm-bindgen output dir: {pkg_dir}"
+    );
+    let pkg_entries = std::fs::read_dir(pkg_dir.as_std_path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect::<Vec<_>>();
+    assert!(
+        pkg_entries
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("js")),
+        "wasm-bindgen output dir should contain a .js glue file: {pkg_entries:?}"
+    );
+    assert!(
+        pkg_entries
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm")),
+        "wasm-bindgen output dir should contain a .wasm artifact: {pkg_entries:?}"
     );
 }
