@@ -1,6 +1,36 @@
 # JavaScript Bindgen Tests
 
-This crate contains smoke tests for the fork-local JavaScript target.
+This crate contains layered integration tests for the fork-local JavaScript
+target. The quick smoke target is deliberately small; contracts and real
+backend builds run in their own named targets.
+
+## Test layers
+
+Run an individual layer with:
+
+```sh
+cargo test -p uniffi-bindgen-tests-javascript --test smoke
+cargo test -p uniffi-bindgen-tests-javascript --test contracts
+cargo test -p uniffi-bindgen-tests-javascript --test wasm_e2e
+cargo test -p uniffi-bindgen-tests-javascript --test napi_e2e
+cargo test -p uniffi-bindgen-tests-javascript --test host_crates
+cargo test -p uniffi-bindgen-tests-javascript --test cli_build
+cargo test -p uniffi-bindgen-tests-javascript --test cli_build_napi
+cargo test -p uniffi-bindgen-tests-javascript --test cli_build_wasm
+```
+
+For normal local iteration, run `smoke`, then add `contracts` for generator or
+runtime changes. PR CI should run the complete non-benchmark suite:
+
+```sh
+cargo test -p uniffi-bindgen-tests-javascript --tests
+```
+
+Nightly and release validation should run that complete suite plus the ignored
+benchmark target and any platform-specific targets available on the runner.
+The Wasm E2E tests use the pinned `wasm-bindgen-cli-support = 0.2.117` library
+in process; a globally installed `wasm-bindgen` executable is not a
+prerequisite.
 
 ## Opt-in JavaScript Benchmarks
 
