@@ -47,5 +47,6 @@ Each row includes:
 
 The harness is meant to catch order-of-magnitude regressions and compare the
 generated wasm/N-API paths on the same fixture. It is not a replacement for a
-dedicated browser benchmark: the wasm path runs through `wasm-bindgen --target
-nodejs` so it can execute in a lightweight, reproducible Node process.
+dedicated browser benchmark: the wasm path uses the version-pinned in-process
+`wasm-bindgen` Node.js target, so it can execute in a lightweight, reproducible
+Node process without a globally installed `wasm-bindgen` CLI.
