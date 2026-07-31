@@ -16,12 +16,28 @@ use camino::Utf8PathBuf;
 use std::process::Command;
 use uniffi_bindgen::{BindgenLoader, BindgenPaths, GlobalConfig};
 use uniffi_bindgen_javascript::{generate, FlavorTarget, GenerateJsOptions, HostCrateOptions};
+use wasm_bindgen_cli_support::Bindgen;
 
 const EMPTY_GENERATED_FILES: &[(&str, &str)] = &[];
 
 fn workspace_root() -> Utf8PathBuf {
     let manifest = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest.join("../..").canonicalize_utf8().unwrap()
+}
+
+fn run_wasm_bindgen_nodejs_in_process(wasm_artifact: &std::path::Path, out_dir: &std::path::Path) {
+    let mut bindgen = Bindgen::new();
+    bindgen
+        .nodejs(true)
+        .expect("configuring the built-in wasm-bindgen Node.js target should succeed");
+    bindgen.input_path(wasm_artifact);
+    bindgen.typescript(true);
+    bindgen.generate(out_dir).unwrap_or_else(|err| {
+        panic!(
+            "built-in wasm-bindgen failed for {}: {err:#}",
+            wasm_artifact.display()
+        )
+    });
 }
 
 fn contains_dynamic_type_word(source: &str) -> bool {
@@ -478,8 +494,8 @@ console.log("ok");
 
 /// Full Path-A end-to-end: takes the generated `browser/<crate>.rs`
 /// shim, drops it into a synthesised `cargo` workspace alongside a
-/// trivial business crate, compiles for `wasm32-unknown-unknown`, runs
-/// `wasm-bindgen --target nodejs`, then loads the resulting JS glue
+/// trivial business crate, compiles for `wasm32-unknown-unknown`, generates
+/// Node.js glue with in-process `wasm-bindgen`, then loads the resulting JS glue
 /// from a Node driver that calls into the generated `browser/index.ts`.
 ///
 /// Covers one sync scalar function, one fallible scalar function, and
@@ -487,8 +503,7 @@ console.log("ok");
 /// the public wasm path can be called complete.
 ///
 /// Skipped gracefully when any piece of the toolchain is missing:
-/// `node` ≥ 22.6, `cargo`, the `wasm32-unknown-unknown` target, or
-/// `wasm-bindgen` CLI.
+/// `node` ≥ 22.6, `cargo`, or the `wasm32-unknown-unknown` target.
 /// Static regression for strict TypeScript consumers:
 ///
 /// 1. `common/api.ts` must explicitly import every named type it uses
@@ -706,11 +721,6 @@ fn runs_generated_wasm_shim_end_to_end() {
         eprintln!("skipping wasm e2e: wasm32-unknown-unknown target not installed");
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!("skipping wasm e2e: wasm-bindgen CLI not found");
-        return;
-    };
-
     let tmp = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
 
@@ -841,30 +851,18 @@ wasm_scalar = { path = "../biz" }
         .output()
         .expect("failed to invoke cargo");
     if !build.status.success() {
-        eprintln!(
-            "skipping wasm e2e: cargo build failed (likely offline/no deps):\nstderr:\n{}",
+        panic!(
+            "cargo build failed for wasm e2e:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
         );
-        return;
     }
 
-    // 6. wasm-bindgen --target nodejs
+    // 6. Generate Node.js glue with the built-in wasm-bindgen library.
     let wasm_file = root.join("target/wasm32-unknown-unknown/release/wasm_scalar_shim.wasm");
     assert!(wasm_file.exists(), "expected wasm artifact at {wasm_file}");
     let pkg = root.join("pkg");
-    let bg = Command::new(&wasm_bindgen)
-        .args(["--target", "nodejs", "--out-dir"])
-        .arg(pkg.as_str())
-        .arg(wasm_file.as_str())
-        .output()
-        .expect("failed to invoke wasm-bindgen");
-    if !bg.status.success() {
-        panic!(
-            "wasm-bindgen failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&bg.stdout),
-            String::from_utf8_lossy(&bg.stderr),
-        );
-    }
+    run_wasm_bindgen_nodejs_in_process(wasm_file.as_std_path(), pkg.as_std_path());
 
     // 7. Driver: import the CJS glue via createRequire, drive initBackend
     //    then exercise sync / fallible / async scalar paths.
@@ -2629,8 +2627,8 @@ struct WasmE2eSpec {
 }
 
 /// Execute a Path-A wasm e2e run for the given spec. Skips gracefully
-/// when any piece of the toolchain (node ≥ 22.6, cargo, wasm32 target,
-/// wasm-bindgen CLI) is missing.
+/// when Node ≥ 22.6, cargo, or the wasm32 target is missing; wasm-bindgen
+/// runs in process and does not require a separately installed CLI.
 fn run_wasm_e2e(spec: WasmE2eSpec) {
     let Some(node) = locate_node_with_strip_types() else {
         eprintln!("skipping wasm e2e {}: node 22.6+ unavailable", spec.name);
@@ -2647,14 +2645,6 @@ fn run_wasm_e2e(spec: WasmE2eSpec) {
         );
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!(
-            "skipping wasm e2e {}: wasm-bindgen CLI not found",
-            spec.name
-        );
-        return;
-    };
-
     let tmp = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
     let name = spec.name;
@@ -2801,25 +2791,13 @@ async-trait = "0.1"
         );
     }
 
-    // wasm-bindgen.
+    // Generate Node.js glue with the built-in wasm-bindgen library.
     let wasm_file = root.join(format!(
         "target/wasm32-unknown-unknown/release/{shim_name}.wasm"
     ));
     assert!(wasm_file.exists(), "expected wasm artifact at {wasm_file}");
     let pkg = root.join("pkg");
-    let bg = Command::new(&wasm_bindgen)
-        .args(["--target", "nodejs", "--out-dir"])
-        .arg(pkg.as_str())
-        .arg(wasm_file.as_str())
-        .output()
-        .expect("failed to invoke wasm-bindgen");
-    if !bg.status.success() {
-        panic!(
-            "wasm-bindgen failed for {name}:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&bg.stdout),
-            String::from_utf8_lossy(&bg.stderr),
-        );
-    }
+    run_wasm_bindgen_nodejs_in_process(wasm_file.as_std_path(), pkg.as_std_path());
 
     std::fs::write(root.join("driver.ts"), spec.driver_ts).unwrap();
 
@@ -4920,7 +4898,7 @@ fn input_stream_bidi_static_generation_contract() {
         "export function runningSum(events: AsyncIterable<CounterEvent>): AsyncIterable<CounterEvent>",
         "const __handle = __call<any>(\"running_sum\", createUniffiInputStream(events, {",
         "return createUniffiAsyncIterable<CounterEvent>({",
-        "next: async (__streamHandle: unknown): Promise<CounterEvent | null> =>",
+        "next: async (__streamHandle: unknown): Promise<UniffiStreamNext<CounterEvent>> =>",
         "__call<void>(\"running_sum_stream_cancel\", __streamHandle);",
     ] {
         assert!(
@@ -5349,11 +5327,6 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
         );
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!("SKIP host_crates_wasm_runs_input_stream_fixture: wasm-bindgen CLI unavailable");
-        return;
-    };
-
     let tmp = tempfile::tempdir().unwrap();
     let Some(fixture) = build_input_stream_fixture(tmp.path()) else {
         return;
@@ -5400,19 +5373,7 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
         wasm_file.display()
     );
     let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
-    let bg = Command::new(&wasm_bindgen)
-        .args(["--target", "nodejs", "--out-dir"])
-        .arg(pkg.as_str())
-        .arg(wasm_file.as_path())
-        .output()
-        .expect("failed to invoke wasm-bindgen for input stream fixture");
-    if !bg.status.success() {
-        panic!(
-            "wasm-bindgen input stream fixture failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&bg.stdout),
-            String::from_utf8_lossy(&bg.stderr)
-        );
-    }
+    run_wasm_bindgen_nodejs_in_process(wasm_file.as_path(), pkg.as_std_path());
 
     std::fs::write(
         tmp.path().join("wasm-input-stream-driver.ts"),
@@ -5588,11 +5549,6 @@ fn host_crates_wasm_runs_stream_fixture() {
         );
         return;
     }
-    let Some(wasm_bindgen) = which_tool("wasm-bindgen") else {
-        eprintln!("SKIP host_crates_wasm_runs_stream_fixture: wasm-bindgen CLI unavailable");
-        return;
-    };
-
     let tmp = tempfile::tempdir().unwrap();
     let Some(fixture) = build_stream_fixture(tmp.path()) else {
         return;
@@ -5639,19 +5595,7 @@ fn host_crates_wasm_runs_stream_fixture() {
         wasm_file.display()
     );
     let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
-    let bg = Command::new(&wasm_bindgen)
-        .args(["--target", "nodejs", "--out-dir"])
-        .arg(pkg.as_str())
-        .arg(wasm_file.as_path())
-        .output()
-        .expect("failed to invoke wasm-bindgen for stream fixture");
-    if !bg.status.success() {
-        panic!(
-            "wasm-bindgen stream fixture failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&bg.stdout),
-            String::from_utf8_lossy(&bg.stderr)
-        );
-    }
+    run_wasm_bindgen_nodejs_in_process(wasm_file.as_path(), pkg.as_std_path());
 
     std::fs::write(
         tmp.path().join("wasm-stream-driver.ts"),

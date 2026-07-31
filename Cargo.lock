@@ -2198,6 +2198,7 @@ dependencies = [
  "tempfile",
  "uniffi_bindgen",
  "uniffi_bindgen_javascript",
+ "wasm-bindgen-cli-support",
 ]
 
 [[package]]
