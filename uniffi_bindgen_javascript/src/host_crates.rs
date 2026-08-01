@@ -939,11 +939,11 @@ edition = "2021"
         std::fs::write(out.join("harmony/demo_core.rs"), "").unwrap();
         for (name, body) in [
             ("native-facade.ets", "export default {};\n"),
-            ("package-index.ets", "export default {};\n"),
+            ("Index.ets", "export default {};\n"),
             ("demo_core.ohos-extra-types.d.ts", "export {};\n"),
             (
                 "demo_core.ohos-facade.json",
-                "{\"schemaVersion\":3,\"component\":\"demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
+                "{\"schemaVersion\":4,\"component\":\"demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
             ),
         ] {
             std::fs::write(out.join("harmony").join(name), body).unwrap();

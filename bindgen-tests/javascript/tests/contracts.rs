@@ -1664,11 +1664,35 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         &std::fs::read(out_dir.join("harmony/stream_core.ohos-facade.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(contract["schemaVersion"], 3);
+    assert_eq!(contract["schemaVersion"], 4);
     assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 6);
+    for output in contract["outputStreams"].as_array().unwrap() {
+        let fields = output
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            fields,
+            [
+                "arguments",
+                "cancelFunction",
+                "errorType",
+                "function",
+                "itemType",
+                "nextFunction",
+                "pullClass",
+                "stepType",
+                "streamFactory",
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
     assert_eq!(
-        contract["outputStreams"][0]["eventsFactory"],
-        "countEventsEvents"
+        contract["outputStreams"][0]["stepType"],
+        "UniffiCountEventsStreamNext"
     );
     assert_eq!(
         contract["outputStreams"][0]["streamFactory"],
@@ -1886,7 +1910,7 @@ fn input_stream_bidi_static_generation_contract() {
         &std::fs::read(out_dir.join("harmony/input_stream_core.ohos-facade.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(contract["schemaVersion"], 3);
+    assert_eq!(contract["schemaVersion"], 4);
     assert_eq!(contract["inputStreams"].as_array().unwrap().len(), 1);
     let factory = contract["inputStreams"][0]["factory"].as_str().unwrap();
     let input_suffix = contract["inputStreams"][0]["suffix"]
@@ -1902,8 +1926,8 @@ fn input_stream_bidi_static_generation_contract() {
     assert_eq!(contract["inputStreams"][0]["itemType"]["kind"], "named");
     assert_eq!(contract["inputStreams"][0]["errorType"]["kind"], "named");
     assert_eq!(
-        contract["outputStreams"][0]["eventsFactory"],
-        "runningSumEvents"
+        contract["outputStreams"][0]["stepType"],
+        "UniffiRunningSumStreamNext"
     );
     let extra_types =
         std::fs::read_to_string(out_dir.join("harmony/input_stream_core.ohos-extra-types.d.ts"))

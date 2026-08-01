@@ -1564,11 +1564,11 @@ fn test_managed_prepared_journal_for_generation(
 fn write_owned_harmony_dist(dist: &Utf8Path, contents: &str) {
     std::fs::create_dir_all(dist).unwrap();
     for file in [
-        "index.d.ts",
+        "native-facade.d.ts",
+        "Index.ets",
         "Index.d.ets",
         "harmony-facade-contract.json",
         "native-facade.ets",
-        "package-index.ets",
     ] {
         std::fs::write(dist.join(file), format!("{file}:{contents}\n")).unwrap();
     }
@@ -2607,10 +2607,10 @@ fn managed_no_har_manifest_only_declares_current_dist_outputs() {
     let dist = package_dir.join("artifacts/harmony/dist");
     std::fs::create_dir_all(&dist).unwrap();
     for file in [
-        "index.d.ts",
+        "native-facade.d.ts",
+        "Index.ets",
         "harmony-facade-contract.json",
         "native-facade.ets",
-        "package-index.ets",
     ] {
         std::fs::write(dist.join(file), "export {};\n").unwrap();
     }
@@ -2926,7 +2926,7 @@ fn managed_transaction_rolls_back_before_commit_and_never_restores_partial_clean
         .collect::<Vec<_>>();
     assert!(archived
         .iter()
-        .any(|path| path.ends_with("previous-generation/dist/index.d.ts")));
+        .any(|path| path.ends_with("previous-generation/dist/native-facade.d.ts")));
     let _ = std::fs::remove_dir_all(package_dir.as_std_path());
 }
 
@@ -2987,7 +2987,7 @@ fn managed_cleanup_binds_replaced_backup_root_identity_without_rolling_back_new_
         std::fs::read(replacement_backup.join("user-sentinel")).unwrap(),
         b"preserve"
     );
-    assert!(displaced.join("dist/index.d.ts").is_file());
+    assert!(displaced.join("dist/native-facade.d.ts").is_file());
     let harmony = package_dir.join("artifacts/harmony");
     validate_owned_tree(
         &harmony,
