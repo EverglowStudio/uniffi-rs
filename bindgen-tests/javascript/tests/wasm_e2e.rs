@@ -11,6 +11,45 @@ use wasm_bindgen_cli_support::Bindgen;
 
 const EMPTY_GENERATED_FILES: &[(&str, &str)] = &[];
 
+// Wasm glue generation is intentionally performed by `wasm-bindgen-cli-support`
+// in this test process. Keep every child command on a Rust-toolchain/system
+// PATH that excludes a developer's ~/.cargo/bin, so a separately installed
+// wasm-bindgen CLI can neither satisfy nor influence the test.
+fn wasm_e2e_path() -> &'static std::ffi::OsStr {
+    static PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let rustc_bin = Command::new("rustup")
+            .args(["which", "rustc"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let rustc =
+                    std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+                rustc.parent().map(std::path::Path::to_path_buf)
+            })
+            .or_else(|| {
+                which_tool("rustc")
+                    .and_then(|rustc| rustc.parent().map(std::path::Path::to_path_buf))
+            });
+        let mut entries = Vec::new();
+        if let Some(rustc_bin) = rustc_bin {
+            entries.push(rustc_bin);
+        }
+        entries.extend([
+            std::path::PathBuf::from("/usr/bin"),
+            std::path::PathBuf::from("/bin"),
+        ]);
+        std::env::join_paths(entries).expect("Wasm E2E PATH entries must be valid")
+    })
+}
+
+fn wasm_e2e_command(program: &std::path::Path) -> Command {
+    let mut command = Command::new(program);
+    command.env("PATH", wasm_e2e_path());
+    command
+}
+
 fn run_wasm_bindgen_nodejs_in_process(wasm_artifact: &std::path::Path, out_dir: &std::path::Path) {
     let mut bindgen = Bindgen::new();
     bindgen
@@ -162,7 +201,7 @@ wasm_scalar = { path = "../biz" }
     let wasm_file = {
         let target_dir = wasm_e2e_shared_target_dir();
         let target_path = target_dir.path().to_str().unwrap();
-        let build = Command::new(&cargo)
+        let build = wasm_e2e_command(&cargo)
             .args([
                 "build",
                 "--target",
@@ -237,7 +276,7 @@ console.log("ok");
 "#;
     std::fs::write(root.join("driver.ts"), driver).unwrap();
 
-    let output = Command::new(&node)
+    let output = wasm_e2e_command(&node)
         .arg("--experimental-strip-types")
         .arg("--no-warnings")
         .arg("driver.ts")
@@ -1870,7 +1909,7 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
 
     let manifest = host_dir.join("wasm/Cargo.toml");
     let target_dir = tmp.path().join("target-wasm-input-stream");
-    let build = Command::new(&cargo)
+    let build = wasm_e2e_command(&cargo)
         .args([
             "build",
             "--manifest-path",
@@ -2039,7 +2078,7 @@ console.log("ok");
     )
     .unwrap();
 
-    let output = Command::new(&node)
+    let output = wasm_e2e_command(&node)
         .arg("--experimental-strip-types")
         .arg("--no-warnings")
         .arg("wasm-input-stream-driver.ts")
@@ -2091,7 +2130,7 @@ fn host_crates_wasm_runs_stream_fixture() {
 
     let manifest = host_dir.join("wasm/Cargo.toml");
     let target_dir = tmp.path().join("target-wasm-stream");
-    let build = Command::new(&cargo)
+    let build = wasm_e2e_command(&cargo)
         .args([
             "build",
             "--manifest-path",
@@ -2126,7 +2165,7 @@ fn host_crates_wasm_runs_stream_fixture() {
         tmp.path().join("wasm-stream-driver.ts"),
         r#"
 import { createRequire } from "node:module";
-import { initBackend, countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, roundtripEventId, singleOptionalEvent, UniffiError } from "./generated/browser/index.ts";
+import { initBackend, countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } from "./generated/browser/index.ts";
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/stream_core_wasm.js");
@@ -2135,6 +2174,18 @@ await initBackend(glue);
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
 }
+
+resetStreamStartCount();
+const lazy = countEvents(1);
+assert(streamStartCount() === 0, "wasm stream construction must not start native work");
+assert((await lazy.next()).value.value === 0, "wasm direct next starts lazy stream");
+assert(streamStartCount() === 1, "wasm first next starts exactly once");
+await lazy.cancel();
+
+resetStreamStartCount();
+const idle = countEvents(1);
+await idle.cancel();
+assert(streamStartCount() === 0, "wasm idle cancel must not start native work");
 
 const values: number[] = [];
 for await (const event of countEvents(3)) {
@@ -2177,7 +2228,8 @@ try {
   }
 } catch (error) {
   threw = true;
-  assert(error instanceof UniffiError, "wasm stream error should be UniffiError");
+  assert(error instanceof StreamError && error instanceof UniffiError, "wasm stream error should retain its typed class");
+  assert((error as StreamError).variant === "Boom" && (error as StreamError).data === "Boom", "wasm stream error should retain variant and payload");
   assert(/boom|Boom|StreamError/i.test((error as Error).message), `wasm stream error message ${(error as Error).message}`);
 }
 assert(errorValues === 7, `wasm stream error first value ${errorValues}`);
@@ -2208,7 +2260,7 @@ console.log("ok");
     )
     .unwrap();
 
-    let output = Command::new(&node)
+    let output = wasm_e2e_command(&node)
         .arg("--experimental-strip-types")
         .arg("--no-warnings")
         .arg("wasm-stream-driver.ts")
@@ -2410,7 +2462,7 @@ async-trait = "0.1"
     let wasm_file = {
         let target_dir = wasm_e2e_shared_target_dir();
         let target_path = target_dir.path().to_str().unwrap();
-        let build = Command::new(&cargo)
+        let build = wasm_e2e_command(&cargo)
             .args([
                 "build",
                 "--target",
@@ -2446,7 +2498,7 @@ async-trait = "0.1"
 
     std::fs::write(root.join("driver.ts"), spec.driver_ts).unwrap();
 
-    let output = Command::new(&node)
+    let output = wasm_e2e_command(&node)
         .arg("--experimental-strip-types")
         .arg("--no-warnings")
         .arg("driver.ts")

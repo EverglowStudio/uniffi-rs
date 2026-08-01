@@ -170,11 +170,23 @@ fn host_crates_napi_runs_stream_fixture() {
     std::fs::write(
         out_dir.join("stream-driver.ts"),
         r#"
-import { countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, roundtripEventId, singleOptionalEvent, UniffiError } from "./node/index.ts";
+import { countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } from "./node/index.ts";
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
 }
+
+resetStreamStartCount();
+const lazy = countEvents(1);
+assert(streamStartCount() === 0, "napi stream construction must not start native work");
+assert((await lazy.next()).value.value === 0, "napi direct next starts lazy stream");
+assert(streamStartCount() === 1, "napi first next starts exactly once");
+await lazy.cancel();
+
+resetStreamStartCount();
+const idle = countEvents(1);
+await idle.cancel();
+assert(streamStartCount() === 0, "napi idle cancel must not start native work");
 
 const values: number[] = [];
 for await (const event of countEvents(3)) {
@@ -217,7 +229,8 @@ try {
   }
 } catch (error) {
   threw = true;
-  assert(error instanceof UniffiError, "napi stream error should be UniffiError");
+  assert(error instanceof StreamError && error instanceof UniffiError, "napi stream error should retain its typed class");
+  assert((error as StreamError).variant === "Boom" && (error as StreamError).data === "Boom", "napi stream error should retain variant and payload");
   assert(/boom|Boom|StreamError/i.test((error as Error).message), `napi stream error message ${(error as Error).message}`);
 }
 assert(errorValues === 7, `napi stream error first value ${errorValues}`);
@@ -1048,8 +1061,8 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 // Simulate the renderer global before importing the electron entry.
 (globalThis as any).window = globalThis as any;
-const electronApi = await import("./electron/renderer.ts");
 require("./electron/preload.cjs");
+const electronApi = await import("./electron/renderer.ts");
 
 const provider = {
     getValue() {

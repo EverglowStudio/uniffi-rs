@@ -6,8 +6,8 @@
 //!
 //! The public wasm path is committed to wasm-bindgen: the generated
 //! `<crate_name>.rs` shim uses `#[wasm_bindgen]`, and `backend-wasm.ts`
-//! consumes the **JS glue module** produced by the `wasm-bindgen` CLI
-//! (e.g. `wasm-bindgen --target nodejs` or `--target web`). It does
+//! consumes the **JS glue module** produced by wasm-bindgen (for example by
+//! the in-process `wasm-bindgen-cli-support` API used by the test suite). It does
 //! **not** load raw `.wasm` bytes — raw exports can't carry async,
 //! bigint lowering or JsError, which wasm-bindgen handles for us.
 //!
@@ -89,8 +89,7 @@ fn render_backend(namespace: &str) -> String {
 //
 // Path A adapter for namespace `{namespace}`: consumes a wasm-bindgen
 // JS glue module directly. Raw `.wasm` bytes are intentionally NOT a
-// supported public input — only the JS glue that `wasm-bindgen` CLI
-// produces (e.g. `wasm-bindgen --target nodejs` or `--target web`).
+// supported public input — only the JS glue that wasm-bindgen produces.
 // The glue handles bigint lowering, async Promise wiring and JsError
 // marshalling for us; a raw-exports adapter could not.
 
@@ -104,12 +103,13 @@ export interface WasmBindgenGlue {{
 }}
 
 export interface WasmBackend {{
+    readonly __uniffiAbiVersion: 2;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     [method: string]: any;
 }}
 
 /** Adapt a wasm-bindgen glue module (sync value or Promise) into a
- *  contract-v1 backend object. For `--target web` glue pass `init` to
+ *  ABI-v2 backend object. For web-target glue pass `init` to
  *  forward it to the module's default export. `--target nodejs` glue
  *  auto-initialises on require, so no init is needed. */
 export async function adaptWasmBindgenGlue(
@@ -118,12 +118,7 @@ export async function adaptWasmBindgenGlue(
 ): Promise<WasmBackend> {{
     const g = await glue;
     if (typeof g.default === "function") {{
-        try {{
-            await (g.default as (i?: unknown) => Promise<unknown>)(init);
-        }} catch {{
-            // nodejs target: default is a no-op or throws when called
-            // without args; ignore and fall through — exports are ready.
-        }}
+        await (g.default as (i?: unknown) => Promise<unknown>)(init);
     }}
     // If the shim has any callback-trait lowering, it exposes a setter for
     // the JS-side dispatch / release / register thunks. Hook them into the
@@ -248,6 +243,7 @@ export async function adaptWasmBindgenGlue(
     }};
     return new Proxy({{}} as WasmBackend, {{
         get(_t, name: string) {{
+            if (name === "__uniffiAbiVersion") return 2;
             const v = (g as Record<string, unknown>)[name];
             if (typeof v !== "function") return undefined;
             const fn = v as (...args: unknown[]) => unknown;
@@ -255,8 +251,6 @@ export async function adaptWasmBindgenGlue(
         }},
     }});
 }}
-
-export const __uniffiBackendKind = "wasm" as const;
 "#
     )
 }
@@ -268,20 +262,17 @@ fn render_index(namespace: &str) -> String {
 // Browser entry for namespace `{namespace}`. Wasm is inherently async,
 // so unlike the napi entry this one requires an explicit
 // `await initBackend(glue)` once before any generated API call.
-// `glue` is the wasm-bindgen JS module produced by the `wasm-bindgen`
-// CLI — see backend-wasm.ts for details.
+// `glue` is the wasm-bindgen JS module — see backend-wasm.ts for details.
 
 import {{ __installBackend }} from "../common/runtime.ts";
 import {{
     adaptWasmBindgenGlue,
-    type WasmBackend,
     type WasmBindgenGlue,
 }} from "./backend-wasm.ts";
 export * from "../common/api.ts";
-export {{ adaptWasmBindgenGlue }} from "./backend-wasm.ts";
-export type {{ WasmBackend, WasmBindgenGlue }} from "./backend-wasm.ts";
+export type {{ WasmBindgenGlue }} from "./backend-wasm.ts";
 
-let backend: WasmBackend | null = null;
+let initialized = false;
 
 /** Install the wasm-bindgen backend. Idempotent: later calls are
  *  ignored so hot-reload loops don't double-install. */
@@ -289,13 +280,10 @@ export async function initBackend(
     glue: WasmBindgenGlue | Promise<WasmBindgenGlue>,
     init?: unknown,
 ): Promise<void> {{
-    if (backend) return;
-    backend = await adaptWasmBindgenGlue(glue, init);
+    if (initialized) return;
+    const backend = await adaptWasmBindgenGlue(glue, init);
     __installBackend(backend);
-}}
-
-export function __getWasmBackend(): WasmBackend | null {{
-    return backend;
+    initialized = true;
 }}
 "#
     )

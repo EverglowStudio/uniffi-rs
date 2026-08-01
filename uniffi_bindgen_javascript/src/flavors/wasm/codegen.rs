@@ -1213,18 +1213,18 @@ fn render_stream_function(
     .unwrap();
     writeln!(
         out,
-        "        Ok(::uniffi::UniFfiStreamStep::Item(value)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::FALSE);\n            let __value = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"value\"), &__value);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
+        "        Ok(::uniffi::UniFfiStreamStep::Item(value)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"kind\"), &JsValue::from_str(\"item\"));\n            let __value = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"value\"), &__value);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
         stream_value_lift_expr(&item_info, item_type, "value")
     )
     .unwrap();
     writeln!(
         out,
-        "        Ok(::uniffi::UniFfiStreamStep::Done) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::TRUE);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}"
+        "        Ok(::uniffi::UniFfiStreamStep::Done) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"kind\"), &JsValue::from_str(\"done\"));\n            Ok::<JsValue, JsError>(__obj.into())\n        }}"
     )
     .unwrap();
     writeln!(
         out,
-        "        Ok(::uniffi::UniFfiStreamStep::Error(error)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::FALSE);\n            let __error = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"error\"), &__error);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
+        "        Ok(::uniffi::UniFfiStreamStep::Error(error)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"kind\"), &JsValue::from_str(\"error\"));\n            let __error = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"error\"), &__error);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
         stream_value_lift_expr(&classify(error_type, crate_ident), error_type, "error")
     )
     .unwrap();
@@ -1966,12 +1966,14 @@ fn input_stream_payload_unsupported_reason(info: &Lowering) -> Option<String> {
 /// Emit a `__lower_<snake>` and `__lift_<snake>` helper for each record
 /// and enum. These translate between `JsValue` and downstream core types
 /// via `js_sys::Reflect` / `js_sys::Array` only. Error enum helpers are
-/// needed when a callback-trait method declares `[Throws=...]`.
+/// also needed when a callback-trait method, input stream, or output stream
+/// crosses the Wasm bridge with a typed error payload.
 fn emit_value_helpers(out: &mut String, ci: &ComponentInterface, crate_ident: &str) {
     let records = ci.record_definitions();
     let enums = ci.enum_definitions();
     let callback_error_enums = crate::callback_metadata::callback_error_enum_names(ci);
     let input_stream_enum_helpers = input_stream_enum_helper_names(ci);
+    let output_stream_enum_helpers = output_stream_enum_helper_names(ci);
     if records.is_empty() && enums.is_empty() {
         return;
     }
@@ -1987,12 +1989,24 @@ fn emit_value_helpers(out: &mut String, ci: &ComponentInterface, crate_ident: &s
         if ci.is_name_used_as_error(e.name())
             && !callback_error_enums.contains(e.name())
             && !input_stream_enum_helpers.contains_key(e.name())
+            && !output_stream_enum_helpers.contains_key(e.name())
         {
             continue;
         }
         emit_enum_helpers(out, e, crate_ident);
     }
     writeln!(out).unwrap();
+}
+
+fn output_stream_enum_helper_names(ci: &ComponentInterface) -> BTreeMap<String, ()> {
+    let mut out = BTreeMap::new();
+    for function in ci.function_definitions() {
+        let Some(Type::Stream { error_type, .. }) = function.return_type() else {
+            continue;
+        };
+        collect_lowered_enum_names(error_type, &mut out);
+    }
+    out
 }
 
 fn input_stream_enum_helper_names(ci: &ComponentInterface) -> BTreeMap<String, ()> {

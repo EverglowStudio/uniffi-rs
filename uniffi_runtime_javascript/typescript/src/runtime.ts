@@ -7,10 +7,10 @@
 // safety net, minimal numeric normalisation, and the callback registry
 // used to forward `Logger`-style foreign traits into the native backend.
 //
-// Contract version is bumped whenever the shape any flavor adapter relies
-// on changes in a breaking way.
-
-export const UNIFFI_JS_CONTRACT_VERSION = 1;
+// This is deliberately private to the generated runtime.  Flavor adapters
+// may be distributed independently from the high-level API, so installation
+// verifies their exact ABI rather than silently accepting an older backend.
+const __UNIFFI_JS_ABI_VERSION = 2;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -88,16 +88,31 @@ function wrapError(raw: unknown): UniffiError {
 // ---------------------------------------------------------------------------
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type UniffiBackend = any;
+type UniffiBackend = any;
 
 let __uniffiBackend: UniffiBackend = null;
 
 export function __installBackend(backend: UniffiBackend): void {
+    let actualVersion: unknown;
+    try {
+        actualVersion =
+            backend !== null && backend !== undefined
+                ? backend.__uniffiAbiVersion
+                : undefined;
+    } catch {
+        actualVersion = undefined;
+    }
+    if (actualVersion !== __UNIFFI_JS_ABI_VERSION) {
+        throw new UniffiError({
+            errorName: "UniffiAbiMismatch",
+            data: {
+                expected: __UNIFFI_JS_ABI_VERSION,
+                actual: actualVersion,
+            },
+            message: `incompatible UniFFI JavaScript backend ABI: expected ${__UNIFFI_JS_ABI_VERSION}, got ${String(actualVersion)}`,
+        });
+    }
     __uniffiBackend = backend;
-}
-
-export function __getBackend(): UniffiBackend {
-    return __uniffiBackend;
 }
 
 function requireBackend(fn: string): UniffiBackend {
@@ -132,195 +147,344 @@ export async function __callAsync<T>(fn: string, ...args: unknown[]): Promise<T>
 // Native stream wrapper
 // ---------------------------------------------------------------------------
 
-/**
- * Binding-internal result of one native output-stream pull.
- *
- * `done` is the sole completion discriminator. In particular, an item value
- * may be `null` when Rust yields `Some(None)` from `Stream<Option<T>>`.
- */
-export type UniffiStreamNext<T> =
-    | { done: false; value: T }
-    | { done: true; value?: undefined };
+/** The public, single-consumer output-stream API. */
+export interface UniFfiStream<T> extends AsyncIterable<T> {
+    next(): Promise<IteratorResult<T>>;
+    cancel(): Promise<void>;
+}
 
-export interface UniffiAsyncIterableOptions<T> {
-    handle: unknown;
-    next: (handle: unknown) => Promise<UniffiStreamNext<T>>;
+// This is intentionally binding-internal.  Output bridges must use a tagged
+// union; neither nullable values nor IteratorResult-style `done` envelopes are
+// accepted at the native boundary.
+type RawStreamStep<T, E> =
+    | { kind: "item"; value: T }
+    | { kind: "done" }
+    | { kind: "error"; error: E };
+
+interface UniFfiStreamOptions<T, E> {
+    start: () => unknown;
+    next: (handle: unknown) => Promise<RawStreamStep<T, E>>;
     cancel: (handle: unknown) => void | Promise<void>;
 }
 
-type UniffiStreamLifetimeState = {
-    consumed: boolean;
-    closed: boolean;
-    pending: boolean;
+type UniffiStreamState =
+    | "idle"
+    | "starting"
+    | "active"
+    | "done"
+    | "failed"
+    | "cancelled";
+
+type UniffiStreamCleanupState = {
     cancelStarted: boolean;
 };
 
 type UniffiStreamFinalizerPayload = {
     handle: unknown;
     cancel: (handle: unknown) => void | Promise<void>;
-    state: UniffiStreamLifetimeState;
+    cleanup: UniffiStreamCleanupState;
 };
 
-// The finalizer intentionally receives only the native cleanup data and the
-// one-shot state. In particular, it must not retain the iterable/iterator
-// lifetime owner, or that owner could never become collectible.
+// The payload has no reference to the stream or iterator.  A finalizer is a
+// best-effort fallback only and must never retain the object it is meant to
+// observe, throw synchronously, or leave a rejected cleanup Promise behind.
 const STREAM_FINALIZERS = new FinalizationRegistry<UniffiStreamFinalizerPayload>(
     (payload) => {
-        if (payload.state.cancelStarted) return;
-        payload.state.cancelStarted = true;
-        payload.state.closed = true;
+        if (payload.cleanup.cancelStarted) return;
+        payload.cleanup.cancelStarted = true;
         try {
-            // Never let a finalizer throw or leave a rejected cleanup promise
-            // unobserved: finalization is best-effort only.
             void Promise.resolve(payload.cancel(payload.handle)).catch(() => {});
         } catch {
-            // Ignore synchronous cleanup failures for the same reason.
+            // Finalization cannot report failures to an application.
         }
     },
 );
 
+function streamProtocolError(message: string): UniffiError {
+    return new UniffiError({
+        errorName: "UniffiStreamProtocolError",
+        message,
+    });
+}
+
+function streamConsumedError(): UniffiError {
+    return new UniffiError({
+        errorName: "UniffiStreamConsumed",
+        message: "a UniFFI output stream can only have one consumer",
+    });
+}
+
+function streamConcurrentNextError(): UniffiError {
+    return new UniffiError({
+        errorName: "UniffiStreamConcurrentNext",
+        message: "concurrent next() on a UniFFI output stream is not supported",
+    });
+}
+
+function terminalStreamResult<T>(): IteratorResult<T> {
+    return { done: true, value: undefined as T };
+}
+
+function hasOwn(object: object, key: string): boolean {
+    return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function hasOnlyStreamKeys(object: object, allowed: readonly string[]): boolean {
+    return Object.keys(object).every((key) => allowed.includes(key));
+}
+
+function validateRawStreamStep<T, E>(raw: unknown): RawStreamStep<T, E> {
+    if (raw === null || typeof raw !== "object" || !hasOwn(raw, "kind")) {
+        throw streamProtocolError(
+            "uniffi stream next returned an invalid tagged step",
+        );
+    }
+    const step = raw as Record<string, unknown>;
+    switch (step.kind) {
+        case "item":
+            if (
+                !hasOwn(step, "value") ||
+                hasOwn(step, "error") ||
+                !hasOnlyStreamKeys(step, ["kind", "value"])
+            ) {
+                throw streamProtocolError(
+                    "uniffi stream Item step must contain only kind and value",
+                );
+            }
+            return { kind: "item", value: step.value as T };
+        case "done":
+            if (!hasOnlyStreamKeys(step, ["kind"])) {
+                throw streamProtocolError(
+                    "uniffi stream Done step must contain only kind",
+                );
+            }
+            return { kind: "done" };
+        case "error":
+            if (
+                !hasOwn(step, "error") ||
+                hasOwn(step, "value") ||
+                !hasOnlyStreamKeys(step, ["kind", "error"])
+            ) {
+                throw streamProtocolError(
+                    "uniffi stream Error step must contain only kind and error",
+                );
+            }
+            return { kind: "error", error: step.error as E };
+        default:
+            throw streamProtocolError(
+                "uniffi stream next returned an unknown tagged step kind",
+            );
+    }
+}
+
 /**
- * Wraps UniFFI's low-level stream handle ABI as a single-consumer
- * AsyncIterable. The Rust side is pull-based (`next(handle)`) and
- * cancellation-based (`cancel(handle)`), so the JS wrapper keeps the
- * ownership rules explicit:
- *
- * - The iterable can be consumed once.
- * - `next()` calls must not overlap.
- * - `return()` / `break` cancels exactly once.
- * - A stream error rejects `next()` and closes the iterator.
+ * Binding-internal factory for a lazy, pull-based output stream.  `start` is
+ * deliberately a closure: constructing the public stream never allocates a
+ * native handle, and only the first consumer pull starts one.
  */
-export function createUniffiAsyncIterable<T>(
-    options: UniffiAsyncIterableOptions<T>,
-): AsyncIterable<T> {
-    // This owner is deliberately independent from the finalizer payload. Both
-    // the iterable and the iterator close over it, so collecting an iterable
-    // cannot cancel a still-active iterator.
-    const state: UniffiStreamLifetimeState = {
-        consumed: false,
-        closed: false,
-        pending: false,
-        cancelStarted: false,
-    };
-    const lifetime = {
-        handle: options.handle,
-        next: options.next,
-        cancel: options.cancel,
-        finalizerToken: {},
-    };
-    const finalizerPayload: UniffiStreamFinalizerPayload = {
-        handle: lifetime.handle,
-        cancel: lifetime.cancel,
-        state,
-    };
+export function createUniFfiStream<T, E>(
+    options: UniFfiStreamOptions<T, E>,
+): UniFfiStream<T> {
+    let state: UniffiStreamState = "idle";
+    let handle: unknown;
+    let pending = false;
+    let consumer: "direct" | "iterator" | null = null;
+    let finalizerRegistered = false;
+    const cleanup: UniffiStreamCleanupState = { cancelStarted: false };
+    const finalizerToken = {};
+
+    // Native callbacks can synchronously re-enter this stream (and async
+    // callbacks can change it while a pull is awaiting). Reading through a
+    // function deliberately preserves the full state union for TypeScript's
+    // control-flow analysis instead of treating a transition as immutable.
+    const currentState = (): UniffiStreamState => state;
 
     const unregisterFinalizer = (): void => {
-        STREAM_FINALIZERS.unregister(lifetime.finalizerToken);
+        if (!finalizerRegistered) return;
+        STREAM_FINALIZERS.unregister(finalizerToken);
+        finalizerRegistered = false;
     };
 
-    const closeWithoutCancel = (): void => {
-        state.closed = true;
+    const registerFinalizer = (owner: object): void => {
+        if (finalizerRegistered || state !== "active") return;
+        STREAM_FINALIZERS.register(
+            owner,
+            { handle, cancel: options.cancel, cleanup },
+            finalizerToken,
+        );
+        finalizerRegistered = true;
+    };
+
+    const finishWithoutCancel = (terminal: "done" | "failed"): void => {
+        state = terminal;
+        handle = undefined;
         unregisterFinalizer();
     };
 
-    const closeWithCancel = async (): Promise<void> => {
-        // A stream that already reached normal Done has no native work left to
-        // cancel. Keep this terminal path cancellation-free as well.
-        if (state.closed) {
-            unregisterFinalizer();
-            return;
-        }
-        state.closed = true;
+    const finishActiveWithCancel = async (
+        terminal: "failed" | "cancelled",
+    ): Promise<void> => {
+        if (state !== "active") return;
+        const activeHandle = handle;
+        state = terminal;
+        handle = undefined;
         unregisterFinalizer();
-        if (state.cancelStarted) return;
-        state.cancelStarted = true;
-        await lifetime.cancel(lifetime.handle);
+        if (cleanup.cancelStarted) return;
+        cleanup.cancelStarted = true;
+        await options.cancel(activeHandle);
     };
 
-    const iterable: AsyncIterable<T> = {
-        [Symbol.asyncIterator](): AsyncIterator<T> {
-            if (state.consumed) {
-                throw new UniffiError({
-                    errorName: "UniffiStreamConsumed",
-                    message:
-                        "uniffi stream AsyncIterable can only be consumed once",
-                });
+    const failActive = async (raw: unknown): Promise<never> => {
+        const error = wrapError(raw);
+        if (state === "active") {
+            try {
+                await finishActiveWithCancel("failed");
+            } catch {
+                // Preserve the original transport/protocol/business error.
             }
-            state.consumed = true;
-            // Once the iterator exists it, rather than the iterable, owns the
-            // finalizer registration. The iterator still strongly retains the
-            // shared lifetime state through its methods.
-            unregisterFinalizer();
-            const iterator: AsyncIterator<T> = {
-                async next(): Promise<IteratorResult<T>> {
-                    if (state.closed) return { done: true, value: undefined };
-                    if (state.pending) {
-                        throw new UniffiError({
-                            errorName: "UniffiStreamConcurrentNext",
-                            message:
-                                "concurrent next() on a uniffi stream is not supported",
-                        });
-                    }
-                    state.pending = true;
-                    try {
-                        const result = await lifetime.next(lifetime.handle);
-                        if (
-                            result === null ||
-                            typeof result !== "object" ||
-                            typeof result.done !== "boolean" ||
-                            (!result.done &&
-                                !Object.prototype.hasOwnProperty.call(
-                                    result,
-                                    "value",
-                                ))
-                        ) {
-                            throw new UniffiError({
-                                errorName: "UniffiStreamProtocolError",
-                                message:
-                                    "uniffi stream next returned an invalid result envelope",
-                            });
-                        }
-                        // A concurrent return()/throw() may cancel a pending native pull.
-                        // Never surface a late item after that terminal transition.
-                        if (state.closed || result.done) {
-                            closeWithoutCancel();
-                            return { done: true, value: undefined };
-                        }
-                        return { done: false, value: result.value };
-                    } catch (raw) {
-                        // Native error paths must close the registry entry. Cancellation is
-                        // best-effort here so a cleanup failure cannot replace the stream error
-                        // or become an unhandled rejection.
-                        void closeWithCancel().catch(() => {});
-                        throw wrapError(raw);
-                    } finally {
-                        state.pending = false;
-                    }
-                },
+        } else if (state === "starting" || state === "idle") {
+            finishWithoutCancel("failed");
+        }
+        throw error;
+    };
+
+    const ensureActive = async (owner: object): Promise<unknown | null> => {
+        if (state === "active") return handle;
+        if (state !== "idle") return null;
+
+        // Publish the starting state before invoking user/native code.  A
+        // re-entrant next() therefore observes a pending pull instead of
+        // running start twice.
+        state = "starting";
+        let startedHandle: unknown;
+        try {
+            startedHandle = options.start();
+        } catch (raw) {
+            if (currentState() !== "cancelled") finishWithoutCancel("failed");
+            throw wrapError(raw);
+        }
+
+        // A synchronous/re-entrant cancel may have closed the stream while
+        // start was executing.  The handle now exists, so clean it up once,
+        // but do not register a finalizer for this already-terminal stream.
+        if (currentState() === "cancelled") {
+            handle = startedHandle;
+            if (!cleanup.cancelStarted) {
+                cleanup.cancelStarted = true;
+                try {
+                    await options.cancel(startedHandle);
+                } catch {
+                    // The initiating cancellation was necessarily best-effort
+                    // here because it happened before a handle existed.
+                }
+            }
+            handle = undefined;
+            return null;
+        }
+
+        handle = startedHandle;
+        state = "active";
+        registerFinalizer(owner);
+        return startedHandle;
+    };
+
+    const pull = async (owner: object): Promise<IteratorResult<T>> => {
+        if (
+            state === "done" ||
+            state === "failed" ||
+            state === "cancelled"
+        ) {
+            return terminalStreamResult<T>();
+        }
+        if (pending) throw streamConcurrentNextError();
+        pending = true;
+        try {
+            const activeHandle = await ensureActive(owner);
+            if (activeHandle === null || currentState() !== "active") {
+                return terminalStreamResult<T>();
+            }
+            const raw = await options.next(activeHandle);
+
+            // return()/throw()/cancel() may have won while the native pull was
+            // pending.  A late item/error must never revive a terminal stream.
+            if (currentState() !== "active") return terminalStreamResult<T>();
+
+            const step = validateRawStreamStep<T, E>(raw);
+            if (step.kind === "item") {
+                return { done: false, value: step.value };
+            }
+            if (step.kind === "done") {
+                finishWithoutCancel("done");
+                return terminalStreamResult<T>();
+            }
+            return await failActive(step.error);
+        } catch (raw) {
+            const terminalState = currentState();
+            if (terminalState === "cancelled" || terminalState === "done") {
+                return terminalStreamResult<T>();
+            }
+            // Error steps are deliberately routed through `failActive` above.
+            // It throws the original (possibly typed) error after cleanup, so
+            // do not run the terminal transition a second time here.
+            if (terminalState === "failed") {
+                throw wrapError(raw);
+            }
+            return await failActive(raw);
+        } finally {
+            pending = false;
+        }
+    };
+
+    const stream: UniFfiStream<T> = {
+        next(): Promise<IteratorResult<T>> {
+            if (consumer === null) consumer = "direct";
+            if (consumer !== "direct") {
+                return Promise.reject(streamConsumedError());
+            }
+            return pull(stream);
+        },
+        async cancel(): Promise<void> {
+            if (state === "idle" || state === "starting") {
+                // There is no active native handle in idle/starting state.
+                // Starting is only observable through synchronous re-entry;
+                // ensureActive performs the deferred cleanup if start wins.
+                state = "cancelled";
+                return;
+            }
+            if (state !== "active") return;
+            await finishActiveWithCancel("cancelled");
+        },
+        [Symbol.asyncIterator](): AsyncIterator<T> {
+            if (consumer !== null) throw streamConsumedError();
+            let iterator: AsyncIterator<T> & AsyncIterable<T>;
+            iterator = {
+                next: (): Promise<IteratorResult<T>> => pull(iterator),
                 async return(): Promise<IteratorResult<T>> {
-                    await closeWithCancel();
-                    return { done: true, value: undefined };
+                    try {
+                        await stream.cancel();
+                    } catch {
+                        // Iterator return is best-effort cleanup.  `break`
+                        // must still complete with the standard terminal value.
+                    }
+                    return terminalStreamResult<T>();
                 },
                 async throw(error?: unknown): Promise<IteratorResult<T>> {
                     try {
-                        await closeWithCancel();
+                        await stream.cancel();
                     } catch {
-                        // AsyncIterator.throw() must reject with the caller-supplied error,
-                        // even if best-effort native cleanup fails.
+                        // The caller's error remains authoritative.
                     }
                     throw error;
                 },
+                [Symbol.asyncIterator](): AsyncIterator<T> {
+                    return iterator;
+                },
             };
-            STREAM_FINALIZERS.register(
-                iterator,
-                finalizerPayload,
-                lifetime.finalizerToken,
-            );
+            consumer = "iterator";
             return iterator;
         },
     };
-    STREAM_FINALIZERS.register(iterable, finalizerPayload, lifetime.finalizerToken);
-    return iterable;
+    return stream;
 }
 
 // ---------------------------------------------------------------------------

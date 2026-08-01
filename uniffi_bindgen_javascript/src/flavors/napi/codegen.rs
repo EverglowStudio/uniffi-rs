@@ -38,22 +38,23 @@ impl NapiTarget {
     fn imports(self) -> TokenStream {
         match self {
             Self::Node => quote! {
-                #[allow(unused_imports)]
-                use napi::bindgen_prelude::*;
-                #[allow(unused_imports)]
-                use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
                 use napi_derive::napi;
+                use napi::bindgen_prelude::JsObjectValue as _;
+                // napi-derive recognizes only the exact `Env` spelling as an
+                // injected argument, so this is intentionally the sole
+                // non-qualified N-API type name in generated bridge code.
+                use napi::Env;
             },
             Self::Ohos => quote! {
                 // Keep internal renderer paths uniform while binding them directly
                 // to the NAPI-OHOS runtime for this target.
                 #[allow(unused_imports)]
                 extern crate napi_ohos as napi;
-                #[allow(unused_imports)]
-                use napi::bindgen_prelude::*;
-                #[allow(unused_imports)]
-                use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
                 use napi_derive_ohos::napi;
+                use napi::bindgen_prelude::JsObjectValue as _;
+                // napi-derive-ohos recognizes only the exact `Env` spelling
+                // as an injected argument.
+                use napi::Env;
             },
         }
     }
@@ -145,13 +146,21 @@ impl<'a> Generator<'a> {
         let input_stream_helpers = self.render_input_stream_helpers(&input_stream_descriptors)?;
         let stream_helpers = if self.has_stream_functions() {
             quote! {
-                fn __uniffi_stream_handle_from_bigint(handle: BigInt) -> Result<::uniffi::Handle> {
+                fn __uniffi_stream_handle_from_bigint(
+                    handle: napi::bindgen_prelude::BigInt,
+                ) -> napi::bindgen_prelude::Result<::uniffi::Handle> {
                     let (sign, value, lossless) = handle.get_u64();
                     if sign && value != 0 {
-                        return Err(Error::new(Status::InvalidArg, "negative stream handle"));
+                        return Err(napi::bindgen_prelude::Error::new(
+                            napi::bindgen_prelude::Status::InvalidArg,
+                            "negative stream handle",
+                        ));
                     }
                     if !lossless || value == 0 {
-                        return Err(Error::new(Status::InvalidArg, "invalid stream handle"));
+                        return Err(napi::bindgen_prelude::Error::new(
+                            napi::bindgen_prelude::Status::InvalidArg,
+                            "invalid stream handle",
+                        ));
                     }
                     Ok(::uniffi::Handle::from_raw_unchecked(value))
                 }
@@ -163,8 +172,11 @@ impl<'a> Generator<'a> {
         Ok(quote! {
             #imports
 
-            fn into_napi_error<E: std::fmt::Display>(err: E) -> Error {
-                Error::new(Status::GenericFailure, err.to_string())
+            fn into_napi_error<E: std::fmt::Display>(err: E) -> napi::bindgen_prelude::Error {
+                napi::bindgen_prelude::Error::new(
+                    napi::bindgen_prelude::Status::GenericFailure,
+                    err.to_string(),
+                )
             }
 
             #stream_helpers
@@ -180,44 +192,44 @@ impl<'a> Generator<'a> {
                 pub id: u32,
             }
 
-            impl TypeName for __UniffiTimestamp {
+            impl napi::bindgen_prelude::TypeName for __UniffiTimestamp {
                 fn type_name() -> &'static str {
                     "Date"
                 }
 
-                fn value_type() -> ValueType {
-                    ValueType::Object
+                fn value_type() -> napi::ValueType {
+                    napi::ValueType::Object
                 }
             }
 
-            impl ValidateNapiValue for __UniffiTimestamp {}
+            impl napi::bindgen_prelude::ValidateNapiValue for __UniffiTimestamp {}
 
-            impl FromNapiValue for __UniffiTimestamp {
-                unsafe fn from_napi_value(env: napi::sys::napi_env, napi_val: napi::sys::napi_value) -> Result<Self> {
+            impl napi::bindgen_prelude::FromNapiValue for __UniffiTimestamp {
+                unsafe fn from_napi_value(env: napi::sys::napi_env, napi_val: napi::sys::napi_value) -> napi::bindgen_prelude::Result<Self> {
                     let mut ms = 0.0;
                     napi::check_status!(unsafe { napi::sys::napi_get_date_value(env, napi_val, &mut ms) })?;
                     if !ms.is_finite() {
-                        return Err(Error::new(Status::InvalidArg, "invalid Date"));
+                        return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "invalid Date"));
                     }
                     if ms.abs() > 8.64e15 {
-                        return Err(Error::new(Status::InvalidArg, "timestamp exceeds JS Date range"));
+                        return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "timestamp exceeds JS Date range"));
                     }
                     let ms_i = ms.trunc() as i64;
                     let ts = if ms_i >= 0 {
                         ::std::time::UNIX_EPOCH
                             .checked_add(::std::time::Duration::from_millis(ms_i as u64))
-                            .ok_or_else(|| Error::new(Status::InvalidArg, "timestamp overflow"))?
+                            .ok_or_else(|| napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "timestamp overflow"))?
                     } else {
                         ::std::time::UNIX_EPOCH
                             .checked_sub(::std::time::Duration::from_millis((-ms_i) as u64))
-                            .ok_or_else(|| Error::new(Status::InvalidArg, "timestamp overflow"))?
+                            .ok_or_else(|| napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "timestamp overflow"))?
                     };
                     Ok(Self(ts))
                 }
             }
 
-            impl ToNapiValue for __UniffiTimestamp {
-                unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+            impl napi::bindgen_prelude::ToNapiValue for __UniffiTimestamp {
+                unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> napi::bindgen_prelude::Result<napi::sys::napi_value> {
                     let ms = match val.0.duration_since(::std::time::UNIX_EPOCH) {
                         Ok(delta) => (delta.as_secs() as f64) * 1000.0 + (delta.subsec_nanos() as f64) / 1_000_000.0,
                         Err(err) => {
@@ -226,7 +238,7 @@ impl<'a> Generator<'a> {
                         }
                     };
                     if !ms.is_finite() || ms.abs() > 8.64e15 {
-                        return Err(Error::new(Status::InvalidArg, "timestamp exceeds JS Date range"));
+                        return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "timestamp exceeds JS Date range"));
                     }
                     let mut js_value = std::ptr::null_mut();
                     napi::check_status!(unsafe { napi::sys::napi_create_date(env, ms, &mut js_value) })?;
@@ -234,30 +246,30 @@ impl<'a> Generator<'a> {
                 }
             }
 
-            impl TypeName for __UniffiDuration {
+            impl napi::bindgen_prelude::TypeName for __UniffiDuration {
                 fn type_name() -> &'static str {
                     "number"
                 }
 
-                fn value_type() -> ValueType {
-                    ValueType::Number
+                fn value_type() -> napi::ValueType {
+                    napi::ValueType::Number
                 }
             }
 
-            impl ValidateNapiValue for __UniffiDuration {}
+            impl napi::bindgen_prelude::ValidateNapiValue for __UniffiDuration {}
 
-            impl FromNapiValue for __UniffiDuration {
-                unsafe fn from_napi_value(env: napi::sys::napi_env, napi_val: napi::sys::napi_value) -> Result<Self> {
-                    let ms = f64::from_napi_value(env, napi_val)?;
+            impl napi::bindgen_prelude::FromNapiValue for __UniffiDuration {
+                unsafe fn from_napi_value(env: napi::sys::napi_env, napi_val: napi::sys::napi_value) -> napi::bindgen_prelude::Result<Self> {
+                    let ms = <f64 as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, napi_val)?;
                     if !ms.is_finite() {
-                        return Err(Error::new(Status::InvalidArg, "duration must be finite"));
+                        return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "duration must be finite"));
                     }
                     if ms < 0.0 {
-                        return Err(Error::new(Status::InvalidArg, "duration must be non-negative"));
+                        return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "duration must be non-negative"));
                     }
                     let secs_f = (ms / 1000.0).trunc();
                     if secs_f > u64::MAX as f64 {
-                        return Err(Error::new(Status::InvalidArg, "duration exceeds Rust range"));
+                        return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "duration exceeds Rust range"));
                     }
                     let mut secs = secs_f as u64;
                     let mut nanos = ((ms % 1000.0) * 1_000_000.0).round() as u32;
@@ -265,19 +277,19 @@ impl<'a> Generator<'a> {
                         nanos = 0;
                         secs = secs
                             .checked_add(1)
-                            .ok_or_else(|| Error::new(Status::InvalidArg, "duration exceeds Rust range"))?;
+                            .ok_or_else(|| napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "duration exceeds Rust range"))?;
                     }
                     Ok(Self(::std::time::Duration::new(secs, nanos)))
                 }
             }
 
-            impl ToNapiValue for __UniffiDuration {
-                unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+            impl napi::bindgen_prelude::ToNapiValue for __UniffiDuration {
+                unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> napi::bindgen_prelude::Result<napi::sys::napi_value> {
                     let ms = (val.0.as_secs() as f64) * 1000.0 + (val.0.subsec_nanos() as f64) / 1_000_000.0;
                     if !ms.is_finite() || ms > 9_007_199_254_740_991.0 {
-                        return Err(Error::new(Status::InvalidArg, "duration exceeds JS number range"));
+                        return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "duration exceeds JS number range"));
                     }
-                    f64::to_napi_value(env, ms)
+                    <f64 as napi::bindgen_prelude::ToNapiValue>::to_napi_value(env, ms)
                 }
             }
 
@@ -302,64 +314,64 @@ impl<'a> Generator<'a> {
             .map(|descriptor| self.render_typed_input_stream_helper(descriptor))
             .collect::<Result<Vec<_>>>()?;
         Ok(quote! {
-            pub struct __UniffiInputStream<NextResult: 'static + FromNapiValue> {
+            pub struct __UniffiInputStream<NextResult: 'static + napi::bindgen_prelude::FromNapiValue> {
                 handle: u32,
                 next: std::sync::Arc<
-                    ThreadsafeFunction<
+                    napi::threadsafe_function::ThreadsafeFunction<
                         u32,
                         napi::bindgen_prelude::Promise<NextResult>,
                     >,
                 >,
-                cancel: std::sync::Arc<ThreadsafeFunction<u32>>,
+                cancel: std::sync::Arc<napi::threadsafe_function::ThreadsafeFunction<u32>>,
             }
 
-            impl<NextResult: 'static + FromNapiValue> TypeName for __UniffiInputStream<NextResult> {
+            impl<NextResult: 'static + napi::bindgen_prelude::FromNapiValue> napi::bindgen_prelude::TypeName for __UniffiInputStream<NextResult> {
                 fn type_name() -> &'static str {
                     "UniFfiInputStream"
                 }
 
-                fn value_type() -> ValueType {
-                    ValueType::Object
+                fn value_type() -> napi::ValueType {
+                    napi::ValueType::Object
                 }
             }
 
-            impl<NextResult: 'static + FromNapiValue> ValidateNapiValue
+            impl<NextResult: 'static + napi::bindgen_prelude::FromNapiValue> napi::bindgen_prelude::ValidateNapiValue
                 for __UniffiInputStream<NextResult>
             {
             }
 
-            impl<NextResult: 'static + FromNapiValue> FromNapiValue
+            impl<NextResult: 'static + napi::bindgen_prelude::FromNapiValue> napi::bindgen_prelude::FromNapiValue
                 for __UniffiInputStream<NextResult>
             where
-                ThreadsafeFunction<
+                napi::threadsafe_function::ThreadsafeFunction<
                     u32,
                     napi::bindgen_prelude::Promise<NextResult>,
-                >: FromNapiValue,
-                ThreadsafeFunction<u32>: FromNapiValue,
+                >: napi::bindgen_prelude::FromNapiValue,
+                napi::threadsafe_function::ThreadsafeFunction<u32>: napi::bindgen_prelude::FromNapiValue,
             {
                 unsafe fn from_napi_value(
                     env: napi::bindgen_prelude::sys::napi_env,
                     napi_val: napi::bindgen_prelude::sys::napi_value,
-                ) -> Result<Self> {
+                ) -> napi::bindgen_prelude::Result<Self> {
                     let mut __scope = std::ptr::null_mut();
                     napi::check_status!(
                         unsafe { napi::bindgen_prelude::sys::napi_open_handle_scope(env, &mut __scope) },
                         "Failed to open input stream wrapper handle scope"
                     )?;
-                    let __result = (|| -> Result<Self> {
-                        let obj = napi::bindgen_prelude::Object::from_napi_value(env, napi_val)?;
+                    let __result = (|| -> napi::bindgen_prelude::Result<Self> {
+                        let obj = <napi::bindgen_prelude::Object as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, napi_val)?;
                         Ok(Self {
                             handle: obj.get_named_property_unchecked::<u32>("handle")?,
                             next: std::sync::Arc::new(
                                 obj.get_named_property_unchecked::<
-                                    ThreadsafeFunction<
+                                    napi::threadsafe_function::ThreadsafeFunction<
                                         u32,
                                         napi::bindgen_prelude::Promise<NextResult>,
                                     >,
                                 >("next")?,
                             ),
                             cancel: std::sync::Arc::new(
-                                obj.get_named_property_unchecked::<ThreadsafeFunction<u32>>(
+                                obj.get_named_property_unchecked::<napi::threadsafe_function::ThreadsafeFunction<u32>>(
                                     "cancel",
                                 )?,
                             ),
@@ -405,12 +417,12 @@ impl<'a> Generator<'a> {
 
             struct #ops_ident {
                 next: std::sync::Arc<
-                    ThreadsafeFunction<
+                    napi::threadsafe_function::ThreadsafeFunction<
                         u32,
                         napi::bindgen_prelude::Promise<#next_ident>,
                     >,
                 >,
-                cancel: std::sync::Arc<ThreadsafeFunction<u32>>,
+                cancel: std::sync::Arc<napi::threadsafe_function::ThreadsafeFunction<u32>>,
                 _phantom: std::marker::PhantomData<fn() -> (#item_core_ty, #error_core_ty)>,
             }
 
@@ -452,7 +464,7 @@ impl<'a> Generator<'a> {
                     });
                     let _ = self
                         .cancel
-                        .call(Ok(handle), ThreadsafeFunctionCallMode::NonBlocking);
+                        .call(Ok(handle), napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking);
                 }
             }
         })
@@ -1023,16 +1035,16 @@ impl<'a> Generator<'a> {
             if method.throws_type().is_some() {
                 let result_ty = self.callback_result_ident(object, method);
                 Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
+                    napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
                 })
             } else if let Some(return_type) = method.return_type() {
                 let bridge_return_ty = self.callback_async_bridge_type(return_type)?;
                 Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
+                    napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
                 })
             } else {
                 Ok(quote! {
-                    ThreadsafeFunction<
+                    napi::threadsafe_function::ThreadsafeFunction<
                         #tsfn_args,
                         napi::bindgen_prelude::Promise<()>,
                     >
@@ -1041,16 +1053,16 @@ impl<'a> Generator<'a> {
         } else if method.throws_type().is_some() {
             let result_ty = self.callback_result_ident(object, method);
             Ok(quote! {
-                FunctionRef<#tsfn_args, #result_ty>
+                napi::bindgen_prelude::FunctionRef<#tsfn_args, #result_ty>
             })
         } else if let Some(return_type) = method.return_type() {
             let bridge_return_ty = self.callback_bridge_type(return_type)?;
             Ok(quote! {
-                FunctionRef<#tsfn_args, #bridge_return_ty>
+                napi::bindgen_prelude::FunctionRef<#tsfn_args, #bridge_return_ty>
             })
         } else {
             Ok(quote! {
-                ThreadsafeFunction<#tsfn_args>
+                napi::threadsafe_function::ThreadsafeFunction<#tsfn_args>
             })
         }
     }
@@ -1150,26 +1162,26 @@ impl<'a> Generator<'a> {
             if method.throws_type().is_some() {
                 let result_ty = self.callback_result_ident(object, method);
                 Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
+                    napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#result_ty>>
                 })
             } else if let Some(return_type) = method.return_type() {
                 let bridge_return_ty = self.callback_async_bridge_type(return_type)?;
                 Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
+                    napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<#bridge_return_ty>>
                 })
             } else {
                 Ok(quote! {
-                    ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<()>>
+                    napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, napi::bindgen_prelude::Promise<()>>
                 })
             }
         } else if method.throws_type().is_some() {
             let result_ty = self.callback_result_ident(object, method);
-            Ok(quote!(ThreadsafeFunction<#tsfn_args, #result_ty>))
+            Ok(quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, #result_ty>))
         } else if let Some(return_type) = method.return_type() {
             let bridge_return_ty = self.callback_bridge_type(return_type)?;
-            Ok(quote!(ThreadsafeFunction<#tsfn_args, #bridge_return_ty>))
+            Ok(quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args, #bridge_return_ty>))
         } else {
-            Ok(quote!(ThreadsafeFunction<#tsfn_args>))
+            Ok(quote!(napi::threadsafe_function::ThreadsafeFunction<#tsfn_args>))
         }
     }
 
@@ -1489,7 +1501,7 @@ impl<'a> Generator<'a> {
                         let (__sender, __receiver) = std::sync::mpsc::channel();
                         let __status = __registry.call_with_return_value(
                             Ok(#registry_call_value),
-                            ThreadsafeFunctionCallMode::NonBlocking,
+                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                             move |__result, _| {
                                 __sender.send(__result).or(Ok(()))
                             },
@@ -1530,7 +1542,7 @@ impl<'a> Generator<'a> {
                             Err(#lowered_error)
                         }
                     } else {
-                    let __env = napi::bindgen_prelude::Env::from_raw(
+                    let __env = napi::Env::from_raw(
                         self.env.unwrap_or_else(|| {
                             panic!(
                                 "callback trait `{}`.{} has no JS env",
@@ -1596,7 +1608,7 @@ impl<'a> Generator<'a> {
                             let (__sender, __receiver) = std::sync::mpsc::channel();
                             let __status = __registry.call_with_return_value(
                                 Ok(#registry_call_value),
-                                ThreadsafeFunctionCallMode::NonBlocking,
+                                napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                                 move |__result, _| {
                                     __sender.send(__result).or(Ok(()))
                                 },
@@ -1626,7 +1638,7 @@ impl<'a> Generator<'a> {
                             });
                             #lowered
                         } else {
-                        let __env = napi::bindgen_prelude::Env::from_raw(
+                        let __env = napi::Env::from_raw(
                             self.env.unwrap_or_else(|| {
                                 panic!(
                                     "callback trait `{}`.{} has no JS env",
@@ -1672,7 +1684,7 @@ impl<'a> Generator<'a> {
                                 #method_name
                             );
                         });
-                        let _ = __registry.call(Ok(#registry_call_value), ThreadsafeFunctionCallMode::NonBlocking);
+                        let _ = __registry.call(Ok(#registry_call_value), napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking);
                     } else {
                         let __callback = self.#method_ident.as_ref().unwrap_or_else(|| {
                             panic!(
@@ -1681,7 +1693,7 @@ impl<'a> Generator<'a> {
                                 #method_name
                             );
                         });
-                        let _ = __callback.call(Ok(#call_value), ThreadsafeFunctionCallMode::NonBlocking);
+                        let _ = __callback.call(Ok(#call_value), napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking);
                     }
                 }
             }),
@@ -1762,7 +1774,7 @@ impl<'a> Generator<'a> {
                         "Failed to open callback wrapper handle scope"
                     )?;
                     let __result = (|| -> napi::bindgen_prelude::Result<Self> {
-                        let obj = napi::bindgen_prelude::Object::from_napi_value(env, napi_val)?;
+                    let obj = <napi::bindgen_prelude::Object as napi::bindgen_prelude::FromNapiValue>::from_napi_value(env, napi_val)?;
                         let obj = if obj
                             .get_named_property_unchecked::<bool>("__uniffiCallback")
                             .unwrap_or(false)
@@ -1847,14 +1859,14 @@ impl<'a> Generator<'a> {
         if constructor.is_async() {
             Ok(quote! {
                 #[napi]
-                pub async fn #fn_ident(#(#args),*) -> Result<#object_ident> {
+                pub async fn #fn_ident(#(#args),*) -> napi::bindgen_prelude::Result<#object_ident> {
                     #body
                 }
             })
         } else {
             Ok(quote! {
                 #[napi]
-                pub fn #fn_ident(#(#args),*) -> Result<#object_ident> {
+                pub fn #fn_ident(#(#args),*) -> napi::bindgen_prelude::Result<#object_ident> {
                     #body
                 }
             })
@@ -1914,7 +1926,7 @@ impl<'a> Generator<'a> {
             let body = self.render_result_body(call, method.return_type(), method.throws_type())?;
             Ok(quote! {
                 #[napi]
-                pub fn #fn_ident(__uniffi_env: Env, #receiver_ident: ClassInstance<'_, #object_ident>, #(#args),*) -> Result<PromiseRaw<'static, #output_ty>> {
+                pub fn #fn_ident(__uniffi_env: Env, #receiver_ident: napi::bindgen_prelude::ClassInstance<'_, #object_ident>, #(#args),*) -> napi::bindgen_prelude::Result<napi::bindgen_prelude::PromiseRaw<'static, #output_ty>> {
                     #(#lowered_bindings)*
                     let __uniffi_core = (*(#receiver_ident)).0.clone();
                     let __uniffi_future = async move {
@@ -1925,7 +1937,7 @@ impl<'a> Generator<'a> {
                     Ok(unsafe {
                         // The raw JS promise is returned immediately; the lifetime only
                         // ties PromiseRaw to the Env used to create it.
-                        std::mem::transmute::<PromiseRaw<'_, #output_ty>, PromiseRaw<'static, #output_ty>>(
+                        std::mem::transmute::<napi::bindgen_prelude::PromiseRaw<'_, #output_ty>, napi::bindgen_prelude::PromiseRaw<'static, #output_ty>>(
                             __uniffi_promise,
                         )
                     })
@@ -1941,7 +1953,7 @@ impl<'a> Generator<'a> {
             let body = self.render_result_body(call, method.return_type(), method.throws_type())?;
             Ok(quote! {
                 #[napi]
-                pub fn #fn_ident(#receiver_ident: ClassInstance<'_, #object_ident>, #(#args),*) -> Result<#output_ty> {
+                pub fn #fn_ident(#receiver_ident: napi::bindgen_prelude::ClassInstance<'_, #object_ident>, #(#args),*) -> napi::bindgen_prelude::Result<#output_ty> {
                     #body
                 }
             })
@@ -2008,14 +2020,14 @@ impl<'a> Generator<'a> {
         if method.is_async() {
             Ok(quote! {
                 #[napi]
-                pub async fn #fn_ident(#self_ident: #self_bridge_ty, #(#args),*) -> Result<#output_ty> {
+                pub async fn #fn_ident(#self_ident: #self_bridge_ty, #(#args),*) -> napi::bindgen_prelude::Result<#output_ty> {
                     #body
                 }
             })
         } else {
             Ok(quote! {
                 #[napi]
-                pub fn #fn_ident(#self_ident: #self_bridge_ty, #(#args),*) -> Result<#output_ty> {
+                pub fn #fn_ident(#self_ident: #self_bridge_ty, #(#args),*) -> napi::bindgen_prelude::Result<#output_ty> {
                     #body
                 }
             })
@@ -2075,14 +2087,14 @@ impl<'a> Generator<'a> {
         if constructor.is_async() {
             Ok(quote! {
                 #[napi]
-                pub async fn #fn_ident(#(#args),*) -> Result<#output_ty> {
+                pub async fn #fn_ident(#(#args),*) -> napi::bindgen_prelude::Result<#output_ty> {
                     #body
                 }
             })
         } else {
             Ok(quote! {
                 #[napi]
-                pub fn #fn_ident(#(#args),*) -> Result<#output_ty> {
+                pub fn #fn_ident(#(#args),*) -> napi::bindgen_prelude::Result<#output_ty> {
                     #body
                 }
             })
@@ -2156,7 +2168,7 @@ impl<'a> Generator<'a> {
                     self.render_result_body(call, function.return_type(), function.throws_type())?;
                 Ok(quote! {
                     #[napi]
-                    pub fn #fn_ident(__uniffi_env: Env, #(#args),*) -> Result<PromiseRaw<'static, #output_ty>> {
+                    pub fn #fn_ident(__uniffi_env: Env, #(#args),*) -> napi::bindgen_prelude::Result<napi::bindgen_prelude::PromiseRaw<'static, #output_ty>> {
                         #(#lowered_bindings)*
                         let __uniffi_promise = __uniffi_env.spawn_future(async move {
                             #body
@@ -2164,7 +2176,7 @@ impl<'a> Generator<'a> {
                         Ok(unsafe {
                             // The raw JS promise is returned immediately; the lifetime only
                             // ties PromiseRaw to the Env used to create it.
-                            std::mem::transmute::<PromiseRaw<'_, #output_ty>, PromiseRaw<'static, #output_ty>>(
+                            std::mem::transmute::<napi::bindgen_prelude::PromiseRaw<'_, #output_ty>, napi::bindgen_prelude::PromiseRaw<'static, #output_ty>>(
                                 __uniffi_promise,
                             )
                         })
@@ -2173,7 +2185,7 @@ impl<'a> Generator<'a> {
             } else {
                 Ok(quote! {
                     #[napi]
-                    pub async fn #fn_ident(#(#args),*) -> Result<#output_ty> {
+                    pub async fn #fn_ident(#(#args),*) -> napi::bindgen_prelude::Result<#output_ty> {
                         #body
                     }
                 })
@@ -2181,7 +2193,7 @@ impl<'a> Generator<'a> {
         } else {
             Ok(quote! {
                 #[napi]
-                pub fn #fn_ident(#(#args),*) -> Result<#output_ty> {
+                pub fn #fn_ident(#(#args),*) -> napi::bindgen_prelude::Result<#output_ty> {
                     #body
                 }
             })
@@ -2226,20 +2238,24 @@ impl<'a> Generator<'a> {
 
             #[napi(object)]
             pub struct #next_struct_ident {
-                pub done: bool,
-                pub value: Option<#item_bridge_ty>,
-                pub error: Option<#error_bridge_ty>,
+                pub kind: ::std::string::String,
+                // These payload fields are only populated by their matching
+                // tagged arm below.  The generated JS adapter projects the
+                // N-API object into an exact `{ kind, value }`, `{ kind }`, or
+                // `{ kind, error }` object before common/api.ts observes it.
+                pub value: ::std::option::Option<#item_bridge_ty>,
+                pub error: ::std::option::Option<#error_bridge_ty>,
             }
 
             #[napi]
-            pub fn #fn_ident(#(#args),*) -> Result<BigInt> {
+            pub fn #fn_ident(#(#args),*) -> napi::bindgen_prelude::Result<napi::bindgen_prelude::BigInt> {
                 let stream = #fn_path(#(#lowered),*);
                 let handle = ::uniffi::rust_stream_new(&#registry_ident, stream);
-                Ok(BigInt::from(handle.as_raw()))
+                Ok(napi::bindgen_prelude::BigInt::from(handle.as_raw()))
             }
 
             #[napi]
-            pub async fn #next_ident(handle: BigInt) -> Result<#next_struct_ident> {
+            pub async fn #next_ident(handle: napi::bindgen_prelude::BigInt) -> napi::bindgen_prelude::Result<#next_struct_ident> {
                 let handle = __uniffi_stream_handle_from_bigint(handle)?;
                 match ::uniffi::rust_stream_next_async::<#item_core_ty, #error_core_ty>(
                     &#registry_ident,
@@ -2248,26 +2264,29 @@ impl<'a> Generator<'a> {
                 .await
                 {
                     Ok(::uniffi::UniFfiStreamStep::Item(value)) => Ok(#next_struct_ident {
-                        done: false,
+                        kind: ::std::string::String::from("item"),
                         value: Some(#lifted_value),
                         error: None,
                     }),
                     Ok(::uniffi::UniFfiStreamStep::Done) => Ok(#next_struct_ident {
-                        done: true,
+                        kind: ::std::string::String::from("done"),
                         value: None,
                         error: None,
                     }),
                     Ok(::uniffi::UniFfiStreamStep::Error(err)) => Ok(#next_struct_ident {
-                        done: false,
+                        kind: ::std::string::String::from("error"),
                         value: None,
                         error: Some(#lifted_error),
                     }),
-                    Err(err) => Err(Error::new(Status::GenericFailure, format!("{err:?}"))),
+                    Err(err) => Err(napi::bindgen_prelude::Error::new(
+                        napi::bindgen_prelude::Status::GenericFailure,
+                        format!("{err:?}"),
+                    )),
                 }
             }
 
             #[napi]
-            pub fn #cancel_ident(handle: BigInt) -> Result<()> {
+            pub fn #cancel_ident(handle: napi::bindgen_prelude::BigInt) -> napi::bindgen_prelude::Result<()> {
                 let handle = __uniffi_stream_handle_from_bigint(handle)?;
                 ::uniffi::rust_stream_cancel::<#item_core_ty, #error_core_ty>(
                     &#registry_ident,
@@ -2319,7 +2338,7 @@ impl<'a> Generator<'a> {
                 let ident = rust_ident(name);
                 match imp {
                     ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
-                        Ok(quote!(ClassInstance<'_, #ident>))
+                        Ok(quote!(napi::bindgen_prelude::ClassInstance<'_, #ident>))
                     }
                     ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                         Ok(quote!(#ident))
@@ -2383,7 +2402,7 @@ impl<'a> Generator<'a> {
             Type::Float64 => Ok(quote!(f64)),
             Type::Boolean => Ok(quote!(bool)),
             Type::String => Ok(quote!(String)),
-            Type::Bytes => Ok(quote!(Buffer)),
+            Type::Bytes => Ok(quote!(napi::bindgen_prelude::Buffer)),
             Type::Record { name, .. } | Type::Enum { name, .. } => {
                 let ident = rust_ident(name);
                 Ok(quote!(#ident))
@@ -2441,17 +2460,17 @@ impl<'a> Generator<'a> {
             Type::UInt64 => Ok(quote!({
                 let (__sign, __val, __lossless) = #ident.get_u64();
                 if __sign && __val != 0 {
-                    return Err(napi::Error::new(napi::Status::InvalidArg, "negative value cannot be converted to u64"));
+                    return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "negative value cannot be converted to u64"));
                 }
                 if !__lossless {
-                    return Err(napi::Error::new(napi::Status::InvalidArg, "BigInt value does not fit into u64"));
+                    return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "BigInt value does not fit into u64"));
                 }
                 __val
             })),
             Type::Int64 => Ok(quote!({
                 let (__val, __lossless) = #ident.get_i64();
                 if !__lossless {
-                    return Err(napi::Error::new(napi::Status::InvalidArg, "BigInt value does not fit into i64"));
+                    return Err(napi::bindgen_prelude::Error::new(napi::bindgen_prelude::Status::InvalidArg, "BigInt value does not fit into i64"));
                 }
                 __val
             })),
@@ -2688,7 +2707,7 @@ impl<'a> Generator<'a> {
                     .iter()
                     .map(|arg| self.bridge_value_type(&arg.as_type()))
                     .collect::<Result<Vec<_>>>()?;
-                Ok(quote!(FnArgs<(#(#tys),*)>))
+                Ok(quote!(napi::bindgen_prelude::FnArgs<(#(#tys),*)>))
             }
         }
     }
@@ -2699,7 +2718,7 @@ impl<'a> Generator<'a> {
             .into_iter()
             .map(|arg| self.bridge_value_type(&arg.as_type()))
             .collect::<Result<Vec<_>>>()?;
-        Ok(quote!(FnArgs<(u32, String, #(#arg_tys),*)>))
+        Ok(quote!(napi::bindgen_prelude::FnArgs<(u32, String, #(#arg_tys),*)>))
     }
 
     fn callback_registry_call_value(&self, method: &Method) -> Result<TokenStream> {
@@ -2712,7 +2731,9 @@ impl<'a> Generator<'a> {
                 self.lift_value_expr(quote!(#arg_ident), &arg.as_type())
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(quote!(FnArgs::from((__id, #method_name.to_string(), #(#args),*))))
+        Ok(
+            quote!(napi::bindgen_prelude::FnArgs::from((__id, #method_name.to_string(), #(#args),*))),
+        )
     }
 
     fn callback_object_needs_return_dispatcher(&self, object: &Object) -> bool {
@@ -3933,7 +3954,7 @@ mod async_object_receiver_tests {
         for source in rendered {
             let compact = source.split_whitespace().collect::<String>();
             assert!(
-                compact.contains("pubfnasync_service_borrowed_async(__uniffi_env:Env,handle:ClassInstance<'_,AsyncService>,)->Result<PromiseRaw<'static,String>>"),
+                compact.contains("pubfnasync_service_borrowed_async(__uniffi_env:Env,handle:napi::bindgen_prelude::ClassInstance<'_,AsyncService>,)->napi::bindgen_prelude::Result<napi::bindgen_prelude::PromiseRaw<'static,String>>"),
                 "async object receiver must start a synchronous N-API Promise boundary:\n{source}"
             );
             assert!(
@@ -4266,7 +4287,7 @@ mod input_stream_descriptor_tests {
     fn output_stream_business_error_is_lifted_into_the_next_envelope() {
         let rust = render_napi_rust(&output_stream_fixture()).unwrap();
         assert!(
-            rust.contains("pub error: Option<ReadError>"),
+            rust.contains("pub error: ::std::option::Option<ReadError>"),
             "generated output stream Error step lost its typed error:\n{rust}"
         );
         assert!(

@@ -223,7 +223,8 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
         assert!(
             source.contains("pub fn async_service_greet(")
                 && source.contains("__uniffi_env: Env,")
-                && source.contains("handle: ClassInstance<'_, AsyncService>,")
+                && source
+                    .contains("handle: napi::bindgen_prelude::ClassInstance<'_, AsyncService>,")
                 && source.contains("let __uniffi_core = (*(handle)).0.clone();")
                 && source.contains("drop(handle);")
                 && source.contains("spawn_future(__uniffi_future)"),
@@ -480,8 +481,9 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
     assert!(
         bridge.contains("pub fn async_counter_value(")
             && bridge.contains("__uniffi_env: Env,")
-            && bridge.contains("counter: ClassInstance<'_, Counter>,")
-            && bridge.contains("Result<PromiseRaw<'static, napi::bindgen_prelude::BigInt>>")
+            && bridge.contains("counter: napi::bindgen_prelude::ClassInstance<'_, Counter>,")
+            && bridge.contains("napi::bindgen_prelude::Result<")
+            && bridge.contains("napi::bindgen_prelude::PromiseRaw<'static, napi::bindgen_prelude::BigInt>")
             && bridge.contains("let __uniffi_counter = (*(counter)).0.clone();")
             && bridge.contains(".spawn_future(async move"),
         "async function with object args should lower ClassInstance before spawning a Promise:\n{bridge}"
