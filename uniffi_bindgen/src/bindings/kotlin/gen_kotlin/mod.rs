@@ -476,7 +476,7 @@ impl<'a> KotlinWrapper<'a> {
         }
         if self.ci.has_stream_fns() {
             imports.insert(ImportRequirement::Import {
-                name: "kotlinx.coroutines.flow.flow".to_owned(),
+                name: "kotlinx.coroutines.flow.FlowCollector".to_owned(),
             });
             imports.insert(ImportRequirement::Import {
                 name: "java.util.concurrent.atomic.AtomicBoolean".to_owned(),
@@ -908,7 +908,7 @@ mod filters {
                 fully_qualified_type_label(inner_type, ci, config)?
             )),
             Type::Stream { item_type, .. } => Ok(format!(
-                "Flow<{}>",
+                "UniFfiStream<{}>",
                 fully_qualified_type_label(item_type, ci, config)?,
             )),
             Type::InputStream { item_type, .. } => Ok(format!(
@@ -1184,14 +1184,93 @@ mod filters {
         Ok(format!("{{ future -> UniffiLib.{ffi_func}(future) }}"))
     }
 
-    /// Remove the "`" chars we put around function/variable names
-    ///
-    /// These are used to avoid name clashes with kotlin identifiers, but sometimes you want to
-    /// render the name unquoted.  One example is the message property for errors where we want to
-    /// display the name for the user.
+    fn strip_box_type(mut type_: &Type) -> &Type {
+        while let Type::Box { inner_type } = type_ {
+            type_ = inner_type;
+        }
+        type_
+    }
+
+    fn is_kotlin_string_or_nullable_string(field: &Field) -> bool {
+        let type_ = field.as_type();
+        match strip_box_type(&type_) {
+            Type::String => true,
+            Type::Optional { inner_type } => matches!(strip_box_type(inner_type), Type::String),
+            _ => false,
+        }
+    }
+
+    fn field_is_throwable_message(field: &Field) -> bool {
+        KotlinCodeOracle.var_name_raw(field.name()) == "message"
+            && is_kotlin_string_or_nullable_string(field)
+    }
+
+    fn error_field_name_raw(field: &Field, variant: &Variant, field_num: usize) -> String {
+        if field.name().is_empty() {
+            return format!("v{field_num}");
+        }
+
+        let rendered_name = KotlinCodeOracle.var_name_raw(field.name());
+        if rendered_name != "message" || is_kotlin_string_or_nullable_string(field) {
+            return rendered_name;
+        }
+
+        let used_names = variant
+            .fields()
+            .iter()
+            .map(|other| KotlinCodeOracle.var_name_raw(other.name()))
+            .collect::<HashSet<_>>();
+        let mut suffix = 1;
+        loop {
+            let candidate = if suffix == 1 {
+                "messageValue".to_owned()
+            } else {
+                format!("messageValue{suffix}")
+            };
+            if !used_names.contains(&candidate) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
     #[askama::filter_fn]
-    pub fn unquote<S: AsRef<str>>(nm: S, _: &dyn askama::Values) -> Result<String, askama::Error> {
-        Ok(nm.as_ref().trim_matches('`').to_string())
+    pub fn error_field_name(
+        field: &Field,
+        _: &dyn askama::Values,
+        variant: &Variant,
+        field_num: &usize,
+    ) -> Result<String, askama::Error> {
+        Ok(format!(
+            "`{}`",
+            error_field_name_raw(field, variant, *field_num)
+        ))
+    }
+
+    #[askama::filter_fn]
+    pub fn error_field_name_unquoted(
+        field: &Field,
+        _: &dyn askama::Values,
+        variant: &Variant,
+        field_num: &usize,
+    ) -> Result<String, askama::Error> {
+        Ok(error_field_name_raw(field, variant, *field_num))
+    }
+
+    #[askama::filter_fn]
+    pub fn is_throwable_message_field(
+        field: &Field,
+        _: &dyn askama::Values,
+    ) -> Result<bool, askama::Error> {
+        Ok(field_is_throwable_message(field))
+    }
+
+    #[askama::filter_fn]
+    pub fn has_throwable_message_field(
+        variant: &Variant,
+        _: &dyn askama::Values,
+    ) -> Result<bool, askama::Error> {
+        Ok(variant.fields().iter().any(field_is_throwable_message))
     }
 
     /// Get the idiomatic Kotlin rendering of docstring
@@ -1249,15 +1328,82 @@ mod test {
             name: "StreamError".to_owned(),
             orig_name: None,
             rust_path: None,
-            shape: EnumShape::Error { flat: true },
+            shape: EnumShape::Error { flat: false },
             remote: false,
-            variants: vec![VariantMetadata {
-                name: "Boom".to_owned(),
-                orig_name: None,
-                discr: None,
-                fields: vec![],
-                docstring: None,
-            }],
+            variants: vec![
+                VariantMetadata {
+                    name: "Detailed".to_owned(),
+                    orig_name: None,
+                    discr: None,
+                    fields: vec![
+                        FieldMetadata {
+                            name: "code".to_owned(),
+                            orig_name: None,
+                            ty: Type::UInt32,
+                            default: None,
+                            docstring: None,
+                        },
+                        FieldMetadata {
+                            name: "message".to_owned(),
+                            orig_name: None,
+                            ty: Type::String,
+                            default: None,
+                            docstring: None,
+                        },
+                    ],
+                    docstring: None,
+                },
+                VariantMetadata {
+                    name: "NullableMessage".to_owned(),
+                    orig_name: None,
+                    discr: None,
+                    fields: vec![FieldMetadata {
+                        name: "message".to_owned(),
+                        orig_name: None,
+                        ty: Type::Optional {
+                            inner_type: Box::new(Type::String),
+                        },
+                        default: None,
+                        docstring: None,
+                    }],
+                    docstring: None,
+                },
+                VariantMetadata {
+                    name: "NumericMessage".to_owned(),
+                    orig_name: None,
+                    discr: None,
+                    fields: vec![
+                        FieldMetadata {
+                            name: "Message".to_owned(),
+                            orig_name: None,
+                            ty: Type::UInt32,
+                            default: None,
+                            docstring: None,
+                        },
+                        FieldMetadata {
+                            name: "message_value".to_owned(),
+                            orig_name: None,
+                            ty: Type::UInt32,
+                            default: None,
+                            docstring: None,
+                        },
+                    ],
+                    docstring: None,
+                },
+                VariantMetadata {
+                    name: "NoMessage".to_owned(),
+                    orig_name: None,
+                    discr: None,
+                    fields: vec![FieldMetadata {
+                        name: "code".to_owned(),
+                        orig_name: None,
+                        ty: Type::UInt32,
+                        default: None,
+                        docstring: None,
+                    }],
+                    docstring: None,
+                },
+            ],
             discr_type: None,
             non_exhaustive: false,
             docstring: None,
@@ -1525,31 +1671,32 @@ mod test {
         let kotlin = stream_bindings();
 
         assert!(kotlin.contains("import kotlinx.coroutines.flow.Flow"));
-        assert!(kotlin.contains("import kotlinx.coroutines.flow.flow"));
+        assert!(kotlin.contains("import kotlinx.coroutines.flow.FlowCollector"));
+        assert!(!kotlin.contains("import kotlinx.coroutines.flow.flow"));
         assert!(kotlin.contains("import java.util.concurrent.atomic.AtomicBoolean"));
+        assert!(kotlin.contains("public class UniFfiStream<T> internal constructor("));
+        assert!(kotlin.contains(") : Flow<T> {"));
+        assert!(kotlin.contains("private val consumed = AtomicBoolean(false)"));
+        assert!(kotlin.contains("override suspend fun collect(collector: FlowCollector<T>)"));
+        assert!(kotlin.contains("if (!consumed.compareAndSet(false, true))"));
         assert!(kotlin.contains("fun `countEvents`("));
-        assert!(kotlin.contains(") : Flow<StreamEvent>"));
+        assert!(kotlin.contains(") : UniFfiStream<StreamEvent>"));
+        assert!(!kotlin.contains(") : Flow<StreamEvent>"));
         assert!(!kotlin.contains("fun `countEvents`(`count`: kotlin.UInt) : ULong"));
-        let stream_owner = kotlin
-            .find("val __streamConsumed = AtomicBoolean(false)")
-            .expect("output stream must own one collection claim");
-        let stream_flow = kotlin
-            .find("return flow {")
-            .expect("output stream must remain a lazy Flow");
-        let stream_claim = kotlin
-            .find("if (!__streamConsumed.compareAndSet(false, true))")
-            .expect("output stream must claim its only collector");
+        let stream_wrapper = kotlin
+            .find("return UniFfiStream {")
+            .expect("output stream must return the explicit lazy wrapper");
         let stream_start = kotlin
             .find("UniffiLib.uniffi_stream_core_fn_func_count_events(")
             .expect("output stream must start natively");
         assert!(
-            stream_owner < stream_flow && stream_flow < stream_claim && stream_claim < stream_start,
-            "output stream ownership must be captured outside the lazy Flow and claimed before argument lowering/native start:\n{kotlin}"
+            stream_wrapper < stream_start,
+            "native start must be captured inside the lazy UniFfiStream body:\n{kotlin}"
         );
         assert!(kotlin.contains(
             "throw InternalException(\"UniFFI output streams may only be consumed once\")"
         ));
-        assert!(kotlin.contains("return flow {"));
+        assert!(!kotlin.contains("return flow {"));
         assert!(kotlin.contains("val __streamHandle ="));
         assert!(kotlin.contains("UniffiLib.uniffi_stream_core_fn_func_count_events("));
         assert!(kotlin.contains(
@@ -1568,9 +1715,75 @@ mod test {
         assert!(kotlin.contains("is __UniffiStreamNext.Error -> throw __streamNext.error"));
         assert!(!kotlin.contains("if (__streamNext == null)"));
         assert!(!kotlin.contains("emit(__streamNext)"));
-        assert!(kotlin.contains("fun `optionalEvents`() : Flow<kotlin.UInt?>"));
+        assert!(kotlin.contains("fun `optionalEvents`() : UniFfiStream<kotlin.UInt?>"));
         assert!(kotlin.contains("FfiConverterOptionalUInt.read(buffer)"));
         assert!(kotlin.contains("} finally {"));
+        assert!(kotlin.contains("var __streamFailure: Throwable? = null"));
+        assert!(kotlin.contains("__streamOriginalError.addSuppressed(__streamCleanupError)"));
+        assert!(kotlin.contains("continuation.invokeOnCancellation"));
+        assert!(kotlin.contains("originalError.addSuppressed(cleanupError)"));
+        assert!(kotlin.contains("class Detailed("));
+        assert!(kotlin.contains("override val `message`: kotlin.String"));
+        assert!(!kotlin.contains("get() = \"code=${ `code` }, message=${ `message` }\""));
+    }
+
+    #[test]
+    fn kotlin_stream_error_message_fields_static_contract() {
+        let kotlin = stream_bindings();
+
+        let detailed = kotlin
+            .split("class Detailed(")
+            .nth(1)
+            .and_then(|source| source.split("class NullableMessage(").next())
+            .expect("generated string message error");
+        assert!(detailed.contains("override val `message`: kotlin.String"));
+
+        let nullable = kotlin
+            .split("class NullableMessage(")
+            .nth(1)
+            .and_then(|source| source.split("class NumericMessage(").next())
+            .expect("generated nullable string message error");
+        assert!(nullable.contains("override val `message`: kotlin.String?"));
+
+        let numeric = kotlin
+            .split("class NumericMessage(")
+            .nth(1)
+            .and_then(|source| source.split("class NoMessage(").next())
+            .expect("generated non-string message error");
+        assert!(numeric.contains("val `messageValue2`: kotlin.UInt"));
+        assert!(numeric.contains("val `messageValue`: kotlin.UInt"));
+        assert!(!numeric.contains("val `message`: kotlin.UInt"));
+        assert!(numeric.contains(
+            "override val message\n            get() = \"messageValue2=${ `messageValue2` }, messageValue=${ `messageValue` }\""
+        ));
+
+        let no_message = kotlin
+            .split("class NoMessage(")
+            .nth(1)
+            .and_then(|source| source.split("companion object ErrorHandler").next())
+            .expect("generated error without a message field");
+        assert!(no_message.contains("val `code`: kotlin.UInt"));
+        assert!(
+            no_message.contains("override val message\n            get() = \"code=${ `code` }\"")
+        );
+
+        let error_converter = kotlin
+            .split("public object FfiConverterTypeStreamError")
+            .nth(1)
+            .expect("generated stream error converter");
+        let numeric_read = error_converter
+            .split("3 -> StreamException.NumericMessage(")
+            .nth(1)
+            .and_then(|source| source.split("4 -> StreamException.NoMessage(").next())
+            .expect("generated numeric message reader");
+        assert_eq!(
+            numeric_read.matches("FfiConverterUInt.read(buf)").count(),
+            2
+        );
+        assert!(kotlin.contains("FfiConverterUInt.allocationSize(value.`messageValue2`)"));
+        assert!(kotlin.contains("FfiConverterUInt.allocationSize(value.`messageValue`)"));
+        assert!(kotlin.contains("FfiConverterUInt.write(value.`messageValue2`, buf)"));
+        assert!(kotlin.contains("FfiConverterUInt.write(value.`messageValue`, buf)"));
     }
 
     #[test]
@@ -1595,7 +1808,9 @@ mod test {
         .unwrap();
 
         assert!(!kotlin.contains("import java.util.concurrent.atomic.AtomicBoolean"));
+        assert!(!kotlin.contains("import kotlinx.coroutines.flow.FlowCollector"));
         assert!(!kotlin.contains("AtomicBoolean(false)"));
+        assert!(!kotlin.contains("class UniFfiStream"));
     }
 
     #[test]
@@ -1649,11 +1864,13 @@ mod test {
         .unwrap();
 
         assert!(kotlin.contains("import kotlinx.coroutines.flow.Flow"));
-        assert!(kotlin.contains("import kotlinx.coroutines.flow.flow"));
+        assert!(kotlin.contains("import kotlinx.coroutines.flow.FlowCollector"));
+        assert!(!kotlin.contains("import kotlinx.coroutines.flow.flow"));
         assert!(kotlin.contains("import java.util.concurrent.atomic.AtomicBoolean"));
         assert!(kotlin.contains("fun `runningSum`("));
         assert!(kotlin.contains("`events`: Flow<CounterEvent>"));
-        assert!(kotlin.contains(") : Flow<CounterEvent>"));
+        assert!(kotlin.contains(") : UniFfiStream<CounterEvent>"));
+        assert!(!kotlin.contains(") : Flow<CounterEvent>"));
         assert!(kotlin
             .contains("FfiConverterInputStreamTypeCounterEventTypeStreamError.lower(`events`)"));
         assert!(
@@ -1663,21 +1880,15 @@ mod test {
             kotlin.contains("lib.uniffi_stream_core_fn_func_running_sum_input_stream_events_init(")
         );
         assert!(kotlin.contains("UniffiLib.uniffi_stream_core_fn_func_running_sum("));
-        let stream_owner = kotlin
-            .find("val __streamConsumed = AtomicBoolean(false)")
-            .expect("output stream must own one collection claim");
-        let stream_flow = kotlin
-            .find("return flow {")
-            .expect("output stream must remain a lazy Flow");
-        let stream_claim = kotlin
-            .find("if (!__streamConsumed.compareAndSet(false, true))")
-            .expect("output stream must claim its only collector");
+        let stream_wrapper = kotlin
+            .find("return UniFfiStream {")
+            .expect("output stream must return the explicit lazy wrapper");
         let stream_start = kotlin
             .find("UniffiLib.uniffi_stream_core_fn_func_running_sum(")
             .expect("output stream must start natively");
         assert!(
-            stream_owner < stream_flow && stream_flow < stream_claim && stream_claim < stream_start,
-            "output stream ownership must be captured outside the lazy Flow and claimed before argument lowering/native start:\n{kotlin}"
+            stream_wrapper < stream_start,
+            "native start must be captured inside the lazy UniFfiStream body:\n{kotlin}"
         );
         assert!(kotlin.contains(
             "throw InternalException(\"UniFFI output streams may only be consumed once\")"

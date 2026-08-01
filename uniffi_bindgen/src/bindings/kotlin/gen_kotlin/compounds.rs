@@ -193,7 +193,7 @@ impl StreamCodeType {
 impl CodeType for StreamCodeType {
     fn type_label(&self, ci: &ComponentInterface) -> String {
         format!(
-            "Flow<{}>",
+            "UniFfiStream<{}>",
             super::KotlinCodeOracle.find(self.item()).type_label(ci)
         )
     }

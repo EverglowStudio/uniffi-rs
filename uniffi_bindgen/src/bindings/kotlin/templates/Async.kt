@@ -48,12 +48,40 @@ private fun <T> __uniffiLiftStreamNext(
     }
 }
 
+{%- if ci.has_stream_fns() %}
+
+/**
+ * A lazy, single-use stream backed by a Rust output stream.
+ *
+ * The native stream is started by the first [collect] call. Repeated or
+ * concurrent collection of the same instance fails before starting Rust again.
+ */
+public class UniFfiStream<T> internal constructor(
+    private val collectOnce: suspend FlowCollector<T>.() -> Unit,
+) : Flow<T> {
+    private val consumed = AtomicBoolean(false)
+
+    @OptIn(kotlinx.coroutines.InternalCoroutinesApi::class)
+    override suspend fun collect(collector: FlowCollector<T>) {
+        if (!consumed.compareAndSet(false, true)) {
+            throw InternalException("UniFFI output streams may only be consumed once")
+        }
+        collector.collectOnce()
+    }
+}
+
+{%- endif %}
+
 internal val uniffiContinuationHandleMap = UniffiHandleMap<CancellableContinuation<Byte>>()
 
 // FFI type for Rust future continuations
 internal object uniffiRustFutureContinuationCallbackImpl: UniffiRustFutureContinuationCallback {
     override fun callback(data: Long, pollResult: Byte) {
-        uniffiContinuationHandleMap.remove(data).resume(pollResult)
+        try {
+            uniffiContinuationHandleMap.remove(data).resume(pollResult)
+        } catch (_: InternalException) {
+            // Cancellation may have removed this continuation before a racing callback arrived.
+        }
     }
 }
 
@@ -65,22 +93,50 @@ internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
     liftFunc: (F) -> T,
     errorHandler: UniffiRustCallStatusErrorHandler<E>
 ): T {
+    var callFailure: Throwable? = null
     try {
         do {
             val pollResult = suspendCancellableCoroutine<Byte> { continuation ->
-                pollFunc(
-                    rustFuture,
-                    uniffiRustFutureContinuationCallbackImpl,
-                    uniffiContinuationHandleMap.insert(continuation)
-                )
+                val continuationHandle = uniffiContinuationHandleMap.insert(continuation)
+                continuation.invokeOnCancellation {
+                    try {
+                        uniffiContinuationHandleMap.remove(continuationHandle)
+                    } catch (_: InternalException) {
+                        // A racing callback already consumed the continuation.
+                    }
+                }
+                try {
+                    pollFunc(
+                        rustFuture,
+                        uniffiRustFutureContinuationCallbackImpl,
+                        continuationHandle,
+                    )
+                } catch (error: Throwable) {
+                    try {
+                        uniffiContinuationHandleMap.remove(continuationHandle)
+                    } catch (_: InternalException) {
+                    }
+                    throw error
+                }
             }
         } while (pollResult != UNIFFI_RUST_FUTURE_POLL_READY);
 
         return liftFunc(
             uniffiRustCallWithError(errorHandler, { status -> completeFunc(rustFuture, status) })
         )
+    } catch (error: Throwable) {
+        callFailure = error
+        throw error
     } finally {
-        freeFunc(rustFuture)
+        try {
+            freeFunc(rustFuture)
+        } catch (cleanupError: Throwable) {
+            val originalError = callFailure
+            if (originalError == null) {
+                throw cleanupError
+            }
+            originalError.addSuppressed(cleanupError)
+        }
     }
 }
 
