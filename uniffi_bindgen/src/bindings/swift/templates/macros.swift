@@ -61,7 +61,7 @@
 {%- call docstring(callable, indent) %}{% endcall %}
 {%- if let Some(stream_item_type) = callable.stream_item_type() %}
 {%- if let Some(stream_error_type) = callable.stream_error_type() %}
-{%- if let Some(stream_next_return_type) = callable.stream_next_return_type() %}
+{%- if let Some(stream_next_ffi_return_type) = callable.stream_next_ffi_return_type() %}
 {{ func_decl }} {{ callable.name()|fn_name }}{{ callable|input_stream_generics }}(
     {%- call arg_list_decl(callable) %}{% endcall -%}) -> {{ callable.return_type().unwrap()|type_name }}{{ callable|input_stream_where_clause }} {
     let __streamHandle =
@@ -76,10 +76,16 @@
                 cancelFunc: {{ callable.ffi_stream_next_rust_future_cancel(ci) }},
                 completeFunc: {{ callable.ffi_stream_next_rust_future_complete(ci) }},
                 freeFunc: {{ callable.ffi_stream_next_rust_future_free(ci) }},
-                liftFunc: { try __uniffiLiftStreamNext($0) { reader in
-                    try {{ stream_item_type|read_fn }}(from: &reader)
-                } },
-                errorHandler: {{ stream_error_type|ffi_error_converter_name }}_lift
+                liftFunc: { try __uniffiLiftStreamNext(
+                    $0,
+                    readItem: { reader in
+                        try {{ stream_item_type|read_fn }}(from: &reader)
+                    },
+                    readError: { reader in
+                        try {{ stream_error_type|read_fn }}(from: &reader)
+                    }
+                ) },
+                errorHandler: nil
             )
         },
         cancel: {

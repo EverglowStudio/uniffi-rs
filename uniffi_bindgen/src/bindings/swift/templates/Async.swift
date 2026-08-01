@@ -1,17 +1,19 @@
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
-// The Rust output-stream ABI completes `Result<Option<Item>, Error>` as a
-// RustBuffer. Decode its outer Option tag before lifting Item: when Item is
-// Optional, an inner `.none` is a valid item rather than stream completion.
+// The Rust output-stream ABI completes one strict tagged StreamStep as a
+// RustBuffer. `Item(nil)` is an item payload when Element is Optional; only a
+// distinct Done tag completes the stream, and Error keeps the typed payload.
 private enum __UniffiStreamNext<T> {
     case item(T)
     case done
+    case error(Swift.Error)
 }
 
 private func __uniffiLiftStreamNext<T>(
     _ rustBuffer: RustBuffer,
-    readItem: (inout (data: Data, offset: Data.Index)) throws -> T
+    readItem: (inout (data: Data, offset: Data.Index)) throws -> T,
+    readError: (inout (data: Data, offset: Data.Index)) throws -> Swift.Error
 ) throws -> __UniffiStreamNext<T> {
     defer {
         rustBuffer.deallocate()
@@ -21,19 +23,25 @@ private func __uniffiLiftStreamNext<T>(
     }
     var reader = createReader(data: Data(rustBuffer: rustBuffer))
     switch try readInt(&reader) as Int8 {
-    case 0:
-        guard !hasRemaining(reader) else {
-            throw UniffiInternalError.incompleteData
-        }
-        return .done
     case 1:
         let item = try readItem(&reader)
         guard !hasRemaining(reader) else {
             throw UniffiInternalError.incompleteData
         }
         return .item(item)
+    case 2:
+        guard !hasRemaining(reader) else {
+            throw UniffiInternalError.incompleteData
+        }
+        return .done
+    case 3:
+        let error = try readError(&reader)
+        guard !hasRemaining(reader) else {
+            throw UniffiInternalError.incompleteData
+        }
+        return .error(error)
     default:
-        throw UniffiInternalError.unexpectedOptionalTag
+        throw UniffiInternalError.unexpectedStreamStepTag
     }
 }
 
@@ -251,15 +259,15 @@ fileprivate final class UniffiAsyncStreamState<Element>: @unchecked Sendable {
                 finishCancelledNext()
                 throw CancellationError()
             }
-            return finish(result)
+            return try finish(result)
         } catch {
             finishFailedNext()
             throw error
         }
     }
 
-    private func finish(_ result: __UniffiStreamNext<Element>) -> Element? {
-        lock.withLock {
+    private func finish(_ result: __UniffiStreamNext<Element>) throws -> Element? {
+        return try lock.withLock { () throws -> Element? in
             nextInFlight = false
             if cancelled {
                 return nil
@@ -268,6 +276,9 @@ fileprivate final class UniffiAsyncStreamState<Element>: @unchecked Sendable {
             case .done:
                 terminal = true
                 return nil
+            case let .error(error):
+                terminal = true
+                throw error
             case let .item(item):
                 // `Element?` adds an outer optional here. In particular, when
                 // Element is Optional<T>, this returns `.some(nil)` for Item(None).

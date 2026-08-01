@@ -3,28 +3,24 @@
 internal const val UNIFFI_RUST_FUTURE_POLL_READY = 0.toByte()
 internal const val UNIFFI_RUST_FUTURE_POLL_WAKE = 1.toByte()
 
-// The Rust output-stream ABI completes `Result<Option<Item>, Error>` as a
-// RustBuffer. Decode its outer Option tag before lifting Item: when Item is
-// nullable, an inner `None` is a valid item rather than stream completion.
+// The Rust output-stream ABI completes one strict tagged StreamStep as a
+// RustBuffer. `Item(null)` is an item payload when T is nullable; only a
+// distinct Done tag completes the stream, and Error keeps the typed payload.
 private sealed class __UniffiStreamNext<out T> {
     class Item<T>(val value: T) : __UniffiStreamNext<T>()
     object Done : __UniffiStreamNext<Nothing>()
+    class Error(val error: Throwable) : __UniffiStreamNext<Nothing>()
 }
 
 private fun <T> __uniffiLiftStreamNext(
     rustBuffer: RustBuffer.ByValue,
     readItem: (ByteBuffer) -> T,
+    readError: (ByteBuffer) -> Throwable,
 ): __UniffiStreamNext<T> {
     try {
         val buffer = rustBuffer.asByteBuffer()
             ?: throw InternalException("stream next returned an empty RustBuffer")
         return when (buffer.get().toInt()) {
-            0 -> {
-                if (buffer.hasRemaining()) {
-                    throw InternalException("stream Done result contains trailing bytes")
-                }
-                __UniffiStreamNext.Done
-            }
             1 -> {
                 val item = readItem(buffer)
                 if (buffer.hasRemaining()) {
@@ -32,7 +28,20 @@ private fun <T> __uniffiLiftStreamNext(
                 }
                 __UniffiStreamNext.Item(item)
             }
-            else -> throw InternalException("unexpected stream next tag")
+            2 -> {
+                if (buffer.hasRemaining()) {
+                    throw InternalException("stream Done result contains trailing bytes")
+                }
+                __UniffiStreamNext.Done
+            }
+            3 -> {
+                val error = readError(buffer)
+                if (buffer.hasRemaining()) {
+                    throw InternalException("stream Error result contains trailing bytes")
+                }
+                __UniffiStreamNext.Error(error)
+            }
+            else -> throw InternalException("unexpected output stream step tag")
         }
     } finally {
         RustBuffer.free(rustBuffer)

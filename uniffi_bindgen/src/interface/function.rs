@@ -352,10 +352,8 @@ pub trait Callable {
         }
     }
 
-    fn stream_next_return_type(&self) -> Option<Type> {
-        self.stream_item_type().map(|item_type| Type::Optional {
-            inner_type: Box::new(item_type.clone()),
-        })
+    fn stream_next_ffi_return_type(&self) -> Option<FfiType> {
+        self.is_stream().then_some(FfiType::RustBuffer(None))
     }
 
     fn ffi_stream_next_func(&self) -> String {
@@ -368,38 +366,34 @@ pub trait Callable {
 
     fn ffi_stream_next_rust_future_poll(&self, ci: &ComponentInterface) -> String {
         let return_type = self
-            .stream_next_return_type()
-            .expect("stream_next_return_type called on a non-stream callable");
-        ci.ffi_rust_future_poll(Some((&return_type).into()))
-            .name()
-            .to_owned()
+            .stream_next_ffi_return_type()
+            .expect("stream_next_ffi_return_type called on a non-stream callable");
+        ci.ffi_rust_future_poll(Some(return_type)).name().to_owned()
     }
 
     fn ffi_stream_next_rust_future_cancel(&self, ci: &ComponentInterface) -> String {
         let return_type = self
-            .stream_next_return_type()
-            .expect("stream_next_return_type called on a non-stream callable");
-        ci.ffi_rust_future_cancel(Some((&return_type).into()))
+            .stream_next_ffi_return_type()
+            .expect("stream_next_ffi_return_type called on a non-stream callable");
+        ci.ffi_rust_future_cancel(Some(return_type))
             .name()
             .to_owned()
     }
 
     fn ffi_stream_next_rust_future_complete(&self, ci: &ComponentInterface) -> String {
         let return_type = self
-            .stream_next_return_type()
-            .expect("stream_next_return_type called on a non-stream callable");
-        ci.ffi_rust_future_complete(Some((&return_type).into()))
+            .stream_next_ffi_return_type()
+            .expect("stream_next_ffi_return_type called on a non-stream callable");
+        ci.ffi_rust_future_complete(Some(return_type))
             .name()
             .to_owned()
     }
 
     fn ffi_stream_next_rust_future_free(&self, ci: &ComponentInterface) -> String {
         let return_type = self
-            .stream_next_return_type()
-            .expect("stream_next_return_type called on a non-stream callable");
-        ci.ffi_rust_future_free(Some((&return_type).into()))
-            .name()
-            .to_owned()
+            .stream_next_ffi_return_type()
+            .expect("stream_next_ffi_return_type called on a non-stream callable");
+        ci.ffi_rust_future_free(Some(return_type)).name().to_owned()
     }
 }
 

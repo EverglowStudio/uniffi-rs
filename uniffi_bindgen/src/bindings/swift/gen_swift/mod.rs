@@ -1581,12 +1581,16 @@ mod tests {
         );
         assert!(swift.contains("try await uniffiRustCallAsync("));
         assert!(swift.contains("cancelFunc: ffi_stream_core_rust_future_cancel_rust_buffer"));
-        assert!(swift.contains("liftFunc: { try __uniffiLiftStreamNext($0) { reader in"));
+        assert!(swift.contains("liftFunc: { try __uniffiLiftStreamNext("));
+        assert!(swift.contains("readItem: { reader in"));
+        assert!(swift.contains("readError: { reader in"));
         assert!(swift.contains("try FfiConverterTypeStreamEvent.read(from: &reader)"));
+        assert!(swift.contains("try FfiConverterTypeStreamError.read(from: &reader)"));
+        assert!(swift.contains("case error(Swift.Error)"));
         assert!(!swift.contains("guard let __streamValue = __streamNext else"));
         assert!(swift.contains("public func optionalEvents() -> UniffiAsyncStream<UInt32?>"));
         assert!(swift.contains("try FfiConverterOptionUInt32.read(from: &reader)"));
-        assert!(swift.contains("errorHandler: FfiConverter") && swift.contains("StreamError_lift"));
+        assert!(swift.contains("errorHandler: nil"));
         assert!(swift.contains("public struct UniffiAsyncStream<Element>: AsyncSequence"));
         assert!(swift.contains("public mutating func next() async throws -> Element?"));
         assert!(swift.contains("throw UniffiInternalError.concurrentStreamNext"));
@@ -1805,6 +1809,7 @@ fileprivate enum UniffiInternalError: Error {
 private enum __UniffiStreamNext<T> {
     case item(T)
     case done
+    case error(Swift.Error)
 }
 
 private struct RustBuffer {}

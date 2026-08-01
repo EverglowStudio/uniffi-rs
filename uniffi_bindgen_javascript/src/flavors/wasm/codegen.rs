@@ -1213,18 +1213,19 @@ fn render_stream_function(
     .unwrap();
     writeln!(
         out,
-        "        Ok(Ok(Some(value))) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::FALSE);\n            let __value = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"value\"), &__value);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
-        stream_item_lift_expr(&item_info, item_type)
+        "        Ok(::uniffi::UniFfiStreamStep::Item(value)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::FALSE);\n            let __value = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"value\"), &__value);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
+        stream_value_lift_expr(&item_info, item_type, "value")
     )
     .unwrap();
     writeln!(
         out,
-        "        Ok(Ok(None)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::TRUE);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}"
+        "        Ok(::uniffi::UniFfiStreamStep::Done) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::TRUE);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}"
     )
     .unwrap();
     writeln!(
         out,
-        "        Ok(Err(e)) => Err(JsError::new(&format!(\"{{e:?}}\"))),"
+        "        Ok(::uniffi::UniFfiStreamStep::Error(error)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"done\"), &JsValue::FALSE);\n            let __error = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"error\"), &__error);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
+        stream_value_lift_expr(&classify(error_type, crate_ident), error_type, "error")
     )
     .unwrap();
     writeln!(
@@ -1264,10 +1265,10 @@ fn item_info_for_check(info: &Lowering) -> Lowering {
     }
 }
 
-fn stream_item_lift_expr(info: &Lowering, item_type: &Type) -> String {
+fn stream_value_lift_expr(info: &Lowering, value_type: &Type, value_ident: &str) -> String {
     match info {
         Lowering::Object { snake, .. } => format!(
-            "Ok::<JsValue, JsError>(JsValue::from_f64(__uniffi_{snake}_insert(value) as f64))"
+            "Ok::<JsValue, JsError>(JsValue::from_f64(__uniffi_{snake}_insert({value_ident}) as f64))"
         ),
         Lowering::Callback { .. } => {
             "Err(JsError::new(\"stream items cannot be callback traits\"))".into()
@@ -1275,7 +1276,7 @@ fn stream_item_lift_expr(info: &Lowering, item_type: &Type) -> String {
         Lowering::Unsupported(reason) => {
             format!("Err(JsError::new(\"unsupported stream item: {reason}\"))")
         }
-        _ => lift_expr_result("value", item_type, 0),
+        _ => lift_expr_result(value_ident, value_type, 0),
     }
 }
 
@@ -2617,5 +2618,27 @@ fn type_debug(l: &Lowering) -> &'static str {
         Lowering::Callback { .. } => "callback",
         Lowering::InputStream { .. } => "input stream",
         Lowering::Unsupported(_) => "unsupported",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_error_lift_uses_the_error_binding() {
+        let lift = stream_value_lift_expr(
+            &Lowering::Native("String".to_owned()),
+            &Type::String,
+            "error",
+        );
+        assert!(
+            lift.contains("JsValue::from_str(&error)"),
+            "typed stream errors must lift the Error payload, not an item binding: {lift}"
+        );
+        assert!(
+            !lift.contains("&value"),
+            "typed stream error lift retained the item binding: {lift}"
+        );
     }
 }

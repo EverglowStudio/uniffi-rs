@@ -1559,12 +1559,13 @@ mod test {
             "UniffiLib.uniffi_stream_core_fn_func_count_events_stream_cancel(__streamHandle)"
         ));
         assert!(kotlin.contains("val __streamNext = uniffiRustCallAsync("));
-        assert!(kotlin.contains(
-            "__uniffiLiftStreamNext(it) { buffer -> FfiConverterTypeStreamEvent.read(buffer) }"
-        ));
-        assert!(kotlin.contains("StreamException.ErrorHandler"));
+        assert!(kotlin.contains("__uniffiLiftStreamNext("));
+        assert!(kotlin.contains("{ buffer -> FfiConverterTypeStreamEvent.read(buffer) }"));
+        assert!(kotlin.contains("{ buffer -> FfiConverterTypeStreamError.read(buffer) }"));
+        assert!(kotlin.contains("UniffiNullRustCallStatusErrorHandler"));
         assert!(kotlin.contains("is __UniffiStreamNext.Item -> emit(__streamNext.value)"));
         assert!(kotlin.contains("__UniffiStreamNext.Done -> break"));
+        assert!(kotlin.contains("is __UniffiStreamNext.Error -> throw __streamNext.error"));
         assert!(!kotlin.contains("if (__streamNext == null)"));
         assert!(!kotlin.contains("emit(__streamNext)"));
         assert!(kotlin.contains("fun `optionalEvents`() : Flow<kotlin.UInt?>"));
@@ -1687,12 +1688,13 @@ mod test {
         assert!(kotlin.contains(
             "UniffiLib.uniffi_stream_core_fn_func_running_sum_stream_cancel(__streamHandle)"
         ));
-        assert!(kotlin.contains("StreamException.ErrorHandler"));
-        assert!(kotlin.contains(
-            "__uniffiLiftStreamNext(it) { buffer -> FfiConverterTypeCounterEvent.read(buffer) }"
-        ));
+        assert!(kotlin.contains("UniffiNullRustCallStatusErrorHandler"));
+        assert!(kotlin.contains("__uniffiLiftStreamNext("));
+        assert!(kotlin.contains("{ buffer -> FfiConverterTypeCounterEvent.read(buffer) }"));
+        assert!(kotlin.contains("{ buffer -> FfiConverterTypeStreamError.read(buffer) }"));
         assert!(kotlin.contains("is __UniffiStreamNext.Item -> emit(__streamNext.value)"));
         assert!(kotlin.contains("__UniffiStreamNext.Done -> break"));
+        assert!(kotlin.contains("is __UniffiStreamNext.Error -> throw __streamNext.error"));
         assert!(!kotlin.contains("emit(__streamNext)"));
     }
 }

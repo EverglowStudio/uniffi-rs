@@ -1097,15 +1097,6 @@ impl ComponentInterface {
         self.types
             .add_known_types(defn.iter_types())
             .with_context(|| format!("adding function {defn:?}"))?;
-        if let Some(Type::Stream { item_type, .. }) = defn.return_type() {
-            self.types
-                .add_known_type(&Type::Optional {
-                    inner_type: Box::new((**item_type).clone()),
-                })
-                .with_context(|| {
-                    format!("adding stream next optional item type for function {defn:?}")
-                })?;
-        }
         for arg in defn.input_stream_arguments() {
             let Type::InputStream { item_type, .. } = arg.as_type() else {
                 continue;
@@ -1787,6 +1778,16 @@ new definition: Enum {
                 error_type: Box::new(Type::String),
                 is_send: true,
             })
+        );
+        assert_eq!(
+            func.ffi_stream_next_rust_future_complete(&ci),
+            "ffi_stream_core_rust_future_complete_rust_buffer"
+        );
+        assert!(
+            !ci.types.contains(&Type::Optional {
+                inner_type: Box::new(Type::UInt32),
+            }),
+            "output stream completion must not add Optional<Item> to the FFI type graph"
         );
     }
 

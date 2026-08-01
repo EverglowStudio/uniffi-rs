@@ -2,8 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use crate::{rust_future_new, FutureLowerReturn, Handle, LiftArgsError};
-use anyhow::anyhow;
+use crate::{
+    check_remaining, rust_future_new, FutureLowerReturn, Handle, Lift, LiftArgsError, Lower,
+    LowerReturn, RustBuffer, RustCallError,
+};
+use anyhow::{anyhow, bail};
+use bytes::{Buf, BufMut};
 use futures_core::Stream;
 use once_cell::sync::Lazy;
 use std::{
@@ -24,6 +28,90 @@ pub type UniFfiStream<T, E> = Pin<Box<dyn Stream<Item = Result<T, E>> + Send + '
 /// Single-threaded wasm stream type reserved for the JavaScript wasm backend.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded"))]
 pub type UniFfiStream<T, E> = Pin<Box<dyn Stream<Item = Result<T, E>> + 'static>>;
+
+/// One native output-stream transition.
+///
+/// This is intentionally a three-variant enum rather than a record with
+/// optional fields: a stream pull is exactly one of an item, normal
+/// completion, or a typed business error.  In particular, `Item(None)` for
+/// `UniFfiStream<Option<T>, E>` is distinct from `Done`.
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum UniFfiStreamStep<T, E> {
+    Item(T),
+    Done,
+    Error(E),
+}
+
+// These tags are part of the native output-stream RustBuffer ABI. Keep them
+// explicit and independent from every item or error encoding so bindings can
+// reject malformed/unknown steps before lifting a payload.
+#[doc(hidden)]
+pub const UNIFFI_STREAM_STEP_ITEM_TAG: u8 = 1;
+#[doc(hidden)]
+pub const UNIFFI_STREAM_STEP_DONE_TAG: u8 = 2;
+#[doc(hidden)]
+pub const UNIFFI_STREAM_STEP_ERROR_TAG: u8 = 3;
+
+unsafe impl<UT, T, E> Lower<UT> for UniFfiStreamStep<T, E>
+where
+    T: Lower<UT>,
+    E: Lower<UT>,
+{
+    type FfiType = RustBuffer;
+
+    fn lower(obj: Self) -> RustBuffer {
+        Self::lower_into_rust_buffer(obj)
+    }
+
+    fn write(obj: Self, buf: &mut Vec<u8>) {
+        match obj {
+            Self::Item(item) => {
+                buf.put_u8(UNIFFI_STREAM_STEP_ITEM_TAG);
+                T::write(item, buf);
+            }
+            Self::Done => buf.put_u8(UNIFFI_STREAM_STEP_DONE_TAG),
+            Self::Error(error) => {
+                buf.put_u8(UNIFFI_STREAM_STEP_ERROR_TAG);
+                E::write(error, buf);
+            }
+        }
+    }
+}
+
+unsafe impl<UT, T, E> Lift<UT> for UniFfiStreamStep<T, E>
+where
+    T: Lift<UT>,
+    E: Lift<UT>,
+{
+    type FfiType = RustBuffer;
+
+    fn try_lift(buf: RustBuffer) -> crate::Result<Self> {
+        Self::try_lift_from_rust_buffer(buf)
+    }
+
+    fn try_read(buf: &mut &[u8]) -> crate::Result<Self> {
+        check_remaining(buf, 1)?;
+        match buf.get_u8() {
+            UNIFFI_STREAM_STEP_ITEM_TAG => Ok(Self::Item(T::try_read(buf)?)),
+            UNIFFI_STREAM_STEP_DONE_TAG => Ok(Self::Done),
+            UNIFFI_STREAM_STEP_ERROR_TAG => Ok(Self::Error(E::try_read(buf)?)),
+            tag => bail!("unexpected UniFFI output stream step tag: {tag}"),
+        }
+    }
+}
+
+unsafe impl<UT, T, E> LowerReturn<UT> for UniFfiStreamStep<T, E>
+where
+    T: Lower<UT>,
+    E: Lower<UT>,
+{
+    type ReturnType = RustBuffer;
+
+    fn lower_return(value: Self) -> Result<Self::ReturnType, RustCallError> {
+        Ok(<Self as Lower<UT>>::lower(value))
+    }
+}
 
 /// Marker trait for values that can be stored in a UniFFI Rust stream registry.
 ///
@@ -161,7 +249,7 @@ pub struct RustStreamNext<T, E> {
 impl<T, E> Unpin for RustStreamNext<T, E> {}
 
 impl<T, E> Future for RustStreamNext<T, E> {
-    type Output = Result<Result<Option<T>, E>, LiftArgsError>;
+    type Output = Result<UniFfiStreamStep<T, E>, LiftArgsError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(message) = self.start_error.take() {
@@ -176,7 +264,7 @@ impl<T, E> Future for RustStreamNext<T, E> {
         }
 
         let Some(owner) = self.owner.as_ref().cloned() else {
-            return Poll::Ready(Ok(Ok(None)));
+            return Poll::Ready(Ok(UniFfiStreamStep::Done));
         };
 
         // Publish the current task waker before polling user code.  cancel()
@@ -213,7 +301,7 @@ impl<T, E> Future for RustStreamNext<T, E> {
             self.owner = None;
             let inner = self.inner.take();
             drop(inner);
-            return Poll::Ready(Ok(Ok(None)));
+            return Poll::Ready(Ok(UniFfiStreamStep::Done));
         }
 
         // The stream is owned by this future, so user poll code runs without
@@ -233,7 +321,7 @@ impl<T, E> Future for RustStreamNext<T, E> {
                     self.owner = None;
                     let inner = self.inner.take();
                     drop(inner);
-                    Poll::Ready(Ok(Ok(None)))
+                    Poll::Ready(Ok(UniFfiStreamStep::Done))
                 } else {
                     Poll::Pending
                 }
@@ -262,18 +350,18 @@ impl<T, E> Future for RustStreamNext<T, E> {
                 self.active = false;
                 self.owner = None;
                 if closed {
-                    Poll::Ready(Ok(Ok(None)))
+                    Poll::Ready(Ok(UniFfiStreamStep::Done))
                 } else {
-                    Poll::Ready(Ok(Ok(Some(value))))
+                    Poll::Ready(Ok(UniFfiStreamStep::Item(value)))
                 }
             }
             Poll::Ready(Some(Err(error))) => {
                 self.finish_terminal(&owner);
-                Poll::Ready(Ok(Err(error)))
+                Poll::Ready(Ok(UniFfiStreamStep::Error(error)))
             }
             Poll::Ready(None) => {
                 self.finish_terminal(&owner);
-                Poll::Ready(Ok(Ok(None)))
+                Poll::Ready(Ok(UniFfiStreamStep::Done))
             }
         }
     }
@@ -363,7 +451,7 @@ pub fn rust_stream_next<T, E, UT>(
 where
     T: UniffiCompatibleStreamValue,
     E: UniffiCompatibleStreamValue,
-    Result<Option<T>, E>: FutureLowerReturn<UT> + 'static,
+    UniFfiStreamStep<T, E>: FutureLowerReturn<UT> + 'static,
 {
     let stream = registry.lock().unwrap().get(&handle.as_raw()).cloned();
     let future = RustStreamRegistryNext {
@@ -379,7 +467,7 @@ where
 pub async fn rust_stream_next_async<T, E>(
     registry: &'static RustStreamRegistry<T, E>,
     handle: Handle,
-) -> Result<Result<Option<T>, E>, LiftArgsError>
+) -> Result<UniFfiStreamStep<T, E>, LiftArgsError>
 where
     T: UniffiCompatibleStreamValue,
     E: UniffiCompatibleStreamValue,
@@ -413,17 +501,20 @@ struct RustStreamRegistryNext<T: 'static, E: 'static> {
 impl<T, E> Unpin for RustStreamRegistryNext<T, E> {}
 
 impl<T, E> Future for RustStreamRegistryNext<T, E> {
-    type Output = Result<Result<Option<T>, E>, LiftArgsError>;
+    type Output = Result<UniFfiStreamStep<T, E>, LiftArgsError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let Some(inner) = &mut self.inner else {
-            return Poll::Ready(Ok(Ok(None)));
+            return Poll::Ready(Ok(UniFfiStreamStep::Done));
         };
 
         match Pin::new(inner).poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(output) => {
-                if matches!(output, Ok(Ok(None)) | Ok(Err(_))) {
+                if matches!(
+                    &output,
+                    Ok(UniFfiStreamStep::Done | UniFfiStreamStep::Error(_))
+                ) {
                     let removed = { self.registry.lock().unwrap().remove(&self.handle) };
                     drop(removed);
                 }
@@ -437,7 +528,7 @@ impl<T, E> Future for RustStreamRegistryNext<T, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Lower;
+    use crate::{Lift, Lower};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{mpsc, Barrier, Weak};
     use std::task::{Wake, Waker};
@@ -607,22 +698,55 @@ mod tests {
     }
 
     #[test]
-    fn stream_next_outer_option_tag_preserves_optional_items_and_errors() {
-        // `None` is Done. `Some(None)` is a yielded Optional item, so the
-        // outer and inner Option discriminators must remain independently
-        // visible to bindings that lift the RustBuffer.
+    fn stream_step_tags_preserve_optional_items_and_typed_errors() {
+        // A stream step has its own discriminator. `Item(None)` retains the
+        // nested Optional tag and can never be confused with `Done`.
         assert_eq!(
-            <Option<Option<u32>> as Lower<crate::UniFfiTag>>::lower(None).destroy_into_vec(),
-            vec![0]
+            <UniFfiStreamStep<Option<u32>, String> as Lower<crate::UniFfiTag>>::lower(
+                UniFfiStreamStep::Done,
+            )
+            .destroy_into_vec(),
+            vec![UNIFFI_STREAM_STEP_DONE_TAG]
         );
         assert_eq!(
-            <Option<Option<u32>> as Lower<crate::UniFfiTag>>::lower(Some(None)).destroy_into_vec(),
-            vec![1, 0]
+            <UniFfiStreamStep<Option<u32>, String> as Lower<crate::UniFfiTag>>::lower(
+                UniFfiStreamStep::Item(None),
+            )
+            .destroy_into_vec(),
+            vec![UNIFFI_STREAM_STEP_ITEM_TAG, 0]
         );
         assert_eq!(
-            <Option<Option<u32>> as Lower<crate::UniFfiTag>>::lower(Some(Some(1)))
-                .destroy_into_vec(),
-            vec![1, 1, 0, 0, 0, 1]
+            <UniFfiStreamStep<Option<u32>, String> as Lower<crate::UniFfiTag>>::lower(
+                UniFfiStreamStep::Item(Some(1)),
+            )
+            .destroy_into_vec(),
+            vec![UNIFFI_STREAM_STEP_ITEM_TAG, 1, 0, 0, 0, 1]
+        );
+        let encoded_error =
+            <UniFfiStreamStep<Option<u32>, String> as Lower<crate::UniFfiTag>>::lower(
+                UniFfiStreamStep::Error("boom".to_owned()),
+            );
+        assert_eq!(
+            <UniFfiStreamStep<Option<u32>, String> as Lift<crate::UniFfiTag>>::try_lift(
+                encoded_error,
+            )
+            .unwrap(),
+            UniFfiStreamStep::Error("boom".to_owned())
+        );
+        assert!(
+            <UniFfiStreamStep<Option<u32>, String> as Lift<crate::UniFfiTag>>::try_lift(
+                RustBuffer::from_vec(vec![0]),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected UniFFI output stream step tag")
+        );
+        assert!(
+            <UniFfiStreamStep<Option<u32>, String> as Lift<crate::UniFfiTag>>::try_lift(
+                RustBuffer::from_vec(vec![UNIFFI_STREAM_STEP_DONE_TAG, 0]),
+            )
+            .is_err(),
+            "Done must reject a payload rather than accepting a nullable EOF fallback"
         );
 
         let handle = rust_stream_new(
@@ -642,15 +766,15 @@ mod tests {
         ));
         assert!(matches!(
             first.as_mut().poll(&mut cx),
-            Poll::Ready(Ok(Ok(Some(Some(1)))))
+            Poll::Ready(Ok(UniFfiStreamStep::Item(Some(1))))
         ));
-        let mut nullable_item = Box::pin(rust_stream_next_async(
+        let mut optional_item = Box::pin(rust_stream_next_async(
             &OPTIONAL_STREAM_REGISTRY,
             handle.clone(),
         ));
         assert!(matches!(
-            nullable_item.as_mut().poll(&mut cx),
-            Poll::Ready(Ok(Ok(Some(None))))
+            optional_item.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(UniFfiStreamStep::Item(None)))
         ));
         let mut error = Box::pin(rust_stream_next_async(
             &OPTIONAL_STREAM_REGISTRY,
@@ -658,7 +782,7 @@ mod tests {
         ));
         assert!(matches!(
             error.as_mut().poll(&mut cx),
-            Poll::Ready(Ok(Err(message))) if message == "boom"
+            Poll::Ready(Ok(UniFfiStreamStep::Error(message))) if message == "boom"
         ));
         assert!(
             !OPTIONAL_STREAM_REGISTRY
@@ -670,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_pending_next_wakes_and_completes_eof() {
+    fn cancelling_pending_next_wakes_and_completes_done() {
         let handle = rust_stream_new(&PENDING_REGISTRY, Box::pin(AlwaysPending));
         let mut next = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, handle.clone()));
         let counter = Arc::new(WakeCounter::default());
@@ -682,7 +806,7 @@ mod tests {
         assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 1);
         assert!(matches!(
             next.as_mut().poll(&mut cx),
-            Poll::Ready(Ok(Ok(None)))
+            Poll::Ready(Ok(UniFfiStreamStep::Done))
         ));
         assert!(!PENDING_REGISTRY
             .lock()
@@ -717,7 +841,7 @@ mod tests {
         assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 1);
         assert!(matches!(
             first.as_mut().poll(&mut cx),
-            Poll::Ready(Ok(Ok(None)))
+            Poll::Ready(Ok(UniFfiStreamStep::Done))
         ));
         assert!(!PENDING_REGISTRY
             .lock()
@@ -739,7 +863,7 @@ mod tests {
         assert_eq!(available.load(AtomicOrdering::SeqCst), 1);
         assert!(matches!(
             next.as_mut().poll(&mut cx),
-            Poll::Ready(Ok(Ok(None)))
+            Poll::Ready(Ok(UniFfiStreamStep::Done))
         ));
     }
 
@@ -759,7 +883,7 @@ mod tests {
             assert_eq!(wake_calls.load(AtomicOrdering::SeqCst), 1);
             assert!(matches!(
                 next.as_mut().poll(&mut cx),
-                Poll::Ready(Ok(Ok(None)))
+                Poll::Ready(Ok(UniFfiStreamStep::Done))
             ));
 
             let owner = Arc::new(RustStream::new(Box::pin(AlwaysPending)));
@@ -777,7 +901,7 @@ mod tests {
             let mut cx = Context::from_waker(waker);
             assert!(matches!(
                 next.as_mut().poll(&mut cx),
-                Poll::Ready(Ok(Ok(None)))
+                Poll::Ready(Ok(UniFfiStreamStep::Done))
             ));
             assert_eq!(drop_calls.load(AtomicOrdering::SeqCst), 1);
         });
@@ -800,7 +924,7 @@ mod tests {
             let mut cx = Context::from_waker(waker);
             assert!(matches!(
                 next.as_mut().poll(&mut cx),
-                Poll::Ready(Ok(Ok(None)))
+                Poll::Ready(Ok(UniFfiStreamStep::Done))
             ));
             assert_eq!(poll_calls.load(AtomicOrdering::SeqCst), 1);
             assert_eq!(drop_calls.load(AtomicOrdering::SeqCst), 1);
@@ -823,7 +947,7 @@ mod tests {
             let mut cx = Context::from_waker(waker);
             assert!(matches!(
                 next.as_mut().poll(&mut cx),
-                Poll::Ready(Ok(Ok(None)))
+                Poll::Ready(Ok(UniFfiStreamStep::Done))
             ));
             assert!(!PENDING_REGISTRY
                 .lock()
@@ -844,7 +968,7 @@ mod tests {
         let mut cx = Context::from_waker(waker);
         assert!(matches!(
             next.as_mut().poll(&mut cx),
-            Poll::Ready(Ok(Ok(None)))
+            Poll::Ready(Ok(UniFfiStreamStep::Done))
         ));
 
         let dropped = rust_stream_new(&PENDING_REGISTRY, Box::pin(AlwaysPending));
@@ -856,7 +980,7 @@ mod tests {
         rust_stream_cancel(&PENDING_REGISTRY, dropped);
         assert!(matches!(
             second.as_mut().poll(&mut cx),
-            Poll::Ready(Ok(Ok(None)))
+            Poll::Ready(Ok(UniFfiStreamStep::Done))
         ));
     }
 
@@ -889,10 +1013,10 @@ mod tests {
                         .unwrap();
                     assert!(matches!(
                         next.as_mut().poll(&mut cx),
-                        Poll::Ready(Ok(Ok(None)))
+                        Poll::Ready(Ok(UniFfiStreamStep::Done))
                     ));
                 }
-                Poll::Ready(Ok(Ok(None))) => {
+                Poll::Ready(Ok(UniFfiStreamStep::Done)) => {
                     // Cancellation won the race while user poll code was
                     // gated, so this very poll observed Closed and settled.
                     first_poll_sender.send(true).unwrap();

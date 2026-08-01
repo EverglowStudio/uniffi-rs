@@ -4,6 +4,7 @@ fileprivate enum UniffiInternalError: LocalizedError {
     case bufferOverflow
     case incompleteData
     case unexpectedOptionalTag
+    case unexpectedStreamStepTag
     case unexpectedEnumCase
     case unexpectedNullPointer
     case unexpectedRustCallStatusCode
@@ -18,6 +19,7 @@ fileprivate enum UniffiInternalError: LocalizedError {
         case .bufferOverflow: return "Reading the requested value would read past the end of the buffer"
         case .incompleteData: return "The buffer still has data after lifting its containing value"
         case .unexpectedOptionalTag: return "Unexpected optional tag; should be 0 or 1"
+        case .unexpectedStreamStepTag: return "Unexpected output stream step tag; should be 1, 2, or 3"
         case .unexpectedEnumCase: return "Raw enum value doesn't match any cases"
         case .unexpectedNullPointer: return "Raw pointer value was null"
         case .unexpectedRustCallStatusCode: return "Unexpected RustCallStatus code"

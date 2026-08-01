@@ -25,18 +25,8 @@ pub fn ffi_definitions(
             context,
         )?;
         ffi_definitions.push(ffi_def);
-        if let Some(Type::Stream {
-            item_type,
-            error_type: _,
-            ..
-        }) = func.return_type.as_ref()
-        {
-            ffi_definitions.extend(stream_ffi_defs(
-                &crate_name,
-                &func.name,
-                item_type,
-                context,
-            )?);
+        if matches!(func.return_type.as_ref(), Some(Type::Stream { .. })) {
+            ffi_definitions.extend(stream_ffi_defs(&crate_name, &func.name, context)?);
         }
         Ok(())
     })?;
@@ -95,15 +85,15 @@ pub fn ffi_definitions(
 fn stream_ffi_defs(
     crate_name: &str,
     func_name: &str,
-    item_type: &Type,
     context: &Context,
 ) -> Result<Vec<FfiDefinition>> {
     let next_name = uniffi_meta::fn_stream_next_symbol_name(crate_name, func_name);
     let cancel_name = uniffi_meta::fn_stream_cancel_symbol_name(crate_name, func_name);
-    let next_return_type = Type::Optional {
-        inner_type: Box::new(item_type.clone()),
-    };
-    let next_ffi_return_type = ffi_types::ffi_type(&next_return_type, context)?;
+    // Output stream pulls always complete a RustBuffer containing one strict
+    // `UniFfiStreamStep::{Item, Done, Error}`.  This is deliberately not the
+    // item type's Optional FFI representation: an optional item is payload,
+    // while completion has its own step tag.
+    let next_ffi_return_type = FfiType::RustBuffer(None);
     Ok(vec![
         FfiDefinition::RustFunction(FfiFunction {
             name: RustFfiFunctionName(next_name),
@@ -259,6 +249,24 @@ mod tests {
             matches!(ffi_arg.ty, FfiType::RustBuffer(None)),
             "expected RustBuffer(None), got {:?}",
             ffi_arg.ty
+        );
+    }
+
+    #[test]
+    fn output_stream_next_uses_the_strict_step_rust_buffer_future() {
+        let mut context = Context::new("stream_core");
+        context.current_crate_name = Some("stream_core".to_owned());
+        let definitions = stream_ffi_defs("stream_core", "events", &context).unwrap();
+        let FfiDefinition::RustFunction(next) = &definitions[0] else {
+            panic!("stream next definition was not a Rust function");
+        };
+        let async_data = next
+            .async_data
+            .as_ref()
+            .expect("stream next must remain an async Rust future");
+        assert_eq!(
+            async_data.ffi_rust_future_complete.0,
+            "ffi_stream_core_rust_future_complete_rust_buffer"
         );
     }
 }
