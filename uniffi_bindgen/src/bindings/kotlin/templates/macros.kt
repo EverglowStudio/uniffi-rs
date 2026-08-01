@@ -77,12 +77,9 @@
     {{ func_decl }} fun {{ callable.name()|fn_name }}(
         {%- call arg_list(callable, callable.self_type().is_none()) %}{% endcall -%}
     ) : {{ callable.return_type().unwrap()|type_name(ci) }} {
-        val __streamConsumed = AtomicBoolean(false)
-        return flow {
-            if (!__streamConsumed.compareAndSet(false, true)) {
-                throw InternalException("UniFFI output streams may only be consumed once")
-            }
+        return UniFfiStream {
             val __streamHandle = {% call to_ffi_call(callable) %}{% endcall %}
+            var __streamFailure: Throwable? = null
             try {
                 while (true) {
                     val __streamNext = uniffiRustCallAsync(
@@ -103,8 +100,19 @@
                         is __UniffiStreamNext.Error -> throw __streamNext.error
                     }
                 }
+            } catch (__streamError: Throwable) {
+                __streamFailure = __streamError
+                throw __streamError
             } finally {
-                UniffiLib.{{ callable.ffi_stream_cancel_func() }}(__streamHandle)
+                try {
+                    UniffiLib.{{ callable.ffi_stream_cancel_func() }}(__streamHandle)
+                } catch (__streamCleanupError: Throwable) {
+                    val __streamOriginalError = __streamFailure
+                    if (__streamOriginalError == null) {
+                        throw __streamCleanupError
+                    }
+                    __streamOriginalError.addSuppressed(__streamCleanupError)
+                }
             }
         }
     }
@@ -200,19 +208,19 @@ v{{- field_num -}}
 {%- endif -%}
 {%- endmacro %}
 
-{% macro field_name_unquoted(field, field_num) %}
-{%- if field.name().is_empty() -%}
-v{{- field_num -}}
-{%- else -%}
-{{ field.name()|var_name|unquote }}
-{%- endif -%}
-{%- endmacro %}
-
  // Macro for destroying fields
 {%- macro destroy_fields(member) %}
     Disposable.destroy(
     {%- for field in member.fields() %}
         this.{%- call field_name(field, loop.index) %}{% endcall -%}{% if loop.last %}{% else %},{% endif -%}
+    {%- endfor %}
+    )
+{%- endmacro -%}
+
+{%- macro destroy_error_fields(member) %}
+    Disposable.destroy(
+    {%- for field in member.fields() %}
+        this.{{ field|error_field_name(member, loop.index) }}{% if loop.last %}{% else %},{% endif -%}
     {%- endfor %}
     )
 {%- endmacro -%}
