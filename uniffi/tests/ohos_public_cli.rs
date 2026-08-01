@@ -1208,10 +1208,11 @@ fn static_stream_host_command(
 
 fn stream_api_snapshot(dist: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     [
+        "Index.ets",
         "Index.d.ets",
         "harmony-facade-contract.json",
+        "native-facade.d.ts",
         "native-facade.ets",
-        "package-index.ets",
     ]
     .into_iter()
     .map(|name| (PathBuf::from(name), std::fs::read(dist.join(name)).unwrap()))
@@ -2485,14 +2486,10 @@ export default class EntryAbility extends UIAbility {
   CounterObject,
   CounterObserver,
   CounterSignal,
-  StreamError,
-  UniFfiStream,
-  UniFfiStreamErrorData
+  UniFfiStream
 }} from '{package_name}';
 import {{
-  CountEventsEventsStream,
   add,
-  countEventsEvents,
   countEventsStream
 }} from '{package_name}';
 
@@ -2511,14 +2508,6 @@ const OBSERVER: CounterObserver = new ConsumerObserver();
 OBSERVER.observe?.(SIGNAL);
 const PULL: UniFfiStream<CounterEvent> = countEventsStream(EVENT.value);
 PULL.cancel();
-const EVENTS: CountEventsEventsStream = countEventsEvents(2);
-EVENTS.on('error', (error: BusinessError<UniFfiStreamErrorData<StreamError>>): void => {{
-  console.error(`UNIFFI_PUBLIC_HSP_ERROR:${{error.data?.errorType}}`);
-}});
-EVENTS.on('done', (): void => {{
-  console.info(`UNIFFI_PUBLIC_HSP_DONE:${{RESULT}}`);
-}});
-EVENTS.start();
 
 @Entry
 @Component
@@ -2896,6 +2885,21 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
 
     let interface_files = targz_files(&interface_bytes, true);
     assert!(interface_files.keys().all(|name| !name.ends_with(".so")));
+    assert!(!interface_files.contains_key("package/harmony-facade-contract.json"));
+    let internal_contracts = interface_files
+        .iter()
+        .filter(|(path, _)| {
+            path.starts_with("package/src/main/cpp/types/")
+                && path.ends_with("/harmony-facade-contract.json")
+        })
+        .collect::<Vec<_>>();
+    let [(_, internal_contract)] = internal_contracts.as_slice() else {
+        panic!(
+            "Interface HAR must retain exactly one internal native facade contract, found {}",
+            internal_contracts.len()
+        );
+    };
+    assert_eq!(internal_contract.as_slice(), facade_contract.as_slice());
     let interface_package: serde_json::Value =
         serde_json::from_slice(interface_files.get("package/oh-package.json5").unwrap()).unwrap();
     assert_eq!(interface_package["packageType"], "InterfaceHar");
@@ -2908,17 +2912,28 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         "CounterObject",
         "CounterObserver",
         "CounterSignal",
-        "CountEventsEventsStream",
         "StreamError",
         "UniFfiStream",
+        "UniFfiStreamResult",
+        "UniFfiStreamFailure",
+        "countEventsStream",
+    ] {
+        assert!(
+            declarations.contains(public_symbol),
+            "Interface HAR root declarations do not expose {public_symbol}"
+        );
+    }
+    for private_or_removed_symbol in [
+        "CountEventsEventsStream",
         "UniFfiStreamErrorData",
+        "UniFfiStreamBusinessError",
         "countEventsEvents",
         "uniffiHarmonyFacadeContract",
         "UNIFFI_HARMONY_FACADE_CONTRACT_SHA256",
     ] {
         assert!(
-            declarations.contains(public_symbol),
-            "Interface HAR root declarations do not expose {public_symbol}"
+            !declarations.contains(private_or_removed_symbol),
+            "Interface HAR root declarations leak {private_or_removed_symbol}"
         );
     }
 
@@ -3773,23 +3788,54 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
     assert_eq!(manifest_json["artifacts"]["harmony"]["kind"], "dist");
     let dist = harmony.join("dist");
     let facade = std::fs::read_to_string(dist.join("native-facade.ets")).unwrap();
+    let native_declarations = std::fs::read_to_string(dist.join("native-facade.d.ts")).unwrap();
     let declarations = std::fs::read_to_string(dist.join("Index.d.ets")).unwrap();
-    let package_index = std::fs::read_to_string(dist.join("package-index.ets")).unwrap();
+    let package_index = std::fs::read_to_string(dist.join("Index.ets")).unwrap();
     let contract: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dist.join("harmony-facade-contract.json")).unwrap())
             .unwrap();
-    assert!(facade.contains("export function countEventsEvents"));
-    assert!(facade.contains("export function echoEventsEvents"));
+    assert!(facade.contains("countEventsStream"));
+    assert!(facade.contains("echoEventsStream"));
+    assert!(!facade.contains("export function countEventsStream"));
+    assert!(!facade.contains("export function echoEventsStream"));
+    assert!(native_declarations.contains("function countEvents("));
+    assert!(native_declarations.contains("function countEventsStreamNext("));
+    assert!(!declarations.contains("countEventsStreamNext"));
+    assert!(!declarations.contains("countEvents("));
     assert!(declarations.contains("export interface __UniffiInputStream<T>"));
-    assert_eq!(contract["schemaVersion"], 3);
+    assert_eq!(contract["schemaVersion"], 4);
     assert!(contract["hostCompositeIdentity"]
         .as_str()
         .is_some_and(|value| value.len() == 64));
     assert_eq!(contract["componentIdentities"].as_array().unwrap().len(), 1);
     for public_source in [&facade, &declarations, &package_index] {
         assert!(!public_source.contains("uniffiohosbridgeidentity"));
+        assert!(!public_source.contains("EventsStream"));
+        assert!(!public_source.contains("countEventsEvents"));
     }
     assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 6);
+    for output in contract["outputStreams"].as_array().unwrap() {
+        let fields = output
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "arguments",
+            "cancelFunction",
+            "errorType",
+            "function",
+            "itemType",
+            "nextFunction",
+            "pullClass",
+            "stepType",
+            "streamFactory",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(fields, expected);
+    }
     assert_eq!(contract["inputStreams"].as_array().unwrap().len(), 2);
     let input_factory = contract["inputStreams"][0]["factory"].as_str().unwrap();
     assert!(facade.contains(&format!("export function {input_factory}")));
@@ -3907,8 +3953,10 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
     );
     assert_eq!(stream_api_snapshot(&static_dist), first_api);
     let facade = std::fs::read_to_string(static_dist.join("native-facade.ets")).unwrap();
-    assert!(facade.contains("countEventsEvents"));
-    assert!(facade.contains("echoEventsEvents"));
+    assert!(facade.contains("countEventsStream"));
+    assert!(facade.contains("echoEventsStream"));
+    assert!(!facade.contains("countEventsEvents"));
+    assert!(!facade.contains("echoEventsEvents"));
 
     // Without --dts-cache there is intentionally no persistent raw type
     // source to reuse. Each invocation must give Cargo a new owned output
@@ -3955,8 +4003,10 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
     );
     assert_eq!(stream_api_snapshot(&no_cache_dist), first_no_cache_api);
     let no_cache_facade = std::fs::read_to_string(no_cache_dist.join("native-facade.ets")).unwrap();
-    assert!(no_cache_facade.contains("countEventsEvents"));
-    assert!(no_cache_facade.contains("echoEventsEvents"));
+    assert!(no_cache_facade.contains("countEventsStream"));
+    assert!(no_cache_facade.contains("echoEventsStream"));
+    assert!(!no_cache_facade.contains("countEventsEvents"));
+    assert!(!no_cache_facade.contains("echoEventsEvents"));
 
     // Exercise the opposite cache transition on an isolated target: a
     // no-cache invocation followed by opt-in cache must rebuild into the

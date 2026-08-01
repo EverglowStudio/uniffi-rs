@@ -880,7 +880,7 @@ node_modules/\n\
                 "node": if targets.node { serde_json::Value::String("src/index.node.ts".to_string()) } else { serde_json::Value::Null },
                 "electron": if targets.electron { serde_json::Value::String("src/index.electron.ts".to_string()) } else { serde_json::Value::Null },
                 "harmony": if targets.harmony {
-                    serde_json::Value::String(self.rel(&self.artifact_root.join(if args.ohos_no_har { "harmony/dist/package-index.ets" } else { "harmony/package/Index.ets" }))?)
+                    serde_json::Value::String(self.rel(&self.artifact_root.join(if args.ohos_no_har { "harmony/dist/Index.ets" } else { "harmony/package/Index.ets" }))?)
                 } else { serde_json::Value::Null },
             },
             "artifacts": {
@@ -922,7 +922,7 @@ node_modules/\n\
                         "facade": self.rel(&self.artifact_root.join("harmony/dist/native-facade.ets"))?,
                         "facadeContract": self.rel(&self.artifact_root.join("harmony/dist/harmony-facade-contract.json"))?,
                         "packageFacadeContract": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/harmony-facade-contract.json"))?) },
-                        "types": self.rel(&self.artifact_root.join("harmony/dist/index.d.ts"))?,
+                        "types": self.rel(&self.artifact_root.join("harmony/dist/native-facade.d.ts"))?,
                         "package": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package"))?) },
                         "moduleProject": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/module-project"))?) } else { serde_json::Value::Null },
                         "moduleSource": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/module-project/library"))?) } else { serde_json::Value::Null },

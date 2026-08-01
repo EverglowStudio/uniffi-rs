@@ -3056,7 +3056,7 @@ fn write_fake_dist(root: &Utf8Path, lib_target_name: &str) -> Utf8PathBuf {
     let native = native_lib_filename(lib_target_name);
     std::fs::create_dir_all(dist.join("arm64-v8a")).unwrap();
     std::fs::write(
-        dist.join("index.d.ts"),
+        dist.join("native-facade.d.ts"),
         "export declare function welcomeAgent(name: string): string;\n",
     )
     .unwrap();
@@ -3073,13 +3073,13 @@ fn write_fake_dist(root: &Utf8Path, lib_target_name: &str) -> Utf8PathBuf {
         )
         .unwrap();
     std::fs::write(
-            dist.join("package-index.ets"),
-            "export { welcomeAgent } from \"./src/main/ets/native\";\nexport { default } from \"./src/main/ets/native\";\n",
+            dist.join("Index.ets"),
+            "export { welcomeAgent } from \"./src/main/ets/native-facade\";\nexport { default } from \"./src/main/ets/native-facade\";\n",
         )
         .unwrap();
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"schemaVersion\":3,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"schemaVersion\":4,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
     )
     .unwrap();
     std::fs::write(dist.join("arm64-v8a").join(native), "fake").unwrap();
@@ -3089,7 +3089,7 @@ fn write_fake_dist(root: &Utf8Path, lib_target_name: &str) -> Utf8PathBuf {
 fn write_invocation_dist(dist: &Utf8Path, arches: &[&str], with_native: bool) -> Result<()> {
     std::fs::create_dir_all(dist)?;
     std::fs::write(
-        dist.join("index.d.ts"),
+        dist.join("native-facade.d.ts"),
         "export declare function demo(): void;\n",
     )?;
     std::fs::write(
@@ -3101,12 +3101,12 @@ fn write_invocation_dist(dist: &Utf8Path, arches: &[&str], with_native: bool) ->
             "import native from \"libdemo_ohos.so\";\nexport const demo = native.demo;\nexport default native;\n",
         )?;
     std::fs::write(
-            dist.join("package-index.ets"),
-            "export { demo } from \"./src/main/ets/native\";\nexport { default } from \"./src/main/ets/native\";\n",
+            dist.join("Index.ets"),
+            "export { demo } from \"./src/main/ets/native-facade\";\nexport { default } from \"./src/main/ets/native-facade\";\n",
         )?;
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"schemaVersion\":3,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"schemaVersion\":4,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
     )?;
     if with_native {
         for arch in arches {
@@ -4098,7 +4098,11 @@ fn dist_inventory_rejects_hardlinked_generated_files() {
         write_invocation_dist(invocation, &["x86_64"], true)
     })
     .unwrap();
-    std::fs::hard_link(dist.join("index.d.ts"), root.join("external-link.d.ts")).unwrap();
+    std::fs::hard_link(
+        dist.join("native-facade.d.ts"),
+        root.join("external-link.d.ts"),
+    )
+    .unwrap();
     let before = regular_file_snapshot(&dist);
     assert!(build_package_dist_transactionally(&dist, |_| {
         panic!("hardlinked output must fail before build")
@@ -4229,8 +4233,8 @@ fn package_dist_transaction_isolates_abi_skip_libs_and_failed_sequences() {
     publish(&[], false).unwrap();
     let skipped = regular_file_snapshot(&dist);
     assert!(native_abis(&skipped).is_empty());
-    assert!(skipped.contains_key(Utf8Path::new("index.d.ts")));
-    assert!(skipped.contains_key(Utf8Path::new("package-index.ets")));
+    assert!(skipped.contains_key(Utf8Path::new("native-facade.d.ts")));
+    assert!(skipped.contains_key(Utf8Path::new("Index.ets")));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -4477,11 +4481,11 @@ fn renders_ohos_string_enum_as_literal_union() {
 
 #[test]
 fn preserves_original_napi_type_names_as_public_aliases() {
-    let json = r#"type_def:{"kind":"interface","name":"UniffiEventsStreamNext","original_name":"__UniffiEventsStreamNext","def":"done: boolean\\nvalue?: string","js_doc":null,"js_mod":null}"#;
+    let json = r#"type_def:{"kind":"interface","name":"UniffiOutputStreamStep","original_name":"__UniffiOutputStreamStep","def":"kind: string\\nvalue?: string\\nerror?: string","js_doc":null,"js_mod":null}"#;
     let def = parse_type_def_line(json).unwrap().unwrap();
     let rendered = render_index_d_ts(vec![def]);
-    assert!(rendered.contains("export interface UniffiEventsStreamNext"));
-    assert!(rendered.contains("export type __UniffiEventsStreamNext = UniffiEventsStreamNext;"));
+    assert!(rendered.contains("export interface UniffiOutputStreamStep"));
+    assert!(rendered.contains("export type __UniffiOutputStreamStep = UniffiOutputStreamStep;"));
 }
 
 #[test]
@@ -4632,7 +4636,7 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
             def(
                 "interface",
                 "FixtureNext",
-                "done: boolean\nvalue?: number\nerror?: string",
+                "kind: string\nvalue?: number\nerror?: string",
             ),
             def(
                 "fn",
@@ -4696,10 +4700,8 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
             next_function: format!("{function}StreamNext"),
             cancel_function: format!("{function}StreamCancel"),
             stream_factory: format!("{function}Stream"),
-            events_factory: format!("{function}Events"),
             pull_class: format!("{prefix}PullStream"),
-            events_class: format!("{prefix}EventsStream"),
-            next_type: "FixtureNext".into(),
+            step_type: "FixtureNext".into(),
             item_type: HarmonyTypeDescriptor::Number,
             error_type: HarmonyTypeDescriptor::String,
             arguments: args,
@@ -4736,26 +4738,37 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
 fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
     let (defs, contracts) = test_harmony_stream_contract();
     let exports = FacadeExports::from_type_defs_and_contracts(&defs, contracts).unwrap();
-    let facade = exports.render_native_facade("libfixture.so");
+    let contract_digest = "a".repeat(64);
+    let facade =
+        exports.render_native_facade_with_contract_digest("libfixture.so", Some(&contract_digest));
     let declarations = render_harmony_declaration_surfaces(&defs, &exports).package_public;
     let index = exports.render_package_index();
     let inventory = exports.render_contract_inventory().unwrap();
 
     for needle in [
-            "export function countEventsEvents(count: number): CountEventsEventsStream",
-            "export function countEventsStream(count: number): CountEventsPullStream",
-            "export function echoEventsEvents(events: NumberStringFingerprint8b30e3aa815a2f4aInputSource)",
+            "export function countEventsStream(count: number): UniFfiStream<number>",
+            "export function echoEventsStream(events: NumberStringFingerprint8b30e3aa815a2f4aInputSource): UniFfiStream<number>",
             "export function createNumberStringFingerprint8b30e3aa815a2f4aInputChannel()",
             "implements __UniffiInputStream<__UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext>",
             "readonly next = (_error: Error | null, handle: number)",
-            "result.error !== undefined && result.error !== null",
-            "result.error",
+            "private state: number = __UNIFFI_STREAM_IDLE",
+            "class __UniFfiStreamStep<T, E>",
+            "function __uniffiOutputStepHasOnly(rawKeys: Array<string>, payload: string | null)",
+            "__uniffiStrictOutputStep<number, string>(",
+            "const rawKeys: Array<string> = Object.keys(raw);",
+            "const __uniffiFacadeContractDigestValue: string = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            "__uniffiFacadeContractDigest();",
+            "protected startNative(): bigint",
+            "const raw: FixtureNext = await native.countEventsStreamNext(handle);",
+            "raw stream step must be item, done, or error",
         ] {
             assert!(facade.contains(needle), "missing `{needle}` in:\n{facade}");
         }
     for needle in [
-        "on(type: 'data', callback: Callback<number>): void",
-        "ErrorCallback<BusinessError<UniFfiStreamErrorData<string>>>",
+        "export interface UniFfiStreamResult<T>",
+        "export interface UniFfiStream<T>",
+        "export declare class UniFfiStreamFailure<E> extends Error {\n  nativeError: E;",
+        "export declare function countEventsStream(count: number): UniFfiStream<number>",
         "write(item: number): Promise<void>",
         "fail(error: UniFfiInputFailure<string>): void",
     ] {
@@ -4765,10 +4778,10 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
         );
     }
     for name in [
-        "countEventsEvents",
         "countEventsStream",
-        "echoEventsEvents",
+        "echoEventsStream",
         "createNumberStringFingerprint8b30e3aa815a2f4aInputChannel",
+        "UniFfiStreamFailure",
     ] {
         assert!(
             index.contains(name),
@@ -4784,17 +4797,14 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
         "echoEventsStreamCancel",
     ] {
         assert!(
-            facade.contains(&format!("export const {raw}:")),
-            "native facade must retain output raw `{raw}`:\n{facade}"
-        );
-        assert!(
             inventory.contains(raw),
             "contract inventory must retain output raw `{raw}`:\n{inventory}"
         );
         assert!(
-            !index.contains(&format!("  {raw},\n"))
+            !facade.contains(&format!("export const {raw}:"))
+                && !index.contains(&format!("  {raw},\n"))
                 && !declarations.contains(&format!("function {raw}(")),
-            "package root must hide output raw `{raw}`:\nindex:\n{index}\ndeclarations:\n{declarations}"
+            "public and adapter exports must hide output raw `{raw}`:\nfacade:\n{facade}\nindex:\n{index}\ndeclarations:\n{declarations}"
         );
     }
     for raw_type in ["FixtureNext", "__FixtureNext"] {
@@ -4807,39 +4817,57 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
             "package root must hide output next envelope `{raw_type}` and its aliases:\nindex:\n{index}\ndeclarations:\n{declarations}"
         );
     }
-    let events_start = facade
-        .find("export class CountEventsEventsStream")
-        .expect("generated Event class exists");
-    let events_end = facade[events_start..]
-        .find("export function countEventsEvents")
-        .map(|offset| events_start + offset)
-        .expect("generated Event factory exists");
-    let events = &facade[events_start..events_end];
-    assert!(events.contains("protected createPull(): UniFfiStream<number>"));
-    for forbidden in [
-        "startNative",
-        "nextNative",
-        "cancelNative",
-        "native.countEvents",
-        "native.countEventsStreamNext",
-        "native.countEventsStreamCancel",
-    ] {
+    for arkts_forbidden in ["unknown", "Object.prototype", ".call("] {
         assert!(
-            !events.contains(forbidden),
-            "Event adapter must delegate through Pull, found `{forbidden}`:\n{events}"
+            !facade.contains(arkts_forbidden),
+            "generated ArkTS contains unsupported dynamic runtime feature `{arkts_forbidden}`:\n{facade}"
         );
     }
+    assert!(
+        !facade.contains("export const __uniffiFacadeContractDigestValue")
+            && !index.contains("__uniffiFacadeContractDigest"),
+        "contract digest anchor must remain internal to native-facade.ets:\nfacade:\n{facade}\nindex:\n{index}"
+    );
     for forbidden in [
-        "AsyncIterable",
-        "Symbol.asyncIterator",
-        "function*",
-        "unknown",
+        "countEventsEvents",
+        "echoEventsEvents",
+        "CountEventsEventsStream",
+        "EchoEventsEventsStream",
+        "__UniFfiEventsStream",
+        "dataListeners",
+        "errorListeners",
+        "doneListeners",
+        ".on(",
+        ".off(",
     ] {
         assert!(
             !facade.contains(forbidden) && !declarations.contains(forbidden),
-            "generated ArkTS contains forbidden `{forbidden}`"
+            "generated ArkTS contains forbidden Event facade `{forbidden}`"
         );
     }
+    let inventory: Value = serde_json::from_str(&inventory).unwrap();
+    assert_eq!(inventory["schemaVersion"], FACADE_CONTRACT_SCHEMA_VERSION);
+    let output = &inventory["outputStreams"][0];
+    let fields = output
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fields,
+        BTreeSet::from([
+            "arguments".to_string(),
+            "cancelFunction".to_string(),
+            "errorType".to_string(),
+            "function".to_string(),
+            "itemType".to_string(),
+            "nextFunction".to_string(),
+            "pullClass".to_string(),
+            "stepType".to_string(),
+            "streamFactory".to_string(),
+        ])
+    );
     let last_import = facade
         .rfind("import ")
         .expect("facade must import native types");
@@ -4848,6 +4876,98 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
         last_import < first_export,
         "ArkTS requires every import before declarations and exports:\n{facade}"
     );
+}
+
+#[test]
+fn harmony_contract_digest_anchor_is_private_and_reachable_without_output_streams() {
+    let ordinary_defs = vec![TypeDefLine {
+        kind: "fn".into(),
+        name: "add".into(),
+        original_name: None,
+        def: "function add(left: number, right: number): number".into(),
+        js_doc: None,
+        js_mod: None,
+        extends: None,
+    }];
+    let ordinary = FacadeExports::from_type_defs_and_contracts(&ordinary_defs, Vec::new()).unwrap();
+    let ordinary_digest = "b".repeat(64);
+    let ordinary_facade =
+        ordinary.render_native_facade_with_contract_digest("libfixture.so", Some(&ordinary_digest));
+    let ordinary_declarations = render_harmony_declaration_surfaces(&ordinary_defs, &ordinary);
+    let ordinary_index = ordinary.render_package_index();
+    assert!(
+        ordinary_facade.contains(&ordinary_digest),
+        "{ordinary_facade}"
+    );
+    assert!(
+        ordinary_facade.contains("__uniffiFacadeContractDigest();"),
+        "{ordinary_facade}"
+    );
+    assert!(
+        ordinary_facade.contains("export const add:"),
+        "{ordinary_facade}"
+    );
+    assert!(
+        !ordinary_facade.contains("UniFfiStream"),
+        "zero-stream facades must not render the stream runtime:\n{ordinary_facade}"
+    );
+    for public_surface in [
+        ordinary_declarations.native.as_str(),
+        ordinary_declarations.package_public.as_str(),
+        ordinary_index.as_str(),
+    ] {
+        assert!(
+            !public_surface.contains("__uniffiFacadeContractDigest"),
+            "contract digest anchor escaped native-facade.ets:\n{public_surface}"
+        );
+    }
+
+    let (mut input_defs, mut input_contracts) = test_harmony_stream_contract();
+    input_contracts[0].output_streams.clear();
+    input_defs.retain(|def| {
+        !matches!(
+            def.name.as_str(),
+            "countEvents"
+                | "countEventsStreamNext"
+                | "countEventsStreamCancel"
+                | "echoEvents"
+                | "echoEventsStreamNext"
+                | "echoEventsStreamCancel"
+                | "FixtureNext"
+        )
+    });
+    let input_only =
+        FacadeExports::from_type_defs_and_contracts(&input_defs, input_contracts).unwrap();
+    let input_digest = "c".repeat(64);
+    let input_facade =
+        input_only.render_native_facade_with_contract_digest("libfixture.so", Some(&input_digest));
+    let input_declarations = render_harmony_declaration_surfaces(&input_defs, &input_only);
+    let input_index = input_only.render_package_index();
+    assert!(input_facade.contains(&input_digest), "{input_facade}");
+    assert!(
+        input_facade.contains("__uniffiFacadeContractDigest();"),
+        "{input_facade}"
+    );
+    assert!(
+        input_facade.contains("export class UniFfiInputFailure"),
+        "input-only facade did not render its input surface:\n{input_facade}"
+    );
+    assert!(
+        input_declarations.package_public.contains("InputChannel"),
+        "input-only public declaration disappeared:\n{}",
+        input_declarations.package_public
+    );
+    assert!(input_index.contains("InputChannel"), "{input_index}");
+    for public_surface in [
+        input_declarations.native.as_str(),
+        input_declarations.package_public.as_str(),
+        input_index.as_str(),
+    ] {
+        assert!(
+            !public_surface.contains("__uniffiFacadeContractDigest"),
+            "contract digest anchor escaped native-facade.ets:\n{public_surface}"
+        );
+    }
 }
 
 #[test]
@@ -4900,8 +5020,8 @@ fn native_declarations_retain_output_raw_contract_while_package_stays_public() {
     }
     for public in [
         "export declare function greeting(",
-        "export declare function countEventsEvents(",
-        "export declare function countEventsStream(",
+        "export declare class UniFfiStreamFailure<E> extends Error",
+        "export declare function countEventsStream(count: number): UniFfiStream<number>",
         "export declare function createNumberStringFingerprint8b30e3aa815a2f4aInputChannel()",
     ] {
         assert!(
@@ -4924,9 +5044,9 @@ fn harmony_stream_contract_rejects_missing_raw_export_and_public_collision() {
     let (mut defs, contracts) = test_harmony_stream_contract();
     defs.push(TypeDefLine {
         kind: "fn".into(),
-        name: "countEventsEvents".into(),
+        name: "countEventsStream".into(),
         original_name: None,
-        def: "function countEventsEvents(): void".into(),
+        def: "function countEventsStream(): void".into(),
         js_doc: None,
         js_mod: None,
         extends: None,
@@ -4935,7 +5055,7 @@ fn harmony_stream_contract_rejects_missing_raw_export_and_public_collision() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("collision") && error.contains("countEventsEvents"),
+        error.contains("collision") && error.contains("countEventsStream"),
         "{error}"
     );
 }
@@ -4968,7 +5088,7 @@ fn harmony_stream_contract_rejects_wrong_signatures_envelopes_and_duplicates() {
     defs.iter_mut()
         .find(|def| def.name == "FixtureNext")
         .unwrap()
-        .def = "done: boolean\nvalue?: string".into();
+        .def = "kind: string\nvalue?: string".into();
     let error = FacadeExports::from_type_defs_and_contracts(&defs, contracts)
         .unwrap_err()
         .to_string();
@@ -5195,6 +5315,49 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
 #[test]
 fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions() {
     let (_, contracts) = test_harmony_stream_contract();
+    let mut legacy_v3 = serde_json::to_value(&contracts[0]).unwrap();
+    legacy_v3["schemaVersion"] = Value::from(3);
+    let legacy_output = legacy_v3["outputStreams"][0].as_object_mut().unwrap();
+    let step_type = legacy_output.remove("stepType").unwrap();
+    legacy_output.insert("nextType".into(), step_type);
+    legacy_output.insert(
+        "eventsFactory".into(),
+        Value::String("countEventsEvents".into()),
+    );
+    legacy_output.insert(
+        "eventsClass".into(),
+        Value::String("CountEventsEventsStream".into()),
+    );
+    let error = format!(
+        "{:#}",
+        parse_harmony_facade_contract(&legacy_v3, Utf8Path::new("contract.json")).unwrap_err()
+    );
+    assert!(
+        error.contains("expected 4") && error.contains("got 3"),
+        "legacy v3 must fail before v4 shape parsing: {error}"
+    );
+
+    let mut non_integer_version = serde_json::to_value(&contracts[0]).unwrap();
+    non_integer_version["schemaVersion"] = Value::String("4".into());
+    let error = format!(
+        "{:#}",
+        parse_harmony_facade_contract(&non_integer_version, Utf8Path::new("contract.json"))
+            .unwrap_err()
+    );
+    assert!(error.contains("must be an integer"), "{error}");
+
+    let mut missing_v4_field = serde_json::to_value(&contracts[0]).unwrap();
+    missing_v4_field["outputStreams"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("stepType");
+    let error = format!(
+        "{:#}",
+        parse_harmony_facade_contract(&missing_v4_field, Utf8Path::new("contract.json"))
+            .unwrap_err()
+    );
+    assert!(error.contains("missing field"), "{error}");
+
     let mut unknown = serde_json::to_value(&contracts[0]).unwrap();
     unknown
         .as_object_mut()
@@ -5256,16 +5419,63 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
         .unwrap_err()
         .to_string();
     assert!(error.contains("value/type name collision"), "{error}");
+
+    for name in [
+        "UniFfiStreamFailure",
+        "__UNIFFI_STREAM_IDLE",
+        "__UniFfiStreamStep",
+        "__uniffiFacadeContractDigest",
+        "__uniffiFacadeContractDigestValue",
+        "__uniffiStreamProtocolError",
+        "__uniffiStrictOutputStep",
+    ] {
+        let (mut defs, contracts) = test_harmony_stream_contract();
+        defs.push(TypeDefLine {
+            kind: "interface".into(),
+            name: name.into(),
+            original_name: None,
+            def: "value: number".into(),
+            js_doc: None,
+            js_mod: None,
+            extends: None,
+        });
+        let error = FacadeExports::from_type_defs_and_contracts(&defs, contracts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(name) && error.contains("collision"),
+            "generated helper `{name}` was not reserved before rendering: {error}"
+        );
+    }
 }
 
 #[test]
 fn stream_argument_names_are_mangled_away_from_state_machine_members() {
     let (mut defs, mut contracts) = test_harmony_stream_contract();
+    let names = [
+        "handle",
+        "nextNative",
+        "cancelNative",
+        "source",
+        "state",
+        "hasHandle",
+        "pulling",
+        "cancelSent",
+        "cancelled",
+        "failure",
+    ];
     defs.iter_mut()
-            .find(|def| def.name == "countEvents")
-            .unwrap()
-            .def = "function countEvents(handle: number, nextNative: number, cancelNative: number, source: number): bigint".into();
-    contracts[0].output_streams[0].arguments = ["handle", "nextNative", "cancelNative", "source"]
+        .find(|def| def.name == "countEvents")
+        .unwrap()
+        .def = format!(
+        "function countEvents({}): bigint",
+        names
+            .iter()
+            .map(|name| format!("{name}: number"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    contracts[0].output_streams[0].arguments = names
         .into_iter()
         .map(|name| HarmonyFacadeArgument {
             name: name.into(),
@@ -5274,7 +5484,7 @@ fn stream_argument_names_are_mangled_away_from_state_machine_members() {
         .collect();
     let exports = FacadeExports::from_type_defs_and_contracts(&defs, contracts).unwrap();
     let facade = exports.render_native_facade("libfixture.so");
-    for index in 0..4 {
+    for index in 0..names.len() {
         assert!(
             facade.contains(&format!("private __arg{index}: number")),
             "{facade}"
@@ -5282,11 +5492,28 @@ fn stream_argument_names_are_mangled_away_from_state_machine_members() {
     }
     assert!(
         facade.contains(
-            "return new CountEventsPullStream(this.__arg0, this.__arg1, this.__arg2, this.__arg3)"
+            "return native.countEvents(this.__arg0, this.__arg1, this.__arg2, this.__arg3, this.__arg4, this.__arg5, this.__arg6, this.__arg7, this.__arg8, this.__arg9)"
         ),
         "{facade}"
     );
-    for name in ["handle", "nextNative", "cancelNative", "source"] {
+    assert!(
+        facade.contains(
+            "return new CountEventsPullStream(handle, nextNative, cancelNative, source, state, hasHandle, pulling, cancelSent, cancelled, failure)"
+        ),
+        "{facade}"
+    );
+    for member in [
+        "private state: number = __UNIFFI_STREAM_IDLE",
+        "private handle: bigint = 0n",
+        "private hasHandle: boolean = false",
+        "private pulling: boolean = false",
+        "private cancelSent: boolean = false",
+        "private cancelled: boolean = false",
+        "private failure: Error | null = null",
+    ] {
+        assert!(facade.contains(member), "missing `{member}` in:\n{facade}");
+    }
+    for name in names {
         assert!(
             !facade.contains(&format!("private {name}: number;")),
             "{facade}"
@@ -6766,19 +6993,22 @@ fn type_cache_rejects_symlink_root_and_hardlinked_owned_files() {
 fn harmony_stream_facade_runtime_state_machines() {
     let available = Command::new("node")
         .args(["--experimental-strip-types", "--eval", ""])
-        .output();
-    if !available.is_ok_and(|output| output.status.success()) {
-        eprintln!("skipping Harmony stream runtime test: Node strip-types unavailable");
-        return;
-    }
+        .output()
+        .expect("Node with --experimental-strip-types is required for the Harmony runtime test");
+    assert!(
+        available.status.success(),
+        "Node --experimental-strip-types is required for the Harmony runtime test\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&available.stdout),
+        String::from_utf8_lossy(&available.stderr)
+    );
 
     let (defs, contracts) = test_harmony_stream_contract();
     let mut exports = FacadeExports::from_type_defs_and_contracts(&defs, contracts).unwrap();
     exports.streams.native_types.clear();
     let mut facade = exports.render_native_facade("libfixture.so");
     let native_stub = r#"interface FixtureNext {
-  done: boolean;
-  value?: number;
+  kind: string;
+  value?: number | null;
   error?: string;
 }
 interface InputNext {
@@ -6794,58 +7024,56 @@ interface __UniffiInputStream<N> {
   cancel(error: Error | null, handle: number): void;
 }
 class __StubState {
-  values: Array<number> = new Array<number>();
-  calls: number = 0;
-  errorAt: number = 0;
-  syncThrow: boolean = false;
-  primitiveThrow: boolean = false;
-  primitiveReject: boolean = false;
-  neverSettles: boolean = false;
-  cancelThrows: boolean = false;
-  typedError: string | null = null;
-  matrixFailureKind: number = -1;
-  matrixPromiseReject: boolean = false;
+  values: Array<number | null> = new Array<number | null>();
+  pulls: number = 0;
+  typed: boolean = false;
+  malformed: boolean = false;
+  extraMalformedKind: string = '';
+  reject: boolean = false;
+  delayed: boolean = false;
   source: __UniffiInputStream<InputNext> | null = null;
 }
+const __typedError = { variant: 'StorageInvalidated', data: { generation: 7 }, message: 'typed failure' };
+const __startError: Error = new Error('start failure');
+let __startCancelCallback: (() => void) | null = null;
 let __nextHandle: bigint = 1n;
 let __startCalls: number = 0;
+let __nextCalls: number = 0;
 let __cancelCalls: number = 0;
 const __states: Map<bigint, __StubState> = new Map<bigint, __StubState>();
-function __matrixFailureReason(kind: number): Error | string | number | null | undefined {
-  if (kind === 0) return new Error('matrix error');
-  if (kind === 1) return 'matrix string';
-  if (kind === 2) return 42;
-  if (kind === 3) return null;
-  return undefined;
-}
 const native = {
   countEvents(count: number): bigint {
+    __startCalls += 1;
+    if (count === 82 || count === 83) {
+      if (__startCancelCallback !== null) {
+        __startCancelCallback();
+      }
+      if (count === 82) {
+        throw new Error('cancelled start failure');
+      }
+    }
+    if (count === 84) {
+      throw __startError;
+    }
     const handle: bigint = __nextHandle;
     __nextHandle += 1n;
-    __startCalls += 1;
     const state: __StubState = new __StubState();
-    if (count === 99) {
-      state.values.push(7);
-      state.errorAt = 2;
-    } else if (count === 88) {
-      state.syncThrow = true;
-    } else if (count === 87) {
-      state.primitiveThrow = true;
+    if (count === 98) {
+      state.typed = true;
+    } else if (count === 97) {
+      state.values.push(null);
     } else if (count === 86) {
-      state.primitiveReject = true;
+      state.malformed = true;
+    } else if (count === 87) {
+      state.extraMalformedKind = 'item';
+    } else if (count === 88) {
+      state.extraMalformedKind = 'done';
+    } else if (count === 89) {
+      state.extraMalformedKind = 'error';
     } else if (count === 85) {
-      state.neverSettles = true;
-    } else if (count === 66) {
-      state.cancelThrows = true;
-      state.values.push(1);
-    } else if (count === 98) {
-      state.typedError = 'StorageInvalidated';
-    } else if (count >= 100 && count < 105) {
-      state.matrixFailureKind = count - 100;
-    } else if (count >= 110 && count < 115) {
-      state.matrixFailureKind = count - 110;
-      state.matrixPromiseReject = true;
+      state.reject = true;
     } else {
+      state.delayed = count === 77;
       for (let index: number = 0; index < count; index += 1) {
         state.values.push(index);
       }
@@ -6854,42 +7082,36 @@ const native = {
     return handle;
   },
   countEventsStreamNext(handle: bigint): Promise<FixtureNext> {
+    __nextCalls += 1;
     const state: __StubState = __states.get(handle) as __StubState;
-    state.calls += 1;
-    if (state.syncThrow) {
-      throw new Error('fixture sync boom');
+    state.pulls += 1;
+    if (state.reject) {
+      return Promise.reject(new Error('adapter rejection'));
     }
-    if (state.primitiveThrow) {
-      throw 'fixture primitive sync boom';
+    if (state.malformed) {
+      return Promise.resolve({ kind: 'item', value: 1, error: 'extra' });
     }
-    if (state.primitiveReject) {
-      return Promise.reject('fixture primitive rejection');
+    if (state.extraMalformedKind === 'item') {
+      return Promise.resolve({ kind: 'item', value: 1, extra: true } as FixtureNext);
     }
-    if (state.neverSettles) {
-      return new Promise<FixtureNext>((_resolve): void => {});
+    if (state.extraMalformedKind === 'done') {
+      return Promise.resolve({ kind: 'done', extra: true } as FixtureNext);
     }
-    if (state.matrixFailureKind >= 0) {
-      const reason: Error | string | number | null | undefined =
-        __matrixFailureReason(state.matrixFailureKind);
-      if (state.matrixPromiseReject) {
-        return Promise.reject(reason);
-      }
-      throw reason;
+    if (state.extraMalformedKind === 'error') {
+      return Promise.resolve({ kind: 'error', error: 'extra', extra: true } as FixtureNext);
     }
-    if (state.errorAt === state.calls) {
-      return Promise.reject(new Error('fixture boom'));
+    if (state.typed) {
+      state.typed = false;
+      __states.delete(handle);
+      return Promise.resolve({ kind: 'error', error: __typedError as unknown as string });
     }
-    if (state.typedError !== null) {
-      const result: FixtureNext = { done: false, error: state.typedError };
-      state.typedError = null;
-      return Promise.resolve(result);
+    if (state.values.length === 0) {
+      __states.delete(handle);
+      return Promise.resolve({ kind: 'done' });
     }
-    const result: FixtureNext = { done: state.values.length === 0 };
-    if (!result.done) {
-      result.value = state.values[0];
-      state.values.splice(0, 1);
-    }
-    if (state.calls === 1 && state.values.length === 76) {
+    const result: FixtureNext = { kind: 'item', value: state.values[0] };
+    state.values.splice(0, 1);
+    if (state.delayed && state.pulls === 1) {
       return new Promise<FixtureNext>((resolve): void => {
         setTimeout((): void => resolve(result), 20);
       });
@@ -6898,33 +7120,31 @@ const native = {
   },
   countEventsStreamCancel(handle: bigint): void {
     __cancelCalls += 1;
-    const state: __StubState | undefined = __states.get(handle);
     __states.delete(handle);
-    if (state !== undefined && state.cancelThrows) {
-      throw new Error('fixture cancel boom');
-    }
   },
   echoEvents(source: __UniffiInputStream<InputNext>): bigint {
+    __startCalls += 1;
     const handle: bigint = __nextHandle;
     __nextHandle += 1n;
-    __startCalls += 1;
     const state: __StubState = new __StubState();
     state.source = source;
     __states.set(handle, state);
     return handle;
   },
   async echoEventsStreamNext(handle: bigint): Promise<FixtureNext> {
+    __nextCalls += 1;
     const state: __StubState = __states.get(handle) as __StubState;
     const source: __UniffiInputStream<InputNext> = state.source as __UniffiInputStream<InputNext>;
     const input: InputNext = await source.next(null, source.handle);
     if (!input.ok) {
-      throw new Error(`input:${input.error}`);
+      __states.delete(handle);
+      return { kind: 'error', error: input.error as string };
     }
-    const result: FixtureNext = { done: input.done === true };
-    if (!result.done) {
-      result.value = input.value;
+    if (input.done === true) {
+      __states.delete(handle);
+      return { kind: 'done' };
     }
-    return result;
+    return { kind: 'item', value: input.value };
   },
   echoEventsStreamCancel(handle: bigint): void {
     __cancelCalls += 1;
@@ -6936,25 +7156,32 @@ const native = {
   }
 };
 export function __testStartCalls(): number { return __startCalls; }
+export function __testNextCalls(): number { return __nextCalls; }
 export function __testCancelCalls(): number { return __cancelCalls; }
 export function __testRegistrySize(): number { return __states.size; }
+export function __testTypedError(): object { return __typedError; }
+export function __testStartError(): Error { return __startError; }
+export function __testSetStartCancelCallback(callback: (() => void) | null): void { __startCancelCallback = callback; }
 "#;
     facade = facade.replace("import native from \"libfixture.so\";\n\n", native_stub);
     facade = facade.replace(
-            "import type { BusinessError, Callback, ErrorCallback } from \"@kit.BasicServicesKit\";",
-            "interface BusinessError<T = void> extends Error { code: number; data?: T; }\ntype Callback<T> = (data: T) => void;\ntype ErrorCallback<T extends Error = BusinessError<void>> = (error: T) => void;",
-        );
+        "import type { BusinessError, Callback, ErrorCallback } from \"@kit.BasicServicesKit\";",
+        "interface BusinessError<T = void> extends Error { code: number; data?: T; }\ntype Callback<T> = (data: T) => void;\ntype ErrorCallback<T extends Error = BusinessError<void>> = (error: T) => void;",
+    );
 
     let driver = r#"import {
   UniFfiInputFailure,
-  UniFfiStreamResult,
-  countEventsEvents,
+  UniFfiStreamFailure,
   countEventsStream,
   createNumberStringFingerprint8b30e3aa815a2f4aInputChannel,
-  echoEventsEvents,
+  echoEventsStream,
   __testCancelCalls,
+  __testNextCalls,
   __testRegistrySize,
-  __testStartCalls
+  __testSetStartCancelCallback,
+  __testStartCalls,
+  __testStartError,
+  __testTypedError
 } from './facade.ts';
 
 function assert(condition: boolean, message: string): void {
@@ -6963,419 +7190,220 @@ function assert(condition: boolean, message: string): void {
 function delay(ms: number): Promise<void> {
   return new Promise<void>((resolve): void => { setTimeout(resolve, ms); });
 }
-let unhandledRejections: number = 0;
-process.on('unhandledRejection', (): void => { unhandledRejections += 1; });
 
-async function assertEventsReason(count: number, expectedMessage: string): Promise<void> {
-  const stream = countEventsEvents(count);
-  let observed: Error | null = null;
-  let errors: number = 0;
-  const cancelBefore: number = __testCancelCalls();
-  const done = new Promise<void>((resolve): void => {
-    stream.on('error', (error): void => {
-      errors += 1;
-      observed = error;
-    });
-    stream.on('done', (): void => resolve());
-  });
-  stream.start();
-  await done;
-  assert(errors === 1, `Events reason ${count} error count ${errors}`);
-  assert((observed as Error).message === expectedMessage,
-    `Events reason ${count} message ${(observed as Error).message}`);
-  assert((observed as BusinessError<void>).code === 1900001,
-    `Events reason ${count} code ${(observed as BusinessError<void>).code}`);
-  assert(__testCancelCalls() === cancelBefore + 1,
-    `Events reason ${count} raw cancel count`);
-  assert(__testRegistrySize() === 0, `Events reason ${count} leaked a native registry entry`);
+const lazyStarts: number = __testStartCalls();
+const lazyPulls: number = __testNextCalls();
+const lazy = countEventsStream(2);
+assert(__testStartCalls() === lazyStarts && __testNextCalls() === lazyPulls,
+  'factory called raw start or next');
+const first = await lazy.next();
+assert(first.done === false && first.value === 0, 'first pull lost its item');
+assert(__testStartCalls() === lazyStarts + 1 && __testNextCalls() === lazyPulls + 1,
+  'first next did not perform exactly one start and pull');
+const second = await lazy.next();
+assert(second.done === false && second.value === 1, 'second pull lost its item');
+assert(__testNextCalls() === lazyPulls + 2, 'item consumption prefetched a raw next');
+const done = await lazy.next();
+assert(done.done === true && __testNextCalls() === lazyPulls + 3, 'raw Done was not pulled once');
+const doneCancels: number = __testCancelCalls();
+assert((await lazy.next()).done === true, 'Done stream restarted');
+await lazy.cancel();
+await lazy.cancel();
+assert(__testCancelCalls() === doneCancels, 'Done stream called raw cancel');
+
+const optional = countEventsStream(97);
+const optionalItem = await optional.next();
+assert(optionalItem.done === false && optionalItem.value === null, 'Optional null item was treated as Done');
+assert((await optional.next()).done === true, 'Optional stream did not complete after null item');
+
+const typed = countEventsStream(98);
+const typedCancels: number = __testCancelCalls();
+const typedPulls: number = __testNextCalls();
+let typedObserved: Error | null = null;
+try {
+  await typed.next();
+} catch (error) {
+  typedObserved = error as Error;
 }
+assert(typedObserved instanceof UniFfiStreamFailure
+  && typedObserved.nativeError === __testTypedError(),
+  'typed Rust error did not preserve native variant/data identity');
+assert(__testCancelCalls() === typedCancels, 'typed Error called raw cancel after Rust terminal cleanup');
+try {
+  await typed.next();
+} catch (error) {
+  assert(error === typedObserved, 'failed stream did not preserve its typed terminal error');
+}
+assert(__testNextCalls() === typedPulls + 1 && __testRegistrySize() === 0,
+  'typed Error performed a post-terminal raw next or leaked its registry entry');
 
-async function assertPullReason(count: number, expectedMessage: string): Promise<void> {
+const idle = countEventsStream(1);
+const idleStarts: number = __testStartCalls();
+const idleCancels: number = __testCancelCalls();
+await idle.cancel();
+await idle.cancel();
+assert(__testStartCalls() === idleStarts && __testCancelCalls() === idleCancels,
+  'idle cancel called raw start or cancel');
+assert((await idle.next()).done === true, 'idle cancel did not remain terminal');
+
+const active = countEventsStream(77);
+const activeCancels: number = __testCancelCalls();
+const activePending = active.next();
+await active.cancel();
+await active.cancel();
+assert(__testCancelCalls() === activeCancels + 1, 'active cancel was not exactly once');
+assert((await activePending).done === true, 'active cancel leaked an in-flight item');
+assert((await active.next()).done === true, 'cancelled stream restarted');
+assert(__testRegistrySize() === 0, 'active cancel leaked a registry entry');
+
+const starting = countEventsStream(83);
+const startingStarts: number = __testStartCalls();
+const startingCancels: number = __testCancelCalls();
+__testSetStartCancelCallback((): void => { void starting.cancel(); });
+const startingDone = await starting.next();
+__testSetStartCancelCallback(null);
+assert(startingDone.done === true, 'STARTING cancellation did not finish terminally');
+assert(__testStartCalls() === startingStarts + 1 && __testCancelCalls() === startingCancels + 1,
+  'STARTING cancellation did not cancel the published native handle exactly once');
+assert((await starting.next()).done === true && __testRegistrySize() === 0,
+  'STARTING cancellation restarted or leaked its native handle');
+
+const cancelledStartFailure = countEventsStream(82);
+const cancelledStartAttempts: number = __testStartCalls();
+const cancelledStartCancels: number = __testCancelCalls();
+__testSetStartCancelCallback((): void => { void cancelledStartFailure.cancel(); });
+const cancelledStartDone = await cancelledStartFailure.next();
+__testSetStartCancelCallback(null);
+assert(cancelledStartDone.done === true, 'cancelled throwing start did not preserve cancellation terminal state');
+assert(__testStartCalls() === cancelledStartAttempts + 1
+  && __testCancelCalls() === cancelledStartCancels,
+  'cancelled throwing start fabricated a native cancel without a handle');
+assert((await cancelledStartFailure.next()).done === true,
+  'cancelled throwing start retried native start');
+
+const concurrent = countEventsStream(77);
+const concurrentPulls: number = __testNextCalls();
+const firstConcurrent = concurrent.next();
+let concurrentName: string = '';
+try {
+  await concurrent.next();
+} catch (error) {
+  concurrentName = (error as Error).name;
+}
+assert(concurrentName === 'UniFfiStreamConcurrentNext', 'concurrent next did not explicitly fail');
+assert(__testNextCalls() === concurrentPulls + 1, 'concurrent next called raw next twice');
+await concurrent.cancel();
+await firstConcurrent;
+
+const malformed = countEventsStream(86);
+const malformedCancels: number = __testCancelCalls();
+let malformedName: string = '';
+try {
+  await malformed.next();
+} catch (error) {
+  malformedName = (error as Error).name;
+}
+assert(malformedName === 'UniFfiStreamProtocolError', 'malformed step was accepted');
+assert(__testCancelCalls() === malformedCancels + 1 && __testRegistrySize() === 0,
+  'malformed step did not clean up its active handle exactly once');
+const malformedPulls: number = __testNextCalls();
+try {
+  await malformed.next();
+} catch (_error) {
+}
+assert(__testNextCalls() === malformedPulls, 'malformed terminal state called raw next');
+
+async function assertExtraOwnKeyProtocolFailure(count: number): Promise<void> {
   const stream = countEventsStream(count);
-  let observed: Error | null = null;
-  const cancelBefore: number = __testCancelCalls();
+  const cancelsBefore: number = __testCancelCalls();
+  const pullsBefore: number = __testNextCalls();
+  let failureName: string = '';
   try {
     await stream.next();
   } catch (error) {
-    observed = error as Error;
+    failureName = (error as Error).name;
   }
-  assert(observed !== null, `Pull reason ${count} unexpectedly resolved`);
-  assert((observed as Error).message === expectedMessage,
-    `Pull reason ${count} message ${(observed as Error).message}`);
-  assert((observed as BusinessError<void>).code === 1900001,
-    `Pull reason ${count} code ${(observed as BusinessError<void>).code}`);
-  assert(__testCancelCalls() === cancelBefore + 1,
-    `Pull reason ${count} raw cancel count`);
-  assert(__testRegistrySize() === 0, `Pull reason ${count} leaked a native registry entry`);
+  assert(failureName === 'UniFfiStreamProtocolError',
+    `extra own key for stream ${count} was accepted`);
+  assert(__testCancelCalls() === cancelsBefore + 1 && __testRegistrySize() === 0,
+    `extra own key for stream ${count} did not cancel its active handle exactly once`);
+  assert(__testNextCalls() === pullsBefore + 1,
+    `extra own key for stream ${count} did not execute exactly one raw pull`);
+  const terminalPulls: number = __testNextCalls();
+  try {
+    await stream.next();
+  } catch (_error) {
+  }
+  assert(__testNextCalls() === terminalPulls,
+    `extra own key for stream ${count} made a post-terminal raw pull`);
 }
 
-const matrixMessages: Array<string> = [
-  'matrix error',
-  'matrix string',
-  '42',
-  'null',
-  'undefined'
-];
-for (let index: number = 0; index < matrixMessages.length; index += 1) {
-  await assertEventsReason(100 + index, matrixMessages[index]);
-  await assertPullReason(100 + index, matrixMessages[index]);
-  await assertEventsReason(110 + index, matrixMessages[index]);
-  await assertPullReason(110 + index, matrixMessages[index]);
-}
+await assertExtraOwnKeyProtocolFailure(87);
+await assertExtraOwnKeyProtocolFailure(88);
+await assertExtraOwnKeyProtocolFailure(89);
 
-const typedEvents = countEventsEvents(98);
-let typedEventsCause: string | null = null;
-let typedEventsMessage: string = '';
-const typedEventsDone = new Promise<void>((resolve): void => {
-  typedEvents.on('error', (error): void => {
-    typedEventsCause = error.data?.cause as string;
-    typedEventsMessage = error.message;
-  });
-  typedEvents.on('done', (): void => resolve());
-});
-typedEvents.start();
-await typedEventsDone;
-assert(typedEventsCause === 'StorageInvalidated', `typed Events cause ${typedEventsCause}`);
-assert(typedEventsMessage === 'UniFFI stream source reported a typed error',
-  `typed Events message ${typedEventsMessage}`);
-
-const typedPull = countEventsStream(98);
-let typedPullCause: string | null = null;
-let typedPullMessage: string = '';
+const adapterFailure = countEventsStream(85);
+const adapterCancels: number = __testCancelCalls();
+let adapterMessage: string = '';
 try {
-  await typedPull.next();
+  await adapterFailure.next();
 } catch (error) {
-  typedPullCause = (error as BusinessError<{ cause: string }>).data?.cause as string;
-  typedPullMessage = (error as Error).message;
+  adapterMessage = (error as Error).message;
 }
-assert(typedPullCause === 'StorageInvalidated', `typed Pull cause ${typedPullCause}`);
-assert(typedPullMessage === 'UniFFI stream source reported a typed error',
-  `typed Pull message ${typedPullMessage}`);
+assert(adapterMessage === 'adapter rejection', 'adapter rejection was swallowed or replaced');
+assert(__testCancelCalls() === adapterCancels + 1 && __testRegistrySize() === 0,
+  'adapter rejection did not clean up its active handle exactly once');
 
-const normal = countEventsEvents(3);
-const normalValues: Array<number> = new Array<number>();
-let selfCalls: number = 0;
-let doneCalls: number = 0;
-let sourceErrors: number = 0;
-const selfRemoving = (_value: number): void => {
-  selfCalls += 1;
-  normal.off('data', selfRemoving);
-};
-normal.on('data', selfRemoving);
-normal.on('data', selfRemoving);
-normal.on('data', (_value: number): void => { throw new Error('listener failure'); });
-normal.on('data', (value: number): void => { normalValues.push(value); });
-normal.on('error', (_error): void => { sourceErrors += 1; });
-const normalDone = new Promise<void>((resolve): void => {
-  normal.on('done', (): void => { doneCalls += 1; resolve(); });
-});
-const startsBefore: number = __testStartCalls();
-const normalCancelBefore: number = __testCancelCalls();
-normal.start();
-normal.start();
-await normalDone;
-assert(__testStartCalls() === startsBefore + 1, 'repeated start created another native stream');
-assert(normalValues.join(',') === '0,1,2', `normal values ${normalValues}`);
-assert(selfCalls === 2, `snapshot self-removal calls ${selfCalls}`);
-assert(sourceErrors === 0, 'listener error escaped as source error');
-assert(doneCalls === 1, `normal done count ${doneCalls}`);
-assert(__testCancelCalls() === normalCancelBefore + 1,
-  'normal Events completion did not explicitly close native exactly once');
-assert(__testRegistrySize() === 0, 'normal Events completion leaked a native registry entry');
-
-const normalPull = countEventsStream(2);
-const normalPullCancelBefore: number = __testCancelCalls();
-const normalPullValues: Array<number> = new Array<number>();
-for (;;) {
-  const result = await normalPull.next();
-  if (result.done) {
-    break;
-  }
-  normalPullValues.push(result.value as number);
+const startFailure = countEventsStream(84);
+const startCancels: number = __testCancelCalls();
+const startAttempts: number = __testStartCalls();
+let startObserved: Error | null = null;
+try {
+  await startFailure.next();
+} catch (error) {
+  startObserved = error as Error;
 }
-assert(normalPullValues.join(',') === '0,1', `normal Pull values ${normalPullValues}`);
-assert(__testCancelCalls() === normalPullCancelBefore + 1,
-  'normal Pull completion did not explicitly close native exactly once');
-await normalPull.cancel();
-assert(__testCancelCalls() === normalPullCancelBefore + 1,
-  'normal Pull post-completion cancel closed native twice');
-assert(__testRegistrySize() === 0, 'normal Pull completion leaked a native registry entry');
-
-const failing = countEventsEvents(99);
-let failureValues: number = 0;
-let failureErrors: number = 0;
-let failureDone: number = 0;
-failing.on('data', (value: number): void => { failureValues += value; });
-failing.on('error', (error): void => {
-  failureErrors += 1;
-  assert(error.code === 1900001, `source error code ${error.code}`);
-  assert(error.data?.cause === null, 'source error fabricated a typed cause');
-  assert(error.data?.errorType === 'string', `source error type ${error.data?.errorType}`);
-  assert(error.data?.nativeErrorName === 'Error', `native error name ${error.data?.nativeErrorName}`);
-  assert(!('variant' in error.data), 'source error fabricated a Rust enum variant');
-});
-const failingDone = new Promise<void>((resolve): void => {
-  failing.on('done', (): void => { failureDone += 1; resolve(); });
-});
-failing.start();
-await failingDone;
-assert(failureValues === 7, `failure values ${failureValues}`);
-assert(failureErrors === 1 && failureDone === 1, 'error/done not emitted exactly once');
-
-const cancelledBeforeStart = countEventsEvents(2);
-let earlyDone: number = 0;
-cancelledBeforeStart.on('done', (): void => { earlyDone += 1; });
-const earlyStarts: number = __testStartCalls();
-const earlyCancels: number = __testCancelCalls();
-cancelledBeforeStart.cancel();
-cancelledBeforeStart.cancel();
-cancelledBeforeStart.start();
-assert(earlyDone === 1, `cancel-before-start done ${earlyDone}`);
-assert(__testStartCalls() === earlyStarts, 'cancel-before-start created a native handle');
-assert(__testCancelCalls() === earlyCancels, 'cancel-before-start called raw cancel');
-
-const inFlight = countEventsEvents(77);
-let inFlightData: number = 0;
-let inFlightError: number = 0;
-let inFlightDone: number = 0;
-inFlight.on('data', (_value: number): void => { inFlightData += 1; });
-inFlight.on('error', (_error): void => { inFlightError += 1; });
-inFlight.on('done', (): void => { inFlightDone += 1; });
-const cancelBefore: number = __testCancelCalls();
-inFlight.start();
-inFlight.cancel();
-inFlight.cancel();
-await delay(40);
-assert(inFlightData === 0 && inFlightError === 0 && inFlightDone === 1, 'in-flight cancel leaked event');
-assert(__testCancelCalls() === cancelBefore + 1, 'raw cancel was not exactly once');
-
-const listenerCancel = countEventsEvents(1);
-const listenerOrder: Array<string> = new Array<string>();
-const listenerDone = new Promise<void>((resolve): void => {
-  listenerCancel.on('data', (_value: number): void => {
-    listenerOrder.push('first');
-    listenerCancel.cancel();
-  });
-  listenerCancel.on('data', (_value: number): void => { listenerOrder.push('second-after-cancel'); });
-  listenerCancel.on('done', (): void => { listenerOrder.push('done'); resolve(); });
-});
-listenerCancel.start();
-await listenerDone;
-assert(listenerOrder.join(',') === 'first,done', `listener cancel order ${listenerOrder}`);
-
-const pull = countEventsStream(77);
-const pendingPull = pull.next();
-await pull.cancel();
-const cancelledPull = await pendingPull;
-assert(cancelledPull.done === true, 'pull cancel leaked an in-flight value');
-
-const concurrentPull = countEventsStream(77);
-const firstPull = concurrentPull.next();
-let concurrentCode: number = 0;
-try { await concurrentPull.next(); } catch (error) { concurrentCode = (error as BusinessError<void>).code; }
-assert(concurrentCode === 1900002, `concurrent pull code ${concurrentCode}`);
-await concurrentPull.cancel();
-await firstPull;
-
-let syncEventsErrors: number = 0;
-let syncEventsDone: number = 0;
-const syncEvents = countEventsEvents(88);
-const syncEventsCancelBefore: number = __testCancelCalls();
-const syncDone = new Promise<void>((resolve): void => {
-  syncEvents.on('error', (_error): void => { syncEventsErrors += 1; });
-  syncEvents.on('done', (): void => { syncEventsDone += 1; resolve(); });
-});
-syncEvents.start();
-await syncDone;
-assert(syncEventsErrors === 1 && syncEventsDone === 1, 'sync next throw did not use error/done path');
-assert(__testCancelCalls() === syncEventsCancelBefore + 1, 'sync Events throw did not close native once');
-
-const syncPull = countEventsStream(88);
-const syncPullCancelBefore: number = __testCancelCalls();
-let syncPullRejected: boolean = false;
-try { await syncPull.next(); } catch (_error) { syncPullRejected = true; }
-assert(syncPullRejected, 'sync pull next throw escaped synchronously or resolved');
-assert(__testCancelCalls() === syncPullCancelBefore + 1, 'sync Pull throw did not close native once');
-
-const primitiveEvents = countEventsEvents(87);
-let primitiveEventsErrors: number = 0;
-const primitiveEventsDone = new Promise<void>((resolve): void => {
-  primitiveEvents.on('error', (error): void => {
-    primitiveEventsErrors += 1;
-    assert(error.message === 'fixture primitive sync boom', `primitive message ${error.message}`);
-  });
-  primitiveEvents.on('done', (): void => resolve());
-});
-const primitiveEventsCancelBefore: number = __testCancelCalls();
-primitiveEvents.start();
-await primitiveEventsDone;
-assert(primitiveEventsErrors === 1, 'primitive Events throw escaped public start');
-assert(__testCancelCalls() === primitiveEventsCancelBefore + 1, 'primitive Events throw did not cancel');
-
-const primitivePull = countEventsStream(87);
-const primitivePullCancelBefore: number = __testCancelCalls();
-let primitivePullRejected: boolean = false;
-try { await primitivePull.next(); } catch (error) {
-  primitivePullRejected = (error as Error).message === 'fixture primitive sync boom';
+assert(startObserved === __testStartError(), 'start failure did not preserve the native Error identity');
+assert(__testStartCalls() === startAttempts + 1 && __testCancelCalls() === startCancels,
+  'start failure fabricated a raw handle or cancel');
+try {
+  await startFailure.next();
+} catch (error) {
+  assert(error === startObserved, 'start failure terminal state changed its native Error identity');
 }
-assert(primitivePullRejected, 'primitive Pull sync throw did not become rejected Promise');
-assert(__testCancelCalls() === primitivePullCancelBefore + 1, 'primitive Pull throw did not cancel');
-
-const primitiveRejectedPull = countEventsStream(86);
-let primitiveRejected: boolean = false;
-try { await primitiveRejectedPull.next(); } catch (error) {
-  primitiveRejected = (error as Error).message === 'fixture primitive rejection';
-}
-assert(primitiveRejected, 'primitive Promise rejection was not normalized');
-
-const neverPull = countEventsStream(85);
-const neverPending = neverPull.next();
-const neverCancelBefore: number = __testCancelCalls();
-await neverPull.cancel();
-const neverResult = await Promise.race<UniFfiStreamResult<number> | string>([
-  neverPending,
-  delay(50).then((): string => 'timeout')
-]);
-assert(neverResult !== 'timeout' && neverResult.done === true, 'never-settling raw Pull did not settle on cancel');
-assert(__testCancelCalls() === neverCancelBefore + 1, 'never-settling Pull cancel count');
-assert(__testRegistrySize() === 0, 'never-settling Pull cancel leaked a native registry entry');
-
-const throwingCancel = countEventsEvents(66);
-let throwingCancelDone: number = 0;
-throwingCancel.on('done', (): void => { throwingCancelDone += 1; });
-throwingCancel.start();
-throwingCancel.cancel();
-assert(throwingCancelDone === 1, 'raw cancel throw broke local termination');
-const throwingPullCancelBefore: number = __testCancelCalls();
-const throwingPull = countEventsStream(66);
-await throwingPull.cancel();
-assert(__testCancelCalls() === throwingPullCancelBefore + 1,
-  'raw Pull cancel throw did not call native exactly once');
-assert((await throwingPull.next()).done === true,
-  'raw Pull cancel throw broke local termination');
-assert(__testRegistrySize() === 0, 'never-polled Pull dispose leaked a native registry entry');
-await delay(0);
-assert(unhandledRejections === 0, `unhandled stream rejections ${unhandledRejections}`);
+assert(__testStartCalls() === startAttempts + 1, 'failed start retried native start');
 
 const channel = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-let firstResolved: boolean = false;
-const firstWrite = channel.writer.write(10).then((): void => { firstResolved = true; });
+let writeResolved: boolean = false;
+const write = channel.writer.write(21).then((): void => { writeResolved = true; });
 await Promise.resolve();
-assert(!firstResolved, 'write resolved before native next pulled it');
-const first = await channel.source.next(null, channel.source.handle);
-await firstWrite;
-assert(first.ok && first.value === 10 && firstResolved, 'queued write/backpressure failed');
-
-const queuedA = channel.writer.write(11);
-const queuedB = channel.writer.write(12);
-const valueA = await channel.source.next(null, channel.source.handle);
-await queuedA;
-const valueB = await channel.source.next(null, channel.source.handle);
-await queuedB;
-assert(valueA.value === 11 && valueB.value === 12, 'input queue order failed');
-
-const waitingNext = channel.source.next(null, channel.source.handle);
-const immediateWrite = channel.writer.write(13);
-const immediate = await waitingNext;
-await immediateWrite;
-assert(immediate.value === 13, 'waiting next delivery failed');
+assert(!writeResolved, 'input write resolved before rendezvous pull');
+const input = await channel.source.next(null, channel.source.handle);
+await write;
+assert(input.ok && input.value === 21, 'input rendezvous lost its item');
 channel.writer.end();
-const ended = await channel.source.next(null, channel.source.handle);
-assert(ended.ok && ended.done === true, 'end did not produce EOF');
-let closedRejected: boolean = false;
-let closedCode: number = 0;
-try { await channel.writer.write(14); } catch (error) {
-  closedRejected = true;
-  closedCode = (error as BusinessError<void>).code;
+const inputDone = await channel.source.next(null, channel.source.handle);
+assert(inputDone.ok && inputDone.done === true, 'input end did not produce Done');
+let closedName: string = '';
+try {
+  await channel.writer.write(22);
+} catch (error) {
+  closedName = (error as Error).name;
 }
-assert(closedRejected, 'write after end did not reject');
-assert(closedCode === 1900004, `input closed code ${closedCode}`);
-
-const ending = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-const pendingAtEnd = ending.writer.write(1);
-ending.writer.end();
-let endPendingRejected: boolean = false;
-try { await pendingAtEnd; } catch (_error) { endPendingRejected = true; }
-assert(endPendingRejected, 'end left a queued write pending');
-
-const failed = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-const failedNext = failed.source.next(null, failed.source.handle);
-const typedFailure = new UniFfiInputFailure<string>('Failed', 'fixture failure', 'Failed');
-assert(typedFailure.code === 1900003, `input failure code ${typedFailure.code}`);
-assert(typedFailure.data.nativeError === 'Failed' && typedFailure.data.variant === 'Failed', 'typed input payload lost');
-failed.writer.fail(typedFailure);
-const failureEnvelope = await failedNext;
-assert(!failureEnvelope.ok && failureEnvelope.error === 'Failed', 'typed input fail envelope failed');
-const afterFailure = await failed.source.next(null, failed.source.handle);
-assert(afterFailure.ok && afterFailure.done === true, 'input failure did not terminate once');
-
-const nativeCancelled = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-const pendingAtCancel = nativeCancelled.writer.write(2);
-nativeCancelled.source.cancel(null, nativeCancelled.source.handle);
-let cancelPendingRejected: boolean = false;
-try { await pendingAtCancel; } catch (_error) { cancelPendingRejected = true; }
-assert(cancelPendingRejected, 'native cancel left a queued write pending');
-const cancelledDone = await nativeCancelled.source.next(null, nativeCancelled.source.handle);
-assert(cancelledDone.done === true, 'native cancel did not terminate next');
-
-const multi = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-const multiFirst = multi.source.next(null, multi.source.handle);
-const multiSecond = multi.source.next(null, multi.source.handle);
-await multi.writer.write(31);
-multi.writer.end();
-const multiA = await multiFirst;
-const multiB = await multiSecond;
-assert(multiA.value === 31 && multiB.done === true, 'FIFO multi-waiter end settlement failed');
-
-const multiFail = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-const failA = multiFail.source.next(null, multiFail.source.handle);
-const failB = multiFail.source.next(null, multiFail.source.handle);
-multiFail.writer.fail(new UniFfiInputFailure<string>('Broadcast', 'broadcast failure', 'Broadcast'));
-const failResultA = await failA;
-const failResultB = await failB;
-assert(!failResultA.ok && failResultA.error === 'Broadcast', 'first failure waiter not settled');
-assert(!failResultB.ok && failResultB.error === 'Broadcast', 'second failure waiter not settled');
-
-const multiCancel = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-const cancelA = multiCancel.source.next(null, multiCancel.source.handle);
-const cancelB = multiCancel.source.next(null, multiCancel.source.handle);
-multiCancel.source.cancel(null, multiCancel.source.handle);
-assert((await cancelA).done === true && (await cancelB).done === true, 'cancel did not settle all waiters');
-
-const mismatch = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-const mismatchWrite = mismatch.writer.write(41);
-const wrongHandle = await mismatch.source.next(null, mismatch.source.handle + 1);
-assert(wrongHandle.done === true, 'mismatched object-local handle was accepted');
-const rightHandle = await mismatch.source.next(null, mismatch.source.handle);
-await mismatchWrite;
-assert(rightHandle.value === 41, 'mismatched handle consumed a queued item');
-mismatch.writer.end();
+assert(closedName === 'UniFfiInputClosedError', 'closed input reused the deleted output BusinessError');
 
 const bidiChannel = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-const bidi = echoEventsEvents(bidiChannel.source);
-const bidiValues: Array<number> = new Array<number>();
-let bidiDoneCount: number = 0;
-bidi.on('data', (value: number): void => { bidiValues.push(value); });
-const bidiDone = new Promise<void>((resolve): void => {
-  bidi.on('done', (): void => { bidiDoneCount += 1; resolve(); });
-});
-bidi.start();
-await bidiChannel.writer.write(21);
+const bidi = echoEventsStream(bidiChannel.source);
+const bidiStarts: number = __testStartCalls();
+const bidiWrite = bidiChannel.writer.write(31);
+const bidiItem = await bidi.next();
+await bidiWrite;
+assert(bidiItem.done === false && bidiItem.value === 31,
+  'input/output Pull bridge did not preserve rendezvous item');
+assert(__testStartCalls() === bidiStarts + 1, 'bidi factory was not lazy');
 bidiChannel.writer.end();
-await bidiDone;
-assert(bidiValues.join(',') === '21' && bidiDoneCount === 1, 'bidi stream failed');
-
-const bidiFailureChannel = createNumberStringFingerprint8b30e3aa815a2f4aInputChannel();
-const bidiFailure = echoEventsEvents(bidiFailureChannel.source);
-let bidiErrors: number = 0;
-const bidiFailureDone = new Promise<void>((resolve): void => {
-  bidiFailure.on('error', (_error): void => { bidiErrors += 1; });
-  bidiFailure.on('done', (): void => resolve());
-});
-bidiFailure.start();
-bidiFailureChannel.writer.fail(new UniFfiInputFailure<string>('Failed', 'bidi failure', 'Failed'));
-await bidiFailureDone;
-assert(bidiErrors === 1, 'bidi typed failure did not reach output error');
+assert((await bidi.next()).done === true, 'bidi Pull did not complete');
+assert(__testRegistrySize() === 0, 'bidi Pull leaked a native registry entry');
 
 console.log('harmony-stream-runtime-ok');
 "#;
@@ -7387,7 +7415,7 @@ console.log('harmony-stream-runtime-ok');
         .current_dir(&root)
         .args(["--experimental-strip-types", "driver.ts"])
         .output()
-        .unwrap();
+        .expect("Node is required to execute the Harmony stream runtime test");
     assert!(
         output.status.success(),
         "Harmony stream runtime driver failed\nstdout:\n{}\nstderr:\n{}",
@@ -7477,7 +7505,7 @@ fn copies_fake_dist_into_package_libs() {
     std::fs::create_dir_all(dist.join("arm64-v8a")).unwrap();
     std::fs::create_dir_all(dist.join("x86_64")).unwrap();
     std::fs::write(
-        dist.join("index.d.ts"),
+        dist.join("native-facade.d.ts"),
         "export declare const add: (a: number, b: number) => number;\n",
     )
     .unwrap();
@@ -7528,7 +7556,7 @@ fn skip_libs_keeps_types_and_facade_without_copying_native_binaries() {
     assert!(package_dir
         .join("src/main/cpp/types/libdemo_ohos/index.d.ts")
         .exists());
-    assert!(package_dir.join("src/main/ets/native.ets").exists());
+    assert!(package_dir.join("src/main/ets/native-facade.ets").exists());
     assert!(!package_dir.join("src/main/ets/common").exists());
     let package: Value = serde_json::from_str(
         &std::fs::read_to_string(package_dir.join("oh-package.json5")).unwrap(),
@@ -7596,7 +7624,7 @@ fn package_staging_rejects_symlinked_native_artifact_directories() {
     let outside = root.join("outside");
     std::fs::create_dir_all(&dist).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    std::fs::write(dist.join("index.d.ts"), "export {};\n").unwrap();
+    std::fs::write(dist.join("native-facade.d.ts"), "export {};\n").unwrap();
     symlink(&outside, dist.join("arm64-v8a")).unwrap();
     let error = copy_dist_to_package_libs(&dist, &root.join("package/libs"), false)
         .unwrap_err()
@@ -7635,7 +7663,7 @@ fn generates_har_with_package_root_and_no_absolute_paths() {
     let package_dir = root.join("package");
     std::fs::create_dir_all(dist.join("arm64-v8a")).unwrap();
     std::fs::write(
-        dist.join("index.d.ts"),
+        dist.join("native-facade.d.ts"),
         "export declare function welcomeAgent(name: string): string;\n",
     )
     .unwrap();
@@ -7650,13 +7678,13 @@ fn generates_har_with_package_root_and_no_absolute_paths() {
         )
         .unwrap();
     std::fs::write(
-            dist.join("package-index.ets"),
-            "export { welcomeAgent } from \"./src/main/ets/native\";\nexport { default } from \"./src/main/ets/native\";\n",
+            dist.join("Index.ets"),
+            "export { welcomeAgent } from \"./src/main/ets/native-facade\";\nexport { default } from \"./src/main/ets/native-facade\";\n",
         )
         .unwrap();
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"schemaVersion\":3,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"schemaVersion\":4,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
     )
     .unwrap();
     std::fs::write(dist.join("arm64-v8a/libdemo_ohos.so"), "fake").unwrap();
@@ -7675,17 +7703,25 @@ fn generates_har_with_package_root_and_no_absolute_paths() {
         std::fs::read(package_dir.join("harmony-facade-contract.json")).unwrap(),
         std::fs::read(dist.join("harmony-facade-contract.json")).unwrap()
     );
-    assert!(package_dir.join("src/main/ets/native.ets").exists());
+    assert!(package_dir.join("src/main/ets/native-facade.ets").exists());
     assert!(package_dir
         .join("src/main/cpp/types/libdemo_ohos/index.d.ts")
         .exists());
     assert!(package_dir
         .join("src/main/cpp/types/libdemo_ohos/oh-package.json5")
         .exists());
+    assert_eq!(
+        std::fs::read(
+            package_dir.join("src/main/cpp/types/libdemo_ohos/harmony-facade-contract.json")
+        )
+        .unwrap(),
+        std::fs::read(dist.join("harmony-facade-contract.json")).unwrap()
+    );
     let index = std::fs::read_to_string(package_dir.join("Index.ets")).unwrap();
     assert!(!index.contains(".so"));
     assert!(!index.contains("export *"));
-    let facade = std::fs::read_to_string(package_dir.join("src/main/ets/native.ets")).unwrap();
+    let facade =
+        std::fs::read_to_string(package_dir.join("src/main/ets/native-facade.ets")).unwrap();
     assert!(facade.contains("import native from \"libdemo_ohos.so\""));
     assert!(!facade.contains("export *"));
 
@@ -7701,6 +7737,7 @@ fn generates_har_with_package_root_and_no_absolute_paths() {
     let mut saw_build_profile = false;
     let mut saw_native_types = false;
     let mut saw_facade_contract = false;
+    let mut saw_internal_facade_contract = false;
     for entry in archive.entries().unwrap() {
         let mut entry = entry.unwrap();
         let path = entry.path().unwrap().to_string_lossy().to_string();
@@ -7737,6 +7774,15 @@ fn generates_har_with_package_root_and_no_absolute_paths() {
                 std::fs::read(dist.join("harmony-facade-contract.json")).unwrap()
             );
         }
+        if path == "package/src/main/cpp/types/libdemo_ohos/harmony-facade-contract.json" {
+            saw_internal_facade_contract = true;
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            assert_eq!(
+                bytes,
+                std::fs::read(dist.join("harmony-facade-contract.json")).unwrap()
+            );
+        }
     }
     assert!(
         saw_package_json,
@@ -7758,6 +7804,10 @@ fn generates_har_with_package_root_and_no_absolute_paths() {
     assert!(
         saw_facade_contract,
         "HAR must contain the normalized facade contract"
+    );
+    assert!(
+        saw_internal_facade_contract,
+        "HAR must retain the internal native facade contract"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -8714,7 +8764,37 @@ fn normalized_so_error_cleans_its_exact_sealed_provenance_root() {
     test_cleanup_temp_root(&root);
 }
 
-fn test_interface_har(metadata: &OhosPackageMetadata, include_so: bool) -> Vec<u8> {
+fn test_hsp_facade_contract() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": FACADE_CONTRACT_SCHEMA_VERSION,
+        "components": [],
+        "componentIdentities": [],
+        "hostCompositeIdentity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outputStreams": [],
+        "inputStreams": []
+    }))
+    .unwrap()
+}
+
+fn test_interface_har(
+    metadata: &OhosPackageMetadata,
+    facade_contract: Option<&[u8]>,
+    include_so: bool,
+) -> Vec<u8> {
+    test_interface_har_with_public_declarations(
+        metadata,
+        facade_contract,
+        include_so,
+        b"export interface UniFfiStreamResult<T> {}\nexport interface UniFfiStream<T> { next(): Promise<UniFfiStreamResult<T>>; cancel(): Promise<void>; }\n",
+    )
+}
+
+fn test_interface_har_with_public_declarations(
+    metadata: &OhosPackageMetadata,
+    facade_contract: Option<&[u8]>,
+    include_so: bool,
+    public_declarations: &[u8],
+) -> Vec<u8> {
     let package = serde_json::to_vec(&serde_json::json!({
         "name": metadata.name,
         "version": metadata.version,
@@ -8732,21 +8812,20 @@ fn test_interface_har(metadata: &OhosPackageMetadata, include_so: bool) -> Vec<u
     }))
     .unwrap();
     let mut entries = vec![
-            ("package/oh-package.json5", package.as_slice()),
-            ("package/src/main/module.json", module.as_slice()),
-            (
-                "package/Index.d.ets",
-                b"export { uniffiHarmonyFacadeContract, UNIFFI_HARMONY_FACADE_CONTRACT_SCHEMA_VERSION, UNIFFI_HARMONY_FACADE_CONTRACT_SHA256 } from './src/main/ets/harmonyFacadeContract';".as_slice(),
-            ),
-            (
-                "package/src/main/ets/harmonyFacadeContract.d.ets",
-                b"export declare const UNIFFI_HARMONY_FACADE_CONTRACT_SCHEMA_VERSION: number; export declare const UNIFFI_HARMONY_FACADE_CONTRACT_SHA256: string; export declare function uniffiHarmonyFacadeContract(): string;".as_slice(),
-            ),
-            (
-                "package/src/main/cpp/types/libdemo/index.d.ts",
-                b"export declare function demo(): number;".as_slice(),
-            ),
-        ];
+        ("package/oh-package.json5", package.as_slice()),
+        ("package/src/main/module.json", module.as_slice()),
+        ("package/Index.d.ets", public_declarations),
+        (
+            "package/src/main/cpp/types/libdemo/index.d.ts",
+            b"export declare function demo(): number;".as_slice(),
+        ),
+    ];
+    if let Some(facade_contract) = facade_contract {
+        entries.push((
+            "package/src/main/cpp/types/libdemo/harmony-facade-contract.json",
+            facade_contract,
+        ));
+    }
     if include_so {
         entries.push(("package/libs/arm64-v8a/libdemo.so", b"so".as_slice()));
     }
@@ -8947,6 +9026,8 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
             })
             .collect(),
     )]);
+    let facade_contract = test_hsp_facade_contract();
+    let contract_sha256 = sha256_bytes(&facade_contract);
     let runtime = test_runtime_hsp(
         &metadata,
         "",
@@ -8955,9 +9036,9 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
             ("arm64-v8a", "libdemo.so"),
             ("arm64-v8a", "libc++_shared.so"),
         ],
-        &"a".repeat(64),
+        &contract_sha256,
     );
-    let interface = test_interface_har(&metadata, false);
+    let interface = test_interface_har(&metadata, Some(&facade_contract), false);
     let tgz = test_targz(&[("demo-default.hsp", &runtime), ("demo.har", &interface)]);
     let members = parse_hsp_tgz(&tgz).unwrap();
     assert_eq!(members.runtime_hsp, runtime);
@@ -8971,7 +9052,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &expected_runtime,
         true,
         None,
-        &"a".repeat(64),
+        &contract_sha256,
     )
     .unwrap();
     let host_bundle = "com.example.host";
@@ -8983,7 +9064,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
             ("arm64-v8a", "libdemo.so"),
             ("arm64-v8a", "libc++_shared.so"),
         ],
-        &"a".repeat(64),
+        &contract_sha256,
         None,
         false,
     );
@@ -8996,7 +9077,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &expected_runtime,
         false,
         Some(host_bundle),
-        &"a".repeat(64),
+        &contract_sha256,
     )
     .unwrap();
     let wrong_runtime_bytes = test_runtime_hsp_with_override(
@@ -9007,7 +9088,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
             ("arm64-v8a", "libdemo.so"),
             ("arm64-v8a", "libc++_shared.so"),
         ],
-        &"a".repeat(64),
+        &contract_sha256,
         Some((
             "libdemo_core.so",
             test_elf_bytes("arm64-v8a", b"same-name-different-runtime-bytes"),
@@ -9022,7 +9103,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &expected_runtime,
         true,
         None,
-        &"a".repeat(64),
+        &contract_sha256,
     )
     .is_err());
     let wrong_arch_runtime = test_runtime_hsp_with_override(
@@ -9033,7 +9114,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
             ("arm64-v8a", "libdemo.so"),
             ("arm64-v8a", "libc++_shared.so"),
         ],
-        &"a".repeat(64),
+        &contract_sha256,
         Some((
             "libdemo_core.so",
             test_elf_bytes("x86_64", b"wrong-architecture"),
@@ -9048,7 +9129,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &expected_runtime,
         true,
         None,
-        &"a".repeat(64),
+        &contract_sha256,
     )
     .is_err());
     let wrong_class_runtime = test_runtime_hsp_with_override(
@@ -9059,7 +9140,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
             ("arm64-v8a", "libdemo.so"),
             ("arm64-v8a", "libc++_shared.so"),
         ],
-        &"a".repeat(64),
+        &contract_sha256,
         Some((
             "libdemo_core.so",
             test_elf_bytes_with_class(183, false, b"wrong-runtime-class"),
@@ -9074,7 +9155,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &expected_runtime,
         true,
         None,
-        &"a".repeat(64),
+        &contract_sha256,
     )
     .is_err());
     for (label, mutate) in [
@@ -9109,7 +9190,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
                 &wrong_identity,
                 true,
                 None,
-                &"a".repeat(64),
+                &contract_sha256,
             )
             .is_err(),
             "runtime {label} provenance mismatch must fail"
@@ -9127,7 +9208,34 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &"b".repeat(64),
     )
     .is_err());
-    validate_interface_har(&interface, &metadata, &"a".repeat(64)).unwrap();
+    validate_interface_har(&interface, &metadata, &contract_sha256).unwrap();
+    assert!(validate_interface_har(&interface, &metadata, &"b".repeat(64)).is_err());
+    assert!(validate_interface_har(
+        &test_interface_har(&metadata, None, false),
+        &metadata,
+        &contract_sha256,
+    )
+    .is_err());
+    let mut tampered_contract: Value = serde_json::from_slice(&facade_contract).unwrap();
+    tampered_contract["hostCompositeIdentity"] = Value::String("b".repeat(64));
+    let tampered_contract = serde_json::to_vec(&tampered_contract).unwrap();
+    assert!(validate_interface_har(
+        &test_interface_har(&metadata, Some(&tampered_contract), false),
+        &metadata,
+        &contract_sha256,
+    )
+    .is_err());
+    assert!(validate_interface_har(
+        &test_interface_har_with_public_declarations(
+            &metadata,
+            Some(&facade_contract),
+            false,
+            b"export const UNIFFI_HARMONY_FACADE_CONTRACT_SHA256: string = 'legacy';\n",
+        ),
+        &metadata,
+        &contract_sha256,
+    )
+    .is_err());
 
     let unknown = test_targz(&[("demo.hsp", &runtime), ("README", b"bad")]);
     assert!(parse_hsp_tgz(&unknown).is_err());
@@ -9150,7 +9258,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
             ("arm64-v8a", "libc++_shared.so"),
             ("arm64-v8a", "libunexpected.so"),
         ],
-        &"a".repeat(64),
+        &contract_sha256,
     );
     assert!(validate_runtime_hsp(
         &extra_runtime,
@@ -9161,7 +9269,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &expected_runtime,
         true,
         None,
-        &"a".repeat(64),
+        &contract_sha256,
     )
     .is_err());
     std::fs::remove_file(libs.join("libunexpected.so")).unwrap();
@@ -9181,7 +9289,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
             &expected_runtime,
             true,
             None,
-            &"a".repeat(64),
+            &contract_sha256,
         )
         .is_err());
     }
@@ -9196,7 +9304,7 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &expected_runtime,
         true,
         None,
-        &"a".repeat(64),
+        &contract_sha256,
     )
     .is_err());
     let mut wrong_hash = expected.clone();
@@ -9213,13 +9321,13 @@ fn hsp_tgz_runtime_and_interface_parsers_enforce_exact_members_and_so_ownership(
         &expected_runtime,
         true,
         None,
-        &"a".repeat(64),
+        &contract_sha256,
     )
     .is_err());
     assert!(validate_interface_har(
-        &test_interface_har(&metadata, true),
+        &test_interface_har(&metadata, Some(&facade_contract), true),
         &metadata,
-        &"b".repeat(64),
+        &contract_sha256,
     )
     .is_err());
     std::fs::remove_dir_all(root).ok();

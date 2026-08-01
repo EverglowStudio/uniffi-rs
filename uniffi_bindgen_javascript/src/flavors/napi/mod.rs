@@ -683,7 +683,7 @@ fn render_ohos_extra_types(ci: &uniffi_bindgen::ComponentInterface) -> Result<St
     Ok(out)
 }
 
-const OHOS_FACADE_SCHEMA_VERSION: u32 = 3;
+const OHOS_FACADE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -701,10 +701,8 @@ struct OhosOutputStreamContract {
     next_function: String,
     cancel_function: String,
     stream_factory: String,
-    events_factory: String,
     pull_class: String,
-    events_class: String,
-    next_type: String,
+    step_type: String,
     item_type: OhosTypeDescriptor,
     error_type: OhosTypeDescriptor,
     arguments: Vec<OhosFacadeArgument>,
@@ -811,10 +809,8 @@ fn render_ohos_facade_contract(ci: &uniffi_bindgen::ComponentInterface) -> Resul
                 &crate::dispatch_key::stream_cancel_key(function.name()),
             ),
             stream_factory: format!("{function_name}Stream"),
-            events_factory: format!("{function_name}Events"),
             pull_class: format!("{class_prefix}PullStream"),
-            events_class: format!("{class_prefix}EventsStream"),
-            next_type: format!("Uniffi{class_prefix}StreamNext"),
+            step_type: format!("Uniffi{class_prefix}StreamNext"),
             item_type: ohos_facade_type_descriptor(item_type)?,
             error_type: ohos_facade_type_descriptor(error_type)?,
             arguments,
@@ -1145,8 +1141,6 @@ fn validate_ohos_facade_contract_names(
         for name in [
             "UniFfiStream",
             "UniFfiStreamResult",
-            "UniFfiStreamErrorData",
-            "UniFfiStreamBusinessError",
             "UniFfiInputFailureData",
             "UniFfiInputFailure",
         ] {
@@ -1154,12 +1148,7 @@ fn validate_ohos_facade_contract_names(
         }
     }
     for output in &contract.output_streams {
-        for name in [
-            output.stream_factory.as_str(),
-            output.events_factory.as_str(),
-            output.pull_class.as_str(),
-            output.events_class.as_str(),
-        ] {
+        for name in [output.stream_factory.as_str(), output.pull_class.as_str()] {
             validate_generated_ohos_name(name, &occupied, &mut generated)?;
         }
     }

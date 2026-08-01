@@ -62,7 +62,7 @@ fn emits_real_tree_for_all_flavors() {
         &std::fs::read(out_dir.join("harmony/arithmetical.ohos-facade.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(harmony_contract["schemaVersion"], 3);
+    assert_eq!(harmony_contract["schemaVersion"], 4);
     assert!(harmony_contract["outputStreams"]
         .as_array()
         .unwrap()
