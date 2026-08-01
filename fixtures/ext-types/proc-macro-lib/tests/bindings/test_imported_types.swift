@@ -38,11 +38,11 @@ var counter = DispatchGroup()
 counter.enter()
 Task {
     // This async function comes from the `uniffi-one` crate
-    let uniffiOneEnum = await getUniffiOneAsync()
+    let uniffiOneEnum = try! await getUniffiOneAsync()
     assert(uniffiOneEnum == UniffiOneEnum.one)
 
     // This async function comes from the `proc-macro-lib` crate
-    let uniffiOneType = await getUniffiOneTypeAsync(t: UniffiOneType(sval: "hello"))
+    let uniffiOneType = try! await getUniffiOneTypeAsync(t: UniffiOneType(sval: "hello"))
     assert(uniffiOneType.sval == "hello")
 
     counter.leave()

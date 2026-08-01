@@ -56,7 +56,7 @@
 }
 {%- endmacro %}
 
-// eg, `public func events() -> UniffiAsyncStream<Event> { body }`
+// eg, `public func events() -> UniFfiStream<Event> { body }`
 {%- macro stream_func_decl(func_decl, callable, indent) %}
 {%- call docstring(callable, indent) %}{% endcall %}
 {%- if let Some(stream_item_type) = callable.stream_item_type() %}
@@ -64,10 +64,11 @@
 {%- if let Some(stream_next_ffi_return_type) = callable.stream_next_ffi_return_type() %}
 {{ func_decl }} {{ callable.name()|fn_name }}{{ callable|input_stream_generics }}(
     {%- call arg_list_decl(callable) %}{% endcall -%}) -> {{ callable.return_type().unwrap()|type_name }}{{ callable|input_stream_where_clause }} {
-    let __streamHandle =
-        {% call to_ffi_call(callable) %}{% endcall %}
-    return UniffiAsyncStream(
-        next: {
+    return UniFfiStream(
+        start: {
+            {% call to_ffi_call(callable) %}{% endcall %}
+        },
+        next: { __streamHandle in
             try await uniffiRustCallAsync(
                 rustFutureFunc: {
                     {{ callable.ffi_stream_next_func() }}(__streamHandle)
@@ -88,7 +89,7 @@
                 errorHandler: nil
             )
         },
-        cancel: {
+        cancel: { __streamHandle in
             {{ callable.ffi_stream_cancel_func() }}(__streamHandle)
         }
     )
@@ -134,7 +135,7 @@ public convenience init(
 {%- endmacro %}
 
 {%- macro call_async(callable) %}
-        {% call is_try(callable) %}{% endcall %} await uniffiRustCallAsync(
+        try await uniffiRustCallAsync(
             rustFutureFunc: {
                 {{ callable.ffi_func().name() }}(
                     {%- match callable.self_type() %}
@@ -230,8 +231,13 @@ v{{- field_num -}}
 {%- if func.is_async() %}async {% endif %}
 {%- endmacro -%}
 
+{#
+Every Rust async call can complete with CALL_CANCELLED. Swift must surface that
+as CancellationError instead of using try! and trapping, so async callable
+entrypoints are throwing even when their Rust return type is otherwise infallible.
+#}
 {%- macro throws(func) %}
-{%- if func.throws() %}throws {% endif %}
+{%- if func.throws() || func.is_async() %}throws {% endif %}
 {%- endmacro -%}
 
 {%- macro is_try(func) %}

@@ -10,43 +10,43 @@ var dispatchGroup = DispatchGroup()
 // Primitive types
 dispatchGroup.enter()
 Task {
-    let returnedU8 = await asyncRoundtripU8(v: 42)
+    let returnedU8 = try! await asyncRoundtripU8(v: 42)
     assert(returnedU8 == 42)
 
-    let returnedI8 = await asyncRoundtripI8(v: -42)
+    let returnedI8 = try! await asyncRoundtripI8(v: -42)
     assert(returnedI8 == -42)
 
-    let returnedU16 = await asyncRoundtripU16(v: 42)
+    let returnedU16 = try! await asyncRoundtripU16(v: 42)
     assert(returnedU16 == 42)
 
-    let returnedI16 = await asyncRoundtripI16(v: -42)
+    let returnedI16 = try! await asyncRoundtripI16(v: -42)
     assert(returnedI16 == -42)
 
-    let returnedU32 = await asyncRoundtripU32(v: 42)
+    let returnedU32 = try! await asyncRoundtripU32(v: 42)
     assert(returnedU32 == 42)
 
-    let returnedI32 = await asyncRoundtripI32(v: -42)
+    let returnedI32 = try! await asyncRoundtripI32(v: -42)
     assert(returnedI32 == -42)
 
-    let returnedU64 = await asyncRoundtripU64(v: 42)
+    let returnedU64 = try! await asyncRoundtripU64(v: 42)
     assert(returnedU64 == 42)
 
-    let returnedI64 = await asyncRoundtripI64(v: -42)
+    let returnedI64 = try! await asyncRoundtripI64(v: -42)
     assert(returnedI64 == -42)
 
-    let returnedF32 = await asyncRoundtripF32(v: 0.5)
+    let returnedF32 = try! await asyncRoundtripF32(v: 0.5)
     assert(returnedF32 == 0.5)
 
-    let returnedF64 = await asyncRoundtripF64(v: -0.5)
+    let returnedF64 = try! await asyncRoundtripF64(v: -0.5)
     assert(returnedF64 == -0.5)
 
-    let returnedString = await asyncRoundtripString(v: "hi")
+    let returnedString = try! await asyncRoundtripString(v: "hi")
     assert(returnedString == "hi")
 
-    let returnedList = await asyncRoundtripVec(v: [42])
+    let returnedList = try! await asyncRoundtripVec(v: [42])
     assert(returnedList == [42])
 
-    let returnedMap = await asyncRoundtripMap(v: ["hello": "world"])
+    let returnedMap = try! await asyncRoundtripMap(v: ["hello": "world"])
     assert(returnedMap == ["hello": "world"])
 
     dispatchGroup.leave()
@@ -72,15 +72,15 @@ dispatchGroup.wait()
 dispatchGroup.enter()
 Task {
     let obj = AsyncInterface(name: "Alice")
-    let objName = await obj.name()
+    let objName = try! await obj.name()
     assert(objName == "Alice")
 
-    let obj2 = await asyncRoundtripObj(v: obj)
-    let obj2Name = await obj2.name()
+    let obj2 = try! await asyncRoundtripObj(v: obj)
+    let obj2Name = try! await obj2.name()
     assert(obj2Name == "Alice")
 
     let rec = AsyncRecord(name: "Bob")
-    let recName = await rec.getName()
+    let recName = try! await rec.getName()
     assert(recName == "Bob")
 
     dispatchGroup.leave()
@@ -101,13 +101,13 @@ class AsyncCallbackImpl: TestAsyncCallbackInterface, @unchecked Sendable {
         asyncCallbackRefCount -= 1
     }
 
-    func noop() async { }
+    func noop() async throws { }
 
-    func getValue() async -> UInt32 {
+    func getValue() async throws -> UInt32 {
         return self.value;
     }
 
-    func setValue(value: UInt32) async {
+    func setValue(value: UInt32) async throws {
         self.value = value;
     }
 
@@ -122,13 +122,13 @@ class AsyncCallbackImpl: TestAsyncCallbackInterface, @unchecked Sendable {
 dispatchGroup.enter()
 Task {
     let cbi = AsyncCallbackImpl(value: 42);
-    await invokeTestAsyncCallbackInterfaceNoop(cbi: cbi);
+    try! await invokeTestAsyncCallbackInterfaceNoop(cbi: cbi);
 
-    var value = await invokeTestAsyncCallbackInterfaceGetValue(cbi: cbi)
+    var value = try! await invokeTestAsyncCallbackInterfaceGetValue(cbi: cbi)
     assert(value == 42)
 
-    await invokeTestAsyncCallbackInterfaceSetValue(cbi: cbi, value: 43);
-    value = await invokeTestAsyncCallbackInterfaceGetValue(cbi: cbi)
+    try! await invokeTestAsyncCallbackInterfaceSetValue(cbi: cbi, value: 43);
+    value = try! await invokeTestAsyncCallbackInterfaceGetValue(cbi: cbi)
     assert(value == 43)
 
     do {
@@ -140,7 +140,7 @@ Task {
         // expected
     } catch {
         fatalError("unexpected error \(error)")
-    } 
+    }
 
     let returnedNumbers = try! await invokeTestAsyncCallbackInterfaceThrowIfEqual(
         cbi: cbi,
@@ -151,4 +151,3 @@ Task {
     dispatchGroup.leave()
 }
 dispatchGroup.wait()
-

@@ -125,13 +125,13 @@ class AsyncTraitImpl: AsyncTestTraitInterface, @unchecked Sendable {
         asyncTraitRefCount -= 1
     }
 
-    func noop() async { }
+    func noop() async throws { }
 
-    func getValue() async -> UInt32 {
+    func getValue() async throws -> UInt32 {
         return self.value;
     }
 
-    func setValue(value: UInt32) async {
+    func setValue(value: UInt32) async throws {
         self.value = value;
     }
 
@@ -144,11 +144,11 @@ class AsyncTraitImpl: AsyncTestTraitInterface, @unchecked Sendable {
 }
 
 func testAsyncRustImpl(traitImpl: AsyncTestTraitInterface) async {
-    await traitImpl.noop();
-    var valueReturn = await traitImpl.getValue();
+    try! await traitImpl.noop();
+    var valueReturn = try! await traitImpl.getValue();
     assert(valueReturn == 42)
-        await traitImpl.setValue(value: 43);
-    valueReturn = await traitImpl.getValue();
+        try! await traitImpl.setValue(value: 43);
+    valueReturn = try! await traitImpl.getValue();
     assert(valueReturn == 43)
         do {
             let _ = try await traitImpl.throwIfEqual(numbers: CallbackInterfaceNumbers(a: 10, b: 10))
@@ -173,11 +173,11 @@ Task {
 dispatchGroup.wait()
 
 func testAsyncSwiftImpl(traitImpl: AsyncTestTraitInterface) async {
-    await invokeAsyncTestTraitInterfaceNoop(interface: traitImpl)
-    var val = await invokeAsyncTestTraitInterfaceGetValue(interface: traitImpl)
+    try! await invokeAsyncTestTraitInterfaceNoop(interface: traitImpl)
+    var val = try! await invokeAsyncTestTraitInterfaceGetValue(interface: traitImpl)
     assert(val == 42)
-    await invokeAsyncTestTraitInterfaceSetValue(interface: traitImpl, value: 43)
-    val = await invokeAsyncTestTraitInterfaceGetValue(interface: traitImpl)
+    try! await invokeAsyncTestTraitInterfaceSetValue(interface: traitImpl, value: 43)
+    val = try! await invokeAsyncTestTraitInterfaceGetValue(interface: traitImpl)
     assert(val == 43)
     do {
         let _ = try await invokeAsyncTestTraitInterfaceThrowIfEqual(

@@ -518,12 +518,25 @@ fn trait_protocol_name(ci: &ComponentInterface, trait_ty: &Type) -> Result<Strin
 }
 
 /// Generate UniFFI component bindings for Swift, as strings in memory.
+#[cfg(test)]
 pub fn generate_bindings(config: &Config, ci: &ComponentInterface) -> Result<Bindings> {
+    generate_bindings_with_stream_runtime(config, ci, ci.has_stream_fns())
+}
+
+/// Generate UniFFI component bindings, optionally including the module-wide output stream runtime.
+///
+/// Callers that generate multiple Swift sources for one module must set
+/// `include_stream_runtime` for exactly one stream component.
+pub(super) fn generate_bindings_with_stream_runtime(
+    config: &Config,
+    ci: &ComponentInterface,
+    include_stream_runtime: bool,
+) -> Result<Bindings> {
     ensure_input_streams_supported(ci)?;
     let header = BridgingHeader::new(config, ci)
         .render()
         .context("failed to render Swift bridging header")?;
-    let library = SwiftWrapper::new(config.clone(), ci)
+    let library = SwiftWrapper::new(config.clone(), ci, include_stream_runtime)
         .render()
         .context("failed to render Swift library")?;
     let modulemap = if config.generate_module_map() {
@@ -550,10 +563,15 @@ pub fn generate_header(config: &Config, ci: &ComponentInterface) -> Result<Strin
         .context("failed to render Swift bridging header")
 }
 
-/// Generate the swift source for a component
-pub fn generate_swift(config: &Config, ci: &ComponentInterface) -> Result<String> {
+/// Generate the Swift source for a component, optionally including the module-wide output stream
+/// runtime.
+pub(super) fn generate_swift_with_stream_runtime(
+    config: &Config,
+    ci: &ComponentInterface,
+    include_stream_runtime: bool,
+) -> Result<String> {
     ensure_input_streams_supported(ci)?;
-    SwiftWrapper::new(config.clone(), ci)
+    SwiftWrapper::new(config.clone(), ci, include_stream_runtime)
         .render()
         .context("failed to render Swift library")
 }
@@ -726,18 +744,20 @@ impl ModuleMap {
 pub struct SwiftWrapper<'a> {
     config: Config,
     ci: &'a ComponentInterface,
+    include_stream_runtime: bool,
     type_helper_code: String,
     type_imports: BTreeSet<String>,
     ensure_init_fn_name: String,
 }
 impl<'a> SwiftWrapper<'a> {
-    pub fn new(config: Config, ci: &'a ComponentInterface) -> Self {
+    pub fn new(config: Config, ci: &'a ComponentInterface, include_stream_runtime: bool) -> Self {
         let type_renderer = TypeRenderer::new(&config, ci);
         let type_helper_code = type_renderer.render().unwrap();
         let type_imports = type_renderer.imports.into_inner();
         Self {
             config,
             ci,
+            include_stream_runtime,
             type_helper_code,
             type_imports,
             ensure_init_fn_name: format!(
@@ -1458,6 +1478,33 @@ mod tests {
         .unwrap()
     }
 
+    fn async_only_component_interface() -> ComponentInterface {
+        let module_path = "async_core";
+        let mut items = BTreeSet::new();
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: "ready_value".to_owned(),
+            orig_name: None,
+            is_async: true,
+            inputs: vec![],
+            return_type: Some(Type::UInt32),
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }));
+        let mut ci = ComponentInterface::from_metadata(MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.to_owned(),
+                name: module_path.to_owned(),
+            },
+            namespace_docstring: None,
+            items,
+        })
+        .unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        ci
+    }
+
     fn input_stream_component_interface() -> ComponentInterface {
         let module_path = "stream_core";
         let counter_event_type = Type::Record {
@@ -1567,11 +1614,14 @@ mod tests {
         let swift = bindings.library;
         let header = bindings.header;
 
-        assert!(swift
-            .contains("public func countEvents(count: UInt32) -> UniffiAsyncStream<StreamEvent>"));
+        assert!(
+            swift.contains("public func countEvents(count: UInt32) -> UniFfiStream<StreamEvent>")
+        );
         assert!(!swift.contains("public func countEvents(count: UInt32) -> UInt64"));
         assert!(!swift.contains("AsyncThrowingStream<StreamEvent, Error>"));
-        assert!(swift.contains("let __streamHandle ="));
+        assert!(!swift.contains("let __streamHandle ="));
+        assert!(swift.contains("return UniFfiStream("));
+        assert!(swift.contains("start: {"));
         assert!(swift.contains("uniffi_stream_core_fn_func_count_events("));
         assert!(
             swift.contains("uniffi_stream_core_fn_func_count_events_stream_next(__streamHandle)")
@@ -1588,11 +1638,12 @@ mod tests {
         assert!(swift.contains("try FfiConverterTypeStreamError.read(from: &reader)"));
         assert!(swift.contains("case error(Swift.Error)"));
         assert!(!swift.contains("guard let __streamValue = __streamNext else"));
-        assert!(swift.contains("public func optionalEvents() -> UniffiAsyncStream<UInt32?>"));
+        assert!(swift.contains("public func optionalEvents() -> UniFfiStream<UInt32?>"));
         assert!(swift.contains("try FfiConverterOptionUInt32.read(from: &reader)"));
         assert!(swift.contains("errorHandler: nil"));
-        assert!(swift.contains("public struct UniffiAsyncStream<Element>: AsyncSequence"));
+        assert!(swift.contains("public struct UniFfiStream<Element>: AsyncSequence"));
         assert!(swift.contains("public mutating func next() async throws -> Element?"));
+        assert!(swift.contains("public func cancel()"));
         assert!(swift.contains("throw UniffiInternalError.concurrentStreamNext"));
         assert!(swift.contains("throw UniffiInternalError.streamConsumed"));
         assert!(swift.contains("withTaskCancellationHandler(operation:"));
@@ -1603,6 +1654,25 @@ mod tests {
         assert!(header.contains("uniffi_stream_core_fn_func_count_events("));
         assert!(header.contains("uniffi_stream_core_fn_func_count_events_stream_next("));
         assert!(header.contains("uniffi_stream_core_fn_func_count_events_stream_cancel("));
+    }
+
+    #[test]
+    fn swift_async_only_bindings_omit_output_stream_runtime() {
+        let bindings = generate_bindings(
+            &Config {
+                module_name: Some("AsyncCore".to_owned()),
+                ..Config::default()
+            },
+            &async_only_component_interface(),
+        )
+        .unwrap();
+
+        assert!(bindings
+            .library
+            .contains("public func readyValue()async throws  -> UInt32"));
+        assert!(!bindings
+            .library
+            .contains("public struct UniFfiStream<Element>: AsyncSequence"));
     }
 
     #[test]
@@ -1660,7 +1730,7 @@ mod tests {
 
         assert!(
             swift.contains(
-                "public func runningSum<S0>(events: S0) -> UniffiAsyncStream<CounterEvent> where S0: AsyncSequence, S0.Element == CounterEvent"
+                "public func runningSum<S0>(events: S0) -> UniFfiStream<CounterEvent> where S0: AsyncSequence, S0.Element == CounterEvent"
             ),
             "{swift}"
         );
@@ -1806,7 +1876,7 @@ fileprivate enum UniffiInternalError: Error {
     case concurrentStreamNext
 }
 
-private enum __UniffiStreamNext<T> {
+enum __UniffiStreamNext<T> {
     case item(T)
     case done
     case error(Swift.Error)
@@ -1960,7 +2030,7 @@ private func waitUntil(_ condition: @escaping () -> Bool) async {
     fatalError("timed out waiting for fixture state")
 }
 
-private func consumeOneAndDrop(_ stream: UniffiAsyncStream<Int>) async throws {
+private func consumeOneAndDrop(_ stream: UniFfiStream<Int>) async throws {
     var iterator = stream.makeAsyncIterator()
     guard try await iterator.next() == 1 else {
         fatalError("expected stream item")
@@ -1972,19 +2042,29 @@ private struct StreamRuntimeFixture {
     static func main() async {
         // Returning a stream and waiting for a slow consumer must not pull anything.
         let values = Results([.item(1), .item(nil), .item(2), .done])
+        let normalStart = Counter()
         let normalCancel = Counter()
-        let stream = UniffiAsyncStream<Int?>(next: { values.next() }, cancel: {
-            normalCancel.increment()
-        })
+        let stream = UniFfiStream<Int?>(
+            start: {
+                normalStart.increment()
+                return 1
+            },
+            next: { _ in values.next() },
+            cancel: { _ in normalCancel.increment() }
+        )
+        precondition(normalStart.get() == 0)
         precondition(values.nextCount() == 0)
         await Task.yield()
+        precondition(normalStart.get() == 0)
         precondition(values.nextCount() == 0)
 
         var iterator = stream.makeAsyncIterator()
+        precondition(normalStart.get() == 0)
         let first = try! await iterator.next()
         guard case let .some(firstValue) = first, firstValue == 1 else {
             fatalError("expected Item(Some(1))")
         }
+        precondition(normalStart.get() == 1)
         precondition(values.nextCount() == 1)
         await Task.yield()
         precondition(values.nextCount() == 1)
@@ -2007,15 +2087,21 @@ private struct StreamRuntimeFixture {
 
         // A stream accepts only one independently-created iterator. Rejection
         // must happen before a native pull or cancellation is attempted.
+        let consumedStart = Counter()
         let consumedNext = Counter()
         let consumedCancel = Counter()
         do {
-            let consumedStream = UniffiAsyncStream<Int>(next: {
-                consumedNext.increment()
-                return .item(1)
-            }, cancel: {
-                consumedCancel.increment()
-            })
+            let consumedStream = UniFfiStream<Int>(
+                start: {
+                    consumedStart.increment()
+                    return 2
+                },
+                next: { _ in
+                    consumedNext.increment()
+                    return .item(1)
+                },
+                cancel: { _ in consumedCancel.increment() }
+            )
             var acceptedIterator = consumedStream.makeAsyncIterator()
             var rejectedIterator = consumedStream.makeAsyncIterator()
             do {
@@ -2025,28 +2111,42 @@ private struct StreamRuntimeFixture {
             catch {
                 fatalError("unexpected second iterator error: \(error)")
             }
+            precondition(consumedStart.get() == 0)
             precondition(consumedNext.get() == 0)
             precondition(consumedCancel.get() == 0)
             _ = acceptedIterator
         }
-        precondition(consumedCancel.get() == 1)
+        precondition(consumedCancel.get() == 0)
 
-        // Even an unconsumed sequence owns a native stream handle and must
-        // release it through its state lifetime exactly once.
+        // An unconsumed sequence never owns a native stream handle, so dropping it
+        // is local-only.
+        let neverConsumedStart = Counter()
         let neverConsumedCancel = Counter()
         do {
-            let neverConsumed = UniffiAsyncStream<Int>(next: { .done }, cancel: {
-                neverConsumedCancel.increment()
-            })
+            let neverConsumed = UniFfiStream<Int>(
+                start: {
+                    neverConsumedStart.increment()
+                    return 3
+                },
+                next: { _ in .done },
+                cancel: { _ in neverConsumedCancel.increment() }
+            )
             withExtendedLifetime(neverConsumed) {}
         }
-        precondition(neverConsumedCancel.get() == 1)
+        precondition(neverConsumedStart.get() == 0)
+        precondition(neverConsumedCancel.get() == 0)
 
-        // Error transitions to terminal and releases the native stream only once.
+        // A typed Error transition is terminal and never issues an extra cancel.
+        let errorStart = Counter()
         let errorCancel = Counter()
-        let errorStream = UniffiAsyncStream<Int>(next: { throw FixtureError.boom }, cancel: {
-            errorCancel.increment()
-        })
+        let errorStream = UniFfiStream<Int>(
+            start: {
+                errorStart.increment()
+                return 4
+            },
+            next: { _ in .error(FixtureError.boom) },
+            cancel: { _ in errorCancel.increment() }
+        )
         var errorIterator = errorStream.makeAsyncIterator()
         do {
             _ = try await errorIterator.next()
@@ -2055,31 +2155,46 @@ private struct StreamRuntimeFixture {
         catch {
             fatalError("unexpected stream error: \(error)")
         }
+        precondition(errorStart.get() == 1)
         let errorDone = try! await errorIterator.next()
         precondition(errorDone == nil)
-        precondition(errorCancel.get() == 1)
+        precondition(errorCancel.get() == 0)
 
         // Dropping an unfinished iterator after an early break performs one cancel.
+        let earlyStart = Counter()
         let earlyCancel = Counter()
-        let earlyStream = UniffiAsyncStream<Int>(next: { .item(1) }, cancel: {
-            earlyCancel.increment()
-        })
+        let earlyStream = UniFfiStream<Int>(
+            start: {
+                earlyStart.increment()
+                return 5
+            },
+            next: { _ in .item(1) },
+            cancel: { _ in earlyCancel.increment() }
+        )
         try! await consumeOneAndDrop(earlyStream)
         await Task.yield()
+        precondition(earlyStart.get() == 1)
         precondition(earlyCancel.get() == 1)
 
         // A pending next observes task cancellation, cancels its stream once, and
         // never returns a late item after the pending operation is released.
         let pending = PendingStreamNext()
+        let cancellationStart = Counter()
         let cancellationCount = Counter()
-        let cancellationStream = UniffiAsyncStream<Int>(next: { await pending.next() }, cancel: {
-            cancellationCount.increment()
-        })
+        let cancellationStream = UniFfiStream<Int>(
+            start: {
+                cancellationStart.increment()
+                return 6
+            },
+            next: { _ in await pending.next() },
+            cancel: { _ in cancellationCount.increment() }
+        )
         var cancellationIterator = cancellationStream.makeAsyncIterator()
         let cancellationTask = Task { () throws -> Int? in
             try await cancellationIterator.next()
         }
         await waitUntil { pending.started() }
+        precondition(cancellationStart.get() == 1)
         cancellationTask.cancel()
         await waitUntil { cancellationCount.get() == 1 }
         pending.resume(.done)
@@ -2095,13 +2210,22 @@ private struct StreamRuntimeFixture {
         // Two copies of an iterator share the same state; a second pending next is
         // rejected before it reaches the native pull closure.
         let concurrentPending = PendingStreamNext()
-        let concurrentStream = UniffiAsyncStream<Int>(next: { await concurrentPending.next() }, cancel: {})
+        let concurrentStart = Counter()
+        let concurrentStream = UniFfiStream<Int>(
+            start: {
+                concurrentStart.increment()
+                return 7
+            },
+            next: { _ in await concurrentPending.next() },
+            cancel: { _ in }
+        )
         var firstConcurrentIterator = concurrentStream.makeAsyncIterator()
         var secondConcurrentIterator = firstConcurrentIterator
         let firstConcurrentTask = Task { () throws -> Int? in
             try await firstConcurrentIterator.next()
         }
         await waitUntil { concurrentPending.started() }
+        precondition(concurrentStart.get() == 1)
         do {
             _ = try await secondConcurrentIterator.next()
             fatalError("expected concurrent next() to fail")
@@ -2185,7 +2309,7 @@ private struct StreamRuntimeFixture {
         let tmp = tempfile::tempdir().unwrap();
         let swift_path = tmp.path().join("StreamRuntimeFixture.swift");
         let executable_path = tmp.path().join("StreamRuntimeFixture");
-        fs::write(&swift_path, fixture).unwrap();
+        fs::write(&swift_path, &fixture).unwrap();
 
         let compile = Command::new("swiftc")
             .arg("-swift-version")
