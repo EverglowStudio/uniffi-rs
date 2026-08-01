@@ -289,6 +289,33 @@ fn render_preload(
              return {{ __uniffiHandle: true, id: storeHandle(value) }};\n\
          }}\n\
          \n\
+         // N-API represents optional object fields according to the host's
+         // property rules. Normalize only output-stream pulls at this trust
+         // boundary so common/api.ts always receives the exact tagged v2
+         // shape: Item owns value (including null), Done owns no payload, and
+         // Error owns error only.
+         function __uniffiNormalizeStreamStep(value) {{\n\
+             if (value === null || typeof value !== \"object\") return value;\n\
+             const raw = value;\n\
+             if (raw.kind === \"item\" && Object.prototype.hasOwnProperty.call(raw, \"value\")) {{\n\
+                 return {{ kind: \"item\", value: raw.value }};\n\
+             }}\n\
+             if (raw.kind === \"done\") {{\n\
+                 return {{ kind: \"done\" }};\n\
+             }}\n\
+             if (raw.kind === \"error\" && Object.prototype.hasOwnProperty.call(raw, \"error\")) {{\n\
+                 return {{ kind: \"error\", error: raw.error }};\n\
+             }}\n\
+             return value;\n\
+         }}\n\
+         \n\
+         function __uniffiLiftResult(method, value) {{\n\
+             const lifted = __uniffiLiftShape(value);\n\
+             return method.endsWith(\"_stream_next\")\n\
+                 ? __uniffiNormalizeStreamStep(lifted)\n\
+                 : lifted;\n\
+         }}\n\
+         \n\
          function dispatchSync(msg) {{\n\
              try {{\n\
                  switch (msg.kind) {{\n\
@@ -302,7 +329,7 @@ fn render_preload(
                              return __uniffiLowerShape(resolveArg(a));\n\
                          }});\n\
                          const raw = fn.apply(addon, resolved);\n\
-                         return {{ kind: \"ok\", id: msg.id, value: wrapResult(__uniffiLiftShape(raw)) }};\n\
+                         return {{ kind: \"ok\", id: msg.id, value: wrapResult(__uniffiLiftResult(msg.method, raw)) }};\n\
                      }}\n\
                      default:\n\
                          throw new Error(`unknown bridge message kind: ${{msg.kind}}`);\n\
@@ -322,7 +349,7 @@ fn render_preload(
                      return __uniffiLowerShape(resolveArg(a));\n\
                  }});\n\
                  const raw = await fn.apply(addon, resolved);\n\
-                 return {{ kind: \"ok\", id: msg.id, value: wrapResult(__uniffiLiftShape(raw)) }};\n\
+                 return {{ kind: \"ok\", id: msg.id, value: wrapResult(__uniffiLiftResult(msg.method, raw)) }};\n\
              }} catch (error) {{\n\
                  return {{ kind: \"err\", id: msg.id, error: serializeError(__uniffiLiftShape(error)) }};\n\
              }}\n\
@@ -330,6 +357,7 @@ fn render_preload(
          \n\
          contextBridge.exposeInMainWorld(\"__uniffi__\", {{\n\
              namespace: \"{namespace}\",\n\
+             __uniffiAbiVersion: 2,\n\
              dispatchSync,\n\
              dispatchAsync,\n\
          }});\n"
@@ -369,6 +397,7 @@ fn render_renderer(namespace: &str, async_keys: &[String]) -> String {
              interface Window {{\n\
                  __uniffi__: {{\n\
                      namespace: string;\n\
+                     __uniffiAbiVersion: 2;\n\
                      dispatchSync: (msg: BridgeMessage) => BridgeResponse;\n\
                      dispatchAsync: (msg: BridgeMessage) => Promise<BridgeResponse>;\n\
                  }};\n\
@@ -424,6 +453,9 @@ fn render_renderer(namespace: &str, async_keys: &[String]) -> String {
          \n\
          const backend = new Proxy({{}}, {{\n\
              get(_t, method: string) {{\n\
+                 if (method === \"__uniffiAbiVersion\") {{\n\
+                     return window.__uniffi__.__uniffiAbiVersion;\n\
+                 }}\n\
                  if (method.startsWith(\"__uniffi_\") && method.endsWith(\"_object_free\")) {{\n\
                      // `common/objects.ts` calls the wasm-style destructor\n\
                      // key for all flavors. In Electron, opaque handles live\n\

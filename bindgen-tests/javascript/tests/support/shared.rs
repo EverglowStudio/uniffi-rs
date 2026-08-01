@@ -107,6 +107,7 @@ resolver = "3"
         src.join("lib.rs"),
         r#"
 use std::{
+    sync::atomic::{AtomicUsize, Ordering},
     collections::VecDeque,
     fmt,
     pin::Pin,
@@ -178,6 +179,8 @@ pub struct OptionalEvents {
     values: VecDeque<Option<u32>>,
 }
 
+static OUTPUT_STREAM_STARTS: AtomicUsize = AtomicUsize::new(0);
+
 impl Stream for PendingStream {
     type Item = Result<StreamEvent, StreamError>;
 
@@ -209,7 +212,18 @@ impl Stream for OptionalEvents {
 
 #[uniffi::export]
 pub fn count_events(count: u32) -> uniffi::UniFfiStream<StreamEvent, StreamError> {
+    OUTPUT_STREAM_STARTS.fetch_add(1, Ordering::SeqCst);
     Box::pin(CountStream { next: 0, end: count })
+}
+
+#[uniffi::export]
+pub fn reset_stream_start_count() {
+    OUTPUT_STREAM_STARTS.store(0, Ordering::SeqCst);
+}
+
+#[uniffi::export]
+pub fn stream_start_count() -> u32 {
+    OUTPUT_STREAM_STARTS.load(Ordering::SeqCst) as u32
 }
 
 #[uniffi::export]

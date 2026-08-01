@@ -159,7 +159,7 @@ fn emits_real_tree_for_all_flavors() {
     );
 
     let runtime = std::fs::read_to_string(out_dir.join("common/runtime.ts")).unwrap();
-    assert!(runtime.contains("UNIFFI_JS_CONTRACT_VERSION = 1"));
+    assert!(runtime.contains("const __UNIFFI_JS_ABI_VERSION = 2"));
     assert!(runtime.contains("class UniffiError"));
     assert!(runtime.contains("class UniffiObjectHandle"));
     assert!(runtime.contains("function toU64"));
@@ -303,6 +303,7 @@ import { add, sub, div, equal } from "./common/api.ts";
 import { ArithmeticError } from "./common/errors.ts";
 
 __installBackend({
+    __uniffiAbiVersion: 2,
     add(a, b) {
         // The generator lowers u64 args via toU64 into bigint.
         // Return a bigint — the high-level contract is bigint-first.

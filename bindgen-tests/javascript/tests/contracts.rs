@@ -596,6 +596,242 @@ fn electron_preload_is_syntactically_valid_js() {
     generate_arithmetic(&out_dir);
 
     let preload = out_dir.join("electron/preload.cjs");
+    let root = out_dir.clone();
+    // Keep the runtime state-machine contract independent of generated API
+    // strings.  It deliberately drives the final factory directly so every
+    // state transition, including ABI refusal and finalizer ownership, is
+    // observable without a native addon.
+    std::fs::write(
+        root.join("driver.ts"),
+        r#"
+class FakeFinalizationRegistry {
+  static readonly registries: FakeFinalizationRegistry[] = [];
+  private readonly callback: (heldValue: unknown) => void;
+  private registrations: Array<{ target: object; heldValue: unknown; token?: object }> = [];
+  constructor(callback: (heldValue: unknown) => void) {
+    this.callback = callback;
+    FakeFinalizationRegistry.registries.push(this);
+  }
+  register(target: object, heldValue: unknown, token?: object): void {
+    this.registrations.push({ target, heldValue, token });
+  }
+  unregister(token: object): boolean {
+    const before = this.registrations.length;
+    this.registrations = this.registrations.filter((entry) => entry.token !== token);
+    return this.registrations.length !== before;
+  }
+  static trigger(target: object): void {
+    for (const registry of FakeFinalizationRegistry.registries) {
+      const entries = registry.registrations.filter((entry) => entry.target === target);
+      registry.registrations = registry.registrations.filter((entry) => entry.target !== target);
+      for (const entry of entries) registry.callback(entry.heldValue);
+    }
+  }
+}
+(globalThis as { FinalizationRegistry?: unknown }).FinalizationRegistry = FakeFinalizationRegistry;
+
+const { __installBackend, createUniFfiStream, UniffiError } =
+  await import("./common/runtime.ts");
+
+function assert(condition: boolean, label: string): void {
+  if (!condition) throw new Error("FAIL " + label);
+}
+async function flush(): Promise<void> {
+  await Promise.resolve();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+function errorName(error: unknown): string {
+  return error instanceof UniffiError ? error.errorName : "";
+}
+
+for (const backend of [{}, { __uniffiAbiVersion: 1 }, { __uniffiAbiVersion: 3 }]) {
+  let rejected = false;
+  try {
+    __installBackend(backend);
+  } catch (error) {
+    rejected = errorName(error) === "UniffiAbiMismatch";
+  }
+  assert(rejected, "backend ABI mismatch is rejected before installation");
+}
+__installBackend({ __uniffiAbiVersion: 2 });
+
+let idleStarts = 0;
+let idleCancels = 0;
+const idle = createUniFfiStream({
+  start: () => { idleStarts += 1; return "idle"; },
+  next: async () => ({ kind: "done" as const }),
+  cancel: () => { idleCancels += 1; },
+});
+assert(idleStarts === 0, "construction is lazy");
+await idle.cancel();
+assert(idleCancels === 0, "idle cancel stays local");
+FakeFinalizationRegistry.trigger(idle);
+await flush();
+assert(idleCancels === 0, "idle stream has no native finalizer");
+assert((await idle.next()).done === true && idleStarts === 0, "idle cancel is terminal");
+
+let starts = 0;
+let pulls = 0;
+let cancels = 0;
+const values: Array<number | null> = [1, null, 2];
+const direct = createUniFfiStream({
+  start: () => { starts += 1; return "direct"; },
+  next: async () => {
+    pulls += 1;
+    return pulls > values.length
+      ? { kind: "done" as const }
+      : { kind: "item" as const, value: values[pulls - 1] };
+  },
+  cancel: () => { cancels += 1; },
+});
+assert(starts === 0, "stream does not start before first direct next");
+assert((await direct.next()).value === 1 && starts === 1, "first direct next starts once");
+assert((await direct.next()).value === null, "optional null is an item");
+assert((await direct.next()).value === 2, "later optional item is retained");
+assert((await direct.next()).done === true, "done is explicit");
+const pullsAfterDone = pulls;
+assert((await direct.next()).done === true && pulls === pullsAfterDone, "done is terminal");
+let mixedRejected = false;
+try {
+  direct[Symbol.asyncIterator]();
+} catch (error) {
+  mixedRejected = errorName(error) === "UniffiStreamConsumed";
+}
+assert(mixedRejected, "direct consumer excludes iterator consumer");
+
+const singleUse = createUniFfiStream({
+  start: () => "single",
+  next: async () => ({ kind: "done" as const }),
+  cancel: () => {},
+});
+const iterator = singleUse[Symbol.asyncIterator]();
+let secondIteratorRejected = false;
+try {
+  singleUse[Symbol.asyncIterator]();
+} catch (error) {
+  secondIteratorRejected = errorName(error) === "UniffiStreamConsumed";
+}
+assert(secondIteratorRejected, "second iterator is rejected before start");
+assert((await iterator.next()).done === true, "first iterator remains valid");
+
+let pendingResolve: ((step: unknown) => void) | null = null;
+const pending = createUniFfiStream({
+  start: () => "pending",
+  next: () => new Promise((resolve) => { pendingResolve = resolve; }),
+  cancel: () => { cancels += 1; },
+});
+const firstPending = pending.next();
+let concurrentRejected = false;
+try {
+  await pending.next();
+} catch (error) {
+  concurrentRejected = errorName(error) === "UniffiStreamConcurrentNext";
+}
+assert(concurrentRejected, "concurrent next is rejected without ending the first pull");
+pendingResolve?.({ kind: "item", value: 99 });
+assert((await firstPending).value === 99, "first pending pull survives concurrent rejection");
+await pending.cancel();
+await pending.cancel();
+
+const protocol = createUniFfiStream({
+  start: () => "protocol",
+  next: async () => ({ done: true } as unknown),
+  cancel: () => { cancels += 1; },
+});
+let protocolRejected = false;
+try {
+  await protocol.next();
+} catch (error) {
+  protocolRejected = errorName(error) === "UniffiStreamProtocolError";
+}
+assert(protocolRejected, "old nullable/done envelope is rejected");
+assert((await protocol.next()).done === true, "protocol failure is terminal");
+
+const typed = new UniffiError({
+  errorName: "StreamError",
+  variant: "Boom",
+  data: { code: 7 },
+  message: "boom",
+});
+const failed = createUniFfiStream({
+  start: () => "failed",
+  next: async () => ({ kind: "error" as const, error: typed }),
+  cancel: () => { cancels += 1; },
+});
+let typedPreserved = false;
+try {
+  await failed.next();
+} catch (error) {
+  typedPreserved = error === typed
+    && errorName(error) === "StreamError"
+    && (error as UniffiError).variant === "Boom"
+    && (error as UniffiError).data !== null
+    && (error as Error).message === "boom";
+}
+assert(typedPreserved, "typed stream error retains name variant data and message");
+assert((await failed.next()).done === true, "error is terminal");
+
+let finalizerCancels = 0;
+const active = createUniFfiStream({
+  start: () => "active",
+  next: async () => ({ kind: "item" as const, value: 7 }),
+  cancel: () => { finalizerCancels += 1; return Promise.reject(new Error("ignored")); },
+});
+assert((await active.next()).value === 7, "active direct stream yields item");
+FakeFinalizationRegistry.trigger(active);
+await flush();
+assert(finalizerCancels === 1, "active stream finalizer cancels once");
+FakeFinalizationRegistry.trigger(active);
+await flush();
+assert(finalizerCancels === 1, "active stream finalizer remains one-shot");
+
+let iteratorCancels = 0;
+const iteratorOwner = createUniFfiStream({
+  start: () => "iterator-owner",
+  next: async () => ({ kind: "item" as const, value: 8 }),
+  cancel: () => { iteratorCancels += 1; },
+});
+const activeIterator = iteratorOwner[Symbol.asyncIterator]();
+await activeIterator.next();
+FakeFinalizationRegistry.trigger(iteratorOwner);
+await flush();
+assert(iteratorCancels === 0, "stream collection cannot cancel a live iterator");
+FakeFinalizationRegistry.trigger(activeIterator);
+await flush();
+assert(iteratorCancels === 1, "active iterator finalizer cancels once");
+
+let returnCancels = 0;
+const returning = createUniFfiStream({
+  start: () => "return",
+  next: async () => ({ kind: "item" as const, value: 1 }),
+  cancel: () => { returnCancels += 1; },
+});
+const returningIterator = returning[Symbol.asyncIterator]();
+await returningIterator.return?.();
+await returningIterator.return?.();
+assert(returnCancels === 0, "iterator return before start stays local");
+
+const throwing = createUniFfiStream({
+  start: () => "throw",
+  next: async () => ({ kind: "item" as const, value: 1 }),
+  cancel: () => { returnCancels += 1; },
+});
+const throwingIterator = throwing[Symbol.asyncIterator]();
+await throwingIterator.next();
+const callerError = new Error("caller");
+let callerPreserved = false;
+try {
+  await throwingIterator.throw?.(callerError);
+} catch (error) {
+  callerPreserved = error === callerError;
+}
+assert(callerPreserved && returnCancels === 1, "iterator throw preserves caller error after cleanup");
+
+console.log("ok");
+"#,
+    )
+    .unwrap();
+
     let output = Command::new(&node)
         .arg("--check")
         .arg(preload.as_path())
@@ -608,6 +844,19 @@ fn electron_preload_is_syntactically_valid_js() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+    let runtime = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("driver.ts")
+        .current_dir(&root)
+        .output()
+        .expect("failed to run runtime state-machine driver");
+    assert!(
+        runtime.status.success(),
+        "runtime state-machine driver failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
 }
 
 #[test]
@@ -643,7 +892,7 @@ fn napi_electron_translate_enum_tag_to_type() {
         "__uniffiLiftShape",
         "__uniffiIsPlainObject",
         "__uniffiLowerShape(resolveArg(a))",
-        "wrapResult(__uniffiLiftShape(raw))",
+        "wrapResult(__uniffiLiftResult(msg.method, raw))",
         "serializeError(__uniffiLiftShape(error))",
     ] {
         assert!(
@@ -762,297 +1011,166 @@ fn js_async_iterable_runtime_stub_contract() {
     )
     .unwrap();
     std::fs::write(
-        common.join("api.ts"),
-        r#"
-import { __call, __callAsync, createUniffiAsyncIterable } from "./runtime.ts";
-
-export interface StreamEvent {
-  value: number;
-}
-
-export function countEvents(count: number): AsyncIterable<StreamEvent> {
-  const __handle = __call<any>("count_events", count);
-  return createUniffiAsyncIterable<StreamEvent>({
-    handle: __handle,
-    next: async (__streamHandle: unknown) => {
-      const __next = await __callAsync<{ done: boolean; value?: any }>("count_events_stream_next", __streamHandle);
-      if (__next == null || __next.done === true) return { done: true };
-      return { done: false, value: { value: __next.value.value } as StreamEvent };
-    },
-    cancel: (__streamHandle: unknown): void => {
-      __call<void>("count_events_stream_cancel", __streamHandle);
-    },
-  });
-}
-"#,
-    )
-    .unwrap();
-    std::fs::write(
         root.join("driver.ts"),
         r#"
-class FakeFinalizationRegistry {
-  static readonly registries: FakeFinalizationRegistry[] = [];
-  private readonly callback: (heldValue: unknown) => void;
-  private registrations: Array<{
-    target: object;
-    heldValue: unknown;
-    unregisterToken?: object;
-  }> = [];
-
-  constructor(callback: (heldValue: unknown) => void) {
-    this.callback = callback;
-    FakeFinalizationRegistry.registries.push(this);
+class Finalizers {
+  static all: Finalizers[] = [];
+  private entries: Array<{ target: object; value: unknown; token?: object }> = [];
+  private readonly callback: (value: unknown) => void;
+  constructor(callback: (value: unknown) => void) { this.callback = callback; Finalizers.all.push(this); }
+  register(target: object, value: unknown, token?: object): void { this.entries.push({ target, value, token }); }
+  unregister(token: object): boolean {
+    const count = this.entries.length;
+    this.entries = this.entries.filter((entry) => entry.token !== token);
+    return count !== this.entries.length;
   }
-
-  register(target: object, heldValue: unknown, unregisterToken?: object): void {
-    this.registrations.push({ target, heldValue, unregisterToken });
-  }
-
-  unregister(unregisterToken: object): boolean {
-    const before = this.registrations.length;
-    this.registrations = this.registrations.filter(
-      (registration) => registration.unregisterToken !== unregisterToken,
-    );
-    return this.registrations.length !== before;
-  }
-
   static trigger(target: object): void {
-    for (const registry of FakeFinalizationRegistry.registries) {
-      const matching = registry.registrations.filter(
-        (registration) => registration.target === target,
-      );
-      registry.registrations = registry.registrations.filter(
-        (registration) => registration.target !== target,
-      );
-      for (const registration of matching) {
-        registry.callback(registration.heldValue);
-      }
+    for (const registry of Finalizers.all) {
+      const selected = registry.entries.filter((entry) => entry.target === target);
+      registry.entries = registry.entries.filter((entry) => entry.target !== target);
+      selected.forEach((entry) => registry.callback(entry.value));
     }
   }
 }
+(globalThis as { FinalizationRegistry?: unknown }).FinalizationRegistry = Finalizers;
+const { __installBackend, createUniFfiStream, UniffiError } = await import("./common/runtime.ts");
+function assert(ok: boolean, label: string): void { if (!ok) throw new Error("FAIL " + label); }
+function name(error: unknown): string { return error instanceof UniffiError ? error.errorName : ""; }
+async function flush(): Promise<void> { await Promise.resolve(); await new Promise<void>((resolve) => setTimeout(resolve, 0)); }
 
-// runtime.ts constructs its registries at module evaluation time, so install the
-// deterministic fake before importing it. These tests never depend on real GC.
-(globalThis as { FinalizationRegistry?: unknown }).FinalizationRegistry =
-  FakeFinalizationRegistry;
-
-const { __installBackend, createUniffiAsyncIterable, UniffiError } =
-  await import("./common/runtime.ts");
-const { countEvents } = await import("./common/api.ts");
-
-function assert(cond: boolean, label: string): void {
-  if (!cond) throw new Error(`FAIL ${label}`);
+for (const backend of [{}, { __uniffiAbiVersion: 1 }, { __uniffiAbiVersion: 3 }]) {
+  let rejected = false;
+  try { __installBackend(backend); } catch (error) { rejected = name(error) === "UniffiAbiMismatch"; }
+  assert(rejected, "ABI mismatch rejects before install");
 }
+__installBackend({ __uniffiAbiVersion: 2 });
 
-async function flushFinalizerWork(): Promise<void> {
-  await Promise.resolve();
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
-}
-
-const unhandledRejections: unknown[] = [];
-(globalThis as { process?: { on?: (event: string, listener: (reason: unknown) => void) => void } })
-  .process?.on?.("unhandledRejection", (reason) => unhandledRejections.push(reason));
-
-let cancelCount = 0;
-let nextId = 1;
-const streams = new Map<string, Array<unknown>>();
-
-__installBackend({
-  count_events(count: number) {
-    const handle = `h${nextId++}`;
-    streams.set(handle, Array.from({ length: count }, (_, value) => ({ value })));
-    return handle;
+let starts = 0;
+let pulls = 0;
+let cancels = 0;
+const values: Array<number | null> = [1, null, 2];
+const stream = createUniFfiStream({
+  start: () => { starts += 1; return "stream"; },
+  next: async () => {
+    pulls += 1;
+    return pulls > values.length
+      ? { kind: "done" as const }
+      : { kind: "item" as const, value: values[pulls - 1] };
   },
-  async count_events_stream_next(handle: string) {
-    const values = streams.get(handle);
-    if (!values) return { done: true };
-    const value = values.shift();
-    return value === undefined ? { done: true } : { done: false, value };
-  },
-  count_events_stream_cancel(handle: string) {
-    cancelCount += 1;
-    streams.delete(handle);
-  },
+  cancel: () => { cancels += 1; },
 });
+assert(starts === 0, "construction is lazy");
+assert((await stream.next()).value === 1 && starts === 1, "first pull starts exactly once");
+assert((await stream.next()).value === null && (await stream.next()).value === 2, "optional null is an item");
+assert((await stream.next()).done === true, "Done is explicit");
+const terminalPulls = pulls;
+assert((await stream.next()).done === true && pulls === terminalPulls, "done is terminal");
+let mixed = false;
+try { stream[Symbol.asyncIterator](); } catch (error) { mixed = name(error) === "UniffiStreamConsumed"; }
+assert(mixed, "direct and iterator consumers cannot mix");
 
-const values: number[] = [];
-for await (const event of countEvents(3)) values.push(event.value);
-assert(values.join(",") === "0,1,2", `for-await values ${values}`);
-
-const beforeBreak = cancelCount;
-for await (const event of countEvents(10)) {
-  assert(event.value === 0, "break first value");
-  break;
-}
-assert(cancelCount === beforeBreak + 1, "break should cancel once");
-
-const manual = countEvents(10)[Symbol.asyncIterator]();
-assert((await manual.next()).done === false, "manual first next");
-await manual.return?.();
-await manual.return?.();
-assert(cancelCount === beforeBreak + 2, "manual return should be idempotent");
-assert((await manual.next()).done === true, "next after return done");
-FakeFinalizationRegistry.trigger(manual);
-await flushFinalizerWork();
-assert(cancelCount === beforeBreak + 2, "return should unregister finalizer");
-
-const doneIterable = createUniffiAsyncIterable<number>({
-  handle: "done",
-  next: async () => ({ done: true }),
-  cancel: () => { cancelCount += 1; },
+let idleStarts = 0;
+let idleCancels = 0;
+const idle = createUniFfiStream({
+  start: () => { idleStarts += 1; return "idle"; },
+  next: async () => ({ kind: "done" as const }),
+  cancel: () => { idleCancels += 1; },
 });
-const doneIterator = doneIterable[Symbol.asyncIterator]();
-const beforeDone = cancelCount;
-assert((await doneIterator.next()).done === true, "normal done result");
-await doneIterator.return?.();
-assert(cancelCount === beforeDone, "return after normal done should not cancel");
-FakeFinalizationRegistry.trigger(doneIterator);
-await flushFinalizerWork();
-assert(cancelCount === beforeDone, "normal done should unregister without cancel");
+await idle.cancel();
+Finalizers.trigger(idle);
+await flush();
+assert(idleStarts === 0 && idleCancels === 0 && (await idle.next()).done === true, "idle cancel has no handle or finalizer");
 
-const activeIterable = createUniffiAsyncIterable<number>({
-  handle: "active",
-  next: async () => ({ done: false, value: 7 }),
-  cancel: () => { cancelCount += 1; },
+const single = createUniFfiStream({
+  start: () => "single",
+  next: async () => ({ kind: "done" as const }),
+  cancel: () => {},
 });
-const activeIterator = activeIterable[Symbol.asyncIterator]();
-const beforeIterableCollection = cancelCount;
-FakeFinalizationRegistry.trigger(activeIterable);
-await flushFinalizerWork();
-assert(cancelCount === beforeIterableCollection, "collecting iterable must not cancel active iterator");
-assert((await activeIterator.next()).value === 7, "active iterator remains usable");
-await activeIterator.return?.();
-assert(cancelCount === beforeIterableCollection + 1, "active iterator return cancels once");
-
-let finalizerCancellationCount = 0;
-const abandoned = createUniffiAsyncIterable<number>({
-  handle: "abandoned",
-  next: async () => ({ done: true }),
-  cancel: () => {
-    finalizerCancellationCount += 1;
-    return Promise.reject(new Error("finalizer rejection must be observed"));
-  },
-});
-FakeFinalizationRegistry.trigger(abandoned);
-await flushFinalizerWork();
-assert(finalizerCancellationCount === 1, "abandoned iterable finalizer cancels once");
-FakeFinalizationRegistry.trigger(abandoned);
-await flushFinalizerWork();
-assert(finalizerCancellationCount === 1, "finalizer cancellation remains one-shot");
-
-let syncFinalizerCancellationCount = 0;
-const syncFailingAbandoned = createUniffiAsyncIterable<number>({
-  handle: "sync-finalizer-failure",
-  next: async () => ({ done: true }),
-  cancel: () => {
-    syncFinalizerCancellationCount += 1;
-    throw new Error("finalizer synchronous failure must be swallowed");
-  },
-});
-FakeFinalizationRegistry.trigger(syncFailingAbandoned);
-await flushFinalizerWork();
-assert(syncFinalizerCancellationCount === 1, "finalizer swallows synchronous cleanup failure");
-assert(unhandledRejections.length === 0, "finalizer must not leave unhandled rejections");
-
-const callerError = new Error("caller error");
-const throwingIterator = createUniffiAsyncIterable<number>({
-  handle: "throwing",
-  next: async () => ({ done: true }),
-  cancel: () => { cancelCount += 1; },
-})[Symbol.asyncIterator]();
-const beforeThrow = cancelCount;
-let threwCallerError = false;
-try {
-  await throwingIterator.throw?.(callerError);
-} catch (error) {
-  threwCallerError = error === callerError;
-}
-assert(threwCallerError, "iterator throw should reject with the caller error");
-assert(cancelCount === beforeThrow + 1, "iterator throw cancels once");
-FakeFinalizationRegistry.trigger(throwingIterator);
-await flushFinalizerWork();
-assert(cancelCount === beforeThrow + 1, "iterator throw should unregister finalizer");
-
-__installBackend({
-  count_events() { return "err"; },
-  async count_events_stream_next() {
-    throw new UniffiError({ errorName: "StreamError", variant: "Boom", message: "boom" });
-  },
-  count_events_stream_cancel() { cancelCount += 1; },
-});
-let threw = false;
-const errorIterator = countEvents(1)[Symbol.asyncIterator]();
-const beforeStreamError = cancelCount;
-try {
-  await errorIterator.next();
-} catch (error) {
-  threw = true;
-  assert(error instanceof UniffiError, "stream error type");
-  assert((error as { errorName: string }).errorName === "StreamError", "stream error name");
-}
-assert(threw, "stream error should throw");
-await flushFinalizerWork();
-assert(cancelCount === beforeStreamError + 1, "stream error should cancel once");
-FakeFinalizationRegistry.trigger(errorIterator);
-await flushFinalizerWork();
-assert(cancelCount === beforeStreamError + 1, "stream error should unregister finalizer");
+const singleIterator = single[Symbol.asyncIterator]();
+let second = false;
+try { single[Symbol.asyncIterator](); } catch (error) { second = name(error) === "UniffiStreamConsumed"; }
+assert(second && (await singleIterator.next()).done === true, "second iterator fails before start");
 
 let resolvePending: ((value: unknown) => void) | null = null;
-__installBackend({
-  count_events() { return "pending"; },
-  count_events_stream_next() {
-    return new Promise((resolve) => { resolvePending = resolve; });
-  },
-  count_events_stream_cancel() { cancelCount += 1; },
+const pending = createUniFfiStream({
+  start: () => "pending",
+  next: () => new Promise((resolve) => { resolvePending = resolve; }),
+  cancel: () => { cancels += 1; },
 });
-const concurrent = countEvents(1)[Symbol.asyncIterator]();
-const pending = concurrent.next();
-let concurrentRejected = false;
-try {
-  await concurrent.next();
-} catch (error) {
-  concurrentRejected = true;
-  assert(error instanceof UniffiError, "concurrent next error type");
-  assert((error as { errorName: string }).errorName === "UniffiStreamConcurrentNext", "concurrent next error name");
-}
-assert(concurrentRejected, "concurrent next should reject");
-resolvePending?.({ done: false, value: { value: 99 } });
-assert((await pending).value.value === 99, "pending value");
-await concurrent.return?.();
+const first = pending.next();
+let concurrent = false;
+try { await pending.next(); } catch (error) { concurrent = name(error) === "UniffiStreamConcurrentNext"; }
+resolvePending?.({ kind: "item", value: 99 });
+assert(concurrent && (await first).value === 99, "concurrent next leaves first pull alive");
+await pending.cancel();
+await pending.cancel();
 
-const single = countEvents(1);
-single[Symbol.asyncIterator]();
-let consumedRejected = false;
-try {
-  single[Symbol.asyncIterator]();
-} catch (error) {
-  consumedRejected = true;
-  assert(error instanceof UniffiError, "consumed error type");
-  assert((error as { errorName: string }).errorName === "UniffiStreamConsumed", "consumed error name");
+const typed = new UniffiError({ errorName: "StreamError", variant: "Boom", data: { id: 7 }, message: "boom" });
+const failed = createUniFfiStream({
+  start: () => "failed",
+  next: async () => ({ kind: "error" as const, error: typed }),
+  cancel: () => { cancels += 1; },
+});
+let typedPreserved = false;
+try { await failed.next(); } catch (error) {
+  typedPreserved = error === typed && name(error) === "StreamError"
+    && (error as UniffiError).variant === "Boom"
+    && (error as Error).message === "boom";
 }
-assert(consumedRejected, "second iterator should throw");
+assert(typedPreserved && (await failed.next()).done === true, "typed Error is preserved and terminal");
 
-const beforeMalformed = cancelCount;
-const malformed = createUniffiAsyncIterable<number>({
-  handle: "malformed",
-  next: async () => ({} as any),
-  cancel: () => { cancelCount += 1; },
-})[Symbol.asyncIterator]();
+const malformed = createUniFfiStream({
+  start: () => "malformed",
+  next: async () => ({ done: true } as unknown),
+  cancel: () => { cancels += 1; },
+});
 let malformedRejected = false;
-try {
-  await malformed.next();
-} catch (error) {
-  malformedRejected = error instanceof UniffiError
-    && (error as { errorName: string }).errorName === "UniffiStreamProtocolError";
-}
-assert(malformedRejected, "malformed envelope must reject rather than become Done");
-assert(cancelCount === beforeMalformed + 1, "malformed envelope should clean up once");
-assert((await malformed.next()).done === true, "malformed iterator should be terminal");
+try { await malformed.next(); } catch (error) { malformedRejected = name(error) === "UniffiStreamProtocolError"; }
+assert(malformedRejected && (await malformed.next()).done === true, "old nullable envelope is rejected");
 
+let finalizerCancels = 0;
+const active = createUniFfiStream({
+  start: () => "active",
+  next: async () => ({ kind: "item" as const, value: 7 }),
+  cancel: () => { finalizerCancels += 1; return Promise.reject(new Error("ignored")); },
+});
+await active.next();
+Finalizers.trigger(active);
+await flush();
+assert(finalizerCancels === 1, "active finalizer is best effort and once only");
+
+let iteratorCancels = 0;
+const owner = createUniFfiStream({
+  start: () => "owner",
+  next: async () => ({ kind: "item" as const, value: 8 }),
+  cancel: () => { iteratorCancels += 1; },
+});
+const ownerIterator = owner[Symbol.asyncIterator]();
+await ownerIterator.next();
+Finalizers.trigger(owner);
+await flush();
+assert(iteratorCancels === 0, "stream finalizer does not own active iterator");
+Finalizers.trigger(ownerIterator);
+await flush();
+assert(iteratorCancels === 1, "iterator finalizer owns active handle");
+
+let returnCancels = 0;
+const throwing = createUniFfiStream({
+  start: () => "throwing",
+  next: async () => ({ kind: "item" as const, value: 1 }),
+  cancel: () => { returnCancels += 1; },
+});
+const throwingIterator = throwing[Symbol.asyncIterator]();
+await throwingIterator.next();
+const caller = new Error("caller");
+let callerPreserved = false;
+try { await throwingIterator.throw?.(caller); } catch (error) { callerPreserved = error === caller; }
+assert(callerPreserved && returnCancels === 1, "iterator throw keeps caller error after cleanup");
 console.log("ok");
 "#,
     )
     .unwrap();
+
     let output = Command::new(&node)
         .arg("--experimental-strip-types")
         .arg("--no-warnings")
@@ -1098,15 +1216,17 @@ fn js_async_iterable_stream_stub_contract() {
 
     let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
     for needle in [
-        "createUniffiAsyncIterable<StreamEvent>",
-        "__call<any>(\"count_events\"",
-        "type UniffiStreamNext",
-        "Promise<UniffiStreamNext<StreamEvent>>",
-        "__callAsync<{ done?: unknown; value?: any; error?: unknown }>(\"count_events_stream_next\"",
+        "createUniFfiStream<StreamEvent, unknown>",
+        "start: () => __call<any>(\"count_events\"",
+        "__callAsync<any>(\"count_events_stream_next\"",
+        "switch (__next.kind)",
+        "return { kind: \"item\", value:",
+        "return { kind: \"done\" };",
+        "return { kind: \"error\", error:",
         "__call<void>(\"count_events_stream_cancel\"",
-        "if (__next.done)",
-        "Object.prototype.hasOwnProperty.call(__next, \"value\")",
-        "return { done: false, value: { value: __next.value.value } as StreamEvent };",
+        "export type { UniFfiStream } from \"./runtime.ts\";",
+        "import type { UniFfiStream } from \"./runtime.ts\";",
+        "new StreamError(",
     ] {
         assert!(
             api.contains(needle),
@@ -1114,18 +1234,137 @@ fn js_async_iterable_stream_stub_contract() {
         );
     }
     assert!(
-        api.contains("export function optionalEvents(): AsyncIterable<number | null>"),
+        api.contains("export function optionalEvents(): UniFfiStream<number | null>"),
         "common/api.ts should retain an optional stream item type:\n{api}"
     );
     assert!(
-        !api.contains("StreamError"),
-        "common/api.ts should not import unused stream error types:\n{api}"
+        api.contains("new StreamError("),
+        "common/api.ts should lift stream Error steps into the typed error class:\n{api}"
     );
+    for removed in [
+        "createUniffiAsyncIterable",
+        "UniffiStreamNext",
+        "done?: unknown",
+        "if (__next.done)",
+        "UNIFFI_JS_CONTRACT_VERSION",
+        "__installBackend",
+    ] {
+        assert!(
+            !api.contains(removed),
+            "common/api.ts retained removed stream/backend surface {removed}:\n{api}"
+        );
+    }
+    // This fixture contains real output-stream bindings.  The local type
+    // import is required in addition to the public re-export above, and a
+    // strict compiler must be able to resolve the stream return annotations.
+    // TypeScript 4.x reports only TS2691 for this repository's deliberate
+    // `.ts` specifiers. TypeScript 5+ supports that form directly; in both
+    // cases every actual type error must still fail this regression.
+    if let Some(tsc) = which_tool("tsc") {
+        let version = Command::new(&tsc)
+            .arg("--version")
+            .output()
+            .expect("failed to query tsc version");
+        assert!(
+            version.status.success(),
+            "tsc --version failed for generated output-stream typecheck:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&version.stdout),
+            String::from_utf8_lossy(&version.stderr),
+        );
+        let supports_ts_extensions = String::from_utf8_lossy(&version.stdout)
+            .split_whitespace()
+            .find_map(|word| {
+                word.split('.')
+                    .next()
+                    .and_then(|major| major.parse::<u32>().ok())
+            })
+            .is_some_and(|major| major >= 5);
+        let tsconfig = out_dir.join("tsconfig.json");
+        std::fs::write(
+            &tsconfig,
+            if supports_ts_extensions {
+                r#"{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": [],
+    "lib": ["es2022", "dom"]
+  },
+  "include": ["common/*.ts"]
+}
+"#
+            } else {
+                r#"{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "node",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": [],
+    "lib": ["es2022", "dom"]
+  },
+  "include": ["common/*.ts"]
+}
+"#
+            },
+        )
+        .unwrap();
+        let output = Command::new(&tsc)
+            .arg("--noEmit")
+            .arg("-p")
+            .arg(tsconfig.as_str())
+            .output()
+            .expect("failed to invoke tsc for generated stream tree");
+        let diagnostics = format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let unexpected = diagnostics
+            .lines()
+            .filter(|line| {
+                line.contains("error TS") && (supports_ts_extensions || !line.contains("TS2691"))
+            })
+            .collect::<Vec<_>>();
+        let has_ts2691 = diagnostics
+            .lines()
+            .any(|line| line.contains("error TS2691"));
+        assert!(
+            output.status.success() || (!supports_ts_extensions && has_ts2691),
+            "tsc --strict failed without the sole TypeScript 4.x .ts-specifier diagnostic:\n{diagnostics}"
+        );
+        assert!(
+            unexpected.is_empty(),
+            "tsc --strict failed on generated output-stream tree:\n{diagnostics}"
+        );
+    } else {
+        eprintln!("note: tsc not available, skipping strict output-stream typecheck");
+    }
     let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
     assert!(
         backend.contains("\"count_events_stream_next\": \"countEventsStreamNext\"")
-            && backend.contains("\"count_events_stream_cancel\": \"countEventsStreamCancel\""),
+            && backend.contains("\"count_events_stream_cancel\": \"countEventsStreamCancel\"")
+            && backend.contains("__uniffiAbiVersion")
+            && backend.contains("__uniffiNormalizeStreamStep"),
         "napi backend name map should include stream next/cancel:\n{backend}"
+    );
+    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    assert!(
+        preload.contains("__uniffiNormalizeStreamStep")
+            && preload.contains("__uniffiLiftResult")
+            && preload.contains("method.endsWith(\"_stream_next\")"),
+        "electron preload must normalize N-API stream output to tagged ABI-v2 steps:\n{preload}"
     );
     let renderer = std::fs::read_to_string(out_dir.join("electron/renderer.ts")).unwrap();
     assert!(
@@ -1138,7 +1377,10 @@ fn js_async_iterable_stream_stub_contract() {
         wasm_rs.contains("RustStreamRegistry")
             && wasm_rs.contains("pub async fn count_events_stream_next")
             && wasm_rs.contains("pub fn count_events_stream_cancel")
-            && wasm_rs.contains("Reflect::set(&__obj, &JsValue::from_str(\"done\")"),
+            && wasm_rs.contains("Reflect::set(&__obj, &JsValue::from_str(\"kind\")")
+            && wasm_rs.contains("JsValue::from_str(\"item\")")
+            && wasm_rs.contains("JsValue::from_str(\"done\")")
+            && wasm_rs.contains("JsValue::from_str(\"error\")"),
         "wasm shim should emit stream start/next/cancel:\n{wasm_rs}"
     );
     let napi_rs = std::fs::read_to_string(out_dir.join("node/stream_core.rs")).unwrap();
@@ -1146,8 +1388,10 @@ fn js_async_iterable_stream_stub_contract() {
         napi_rs.contains("RustStreamRegistry")
             && napi_rs.contains("pub async fn count_events_stream_next")
             && napi_rs.contains("pub fn count_events_stream_cancel")
-            && napi_rs.contains("pub done: bool,")
-            && napi_rs.contains("pub value: Option<"),
+            && napi_rs.contains("pub kind: ::std::string::String,")
+            && napi_rs.contains("kind: ::std::string::String::from(\"item\")")
+            && napi_rs.contains("kind: ::std::string::String::from(\"done\")")
+            && napi_rs.contains("kind: ::std::string::String::from(\"error\")"),
         "napi shim should emit stream start/next/cancel:\n{napi_rs}"
     );
 
@@ -1167,6 +1411,7 @@ let errorNextCalls = 0;
 const streams = new Map<string, { values: Array<unknown>; errorAt?: number; nextCalls: number }>();
 
 __installBackend({
+  __uniffiAbiVersion: 2,
   count_events(count: number) {
     const handle = `h${nextId++}`;
     streams.set(handle, {
@@ -1177,10 +1422,10 @@ __installBackend({
   },
   async count_events_stream_next(handle: string) {
     const stream = streams.get(handle);
-    if (!stream) return { done: true };
+    if (!stream) return { kind: "done" };
     stream.nextCalls += 1;
     const value = stream.values.shift();
-    return value === undefined ? { done: true } : { done: false, value };
+    return value === undefined ? { kind: "done" } : { kind: "item", value };
   },
   count_events_stream_cancel(handle: string) {
     cancelCount += 1;
@@ -1193,10 +1438,10 @@ __installBackend({
   },
   async optional_events_stream_next(handle: string) {
     const stream = streams.get(handle);
-    if (!stream) return { done: true };
+    if (!stream) return { kind: "done" };
     stream.nextCalls += 1;
-    if (stream.values.length === 0) return { done: true };
-    return { done: false, value: stream.values.shift() };
+    if (stream.values.length === 0) return { kind: "done" };
+    return { kind: "item", value: stream.values.shift() };
   },
   optional_events_stream_cancel(handle: string) {
     cancelCount += 1;
@@ -1209,9 +1454,9 @@ __installBackend({
   },
   async empty_optional_events_stream_next(handle: string) {
     const stream = streams.get(handle);
-    if (!stream || stream.values.length === 0) return { done: true };
+    if (!stream || stream.values.length === 0) return { kind: "done" };
     stream.nextCalls += 1;
-    return { done: false, value: stream.values.shift() };
+    return { kind: "item", value: stream.values.shift() };
   },
   empty_optional_events_stream_cancel(handle: string) {
     cancelCount += 1;
@@ -1224,9 +1469,9 @@ __installBackend({
   },
   async single_optional_event_stream_next(handle: string) {
     const stream = streams.get(handle);
-    if (!stream || stream.values.length === 0) return { done: true };
+    if (!stream || stream.values.length === 0) return { kind: "done" };
     stream.nextCalls += 1;
-    return { done: false, value: stream.values.shift() };
+    return { kind: "item", value: stream.values.shift() };
   },
   single_optional_event_stream_cancel(handle: string) {
     cancelCount += 1;
@@ -1239,14 +1484,14 @@ __installBackend({
   },
   async error_after_one_stream_next(handle: string) {
     const stream = streams.get(handle);
-    if (!stream) return { done: true };
+    if (!stream) return { kind: "done" };
     errorNextCalls += 1;
     stream.nextCalls += 1;
     if (stream.errorAt === stream.nextCalls) {
-      throw new UniffiError({ errorName: "StreamError", variant: "Boom", message: "boom" });
+      return { kind: "error", error: "Boom" };
     }
     const value = stream.values.shift();
-    return value === undefined ? { done: true } : { done: false, value };
+    return value === undefined ? { kind: "done" } : { kind: "item", value };
   },
   error_after_one_stream_cancel(handle: string) {
     cancelCount += 1;
@@ -1323,10 +1568,11 @@ try {
 }
 assert(callerErrorPreserved, "throw should reject the caller error");
 await thrown.return?.();
-assert(cancelCount === beforeThrow + 1, "throw cleanup should be idempotent");
+assert(cancelCount === beforeThrow, "throw before first pull should not start or cancel a native handle");
 
 let resolvePending: ((value: unknown) => void) | null = null;
 __installBackend({
+  __uniffiAbiVersion: 2,
   count_events() { return "pending"; },
   count_events_stream_next() {
     return new Promise((resolve) => { resolvePending = resolve; });
@@ -1344,7 +1590,7 @@ try {
   assert((error as UniffiError).errorName === "UniffiStreamConcurrentNext", "concurrent next error name");
 }
 assert(concurrentRejected, "concurrent next should reject");
-resolvePending?.({ done: false, value: { value: 99 } });
+resolvePending?.({ kind: "item", value: { value: 99 } });
 assert((await pending).value.value === 99, "pending value");
 await concurrent.return?.();
 
@@ -1362,6 +1608,7 @@ assert(consumedRejected, "second iterator should throw");
 
 const beforeMalformed = cancelCount;
 __installBackend({
+  __uniffiAbiVersion: 2,
   optional_events() { return "malformed"; },
   async optional_events_stream_next() { return {}; },
   optional_events_stream_cancel() { cancelCount += 1; },
@@ -1437,16 +1684,13 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
 
     let stream = std::fs::read_to_string(out_dir.join("harmony/stream.ts")).unwrap();
     for needle in [
-        "export interface UniFfiStream<T>",
-        "next(): Promise<IteratorResult<T>>;",
-        "cancel(): Promise<void>;",
-        "export function toUniFfiStream<T>(source: AsyncIterable<T>): UniFfiStream<T>",
-        "source[Symbol.asyncIterator]()",
-        "returnFn.call(iterator)",
+        "import type { UniFfiStream } from \"../common/runtime.ts\";",
         "export function countEventsStream(count: number): UniFfiStream<StreamEvent>",
-        "return toUniFfiStream(countEvents(count));",
+        "return countEvents(count);",
         "export function errorAfterOneStream(): UniFfiStream<StreamEvent>",
+        "return errorAfterOne();",
         "export function optionalEventsStream(): UniFfiStream<number | null>",
+        "return optionalEvents();",
         "import type { StreamEvent } from \"../common/public-types.ts\";",
     ] {
         assert!(
@@ -1455,113 +1699,14 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         );
     }
     assert!(
-        !stream.contains("unknown") && !contains_dynamic_type_word(&stream),
-        "harmony stream helper should avoid explicit any/unknown:\n{stream}"
-    );
-    assert!(
         !stream.contains("__call") && !stream.contains("_stream_next"),
-        "harmony fallback should not expose raw stream ABI keys:\n{stream}"
+        "harmony stream helper should not expose raw stream ABI keys:\n{stream}"
     );
-
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("skipping harmony stream runtime driver: node with --experimental-strip-types not available");
-        return;
-    };
-    std::fs::write(
-        out_dir.join("harmony-stream-driver.ts"),
-        r#"
-import { toUniFfiStream } from "./harmony/stream.ts";
-
-function assert(cond: boolean, label: string): void {
-  if (!cond) throw new Error(`FAIL ${label}`);
-}
-
-let returnCount = 0;
-const source = {
-  [Symbol.asyncIterator](): AsyncIterator<number> {
-    let nextValue = 0;
-    return {
-      async next(): Promise<IteratorResult<number>> {
-        if (nextValue >= 3) return { done: true, value: undefined as number };
-        return { done: false, value: nextValue++ };
-      },
-      async return(): Promise<IteratorResult<number>> {
-        returnCount += 1;
-        return { done: true, value: undefined as number };
-      },
-    };
-  },
-};
-
-const stream = toUniFfiStream(source);
-const one = await stream.next();
-assert(one.done === false && one.value === 0, "first next");
-await stream.cancel();
-await stream.cancel();
-assert(returnCount === 1, `cancel idempotent ${returnCount}`);
-const afterCancel = await stream.next();
-assert(afterCancel.done === true, "next after cancel done");
-
-const nullable = toUniFfiStream<number | null>({
-  [Symbol.asyncIterator](): AsyncIterator<number | null> {
-    let nextValue = 0;
-    return {
-      async next(): Promise<IteratorResult<number | null>> {
-        if (nextValue === 0) { nextValue += 1; return { done: false, value: 1 }; }
-        if (nextValue === 1) { nextValue += 1; return { done: false, value: null }; }
-        if (nextValue === 2) { nextValue += 1; return { done: false, value: 2 }; }
-        return { done: true, value: undefined as number | null };
-      },
-    };
-  },
-});
-const nullableValues: Array<number | null> = [];
-for (;;) {
-  const result = await nullable.next();
-  if (result.done) break;
-  nullableValues.push(result.value);
-}
-assert(nullableValues.length === 3 && nullableValues[1] === null,
-  `nullable Harmony stream values ${nullableValues}`);
-
-let threw = false;
-const bad = toUniFfiStream({
-  [Symbol.asyncIterator](): AsyncIterator<number> {
-    return {
-      async next(): Promise<IteratorResult<number>> {
-        throw new Error("boom");
-      },
-    };
-  },
-});
-try {
-  await bad.next();
-} catch (error) {
-  threw = error instanceof Error && error.message === "boom";
-}
-assert(threw, "error rejection propagates");
-
-console.log("ok");
-"#,
-    )
-    .unwrap();
-    let output = Command::new(&node)
-        .arg("--experimental-strip-types")
-        .arg("--no-warnings")
-        .arg("harmony-stream-driver.ts")
-        .current_dir(&out_dir)
-        .output()
-        .expect("failed to run harmony stream driver");
     assert!(
-        output.status.success(),
-        "harmony stream driver failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("ok"),
-        "harmony stream driver did not print ok"
+        !stream.contains("toUniFfiStream")
+            && !stream.contains("source[Symbol.asyncIterator]")
+            && !stream.contains("returnFn.call"),
+        "harmony stream helper must delegate to the canonical strict runtime:\n{stream}"
     );
 }
 
@@ -1774,10 +1919,11 @@ fn input_stream_bidi_static_generation_contract() {
         "lowerItem: (__uniffiInputValue0: any) => ({ value: __uniffiInputValue0.value })",
         "lowerError: (__uniffiInputError0: unknown) => __uniffiInputError0",
         "errorShape: \"flat\"",
-        "export function runningSum(events: AsyncIterable<CounterEvent>): AsyncIterable<CounterEvent>",
-        "const __handle = __call<any>(\"running_sum\", createUniffiInputStream(events, {",
-        "return createUniffiAsyncIterable<CounterEvent>({",
-        "next: async (__streamHandle: unknown): Promise<UniffiStreamNext<CounterEvent>> =>",
+        "export function runningSum(events: AsyncIterable<CounterEvent>): UniFfiStream<CounterEvent>",
+        "return createUniFfiStream<CounterEvent, unknown>({",
+        "start: () => __call<any>(\"running_sum\", createUniffiInputStream(events, {",
+        "next: async (__streamHandle: unknown) =>",
+        "switch (__next.kind)",
         "__call<void>(\"running_sum_stream_cancel\", __streamHandle);",
     ] {
         assert!(
@@ -1802,12 +1948,18 @@ fn input_stream_bidi_static_generation_contract() {
         "electron preload should forward input stream markers:\n{preload}"
     );
     let napi_rs = std::fs::read_to_string(out_dir.join("node/input_stream_core.rs")).unwrap();
+    let compact_napi_rs = napi_rs.split_whitespace().collect::<String>();
+    assert!(
+        compact_napi_rs.contains(
+            "pubstruct__UniffiInputStream<NextResult:'static+napi::bindgen_prelude::FromNapiValue,>"
+        ),
+        "napi bridge must fully qualify the input-stream FromNapiValue bound:\n{napi_rs}"
+    );
     for needle in [
-        "pub struct __UniffiInputStream<NextResult: 'static + FromNapiValue>".to_string(),
         input_next_type.clone(),
         "impl ::uniffi::ForeignInputStreamOps".to_string(),
         "::uniffi::UniFfiInputStream::from_handle_and_ops".to_string(),
-        "ThreadsafeFunctionCallMode::NonBlocking".to_string(),
+        "napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking".to_string(),
         "pub fn running_sum(".to_string(),
         "events: __UniffiInputStream<".to_string(),
         "pub async fn running_sum_stream_next(".to_string(),
@@ -2334,9 +2486,10 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
 
     let node_rs = std::fs::read_to_string(out_dir.join("node/arithmetical.rs")).unwrap();
     assert!(
-        node_rs.contains("use napi::bindgen_prelude::*;")
-            && node_rs.contains("use napi_derive::napi;"),
-        "node bridge must keep ordinary napi-rs imports:\n{node_rs}"
+        !node_rs.contains("use napi::bindgen_prelude::*;")
+            && node_rs.contains("use napi_derive::napi;")
+            && node_rs.contains("napi::bindgen_prelude::Result"),
+        "node bridge must use collision-safe qualified napi-rs paths:\n{node_rs}"
     );
     assert!(
         !node_rs.contains("napi_ohos"),
@@ -2373,7 +2526,7 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
         "__uniffiLowerShape",
         "__uniffiLiftShape",
         "__uniffiCallback",
-        "__uniffiBackendKind = \"ohos\"",
+        "__uniffiAbiVersion",
         "then(",
     ] {
         assert!(

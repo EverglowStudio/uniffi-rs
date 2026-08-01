@@ -136,13 +136,6 @@ impl BackendAdapterTarget<'_> {
         }
     }
 
-    fn backend_kind(&self) -> &'static str {
-        match self {
-            Self::Node { .. } => "napi",
-            Self::Ohos { .. } => "ohos",
-        }
-    }
-
     fn dynamic_value_type(&self) -> &'static str {
         match self {
             Self::Node { .. } => "unknown",
@@ -221,7 +214,6 @@ fn render_backend_adapter(
     let bridge_label = target.bridge_label();
     let native_artifact = target.native_artifact();
     let runtime_label = target.runtime_label();
-    let backend_kind = target.backend_kind();
     let dynamic_type = target.dynamic_value_type();
     let prelude = target.prelude(namespace);
     let name_map_literal =
@@ -251,6 +243,29 @@ fn render_backend_adapter(
          \n\
          function __uniffiIsObjectFreeKey(name: string): boolean {{\n\
              return name.startsWith(\"__uniffi_\") && name.endsWith(\"_object_free\");\n\
+         }}\n\
+         \n\
+         function __uniffiIsStreamNextKey(name: string): boolean {{\n\
+             return name.endsWith(\"_stream_next\");\n\
+         }}\n\
+         \n\
+         // napi-rs represents optional object fields with the host's optional\n\
+         // property rules. Project the generated bridge struct into the exact\n\
+         // internal tagged union before common/api.ts sees it, so Done has no\n\
+         // payload and Item(None) remains an own value:null field.\n\
+         function __uniffiNormalizeStreamStep(value: {dynamic_type}): {dynamic_type} {{\n\
+             if (value === null || typeof value !== \"object\") return value;\n\
+             const raw = value as Record<string, {dynamic_type}>;\n\
+             if (raw.kind === \"item\" && Object.prototype.hasOwnProperty.call(raw, \"value\")) {{\n\
+                 return {{ kind: \"item\", value: raw.value }};\n\
+             }}\n\
+             if (raw.kind === \"done\") {{\n\
+                 return {{ kind: \"done\" }};\n\
+             }}\n\
+             if (raw.kind === \"error\" && Object.prototype.hasOwnProperty.call(raw, \"error\")) {{\n\
+                 return {{ kind: \"error\", error: raw.error }};\n\
+             }}\n\
+             return value;\n\
          }}\n\
          \n\
          function __uniffiCallbackErrorPayload(error: {dynamic_type}, shape: {dynamic_type}): {dynamic_type} {{\n\
@@ -382,6 +397,7 @@ fn render_backend_adapter(
              {{}} as Record<string, {dynamic_type}>,\n\
              {{\n\
                  get(_t, name: string) {{\n\
+                     if (name === \"__uniffiAbiVersion\") return 2;\n\
                      // `common/objects.ts` uses the wasm registry destructor\n\
                      // key for every flavor. N-API object wrappers are native\n\
                      // class instances whose lifetime is owned by {runtime_label},\n\
@@ -419,21 +435,27 @@ fn render_backend_adapter(
                              typeof (result as {{ then?: {dynamic_type} }}).then === \"function\"\n\
                          ) {{\n\
                              return (result as Promise<{dynamic_type}>).then(\n\
-                                 (value) => __uniffiLiftShape(value),\n\
+                                 (value) => {{\n\
+                                     const lifted = __uniffiLiftShape(value);\n\
+                                     return __uniffiIsStreamNextKey(name)\n\
+                                         ? __uniffiNormalizeStreamStep(lifted)\n\
+                                         : lifted;\n\
+                                 }},\n\
                                  (err) => {{\n\
                                      throw __uniffiLiftShape(err);\n\
                                  }},\n\
                              );\n\
                          }}\n\
-                         return __uniffiLiftShape(result);\n\
+                         const lifted = __uniffiLiftShape(result);\n\
+                         return __uniffiIsStreamNextKey(name)\n\
+                             ? __uniffiNormalizeStreamStep(lifted)\n\
+                             : lifted;\n\
                      }};\n\
                  }},\n\
              }},\n\
          );\n\
          \n\
-         export default backend;\n\
-         export {{ native as __uniffiNativeAddon }};\n\
-         export const __uniffiBackendKind = \"{backend_kind}\" as const;\n"
+         export default backend;\n"
     )
 }
 
@@ -483,8 +505,7 @@ fn render_index(ci: &uniffi_bindgen::ComponentInterface) -> String {
          import backend from \"./backend-napi.ts\";\n\
          import {{ __installBackend }} from \"../common/runtime.ts\";\n\
          __installBackend(backend);\n\
-         export * from \"../common/api.ts\";\n\
-         export {{ backend as __uniffiBackend }};\n"
+         export * from \"../common/api.ts\";\n"
     )
 }
 
@@ -507,8 +528,7 @@ fn render_ohos_index(ci: &uniffi_bindgen::ComponentInterface) -> String {
          import {{ __installBackend }} from \"../common/runtime.ts\";\n\
          __installBackend(backend);\n\
          export * from \"../common/api.ts\";\n\
-         export * from \"./stream.ts\";\n\
-         export {{ backend as __uniffiBackend }};\n"
+         export * from \"./stream.ts\";\n"
     )
 }
 
@@ -549,7 +569,7 @@ fn render_ohos_stream_helpers(ci: &uniffi_bindgen::ComponentInterface) -> String
         let item_ts = ohos_native_ts_type(item_type);
         let wrapper_name = format!("{fn_name}Stream");
         wrappers.push_str(&format!(
-            "\nexport function {wrapper_name}({args}): UniFfiStream<{item_ts}> {{\n    return toUniFfiStream({fn_name}({pass}));\n}}\n"
+            "\nexport function {wrapper_name}({args}): UniFfiStream<{item_ts}> {{\n    return {fn_name}({pass});\n}}\n"
         ));
     }
 
@@ -578,38 +598,7 @@ fn render_ohos_stream_helpers(ci: &uniffi_bindgen::ComponentInterface) -> String
          // Harmony/OpenHarmony consumers can use this small wrapper when ArkTS\n\
          // tooling is stricter than standard JavaScript `for await` syntax.\n\
          \n\
-         {function_import}{type_import}\n\
-         export interface UniFfiStream<T> {{\n\
-             next(): Promise<IteratorResult<T>>;\n\
-             cancel(): Promise<void>;\n\
-         }}\n\
-         \n\
-         export function toUniFfiStream<T>(source: AsyncIterable<T>): UniFfiStream<T> {{\n\
-             const iterator: AsyncIterator<T> = source[Symbol.asyncIterator]();\n\
-             let closed = false;\n\
-             return {{\n\
-                 async next(): Promise<IteratorResult<T>> {{\n\
-                     if (closed) {{\n\
-                         return {{ done: true, value: undefined as T }};\n\
-                     }}\n\
-                     const result = await iterator.next();\n\
-                     if (result.done === true) {{\n\
-                         closed = true;\n\
-                     }}\n\
-                     return result;\n\
-                 }},\n\
-                 async cancel(): Promise<void> {{\n\
-                     if (closed) {{\n\
-                         return;\n\
-                     }}\n\
-                     closed = true;\n\
-                     const returnFn = iterator.return;\n\
-                     if (typeof returnFn === \"function\") {{\n\
-                         await returnFn.call(iterator);\n\
-                     }}\n\
-                 }},\n\
-             }};\n\
-         }}\n\
+         {function_import}{type_import}import type {{ UniFfiStream }} from \"../common/runtime.ts\";\n\
          {wrappers}"
     )
 }
@@ -1711,12 +1700,12 @@ mod ohos_facade_type_tests {
         assert!(node.contains("process.env"));
         assert!(node.contains("./unknown_chat.node"));
         assert!(node.contains("Record<string, unknown>"));
-        assert!(node.contains("__uniffiBackendKind = \"napi\""));
+        assert!(node.contains("__uniffiAbiVersion"));
 
         let ohos = render_ohos_backend_adapter(&ci);
         assert!(ohos.contains("import * as native from \"libunknown_chat_ohos.so\";"));
         assert!(ohos.contains("type UniffiValue = UniffiPrimitive | object;"));
-        assert!(ohos.contains("__uniffiBackendKind = \"ohos\""));
+        assert!(ohos.contains("__uniffiAbiVersion"));
         for node_loader_token in ["createRequire", "process.env", ".node"] {
             assert!(
                 !ohos.contains(node_loader_token),

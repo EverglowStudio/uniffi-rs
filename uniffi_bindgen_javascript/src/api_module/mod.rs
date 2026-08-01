@@ -1139,11 +1139,8 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
         ));
     }
     out.push_str(
-        "export {\n    \
-         UniffiError,\n    \
-         UNIFFI_JS_CONTRACT_VERSION,\n    \
-         __installBackend,\n\
-         } from \"./runtime.ts\";\n\n",
+        "export { UniffiError } from \"./runtime.ts\";\n\
+         export type { UniFfiStream } from \"./runtime.ts\";\n\n",
     );
 
     let mut usage = Usage::default();
@@ -1188,9 +1185,8 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
         runtime.push("fromU64");
     }
     if usage.needs_stream {
-        runtime.push("createUniffiAsyncIterable");
+        runtime.push("createUniFfiStream");
         runtime.push("UniffiError");
-        runtime.push("type UniffiStreamNext");
     }
     if usage.needs_input_stream {
         runtime.push("createUniffiInputStream");
@@ -1200,6 +1196,13 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
             "import {{ {} }} from \"./runtime.ts\";\n",
             runtime.join(", ")
         ));
+    }
+    // A type re-export does not create a local binding that the generated
+    // stream function signatures can use. Keep the public re-export above,
+    // but only import the local type when this component actually emits an
+    // output stream so strict/noUnusedLocals builds remain clean.
+    if usage.needs_stream {
+        out.push_str("import type { UniFfiStream } from \"./runtime.ts\";\n");
     }
 
     // Explicit named imports. Strict TS refuses unused imports, and
@@ -1244,10 +1247,29 @@ fn render_api(ci: &ComponentInterface, config: &JsConfig) -> String {
             join_sorted(&grouped.enums)
         ));
     }
-    if !grouped.errors.is_empty() {
+    let error_value_needed: BTreeSet<String> = usage
+        .stream_error_values
+        .iter()
+        .filter(|name| grouped.errors.contains(*name))
+        .cloned()
+        .collect();
+    let error_type_only: Vec<String> = grouped
+        .errors
+        .iter()
+        .filter(|name| !error_value_needed.contains(*name))
+        .cloned()
+        .collect();
+    if !error_value_needed.is_empty() {
+        let values: Vec<String> = error_value_needed.into_iter().collect();
+        out.push_str(&format!(
+            "import {{ {} }} from \"./errors.ts\";\n",
+            join_sorted(&values)
+        ));
+    }
+    if !error_type_only.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./errors.ts\";\n",
-            join_sorted(&grouped.errors)
+            join_sorted(&error_type_only)
         ));
     }
     if !grouped.callbacks.is_empty() {
@@ -1316,29 +1338,42 @@ fn render_free_function(ci: &ComponentInterface, config: &JsConfig, f: &Function
         let next_name = crate::dispatch_key::stream_next_key(f.name());
         let cancel_name = crate::dispatch_key::stream_cancel_key(f.name());
         let item_ts = ts_type(item_type, config);
-        let item_call_g = call_generic(Some(item_type));
         let item_lift = ts_lift_expr(ci, config, item_type, "__next.value", 0);
+        let error_type = match ret_ty {
+            Some(Type::Stream { error_type, .. }) => error_type,
+            _ => unreachable!("stream branch must have a stream return type"),
+        };
+        let error_expr = ts_stream_error_expr(ci, config, error_type, "__next.error", 0);
         return format!(
             "export function {js_name}({arg_decls}): {ret_ts} {{\n    \
-             const __handle = __call<any>(\"{rust_name}\"{sep}{arg_pass});\n    \
-             return createUniffiAsyncIterable<{item_ts}>({{\n        \
-             handle: __handle,\n        \
-             next: async (__streamHandle: unknown): Promise<UniffiStreamNext<{item_ts}>> => {{\n            \
-             const __next = await __callAsync<{{ done?: unknown; value?: {item_call_g}; error?: unknown }}>(\"{next_name}\", __streamHandle);\n            \
-             if (__next === null || typeof __next !== \"object\" || typeof __next.done !== \"boolean\") {{\n                \
-             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream next returned an invalid native envelope\" }});\n            \
+             return createUniFfiStream<{item_ts}, unknown>({{\n        \
+             start: () => __call<any>(\"{rust_name}\"{sep}{arg_pass}),\n        \
+             next: async (__streamHandle: unknown) => {{\n            \
+             const __next = await __callAsync<any>(\"{next_name}\", __streamHandle);\n            \
+             const __hasOwn = (key: string): boolean => Object.prototype.hasOwnProperty.call(__next, key);\n            \
+             const __hasOnly = (...keys: string[]): boolean => Object.keys(__next).every((key) => keys.includes(key));\n            \
+             if (__next === null || typeof __next !== \"object\" || !__hasOwn(\"kind\")) {{\n                \
+             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream next returned an invalid tagged native step\" }});\n            \
              }}\n            \
-             if (__next.done) {{\n                \
-             if (__next.error !== null && __next.error !== undefined) {{\n                    \
-             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream Done envelope contained an error\" }});\n                \
-             }}\n                \
-             return {{ done: true }};\n            \
-             }}\n            \
-             if (__next.error !== null && __next.error !== undefined) throw __next.error;\n            \
-             if (!Object.prototype.hasOwnProperty.call(__next, \"value\")) {{\n                \
-             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream Item envelope omitted value\" }});\n            \
-             }}\n            \
-             return {{ done: false, value: {item_lift} as {item_ts} }};\n        \
+             switch (__next.kind) {{\n                \
+             case \"item\":\n                    \
+             if (!__hasOwn(\"value\") || __hasOwn(\"error\") || !__hasOnly(\"kind\", \"value\")) {{\n                        \
+             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream Item step is malformed\" }});\n                    \
+             }}\n                    \
+             return {{ kind: \"item\", value: {item_lift} as {item_ts} }};\n                \
+             case \"done\":\n                    \
+             if (!__hasOnly(\"kind\")) {{\n                        \
+             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream Done step is malformed\" }});\n                    \
+             }}\n                    \
+             return {{ kind: \"done\" }};\n                \
+             case \"error\":\n                    \
+             if (!__hasOwn(\"error\") || __hasOwn(\"value\") || !__hasOnly(\"kind\", \"error\")) {{\n                        \
+             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream Error step is malformed\" }});\n                    \
+             }}\n                    \
+             return {{ kind: \"error\", error: {error_expr} }};\n                \
+             default:\n                    \
+             throw new UniffiError({{ errorName: \"UniffiStreamProtocolError\", message: \"uniffi stream next returned an unknown step kind\" }});\n            \
+             }}\n        \
              }},\n        \
              cancel: (__streamHandle: unknown): void => {{\n            \
              __call<void>(\"{cancel_name}\", __streamHandle);\n        \
@@ -1711,6 +1746,24 @@ fn ts_lift_expr(
     }
 }
 
+fn ts_stream_error_expr(
+    ci: &ComponentInterface,
+    config: &JsConfig,
+    ty: &Type,
+    ident: &str,
+    depth: usize,
+) -> String {
+    let lifted = ts_lift_expr(ci, config, ty, ident, depth);
+    match ty {
+        Type::Enum { name, .. } if ci.is_name_used_as_error(name) => format!(
+            "(() => {{ const __streamError = {lifted}; const __variant = typeof __streamError === \"string\" ? __streamError : (__streamError !== null && typeof __streamError === \"object\" && typeof (__streamError as {{ tag?: unknown }}).tag === \"string\" ? (__streamError as {{ tag: string }}).tag : null); return new {name}(`uniffi stream error${{__variant === null ? \"\" : `: ${{__variant}}`}}`, __variant, __streamError); }})()"
+        ),
+        _ => format!(
+            "(() => {{ const __streamError = {lifted}; return new UniffiError({{ errorName: \"UniffiStreamError\", data: __streamError, message: String(__streamError) }}); }})()"
+        ),
+    }
+}
+
 fn ts_arrow_expr_body(expr: String) -> String {
     if expr.trim_start().starts_with('{') {
         format!("({expr})")
@@ -1778,7 +1831,7 @@ fn ts_type(ty: &Type, config: &JsConfig) -> String {
         Type::Box { inner_type } => ts_type(inner_type, config),
         Type::Set { inner_type } => format!("Set<{}>", ts_type(inner_type, config)),
         Type::Stream { item_type, .. } => {
-            format!("AsyncIterable<{}>", ts_type(item_type, config))
+            format!("UniFfiStream<{}>", ts_type(item_type, config))
         }
         Type::InputStream { item_type, .. } => {
             format!("AsyncIterable<{}>", ts_type(item_type, config))
@@ -1819,6 +1872,8 @@ struct Usage {
     needs_from_u64: bool,
     needs_stream: bool,
     needs_input_stream: bool,
+    /// Error classes that a stream-step Error arm constructs at runtime.
+    stream_error_values: BTreeSet<String>,
     /// Every named type (record/enum/error/object/callback/trait) touched.
     named: BTreeSet<String>,
     /// Object names appearing as return types — their class value (not
@@ -1882,9 +1937,19 @@ impl Usage {
                 self.see(ci, key_type, pos, config);
                 self.see(ci, value_type, pos, config);
             }
-            Type::Stream { item_type, .. } => {
+            Type::Stream {
+                item_type,
+                error_type,
+                ..
+            } => {
                 self.needs_stream = true;
                 self.see(ci, item_type, pos, config);
+                self.see(ci, error_type, UsagePos::Ret, config);
+                if let Type::Enum { name, .. } = error_type.as_ref() {
+                    if ci.is_name_used_as_error(name) {
+                        self.stream_error_values.insert(name.clone());
+                    }
+                }
             }
             Type::InputStream {
                 item_type,
@@ -2125,8 +2190,10 @@ fn render_public_types(ci: &ComponentInterface, config: &JsConfig) -> String {
         .unwrap();
         api_entries.extend(errors.iter().map(|name| (name.clone(), "./errors.ts")));
     }
-    // Always re-export UniffiError so downstream can catch it.
+    // Always re-export the stable JavaScript runtime contract types, but never
+    // expose its backend installation or raw stream-step implementation.
     writeln!(out, "export {{ UniffiError }} from \"./runtime.ts\";").unwrap();
+    writeln!(out, "export type {{ UniFfiStream }} from \"./runtime.ts\";").unwrap();
     api_entries.push(("UniffiError".to_string(), "./runtime.ts"));
 
     // Callbacks (callback interfaces + callback traits)
