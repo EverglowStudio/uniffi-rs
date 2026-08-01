@@ -2247,17 +2247,17 @@ impl<'a> Generator<'a> {
                 )
                 .await
                 {
-                    Ok(Ok(Some(value))) => Ok(#next_struct_ident {
+                    Ok(::uniffi::UniFfiStreamStep::Item(value)) => Ok(#next_struct_ident {
                         done: false,
                         value: Some(#lifted_value),
                         error: None,
                     }),
-                    Ok(Ok(None)) => Ok(#next_struct_ident {
+                    Ok(::uniffi::UniFfiStreamStep::Done) => Ok(#next_struct_ident {
                         done: true,
                         value: None,
                         error: None,
                     }),
-                    Ok(Err(err)) => Ok(#next_struct_ident {
+                    Ok(::uniffi::UniFfiStreamStep::Error(err)) => Ok(#next_struct_ident {
                         done: false,
                         value: None,
                         error: Some(#lifted_error),
@@ -4267,11 +4267,11 @@ mod input_stream_descriptor_tests {
         let rust = render_napi_rust(&output_stream_fixture()).unwrap();
         assert!(
             rust.contains("pub error: Option<ReadError>"),
-            "generated output stream next envelope lost its typed error:\n{rust}"
+            "generated output stream Error step lost its typed error:\n{rust}"
         );
         assert!(
-            rust.contains("error: Some(err.into())"),
-            "generated output stream next path did not lift its typed error:\n{rust}"
+            rust.contains("UniFfiStreamStep::Error") && rust.contains("error: Some(err.into())"),
+            "generated output stream Error step did not lift its typed error:\n{rust}"
         );
     }
 

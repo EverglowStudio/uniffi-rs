@@ -74,6 +74,18 @@ impl Stream for ErrorStream {
     }
 }
 
+struct OptionalEventStream {
+    values: VecDeque<Result<Option<StreamEvent>, StreamError>>,
+}
+
+impl Stream for OptionalEventStream {
+    type Item = Result<Option<StreamEvent>, StreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.values.pop_front())
+    }
+}
+
 struct PendingStream;
 
 impl Stream for PendingStream {
@@ -155,6 +167,15 @@ pub fn error_after_one(
 }
 
 #[uniffi::export]
+pub fn optional_output_events() -> uniffi::UniFfiStream<Option<StreamEvent>, StreamError> {
+    Box::pin(OptionalEventStream {
+        values: [Ok(Some(StreamEvent { value: 9 })), Ok(None)]
+            .into_iter()
+            .collect(),
+    })
+}
+
+#[uniffi::export]
 pub fn pending_events(
 ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamError>> + Send + 'static>> {
     Box::pin(PendingStream)
@@ -210,25 +231,55 @@ fn start_count(count: u32) -> uniffi::Handle {
     handle
 }
 
-fn next_count(handle: uniffi::Handle) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
+type NativeStreamStep<T> = uniffi::UniFfiStreamStep<T, StreamError>;
+
+fn next_count(
+    handle: uniffi::Handle,
+) -> (
+    uniffi::RustCallStatusCode,
+    Option<NativeStreamStep<StreamEvent>>,
+) {
     let future = uniffi_uniffi_fn_func_count_events_stream_next(handle);
     complete_next_future(future)
 }
 
 fn next_error_after_one(
     handle: uniffi::Handle,
-) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
+) -> (
+    uniffi::RustCallStatusCode,
+    Option<NativeStreamStep<StreamEvent>>,
+) {
     let future = uniffi_uniffi_fn_func_error_after_one_stream_next(handle);
     complete_next_future(future)
 }
 
-fn next_alias(handle: uniffi::Handle) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
+fn next_optional_output(
+    handle: uniffi::Handle,
+) -> (
+    uniffi::RustCallStatusCode,
+    Option<NativeStreamStep<Option<StreamEvent>>>,
+) {
+    let future = uniffi_uniffi_fn_func_optional_output_events_stream_next(handle);
+    complete_optional_next_future(future)
+}
+
+fn next_alias(
+    handle: uniffi::Handle,
+) -> (
+    uniffi::RustCallStatusCode,
+    Option<NativeStreamStep<StreamEvent>>,
+) {
     let future = uniffi_uniffi_fn_func_count_events_alias_stream_next(handle);
     complete_next_future(future)
 }
 
 #[cfg(feature = "tokio")]
-fn next_tokio_probe(handle: uniffi::Handle) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
+fn next_tokio_probe(
+    handle: uniffi::Handle,
+) -> (
+    uniffi::RustCallStatusCode,
+    Option<NativeStreamStep<StreamEvent>>,
+) {
     let future = uniffi_uniffi_fn_func_tokio_probe_events_stream_next(handle);
     complete_next_future(future)
 }
@@ -240,14 +291,17 @@ fn start_running_sum(input_handle: uniffi::Handle) -> uniffi::Handle {
     handle
 }
 
-fn next_running_sum(handle: uniffi::Handle) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
+fn next_running_sum(
+    handle: uniffi::Handle,
+) -> (
+    uniffi::RustCallStatusCode,
+    Option<NativeStreamStep<StreamEvent>>,
+) {
     let future = uniffi_uniffi_fn_func_running_sum_stream_next(handle);
     complete_next_future(future)
 }
 
-fn complete_next_future(
-    future: uniffi::Handle,
-) -> (uniffi::RustCallStatusCode, Option<StreamEvent>) {
+fn complete_next_raw(future: uniffi::Handle) -> (uniffi::RustCallStatusCode, Vec<u8>) {
     let poll_result = AtomicI8::new(-1);
     unsafe {
         ffi_uniffi_rust_future_poll_rust_buffer(
@@ -263,14 +317,64 @@ fn complete_next_future(
     unsafe {
         ffi_uniffi_rust_future_free_rust_buffer(future);
     }
-    if status.code == uniffi::RustCallStatusCode::Success {
-        (
-            status.code,
-            <Option<StreamEvent> as uniffi::Lift<UniFfiTag>>::try_lift(buf).unwrap(),
-        )
+    let raw = if status.code == uniffi::RustCallStatusCode::Success {
+        buf.destroy_into_vec()
     } else {
-        (status.code, None)
+        Vec::new()
+    };
+    (status.code, raw)
+}
+
+fn decode_native_stream_step<T>(raw: Vec<u8>) -> NativeStreamStep<T>
+where
+    T: uniffi::Lift<UniFfiTag, FfiType = uniffi::RustBuffer>,
+{
+    let (tag, payload) = raw
+        .split_first()
+        .expect("native stream next completed with an empty RustBuffer");
+    match *tag {
+        uniffi::UNIFFI_STREAM_STEP_ITEM_TAG => NativeStreamStep::Item(
+            <T as uniffi::Lift<UniFfiTag>>::try_lift(uniffi::RustBuffer::from_vec(
+                payload.to_vec(),
+            ))
+            .expect("native stream Item payload did not lift"),
+        ),
+        uniffi::UNIFFI_STREAM_STEP_DONE_TAG => {
+            assert!(payload.is_empty(), "native stream Done carried a payload");
+            NativeStreamStep::Done
+        }
+        uniffi::UNIFFI_STREAM_STEP_ERROR_TAG => NativeStreamStep::Error(
+            <StreamError as uniffi::Lift<UniFfiTag>>::try_lift(uniffi::RustBuffer::from_vec(
+                payload.to_vec(),
+            ))
+            .expect("native stream Error payload did not lift"),
+        ),
+        tag => panic!("unknown native stream step tag {tag}"),
     }
+}
+
+fn complete_next_future(
+    future: uniffi::Handle,
+) -> (
+    uniffi::RustCallStatusCode,
+    Option<NativeStreamStep<StreamEvent>>,
+) {
+    let (status, raw) = complete_next_raw(future);
+    let step = (status == uniffi::RustCallStatusCode::Success)
+        .then(|| decode_native_stream_step::<StreamEvent>(raw));
+    (status, step)
+}
+
+fn complete_optional_next_future(
+    future: uniffi::Handle,
+) -> (
+    uniffi::RustCallStatusCode,
+    Option<NativeStreamStep<Option<StreamEvent>>>,
+) {
+    let (status, raw) = complete_next_raw(future);
+    let step = (status == uniffi::RustCallStatusCode::Success)
+        .then(|| decode_native_stream_step::<Option<StreamEvent>>(raw));
+    (status, step)
 }
 
 fn complete_u64_future(future: uniffi::Handle) -> (uniffi::RustCallStatusCode, u64) {
@@ -364,23 +468,29 @@ fn stream_next_yields_values_then_done() {
         next_count(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 0 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 0 }))
         )
     );
     assert_eq!(
         next_count(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 1 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 1 }))
         )
     );
     assert_eq!(
         next_count(handle.clone()),
-        (uniffi::RustCallStatusCode::Success, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Done)
+        )
     );
     assert_eq!(
         next_count(handle),
-        (uniffi::RustCallStatusCode::Success, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Done)
+        )
     );
 }
 
@@ -393,17 +503,20 @@ fn stream_alias_yields_values_then_done() {
         next_alias(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 0 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 0 }))
         )
     );
     assert_eq!(
         next_alias(handle),
-        (uniffi::RustCallStatusCode::Success, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Done)
+        )
     );
 }
 
 #[test]
-fn stream_next_lowers_errors_through_fallible_path() {
+fn stream_next_c_abi_returns_a_typed_error_step() {
     let mut status = uniffi::RustCallStatus::default();
     let handle = uniffi_uniffi_fn_func_error_after_one(&mut status);
     assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
@@ -412,16 +525,90 @@ fn stream_next_lowers_errors_through_fallible_path() {
         next_error_after_one(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 7 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 7 }))
         )
     );
     assert_eq!(
         next_error_after_one(handle.clone()),
-        (uniffi::RustCallStatusCode::Error, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Error(StreamError::Boom))
+        )
     );
     assert_eq!(
         next_error_after_one(handle),
-        (uniffi::RustCallStatusCode::Success, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Done)
+        )
+    );
+}
+
+#[test]
+fn stream_next_c_abi_has_exactly_one_tagged_payload() {
+    let handle = start_count(1);
+    let item_future = uniffi_uniffi_fn_func_count_events_stream_next(handle.clone());
+    let (item_status, item_raw) = complete_next_raw(item_future);
+    assert_eq!(item_status, uniffi::RustCallStatusCode::Success);
+    assert_eq!(item_raw.first(), Some(&uniffi::UNIFFI_STREAM_STEP_ITEM_TAG));
+    assert_eq!(
+        decode_native_stream_step::<StreamEvent>(item_raw),
+        NativeStreamStep::Item(StreamEvent { value: 0 })
+    );
+
+    let done_future = uniffi_uniffi_fn_func_count_events_stream_next(handle);
+    let (done_status, done_raw) = complete_next_raw(done_future);
+    assert_eq!(done_status, uniffi::RustCallStatusCode::Success);
+    assert_eq!(done_raw, vec![uniffi::UNIFFI_STREAM_STEP_DONE_TAG]);
+    assert_eq!(
+        decode_native_stream_step::<StreamEvent>(done_raw),
+        NativeStreamStep::Done
+    );
+
+    let mut status = uniffi::RustCallStatus::default();
+    let error_handle = uniffi_uniffi_fn_func_error_after_one(&mut status);
+    assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
+    let item_future = uniffi_uniffi_fn_func_error_after_one_stream_next(error_handle.clone());
+    let _ = complete_next_raw(item_future);
+    let error_future = uniffi_uniffi_fn_func_error_after_one_stream_next(error_handle);
+    let (error_status, error_raw) = complete_next_raw(error_future);
+    assert_eq!(error_status, uniffi::RustCallStatusCode::Success);
+    assert_eq!(
+        error_raw.first(),
+        Some(&uniffi::UNIFFI_STREAM_STEP_ERROR_TAG)
+    );
+    assert_eq!(
+        decode_native_stream_step::<StreamEvent>(error_raw),
+        NativeStreamStep::Error(StreamError::Boom)
+    );
+}
+
+#[test]
+fn stream_next_c_abi_distinguishes_optional_none_item_from_done() {
+    let mut status = uniffi::RustCallStatus::default();
+    let handle = uniffi_uniffi_fn_func_optional_output_events(&mut status);
+    assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
+
+    assert_eq!(
+        next_optional_output(handle.clone()),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Item(Some(StreamEvent { value: 9 })))
+        )
+    );
+    assert_eq!(
+        next_optional_output(handle.clone()),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Item(None))
+        )
+    );
+    assert_eq!(
+        next_optional_output(handle),
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Done)
+        )
     );
 }
 
@@ -436,12 +623,15 @@ fn stream_next_enters_tokio_runtime_when_tokio_feature_is_enabled() {
         next_tokio_probe(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 42 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 42 }))
         )
     );
     assert_eq!(
         next_tokio_probe(handle),
-        (uniffi::RustCallStatusCode::Success, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Done)
+        )
     );
 }
 
@@ -452,7 +642,10 @@ fn stream_cancel_is_idempotent_and_next_after_cancel_is_done() {
     uniffi_uniffi_fn_func_count_events_stream_cancel(handle.clone());
     assert_eq!(
         next_count(handle),
-        (uniffi::RustCallStatusCode::Success, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Done)
+        )
     );
 }
 
@@ -479,7 +672,7 @@ fn stream_concurrent_next_is_rejected() {
     assert_eq!(value, None);
 
     // The client error belongs only to the second next call. The registry and
-    // first future must remain reachable so raw cancel can wake it to EOF.
+    // first future must remain reachable so raw cancel can wake it to Done.
     uniffi_uniffi_fn_func_pending_events_stream_cancel(handle);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while pending_poll.load(Ordering::SeqCst) == -1 {
@@ -507,8 +700,8 @@ fn stream_concurrent_next_is_rejected() {
     }
     assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
     assert_eq!(
-        <Option<StreamEvent> as uniffi::Lift<UniFfiTag>>::try_lift(buffer).unwrap(),
-        None
+        decode_native_stream_step::<StreamEvent>(buffer.destroy_into_vec()),
+        NativeStreamStep::Done
     );
 }
 
@@ -560,26 +753,29 @@ fn bidi_stream_scaffolding_lifts_input_and_returns_output_handle() {
         next_running_sum(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 1 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 1 }))
         )
     );
     assert_eq!(
         next_running_sum(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 3 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 3 }))
         )
     );
     assert_eq!(
         next_running_sum(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 6 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 6 }))
         )
     );
     assert_eq!(
         next_running_sum(handle),
-        (uniffi::RustCallStatusCode::Success, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Done)
+        )
     );
     assert_eq!(INPUT_STREAM_CANCELS.load(Ordering::SeqCst), 1);
 }
@@ -595,12 +791,15 @@ fn bidi_stream_scaffolding_propagates_input_error_to_output_next() {
         next_running_sum(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 2 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 2 }))
         )
     );
     assert_eq!(
         next_running_sum(handle),
-        (uniffi::RustCallStatusCode::Error, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Error(StreamError::Boom))
+        )
     );
     assert_eq!(INPUT_STREAM_CANCELS.load(Ordering::SeqCst), 1);
 }
@@ -619,7 +818,7 @@ fn bidi_stream_cancel_drops_input_stream() {
         next_running_sum(handle.clone()),
         (
             uniffi::RustCallStatusCode::Success,
-            Some(StreamEvent { value: 10 })
+            Some(NativeStreamStep::Item(StreamEvent { value: 10 }))
         )
     );
     uniffi_uniffi_fn_func_running_sum_stream_cancel(handle.clone());
@@ -627,6 +826,9 @@ fn bidi_stream_cancel_drops_input_stream() {
     assert_eq!(INPUT_STREAM_CANCELS.load(Ordering::SeqCst), 1);
     assert_eq!(
         next_running_sum(handle),
-        (uniffi::RustCallStatusCode::Success, None)
+        (
+            uniffi::RustCallStatusCode::Success,
+            Some(NativeStreamStep::Done)
+        )
     );
 }

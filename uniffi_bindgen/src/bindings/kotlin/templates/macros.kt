@@ -73,7 +73,7 @@
 
     {%- if let Some(stream_item_type) = callable.stream_item_type() %}
     {%- if let Some(stream_error_type) = callable.stream_error_type() %}
-    {%- if let Some(stream_next_return_type) = callable.stream_next_return_type() %}
+    {%- if let Some(stream_next_ffi_return_type) = callable.stream_next_ffi_return_type() %}
     {{ func_decl }} fun {{ callable.name()|fn_name }}(
         {%- call arg_list(callable, callable.self_type().is_none()) %}{% endcall -%}
     ) : {{ callable.return_type().unwrap()|type_name(ci) }} {
@@ -90,16 +90,17 @@
                         { future, callback, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_poll(ci) }}(future, callback, continuation) },
                         { future, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_complete(ci) }}(future, continuation) },
                         { future -> UniffiLib.{{ callable.ffi_stream_next_rust_future_free(ci) }}(future) },
-                        { __uniffiLiftStreamNext(it) { buffer -> {{ stream_item_type|read_fn }}(buffer) } },
-                        {%- if ci.is_external(stream_error_type) %}
-                        {{ stream_error_type|type_name(ci) }}ExternalErrorHandler,
-                        {%- else %}
-                        {{ stream_error_type|type_name(ci) }}.ErrorHandler,
-                        {%- endif %}
+                        { __uniffiLiftStreamNext(
+                            it,
+                            { buffer -> {{ stream_item_type|read_fn }}(buffer) },
+                            { buffer -> {{ stream_error_type|read_fn }}(buffer) },
+                        ) },
+                        UniffiNullRustCallStatusErrorHandler,
                     )
                     when (__streamNext) {
                         is __UniffiStreamNext.Item -> emit(__streamNext.value)
                         __UniffiStreamNext.Done -> break
+                        is __UniffiStreamNext.Error -> throw __streamNext.error
                     }
                 }
             } finally {
