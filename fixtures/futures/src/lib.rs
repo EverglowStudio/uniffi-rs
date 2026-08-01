@@ -12,6 +12,7 @@ use std::{
 };
 
 use futures::future::{AbortHandle, Abortable, Aborted};
+use once_cell::sync::Lazy;
 
 /// Non-blocking timer future.
 pub struct TimerFuture {
@@ -358,19 +359,87 @@ pub enum AsyncError {
     Timeout,
 }
 
+#[derive(Clone, Copy)]
+struct SharedResourceProbe {
+    generation: u64,
+    locked_generation: Option<u64>,
+}
+
+struct SharedResourceProbeState {
+    snapshot: SharedResourceProbe,
+    sender: tokio::sync::watch::Sender<SharedResourceProbe>,
+}
+
+static SHARED_RESOURCE_MUTEX: Lazy<tokio::sync::Mutex<()>> =
+    Lazy::new(|| tokio::sync::Mutex::new(()));
+static SHARED_RESOURCE_PROBE: Lazy<Mutex<SharedResourceProbeState>> = Lazy::new(|| {
+    let snapshot = SharedResourceProbe {
+        generation: 0,
+        locked_generation: None,
+    };
+    let (sender, _receiver) = tokio::sync::watch::channel(snapshot);
+    Mutex::new(SharedResourceProbeState { snapshot, sender })
+});
+
+/// Arm a new readiness probe before starting the future that will hold the shared resource.
+#[uniffi::export]
+pub fn reset_shared_resource_probe() -> u64 {
+    let mut probe = SHARED_RESOURCE_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    probe.snapshot.generation = probe.snapshot.generation.wrapping_add(1);
+    probe.snapshot.locked_generation = None;
+    let snapshot = probe.snapshot;
+    probe.sender.send_replace(snapshot);
+    snapshot.generation
+}
+
+fn mark_shared_resource_locked() {
+    let mut probe = SHARED_RESOURCE_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    probe.snapshot.locked_generation = Some(probe.snapshot.generation);
+    let snapshot = probe.snapshot;
+    probe.sender.send_replace(snapshot);
+}
+
+/// Wait, with a bounded timeout, until the armed shared-resource call has acquired its mutex.
 #[uniffi::export(async_runtime = "tokio")]
-pub async fn use_shared_resource(options: SharedResourceOptions) -> Result<(), AsyncError> {
-    use once_cell::sync::Lazy;
-    use tokio::{
-        sync::Mutex,
-        time::{sleep, timeout},
+pub async fn wait_for_shared_resource_probe(
+    probe_id: u64,
+    timeout_ms: u16,
+) -> Result<(), AsyncError> {
+    let mut receiver = {
+        let probe = SHARED_RESOURCE_PROBE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if probe.snapshot.generation != probe_id {
+            return Err(AsyncError::Timeout);
+        }
+        probe.sender.subscribe()
     };
 
-    static MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    tokio::time::timeout(Duration::from_millis(timeout_ms.into()), async {
+        loop {
+            let snapshot = *receiver.borrow_and_update();
+            if snapshot.generation != probe_id {
+                return Err(AsyncError::Timeout);
+            }
+            if snapshot.locked_generation == Some(probe_id) {
+                return Ok(());
+            }
+            receiver.changed().await.map_err(|_| AsyncError::Timeout)?;
+        }
+    })
+    .await
+    .map_err(|_| AsyncError::Timeout)?
+}
 
-    let _guard = timeout(
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn use_shared_resource(options: SharedResourceOptions) -> Result<(), AsyncError> {
+    let _guard = tokio::time::timeout(
         Duration::from_millis(options.timeout_ms.into()),
-        MUTEX.lock(),
+        SHARED_RESOURCE_MUTEX.lock(),
     )
     .await
     .map_err(|_| {
@@ -378,7 +447,8 @@ pub async fn use_shared_resource(options: SharedResourceOptions) -> Result<(), A
         AsyncError::Timeout
     })?;
 
-    sleep(Duration::from_millis(options.release_after_ms.into())).await;
+    mark_shared_resource_locked();
+    tokio::time::sleep(Duration::from_millis(options.release_after_ms.into())).await;
     Ok(())
 }
 

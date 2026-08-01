@@ -26,7 +26,7 @@ final class SwiftHttpClient : HttpClient {
 }
 
 final class SwiftTaskRunner : TaskRunner {
-    func runTask(task: RustTask) async {
+    func runTask(task: RustTask) async throws {
         let swiftTask = Task { task.execute() }
         let _ = await swiftTask.result
     }

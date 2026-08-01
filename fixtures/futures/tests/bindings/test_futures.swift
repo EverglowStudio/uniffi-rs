@@ -8,7 +8,7 @@ counter.enter()
 
 Task {
 	let t0 = Date()
-	let result = await alwaysReady()
+	let result = try! await alwaysReady()
 	let t1 = Date()
 
 	let tDelta = DateInterval(start: t0, end: t1)
@@ -22,7 +22,7 @@ Task {
 counter.enter()
 
 Task {
-	let result = await newMyRecord(a: "foo", b: 42)
+	let result = try! await newMyRecord(a: "foo", b: 42)
 
 	assert(result.a == "foo")
 	assert(result.b == 42)
@@ -35,7 +35,7 @@ counter.enter()
 
 Task {
 	let t0 = Date()
-	await void()
+	try! await void()
 	let t1 = Date()
 
 	let tDelta = DateInterval(start: t0, end: t1)
@@ -49,7 +49,7 @@ counter.enter()
 
 Task {
 	let t0 = Date()
-	let result = await sleep(ms: 2000)
+	let result = try! await sleep(ms: 2000)
 	let t1 = Date()
 
 	let tDelta = DateInterval(start: t0, end: t1)
@@ -64,8 +64,8 @@ counter.enter()
 
 Task {
 	let t0 = Date()
-	let result_alice = await sayAfter(ms: 1000, who: "Alice")
-	let result_bob = await sayAfter(ms: 2000, who: "Bob")
+	let result_alice = try! await sayAfter(ms: 1000, who: "Alice")
+	let result_bob = try! await sayAfter(ms: 2000, who: "Bob")
 	let t1 = Date()
 
 	let tDelta = DateInterval(start: t0, end: t1)
@@ -80,8 +80,8 @@ Task {
 counter.enter()
 
 Task {
-	async let alice = sayAfter(ms: 1000, who: "Alice")
-	async let bob = sayAfter(ms: 2000, who: "Bob")
+	async let alice = try! await sayAfter(ms: 1000, who: "Alice")
+	async let bob = try! await sayAfter(ms: 2000, who: "Bob")
 
 	let t0 = Date()
 	let (result_alice, result_bob) = await (alice, bob)
@@ -102,7 +102,7 @@ Task {
 	let megaphone = newMegaphone()
 
 	let t0 = Date()
-	let result_alice = await megaphone.sayAfter(ms: 2000, who: "Alice")
+	let result_alice = try! await megaphone.sayAfter(ms: 2000, who: "Alice")
 	let t1 = Date()
 
 	let tDelta = DateInterval(start: t0, end: t1)
@@ -119,8 +119,8 @@ Task {
 	let traits = getSayAfterTraits()
 
 	let t0 = Date()
-	let result1 = await traits[0].sayAfter(ms: 1000, who: "Alice")
-	let result2 = await traits[1].sayAfter(ms: 1000, who: "Bob")
+	let result1 = try! await traits[0].sayAfter(ms: 1000, who: "Alice")
+	let result2 = try! await traits[1].sayAfter(ms: 1000, who: "Bob")
 	let t1 = Date()
 
 	assert(result1 == "Hello, Alice!")
@@ -138,8 +138,8 @@ Task {
 	let traits = getSayAfterUdlTraits()
 
 	let t0 = Date()
-	let result1 = await traits[0].sayAfter(ms: 1000, who: "Alice")
-	let result2 = await traits[1].sayAfter(ms: 1000, who: "Bob")
+	let result1 = try! await traits[0].sayAfter(ms: 1000, who: "Alice")
+	let result2 = try! await traits[1].sayAfter(ms: 1000, who: "Bob")
 	let t1 = Date()
 
 	assert(result1 == "Hello, Alice!")
@@ -157,8 +157,8 @@ Task {
 	let traits = getSayAfterTokioTraits()
 
 	let t0 = Date()
-	let result1 = await traits[0].sayAfter(ms: 1000, who: "Alice")
-	let result2 = await traits[1].sayAfter(ms: 1000, who: "Bob")
+	let result1 = try! await traits[0].sayAfter(ms: 1000, who: "Alice")
+	let result2 = try! await traits[1].sayAfter(ms: 1000, who: "Bob")
 	let t1 = Date()
 
 	assert(result1 == "Hello, Alice (with Tokio)!")
@@ -191,7 +191,7 @@ struct UnexpectedError : Error { }
 final class SwiftAsyncParser: AsyncParser, @unchecked Sendable {
     var completedDelays: Int = 0
 
-    func asString(delayMs: Int32, value: Int32) async -> String {
+    func asString(delayMs: Int32, value: Int32) async throws -> String {
         try! await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
         return String(value)
     }
@@ -208,7 +208,7 @@ final class SwiftAsyncParser: AsyncParser, @unchecked Sendable {
         return result
     }
 
-    func delay(delayMs: Int32) async {
+    func delay(delayMs: Int32) async throws {
         do {
             try await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
         } catch is CancellationError {
@@ -236,7 +236,7 @@ final class SwiftAsyncParser: AsyncParser, @unchecked Sendable {
 
 Task {
     let traitObj = SwiftAsyncParser()
-    let result = await asStringUsingTrait(obj: traitObj, delayMs: 1, value: 42)
+    let result = try! await asStringUsingTrait(obj: traitObj, delayMs: 1, value: 42)
     assert(result == "42")
     let result2 = try! await tryFromStringUsingTrait(obj: traitObj, delayMs: 1, value: "42")
     assert(result2 == 42)
@@ -252,7 +252,7 @@ Task {
     } catch ParserError.UnexpectedError {
         // Expected
     }
-    await delayUsingTrait(obj: traitObj, delayMs: 1)
+    try! await delayUsingTrait(obj: traitObj, delayMs: 1)
     try! await tryDelayUsingTrait(obj: traitObj, delayMs: "1")
     do {
         try await tryDelayUsingTrait(obj: traitObj, delayMs: "one")
@@ -262,7 +262,7 @@ Task {
     }
 
     let completedDelaysBefore = traitObj.completedDelays
-    await cancelDelayUsingTrait(obj: traitObj, delayMs: 10)
+    try! await cancelDelayUsingTrait(obj: traitObj, delayMs: 10)
     // sleep long enough so that the `delay()` call would finish if it wasn't cancelled.
     try! await Task.sleep(nanoseconds: 100_000_000)
     // If the task was cancelled, then completedDelays won't have increased
@@ -278,7 +278,7 @@ Task {
 counter.enter()
 
 Task {
-	let megaphone = await asyncNewMegaphone()
+	let megaphone = try! await asyncNewMegaphone()
 
 	let result = try await megaphone.fallibleMe(doFail: false)
 	assert(result == 42)
@@ -289,7 +289,7 @@ Task {
 counter.enter()
 
 Task {
-	let megaphone = await Megaphone()
+	let megaphone = try! await Megaphone()
 
 	let result = try await megaphone.fallibleMe(doFail: false)
 	assert(result == 42)
@@ -300,7 +300,7 @@ Task {
 counter.enter()
 
 Task {
-	let megaphone = await Megaphone.secondary()
+	let megaphone = try! await Megaphone.secondary()
 
 	let result = try await megaphone.fallibleMe(doFail: false)
 	assert(result == 42)
@@ -313,7 +313,7 @@ counter.enter()
 
 Task {
 	let t0 = Date()
-	let result_alice = await sayAfterWithTokio(ms: 2000, who: "Alice")
+	let result_alice = try! await sayAfterWithTokio(ms: 2000, who: "Alice")
 	let t1 = Date()
 
 	let tDelta = DateInterval(start: t0, end: t1)
@@ -419,27 +419,38 @@ Task {
 // Test a future that uses a lock and that is cancelled.
 counter.enter()
 Task {
-	let task = Task {
-	    try! await useSharedResource(options: SharedResourceOptions(releaseAfterMs: 100, timeoutMs: 1000))
+	let probeId = resetSharedResourceProbe()
+	let task = Task { () throws -> Void in
+	    try await useSharedResource(options: SharedResourceOptions(releaseAfterMs: 5000, timeoutMs: 1000))
 	}
 
-	// Wait some time to ensure the task has locked the shared resource
-	try await Task.sleep(nanoseconds: 50_000_000)
-	// Cancel the job task the shared resource has been released.
-	//
-	// FIXME: this test currently passes because `test.cancel()` doesn't actually cancel the
-	// operation.  We need to rework the Swift async handling to handle this properly.
+	// The probe is armed before the Task is created, and this is the only caller of
+	// the shared Rust mutex until the cancellation sequence completes. A matching
+	// signal therefore proves this Task acquired that mutex before it is cancelled.
+	do {
+		try await waitForSharedResourceProbe(probeId: probeId, timeoutMs: 1000)
+	} catch {
+		fatalError("shared-resource cancellation task never acquired the initial lock: \(error)")
+	}
+
+	// Cancel the job task and wait for the generated binding to map Rust cancellation
+	// to CancellationError before trying to acquire the same Rust mutex again.
 	task.cancel()
+	do {
+		try await task.value
+		fatalError("cancelled shared-resource task unexpectedly succeeded")
+	} catch is CancellationError {
+		// Expected.
+	} catch {
+		fatalError("unexpected shared-resource cancellation error: \(error)")
+	}
 
 	// Try accessing the shared resource again.  The initial task should release the shared resource
-	// before the timeout expires.
+	// before the timeout expires, proving that Rust released the cancelled future's lock.
 	try! await useSharedResource(options: SharedResourceOptions(releaseAfterMs: 0, timeoutMs: 1000))
-	counter.leave()
-}
 
-// Test a future that uses a lock and that is not cancelled.
-counter.enter()
-Task {
+	// Run the non-cancelled case only after the cancellation case has released the same
+	// static Rust mutex, so no other Task can satisfy the readiness probe or its lock checks.
 	try! await useSharedResource(options: SharedResourceOptions(releaseAfterMs: 100, timeoutMs: 1000))
 	try! await useSharedResource(options: SharedResourceOptions(releaseAfterMs: 0, timeoutMs: 1000))
 	counter.leave()

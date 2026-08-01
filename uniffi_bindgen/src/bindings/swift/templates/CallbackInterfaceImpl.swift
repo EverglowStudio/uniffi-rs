@@ -45,7 +45,7 @@ fileprivate struct {{ trait_impl }} {
                 guard let uniffiObj = try? {{ ffi_converter_name }}.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
-                return {% if meth.throws() %}try {% endif %}{% if meth.is_async() %}await {% endif %}uniffiObj.{{ meth.name()|fn_name }}(
+                return {% if meth.throws() || meth.is_async() %}try {% endif %}{% if meth.is_async() %}await {% endif %}uniffiObj.{{ meth.name()|fn_name }}(
                     {%- for arg in meth.arguments() %}
                     {% if !config.omit_argument_labels() %} {{ arg.name()|arg_name }}: {% endif %}try {{ arg|lift_fn }}({{ arg.name()|var_name }}){% if !loop.last %},{% endif %}
                     {%- endfor %}

@@ -35,13 +35,16 @@ use crate::{
     BindgenLoader, BindgenPaths, Component, ComponentInterface, GlobalConfig,
 };
 use anyhow::{bail, Result};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use fs_err as fs;
 use std::collections::HashMap;
 use std::process::Command;
 
 mod gen_swift;
-use gen_swift::{generate_bindings, generate_header, generate_modulemap, generate_swift, Config};
+use gen_swift::{
+    generate_bindings_with_stream_runtime, generate_header, generate_modulemap,
+    generate_swift_with_stream_runtime, Config,
+};
 
 #[cfg(feature = "bindgen-tests")]
 pub mod test;
@@ -78,32 +81,53 @@ pub fn generate(
         c.ci.derive_ffi_funcs()?;
     }
 
-    for Component { ci, config, .. } in components.iter_mut() {
-        if let Some(crate_filter) = &options.crate_filter {
+    write_component_bindings(
+        &mut components,
+        options.crate_filter.as_deref(),
+        &options.out_dir,
+        options.format,
+    )?;
+    Ok(components)
+}
+
+/// Write all Swift component bindings destined for a single generated source set.
+///
+/// Output stream functions in that set share one public `UniFfiStream` runtime, even when
+/// multiple components contain streams. The generated Swift sources are compiled together by the
+/// Swift runner and are normally added to one Swift target by consumers.
+fn write_component_bindings(
+    components: &mut [Component<Config>],
+    crate_filter: Option<&str>,
+    out_dir: &Utf8Path,
+    format: bool,
+) -> Result<()> {
+    let stream_runtime_emitter = stream_runtime_emitter_index(components, crate_filter);
+
+    for (component_index, Component { ci, config, .. }) in components.iter_mut().enumerate() {
+        if let Some(crate_filter) = crate_filter {
             if ci.crate_name() != crate_filter {
                 continue;
             }
         }
+        let include_stream_runtime = stream_runtime_emitter == Some(component_index);
         let Bindings {
             header,
             library,
             modulemap,
-        } = generate_bindings(config, ci)?;
+        } = generate_bindings_with_stream_runtime(config, ci, include_stream_runtime)?;
 
-        let source_file = options
-            .out_dir
-            .join(format!("{}.swift", config.module_name()));
+        let source_file = out_dir.join(format!("{}.swift", config.module_name()));
         fs::write(&source_file, library)?;
 
-        let header_file = options.out_dir.join(config.header_filename());
+        let header_file = out_dir.join(config.header_filename());
         fs::write(header_file, header)?;
 
         if let Some(modulemap) = modulemap {
-            let modulemap_file = options.out_dir.join(config.modulemap_filename());
+            let modulemap_file = out_dir.join(config.modulemap_filename());
             fs::write(modulemap_file, modulemap)?;
         }
 
-        if options.format {
+        if format {
             let commands_to_try = [
                 // Available in Xcode 16.
                 vec!["xcrun", "swift-format"],
@@ -129,7 +153,20 @@ pub fn generate(
             }
         }
     }
-    Ok(components)
+    Ok(())
+}
+
+/// Select the single output-stream runtime emitter for a generated Swift source set.
+fn stream_runtime_emitter_index(
+    components: &[Component<Config>],
+    crate_filter: Option<&str>,
+) -> Option<usize> {
+    components.iter().position(|component| {
+        component.ci.has_stream_fns()
+            && crate_filter.map_or(true, |crate_filter| {
+                component.ci.crate_name() == crate_filter
+            })
+    })
 }
 
 /// Generate Swift bindings (specialized version)
@@ -175,12 +212,20 @@ pub fn generate_swift_bindings(options: SwiftBindingsOptions) -> Result<()> {
         ci.derive_ffi_funcs()?;
     }
 
-    for Component { ci, config } in &components {
+    let stream_runtime_emitter = stream_runtime_emitter_index(&components, None);
+    for (component_index, Component { ci, config }) in components.iter().enumerate() {
         if options.generate_swift_sources {
             let source_file = options
                 .out_dir
                 .join(format!("{}.swift", config.module_name()));
-            fs::write(&source_file, generate_swift(config, ci)?)?;
+            fs::write(
+                &source_file,
+                generate_swift_with_stream_runtime(
+                    config,
+                    ci,
+                    stream_runtime_emitter == Some(component_index),
+                )?,
+            )?;
         }
 
         if options.generate_headers {
@@ -265,5 +310,184 @@ fn apply_renames(components: &mut Vec<Component<Config>>) {
         for c in &mut *components {
             rename(&mut c.ci, &module_renames);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use camino::Utf8PathBuf;
+    use std::{collections::BTreeSet, process::Command};
+    use uniffi_meta::{
+        EnumMetadata, EnumShape, FnMetadata, Metadata, MetadataGroup, NamespaceMetadata, Type,
+        VariantMetadata,
+    };
+
+    fn output_stream_component(
+        module_path: &str,
+        function_name: &str,
+        error_name: &str,
+    ) -> ComponentInterface {
+        let mut items = BTreeSet::new();
+        let stream_error_type = Type::Enum {
+            module_path: module_path.to_owned(),
+            name: error_name.to_owned(),
+        };
+        items.insert(Metadata::Enum(EnumMetadata {
+            module_path: module_path.to_owned(),
+            name: error_name.to_owned(),
+            orig_name: None,
+            rust_path: None,
+            discr_type: None,
+            shape: EnumShape::Error { flat: true },
+            remote: false,
+            variants: vec![VariantMetadata {
+                name: "boom".to_owned(),
+                orig_name: None,
+                discr: None,
+                fields: vec![],
+                docstring: None,
+            }],
+            non_exhaustive: false,
+            docstring: None,
+        }));
+        items.insert(Metadata::Func(FnMetadata {
+            module_path: module_path.to_owned(),
+            name: function_name.to_owned(),
+            orig_name: None,
+            is_async: false,
+            inputs: vec![],
+            return_type: Some(Type::Stream {
+                item_type: Box::new(Type::UInt32),
+                error_type: Box::new(stream_error_type),
+                is_send: true,
+            }),
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }));
+        let mut ci = ComponentInterface::from_metadata(MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.to_owned(),
+                name: module_path.to_owned(),
+            },
+            namespace_docstring: None,
+            items,
+        })
+        .unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        ci
+    }
+
+    fn config_with_module_name(module_name: &str) -> Config {
+        let mut config = Config::default();
+        config.module_name = Some(module_name.to_owned());
+        config
+    }
+
+    #[test]
+    fn swift_stream_multi_component_generation_emits_shared_runtime_once_and_typechecks() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8PathBuf::from_path_buf(tempdir.path().to_path_buf()).unwrap();
+        let mut components = vec![
+            Component {
+                ci: output_stream_component("first_component", "first_stream", "FirstStreamError"),
+                config: config_with_module_name("FirstComponent"),
+            },
+            Component {
+                ci: output_stream_component(
+                    "second_component",
+                    "second_stream",
+                    "SecondStreamError",
+                ),
+                config: config_with_module_name("SecondComponent"),
+            },
+        ];
+
+        write_component_bindings(&mut components, None, &out_dir, false).unwrap();
+
+        let first_source = std::fs::read_to_string(out_dir.join("FirstComponent.swift")).unwrap();
+        let second_source = std::fs::read_to_string(out_dir.join("SecondComponent.swift")).unwrap();
+        let sources = [&first_source, &second_source];
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source
+                    .matches("public struct UniFfiStream<Element>: AsyncSequence")
+                    .count())
+                .sum::<usize>(),
+            1,
+        );
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source
+                    .matches("final class UniFfiStreamState<Element>")
+                    .count())
+                .sum::<usize>(),
+            1,
+        );
+        assert!(first_source.contains("public func firstStream() -> UniFfiStream<UInt32>"));
+        assert!(second_source.contains("public func secondStream() -> UniFfiStream<UInt32>"));
+        assert!(first_source.contains("return UniFfiStream("));
+        assert!(second_source.contains("return UniFfiStream("));
+        assert!(!second_source.contains("public struct UniFfiStream<Element>: AsyncSequence"));
+
+        let swiftc_version = Command::new("swiftc")
+            .arg("--version")
+            .output()
+            .expect("swiftc is required for the multi-component stream typecheck");
+        assert!(
+            swiftc_version.status.success(),
+            "swiftc --version failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&swiftc_version.stdout),
+            String::from_utf8_lossy(&swiftc_version.stderr)
+        );
+
+        let modulemap_path = out_dir.join("combined.modulemap");
+        let modulemap = [
+            "FirstComponentFFI.modulemap",
+            "SecondComponentFFI.modulemap",
+        ]
+        .into_iter()
+        .map(|filename| std::fs::read_to_string(out_dir.join(filename)).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&modulemap_path, modulemap).unwrap();
+
+        let usage_path = out_dir.join("UseBothStreams.swift");
+        std::fs::write(
+            &usage_path,
+            r#"
+private func useBothStreamComponents() {
+    let first: UniFfiStream<UInt32> = firstStream()
+    let second: UniFfiStream<UInt32> = secondStream()
+    _ = (first, second)
+}
+"#,
+        )
+        .unwrap();
+
+        let output = Command::new("swiftc")
+            .arg("-typecheck")
+            .arg("-module-name")
+            .arg("CombinedStreams")
+            .arg("-swift-version")
+            .arg("5")
+            .arg("-I")
+            .arg(&out_dir)
+            .arg("-Xcc")
+            .arg(format!("-fmodule-map-file={modulemap_path}"))
+            .arg(out_dir.join("FirstComponent.swift"))
+            .arg(out_dir.join("SecondComponent.swift"))
+            .arg(&usage_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "swiftc multi-component typecheck failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
