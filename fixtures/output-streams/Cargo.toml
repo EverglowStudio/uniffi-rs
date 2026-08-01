@@ -1,0 +1,23 @@
+[package]
+name = "uniffi-fixture-output-streams"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+name = "uniffi_output_streams"
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+thiserror = "2"
+uniffi = { workspace = true }
+
+[build-dependencies]
+uniffi = { workspace = true, features = ["build"] }
+
+[dev-dependencies]
+uniffi = { workspace = true, features = ["bindgen-tests"] }
+
+[features]
+ffi-trace = ["uniffi/ffi-trace"]

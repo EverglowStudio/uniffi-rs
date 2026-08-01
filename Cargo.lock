@@ -2573,6 +2573,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniffi-fixture-output-streams"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "uniffi",
+]
+
+[[package]]
 name = "uniffi-fixture-proc-macro"
 version = "0.22.0"
 dependencies = [
