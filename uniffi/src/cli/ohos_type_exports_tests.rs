@@ -1,11 +1,96 @@
 use super::*;
 
 fn def(kind: &str, name: &str, definition: &str) -> TypeDefLine {
+    def_with_type_parameters(kind, name, definition, &[])
+}
+
+fn def_with_type_parameters(
+    kind: &str,
+    name: &str,
+    definition: &str,
+    type_parameters: &[&str],
+) -> TypeDefLine {
     TypeDefLine {
         kind: kind.to_string(),
         name: name.to_string(),
         def: definition.to_string(),
-        type_parameters: Vec::new(),
+        type_parameters: type_parameters
+            .iter()
+            .map(|parameter| (*parameter).to_string())
+            .collect(),
+    }
+}
+
+fn assert_component_stream_declarations_are_arkts_safe(
+    exports: &FacadeExports,
+    module: &FacadeComponentModule,
+) {
+    assert!(
+        !module.declarations.contains("typeof "),
+        "component declarations must not use ArkTS-incompatible type queries:\n{}",
+        module.declarations
+    );
+    let owned = exports
+        .owned_defs
+        .iter()
+        .find(|owned| owned.projection.namespace == module.namespace)
+        .expect("component module must have an owned projection");
+    let stream_projection = exports
+        .component_stream_projection(&owned.projection, true)
+        .expect("stream projection must render");
+    for binding in stream_projection
+        .values
+        .iter()
+        .filter(|binding| !binding.is_class)
+    {
+        let callable_type = stream_projection
+            .explicit_value_declarations
+            .get(&binding.public)
+            .expect("every stream callable must carry its explicit source type");
+        let source_alias = format!("export const {}: {} = ", binding.public, callable_type);
+        assert_eq!(
+            module.source.matches(&source_alias).count(),
+            1,
+            "stream callable `{}` must have exactly one explicitly typed source alias:\n{}",
+            binding.public,
+            module.source
+        );
+        let declaration = format!("export declare function {}(", binding.public);
+        assert_eq!(
+            module.declarations.matches(&declaration).count(),
+            1,
+            "stream callable `{}` must have exactly one explicit component declaration:\n{}",
+            binding.public,
+            module.declarations
+        );
+    }
+}
+
+fn assert_arkts_safe_component_class_projection(
+    source: &str,
+    declarations: &str,
+    internal: &str,
+    public: &str,
+) {
+    let imported = if internal == public {
+        format!("  {internal},\n")
+    } else {
+        format!("  {internal} as {public},\n")
+    };
+    assert!(
+        source.contains(&imported) && source.contains(&format!("export {{ {public} }};")),
+        "component source must create and export a local ArkTS class binding `{public}`:\n{source}"
+    );
+    assert!(
+        declarations.contains(&imported) && declarations.contains(&format!("export {{ {public} }};")),
+        "component declaration must create and export a local ArkTS class binding `{public}`:\n{declarations}"
+    );
+    for surface in [source, declarations] {
+        assert!(
+            !surface.contains(&format!("export const {public} ="))
+                && !surface.contains(&format!("export type {public} =")),
+            "class `{public}` must not be modeled as a const/type alias:\n{surface}"
+        );
     }
 }
 
@@ -118,7 +203,7 @@ fn no_stream_package_uses_only_raw_type_exports() {
 }
 
 #[test]
-fn single_owned_component_projects_prefixed_raw_exports_to_flat_short_names() {
+fn single_owned_component_projects_public_bindings_through_its_namespace() {
     let component = "fixture-core";
     let native_export_prefix =
         uniffi_bindgen::interface::native_export_prefix_for_component(component);
@@ -132,10 +217,12 @@ fn single_owned_component_projects_prefixed_raw_exports_to_flat_short_names() {
     };
     let raw_payload = format!("{native_export_prefix}_Payload");
     let raw_ping = format!("{native_export_prefix}_ping");
+    let raw_worker = format!("{native_export_prefix}_Worker");
     let owned = OwnedFacadeTypeDefs::new(
         &identity,
         vec![
             def("interface", &raw_payload, "value: string"),
+            def("struct", &raw_worker, "constructor();"),
             def(
                 "fn",
                 &raw_ping,
@@ -148,21 +235,47 @@ fn single_owned_component_projects_prefixed_raw_exports_to_flat_short_names() {
         FacadeExports::from_owned_type_defs_and_contracts(vec![owned], Vec::new()).unwrap();
     let index = exports.render_package_index();
     let declarations = render_harmony_declaration_surfaces(&[], &exports).package_public;
+    let modules = exports.component_modules().unwrap();
+    let module = modules
+        .iter()
+        .find(|module| module.namespace == "fixture")
+        .unwrap();
+
+    assert_component_stream_declarations_are_arkts_safe(&exports, module);
+
+    assert!(
+        module
+            .source
+            .contains(&format!("export const ping: () => Payload = {raw_ping};")),
+        "ordinary callable aliases must also carry an explicit public type:\n{}",
+        module.source
+    );
 
     for surface in [&index, &declarations] {
         assert!(
-            surface.contains(&format!("{raw_ping} as ping")),
+            surface.contains("import * as fixture from \"./src/main/ets/components/fixture\";"),
             "{surface}"
         );
+        assert!(surface.contains("export {\n  fixture,\n};"), "{surface}");
         assert!(
-            surface.contains(&format!("{raw_payload} as Payload")),
-            "{surface}"
-        );
-        assert!(
-            !surface.contains("components/fixture"),
-            "single-component package must remain flat:\n{surface}"
+            !surface.contains(&raw_ping) && !surface.contains(&raw_payload),
+            "single-component package root must not leak flat raw bindings:\n{surface}"
         );
     }
+    for surface in [&module.source, &module.declarations] {
+        assert!(surface.contains(&raw_ping), "{surface}");
+        assert!(surface.contains(&raw_payload), "{surface}");
+        assert!(surface.contains(&raw_worker), "{surface}");
+        assert!(surface.contains("ping"), "{surface}");
+        assert!(surface.contains("Payload"), "{surface}");
+        assert!(surface.contains("Worker"), "{surface}");
+    }
+    assert_arkts_safe_component_class_projection(
+        &module.source,
+        &module.declarations,
+        &raw_worker,
+        "Worker",
+    );
 }
 
 #[test]
@@ -207,10 +320,11 @@ fn composite_stream_components_project_internal_helpers_and_cross_owner_types() 
     let beta_owned = OwnedFacadeTypeDefs::new(
         &beta_identity,
         vec![
-            def(
+            def_with_type_parameters(
                 "interface",
                 &beta_input_stream,
                 "handle: number\nnext(error: Error | null, handle: number): Promise<T>\ncancel(error: Error | null, handle: number): void",
+                &["T"],
             ),
             def(
                 "interface",
@@ -315,6 +429,10 @@ fn composite_stream_components_project_internal_helpers_and_cross_owner_types() 
     let root = exports.render_package_index();
     let declarations = render_harmony_declaration_surfaces(&[], &exports).package_public;
 
+    for module in &modules {
+        assert_component_stream_declarations_are_arkts_safe(&exports, module);
+    }
+
     for internal in [
         "__uniffi_beta_eventsStream",
         "__uniffi_beta_EventsPullStream",
@@ -333,18 +451,43 @@ fn composite_stream_components_project_internal_helpers_and_cross_owner_types() 
             beta.source
         );
     }
-    for public in [
-        "eventsStream",
-        "EventsPullStream",
-        "SharedPayloadInputWriter",
-        "SharedPayloadInputSource",
-        "SharedPayloadInputChannel",
-        "createSharedPayloadInputChannel",
-    ] {
+    for public in ["eventsStream", "createSharedPayloadInputChannel"] {
         assert!(
-            beta.source.contains(&format!("export const {public} =")),
-            "missing component public stream alias `{public}`:\n{}",
+            beta.source.contains(&format!("export const {public}: ")),
+            "missing explicitly typed component public stream alias `{public}`:\n{}",
             beta.source
+        );
+    }
+    for (internal, public) in [
+        ("__uniffi_beta_EventsPullStream", "EventsPullStream"),
+        (
+            "__uniffi_beta_SharedPayloadInputWriter",
+            "SharedPayloadInputWriter",
+        ),
+        (
+            "__uniffi_beta_SharedPayloadInputSource",
+            "SharedPayloadInputSource",
+        ),
+        (
+            "__uniffi_beta_SharedPayloadInputChannel",
+            "SharedPayloadInputChannel",
+        ),
+        ("UniFfiInputFailure", "UniFfiInputFailure"),
+        ("UniFfiStreamFailure", "UniFfiStreamFailure"),
+    ] {
+        assert_arkts_safe_component_class_projection(
+            &beta.source,
+            &beta.declarations,
+            internal,
+            public,
+        );
+    }
+    for surface in [&beta.source, &beta.declarations] {
+        assert!(
+            surface.contains(&format!(
+                "export type UniffiInputStream<T> = {beta_input_stream}<T>;"
+            )),
+            "generic raw type parameters must be preserved exactly:\n{surface}"
         );
     }
     assert!(
@@ -370,7 +513,7 @@ fn composite_stream_components_project_internal_helpers_and_cross_owner_types() 
 }
 
 #[test]
-fn single_owned_stream_component_keeps_a_flat_short_public_surface() {
+fn single_owned_stream_component_keeps_a_namespace_only_pull_surface() {
     let component = "fixture-core";
     let native_export_prefix =
         uniffi_bindgen::interface::native_export_prefix_for_component(component);
@@ -450,24 +593,63 @@ fn single_owned_stream_component_keeps_a_flat_short_public_surface() {
     let native = exports.render_native_facade("libfixture.so");
     let index = exports.render_package_index();
     let declarations = render_harmony_declaration_surfaces(&[], &exports).package_public;
+    let modules = exports.component_modules().unwrap();
+    let module = modules
+        .iter()
+        .find(|module| module.namespace == "fixture")
+        .unwrap();
+
+    assert_component_stream_declarations_are_arkts_safe(&exports, module);
 
     assert!(
         native.contains(&format!("UniFfiStream<{payload}>")),
         "{native}"
     );
+    assert!(
+        native.contains("export class EventsPullStream extends __UniFfiPullStream"),
+        "owned component Pull implementation must be exported for its namespace facade:\n{native}"
+    );
     for surface in [&index, &declarations] {
-        assert!(surface.contains("eventsStream"), "{surface}");
         assert!(
-            surface.contains(&format!("{payload} as Payload")),
+            surface.contains("import * as fixture from \"./src/main/ets/components/fixture\";"),
             "{surface}"
         );
-        assert!(
-            !surface.contains("components/fixture"),
-            "single stream facade must remain flat:\n{surface}"
-        );
+        assert!(surface.contains("export {\n  fixture,\n};"), "{surface}");
+        for private in [
+            raw_output.function.as_str(),
+            raw_output.next_function.as_str(),
+            raw_output.cancel_function.as_str(),
+            raw_output.step_type.as_str(),
+            "eventsStream",
+            "EventsPullStream",
+            "Payload",
+        ] {
+            assert!(
+                !surface.contains(private),
+                "single-component root leaked `{private}` instead of only the namespace:\n{surface}"
+            );
+        }
     }
-    assert!(
-        !index.contains("EventsPullStream"),
-        "single component must not expand its existing public surface with a pull helper:\n{index}"
+    for surface in [&module.source, &module.declarations] {
+        assert!(surface.contains("eventsStream"), "{surface}");
+        assert!(surface.contains("EventsPullStream"), "{surface}");
+        assert!(surface.contains("Payload"), "{surface}");
+        for private in [
+            raw_output.function.as_str(),
+            raw_output.next_function.as_str(),
+            raw_output.cancel_function.as_str(),
+            raw_output.step_type.as_str(),
+        ] {
+            assert!(
+                !surface.contains(private),
+                "component public pull facade leaked raw output `{private}`:\n{surface}"
+            );
+        }
+    }
+    assert_arkts_safe_component_class_projection(
+        &module.source,
+        &module.declarations,
+        "EventsPullStream",
+        "EventsPullStream",
     );
 }

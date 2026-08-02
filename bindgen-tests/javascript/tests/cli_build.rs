@@ -315,8 +315,13 @@ fn cli_build_orchestrates_wasm_and_napi() {
         pkg_dir.exists(),
         "missing wasm-bindgen output dir: {pkg_dir}"
     );
-    assert_single_node_addon(out_dir.join("components/cli_build/node"));
-    assert_single_node_addon(out_dir.join("components/cli_build/electron"));
+    let expected_addon_name = format!(
+        "{}.node",
+        uniffi_bindgen_javascript::host_crates::composite_host_lib_target("cli-build-fixture")
+    );
+    assert_exact_node_addon(out_dir.join("node"), &expected_addon_name);
+    assert_no_node_addons(out_dir.join("components/cli_build/node"));
+    assert_no_node_addons(out_dir.join("components/cli_build/electron"));
 }
 
 #[test]
@@ -457,17 +462,35 @@ console.log("ok");
     );
 }
 
-fn assert_single_node_addon(dir: Utf8PathBuf) {
-    let addons = std::fs::read_dir(dir.as_std_path())
+fn node_addons(dir: &Utf8PathBuf) -> Vec<std::path::PathBuf> {
+    let mut addons = std::fs::read_dir(dir.as_std_path())
         .unwrap()
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
+        .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("node"))
         .collect::<Vec<_>>();
+    addons.sort();
+    addons
+}
+
+fn assert_exact_node_addon(dir: Utf8PathBuf, expected_basename: &str) {
+    let addons = node_addons(&dir);
     assert_eq!(
         addons.len(),
         1,
         "expected exactly one .node addon in {dir}: {addons:?}"
+    );
+    assert_eq!(
+        addons[0].file_name().and_then(|name| name.to_str()),
+        Some(expected_basename),
+        "expected composite addon basename in {dir}: {addons:?}"
+    );
+}
+
+fn assert_no_node_addons(dir: Utf8PathBuf) {
+    let addons = node_addons(&dir);
+    assert!(
+        addons.is_empty(),
+        "component directories must not duplicate the package-level .node addon in {dir}: {addons:?}"
     );
 }
 #[test]

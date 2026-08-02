@@ -1177,7 +1177,11 @@ fn render_stream_function(
         .collect();
     let item_info = classify(item_type, crate_ident);
     let error_ty = core_ty_for(error_type, crate_ident);
-    let item_ty = core_ty_for(item_type, crate_ident);
+    // Object stream items are held by their normal Arc-based object registry.
+    // `core_ty_for` intentionally maps general object values to `JsValue`,
+    // which is correct for ordinary Wasm signatures but not for this direct
+    // Rust stream specialization.
+    let item_ty = stream_item_core_ty(item_type, crate_ident);
 
     let unsupported = first_unsupported(&arg_info, &Some(item_info_for_check(&item_info)));
     if let Some(reason) = unsupported {
@@ -1312,9 +1316,20 @@ fn item_info_for_check(info: &Lowering) -> Lowering {
         Lowering::Callback { .. } => {
             Lowering::Unsupported("stream items cannot be callback traits".into())
         }
-        Lowering::Object { .. } => Lowering::Unsupported(
-            "stream items cannot be opaque objects in the wasm backend yet".into(),
-        ),
+        // A direct opaque Rust object stream item can reuse the same object
+        // registry and `__uniffi_<object>_insert` lifting path as a regular
+        // object return.  Do not broaden this to nested object values: those
+        // stay unsupported in `classify` and never reach this direct-item
+        // path.  Callback/foreign trait objects remain rejected above.
+        Lowering::Object {
+            snake,
+            rust_ty,
+            module_path,
+        } => Lowering::Object {
+            snake: snake.clone(),
+            rust_ty: rust_ty.clone(),
+            module_path: module_path.clone(),
+        },
         _ => Lowering::Native("__stream_item_supported".into()),
     }
 }
@@ -2183,7 +2198,8 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     .unwrap();
     for f in r.fields() {
         let key = crate::js_names::field_name(f.name());
-        let field_ident = format!("__f_{}", f.name());
+        let rust_name = f.rust_name();
+        let field_ident = format!("__f_{}", rust_name);
         writeln!(
             out,
             "    let {field_ident}: JsValue = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"{key}\")).map_err(|_| JsError::new(\"reflect get `{key}` on `{name}` failed\"))?;"
@@ -2193,14 +2209,14 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
         writeln!(
             out,
             "    let {ident}: {ty} = ({lower})?;",
-            ident = f.name(),
+            ident = rust_name,
             ty = core_ty_for(&f.as_type(), crate_ident),
         )
         .unwrap();
     }
     writeln!(out, "    Ok::<{core}, JsError>({core} {{").unwrap();
     for f in r.fields() {
-        writeln!(out, "        {n},", n = f.name()).unwrap();
+        writeln!(out, "        {n},", n = f.rust_name()).unwrap();
     }
     writeln!(out, "    }})\n}}").unwrap();
 
@@ -2211,7 +2227,11 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     )
     .unwrap();
     writeln!(out, "    let __obj = ::js_sys::Object::new();").unwrap();
-    let binds: Vec<String> = r.fields().iter().map(|f| f.name().to_string()).collect();
+    let binds: Vec<String> = r
+        .fields()
+        .iter()
+        .map(|f| f.rust_name().to_string())
+        .collect();
     writeln!(
         out,
         "    let {core} {{ {fields} }} = __c;",
@@ -2220,7 +2240,7 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     .unwrap();
     for f in r.fields() {
         let key = crate::js_names::field_name(f.name());
-        let lift = lift_expr_result(f.name(), &f.as_type(), 0, crate_ident);
+        let lift = lift_expr_result(f.rust_name(), &f.as_type(), 0, crate_ident);
         writeln!(
             out,
             "    let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"{key}\"), &({lift})?);"
@@ -2268,10 +2288,11 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
     writeln!(out, "    match __tag.as_str() {{").unwrap();
     for v in e.variants() {
         let vname = v.name();
+        let rust_vname = v.rust_name();
         if v.fields().is_empty() {
             writeln!(
                 out,
-                "        \"{vname}\" => Ok::<{core}, JsError>({core}::{vname}),"
+                "        \"{vname}\" => Ok::<{core}, JsError>({core}::{rust_vname}),"
             )
             .unwrap();
             continue;
@@ -2286,12 +2307,12 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
                 if f.name().is_empty() {
                     format!("v{i}")
                 } else {
-                    f.name().to_string()
+                    f.rust_name().to_string()
                 }
             })
             .collect();
         for (bind, f) in binds.iter().zip(v.fields().iter()) {
-            let key = crate::js_names::field_name(bind);
+            let key = crate::js_names::field_name(f.name());
             let field_ident = format!("__vf_{bind}");
             writeln!(
                 out,
@@ -2309,14 +2330,23 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
         if nameless {
             writeln!(
                 out,
-                "            Ok::<{core}, JsError>({core}::{vname}({args}))",
+                "            Ok::<{core}, JsError>({core}::{rust_vname}({args}))",
                 args = binds.join(", ")
             )
             .unwrap();
         } else {
-            writeln!(out, "            Ok::<{core}, JsError>({core}::{vname} {{").unwrap();
+            writeln!(
+                out,
+                "            Ok::<{core}, JsError>({core}::{rust_vname} {{"
+            )
+            .unwrap();
             for (bind, f) in binds.iter().zip(v.fields().iter()) {
-                writeln!(out, "                {fname}: {bind},", fname = f.name()).unwrap();
+                writeln!(
+                    out,
+                    "                {fname}: {bind},",
+                    fname = f.rust_name()
+                )
+                .unwrap();
             }
             writeln!(out, "            }})").unwrap();
         }
@@ -2338,17 +2368,18 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
     writeln!(out, "    match __c {{").unwrap();
     for v in e.variants() {
         let vname = v.name();
+        let rust_vname = v.rust_name();
         if v.fields().is_empty() {
             if all_unit {
                 writeln!(
                     out,
-                    "        {core}::{vname} => Ok::<JsValue, JsError>(JsValue::from_str(\"{vname}\")),"
+                    "        {core}::{rust_vname} => Ok::<JsValue, JsError>(JsValue::from_str(\"{vname}\")),"
                 )
                 .unwrap();
             } else {
                 writeln!(
                     out,
-                    "        {core}::{vname} => {{\n            \
+                    "        {core}::{rust_vname} => {{\n            \
                      let __obj = ::js_sys::Object::new();\n            \
                      let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"tag\"), &JsValue::from_str(\"{vname}\"));\n            \
                     Ok::<JsValue, JsError>(__obj.into())\n        \
@@ -2367,24 +2398,23 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
                 if f.name().is_empty() {
                     format!("v{i}")
                 } else {
-                    f.name().to_string()
+                    f.rust_name().to_string()
                 }
             })
             .collect();
         if nameless {
             writeln!(
                 out,
-                "        {core}::{vname}({args}) => {{",
+                "        {core}::{rust_vname}({args}) => {{",
                 args = binds.join(", ")
             )
             .unwrap();
         } else {
-            // Bind names always equal UDL field names here, so we can
-            // emit the shorthand `{ x, y }` pattern and avoid the
-            // `non_shorthand_field_patterns` warning.
+            // Bind names use Rust core field names, so shorthand patterns
+            // preserve renamed public field keys without a second mapping.
             writeln!(
                 out,
-                "        {core}::{vname} {{ {fields} }} => {{",
+                "        {core}::{rust_vname} {{ {fields} }} => {{",
                 fields = binds.join(", ")
             )
             .unwrap();
@@ -2396,7 +2426,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
         )
         .unwrap();
         for (bind, f) in binds.iter().zip(v.fields().iter()) {
-            let key = crate::js_names::field_name(bind);
+            let key = crate::js_names::field_name(f.name());
             let lift = lift_expr_result(bind, &f.as_type(), 0, crate_ident);
             writeln!(
                 out,
@@ -2835,6 +2865,22 @@ fn core_ty_for(ty: &Type, crate_ident: &str) -> String {
     }
 }
 
+/// The native value stored in an output-stream registry.
+///
+/// A direct Rust object item keeps the same `Arc` representation as object
+/// returns, so its existing registry insertion/lifting helper can preserve
+/// identity.  This is intentionally not recursive: nested object values stay
+/// on the regular `core_ty_for` path and are rejected by stream validation.
+fn stream_item_core_ty(ty: &Type, crate_ident: &str) -> String {
+    match ty {
+        Type::Object {
+            imp: ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly),
+            ..
+        } => format!("Arc<{}>", rust_ty_for_type(crate_ident, ty)),
+        _ => core_ty_for(ty, crate_ident),
+    }
+}
+
 fn type_debug(l: &Lowering) -> &'static str {
     match l {
         Lowering::Native(_) => "native",
@@ -2865,6 +2911,163 @@ mod tests {
         assert!(
             !lift.contains("&value"),
             "typed stream error lift retained the item binding: {lift}"
+        );
+    }
+
+    #[test]
+    fn direct_rust_object_stream_items_keep_the_existing_object_registry_bridge() {
+        let object = Type::Object {
+            module_path: "stream_object_fixture".into(),
+            name: "StreamObject".into(),
+            imp: ObjectImpl::Struct,
+        };
+        let object_info = classify(&object, "stream_object_fixture");
+        assert!(
+            matches!(item_info_for_check(&object_info), Lowering::Object { .. }),
+            "a direct Rust object stream item must retain object lifting"
+        );
+        assert_eq!(
+            stream_item_core_ty(&object, "stream_object_fixture"),
+            "Arc<::stream_object_fixture::StreamObject>"
+        );
+        let lifted =
+            stream_value_lift_expr(&object_info, &object, "value", "stream_object_fixture");
+        assert!(
+            lifted.contains("__uniffi_stream_object_insert(value)"),
+            "direct object stream items must use the normal registry insertion: {lifted}"
+        );
+
+        let nested = Type::Optional {
+            inner_type: Box::new(object),
+        };
+        assert!(
+            matches!(
+                item_info_for_check(&classify(&nested, "stream_object_fixture")),
+                Lowering::Unsupported(_)
+            ),
+            "nested object stream items must stay rejected"
+        );
+        let callback = Type::Object {
+            module_path: "stream_object_fixture".into(),
+            name: "ForeignStreamObject".into(),
+            imp: ObjectImpl::Trait(TraitKind::Both),
+        };
+        assert!(
+            matches!(
+                item_info_for_check(&classify(&callback, "stream_object_fixture")),
+                Lowering::Unsupported(_)
+            ),
+            "callback/foreign trait stream items must stay rejected"
+        );
+    }
+
+    #[test]
+    fn renamed_record_and_enum_helpers_keep_public_js_names_and_use_rust_members() {
+        use uniffi_meta::{
+            EnumMetadata, EnumShape, FieldMetadata, MetadataGroup, NamespaceMetadata,
+            RecordMetadata, VariantMetadata,
+        };
+
+        let module_path = "renamed_value_fixture";
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module_path.into(),
+                name: module_path.into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            RecordMetadata {
+                module_path: module_path.into(),
+                name: "MatrixRecord".into(),
+                orig_name: Some("MatrixRecord".into()),
+                rust_path: None,
+                remote: false,
+                fields: vec![
+                    FieldMetadata {
+                        name: "unknown".into(),
+                        orig_name: Some("unknown_value".into()),
+                        ty: Type::String,
+                        default: None,
+                        docstring: None,
+                    },
+                    FieldMetadata {
+                        name: "napi".into(),
+                        orig_name: Some("napi_value".into()),
+                        ty: Type::UInt32,
+                        default: None,
+                        docstring: None,
+                    },
+                ],
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            EnumMetadata {
+                module_path: module_path.into(),
+                name: "MatrixEnum".into(),
+                orig_name: Some("MatrixEnum".into()),
+                rust_path: None,
+                shape: EnumShape::Enum,
+                remote: false,
+                variants: vec![
+                    VariantMetadata {
+                        name: "unknown".into(),
+                        orig_name: Some("Unknown".into()),
+                        discr: None,
+                        fields: vec![FieldMetadata {
+                            name: "napi".into(),
+                            orig_name: Some("napi_value".into()),
+                            ty: Type::UInt32,
+                            default: None,
+                            docstring: None,
+                        }],
+                        docstring: None,
+                    },
+                    VariantMetadata {
+                        name: "Buffer".into(),
+                        orig_name: Some("Buffer".into()),
+                        discr: None,
+                        fields: vec![],
+                        docstring: None,
+                    },
+                ],
+                discr_type: None,
+                non_exhaustive: false,
+                docstring: None,
+            }
+            .into(),
+        );
+        let ci = ComponentInterface::from_metadata(group).expect("renamed value fixture metadata");
+        let rendered = render_wasm_rust(&ci);
+
+        assert!(
+            rendered.contains("MatrixRecord {\n        unknown_value,\n        napi_value,"),
+            "record constructor must use Rust field names:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("MatrixRecord { unknown_value, napi_value }"),
+            "record pattern must use Rust field names:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("JsValue::from_str(\"unknown\")")
+                && rendered.contains("JsValue::from_str(\"napi\")"),
+            "record JS keys must retain public hostile names:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("MatrixEnum::Unknown {\n                napi_value: napi_value,"),
+            "enum constructor must use Rust variant and field names:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("MatrixEnum::Unknown { napi_value }"),
+            "enum pattern must use Rust variant and field names:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("JsValue::from_str(\"unknown\")")
+                && rendered.contains("JsValue::from_str(\"Buffer\")"),
+            "enum JS tags must retain public hostile names:\n{rendered}"
         );
     }
 
