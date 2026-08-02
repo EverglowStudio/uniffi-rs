@@ -5496,6 +5496,85 @@ fn managed_package_active_journal_fails_closed_before_lock_and_retry_commits() {
 #[cfg(unix)]
 #[test]
 fn managed_exited_historical_test_controls_are_cleaned_only_from_exact_witnesses() {
+    if exact_test_isolated_tmpdir_child(
+        MANAGED_EXITED_HISTORICAL_CLEANUP_CHILD,
+        MANAGED_EXITED_HISTORICAL_CLEANUP_CHILD_ROOT,
+    ) {
+        run_managed_exited_historical_test_controls_are_cleaned_only_from_exact_witnesses();
+        return;
+    }
+
+    run_exact_test_in_isolated_tmpdir(
+        "cli::artifacts::tests::managed_exited_historical_test_controls_are_cleaned_only_from_exact_witnesses",
+        MANAGED_EXITED_HISTORICAL_CLEANUP_CHILD,
+        MANAGED_EXITED_HISTORICAL_CLEANUP_CHILD_ROOT,
+    );
+}
+
+#[cfg(unix)]
+const MANAGED_EXITED_HISTORICAL_CLEANUP_CHILD: &str =
+    "UNIFFI_MANAGED_EXITED_HISTORICAL_CLEANUP_CHILD";
+
+#[cfg(unix)]
+const MANAGED_EXITED_HISTORICAL_CLEANUP_CHILD_ROOT: &str =
+    "UNIFFI_MANAGED_EXITED_HISTORICAL_CLEANUP_CHILD_ROOT";
+
+#[cfg(unix)]
+const MANAGED_NESTED_HISTORICAL_CLEANUP_CHILD: &str =
+    "UNIFFI_MANAGED_NESTED_HISTORICAL_CLEANUP_CHILD";
+
+#[cfg(unix)]
+const MANAGED_NESTED_HISTORICAL_CLEANUP_CHILD_ROOT: &str =
+    "UNIFFI_MANAGED_NESTED_HISTORICAL_CLEANUP_CHILD_ROOT";
+
+#[cfg(unix)]
+fn exact_test_isolated_tmpdir_child(child_env_key: &str, child_root_env_key: &str) -> bool {
+    if std::env::var_os(child_env_key).is_none() {
+        return false;
+    }
+
+    let root = Utf8PathBuf::from_path_buf(
+        std::env::var_os(child_root_env_key)
+            .expect("isolated historical cleanup child root must be set")
+            .into(),
+    )
+    .expect("isolated historical cleanup child root must be UTF-8");
+    let temp = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .expect("isolated historical cleanup child TMPDIR must be UTF-8")
+        .canonicalize_utf8()
+        .expect("isolated historical cleanup child TMPDIR must exist");
+    assert_eq!(
+        temp, root,
+        "isolated historical cleanup child TMPDIR escaped its canonical sandbox"
+    );
+    true
+}
+
+#[cfg(unix)]
+fn run_exact_test_in_isolated_tmpdir(
+    test_name: &str,
+    child_env_key: &str,
+    child_root_env_key: &str,
+) {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(sandbox.path().canonicalize().unwrap()).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(child_env_key, "1")
+        .env(child_root_env_key, &root)
+        .env("TMPDIR", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated historical cleanup child `{test_name}` failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(unix)]
+fn run_managed_exited_historical_test_controls_are_cleaned_only_from_exact_witnesses() {
     let _cleanup_lock = historical_managed_cleanup_test_lock();
     let (cleaned, preserved) = cleanup_exited_historical_managed_test_controls();
     for report in &preserved {
@@ -5866,6 +5945,23 @@ fn historical_managed_name_only_snapshot_intent_preserves_every_record() {
 #[cfg(unix)]
 #[test]
 fn managed_nested_random_tempdir_residue_is_discovered_but_not_reowned() {
+    if exact_test_isolated_tmpdir_child(
+        MANAGED_NESTED_HISTORICAL_CLEANUP_CHILD,
+        MANAGED_NESTED_HISTORICAL_CLEANUP_CHILD_ROOT,
+    ) {
+        run_managed_nested_random_tempdir_residue_is_discovered_but_not_reowned();
+        return;
+    }
+
+    run_exact_test_in_isolated_tmpdir(
+        "cli::artifacts::tests::managed_nested_random_tempdir_residue_is_discovered_but_not_reowned",
+        MANAGED_NESTED_HISTORICAL_CLEANUP_CHILD,
+        MANAGED_NESTED_HISTORICAL_CLEANUP_CHILD_ROOT,
+    );
+}
+
+#[cfg(unix)]
+fn run_managed_nested_random_tempdir_residue_is_discovered_but_not_reowned() {
     use std::os::unix::fs::MetadataExt as _;
     use std::time::{Duration, Instant};
 
