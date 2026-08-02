@@ -2098,7 +2098,10 @@ fn multi_target_hsp_manifest_keeps_logical_paths_under_symlinked_package_ancesto
     );
     assert_eq!(
         manifest["artifacts"]["node"]["addon"],
-        "artifacts/node/uni_core.node"
+        format!(
+            "artifacts/node/{}.node",
+            uniffi_bindgen_javascript::host_crates::composite_host_lib_target("uni-core")
+        )
     );
     let _ = std::fs::remove_dir_all(root.as_std_path());
 }
@@ -4870,7 +4873,7 @@ fn managed_layout_derives_and_commits_integrated_hsp_generation() {
         serde_json::from_slice(&std::fs::read(package_dir.join("artifact-manifest.json")).unwrap())
             .unwrap();
     let hsp = &manifest["artifacts"]["harmony"];
-    assert_eq!(manifest["artifactManifestSchemaVersion"], 3);
+    assert_eq!(manifest["artifactManifestSchemaVersion"], 4);
     assert!(manifest.get("schemaVersion").is_none());
     assert_eq!(hsp["kind"], "hsp");
     assert_eq!(hsp["integrated"], true);
