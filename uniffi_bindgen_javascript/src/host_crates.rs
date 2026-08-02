@@ -1273,8 +1273,12 @@ fn render_ohos_facade_bundle(
             .join(&sidecar_file);
         let sidecar_content = fs::read_to_string(&sidecar_path)
             .with_context(|| format!("reading generated OHOS type sidecar {sidecar_path}"))?;
-        crate::flavors::napi::validate_ohos_extra_types(&sidecar_content, &identity_export)
-            .with_context(|| format!("validating generated OHOS type sidecar {sidecar_path}"))?;
+        crate::flavors::napi::validate_ohos_extra_types(
+            &sidecar_content,
+            &identity_export,
+            &contract,
+        )
+        .with_context(|| format!("validating generated OHOS type sidecar {sidecar_path}"))?;
 
         contracts.push(serde_json::json!({
             "file": contract_file.clone(),

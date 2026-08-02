@@ -1206,7 +1206,7 @@ fn static_stream_host_command(
 }
 
 fn stream_api_snapshot(dist: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    [
+    let mut snapshot = [
         "Index.ets",
         "Index.d.ets",
         "harmony-facade-contract.json",
@@ -1215,7 +1215,25 @@ fn stream_api_snapshot(dist: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     ]
     .into_iter()
     .map(|name| (PathBuf::from(name), std::fs::read(dist.join(name)).unwrap()))
-    .collect()
+    .collect::<BTreeMap<_, _>>();
+    let component_root = dist.join("component-facades");
+    if component_root.is_dir() {
+        let mut entries = std::fs::read_dir(&component_root)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_file() {
+                snapshot.insert(
+                    PathBuf::from("component-facades").join(entry.file_name()),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    snapshot
 }
 
 fn hsp_managed_command(root: &Path) -> Command {
@@ -1312,6 +1330,15 @@ fn assert_published_wasm_stream_consumer(
     package_root: &Path,
     manifest: &serde_json::Value,
 ) {
+    let components = manifest["components"]
+        .as_array()
+        .expect("published wasm manifest components must be an array");
+    let [component] = components.as_slice() else {
+        panic!("published wasm fixture must declare exactly one component: {components:?}");
+    };
+    let namespace = component["namespace"]
+        .as_str()
+        .expect("published wasm component must declare its namespace");
     assert!(manifest["targets"]
         .as_array()
         .unwrap()
@@ -1358,15 +1385,15 @@ fn assert_published_wasm_stream_consumer(
         r#"
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { initBackend, countEvents, sumEvents } from "./package/src/ffi/browser/index.ts";
+import { __UNIFFI_NAMESPACE__ } from "./package/src/ffi/browser/index.ts";
 
 const glue = await import(pathToFileURL(process.env.UNIFFI_TEST_PUBLISHED_WASM_GLUE!).href);
 const bytes = await readFile(process.env.UNIFFI_TEST_PUBLISHED_WASM_BYTES!);
 await glue.default(bytes);
-await initBackend(glue);
+await __UNIFFI_NAMESPACE__.initBackend(glue);
 
 const values: number[] = [];
-for await (const event of countEvents(3)) values.push(event.value);
+for await (const event of __UNIFFI_NAMESPACE__.countEvents(3)) values.push(event.value);
 if (values.join(",") !== "0,1,2") throw new Error(`countEvents: ${values}`);
 
 async function* events(): AsyncIterable<{ value: number }> {
@@ -1374,10 +1401,11 @@ async function* events(): AsyncIterable<{ value: number }> {
   yield { value: 2 };
   yield { value: 3 };
 }
-const sum = await sumEvents(events());
+const sum = await __UNIFFI_NAMESPACE__.sumEvents(events());
 if (sum !== 6) throw new Error(`sumEvents: ${sum}`);
 console.log("published managed wasm stream smoke ok");
-"#,
+"#
+        .replace("__UNIFFI_NAMESPACE__", namespace),
     )
     .unwrap();
     let mut node = Command::new("node");
@@ -1434,7 +1462,9 @@ fn assert_direct_web_wasm_consumer(root: &Path, public: &Path, label: &str) {
         r#"
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-const api = await import(process.env.UNIFFI_TEST_WASM_ENTRY!);
+const root = await import(process.env.UNIFFI_TEST_WASM_ENTRY!);
+const api = root.uniffi_ohos_public_core;
+if (!api) throw new Error("missing uniffi_ohos_public_core namespace export");
 const glue = await import(pathToFileURL(process.env.UNIFFI_TEST_WASM_GLUE!).href);
 const bytes = await readFile(process.env.UNIFFI_TEST_WASM_BYTES!);
 await glue.default(bytes);
@@ -1495,7 +1525,9 @@ const wasmBytes = await readFile(process.env.UNIFFI_TEST_MINI_WASM!);
     return WebAssembly.instantiate(wasmBytes, imports);
   },
 };
-const api = await import(process.env.UNIFFI_TEST_MINI_ENTRY!);
+const root = await import(process.env.UNIFFI_TEST_MINI_ENTRY!);
+const api = root.uniffi_ohos_public_core;
+if (!api) throw new Error("missing uniffi_ohos_public_core namespace export");
 await api.init();
 const values: number[] = [];
 for await (const event of api.countEvents(3)) values.push(event.value);
@@ -1539,7 +1571,9 @@ fn assert_published_node_stream_consumer(root: &Path, entry: &Path, addon: &Path
     std::fs::write(
         &driver,
         r#"
-const api = await import(process.env.UNIFFI_TEST_NODE_ENTRY!);
+const root = await import(process.env.UNIFFI_TEST_NODE_ENTRY!);
+const api = root.uniffi_ohos_public_core;
+if (!api) throw new Error("missing uniffi_ohos_public_core namespace export");
 if (api.add(2, 3) !== 5) throw new Error("published addon add() failed");
 const values: number[] = [];
 for await (const event of api.countEvents(3)) values.push(event.value);
@@ -2274,6 +2308,603 @@ fn zip_files(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     files
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct HarmonyPublicSurface {
+    declarations: String,
+    component_declarations: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HarmonyContractCallable {
+    function_statement: String,
+    const_statement: String,
+}
+
+fn compact_harmony_declaration(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn facade_contract_descriptor_public_type(
+    descriptor: &serde_json::Value,
+    current_component: &str,
+) -> Result<String, String> {
+    let kind = descriptor
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("facade type descriptor lacks string kind: {descriptor}"))?;
+    match kind {
+        "number" => Ok("number".to_string()),
+        "bigint" => Ok("bigint".to_string()),
+        "boolean" => Ok("boolean".to_string()),
+        "string" => Ok("string".to_string()),
+        "arrayBuffer" => Ok("ArrayBuffer".to_string()),
+        "named" => {
+            let owner = descriptor
+                .get("owner")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| format!("named facade descriptor lacks owner: {descriptor}"))?;
+            let owner_component = owner
+                .get("component")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    format!("named facade descriptor owner lacks component: {descriptor}")
+                })?;
+            let owner_namespace = owner
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    format!("named facade descriptor owner lacks namespace: {descriptor}")
+                })?;
+            let name = descriptor
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("named facade descriptor lacks name: {descriptor}"))?;
+            Ok(if owner_component == current_component {
+                name.to_string()
+            } else {
+                format!("{owner_namespace}.{name}")
+            })
+        }
+        "optional" => Ok(format!(
+            "{}|undefined|null",
+            facade_contract_descriptor_public_type(
+                descriptor.get("inner").ok_or_else(|| format!(
+                    "optional facade descriptor lacks inner: {descriptor}"
+                ))?,
+                current_component,
+            )?
+        )),
+        "sequence" => Ok(format!(
+            "Array<{}>",
+            facade_contract_descriptor_public_type(
+                descriptor.get("inner").ok_or_else(|| format!(
+                    "sequence facade descriptor lacks inner: {descriptor}"
+                ))?,
+                current_component,
+            )?
+        )),
+        "set" => Ok(format!(
+            "Set<{}>",
+            facade_contract_descriptor_public_type(
+                descriptor
+                    .get("inner")
+                    .ok_or_else(|| format!("set facade descriptor lacks inner: {descriptor}"))?,
+                current_component,
+            )?
+        )),
+        "inputSource" => descriptor
+            .get("suffix")
+            .and_then(serde_json::Value::as_str)
+            .map(|suffix| format!("{suffix}InputSource"))
+            .ok_or_else(|| format!("input-source facade descriptor lacks suffix: {descriptor}")),
+        other => Err(format!("unsupported facade type descriptor kind `{other}`")),
+    }
+}
+
+fn facade_contract_callable_declarations(
+    facade_contract: &serde_json::Value,
+) -> Result<BTreeMap<String, HarmonyContractCallable>, String> {
+    let identity = facade_contract
+        .get("componentIdentities")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|identities| identities.first())
+        .ok_or_else(|| "facade contract lacks its component identity".to_string())?;
+    let current_component = identity
+        .get("component")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "facade contract component identity lacks component".to_string())?;
+    let mut declarations = BTreeMap::new();
+    let mut insert = |name: String, function_statement: String, const_statement: String| {
+        if declarations
+            .insert(
+                name.clone(),
+                HarmonyContractCallable {
+                    function_statement,
+                    const_statement,
+                },
+            )
+            .is_some()
+        {
+            Err(format!("facade contract has duplicate callable `{name}`"))
+        } else {
+            Ok(())
+        }
+    };
+    for output in facade_contract
+        .get("outputStreams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "facade contract lacks outputStreams".to_string())?
+    {
+        let name = output
+            .get("streamFactory")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("facade output stream lacks streamFactory: {output}"))?;
+        let arguments = output
+            .get("arguments")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("facade output stream lacks arguments: {output}"))?
+            .iter()
+            .map(|argument| {
+                let name = argument
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("facade output argument lacks name: {argument}"))?;
+                let ty = facade_contract_descriptor_public_type(
+                    argument
+                        .get("type")
+                        .ok_or_else(|| format!("facade output argument lacks type: {argument}"))?,
+                    current_component,
+                )?;
+                Ok(format!("{name}:{ty}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .join(",");
+        let item_type = facade_contract_descriptor_public_type(
+            output
+                .get("itemType")
+                .ok_or_else(|| format!("facade output stream lacks itemType: {output}"))?,
+            current_component,
+        )?;
+        let return_type = format!("UniFfiStream<{item_type}>");
+        insert(
+            name.to_string(),
+            format!("exportdeclarefunction{name}({arguments}):{return_type};"),
+            format!("exportdeclareconst{name}:({arguments})=>{return_type};"),
+        )?;
+    }
+    for input in facade_contract
+        .get("inputStreams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "facade contract lacks inputStreams".to_string())?
+    {
+        let name = input
+            .get("factory")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("facade input stream lacks factory: {input}"))?;
+        let channel = input
+            .get("channelClass")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("facade input stream lacks channelClass: {input}"))?;
+        insert(
+            name.to_string(),
+            format!("exportdeclarefunction{name}():{channel};"),
+            format!("exportdeclareconst{name}:()=>{channel};"),
+        )?;
+    }
+    if declarations.is_empty() {
+        return Err("facade contract has no callable factories".to_string());
+    }
+    Ok(declarations)
+}
+
+/// Strip precisely the known contract factories from one generated component
+/// declaration. Hvigor turns only these implementation callables from
+/// `declare function` into `declare const: (...) => ...` while archiving a
+/// default HAR. Everything else remains in the canonical comparison below.
+fn project_contract_callables_from_component_declaration(
+    source: &str,
+    expected: &BTreeMap<String, HarmonyContractCallable>,
+) -> Result<String, String> {
+    let uncommented = source
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.starts_with("//") && !line.starts_with("/*") && !line.starts_with('*')
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut seen = BTreeMap::new();
+    let mut retained = Vec::new();
+    for statement in uncommented.split_inclusive(';') {
+        let compact = compact_harmony_declaration(statement);
+        if compact.is_empty() {
+            continue;
+        }
+        let matches = expected
+            .iter()
+            .filter(|(_, declaration)| {
+                compact == declaration.function_statement || compact == declaration.const_statement
+            })
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => retained.push(compact),
+            [name] => {
+                let count = seen.entry((*name).clone()).or_insert(0usize);
+                *count += 1;
+                if *count != 1 {
+                    return Err(format!("contract callable `{name}` appears more than once"));
+                }
+            }
+            names => return Err(format!("ambiguous contract callable statement: {names:?}")),
+        }
+    }
+    for name in expected.keys() {
+        if seen.get(name) != Some(&1) {
+            return Err(format!(
+                "contract callable `{name}` is missing or has a changed signature"
+            ));
+        }
+    }
+    let mut exports = Vec::new();
+    for statement in retained {
+        if statement.starts_with("import") {
+            // Declaration emitters may elide implementation-only imports;
+            // local class imports are independently checked below.
+            continue;
+        }
+        if !statement.starts_with("export") {
+            return Err(format!("unexpected declaration statement `{statement}`"));
+        }
+        exports.push(statement);
+    }
+    exports.sort();
+    Ok(exports.join(";"))
+}
+
+#[test]
+fn harmony_contract_callable_projection_equates_function_and_const_forms() {
+    let expected = BTreeMap::from([(
+        "eventsStream".to_string(),
+        HarmonyContractCallable {
+            function_statement:
+                "exportdeclarefunctioneventsStream(event:EventId):UniFfiStream<EventId>;"
+                    .to_string(),
+            const_statement:
+                "exportdeclareconsteventsStream:(event:EventId)=>UniFfiStream<EventId>;".to_string(),
+        },
+    )]);
+    let function = "import { raw } from \"../native-facade\"; export declare function eventsStream(event: EventId): UniFfiStream<EventId>; export type EventId = RawEventId;";
+    let constant = "export type EventId = RawEventId; import { raw as hidden } from \"../native-facade\"; export declare const eventsStream: (event: EventId) => UniFfiStream<EventId>;";
+    assert_eq!(
+        project_contract_callables_from_component_declaration(function, &expected).unwrap(),
+        project_contract_callables_from_component_declaration(constant, &expected).unwrap(),
+    );
+}
+
+#[test]
+fn harmony_contract_callable_projection_rejects_signature_drift() {
+    let expected = BTreeMap::from([(
+        "eventsStream".to_string(),
+        HarmonyContractCallable {
+            function_statement:
+                "exportdeclarefunctioneventsStream(event:EventId):UniFfiStream<EventId>;"
+                    .to_string(),
+            const_statement:
+                "exportdeclareconsteventsStream:(event:EventId)=>UniFfiStream<EventId>;".to_string(),
+        },
+    )]);
+    let wrong_parameter =
+        "export declare const eventsStream: (other: EventId) => UniFfiStream<EventId>;";
+    let wrong_return =
+        "export declare function eventsStream(event: EventId): UniFfiStream<string>;";
+    assert!(
+        project_contract_callables_from_component_declaration(wrong_parameter, &expected).is_err()
+    );
+    assert!(
+        project_contract_callables_from_component_declaration(wrong_return, &expected).is_err()
+    );
+}
+
+fn archive_utf8(files: &BTreeMap<String, Vec<u8>>, path: &str, label: &str) -> String {
+    let bytes = files
+        .get(path)
+        .unwrap_or_else(|| panic!("{label} is missing {path}"));
+    String::from_utf8(bytes.clone()).unwrap_or_else(|_| panic!("{label} has non-UTF-8 {path}"))
+}
+
+fn assert_namespaced_harmony_public_surface(
+    files: &BTreeMap<String, Vec<u8>>,
+    namespace: &str,
+    facade_contract: &serde_json::Value,
+    label: &str,
+) -> HarmonyPublicSurface {
+    // Interface HARs intentionally carry declarations rather than the
+    // implementation `.ets` modules. Hvigor canonicalizes the finite set of
+    // contract stream/input factories from `declare function` to callable
+    // `declare const` in a default HAR; compare that exact contract projection
+    // semantically and retain a canonical exact comparison for everything
+    // else.
+    let index = files
+        .contains_key("package/Index.ets")
+        .then(|| archive_utf8(files, "package/Index.ets", label));
+    let declarations = archive_utf8(files, "package/Index.d.ets", label);
+    let component_source_path = format!("package/src/main/ets/components/{namespace}.ets");
+    let component_declaration_path = format!("package/src/main/ets/components/{namespace}.d.ets");
+    assert!(
+        !files.contains_key(&format!("package/src/main/ets/components/{namespace}.d.ts")),
+        "{label} must not contain a legacy component .d.ts compatibility declaration"
+    );
+    let mut component_sources = BTreeMap::from([(
+        component_declaration_path.clone(),
+        archive_utf8(files, &component_declaration_path, label),
+    )]);
+    let component_declarations = component_sources
+        .get(&component_declaration_path)
+        .expect("component declaration was inserted");
+    assert!(
+        !component_declarations.contains("typeof "),
+        "{label} component declaration must not use ArkTS-incompatible type queries:\n{component_declarations}"
+    );
+    if files.contains_key(&component_source_path) {
+        let source = archive_utf8(files, &component_source_path, label);
+        component_sources.insert(component_source_path.clone(), source);
+    }
+    let root_import =
+        format!("import * as {namespace} from \"./src/main/ets/components/{namespace}\";");
+    let root_export = format!("export {{\n  {namespace},\n}};");
+    let normalize_active_root = |source: &str| {
+        source
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                !line.is_empty()
+                    && !line.starts_with("//")
+                    && !line.starts_with("/*")
+                    && !line.starts_with('*')
+            })
+            .flat_map(str::chars)
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+    };
+    let expected_root = normalize_active_root(&format!("{root_import}\n{root_export}"));
+    let mut roots = vec![&declarations];
+    if let Some(index) = &index {
+        roots.push(index);
+    }
+    for root in roots {
+        assert!(
+            !root.contains("native-facade"),
+            "{label} root directly exposes the native facade:\n{root}"
+        );
+        assert_eq!(
+            normalize_active_root(root),
+            expected_root,
+            "{label} root must contain exactly one namespace import/export and no compatibility surface:\n{root}"
+        );
+        for flat_public in [
+            "add",
+            "CounterEvent",
+            "CounterObject",
+            "CounterObserver",
+            "CounterSignal",
+            "StreamError",
+            "UniFfiStream",
+            "UniFfiStreamResult",
+            "UniFfiStreamFailure",
+            "countEventsStream",
+        ] {
+            assert!(
+                !root.contains(flat_public),
+                "{label} root leaked flat public binding `{flat_public}`:\n{root}"
+            );
+        }
+    }
+
+    let component_text = component_sources
+        .values()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for public_symbol in [
+        "add",
+        "CounterEvent",
+        "CounterObject",
+        "CounterObserver",
+        "CounterSignal",
+        "StreamError",
+        "UniFfiStream",
+        "UniFfiStreamResult",
+        "UniFfiStreamFailure",
+        "countEventsStream",
+    ] {
+        assert!(
+            component_text.contains(public_symbol),
+            "{label} namespace `{namespace}` misses public/Pull binding `{public_symbol}`:\n{component_text}"
+        );
+    }
+    for legacy_event_facade in ["CountEventsEventsStream", "countEventsEvents"] {
+        assert!(
+            !component_text.contains(legacy_event_facade),
+            "{label} namespace `{namespace}` leaked removed Event facade `{legacy_event_facade}`:\n{component_text}"
+        );
+    }
+    assert!(
+        !component_text.contains("typeof "),
+        "{label} namespace `{namespace}` contains an ArkTS-incompatible type query:\n{component_text}"
+    );
+    let has_local_class_import = |source: &str, internal: &str, public: &str| {
+        let expected_binding = if internal == public {
+            internal.to_string()
+        } else {
+            format!("{internal}as{public}")
+        };
+        source.split(';').any(|statement| {
+            let compact = statement
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            compact
+                .strip_prefix("import{")
+                .and_then(|bindings| bindings.strip_suffix("}from\"../native-facade\""))
+                .is_some_and(|bindings| {
+                    bindings
+                        .split(',')
+                        .any(|binding| binding == expected_binding)
+                })
+        })
+    };
+    let outputs = facade_contract["outputStreams"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{label} facade contract lacks outputStreams"));
+    assert!(
+        !outputs.is_empty(),
+        "{label} fixture unexpectedly has no output stream"
+    );
+    let mut class_reexports = BTreeMap::from([(
+        "UniFfiStreamFailure".to_string(),
+        "UniFfiStreamFailure".to_string(),
+    )]);
+    for output in outputs {
+        let class = output["pullClass"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label} output stream has no pullClass"))
+            .to_string();
+        class_reexports.insert(class.clone(), class);
+    }
+    let inputs = facade_contract["inputStreams"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{label} facade contract lacks inputStreams"));
+    let contract_callables =
+        facade_contract_callable_declarations(facade_contract).unwrap_or_else(|error| {
+            panic!("{label} facade contract callable projection failed: {error}")
+        });
+    assert_eq!(
+        contract_callables.len(),
+        outputs.len() + inputs.len(),
+        "{label} facade contract has non-unique output/input factory names"
+    );
+    if !inputs.is_empty() {
+        class_reexports.insert(
+            "UniFfiInputFailure".to_string(),
+            "UniFfiInputFailure".to_string(),
+        );
+        let native_export_prefix = facade_contract["componentIdentities"]
+            .as_array()
+            .and_then(|identities| identities.first())
+            .and_then(|identity| identity["nativeExportPrefix"].as_str())
+            .unwrap_or_else(|| {
+                panic!("{label} facade contract lacks its component nativeExportPrefix")
+            });
+        let raw_input_stream = format!("{native_export_prefix}_UniffiInputStream");
+        for source in component_sources.values() {
+            assert!(
+                source.contains(&format!(
+                    "export type UniffiInputStream<T> = {raw_input_stream}<T>;"
+                )),
+                "{label} namespace `{namespace}` did not preserve its exact prefixed raw input generic:\n{source}"
+            );
+            assert!(
+                !source.contains("export interface UniffiInputStream<T>"),
+                "{label} namespace `{namespace}` reintroduced a compatibility raw input interface:\n{source}"
+            );
+        }
+    }
+    for input in inputs {
+        for field in ["writerClass", "sourceClass", "channelClass"] {
+            let class = input[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{label} input stream has no {field}"))
+                .to_string();
+            class_reexports.insert(class.clone(), class);
+        }
+    }
+    let native_export_prefix = facade_contract["componentIdentities"]
+        .as_array()
+        .and_then(|identities| identities.first())
+        .and_then(|identity| identity["nativeExportPrefix"].as_str())
+        .unwrap_or_else(|| {
+            panic!("{label} facade contract lacks its component nativeExportPrefix")
+        });
+    class_reexports.insert(
+        "CounterObject".to_string(),
+        format!("{native_export_prefix}_CounterObject"),
+    );
+    for (class, internal) in class_reexports {
+        let component_declaration = component_sources
+            .get(&component_declaration_path)
+            .expect("required component declaration is present");
+        let export = format!("export {{ {class} }};");
+        assert!(
+            has_local_class_import(component_declaration, &internal, &class)
+                && component_declaration.matches(&export).count() == 1,
+            "{label} namespace `{namespace}` declaration must create and export a local ArkTS class binding for `{class}`:\n{component_declaration}"
+        );
+        if let Some(component_source) = component_sources.get(&component_source_path) {
+            assert!(
+                has_local_class_import(component_source, &internal, &class)
+                    && component_source.matches(&export).count() == 1,
+                "{label} namespace `{namespace}` source must create and export a local ArkTS class binding for `{class}`:\n{component_source}"
+            );
+        }
+        let direct_reexport =
+            format!("export {{ {internal} as {class} }} from \"../native-facade\";");
+        for source in component_sources.values() {
+            assert!(
+                !source.contains(&format!("export const {class} ="))
+                    && !source.contains(&format!("export type {class} ="))
+                    && !source.contains(&direct_reexport),
+                "{label} namespace `{namespace}` modeled class `{class}` as an invalid const/type alias:\n{source}"
+            );
+        }
+    }
+    for output in outputs {
+        for field in ["function", "nextFunction", "cancelFunction", "stepType"] {
+            let raw = output[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{label} output stream has no {field}"));
+            assert!(
+                !component_text.contains(raw),
+                "{label} namespace `{namespace}` leaked raw output `{raw}`:\n{component_text}"
+            );
+        }
+        for field in ["streamFactory", "pullClass"] {
+            let public = output[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{label} output stream has no {field}"));
+            assert!(
+                component_text.contains(public),
+                "{label} namespace `{namespace}` misses Pull facade `{public}`:\n{component_text}"
+            );
+        }
+    }
+
+    let component_declarations = component_sources
+        .remove(&format!(
+            "package/src/main/ets/components/{namespace}.d.ets"
+        ))
+        .expect("required component declaration is present");
+    let component_declarations = project_contract_callables_from_component_declaration(
+        &component_declarations,
+        &contract_callables,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{label} namespace `{namespace}` contract callable declaration projection failed: {error}"
+        )
+    });
+    HarmonyPublicSurface {
+        declarations: normalize_active_root(&declarations),
+        component_declarations: BTreeMap::from([(
+            component_declaration_path,
+            component_declarations,
+        )]),
+    }
+}
+
 fn write_consumer_file(root: &Path, relative: &str, contents: impl AsRef<[u8]>) {
     let path = root.join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2304,7 +2935,13 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
-fn write_integrated_hsp_consumer(root: &Path, package_name: &str, tgz: &Path, sdk_home: &Path) {
+fn write_integrated_hsp_consumer(
+    root: &Path,
+    package_name: &str,
+    namespace: &str,
+    tgz: &Path,
+    sdk_home: &Path,
+) {
     write_consumer_file(
         root,
         ".ohpmrc",
@@ -2470,32 +3107,22 @@ export default class EntryAbility extends UIAbility {
         root,
         "entry/src/main/ets/pages/Index.ets",
         format!(
-            r#"import type {{
-  CounterEvent,
-  CounterObject,
-  CounterObserver,
-  CounterSignal,
-  UniFfiStream
-}} from '{package_name}';
-import {{
-  add,
-  countEventsStream
-}} from '{package_name}';
+            r#"import {{ {namespace} }} from '{package_name}';
 
-const RESULT: number = add(20, 22);
-const COUNTER: CounterObject | null = null;
-const EVENT: CounterEvent = {{
+const RESULT: number = {namespace}.add(20, 22);
+const COUNTER: {namespace}.CounterObject | null = null;
+const EVENT: {namespace}.CounterEvent = {{
   value: COUNTER === null ? 1 : 0
 }};
-const SIGNAL: CounterSignal = {{ type: 'Tick', event: EVENT }};
-class ConsumerObserver implements CounterObserver {{
-  observe(signal: CounterSignal): void {{
+const SIGNAL: {namespace}.CounterSignal = {{ type: 'Tick', event: EVENT }};
+class ConsumerObserver implements {namespace}.CounterObserver {{
+  observe(signal: {namespace}.CounterSignal): void {{
     console.info(`UNIFFI_PUBLIC_HSP_SIGNAL:${{signal.type}}`);
   }}
 }}
-const OBSERVER: CounterObserver = new ConsumerObserver();
+const OBSERVER: {namespace}.CounterObserver = new ConsumerObserver();
 OBSERVER.observe?.(SIGNAL);
-const PULL: UniFfiStream<CounterEvent> = countEventsStream(EVENT.value);
+const PULL: {namespace}.UniFfiStream<{namespace}.CounterEvent> = {namespace}.countEventsStream(EVENT.value);
 PULL.cancel();
 
 @Entry
@@ -2673,9 +3300,23 @@ fn artifacts_hsp_target_sdk_order_is_validated_before_output_generation() {
     }
 }
 
-fn codelinter_bin() -> PathBuf {
+fn is_standalone_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn standalone_codelinter_bin() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("CODELINTER") {
-        return PathBuf::from(path);
+        let path = PathBuf::from(path);
+        return is_standalone_executable(&path)
+            .then_some(path.clone())
+            .ok_or_else(|| {
+                format!(
+                    "CODELINTER must name an executable standalone CodeLinter CLI, not {}",
+                    path.display()
+                )
+            });
     }
     if let Some(home) = std::env::var_os("HOME") {
         for relative in [
@@ -2683,15 +3324,26 @@ fn codelinter_bin() -> PathBuf {
             "Downloads/command-line-tools/codelinter/bin/codelinter",
         ] {
             let candidate = PathBuf::from(&home).join(relative);
-            if candidate.is_file() {
-                return candidate;
+            if is_standalone_executable(&candidate) {
+                return Ok(candidate);
             }
         }
     }
-    PathBuf::from("codelinter")
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            let candidate = directory.join("codelinter");
+            if is_standalone_executable(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(
+        "standalone CodeLinter CLI is unavailable; set CODELINTER to its executable path. DevEco IDE plugin JavaScript is not an accepted CLI substitute."
+            .to_string(),
+    )
 }
 
-fn run_codelinter(project: &Path, label: &str) {
+fn run_codelinter(codelinter: &Path, project: &Path, label: &str) {
     let config = project.join(".uniffi-code-linter.json5");
     let report = project.join(".uniffi-codelinter-report.json");
     std::fs::write(
@@ -2704,7 +3356,7 @@ fn run_codelinter(project: &Path, label: &str) {
 "#,
     )
     .unwrap();
-    let mut command = Command::new(codelinter_bin());
+    let mut command = Command::new(codelinter);
     command
         .current_dir(project)
         .args(["-c"])
@@ -2738,6 +3390,17 @@ fn run_codelinter(project: &Path, label: &str) {
         diagnostics,
         serde_json::json!([]),
         "{label} CodeLinter emitted error/warn diagnostics"
+    );
+}
+
+#[test]
+#[ignore = "requires a standalone CodeLinter CLI; set CODELINTER to its executable path"]
+fn public_hsp_codelinter_boundary_requires_a_standalone_cli() {
+    let codelinter =
+        standalone_codelinter_bin().unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
+    eprintln!(
+        "standalone CodeLinter boundary resolved executable {}",
+        codelinter.display()
     );
 }
 
@@ -2791,14 +3454,48 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         &std::fs::read(package_root.join("artifact-manifest.json")).unwrap(),
     )
     .unwrap();
-    let harmony = &manifest["artifacts"]["harmony"];
-    assert_eq!(manifest["artifactManifestSchemaVersion"], 3);
+    assert_eq!(manifest["artifactManifestSchemaVersion"], 4);
     assert!(manifest.get("schemaVersion").is_none());
-    assert!(manifest["targets"]
+    assert_eq!(manifest["targets"], serde_json::json!(["wasm", "harmony"]));
+    assert_eq!(manifest["source"]["root"], "src/ffi");
+    assert_eq!(manifest["source"]["shared"], "src/ffi/shared");
+    assert_eq!(manifest["source"]["browser"], "src/ffi/browser");
+    assert_eq!(manifest["source"]["harmony"], "src/ffi/harmony");
+    let components = manifest["components"]
         .as_array()
-        .unwrap()
-        .iter()
-        .any(|value| value == "harmony"));
+        .expect("managed artifact manifest components must be an array");
+    let [component] = components.as_slice() else {
+        panic!("public HSP fixture must have exactly one component: {components:?}");
+    };
+    assert_eq!(component["component"], "uniffi_ohos_public_core");
+    assert_eq!(component["namespace"], "uniffi_ohos_public_core");
+    assert_eq!(
+        component["nativeExportPrefix"],
+        "ffi_uniffi_ohos_public_core"
+    );
+    let namespace = component["namespace"].as_str().unwrap();
+    assert_eq!(
+        component["source"]["common"],
+        "src/ffi/components/uniffi_ohos_public_core/common"
+    );
+    assert_eq!(
+        component["source"]["browser"],
+        "src/ffi/components/uniffi_ohos_public_core/browser"
+    );
+    assert_eq!(
+        component["source"]["harmony"],
+        "src/ffi/components/uniffi_ohos_public_core/harmony"
+    );
+    assert_eq!(
+        component["source"]["publicTypes"],
+        "src/ffi/components/uniffi_ohos_public_core/common/public-types.ts"
+    );
+    assert_eq!(manifest["entrypoints"]["web"], "src/index.web.ts");
+    assert_eq!(
+        manifest["entrypoints"]["harmony"],
+        "artifacts/harmony/package/Index.ets"
+    );
+    let harmony = &manifest["artifacts"]["harmony"];
     assert_published_wasm_stream_consumer(root, &package_root, &manifest);
     assert_eq!(harmony["kind"], "hsp");
     assert_eq!(harmony["integrated"], true);
@@ -2849,6 +3546,7 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
     let runtime_files = zip_files(&runtime_bytes);
     let facade_contract = std::fs::read(artifact("facadeContract")).unwrap();
     let facade_contract_sha256 = sha256(&facade_contract);
+    let facade_contract_json: serde_json::Value = serde_json::from_slice(&facade_contract).unwrap();
     assert!(runtime_files["ets/modules.abc"]
         .windows(facade_contract_sha256.len())
         .any(|window| window == facade_contract_sha256.as_bytes()));
@@ -2864,12 +3562,15 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         .filter(|name| name.ends_with(".so"))
         .cloned()
         .collect::<Vec<_>>();
+    let host_lib_target = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(
+        "uniffi-ohos-public-core",
+    );
     assert_eq!(
         runtime_so,
         vec![
             "libs/arm64-v8a/libc++_shared.so".to_string(),
             "libs/arm64-v8a/libuniffi_ohos_public_core.so".to_string(),
-            "libs/arm64-v8a/libuniffi_ohos_public_core_ohos.so".to_string(),
+            format!("libs/arm64-v8a/lib{host_lib_target}.so"),
         ]
     );
 
@@ -2894,41 +3595,15 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         serde_json::from_slice(interface_files.get("package/oh-package.json5").unwrap()).unwrap();
     assert_eq!(interface_package["packageType"], "InterfaceHar");
     assert_eq!(interface_package["name"], package_name);
-    let declarations =
-        std::str::from_utf8(interface_files.get("package/Index.d.ets").unwrap()).unwrap();
-    for public_symbol in [
-        "add",
-        "CounterEvent",
-        "CounterObject",
-        "CounterObserver",
-        "CounterSignal",
-        "StreamError",
-        "UniFfiStream",
-        "UniFfiStreamResult",
-        "UniFfiStreamFailure",
-        "countEventsStream",
-    ] {
-        assert!(
-            declarations.contains(public_symbol),
-            "Interface HAR root declarations do not expose {public_symbol}"
-        );
-    }
-    for private_or_removed_symbol in [
-        "CountEventsEventsStream",
-        "UniFfiStreamErrorData",
-        "UniFfiStreamBusinessError",
-        "countEventsEvents",
-        "uniffiHarmonyFacadeContract",
-        "UNIFFI_HARMONY_FACADE_CONTRACT_SHA256",
-    ] {
-        assert!(
-            !declarations.contains(private_or_removed_symbol),
-            "Interface HAR root declarations leak {private_or_removed_symbol}"
-        );
-    }
+    let hsp_public_surface = assert_namespaced_harmony_public_surface(
+        &interface_files,
+        namespace,
+        &facade_contract_json,
+        "HSP Interface HAR",
+    );
 
     let consumer = root.join("fresh-consumer");
-    write_integrated_hsp_consumer(&consumer, package_name, &tgz, &deveco_sdk_home());
+    write_integrated_hsp_consumer(&consumer, package_name, namespace, &tgz, &deveco_sdk_home());
     for stale in [
         "oh-package-lock.json5",
         "oh_modules",
@@ -3006,10 +3681,12 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         "generated HSP declarations regressed to ArkTS-incompatible typeof queries:\n{build_log}"
     );
     assert_success(output, &assemble_hap);
-    run_codelinter(&consumer, "fresh integrated HSP consumer");
-    let module_lint_copy = root.join("module-project-lint-copy");
-    copy_tree(&module_project, &module_lint_copy);
-    run_codelinter(&module_lint_copy, "generated HSP module project");
+    let codelinter = standalone_codelinter_bin();
+    let module_lint_copy = codelinter.as_ref().ok().map(|_| {
+        let copy = root.join("module-project-lint-copy");
+        copy_tree(&module_project, &copy);
+        copy
+    });
 
     let hap =
         unique_file_with_extension(&consumer.join("entry/build/default/outputs/default"), "hap");
@@ -3136,6 +3813,22 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         )
     }));
     assert_published_wasm_stream_consumer(root, &package_root, &manifest);
+    let har = package_root.join(
+        manifest["artifacts"]["harmony"]["har"]
+            .as_str()
+            .expect("default HAR manifest route must be a string"),
+    );
+    let har_files = targz_files(&std::fs::read(&har).unwrap(), true);
+    let har_public_surface = assert_namespaced_harmony_public_surface(
+        &har_files,
+        namespace,
+        &facade_contract_json,
+        "default HAR",
+    );
+    assert_eq!(
+        har_public_surface, hsp_public_surface,
+        "default HAR and HSP Interface HAR must expose the identical namespace-only public surface"
+    );
 
     let mut dist = managed_command(root, "aarch");
     let output = dist.output().unwrap();
@@ -3249,6 +3942,23 @@ exit 0
         "next managed invocation did not fail closed on retained evidence:\n{blocked_log}"
     );
     cleanup_managed_failure_from_exact_journals(&package_root);
+
+    match (codelinter, module_lint_copy) {
+        (Ok(codelinter), Some(module_lint_copy)) => {
+            run_codelinter(&codelinter, &consumer, "fresh integrated HSP consumer");
+            run_codelinter(
+                &codelinter,
+                &module_lint_copy,
+                "generated HSP module project",
+            );
+        }
+        (Err(diagnostic), None) => eprintln!(
+            "CodeLinter availability boundary after completed HSP/HAP core evidence: {diagnostic}"
+        ),
+        (Ok(_), None) | (Err(_), Some(_)) => {
+            panic!("CodeLinter availability state and copied lint project diverged")
+        }
+    }
 }
 
 #[test]
@@ -3790,9 +4500,6 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
     assert!(!facade.contains("export function echoEventsStream"));
     assert!(native_declarations.contains("function countEvents("));
     assert!(native_declarations.contains("function countEventsStreamNext("));
-    assert!(!declarations.contains("countEventsStreamNext"));
-    assert!(!declarations.contains("countEvents("));
-    assert!(declarations.contains("export interface UniffiInputStream<T>"));
     assert_eq!(contract["hspFacadeAggregateSchemaVersion"], 1);
     assert!(contract.get("schemaVersion").is_none());
     assert!(contract["hostCompositeIdentity"]
@@ -3801,18 +4508,65 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
     assert_eq!(contract["componentIdentities"].as_array().unwrap().len(), 1);
     let identity = &contract["componentIdentities"][0];
     let component = identity["component"].as_str().unwrap();
+    let namespace = identity["namespace"].as_str().unwrap();
+    let component_facade = std::fs::read_to_string(
+        dist.join("component-facades")
+            .join(format!("{namespace}.ets")),
+    )
+    .unwrap();
+    let component_declarations = std::fs::read_to_string(
+        dist.join("component-facades")
+            .join(format!("{namespace}.d.ets")),
+    )
+    .unwrap();
     assert_eq!(contract["components"][0], component);
-    assert!(identity["namespace"]
-        .as_str()
-        .is_some_and(|value| !value.is_empty()));
+    assert!(!namespace.is_empty());
     assert_eq!(
         identity["nativeExportPrefix"],
         format!("ffi_{}", component.replace('-', "_"))
     );
-    for public_source in [&facade, &declarations, &package_index] {
+    let root_import =
+        format!("import * as {namespace} from \"./src/main/ets/components/{namespace}\";");
+    let root_export = format!("export {{\n  {namespace},\n}};");
+    for public_root in [&declarations, &package_index] {
+        assert!(public_root.contains(&root_import));
+        assert!(public_root.contains(&root_export));
+        assert!(!public_root.contains("native-facade"));
+        assert!(!public_root.contains("countEventsStreamNext"));
+        assert!(!public_root.contains("countEvents("));
+        assert!(!public_root.contains("UniffiInputStream"));
+    }
+    for public_source in [&component_facade, &component_declarations] {
         assert!(!public_source.contains("uniffiohosbridgeidentity"));
-        assert!(!public_source.contains("EventsStream"));
+        assert!(!public_source.contains("CountEventsEventsStream"));
         assert!(!public_source.contains("countEventsEvents"));
+    }
+    let native_export_prefix = identity["nativeExportPrefix"].as_str().unwrap();
+    let raw_input_stream = format!("{native_export_prefix}_UniffiInputStream");
+    for public_source in [&component_facade, &component_declarations] {
+        assert!(public_source.contains(&format!(
+            "export type UniffiInputStream<T> = {raw_input_stream}<T>;"
+        )));
+        assert!(!public_source.contains("export interface UniffiInputStream<T>"));
+    }
+    for class in ["CounterObject", "UniFfiStreamFailure", "UniFfiInputFailure"] {
+        let internal = if class == "CounterObject" {
+            format!("{native_export_prefix}_{class}")
+        } else {
+            class.to_string()
+        };
+        let imported = format!(
+            "  {internal}{}\n",
+            (internal != class)
+                .then(|| format!(" as {class},"))
+                .unwrap_or(",".to_string())
+        );
+        for public_source in [&component_facade, &component_declarations] {
+            assert!(public_source.contains(&imported));
+            assert!(public_source.contains(&format!("export {{ {class} }};")));
+            assert!(!public_source.contains(&format!("export const {class} =")));
+            assert!(!public_source.contains(&format!("export type {class} =")));
+        }
     }
     assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 6);
     for output in contract["outputStreams"].as_array().unwrap() {
@@ -3839,7 +4593,7 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
     }
     assert_eq!(contract["inputStreams"].as_array().unwrap().len(), 2);
     let input_factory = contract["inputStreams"][0]["factory"].as_str().unwrap();
-    assert!(facade.contains(&format!("export function {input_factory}")));
+    assert!(component_facade.contains(&format!("export const {input_factory}")));
     assert!(contract["inputStreams"][0]["fingerprint"]
         .as_str()
         .is_some_and(|value| value.len() == 16));

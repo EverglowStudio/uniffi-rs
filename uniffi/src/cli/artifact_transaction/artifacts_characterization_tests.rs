@@ -1608,10 +1608,10 @@ name = "uni_core"
     manifest
 }
 
-/// A source-parseable core crate used to prove that managed planning does not
-/// wait for a default cdylib build. The exported item is feature-gated so the
-/// test also exercises propagation of `--cargo-feature` into the planner's
-/// Cargo metadata layer.
+/// A source-mode core crate used to prove that managed identity planning does
+/// not wait for a default cdylib build or parse API details. Its feature-gated
+/// exports include both output and input streams, so the test also exercises
+/// `--cargo-feature` propagation into the planner's Cargo metadata layer.
 fn write_test_source_manifest(package_dir: &Utf8Path) -> Utf8PathBuf {
     write_test_source_manifest_with_names(package_dir, "uni-core", "uni_core")
 }
@@ -1625,7 +1625,31 @@ fn write_test_source_manifest_with_names(
     std::fs::create_dir_all(&src_dir).unwrap();
     std::fs::write(
         src_dir.join("lib.rs"),
-        "#[cfg(feature = \"planned\")]\n#[uniffi::export]\npub fn current_component() -> u32 { 1 }\n",
+        r#"#[cfg(feature = "planned")]
+#[uniffi::export]
+pub fn current_component() -> u32 { 1 }
+
+#[cfg(feature = "planned")]
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum PlannedStreamError {
+    #[error("planned stream error")]
+    Failed,
+}
+
+#[cfg(feature = "planned")]
+#[uniffi::export]
+pub fn planned_output() -> uniffi::UniFfiStream<u32, PlannedStreamError> {
+    Box::pin(futures_util::stream::empty())
+}
+
+#[cfg(feature = "planned")]
+#[uniffi::export]
+pub async fn planned_input(
+    _events: uniffi::UniFfiInputStream<u32, PlannedStreamError>,
+) -> Result<(), PlannedStreamError> {
+    Ok(())
+}
+"#,
     )
     .unwrap();
     let uniffi_path = env!("CARGO_MANIFEST_DIR")
@@ -1635,7 +1659,7 @@ fn write_test_source_manifest_with_names(
     std::fs::write(
         &manifest,
         format!(
-            "[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"{lib_target}\"\n\n[features]\nplanned = []\n\n[dependencies]\nuniffi = {{ path = \"{uniffi_path}\" }}\n"
+            "[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"{lib_target}\"\n\n[features]\nplanned = []\n\n[dependencies]\nfutures-util = \"0.3\"\nthiserror = \"2\"\nuniffi = {{ path = \"{uniffi_path}\" }}\n"
         ),
     )
     .unwrap();
@@ -3528,6 +3552,182 @@ fn managed_manifest_v4_node_incremental_preflight_reconstructs_historical_hsp_ro
     let sidecar = managed_owner_path(&layout.package_dir);
     std::fs::remove_dir_all(root).ok();
     let _ = std::fs::remove_file(sidecar);
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_manifest_v4_harmony_kind_transitions_validate_historical_routes_before_merge() {
+    let root = unique_tmp_dir("managed-manifest-v4-harmony-kind-transition");
+    let manifest_path = write_test_manifest(&root.join("core"));
+    let package_dir = root.join("package");
+    let meta = cargo_package_metadata(&manifest_path).unwrap();
+    let configure_harmony_layout = |kind: super::super::ohos::PackageKind| {
+        let mut args = empty_build_args();
+        args.manifest_path = manifest_path.clone();
+        args.managed_layout = true;
+        args.package_dir = Some(package_dir.clone());
+        args.out_dir = None;
+        args.target = vec![ArtifactTargetArg::Harmony];
+        args.ohos_package_kind = kind;
+        args.ohos_integrated_hsp = kind == super::super::ohos::PackageKind::Hsp;
+        let targets = expand_targets(&args.target).unwrap();
+        let mut layout = ManagedLayout::apply(&mut args, &targets)
+            .unwrap()
+            .expect("managed layout should resolve");
+        layout.components_authoritative = true;
+        let route_inputs = ManagedArtifactRouteInputs::from(&args);
+        layout.expected_routes = Some(
+            layout
+                .managed_artifact_route_plan(&targets, &route_inputs, None)
+                .unwrap(),
+        );
+        layout.route_inputs = Some(route_inputs);
+        (args, targets, layout)
+    };
+
+    let (historical_hsp_args, hsp_targets, historical_hsp_layout) =
+        configure_harmony_layout(super::super::ohos::PackageKind::Hsp);
+    let historical_hsp: serde_json::Value = serde_json::from_str(
+        &historical_hsp_layout
+            .render_manifest(&hsp_targets, &meta, &historical_hsp_args)
+            .expect("historical HSP manifest should render"),
+    )
+    .unwrap();
+    assert_eq!(historical_hsp["artifacts"]["harmony"]["kind"], "hsp");
+    publish_exact_all_target_managed_fixture(&historical_hsp_layout, &historical_hsp);
+
+    let (har_args, har_targets, har_layout) =
+        configure_harmony_layout(super::super::ohos::PackageKind::Har);
+    let before_hsp_to_har = regular_file_snapshot(&root);
+    har_layout
+        .preflight_existing_package()
+        .expect("a current HAR plan must first accept the exact historical HSP route plan");
+    let hsp_to_har: serde_json::Value = serde_json::from_str(
+        &har_layout
+            .render_manifest_with_harmony_root(
+                &har_targets,
+                &meta,
+                &har_args,
+                Some(&root.join("next-har-harmony-source")),
+            )
+            .expect("HSP to HAR merge should validate historical routes before current routes"),
+    )
+    .unwrap();
+    assert_eq!(
+        regular_file_snapshot(&root),
+        before_hsp_to_har,
+        "HSP to HAR validation must not mutate the existing managed package"
+    );
+    let hsp_to_har_harmony = &hsp_to_har["artifacts"]["harmony"];
+    assert_eq!(hsp_to_har_harmony["kind"], "har");
+    assert!(hsp_to_har_harmony["har"].is_string());
+    for field in ["runtimeHsp", "interfaceHar", "tgz"] {
+        assert!(hsp_to_har_harmony[field].is_null(), "{field}");
+    }
+
+    // A real managed transaction seeds the old manifest, clears its Harmony
+    // tree, and stages the current HAR metadata before it merges. Keep a
+    // separate untouched public HSP package as the historical evidence; using
+    // the candidate's new HAR metadata to validate the old HSP manifest must
+    // fail rather than accidentally redefine its declared routes.
+    let candidate_root = root.join("seeded-hsp-private-candidate");
+    let candidate_layout = har_layout
+        .rebased(&har_layout.package_dir, &candidate_root)
+        .unwrap();
+    let candidate_sidecar = managed_owner_path(&candidate_layout.package_dir);
+    publish_exact_all_target_managed_fixture(&candidate_layout, &historical_hsp);
+    std::fs::remove_dir_all(candidate_layout.artifact_root.join("harmony")).unwrap();
+    let candidate_harmony_root = candidate_layout.artifact_root.join("harmony");
+    let current_metadata = candidate_layout
+        .harmony_package_metadata(
+            &meta,
+            &har_args,
+            har_args.ohos_package_name.as_deref().unwrap(),
+            &candidate_harmony_root,
+        )
+        .unwrap();
+    let candidate_package = candidate_harmony_root.join("package");
+    std::fs::create_dir_all(candidate_package.join("src/main")).unwrap();
+    std::fs::write(
+        candidate_package.join("oh-package.json5"),
+        serde_json::to_vec_pretty(&current_metadata["package"]).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        candidate_package.join("src/main/module.json5"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "module": current_metadata["module"].clone(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        candidate_package.join("build-profile.json5"),
+        serde_json::to_vec_pretty(&current_metadata["buildProfile"]).unwrap(),
+    )
+    .unwrap();
+    let misleading_candidate_evidence = candidate_layout
+        .render_manifest_with_read_roots(&har_targets, &meta, &har_args, None, None)
+        .unwrap_err();
+    assert!(
+        format!("{misleading_candidate_evidence:#}").contains("artifacts.harmony.har"),
+        "{misleading_candidate_evidence:#}"
+    );
+    let seeded_hsp_to_har: serde_json::Value = serde_json::from_str(
+        &candidate_layout
+            .render_manifest_with_read_roots_and_existing_manifest_evidence(
+                &har_targets,
+                &meta,
+                &har_args,
+                None,
+                None,
+                Some(&har_layout),
+            )
+            .expect("seeded HSP manifest must use public HSP evidence before merging current HAR routes"),
+    )
+    .unwrap();
+    assert_eq!(seeded_hsp_to_har["artifacts"]["harmony"]["kind"], "har");
+    assert!(seeded_hsp_to_har["artifacts"]["harmony"]["har"].is_string());
+
+    publish_exact_all_target_managed_fixture(&har_layout, &hsp_to_har);
+    let (next_hsp_args, next_hsp_targets, next_hsp_layout) =
+        configure_harmony_layout(super::super::ohos::PackageKind::Hsp);
+    let before_har_to_hsp = regular_file_snapshot(&root);
+    next_hsp_layout
+        .preflight_existing_package()
+        .expect("a current HSP plan must first accept the exact historical HAR route plan");
+    let har_to_hsp: serde_json::Value = serde_json::from_str(
+        &next_hsp_layout
+            .render_manifest_with_harmony_root(
+                &next_hsp_targets,
+                &meta,
+                &next_hsp_args,
+                Some(&root.join("next-hsp-harmony-source")),
+            )
+            .expect("HAR to HSP merge should validate historical routes before current routes"),
+    )
+    .unwrap();
+    assert_eq!(
+        regular_file_snapshot(&root),
+        before_har_to_hsp,
+        "HAR to HSP validation must not mutate the existing managed package"
+    );
+    let har_to_hsp_harmony = &har_to_hsp["artifacts"]["harmony"];
+    assert_eq!(har_to_hsp_harmony["kind"], "hsp");
+    assert!(har_to_hsp_harmony["har"].is_null());
+    for field in ["runtimeHsp", "interfaceHar", "tgz"] {
+        assert!(har_to_hsp_harmony[field].is_string(), "{field}");
+    }
+    validate_managed_owner(
+        &next_hsp_layout.package_dir,
+        &parse_managed_owner(&next_hsp_layout.package_dir).unwrap(),
+    )
+    .unwrap();
+
+    let sidecar = managed_owner_path(&next_hsp_layout.package_dir);
+    std::fs::remove_dir_all(root).ok();
+    let _ = std::fs::remove_file(sidecar);
+    let _ = std::fs::remove_file(candidate_sidecar);
 }
 
 #[cfg(unix)]

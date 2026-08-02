@@ -2,19 +2,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-//! A real Rust cdylib fixture for foreign-language output-stream lifecycle tests.
+//! A real Rust cdylib fixture for foreign-language stream lifecycle tests.
 //!
 //! The exported factories increment `stream_starts` when foreign code enters Rust.
 //! Each returned stream records its own polls and classifies its one Drop as either
-//! terminal or cancelled.  `pending_operation` provides the corresponding ordinary
-//! async cancellation probe.
+//! terminal or cancelled. Input-stream probes provide a gate-controlled
+//! rendezvous/backpressure check, while `pending_operation` covers ordinary async
+//! cancellation.
 
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
-    sync::{Mutex, OnceLock},
-    task::{Context, Poll},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    task::{Context, Poll, Waker},
 };
 
 use uniffi::deps::futures_core::Stream;
@@ -38,12 +42,88 @@ pub struct ProbeSnapshot {
     pub future_polls: u64,
     pub future_cancelled_drops: u64,
     pub future_drops: u64,
+    pub input_stream_starts: u64,
+    pub input_stream_next_requests: u64,
+    pub input_stream_items: u64,
+    pub input_stream_terminal_completions: u64,
 }
 
 static PROBES: OnceLock<Mutex<HashMap<String, ProbeSnapshot>>> = OnceLock::new();
 
+/// Per-probe gates let the Kotlin input-stream fixture suspend Rust between two
+/// foreign `next` requests without relying on wall-clock timing.
+#[derive(Default)]
+struct InputStreamGate {
+    released: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+static INPUT_STREAM_GATES: OnceLock<Mutex<HashMap<String, Arc<InputStreamGate>>>> = OnceLock::new();
+
 fn probes() -> &'static Mutex<HashMap<String, ProbeSnapshot>> {
     PROBES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn input_stream_gates() -> &'static Mutex<HashMap<String, Arc<InputStreamGate>>> {
+    INPUT_STREAM_GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn input_stream_gate(probe_id: &str) -> Arc<InputStreamGate> {
+    let mut gates = input_stream_gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    gates
+        .entry(probe_id.to_owned())
+        .or_insert_with(|| Arc::new(InputStreamGate::default()))
+        .clone()
+}
+
+impl InputStreamGate {
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        if let Some(waker) = self
+            .waker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            waker.wake();
+        }
+    }
+}
+
+struct WaitForInputStreamGate {
+    gate: Arc<InputStreamGate>,
+}
+
+impl Future for WaitForInputStreamGate {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.gate.released.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
+        let mut waker = self
+            .gate
+            .waker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *waker = Some(context.waker().clone());
+
+        if self.gate.released.load(Ordering::Acquire) {
+            waker.take();
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+fn wait_for_input_stream_release(probe_id: &str) -> WaitForInputStreamGate {
+    WaitForInputStreamGate {
+        gate: input_stream_gate(probe_id),
+    }
 }
 
 fn with_probe(probe_id: &str, update: impl FnOnce(&mut ProbeSnapshot)) {
@@ -91,6 +171,26 @@ fn record_future_cancelled_drop(probe_id: &str) {
     });
 }
 
+fn record_input_stream_start(probe_id: &str) {
+    with_probe(probe_id, |probe| increment(&mut probe.input_stream_starts));
+}
+
+fn record_input_stream_next_request(probe_id: &str) {
+    with_probe(probe_id, |probe| {
+        increment(&mut probe.input_stream_next_requests)
+    });
+}
+
+fn record_input_stream_item(probe_id: &str) {
+    with_probe(probe_id, |probe| increment(&mut probe.input_stream_items));
+}
+
+fn record_input_stream_terminal_completion(probe_id: &str) {
+    with_probe(probe_id, |probe| {
+        increment(&mut probe.input_stream_terminal_completions)
+    });
+}
+
 /// Return a value-copy of the counters associated with `probe_id`.
 #[uniffi::export]
 pub fn probe_snapshot(probe_id: String) -> ProbeSnapshot {
@@ -103,10 +203,16 @@ pub fn probe_snapshot(probe_id: String) -> ProbeSnapshot {
 /// Reset one probe without affecting any other probe id.
 #[uniffi::export]
 pub fn reset_probe(probe_id: String) {
-    let mut probes = probes()
+    {
+        let mut probes = probes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        probes.insert(probe_id.clone(), ProbeSnapshot::default());
+    }
+    input_stream_gates()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    probes.insert(probe_id, ProbeSnapshot::default());
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&probe_id);
 }
 
 struct ProbedSequence<T> {
@@ -230,6 +336,55 @@ pub fn pending_stream(probe_id: String) -> uniffi::UniFfiStream<u32, OutputStrea
         probe_id,
         dropped: false,
     })
+}
+
+async fn next_input_stream_item(
+    probe_id: &str,
+    stream: &mut uniffi::UniFfiInputStream<u32, OutputStreamError>,
+) -> Option<Result<u32, OutputStreamError>> {
+    record_input_stream_next_request(probe_id);
+    std::future::poll_fn(|context| Pin::new(&mut *stream).poll_next(context)).await
+}
+
+/// Consume a Kotlin-owned input stream with a gate after its first item.
+///
+/// The gate makes the foreign producer's second `emit` wait for Rust to issue
+/// its next pull.  The Kotlin runtime fixture uses that exact handshake to
+/// verify rendezvous backpressure instead of inferring it from elapsed time.
+#[uniffi::export]
+pub async fn rendezvous_input_stream_sum(
+    probe_id: String,
+    events: uniffi::UniFfiInputStream<u32, OutputStreamError>,
+) -> Result<u64, OutputStreamError> {
+    record_input_stream_start(&probe_id);
+    let mut events = events;
+    let mut sum = 0;
+    let mut item_count = 0;
+
+    loop {
+        match next_input_stream_item(&probe_id, &mut events).await {
+            Some(Ok(value)) => {
+                record_input_stream_item(&probe_id);
+                sum += u64::from(value);
+                item_count += 1;
+
+                if item_count == 1 {
+                    wait_for_input_stream_release(&probe_id).await;
+                }
+            }
+            Some(Err(error)) => return Err(error),
+            None => {
+                record_input_stream_terminal_completion(&probe_id);
+                return Ok(sum);
+            }
+        }
+    }
+}
+
+/// Allow [`rendezvous_input_stream_sum`] to request the next foreign item.
+#[uniffi::export]
+pub fn release_input_stream_consumer(probe_id: String) {
+    input_stream_gate(&probe_id).release();
 }
 
 struct PendingOperation {

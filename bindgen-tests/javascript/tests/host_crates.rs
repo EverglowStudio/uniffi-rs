@@ -9,6 +9,15 @@ use shared::*;
 use support::*;
 use uniffi_bindgen_javascript::HostCrateOptions;
 
+fn contains_rust_identifier(source: &str, identifier: &str) -> bool {
+    let is_identifier_char = |ch: char| ch == '_' || ch.is_ascii_alphanumeric();
+    source.match_indices(identifier).any(|(start, _)| {
+        let before = source[..start].chars().next_back();
+        let after = source[start + identifier.len()..].chars().next();
+        !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
+    })
+}
+
 #[test]
 fn emits_host_crate_tree_when_opted_in() {
     let out = tempfile::tempdir().unwrap();
@@ -223,6 +232,7 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
         out_dir.join("components/float32_record_core/harmony/float32_record_core.rs"),
     ] {
         let source = std::fs::read_to_string(&bridge).unwrap();
+        let compact = source.split_whitespace().collect::<String>();
         assert!(
             source.contains("pub speed: f64")
                 && source.contains("speed: value.speed as f32")
@@ -233,15 +243,30 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
             !source.contains("pub speed: f32"),
             "the host crate must not ask N-API to marshal f32 directly: {source}"
         );
+        let async_body = compact
+            .split_once("let__uniffi_future=asyncmove{")
+            .and_then(|(_, after_start)| {
+                after_start
+                    .split_once("};drop(handle);")
+                    .map(|(body, _)| body)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "async object receiver must construct a named future and drop its ClassInstance: {source}"
+                )
+            });
         assert!(
-            source.contains("pub fn async_service_greet(")
-                && source.contains("__uniffi_env: Env,")
-                && source
-                    .contains("handle: napi::bindgen_prelude::ClassInstance<'_, AsyncService>,")
-                && source.contains("let __uniffi_core = (*(handle)).0.clone();")
-                && source.contains("drop(handle);")
-                && source.contains("spawn_future(__uniffi_future)"),
-            "async object receivers must lower before entering the Send promise future: {source}"
+            compact.contains(
+                "pubfnasync_service_greet(__uniffi_env:Env,handle:napi::bindgen_prelude::ClassInstance<'_,AsyncService>,message:String,)->napi::bindgen_prelude::Result<napi::bindgen_prelude::PromiseRaw<'static,String>>",
+            ) && compact.contains(
+                "let__uniffi_message=message;let__uniffi_core=(*(handle)).__uniffi_core_clone();let__uniffi_future=asyncmove{",
+            ) && compact.contains(
+                "drop(handle);let__uniffi_promise=__uniffi_env.spawn_future(__uniffi_future)?;",
+            ) && compact.contains(
+                "std::mem::transmute::<napi::bindgen_prelude::PromiseRaw<'_,String>,napi::bindgen_prelude::PromiseRaw<'static,String>,>(__uniffi_promise)",
+            ) && !contains_rust_identifier(async_body, "handle")
+                && !compact.contains("unsafeimplSend"),
+            "async object receivers must lower before a Send future, drop the ClassInstance before spawn, and return the transmuted raw Promise: {source}"
         );
         assert!(
             !source.contains("pub async fn async_service_greet("),
@@ -502,14 +527,35 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
         "rich fixture should use napi::BigInt for u64/i64, got:\n{bridge}"
     );
     assert!(
-        bridge.contains("pub fn async_counter_value(")
-            && bridge.contains("__uniffi_env: Env,")
-            && bridge.contains("counter: napi::bindgen_prelude::ClassInstance<'_, Counter>,")
-            && bridge.contains("napi::bindgen_prelude::Result<")
-            && bridge.contains("napi::bindgen_prelude::PromiseRaw<'static, napi::bindgen_prelude::BigInt>")
-            && bridge.contains("let __uniffi_counter = (*(counter)).0.clone();")
-            && bridge.contains(".spawn_future(async move"),
-        "async function with object args should lower ClassInstance before spawning a Promise:\n{bridge}"
+        {
+            let compact = bridge.split_whitespace().collect::<String>();
+            let inline_future_body = compact
+                .split_once("let__uniffi_promise=__uniffi_env.spawn_future(asyncmove{")
+                .and_then(|(_, after_start)| {
+                    after_start
+                        .split_once("})?;Ok(unsafe{")
+                        .map(|(body, _)| body)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "async ClassInstance argument must enter the inline Promise future only after lowering: {bridge}"
+                    )
+                });
+            compact.contains(
+                "pubfnasync_counter_value(__uniffi_env:Env,counter:napi::bindgen_prelude::ClassInstance<'_,Counter>,)",
+            ) && compact.contains(
+                "napi::bindgen_prelude::PromiseRaw<'static,napi::bindgen_prelude::BigInt>",
+            ) && compact.contains(
+                "let__uniffi_counter=(*(counter)).__uniffi_core_clone();let__uniffi_promise=__uniffi_env.spawn_future(asyncmove{",
+            ) && inline_future_body.contains(
+                "napi_compat::async_counter_value(__uniffi_counter).await",
+            ) && !contains_rust_identifier(inline_future_body, "counter")
+                && compact.contains(
+                    "std::mem::transmute::<napi::bindgen_prelude::PromiseRaw<'_,napi::bindgen_prelude::BigInt>,napi::bindgen_prelude::PromiseRaw<'static,napi::bindgen_prelude::BigInt>,>(__uniffi_promise)",
+                ) && !compact.contains("pubasyncfnasync_counter_value(")
+                && !compact.contains("unsafeimplSend")
+        },
+        "async function with object args must lower ClassInstance before its Send Promise future and return the transmuted raw Promise:\n{bridge}"
     );
 
     let manifest = host_dir.join("napi/Cargo.toml");

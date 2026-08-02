@@ -459,6 +459,36 @@ fn managed_authoritative_input_components(
             ..CargoMetadataOptions::default()
         },
     ));
+    if let Some(source_crate) = source.as_str().strip_prefix("src:") {
+        // Source parsing is the generator's eventual metadata authority, but
+        // it is deliberately not part of this identity-only managed preflight.
+        // In particular, the planner must reject an existing-package mismatch
+        // before invoking a backend or parsing API details that are irrelevant
+        // to component identity. Keep the selected crate set and its name
+        // normalization in lockstep with `BindgenLoader::load_metadata`:
+        // `uniffi_parse_rs::Ir::add_crate_root` converts `-` to `_`.
+        let mut crate_names = paths
+            .get_source_crates(source_crate)
+            .context("Failed to find Rust crates, was the `cargo_metadata` feature enabled?")?
+            .into_iter()
+            .map(|source| source.name.replace('-', "_"))
+            .collect::<Vec<_>>();
+        if let Some(crate_filter) = &args.crate_name {
+            if !crate_names
+                .iter()
+                .any(|crate_name| crate_name == crate_filter)
+            {
+                bail!("No UniFFI metadata found for crate {crate_filter}");
+            }
+            crate_names.retain(|crate_name| crate_name == crate_filter);
+        }
+        return canonical_managed_component_identities(
+            crate_names
+                .into_iter()
+                .map(|crate_name| ManagedComponentIdentity::new(&crate_name, &crate_name))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
     let loader = BindgenLoader::new(paths, global_config);
     let metadata = loader.load_metadata(&source)?;
     if let Some(crate_filter) = &args.crate_name {
@@ -1881,16 +1911,20 @@ fn read_existing_managed_manifest_components(
         // so incremental direct fixtures retain their established diagnostic.
         None,
         Some(host_identity),
-        layout.expected_routes.as_ref(),
+        // An existing manifest must prove its own declared historical routes
+        // before a current invocation is allowed to replace any target. In
+        // particular, Harmony's package kind is dynamic, so validating this
+        // read against the current HAR/HSP plan would make a valid transition
+        // look like an existing-manifest route mismatch.
+        None,
         false,
         "existing managed artifact manifest",
     )?;
-    if let Some(declared_plan) = layout.manifest_declared_route_plan(&raw)? {
-        // The current invocation plan protects requested targets; the
-        // immutable declared-target union protects every target that will be
-        // retained from the existing generation.  Never let a same-typed
-        // historical route become trusted merely because it was not selected
-        // in this invocation.
+    if let Some(declared_plan) = layout.historical_manifest_declared_route_plan(&raw)? {
+        // This is deliberately independent from the current invocation. The
+        // immutable declared-target union protects every route retained from
+        // the existing generation, including a Harmony HSP/HAR shape that a
+        // new invocation is about to replace.
         declared_plan.validate_manifest_routes(&raw, true)?;
     }
     validate_managed_manifest_paths(layout, &raw)?;
@@ -2314,14 +2348,15 @@ impl ManagedLayout {
     }
 
     /// Reconstruct the declared target union from immutable layout state,
-    /// captured inputs, and (only for an unrequested historical Harmony
-    /// target) canonical producer-owned package metadata.  The manifest may
-    /// select which dynamic evidence is needed, but never supplies a route
-    /// value used by the plan.
+    /// captured inputs, and canonical producer-owned package metadata when a
+    /// retained Harmony target was not requested in the current run. The
+    /// manifest may select which dynamic evidence is needed, but never
+    /// supplies a route value used by the plan.
     fn manifest_declared_route_inputs(
         &self,
         manifest: &serde_json::Value,
         targets: &ExpandedTargets,
+        force_historical_harmony: bool,
     ) -> Result<ManagedArtifactRouteInputs> {
         let base = self.route_inputs.as_ref().context(
             "managed artifact route inputs are unavailable for declared-target validation; refusing to adopt historical routes",
@@ -2330,7 +2365,7 @@ impl ManagedLayout {
         let current_harmony = current.is_some_and(|targets| targets.harmony);
         let current_android = current.is_some_and(|targets| targets.android);
         let mut inputs = base.clone();
-        if targets.harmony && !current_harmony {
+        if targets.harmony && (force_historical_harmony || !current_harmony) {
             inputs = self.historical_harmony_route_inputs(&inputs)?;
         }
         if targets.android && !current_android {
@@ -2348,13 +2383,31 @@ impl ManagedLayout {
         Ok(inputs)
     }
 
-    /// Reconstruct a historical route plan from immutable layout state and
-    /// captured producer inputs. Dynamic retained targets either use
-    /// independent canonical evidence or fail closed; they never inherit the
-    /// current invocation's default Harmony shape.
+    /// Reconstruct the declared route union for a merged candidate. Current
+    /// requested targets use the current producer inputs; dynamic retained
+    /// targets use independent canonical evidence or fail closed.
     fn manifest_declared_route_plan(
         &self,
         manifest: &serde_json::Value,
+    ) -> Result<Option<ManagedArtifactRoutePlan>> {
+        self.manifest_declared_route_plan_with_harmony_mode(manifest, false)
+    }
+
+    /// Reconstruct a route plan for an already-published manifest. Unlike a
+    /// merged candidate, this must never inherit the current Harmony kind:
+    /// its canonical package metadata is the only accepted evidence for the
+    /// historical HSP/HAR route shape.
+    fn historical_manifest_declared_route_plan(
+        &self,
+        manifest: &serde_json::Value,
+    ) -> Result<Option<ManagedArtifactRoutePlan>> {
+        self.manifest_declared_route_plan_with_harmony_mode(manifest, true)
+    }
+
+    fn manifest_declared_route_plan_with_harmony_mode(
+        &self,
+        manifest: &serde_json::Value,
+        force_historical_harmony: bool,
     ) -> Result<Option<ManagedArtifactRoutePlan>> {
         if self.route_inputs.is_none() {
             if self.expected_routes.is_some() {
@@ -2365,7 +2418,8 @@ impl ManagedLayout {
             return Ok(None);
         }
         let targets = expanded_targets_from_managed_manifest(manifest)?;
-        let inputs = self.manifest_declared_route_inputs(manifest, &targets)?;
+        let inputs =
+            self.manifest_declared_route_inputs(manifest, &targets, force_historical_harmony)?;
         Ok(Some(
             self.managed_artifact_route_plan(&targets, &inputs, None)?,
         ))
@@ -2737,10 +2791,9 @@ impl ManagedLayout {
         self.emit_with_artifact_read_root(targets, meta, args, None)
     }
 
-    /// Production publication has a completed invocation-private artifact
-    /// tree and must prove the composite addon came from its canonical
-    /// private route.  Direct manifest fixtures deliberately have no built
-    /// addon yet, so they retain the pure renderer entry point above.
+    /// Direct manifest fixtures deliberately have no built addon yet, so
+    /// they retain the pure renderer entry point above.
+    #[cfg(test)]
     fn emit_with_artifact_read_root(
         &self,
         targets: &ExpandedTargets,
@@ -2748,9 +2801,36 @@ impl ManagedLayout {
         args: &BuildArgs,
         artifact_read_root: Option<&Utf8Path>,
     ) -> Result<()> {
+        self.emit_with_artifact_read_root_and_existing_manifest_evidence(
+            targets,
+            meta,
+            args,
+            artifact_read_root,
+            None,
+        )
+    }
+
+    /// Emit a private candidate while keeping the pre-replacement public
+    /// layout available to validate an existing manifest's historical route
+    /// evidence. `artifact_read_root` is only for current generated artifacts;
+    /// it must never be used to interpret the manifest being replaced.
+    fn emit_with_artifact_read_root_and_existing_manifest_evidence(
+        &self,
+        targets: &ExpandedTargets,
+        meta: &CargoPackageMetadata,
+        args: &BuildArgs,
+        artifact_read_root: Option<&Utf8Path>,
+        existing_manifest_evidence_layout: Option<&ManagedLayout>,
+    ) -> Result<()> {
         self.emit_supporting_files(targets, meta, args)?;
-        let manifest =
-            self.render_manifest_with_read_roots(targets, meta, args, None, artifact_read_root)?;
+        let manifest = self.render_manifest_with_read_roots_and_existing_manifest_evidence(
+            targets,
+            meta,
+            args,
+            None,
+            artifact_read_root,
+            existing_manifest_evidence_layout,
+        )?;
         write_file_atomically(&self.manifest_path, manifest.as_bytes())?;
         Ok(())
     }
@@ -2943,6 +3023,29 @@ node_modules/\n\
         harmony_source_root: Option<&Utf8Path>,
         artifact_read_root: Option<&Utf8Path>,
     ) -> Result<String> {
+        self.render_manifest_with_read_roots_and_existing_manifest_evidence(
+            targets,
+            meta,
+            args,
+            harmony_source_root,
+            artifact_read_root,
+            None,
+        )
+    }
+
+    /// Render a manifest from current staged outputs. When a transaction has
+    /// already replaced a selected private target tree, the existing manifest
+    /// still has to be validated against the untouched public layout rather
+    /// than this current artifact read root.
+    fn render_manifest_with_read_roots_and_existing_manifest_evidence(
+        &self,
+        targets: &ExpandedTargets,
+        meta: &CargoPackageMetadata,
+        args: &BuildArgs,
+        harmony_source_root: Option<&Utf8Path>,
+        artifact_read_root: Option<&Utf8Path>,
+        existing_manifest_evidence_layout: Option<&ManagedLayout>,
+    ) -> Result<String> {
         let route_inputs = ManagedArtifactRouteInputs::from(args);
         let route_plan =
             self.managed_artifact_route_plan(targets, &route_inputs, artifact_read_root)?;
@@ -2984,7 +3087,7 @@ node_modules/\n\
             "artifacts": artifacts,
             "hostCrates": route_plan.host_crates.clone(),
         });
-        let manifest = self.merge_existing_manifest(manifest)?;
+        let manifest = self.merge_existing_manifest(manifest, existing_manifest_evidence_layout)?;
         let bytes = serde_json::to_vec(&manifest)?;
         let (_, parsed_manifest) = parse_exact_managed_artifact_manifest_with_routes(
             &bytes,
@@ -3114,6 +3217,7 @@ node_modules/\n\
     fn merge_existing_manifest(
         &self,
         mut manifest: serde_json::Value,
+        existing_manifest_evidence_layout: Option<&ManagedLayout>,
     ) -> Result<serde_json::Value> {
         if !self.manifest_path.exists() {
             return Ok(manifest);
@@ -3125,11 +3229,17 @@ node_modules/\n\
             existing_text.as_bytes(),
             None,
             None,
-            self.expected_routes.as_ref(),
+            // Validate the published document as a historical exact-v4
+            // artifact first. The current route plan is only relevant after
+            // this merge has selected the replacement target values.
+            None,
             false,
             "existing managed artifact manifest",
         )?;
-        if let Some(declared_plan) = self.manifest_declared_route_plan(&existing)? {
+        let existing_manifest_evidence_layout = existing_manifest_evidence_layout.unwrap_or(self);
+        if let Some(declared_plan) =
+            existing_manifest_evidence_layout.historical_manifest_declared_route_plan(&existing)?
+        {
             declared_plan.validate_manifest_routes(&existing, true)?;
         }
 
@@ -4357,11 +4467,12 @@ fn build_managed_package(
         }
         let meta = cargo_package_metadata(&public_args.manifest_path)?;
         private_layout
-            .emit_with_artifact_read_root(
+            .emit_with_artifact_read_root_and_existing_manifest_evidence(
                 &targets,
                 &meta,
                 &private_args,
                 Some(&private_layout.artifact_root),
+                Some(&layout),
             )
             .context("emitting complete private managed package manifest")?;
         validate_managed_manifest_candidate(&private_layout, &public_args.cargo_bin)?;

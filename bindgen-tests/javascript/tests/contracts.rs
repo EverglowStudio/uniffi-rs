@@ -250,15 +250,38 @@ crate-type = ["rlib"]
         !objects.contains("import") || !objects.contains("runtime.ts"),
         "common/objects.ts has unused runtime import (no objects in this fixture):\n{objects}"
     );
+    // 6. Empty generated category files still need an explicit ES-module
+    // marker. In particular, an error-free component must not import the
+    // runtime's UniffiError merely to make an otherwise comment-only module.
+    let errors =
+        std::fs::read_to_string(gen_dir.join("components/blockers/common/errors.ts")).unwrap();
+    let custom_types =
+        std::fs::read_to_string(gen_dir.join("components/blockers/common/custom-types.ts"))
+            .unwrap();
+    for (module, source) in [
+        ("custom-types.ts", custom_types.as_str()),
+        ("errors.ts", errors.as_str()),
+        ("objects.ts", objects.as_str()),
+    ] {
+        assert!(
+            source.lines().last() == Some("export {};"),
+            "empty {module} must end with exactly `export {{}};`:\n{source}"
+        );
+    }
+    assert!(
+        !errors.contains("UniffiError"),
+        "errors.ts must not import UniffiError without generated error classes:\n{errors}"
+    );
 
-    // 6. Optional: if tsc is available, actually compile in strict
-    //    mode. This is the real guardrail — the string assertions
-    //    above are only a faster early signal.
-    if let Some(tsc) = which_tool("tsc") {
-        let tsconfig = gen_dir.join("tsconfig.json");
-        std::fs::write(
-            &tsconfig,
-            r#"{
+    // 7. The final matrix injects an explicit TypeScript 5.9.3 compiler.
+    //    This is the real guardrail — the string assertions above are only a
+    //    faster early signal. Missing or broken compiler configuration fails
+    //    this required contract instead of silently skipping it.
+    let tsc = required_typescript_compiler();
+    let tsconfig = gen_dir.join("tsconfig.json");
+    std::fs::write(
+        &tsconfig,
+        r#"{
   "compilerOptions": {
     "target": "es2022",
     "module": "es2022",
@@ -267,7 +290,6 @@ crate-type = ["rlib"]
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noEmit": true,
-    "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "types": [],
     "lib": ["es2022", "dom"]
@@ -275,24 +297,15 @@ crate-type = ["rlib"]
   "include": ["components/blockers/common/*.ts"]
 }
 "#,
-        )
-        .unwrap();
-        let out = Command::new(&tsc)
-            .arg("--noEmit")
-            .arg("-p")
-            .arg(tsconfig.as_str())
-            .output()
-            .expect("failed to invoke tsc");
-        if !out.status.success() {
-            panic!(
-                "tsc --strict failed on generated tree:\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr),
-            );
-        }
-    } else {
-        eprintln!("note: tsc not available, skipping strict TS compile check");
-    }
+    )
+    .unwrap();
+    let out = run_required_typescript_check(&tsc, tsconfig.as_std_path());
+    assert!(
+        out.status.success(),
+        "required TypeScript 5.9.3 --strict check failed on generated tree:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
 }
 
 #[test]
@@ -1305,36 +1318,15 @@ fn js_async_iterable_stream_stub_contract() {
             "common/api.ts retained removed stream/backend surface {removed}:\n{api}"
         );
     }
-    // This fixture contains real output-stream bindings.  The local type
-    // import is required in addition to the public re-export above, and a
-    // strict compiler must be able to resolve the stream return annotations.
-    // TypeScript 4.x reports only TS2691 for this repository's deliberate
-    // `.ts` specifiers. TypeScript 5+ supports that form directly; in both
-    // cases every actual type error must still fail this regression.
-    if let Some(tsc) = which_tool("tsc") {
-        let version = Command::new(&tsc)
-            .arg("--version")
-            .output()
-            .expect("failed to query tsc version");
-        assert!(
-            version.status.success(),
-            "tsc --version failed for generated output-stream typecheck:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&version.stdout),
-            String::from_utf8_lossy(&version.stderr),
-        );
-        let supports_ts_extensions = String::from_utf8_lossy(&version.stdout)
-            .split_whitespace()
-            .find_map(|word| {
-                word.split('.')
-                    .next()
-                    .and_then(|major| major.parse::<u32>().ok())
-            })
-            .is_some_and(|major| major >= 5);
-        let tsconfig = out_dir.join("tsconfig.json");
-        std::fs::write(
-            &tsconfig,
-            if supports_ts_extensions {
-                r#"{
+    // This fixture contains real output-stream bindings. The local type import
+    // is required in addition to the public re-export above, and the injected
+    // TypeScript 5.9.3 compiler must resolve the stream return annotations
+    // with strict unused-local/parameter checking enabled.
+    let tsc = required_typescript_compiler();
+    let tsconfig = out_dir.join("tsconfig.json");
+    std::fs::write(
+        &tsconfig,
+        r#"{
   "compilerOptions": {
     "target": "es2022",
     "module": "es2022",
@@ -1344,64 +1336,21 @@ fn js_async_iterable_stream_stub_contract() {
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noEmit": true,
-    "skipLibCheck": true,
     "types": [],
     "lib": ["es2022", "dom"]
   },
   "include": ["components/stream_core/common/*.ts"]
 }
-"#
-            } else {
-                r#"{
-  "compilerOptions": {
-    "target": "es2022",
-    "module": "es2022",
-    "moduleResolution": "node",
-    "strict": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "noEmit": true,
-    "skipLibCheck": true,
-    "types": [],
-    "lib": ["es2022", "dom"]
-  },
-  "include": ["components/stream_core/common/*.ts"]
-}
-"#
-            },
-        )
-        .unwrap();
-        let output = Command::new(&tsc)
-            .arg("--noEmit")
-            .arg("-p")
-            .arg(tsconfig.as_str())
-            .output()
-            .expect("failed to invoke tsc for generated stream tree");
-        let diagnostics = format!(
-            "stdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        let unexpected = diagnostics
-            .lines()
-            .filter(|line| {
-                line.contains("error TS") && (supports_ts_extensions || !line.contains("TS2691"))
-            })
-            .collect::<Vec<_>>();
-        let has_ts2691 = diagnostics
-            .lines()
-            .any(|line| line.contains("error TS2691"));
-        assert!(
-            output.status.success() || (!supports_ts_extensions && has_ts2691),
-            "tsc --strict failed without the sole TypeScript 4.x .ts-specifier diagnostic:\n{diagnostics}"
-        );
-        assert!(
-            unexpected.is_empty(),
-            "tsc --strict failed on generated output-stream tree:\n{diagnostics}"
-        );
-    } else {
-        eprintln!("note: tsc not available, skipping strict output-stream typecheck");
-    }
+"#,
+    )
+    .unwrap();
+    let output = run_required_typescript_check(&tsc, tsconfig.as_std_path());
+    assert!(
+        output.status.success(),
+        "required TypeScript 5.9.3 --strict check failed on generated output-stream tree:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     let backend =
         std::fs::read_to_string(out_dir.join("components/stream_core/node/backend-napi.ts"))
             .unwrap();

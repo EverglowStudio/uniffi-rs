@@ -4015,7 +4015,10 @@ fn validates_device_type_overrides() {
         resolve_device_types(&["tv".into(), "tv".into(), "wearable".into()]).unwrap(),
         vec!["tv", "wearable"]
     );
-    assert!(resolve_device_types(&["default".into()]).is_err());
+    assert_eq!(
+        resolve_device_types(&["default".into()]).unwrap(),
+        vec!["default"]
+    );
     assert!(resolve_device_types(&["unknown".into()]).is_err());
 }
 
@@ -4547,15 +4550,15 @@ fn rejects_noncanonical_ohos_type_kind_and_type_parameters() {
         ),
         (
             r#"type_def:{"kind":"interface","name":"UniffiInputStream","def":"value: string","typeParameters":[]}"#,
-            "exact typeParameters",
+            "no owning facade contract",
         ),
         (
             r#"type_def:{"kind":"interface","name":"UniffiInputStream","def":"value: string","typeParameters":["T","U"]}"#,
-            "exact typeParameters",
+            "no owning facade contract",
         ),
         (
             r#"type_def:{"kind":"interface","name":"UniffiInputStream","def":"value: string","typeParameters":["T","T"]}"#,
-            "exact typeParameters",
+            "no owning facade contract",
         ),
         (
             r#"type_def:{"kind":"interface","name":"OtherGeneric","def":"value: string","typeParameters":["T"]}"#,
@@ -4803,6 +4806,74 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
         input_streams: vec![input],
     }];
     (defs, contracts)
+}
+
+/// The rendering characterization fixture intentionally retains short raw
+/// names so it can exercise the legacy compatibility projection directly.
+/// Schema parsing, however, models the emitted sidecar and therefore needs
+/// the component-prefixed native bridge names.
+fn test_harmony_stream_contract_for_schema() -> HarmonyFacadeContract {
+    fn prefix_input_source_next_type(
+        descriptor: &mut HarmonyTypeDescriptor,
+        native_export_prefix: &str,
+    ) {
+        match descriptor {
+            HarmonyTypeDescriptor::InputSource { suffix, next_type } => {
+                *next_type =
+                    uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_next_type_for_prefix(
+                        native_export_prefix,
+                        suffix,
+                    );
+            }
+            HarmonyTypeDescriptor::Optional { inner }
+            | HarmonyTypeDescriptor::Sequence { inner }
+            | HarmonyTypeDescriptor::Set { inner } => {
+                prefix_input_source_next_type(inner, native_export_prefix);
+            }
+            HarmonyTypeDescriptor::Number
+            | HarmonyTypeDescriptor::Bigint
+            | HarmonyTypeDescriptor::Boolean
+            | HarmonyTypeDescriptor::String
+            | HarmonyTypeDescriptor::ArrayBuffer
+            | HarmonyTypeDescriptor::Named { .. } => {}
+        }
+    }
+
+    let (_, mut contracts) = test_harmony_stream_contract();
+    let mut contract = contracts
+        .pop()
+        .expect("test harmony stream fixture must have one contract");
+    assert!(contracts.is_empty());
+    let native_export_prefix = contract.native_export_prefix.clone();
+    for output in &mut contract.output_streams {
+        let short_name = output
+            .stream_factory
+            .strip_suffix("Stream")
+            .expect("test output stream factory must end in Stream");
+        let raw = uniffi_bindgen_javascript::flavors::napi::ohos_raw_output_stream_names_for_prefix(
+            &native_export_prefix,
+            short_name,
+        );
+        output.function = raw.function;
+        output.next_function = raw.next_function;
+        output.cancel_function = raw.cancel_function;
+        output.step_type = raw.step_type;
+        prefix_input_source_next_type(&mut output.item_type, &native_export_prefix);
+        prefix_input_source_next_type(&mut output.error_type, &native_export_prefix);
+        for argument in &mut output.arguments {
+            prefix_input_source_next_type(&mut argument.r#type, &native_export_prefix);
+        }
+    }
+    for input in &mut contract.input_streams {
+        input.next_type =
+            uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_next_type_for_prefix(
+                &native_export_prefix,
+                &input.suffix,
+            );
+        prefix_input_source_next_type(&mut input.item_type, &native_export_prefix);
+        prefix_input_source_next_type(&mut input.error_type, &native_export_prefix);
+    }
+    contract
 }
 
 #[test]
@@ -5387,12 +5458,12 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
 
 #[test]
 fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions() {
-    let (_, contracts) = test_harmony_stream_contract();
+    let contract = test_harmony_stream_contract_for_schema();
     let parse = |value: &Value| {
         let bytes = serde_json::to_vec(value).unwrap();
         parse_harmony_facade_contract(&bytes, Utf8Path::new("contract.json"))
     };
-    let mut legacy_v3 = serde_json::to_value(&contracts[0]).unwrap();
+    let mut legacy_v3 = serde_json::to_value(&contract).unwrap();
     legacy_v3["facadeContractSchemaVersion"] = Value::from(3);
     let legacy_output = legacy_v3["outputStreams"][0].as_object_mut().unwrap();
     let step_type = legacy_output.remove("stepType").unwrap();
@@ -5411,7 +5482,7 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
         "legacy v3 must fail before v4 shape parsing: {error}"
     );
 
-    let mut non_integer_version = serde_json::to_value(&contracts[0]).unwrap();
+    let mut non_integer_version = serde_json::to_value(&contract).unwrap();
     non_integer_version["facadeContractSchemaVersion"] = Value::String("4".into());
     let error = format!("{:#}", parse(&non_integer_version).unwrap_err());
     assert!(
@@ -5419,7 +5490,7 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
         "{error}"
     );
 
-    let mut generic_schema_version = serde_json::to_value(&contracts[0]).unwrap();
+    let mut generic_schema_version = serde_json::to_value(&contract).unwrap();
     generic_schema_version
         .as_object_mut()
         .unwrap()
@@ -5431,7 +5502,7 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
         "{error}"
     );
 
-    let mut missing_v4_field = serde_json::to_value(&contracts[0]).unwrap();
+    let mut missing_v4_field = serde_json::to_value(&contract).unwrap();
     missing_v4_field["outputStreams"][0]
         .as_object_mut()
         .unwrap()
@@ -5439,7 +5510,7 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
     let error = format!("{:#}", parse(&missing_v4_field).unwrap_err());
     assert!(error.contains("missing field"), "{error}");
 
-    let mut unknown = serde_json::to_value(&contracts[0]).unwrap();
+    let mut unknown = serde_json::to_value(&contract).unwrap();
     unknown
         .as_object_mut()
         .unwrap()
@@ -5447,12 +5518,12 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
     let error = format!("{:#}", parse(&unknown).unwrap_err());
     assert!(error.contains("unknown field"), "{error}");
 
-    let mut malicious = serde_json::to_value(&contracts[0]).unwrap();
+    let mut malicious = serde_json::to_value(&contract).unwrap();
     malicious["inputStreams"][0]["suffix"] = Value::String("Bad;Injected".into());
     let error = format!("{:#}", parse(&malicious).unwrap_err());
     assert!(error.contains("invalid generated identifier"), "{error}");
 
-    let mut malformed_type = serde_json::to_value(&contracts[0]).unwrap();
+    let mut malformed_type = serde_json::to_value(&contract).unwrap();
     malformed_type["outputStreams"][0]["itemType"]["kind"] =
         Value::String("recordIndexSignature".into());
     let error = format!("{:#}", parse(&malformed_type).unwrap_err());
@@ -5668,17 +5739,16 @@ fn test_host_facade_bundle() -> HostFacadeBundle {
         contract_sha256: contract_sha256.clone(),
         identity_export,
     }];
-    let host_identity = serde_json::json!({
-        "packageName": "cache-host",
-        "libTarget": "cache_host",
-        "components": components,
-    });
     let mut bundle = HostFacadeBundle {
         host_bundle_schema_version: HOST_BUNDLE_SCHEMA_VERSION,
         fingerprint: String::new(),
         package_name: "cache-host".into(),
         lib_target: "cache_host".into(),
-        host_composite_identity: sha256_bytes(&serde_json::to_vec(&host_identity).unwrap()),
+        host_composite_identity: test_host_composite_identity(
+            "cache-host",
+            "cache_host",
+            &components,
+        ),
         components,
         contracts: vec![HostFacadeBundleEntry {
             file: "cache_fixture.ohos-facade.json".into(),
@@ -5694,6 +5764,311 @@ fn test_host_facade_bundle() -> HostFacadeBundle {
     };
     bundle.fingerprint = bundle.computed_fingerprint().unwrap();
     bundle
+}
+
+fn test_host_composite_identity(
+    package_name: &str,
+    lib_target: &str,
+    components: &[HostFacadeComponentIdentity],
+) -> String {
+    uniffi_bindgen_javascript::host_crates::composite_host_identity(
+        package_name,
+        lib_target,
+        &components
+            .iter()
+            .map(|component| {
+                (
+                    component.component.clone(),
+                    component.namespace.clone(),
+                    component.native_export_prefix.clone(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+fn test_input_stream_host_facade_bundle() -> HostFacadeBundle {
+    let component = "input_fixture";
+    let namespace = "input_fixture";
+    let native_export_prefix =
+        uniffi_bindgen::interface::native_export_prefix_for_component(component);
+    let canonical = "input-fixture-number-string";
+    let fingerprint = stable_facade_fingerprint(canonical);
+    let suffix = format!("NumberStringFingerprint{fingerprint}");
+    let input = HarmonyInputStreamContract {
+        suffix: suffix.clone(),
+        canonical: canonical.into(),
+        fingerprint,
+        item_type: HarmonyTypeDescriptor::Number,
+        error_type: HarmonyTypeDescriptor::String,
+        next_type: uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_next_type_for_prefix(
+            &native_export_prefix,
+            &suffix,
+        ),
+        writer_class: format!("{suffix}InputWriter"),
+        source_class: format!("{suffix}InputSource"),
+        channel_class: format!("{suffix}InputChannel"),
+        factory: format!("create{suffix}InputChannel"),
+    };
+    let contract = HarmonyFacadeContract {
+        facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+        component: component.into(),
+        namespace: namespace.into(),
+        native_export_prefix: native_export_prefix.clone(),
+        output_streams: Vec::new(),
+        input_streams: vec![input.clone()],
+    };
+    let contract_content = serde_json::to_string(&contract).unwrap();
+    let contract_sha256 = sha256_bytes(contract_content.as_bytes());
+    let identity_export = bridge_identity_export(&native_export_prefix, &contract_sha256);
+    let raw_input_stream =
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_stream_type_for_prefix(
+            &native_export_prefix,
+        );
+    let type_def = |kind: &str, name: &str, definition: &str, type_parameters: Value| {
+        format!(
+            "type_def:{}\n",
+            serde_json::to_string(&serde_json::json!({
+                "kind": kind,
+                "name": name,
+                "def": definition,
+                "typeParameters": type_parameters,
+            }))
+            .unwrap()
+        )
+    };
+    let sidecar_content = [
+        type_def(
+            "interface",
+            &raw_input_stream,
+            "handle: number;\nnext(error: Error | null, handle: number): Promise<T>;\ncancel(error: Error | null, handle: number): void;",
+            serde_json::json!(["T"]),
+        ),
+        type_def(
+            "interface",
+            &input.next_type,
+            "ok: boolean\ndone?: boolean\nvalue?: number\nerror?: string",
+            serde_json::json!([]),
+        ),
+        type_def(
+            "fn",
+            &identity_export,
+            &format!("function {identity_export}(): string"),
+            serde_json::json!([]),
+        ),
+    ]
+    .concat();
+    let components = vec![HostFacadeComponentIdentity {
+        component: component.into(),
+        namespace: namespace.into(),
+        native_export_prefix,
+        contract_file: format!("{component}.ohos-facade.json"),
+        contract_sha256: contract_sha256.clone(),
+        identity_export,
+    }];
+    let mut bundle = HostFacadeBundle {
+        host_bundle_schema_version: HOST_BUNDLE_SCHEMA_VERSION,
+        fingerprint: String::new(),
+        package_name: "input-host".into(),
+        lib_target: "input_host".into(),
+        host_composite_identity: test_host_composite_identity(
+            "input-host",
+            "input_host",
+            &components,
+        ),
+        components,
+        contracts: vec![HostFacadeBundleEntry {
+            file: format!("{component}.ohos-facade.json"),
+            sha256: contract_sha256,
+            content: contract_content,
+        }],
+        type_sidecars: vec![HostFacadeBundleEntry {
+            file: format!("{component}.ohos-extra-types.d.ts"),
+            sha256: sha256_bytes(sidecar_content.as_bytes()),
+            content: sidecar_content,
+        }],
+        mode: FacadeBundleMode::Required,
+    };
+    bundle.fingerprint = bundle.computed_fingerprint().unwrap();
+    bundle
+}
+
+fn replace_test_bundle_sidecar(bundle: &mut HostFacadeBundle, sidecar_content: String) {
+    bundle.type_sidecars[0].content = sidecar_content;
+    bundle.type_sidecars[0].sha256 = sha256_bytes(bundle.type_sidecars[0].content.as_bytes());
+    bundle.fingerprint = bundle.computed_fingerprint().unwrap();
+}
+
+#[test]
+fn input_stream_sidecar_generics_require_the_exact_owning_contract_name() {
+    let root = temp_test_dir("uniffi-ohos-input-stream-sidecar-contract");
+    let bundle_path = root.join("bundle.json");
+    let valid = test_input_stream_host_facade_bundle();
+    let native_export_prefix = valid.components[0].native_export_prefix.clone();
+    let raw_input_stream =
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_stream_type_for_prefix(
+            &native_export_prefix,
+        );
+    let valid_sidecar = valid.type_sidecars[0].content.clone();
+    let raw_line = valid_sidecar
+        .lines()
+        .find(|line| line.contains(&format!("\"name\":\"{raw_input_stream}\"")))
+        .unwrap()
+        .to_string();
+
+    write_required_host_facade_bundle(&bundle_path, &valid);
+    load_host_facade_bundle(&FacadeMode::Required(bundle_path.clone())).unwrap();
+
+    let cases = [
+        (
+            "bare legacy name",
+            valid_sidecar.replacen(&raw_input_stream, "UniffiInputStream", 1),
+            "only raw input-stream type",
+        ),
+        (
+            "wrong component prefix",
+            valid_sidecar.replacen(&raw_input_stream, "ffi_other_UniffiInputStream", 1),
+            "only raw input-stream type",
+        ),
+        (
+            "arbitrary generic",
+            valid_sidecar.replacen(&raw_input_stream, "OtherGeneric", 1),
+            "only raw input-stream type",
+        ),
+        (
+            "wrong expected kind",
+            valid_sidecar.replacen(
+                &format!("\"kind\":\"interface\",\"name\":\"{raw_input_stream}\""),
+                &format!("\"kind\":\"type\",\"name\":\"{raw_input_stream}\""),
+                1,
+            ),
+            "must be an interface",
+        ),
+        (
+            "wrong expected parameters",
+            valid_sidecar.replacen(
+                "\"typeParameters\":[\"T\"]",
+                "\"typeParameters\":[\"T\",\"U\"]",
+                1,
+            ),
+            "exact typeParameters",
+        ),
+        (
+            "missing expected generic",
+            valid_sidecar
+                .lines()
+                .filter(|line| line != &raw_line)
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+            "must declare exactly one raw input-stream type",
+        ),
+        (
+            "duplicate expected generic",
+            format!("{valid_sidecar}{raw_line}\n"),
+            "must declare exactly one raw input-stream type",
+        ),
+    ];
+    for (label, sidecar, expected) in cases {
+        let mut bundle = valid.clone();
+        replace_test_bundle_sidecar(&mut bundle, sidecar);
+        write_required_host_facade_bundle(&bundle_path, &bundle);
+        let error = load_host_facade_bundle(&FacadeMode::Required(bundle_path.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{label}: {error}");
+    }
+
+    let mut no_input = test_host_facade_bundle();
+    let no_input_raw =
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_stream_type_for_prefix(
+            &no_input.components[0].native_export_prefix,
+        );
+    let no_input_sidecar = format!(
+        "{}type_def:{{\"kind\":\"interface\",\"name\":\"{no_input_raw}\",\"def\":\"handle: number\",\"typeParameters\":[\"T\"]}}\n",
+        no_input.type_sidecars[0].content
+    );
+    replace_test_bundle_sidecar(&mut no_input, no_input_sidecar);
+    write_required_host_facade_bundle(&bundle_path, &no_input);
+    let error = load_host_facade_bundle(&FacadeMode::Required(bundle_path.clone()))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("declares no inputStreams"), "{error}");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn input_stream_sidecar_contract_is_revalidated_for_cache_and_declarations() {
+    let root = temp_test_dir("uniffi-ohos-input-stream-sidecar-cache");
+    let target = root.join("target");
+    let package = test_host_package("input-host", "1.0.0", "input_host");
+    let bundle = test_input_stream_host_facade_bundle();
+
+    {
+        let mut transaction = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
+        write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
+        transaction.commit().unwrap();
+    }
+    let cache = test_type_cache_path(&target, &package, &bundle);
+    let inventory = load_facade_type_inventory(&cache).unwrap();
+    let owned = collect_owned_type_defs(&cache, &inventory).unwrap();
+    assert_eq!(owned.len(), 1);
+    let valid_dist = root.join("valid-dist");
+    std::fs::create_dir_all(&valid_dist).unwrap();
+    emit_index_d_ts(&valid_dist, &cache, "input_host").unwrap();
+    assert!(valid_dist.join("Index.d.ets").exists());
+
+    // `InvocationTypeCache` itself only installs checksummed inputs.  The
+    // cache inventory writer must still bind a sidecar generic to the exact
+    // installed contract before it records the cache as consumable.
+    let raw_input_stream =
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_stream_type_for_prefix(
+            &bundle.components[0].native_export_prefix,
+        );
+    let mut invalid_bundle = bundle.clone();
+    let invalid_sidecar =
+        invalid_bundle.type_sidecars[0]
+            .content
+            .replacen(&raw_input_stream, "UniffiInputStream", 1);
+    replace_test_bundle_sidecar(&mut invalid_bundle, invalid_sidecar);
+    let invalid_target = root.join("invalid-target");
+    let transaction =
+        InvocationTypeCache::new(&invalid_target, &package, true, &invalid_bundle).unwrap();
+    let error = write_facade_type_inventory(transaction.work_dir(), &invalid_bundle)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("only raw input-stream type"), "{error}");
+    drop(transaction);
+
+    // Model a cache that was altered after it became current, while keeping
+    // the inventory's declared sidecar checksum internally consistent.  The
+    // declaration emitter must parse the exact associated contract again,
+    // rather than trusting the cache filename or generic declaration alone.
+    let sidecar_path = cache.join(&bundle.type_sidecars[0].file);
+    let invalid_sidecar = bundle.type_sidecars[0].content.replacen(
+        &raw_input_stream,
+        "ffi_other_UniffiInputStream",
+        1,
+    );
+    std::fs::write(&sidecar_path, &invalid_sidecar).unwrap();
+    let inventory_path = cache.join(FACADE_INVENTORY_FILE);
+    let mut inventory_value: Value =
+        serde_json::from_slice(&std::fs::read(&inventory_path).unwrap()).unwrap();
+    inventory_value["typeDefinitions"][0]["sha256"] =
+        Value::String(sha256_bytes(invalid_sidecar.as_bytes()));
+    std::fs::write(
+        &inventory_path,
+        serde_json::to_vec(&inventory_value).unwrap(),
+    )
+    .unwrap();
+    let invalid_dist = root.join("invalid-dist");
+    std::fs::create_dir_all(&invalid_dist).unwrap();
+    let error = emit_index_d_ts(&invalid_dist, &cache, "input_host")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("only raw input-stream type"), "{error}");
+    assert!(!invalid_dist.join("Index.d.ets").exists());
+    std::fs::remove_dir_all(root).ok();
 }
 
 fn write_required_host_facade_bundle(path: &Utf8Path, bundle: &HostFacadeBundle) {
@@ -5783,17 +6158,16 @@ fn two_component_prefixed_bundle_loads_and_namespaces_same_short_exports() {
     let (alpha_identity, alpha_contract, alpha_sidecar) = component("a", "alpha");
     let (beta_identity, beta_contract, beta_sidecar) = component("a_b", "beta");
     let components = vec![alpha_identity, beta_identity];
-    let host_identity = serde_json::json!({
-        "packageName": "composite-host",
-        "libTarget": "composite_host",
-        "components": components,
-    });
     let mut bundle = HostFacadeBundle {
         host_bundle_schema_version: HOST_BUNDLE_SCHEMA_VERSION,
         fingerprint: String::new(),
         package_name: "composite-host".into(),
         lib_target: "composite_host".into(),
-        host_composite_identity: sha256_bytes(&serde_json::to_vec(&host_identity).unwrap()),
+        host_composite_identity: test_host_composite_identity(
+            "composite-host",
+            "composite_host",
+            &components,
+        ),
         components,
         contracts: vec![alpha_contract, beta_contract],
         type_sidecars: vec![alpha_sidecar, beta_sidecar],
@@ -6014,17 +6388,16 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
             identity_export: owner_identity_export,
         },
     ];
-    let host_identity = serde_json::json!({
-        "packageName": "owner-host",
-        "libTarget": "owner_host",
-        "components": components,
-    });
     let mut bundle = HostFacadeBundle {
         host_bundle_schema_version: HOST_BUNDLE_SCHEMA_VERSION,
         fingerprint: String::new(),
         package_name: "owner-host".into(),
         lib_target: "owner_host".into(),
-        host_composite_identity: sha256_bytes(&serde_json::to_vec(&host_identity).unwrap()),
+        host_composite_identity: test_host_composite_identity(
+            "owner-host",
+            "owner_host",
+            &components,
+        ),
         components,
         contracts: vec![
             HostFacadeBundleEntry {
@@ -6148,7 +6521,7 @@ fn host_bundle_version_checksum_and_identity_rejections_do_not_mutate_cache_or_o
     reject(
         "identity",
         std::fs::read(&bundle_path).unwrap(),
-        "invalid nativeExportPrefix",
+        "does not exactly match its contract identity",
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -8628,6 +9001,7 @@ fn copies_fake_dist_into_package_libs() {
     let libs = root.join("package/libs");
     std::fs::create_dir_all(dist.join("arm64-v8a")).unwrap();
     std::fs::create_dir_all(dist.join("x86_64")).unwrap();
+    std::fs::create_dir_all(dist.join("component-facades")).unwrap();
     std::fs::write(
         dist.join("native-facade.d.ts"),
         "export declare const add: (a: number, b: number) => number;\n",
@@ -8635,11 +9009,63 @@ fn copies_fake_dist_into_package_libs() {
     .unwrap();
     std::fs::write(dist.join("arm64-v8a/libuni_core_ohos.so"), "arm").unwrap();
     std::fs::write(dist.join("x86_64/libuni_core_ohos.so"), "x64").unwrap();
+    std::fs::write(
+        dist.join("component-facades/demo.ets"),
+        "export const demo = 1;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dist.join("component-facades/demo.d.ets"),
+        "export declare const demo: number;\n",
+    )
+    .unwrap();
 
     copy_dist_to_package_libs(&dist, &libs, false).unwrap();
     assert!(libs.join("index.d.ts").exists());
     assert!(libs.join("arm64-v8a/libuni_core_ohos.so").exists());
     assert!(libs.join("x86_64/libuni_core_ohos.so").exists());
+    assert!(
+        !libs.join("component-facades").exists(),
+        "ArkTS component sources must not enter the native ABI inventory"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn component_facade_declarations_use_only_arkts_d_ets_through_staging() {
+    let root = temp_test_dir("uniffi-ohos-component-declaration-extension");
+    let dist = root.join("dist");
+    let package = root.join("package");
+    let modules = vec![FacadeComponentModule {
+        namespace: "fixture".into(),
+        source: "export const ping = 1;\n".into(),
+        declarations: "export declare const ping: number;\n".into(),
+    }];
+
+    write_component_facade_modules(&dist, &modules).unwrap();
+    let generated = dist.join("component-facades");
+    assert!(generated.join("fixture.ets").is_file());
+    assert!(generated.join("fixture.d.ets").is_file());
+    assert!(
+        !generated.join("fixture.d.ts").exists(),
+        "component declarations must not emit a legacy .d.ts compatibility copy"
+    );
+
+    stage_component_facade_modules(&dist, &package).unwrap();
+    let staged = package.join("src/main/ets/components");
+    assert_eq!(
+        std::fs::read_to_string(staged.join("fixture.ets")).unwrap(),
+        modules[0].source
+    );
+    assert_eq!(
+        std::fs::read_to_string(staged.join("fixture.d.ets")).unwrap(),
+        modules[0].declarations
+    );
+    assert!(
+        !staged.join("fixture.d.ts").exists(),
+        "staging must not synthesize a legacy .d.ts component declaration"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

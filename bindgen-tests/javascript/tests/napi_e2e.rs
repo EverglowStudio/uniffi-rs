@@ -28,6 +28,15 @@ fn install_composite_addon(
     addon
 }
 
+/// Raw N-API addons intentionally expose only canonical component-prefixed
+/// exports.  Keep direct-addon tests on the same source of truth as the
+/// generated Node/Electron name map rather than accidentally relying on
+/// napi-rs's old lower-camel-case default names.
+fn canonical_raw_napi_export(component: &str, dispatch_key: &str) -> String {
+    let prefix = uniffi_bindgen::interface::native_export_prefix_for_component(component);
+    uniffi_bindgen_javascript::native_exports::native_export_name_for_prefix(&prefix, dispatch_key)
+}
+
 #[test]
 fn host_crates_napi_raw_addon_is_bigint_native() {
     let Some(node) = which_node() else {
@@ -60,6 +69,10 @@ fn host_crates_napi_raw_addon_is_bigint_native() {
     assert!(dylib.exists(), "expected raw cdylib at {}", dylib.display());
     let addon = tmp.path().join("napi_compat.node");
     std::fs::copy(&dylib, &addon).unwrap();
+    let roundtrip_u64 = canonical_raw_napi_export("napi_compat", "roundtrip_u64");
+    let roundtrip_i64 = canonical_raw_napi_export("napi_compat", "roundtrip_i64");
+    let add_u64 = canonical_raw_napi_export("napi_compat", "add_u64");
+    let async_roundtrip_u64 = canonical_raw_napi_export("napi_compat", "async_roundtrip_u64");
 
     let driver = tmp.path().join("raw-addon-bigint.cjs");
     std::fs::write(
@@ -67,6 +80,23 @@ fn host_crates_napi_raw_addon_is_bigint_native() {
         format!(
             r#"
 const addon = require({addon:?});
+
+function rawExport(name) {{
+  const value = addon[name];
+  if (typeof value !== "function") {{
+    throw new Error(`missing canonical raw N-API export ${{name}}; available=${{Object.keys(addon).join(",")}}`);
+  }}
+  return value;
+}}
+
+if ("roundtripU64" in addon) {{
+  throw new Error("legacy raw N-API alias roundtripU64 must not exist");
+}}
+
+const roundtripU64 = rawExport({roundtrip_u64:?});
+const roundtripI64 = rawExport({roundtrip_i64:?});
+const addU64 = rawExport({add_u64:?});
+const asyncRoundtripU64 = rawExport({async_roundtrip_u64:?});
 
 function expectBigint(label, value) {{
   if (typeof value !== "bigint") {{
@@ -95,23 +125,23 @@ const u64Max = 18446744073709551615n;
 const i64Min = -9223372036854775808n;
 const i64Max = 9223372036854775807n;
 
-if (expectBigint("roundtripU64", addon.roundtripU64(u64Max)) !== u64Max) {{
+if (expectBigint("roundtripU64", roundtripU64(u64Max)) !== u64Max) {{
   throw new Error("roundtripU64 failed");
 }}
-if (expectBigint("roundtripI64(min)", addon.roundtripI64(i64Min)) !== i64Min) {{
+if (expectBigint("roundtripI64(min)", roundtripI64(i64Min)) !== i64Min) {{
   throw new Error("roundtripI64(min) failed");
 }}
-if (expectBigint("roundtripI64(max)", addon.roundtripI64(i64Max)) !== i64Max) {{
+if (expectBigint("roundtripI64(max)", roundtripI64(i64Max)) !== i64Max) {{
   throw new Error("roundtripI64(max) failed");
 }}
-if (expectBigint("addU64", addon.addU64(9007199254740993n, 2n)) !== 9007199254740995n) {{
+if (expectBigint("addU64", addU64(9007199254740993n, 2n)) !== 9007199254740995n) {{
   throw new Error("addU64 above safe integer failed");
 }}
 
-expectThrow("u64 overflow", () => addon.roundtripU64(18446744073709551616n));
-expectThrow("i64 overflow", () => addon.roundtripI64(9223372036854775808n));
+expectThrow("u64 overflow", () => roundtripU64(18446744073709551616n));
+expectThrow("i64 overflow", () => roundtripI64(9223372036854775808n));
 
-Promise.resolve(addon.asyncRoundtripU64(u64Max)).then((value) => {{
+Promise.resolve(asyncRoundtripU64(u64Max)).then((value) => {{
   if (expectBigint("asyncRoundtripU64", value) !== u64Max) {{
     throw new Error("asyncRoundtripU64 failed");
   }}
@@ -121,6 +151,10 @@ Promise.resolve(addon.asyncRoundtripU64(u64Max)).then((value) => {{
 }});
 "#,
             addon = addon.display().to_string(),
+            roundtrip_u64 = roundtrip_u64,
+            roundtrip_i64 = roundtrip_i64,
+            add_u64 = add_u64,
+            async_roundtrip_u64 = async_roundtrip_u64,
         ),
     )
     .unwrap();
@@ -300,6 +334,74 @@ console.log("ok");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("ok"),
         "napi stream driver did not print ok"
+    );
+}
+
+#[test]
+fn final_runtime_matrix_napi_executes_tagged_steps_typed_payloads_and_native_drops() {
+    let node = locate_node_with_strip_types().expect(
+        "final N-API runtime matrix requires Node.js 22.6+ with --experimental-strip-types",
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = build_runtime_matrix_fixture(tmp.path());
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    generate_runtime_matrix_tree(
+        &fixture,
+        &out_dir,
+        Some(host_dir.clone()),
+        vec![FlavorTarget::Napi],
+    );
+
+    let manifest = host_dir.join("napi/Cargo.toml");
+    let target_dir = tmp.path().join("target-napi-runtime-matrix");
+    let build = run_cargo_build(&manifest, &[], &target_dir)
+        .expect("final N-API runtime matrix requires cargo to build its host crate");
+    assert!(
+        build.status.success(),
+        "cargo build on final N-API runtime matrix host crate failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let package_name = "runtime-matrix-core";
+    let built_lib = target_dir
+        .join("debug")
+        .join(composite_host_cdylib_filename(package_name));
+    assert!(
+        built_lib.exists(),
+        "expected final N-API runtime matrix addon at {}",
+        built_lib.display()
+    );
+    install_composite_addon(out_dir.as_std_path(), &built_lib, package_name);
+    let host_target =
+        uniffi_bindgen_javascript::host_crates::composite_host_lib_target(package_name);
+    let driver = runtime_matrix_driver(
+        "./node/index.ts",
+        "",
+        &format!("require(\"./node/{host_target}.node\")"),
+        "type",
+        "",
+    );
+    std::fs::write(out_dir.join("runtime-matrix-driver.ts"), driver).unwrap();
+
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("runtime-matrix-driver.ts")
+        .current_dir(&out_dir)
+        .output()
+        .expect("failed to run final N-API runtime matrix driver");
+    assert!(
+        output.status.success(),
+        "final N-API runtime matrix driver failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "final N-API runtime matrix driver did not print ok"
     );
 }
 
@@ -856,9 +958,13 @@ exports.__state = state;
     .unwrap();
 
     let driver = generated.join("bigint-driver.ts");
-    std::fs::write(
-        &driver,
-        r#"
+    let raw_roundtrip_u64 = canonical_raw_napi_export("napi_compat", "roundtrip_u64");
+    let raw_roundtrip_i64 = canonical_raw_napi_export("napi_compat", "roundtrip_i64");
+    let raw_async_roundtrip_u64 = canonical_raw_napi_export("napi_compat", "async_roundtrip_u64");
+    let raw_counter_with_initial = canonical_raw_napi_export("napi_compat", "counter_with_initial");
+    let raw_counter_get = canonical_raw_napi_export("napi_compat", "counter_get");
+    let raw_slow_add = canonical_raw_napi_export("napi_compat", "slow_add");
+    let driver_source = r#"
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -867,6 +973,25 @@ const raw = require("./node/napi_compat_core_uniffi_js_host.node");
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
 }
+
+function rawExport(name: string): any {
+  const value = raw[name];
+  if (typeof value !== "function") {
+    throw new Error(`missing canonical raw N-API export ${name}; available=${Object.keys(raw).join(",")}`);
+  }
+  return value;
+}
+
+if ("roundtripU64" in raw) {
+  throw new Error("legacy raw N-API alias roundtripU64 must not exist");
+}
+
+const rawRoundtripU64 = rawExport("__UNIFFI_RAW_ROUNDTRIP_U64__");
+const rawRoundtripI64 = rawExport("__UNIFFI_RAW_ROUNDTRIP_I64__");
+const rawAsyncRoundtripU64 = rawExport("__UNIFFI_RAW_ASYNC_ROUNDTRIP_U64__");
+const rawCounterWithInitial = rawExport("__UNIFFI_RAW_COUNTER_WITH_INITIAL__");
+const rawCounterGet = rawExport("__UNIFFI_RAW_COUNTER_GET__");
+const rawSlowAdd = rawExport("__UNIFFI_RAW_SLOW_ADD__");
 
 function expectBigint(value: unknown, expected: bigint, label: string): void {
   assert(typeof value === "bigint", `${label}: expected bigint, got ${typeof value}`);
@@ -885,16 +1010,16 @@ function expectThrow(label: string, fn: () => unknown, re: RegExp): void {
   }
 }
 
-expectBigint(raw.roundtripU64(18446744073709551615n), 18446744073709551615n, "raw roundtripU64");
-expectBigint(raw.roundtripI64(9223372036854775807n), 9223372036854775807n, "raw roundtripI64 max");
-expectBigint(raw.roundtripI64(-9223372036854775808n), -9223372036854775808n, "raw roundtripI64 min");
-expectBigint(await raw.asyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "raw asyncRoundtripU64");
-const rawCounter = raw.counterWithInitial(3n);
-expectBigint(raw.counterGet(rawCounter), 3n, "raw counterGet");
-assert(await raw.slowAdd(20, 22, 300n) === 42, "raw slowAdd mixed args");
-expectThrow("raw u64 overflow", () => raw.roundtripU64(18446744073709551616n), /u64/i);
-expectThrow("raw i64 overflow", () => raw.roundtripI64(9223372036854775808n), /i64/i);
-expectThrow("raw i64 underflow", () => raw.roundtripI64(-9223372036854775809n), /i64/i);
+expectBigint(rawRoundtripU64(18446744073709551615n), 18446744073709551615n, "raw roundtripU64");
+expectBigint(rawRoundtripI64(9223372036854775807n), 9223372036854775807n, "raw roundtripI64 max");
+expectBigint(rawRoundtripI64(-9223372036854775808n), -9223372036854775808n, "raw roundtripI64 min");
+expectBigint(await rawAsyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "raw asyncRoundtripU64");
+const rawCounter = rawCounterWithInitial(3n);
+expectBigint(rawCounterGet(rawCounter), 3n, "raw counterGet");
+assert(await rawSlowAdd(20, 22, 300n) === 42, "raw slowAdd mixed args");
+expectThrow("raw u64 overflow", () => rawRoundtripU64(18446744073709551616n), /u64/i);
+expectThrow("raw i64 overflow", () => rawRoundtripI64(9223372036854775808n), /i64/i);
+expectThrow("raw i64 underflow", () => rawRoundtripI64(-9223372036854775809n), /i64/i);
 
 const nodeRoot = await import("./node/index.ts");
 const nodeApi = nodeRoot.napi_compat;
@@ -934,9 +1059,20 @@ assert(overflowRes.kind === "err", "electron overflow should error");
 assert(/u64/i.test(String(overflowRes.error?.message ?? "")), "electron overflow message");
 
 console.log("ok");
-"#,
+"#
+    .replace("__UNIFFI_RAW_ROUNDTRIP_U64__", &raw_roundtrip_u64)
+    .replace("__UNIFFI_RAW_ROUNDTRIP_I64__", &raw_roundtrip_i64)
+    .replace(
+        "__UNIFFI_RAW_ASYNC_ROUNDTRIP_U64__",
+        &raw_async_roundtrip_u64,
     )
-    .unwrap();
+    .replace(
+        "__UNIFFI_RAW_COUNTER_WITH_INITIAL__",
+        &raw_counter_with_initial,
+    )
+    .replace("__UNIFFI_RAW_COUNTER_GET__", &raw_counter_get)
+    .replace("__UNIFFI_RAW_SLOW_ADD__", &raw_slow_add);
+    std::fs::write(&driver, driver_source).unwrap();
 
     let output = Command::new(&node)
         .arg("--experimental-strip-types")
@@ -1633,10 +1769,22 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
         .find(|path| path.extension().is_some_and(|ext| ext == "rs"))
         .expect("generated node bridge should contain a Rust shim");
     let bridge = std::fs::read_to_string(bridge_path).unwrap();
+    let compact_bridge = bridge.split_whitespace().collect::<String>();
+    let callback_results = [
+        "UniffiCheckedWorkerCheckedVoidCallbackResult",
+        "UniffiCheckedWorkerCheckedValueCallbackResult",
+        "UniffiCheckedWorkerCheckedRecordCallbackResult",
+    ];
     assert!(
-        bridge.contains("__UniffiCheckedWorkerCheckedVoidCallbackResult")
-            && bridge.contains("napi::bindgen_prelude::Promise")
-            && bridge.contains(".call_async(Ok"),
+        callback_results
+            .iter()
+            .all(|result| compact_bridge.contains(result))
+            && compact_bridge.contains("napi::bindgen_prelude::Promise")
+            && compact_bridge
+                .matches("ThreadsafeFunction<bool,napi::bindgen_prelude::Promise<")
+                .count()
+                >= 3
+            && compact_bridge.matches(".call_async(Ok(").count() >= 6,
         "napi bridge should implement fallible async callback methods through TSFN Promise:\n{bridge}"
     );
     let preload = std::fs::read_to_string(
@@ -1816,6 +1964,12 @@ fn custom_types_surface_and_raw_napi_execute() {
         "napi bridge should use uniffi Lift/Lower for custom types:\n{bridge}"
     );
 
+    let normalize_email = canonical_raw_napi_export("custom_js_core", "normalize_email");
+    let normalize_contact = canonical_raw_napi_export("custom_js_core", "normalize_contact");
+    let normalize_many = canonical_raw_napi_export("custom_js_core", "normalize_many");
+    let format_email_with = canonical_raw_napi_export("custom_js_core", "format_email_with");
+    let format_contact_with = canonical_raw_napi_export("custom_js_core", "format_contact_with");
+
     let driver = tmp.path().join("raw-custom-addon.cjs");
     std::fs::write(
         &driver,
@@ -1823,30 +1977,48 @@ fn custom_types_surface_and_raw_napi_execute() {
             r#"
 const addon = require({addon:?});
 
+function rawExport(name) {{
+  const value = addon[name];
+  if (typeof value !== "function") {{
+    throw new Error(`missing canonical raw N-API export ${{name}}; available=${{Object.keys(addon).join(",")}}`);
+  }}
+  return value;
+}}
+
+if ("normalizeEmail" in addon) {{
+  throw new Error("legacy raw N-API alias normalizeEmail must not exist");
+}}
+
+const normalizeEmail = rawExport({normalize_email:?});
+const normalizeContact = rawExport({normalize_contact:?});
+const normalizeMany = rawExport({normalize_many:?});
+const formatEmailWith = rawExport({format_email_with:?});
+const formatContactWith = rawExport({format_contact_with:?});
+
 function eq(actual, expected, label) {{
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {{
     throw new Error(`${{label}}: ${{JSON.stringify(actual)}} !== ${{JSON.stringify(expected)}}`);
   }}
 }}
 
-eq(addon.normalizeEmail("  A@EXAMPLE.COM  "), "a@example.com", "normalizeEmail");
+eq(normalizeEmail("  A@EXAMPLE.COM  "), "a@example.com", "normalizeEmail");
 eq(
-  addon.normalizeContact({{ primary: " ROOT@EXAMPLE.COM ", aliases: [" Alias@One.Com ", "TWO@EXAMPLE.COM"] }}),
+  normalizeContact({{ primary: " ROOT@EXAMPLE.COM ", aliases: [" Alias@One.Com ", "TWO@EXAMPLE.COM"] }}),
   {{ primary: "root@example.com", aliases: ["alias@one.com", "two@example.com"] }},
   "normalizeContact",
 );
 eq(
-  addon.normalizeMany([" X@Y.COM ", "Z@Q.COM"]),
+  normalizeMany([" X@Y.COM ", "Z@Q.COM"]),
   ["x@y.com", "z@q.com"],
   "normalizeMany",
 );
 eq(
-  addon.formatEmailWith({{ formatEmail(value) {{ return `${{value.trim().toUpperCase()}}!`; }}, formatContact(value) {{ return value; }} }}, " ada@example.com "),
+  formatEmailWith({{ formatEmail(value) {{ return `${{value.trim().toUpperCase()}}!`; }}, formatContact(value) {{ return value; }} }}, " ada@example.com "),
   "ADA@EXAMPLE.COM!",
   "formatEmailWith",
 );
 eq(
-  addon.formatContactWith({{
+  formatContactWith({{
     formatEmail(value) {{ return value; }},
     formatContact(value) {{
       return {{
@@ -1861,7 +2033,12 @@ eq(
 
 console.log("ok");
 "#,
-            addon = addon.as_str()
+            addon = addon.as_str(),
+            normalize_email = normalize_email,
+            normalize_contact = normalize_contact,
+            normalize_many = normalize_many,
+            format_email_with = format_email_with,
+            format_contact_with = format_contact_with,
         ),
     )
     .unwrap();

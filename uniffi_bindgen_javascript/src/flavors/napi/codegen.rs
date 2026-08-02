@@ -21,6 +21,107 @@ pub fn render_napi_rust(ci: &ComponentInterface) -> Result<String> {
     render_rust(ci, NapiTarget::Node)
 }
 
+#[cfg(test)]
+mod direct_object_stream_tests {
+    use super::*;
+    use uniffi_meta::{FnMetadata, MetadataGroup, NamespaceMetadata, ObjectMetadata};
+
+    const MODULE_PATH: &str = "direct_object_stream_fixture";
+
+    fn direct_object() -> Type {
+        Type::Object {
+            module_path: MODULE_PATH.into(),
+            name: "StreamObject".into(),
+            imp: ObjectImpl::Struct,
+        }
+    }
+
+    fn fixture() -> ComponentInterface {
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: MODULE_PATH.into(),
+                name: MODULE_PATH.into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            ObjectMetadata {
+                module_path: MODULE_PATH.into(),
+                name: "StreamObject".into(),
+                orig_name: None,
+                remote: false,
+                imp: ObjectImpl::Struct,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            FnMetadata {
+                module_path: MODULE_PATH.into(),
+                name: "stream_objects".into(),
+                orig_name: None,
+                is_async: false,
+                inputs: vec![],
+                return_type: Some(Type::Stream {
+                    item_type: Box::new(direct_object()),
+                    error_type: Box::new(Type::String),
+                    is_send: true,
+                }),
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        ComponentInterface::from_metadata(group).expect("direct object stream fixture metadata")
+    }
+
+    #[test]
+    fn direct_rust_object_stream_items_use_the_existing_napi_class_bridge() {
+        let ci = fixture();
+        let rendered = render_napi_rust(&ci).expect("direct object stream codegen must succeed");
+        let compact = rendered.split_whitespace().collect::<String>();
+        assert!(
+            compact.contains("RustStreamRegistry<std::sync::Arc<"),
+            "direct object stream registry must retain an Arc core object: {rendered}"
+        );
+        assert!(
+            compact.contains("spawn_future_with_callback"),
+            "direct object stream must create its tagged raw envelope on the N-API thread: {rendered}"
+        );
+        assert!(
+            compact.contains("JavaScriptClassExt::into_instance"),
+            "direct object stream must use the existing generated N-API class: {rendered}"
+        );
+
+        let generator = Generator::new(&ci, NapiTarget::Node);
+        assert!(generator
+            .ensure_stream_item_type_supported(&direct_object())
+            .is_ok());
+        let nested = Type::Optional {
+            inner_type: Box::new(direct_object()),
+        };
+        assert!(
+            generator
+                .ensure_stream_item_type_supported(&nested)
+                .is_err(),
+            "nested object stream items must stay rejected"
+        );
+        let foreign_trait = Type::Object {
+            module_path: MODULE_PATH.into(),
+            name: "ForeignStreamObject".into(),
+            imp: ObjectImpl::Trait(TraitKind::Both),
+        };
+        assert!(
+            generator
+                .ensure_stream_item_type_supported(&foreign_trait)
+                .is_err(),
+            "callback/foreign trait stream items must stay rejected"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NapiTarget {
     Node,
@@ -168,6 +269,25 @@ impl<'a> Generator<'a> {
             .any(|function| matches!(function.return_type(), Some(Type::Stream { .. })))
     }
 
+    fn has_direct_object_stream_functions(&self) -> bool {
+        self.ci.function_definitions().iter().any(|function| {
+            matches!(
+                function.return_type(),
+                Some(Type::Stream { item_type, .. }) if Self::is_direct_rust_object_stream_item(item_type)
+            )
+        })
+    }
+
+    fn is_direct_rust_object_stream_item(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Object {
+                imp: ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly),
+                ..
+            }
+        )
+    }
+
     fn render(&self) -> Result<TokenStream> {
         let imports = self.target.imports();
         let input_stream_descriptors = collect_input_stream_descriptors(self.ci)?;
@@ -220,6 +340,62 @@ impl<'a> Generator<'a> {
         } else {
             quote!()
         };
+        // `#[napi(object)]` envelopes require every field to implement both
+        // N-API object conversion directions.  A generated class instance is
+        // deliberately return-only, so a direct object stream item uses this
+        // tiny owned raw-object envelope instead.  The async callback creates
+        // the JavaScript object on the N-API thread and attaches the existing
+        // object wrapper as its `value` property.
+        let object_stream_helpers = if self.has_direct_object_stream_functions() {
+            quote! {
+                struct __UniffiNapiRawObject(napi::bindgen_prelude::sys::napi_value);
+
+                impl napi::bindgen_prelude::ToNapiValue for __UniffiNapiRawObject {
+                    unsafe fn to_napi_value(
+                        _env: napi::bindgen_prelude::sys::napi_env,
+                        value: Self,
+                    ) -> napi::bindgen_prelude::Result<napi::bindgen_prelude::sys::napi_value> {
+                        Ok(value.0)
+                    }
+                }
+
+                fn __uniffi_napi_new_raw_object(
+                    env: &Env,
+                ) -> napi::bindgen_prelude::Result<__UniffiNapiRawObject> {
+                    let mut object = std::ptr::null_mut();
+                    napi::check_status!(unsafe {
+                        napi::bindgen_prelude::sys::napi_create_object(env.raw(), &mut object)
+                    })?;
+                    Ok(__UniffiNapiRawObject(object))
+                }
+
+                fn __uniffi_napi_set_raw_object_property<T: napi::bindgen_prelude::ToNapiValue>(
+                    env: &Env,
+                    object: &__UniffiNapiRawObject,
+                    name: &str,
+                    value: T,
+                ) -> napi::bindgen_prelude::Result<()> {
+                    let mut key = std::ptr::null_mut();
+                    napi::check_status!(unsafe {
+                        napi::bindgen_prelude::sys::napi_create_string_utf8(
+                            env.raw(),
+                            name.as_ptr().cast(),
+                            name.len() as isize,
+                            &mut key,
+                        )
+                    })?;
+                    let value = unsafe {
+                        <T as napi::bindgen_prelude::ToNapiValue>::to_napi_value(env.raw(), value)
+                    }?;
+                    napi::check_status!(unsafe {
+                        napi::bindgen_prelude::sys::napi_set_property(env.raw(), object.0, key, value)
+                    })?;
+                    Ok(())
+                }
+            }
+        } else {
+            quote!()
+        };
 
         Ok(quote! {
             #imports
@@ -232,6 +408,8 @@ impl<'a> Generator<'a> {
             }
 
             #stream_helpers
+
+            #object_stream_helpers
 
             #[derive(Clone, Debug, PartialEq, Eq, Hash)]
             struct __UniffiTimestamp(pub ::std::time::SystemTime);
@@ -724,7 +902,7 @@ impl<'a> Generator<'a> {
                     ..
                 } = ty
                 {
-                    self.ensure_type_supported(item_type, TypeUsage::Value, "stream item")?;
+                    self.ensure_stream_item_type_supported(item_type)?;
                     self.ensure_type_supported(error_type, TypeUsage::Error, "stream error")?;
                 }
                 Ok(())
@@ -990,6 +1168,24 @@ impl<'a> Generator<'a> {
             ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                 self.render_callback_trait(object)
             }
+        }
+    }
+
+    /// Output stream items cross the N-API boundary in their own tagged
+    /// envelope.  An opaque Rust object is consequently safe as a *direct*
+    /// item: the existing generated wrapper is the envelope's `value` and
+    /// the public TypeScript bridge then wraps that raw object identity.
+    ///
+    /// Keep this intentionally narrower than general nested-value support.
+    /// In particular, `Option<Object>` and collections/maps of objects still
+    /// use the ordinary `TypeUsage::Value` validation and remain rejected.
+    fn ensure_stream_item_type_supported(&self, ty: &Type) -> Result<()> {
+        match ty {
+            Type::Object {
+                imp: ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly),
+                ..
+            } => Ok(()),
+            _ => self.ensure_type_supported(ty, TypeUsage::Value, "stream item"),
         }
     }
 
@@ -2276,6 +2472,9 @@ impl<'a> Generator<'a> {
         item_type: &Type,
         error_type: &Type,
     ) -> Result<TokenStream> {
+        if Self::is_direct_rust_object_stream_item(item_type) {
+            return self.render_direct_object_stream_function(function, item_type, error_type);
+        }
         let fn_ident = rust_ident(function.name());
         let next_ident = rust_ident(&crate::dispatch_key::stream_next_key(function.name()));
         let cancel_ident = rust_ident(&crate::dispatch_key::stream_cancel_key(function.name()));
@@ -2365,6 +2564,152 @@ impl<'a> Generator<'a> {
                 Ok(())
             }
         })
+    }
+
+    /// Render the one stream shape whose item cannot travel through an
+    /// `#[napi(object)]` envelope: an opaque Rust object class.  Its raw
+    /// tagged step is still an ordinary `{ kind, value }` JavaScript object,
+    /// but the object is attached on the N-API thread after the Rust future
+    /// resolves so it retains the same class identity used by normal object
+    /// returns and method calls.
+    fn render_direct_object_stream_function(
+        &self,
+        function: &Function,
+        item_type: &Type,
+        error_type: &Type,
+    ) -> Result<TokenStream> {
+        let fn_ident = rust_ident(function.name());
+        let next_ident = rust_ident(&crate::dispatch_key::stream_next_key(function.name()));
+        let cancel_ident = rust_ident(&crate::dispatch_key::stream_cancel_key(function.name()));
+        let registry_ident = self.stream_registry_ident(function);
+        let fn_path = self.core_item_path(self.ci.crate_name(), function.name());
+        let args = function
+            .arguments()
+            .into_iter()
+            .map(|arg| self.render_signature_arg(arg))
+            .collect::<Result<Vec<_>>>()?;
+        let lowered = function
+            .arguments()
+            .into_iter()
+            .map(|arg| {
+                let arg_ident = rust_ident(arg.name());
+                self.lower_arg_expr(arg_ident, &arg.as_type())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let item_core_ty = self.direct_object_stream_item_core_type(item_type)?;
+        let error_core_ty = self.core_value_type(error_type)?;
+        let item_bridge_ty = self.bridge_return_type(item_type)?;
+        let error_bridge_ty = self.bridge_return_type(error_type)?;
+        let lifted_value = self.lift_value_expr(quote!(value), item_type)?;
+        let lifted_error = self.lift_value_expr(quote!(error), error_type)?;
+
+        Ok(quote! {
+            static #registry_ident: ::uniffi::RustStreamRegistry<#item_core_ty, #error_core_ty> =
+                ::uniffi::deps::once_cell::sync::Lazy::new(|| ::std::sync::Mutex::new(::std::collections::HashMap::new()));
+
+            #[napi]
+            pub fn #fn_ident(#(#args),*) -> napi::bindgen_prelude::Result<napi::bindgen_prelude::BigInt> {
+                let stream = #fn_path(#(#lowered),*);
+                let handle = ::uniffi::rust_stream_new(&#registry_ident, stream);
+                Ok(napi::bindgen_prelude::BigInt::from(handle.as_raw()))
+            }
+
+            #[napi]
+            pub fn #next_ident(
+                __uniffi_env: Env,
+                handle: napi::bindgen_prelude::BigInt,
+            ) -> napi::bindgen_prelude::Result<napi::bindgen_prelude::PromiseRaw<'static, __UniffiNapiRawObject>> {
+                let handle = __uniffi_stream_handle_from_bigint(handle)?;
+                let __uniffi_future = async move {
+                    ::uniffi::rust_stream_next_async::<#item_core_ty, #error_core_ty>(
+                        &#registry_ident,
+                        handle,
+                    )
+                    .await
+                    .map_err(|err| napi::bindgen_prelude::Error::new(
+                        napi::bindgen_prelude::Status::GenericFailure,
+                        format!("{err:?}"),
+                    ))
+                };
+                let __uniffi_promise = __uniffi_env.spawn_future_with_callback(
+                    __uniffi_future,
+                    |env, step| {
+                        let object = __uniffi_napi_new_raw_object(env)?;
+                        match step {
+                            ::uniffi::UniFfiStreamStep::Item(value) => {
+                                __uniffi_napi_set_raw_object_property(
+                                    env,
+                                    &object,
+                                    "kind",
+                                    ::std::string::String::from("item"),
+                                )?;
+                                let value: #item_bridge_ty = #lifted_value;
+                                let instance = napi::bindgen_prelude::JavaScriptClassExt::into_instance(value, env)?;
+                                let value = instance.as_object(env);
+                                __uniffi_napi_set_raw_object_property(env, &object, "value", &value)?;
+                            }
+                            ::uniffi::UniFfiStreamStep::Done => {
+                                __uniffi_napi_set_raw_object_property(
+                                    env,
+                                    &object,
+                                    "kind",
+                                    ::std::string::String::from("done"),
+                                )?;
+                            }
+                            ::uniffi::UniFfiStreamStep::Error(error) => {
+                                __uniffi_napi_set_raw_object_property(
+                                    env,
+                                    &object,
+                                    "kind",
+                                    ::std::string::String::from("error"),
+                                )?;
+                                let error: #error_bridge_ty = #lifted_error;
+                                __uniffi_napi_set_raw_object_property(env, &object, "error", error)?;
+                            }
+                        }
+                        Ok(object)
+                    },
+                )?;
+                Ok(unsafe {
+                    // `PromiseRaw` only borrows the immediate N-API call's
+                    // environment while the raw JavaScript promise is created.
+                    std::mem::transmute::<
+                        napi::bindgen_prelude::PromiseRaw<'_, __UniffiNapiRawObject>,
+                        napi::bindgen_prelude::PromiseRaw<'static, __UniffiNapiRawObject>,
+                    >(__uniffi_promise)
+                })
+            }
+
+            #[napi]
+            pub fn #cancel_ident(handle: napi::bindgen_prelude::BigInt) -> napi::bindgen_prelude::Result<()> {
+                let handle = __uniffi_stream_handle_from_bigint(handle)?;
+                ::uniffi::rust_stream_cancel::<#item_core_ty, #error_core_ty>(
+                    &#registry_ident,
+                    handle,
+                );
+                Ok(())
+            }
+        })
+    }
+
+    fn direct_object_stream_item_core_type(&self, item_type: &Type) -> Result<TokenStream> {
+        match item_type {
+            Type::Object {
+                imp: ObjectImpl::Struct,
+                ..
+            } => {
+                let core_path = self.core_type_path(item_type.clone());
+                Ok(quote!(std::sync::Arc<#core_path>))
+            }
+            Type::Object {
+                imp: ObjectImpl::Trait(TraitKind::RustOnly),
+                ..
+            } => {
+                let core_path = self.core_type_path(item_type.clone());
+                Ok(quote!(std::sync::Arc<dyn #core_path>))
+            }
+            _ => bail!("direct object stream renderer received a non-object item"),
+        }
     }
 
     fn render_signature_arg(&self, arg: &Argument) -> Result<TokenStream> {

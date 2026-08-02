@@ -2291,6 +2291,118 @@ console.log("ok");
 }
 
 #[test]
+fn final_runtime_matrix_wasm_executes_tagged_steps_typed_payloads_native_drops_and_non_send_stream()
+{
+    let node = locate_node_with_strip_types()
+        .expect("final Wasm runtime matrix requires Node.js 22.6+ with --experimental-strip-types");
+    let cargo = which_tool("cargo").expect("final Wasm runtime matrix requires cargo");
+    assert!(
+        has_wasm32_target(&cargo),
+        "final Wasm runtime matrix requires the wasm32-unknown-unknown target"
+    );
+
+    // The fixture must be independent of a developer-installed CLI.  Its
+    // glue is generated below through wasm-bindgen-cli-support in this test
+    // process, while every child command receives the sanitized PATH.
+    let cli_probe = wasm_e2e_command(std::path::Path::new("/bin/sh"))
+        .args(["-c", "command -v wasm-bindgen"])
+        .output()
+        .expect("final Wasm runtime matrix must probe its sanitized PATH");
+    assert!(
+        !cli_probe.status.success(),
+        "the final Wasm runtime matrix PATH must not expose an external wasm-bindgen CLI: {}",
+        String::from_utf8_lossy(&cli_probe.stdout).trim(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = build_runtime_matrix_fixture(tmp.path());
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    generate_runtime_matrix_tree(
+        &fixture,
+        &out_dir,
+        Some(host_dir.clone()),
+        vec![FlavorTarget::Wasm],
+    );
+
+    let manifest = host_dir.join("wasm/Cargo.toml");
+    let target_dir = tmp.path().join("target-wasm-runtime-matrix");
+    let build = wasm_e2e_command(&cargo)
+        .args(["build", "--manifest-path"])
+        .arg(manifest.as_std_path())
+        .args(["--target", "wasm32-unknown-unknown"])
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("RUSTFLAGS", "-D warnings")
+        .output()
+        .expect("failed to invoke cargo for final Wasm runtime matrix host");
+    assert!(
+        build.status.success(),
+        "cargo build on final Wasm runtime matrix host crate failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let package_name = "runtime-matrix-core";
+    let host_target =
+        uniffi_bindgen_javascript::host_crates::composite_host_lib_target(package_name);
+    let wasm_file = target_dir
+        .join("wasm32-unknown-unknown/debug")
+        .join(composite_host_wasm_filename(package_name));
+    assert!(
+        wasm_file.exists(),
+        "expected final Wasm runtime matrix module at {}",
+        wasm_file.display(),
+    );
+    let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
+    run_wasm_bindgen_nodejs_in_process(wasm_file.as_path(), pkg.as_std_path());
+    assert!(
+        pkg.join(format!("{host_target}.js")).exists(),
+        "in-process wasm-bindgen must produce final runtime matrix glue"
+    );
+
+    let setup =
+        format!("const glue = require(\"./pkg/{host_target}.js\");\nawait api.initBackend(glue);");
+    let non_send_assertions = r#"
+api.resetProbe("non-send");
+const local = api.nonSendItems("non-send", 2);
+const localValues: number[] = [];
+for await (const value of local) localValues.push(value);
+assert(localValues.join(",") === "0,1", "Wasm Rc<Cell> non-Send local stream executes");
+const localProbe = api.probeSnapshot("non-send");
+assert(localProbe.streamStarts === 1n && localProbe.streamDrops === 1n
+  && localProbe.streamTerminalDrops === 1n && localProbe.streamCancelledDrops === 0n,
+  "Wasm Rc<Cell> non-Send local stream drops exactly once");
+"#;
+    let driver = runtime_matrix_driver(
+        "./generated/browser/index.ts",
+        &setup,
+        "glue",
+        "tag",
+        non_send_assertions,
+    );
+    std::fs::write(tmp.path().join("wasm-runtime-matrix-driver.ts"), driver).unwrap();
+
+    let output = wasm_e2e_command(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("wasm-runtime-matrix-driver.ts")
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run final Wasm runtime matrix driver");
+    assert!(
+        output.status.success(),
+        "final Wasm runtime matrix driver failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "final Wasm runtime matrix driver did not print ok"
+    );
+}
+
+#[test]
 fn composite_wasm_uses_one_in_process_glue_for_isolated_namespaces_without_cli() {
     let node = locate_node_with_strip_types().expect(
         "composite Wasm runtime test requires Node.js 22.6+ with --experimental-strip-types",

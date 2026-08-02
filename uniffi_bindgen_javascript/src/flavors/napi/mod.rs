@@ -67,6 +67,15 @@ pub fn emit_ohos(
     let stream_helpers = render_ohos_stream_helpers(ci);
     let index = render_ohos_index(ci, composite_native_library_stem);
 
+    // Keep the producer on the same sidecar/contract protocol that a host
+    // crate consumes.  The input-stream generic is intentionally keyed by
+    // the checked facade contract's exact native export prefix, not by an
+    // unqualified legacy name or an inferred sidecar suffix.
+    let parsed_facade_contract = parse_ohos_facade_contract(&facade_contract)
+        .context("validating generated OHOS facade contract before sidecar emission")?;
+    validate_ohos_extra_types(&extra_types, &identity_export, &parsed_facade_contract)
+        .context("validating generated OHOS type sidecar before emission")?;
+
     // Finish every render and validation before touching the output tree.  In
     // particular, canonical sidecar collection can still reject generated
     // name collisions; writing the bridge first would leave a broken partial
@@ -1226,9 +1235,15 @@ struct CanonicalOhosTypeDef {
 pub(crate) fn validate_ohos_extra_types(
     content: &str,
     expected_identity_export: &str,
+    contract: &OhosFacadeContract,
 ) -> Result<()> {
     let mut names = std::collections::BTreeSet::new();
+    let mut duplicate_name = None;
     let mut found_identity_export = false;
+    let expected_input_stream_type =
+        ohos_raw_input_stream_type_for_prefix(&contract.native_export_prefix);
+    let requires_input_stream_type = !contract.input_streams.is_empty();
+    let mut input_stream_type_count = 0usize;
     for (line_number, line) in content.lines().enumerate() {
         if line.is_empty() {
             continue;
@@ -1241,26 +1256,29 @@ pub(crate) fn validate_ohos_extra_types(
         })?;
         let definition: CanonicalOhosTypeDef = serde_json::from_str(record)
             .with_context(|| format!("parsing exact OHOS type sidecar line {}", line_number + 1))?;
-        if definition.name == "UniffiInputStream" {
+        if definition.name == expected_input_stream_type {
+            if !requires_input_stream_type {
+                bail!(
+                    "canonical OHOS raw input-stream type `{expected_input_stream_type}` is not allowed because its owning facade contract declares no inputStreams"
+                );
+            }
             if !matches!(definition.kind, CanonicalOhosTypeDefKind::Interface)
                 || definition.type_parameters.len() != 1
                 || definition.type_parameters[0] != "T"
             {
                 bail!(
-                    "canonical OHOS type `UniffiInputStream` must be an interface with exact typeParameters [\"T\"]"
+                    "canonical OHOS raw input-stream type `{expected_input_stream_type}` must be an interface with exact typeParameters [\"T\"]"
                 );
             }
+            input_stream_type_count += 1;
         } else if !definition.type_parameters.is_empty() {
             bail!(
-                "canonical OHOS type `{}` must not declare typeParameters; only `UniffiInputStream` may use exact [\"T\"]",
-                definition.name
+                "canonical OHOS type `{}` must not declare typeParameters; only raw input-stream type `{expected_input_stream_type}` from its owning facade contract may use exact [\"T\"]",
+                definition.name,
             );
         }
-        if !names.insert(definition.name.clone()) {
-            bail!(
-                "canonical OHOS type sidecar repeats declaration `{}`",
-                definition.name
-            );
+        if !names.insert(definition.name.clone()) && duplicate_name.is_none() {
+            duplicate_name = Some(definition.name.clone());
         }
         if definition.name == expected_identity_export {
             if !matches!(definition.kind, CanonicalOhosTypeDefKind::Fn)
@@ -1272,6 +1290,14 @@ pub(crate) fn validate_ohos_extra_types(
             }
             found_identity_export = true;
         }
+    }
+    if requires_input_stream_type && input_stream_type_count != 1 {
+        bail!(
+            "canonical OHOS type sidecar must declare exactly one raw input-stream type `{expected_input_stream_type}` because its owning facade contract declares inputStreams"
+        );
+    }
+    if let Some(name) = duplicate_name {
+        bail!("canonical OHOS type sidecar repeats declaration `{name}`");
     }
     if !found_identity_export {
         bail!(
@@ -1903,7 +1929,10 @@ fn ohos_facade_type_descriptor(
             let descriptor = codegen::describe_input_stream_type(ty)?;
             OhosTypeDescriptor::InputSource {
                 suffix: descriptor.suffix().to_string(),
-                next_type: format!("UniffiInputStream{}Next", descriptor.suffix()),
+                next_type: ohos_raw_input_next_type_for_prefix(
+                    &root.native_export_prefix(),
+                    descriptor.suffix(),
+                ),
             }
         }
         Type::Map { .. } => anyhow::bail!(
@@ -2139,6 +2168,53 @@ mod ohos_facade_type_tests {
         }
     }
 
+    fn test_ohos_input_stream_contract(
+        native_export_prefix: &str,
+        has_input_streams: bool,
+    ) -> OhosFacadeContract {
+        let input_streams = has_input_streams
+            .then(|| OhosInputStreamContract {
+                suffix: "NumberStringFingerprint8b30e3aa815a2f4a".into(),
+                canonical: "fixture-number-string".into(),
+                fingerprint: "8b30e3aa815a2f4a".into(),
+                item_type: OhosTypeDescriptor::Number,
+                error_type: OhosTypeDescriptor::String,
+                next_type: ohos_raw_input_next_type_for_prefix(
+                    native_export_prefix,
+                    "NumberStringFingerprint8b30e3aa815a2f4a",
+                ),
+                writer_class: "NumberStringFingerprint8b30e3aa815a2f4aInputWriter".into(),
+                source_class: "NumberStringFingerprint8b30e3aa815a2f4aInputSource".into(),
+                channel_class: "NumberStringFingerprint8b30e3aa815a2f4aInputChannel".into(),
+                factory: "createNumberStringFingerprint8b30e3aa815a2f4aInputChannel".into(),
+            })
+            .into_iter()
+            .collect();
+        OhosFacadeContract {
+            facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+            component: "fixture".into(),
+            namespace: "fixture".into(),
+            native_export_prefix: native_export_prefix.into(),
+            output_streams: Vec::new(),
+            input_streams,
+        }
+    }
+
+    fn test_ohos_type_def(
+        kind: &str,
+        name: &str,
+        definition: &str,
+        type_parameters: &[&str],
+    ) -> String {
+        let record = serde_json::json!({
+            "kind": kind,
+            "name": name,
+            "def": definition,
+            "typeParameters": type_parameters,
+        });
+        format!("type_def:{}\n", serde_json::to_string(&record).unwrap())
+    }
+
     fn function(name: &str, inputs: Vec<FnParamMetadata>, return_type: Option<Type>) -> FnMetadata {
         FnMetadata {
             module_path: "facade_graph".to_string(),
@@ -2228,6 +2304,21 @@ mod ohos_facade_type_tests {
         assert_eq!(
             ohos_napi_ts_type(&optional_record).unwrap(),
             "StreamItem | undefined | null"
+        );
+    }
+
+    #[test]
+    fn input_source_contract_descriptor_uses_the_component_prefixed_next_type() {
+        let ci = ComponentInterface::from_metadata(group("fixture")).unwrap();
+        let input = input_stream(Type::UInt32, Type::String);
+        let descriptor = codegen::describe_input_stream_type(&input).unwrap();
+        let value =
+            serde_json::to_value(ohos_facade_type_descriptor(&ci, &input).unwrap()).unwrap();
+        assert_eq!(value["kind"], "inputSource");
+        assert_eq!(value["suffix"], descriptor.suffix());
+        assert_eq!(
+            value["nextType"],
+            ohos_raw_input_next_type_for_prefix(&ci.native_export_prefix(), descriptor.suffix())
         );
     }
 
@@ -2479,6 +2570,86 @@ mod ohos_facade_type_tests {
         );
         assert!(error.contains("external_values"), "{error}");
         assert!(!error.contains("field `id`"), "{error}");
+    }
+
+    #[test]
+    fn ohos_extra_type_generics_are_exactly_owned_by_the_facade_contract() {
+        let native_export_prefix = "ffi_fixture";
+        let contract = test_ohos_input_stream_contract(native_export_prefix, true);
+        let raw_input_stream = ohos_raw_input_stream_type_for_prefix(native_export_prefix);
+        let identity_export = "ffi_fixture_uniffiohosbridgeidentityfixture";
+        let identity = test_ohos_type_def(
+            "fn",
+            identity_export,
+            &format!("function {identity_export}(): string"),
+            &[],
+        );
+        let raw = test_ohos_type_def("interface", &raw_input_stream, "handle: number", &["T"]);
+
+        validate_ohos_extra_types(&(raw.clone() + &identity), identity_export, &contract).unwrap();
+
+        let cases = [
+            (
+                "bare legacy name",
+                test_ohos_type_def("interface", "UniffiInputStream", "handle: number", &["T"])
+                    + &identity,
+                "only raw input-stream type",
+            ),
+            (
+                "wrong component prefix",
+                test_ohos_type_def(
+                    "interface",
+                    "ffi_other_UniffiInputStream",
+                    "handle: number",
+                    &["T"],
+                ) + &identity,
+                "only raw input-stream type",
+            ),
+            (
+                "arbitrary generic",
+                test_ohos_type_def("interface", "OtherGeneric", "handle: number", &["T"])
+                    + &identity,
+                "only raw input-stream type",
+            ),
+            (
+                "wrong expected kind",
+                test_ohos_type_def("type", &raw_input_stream, "number", &["T"]) + &identity,
+                "must be an interface",
+            ),
+            (
+                "wrong expected parameters",
+                test_ohos_type_def(
+                    "interface",
+                    &raw_input_stream,
+                    "handle: number",
+                    &["T", "U"],
+                ) + &identity,
+                "exact typeParameters",
+            ),
+            (
+                "missing expected generic",
+                identity.clone(),
+                "must declare exactly one raw input-stream type",
+            ),
+            (
+                "duplicate expected generic",
+                raw.clone() + &raw + &identity,
+                "must declare exactly one raw input-stream type",
+            ),
+        ];
+        for (label, sidecar, expected) in cases {
+            let error = validate_ohos_extra_types(&sidecar, identity_export, &contract)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        let no_input_contract = test_ohos_input_stream_contract(native_export_prefix, false);
+        let error =
+            validate_ohos_extra_types(&(raw + &identity), identity_export, &no_input_contract)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("declares no inputStreams"), "{error}");
     }
 
     #[test]

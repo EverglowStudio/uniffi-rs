@@ -17,6 +17,71 @@ pub fn which_tool(name: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// The final strict TypeScript contracts are deliberately opt-in at the test
+/// command boundary: a CI or developer supplies the compiler path explicitly
+/// instead of the suite silently discovering whichever `tsc` happens to be on
+/// PATH.  Keeping the path in the environment also prevents a machine-local
+/// SDK location from becoming part of the repository contract.
+pub const REQUIRED_TYPESCRIPT_COMPILER_ENV: &str = "UNIFFI_TEST_TYPESCRIPT_COMPILER";
+
+pub fn required_typescript_compiler() -> std::path::PathBuf {
+    let compiler = std::env::var_os(REQUIRED_TYPESCRIPT_COMPILER_ENV).unwrap_or_else(|| {
+        panic!(
+            "required strict TypeScript compiler is unset; provide an explicit executable path in {REQUIRED_TYPESCRIPT_COMPILER_ENV}"
+        )
+    });
+    let compiler = std::path::PathBuf::from(compiler);
+    assert!(
+        compiler.is_file(),
+        "required strict TypeScript compiler in {REQUIRED_TYPESCRIPT_COMPILER_ENV} is not a file: {}",
+        compiler.display()
+    );
+
+    let version = Command::new(&compiler)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to execute required strict TypeScript compiler {}: {error}",
+                compiler.display()
+            )
+        });
+    assert!(
+        version.status.success(),
+        "required strict TypeScript compiler {} rejected --version:\nstdout:\n{}\nstderr:\n{}",
+        compiler.display(),
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        "Version 5.9.3",
+        "required strict TypeScript compiler must be TypeScript 5.9.3"
+    );
+    compiler
+}
+
+pub fn run_required_typescript_check(
+    compiler: &std::path::Path,
+    tsconfig: &std::path::Path,
+) -> std::process::Output {
+    assert!(
+        tsconfig.is_file(),
+        "required strict TypeScript config does not exist: {}",
+        tsconfig.display()
+    );
+    Command::new(compiler)
+        .args(["--noEmit", "-p"])
+        .arg(tsconfig)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to invoke required strict TypeScript compiler {}: {error}",
+                compiler.display()
+            )
+        })
+}
+
 pub fn has_wasm32_target(cargo: &std::path::Path) -> bool {
     // Ask rustup first; fall back to a dry-run build probe if no rustup.
     if let Ok(out) = Command::new("rustup")
@@ -330,6 +395,616 @@ pub fn generate_stream_tree(
         },
     )
     .expect("generator should succeed for native stream fixture");
+}
+
+/// A native fixture shared by the final N-API and Wasm runtime matrix.
+///
+/// It deliberately combines the properties that are easy to accidentally
+/// validate only in generated text: a structured error, record/enum/object
+/// stream values, public names hostile to backend implementation identifiers,
+/// and Rust-side lifecycle counters.  Both runtimes build the exact same Rust
+/// source and execute the same TypeScript driver from this module.
+pub struct RuntimeMatrixFixture {
+    crate_dir: Utf8PathBuf,
+    lib_path: Utf8PathBuf,
+}
+
+pub fn build_runtime_matrix_fixture(root: &std::path::Path) -> RuntimeMatrixFixture {
+    let cargo = which_tool("cargo").expect("final JavaScript runtime matrix requires cargo");
+    let root = Utf8PathBuf::from_path_buf(root.to_path_buf()).unwrap();
+    let crate_dir = root.join("runtime-matrix-core");
+    let src = crate_dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let uniffi_dep = workspace_root().join("uniffi");
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "runtime-matrix-core"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+uniffi = {{ path = {:?}, features = ["wasm-unstable-single-threaded"] }}
+
+[workspace]
+resolver = "3"
+"#,
+            uniffi_dep.as_str()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    pin::Pin,
+    sync::{Arc, Mutex, OnceLock},
+    task::{Context, Poll},
+};
+
+#[cfg(target_arch = "wasm32")]
+use std::{cell::Cell, rc::Rc};
+
+use uniffi::deps::futures_core::Stream;
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MatrixRecord {
+    #[uniffi(name = "unknown")]
+    pub unknown_value: String,
+    #[uniffi(name = "napi")]
+    pub napi_value: u32,
+    pub bytes: String,
+}
+
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum MatrixEnum {
+    #[uniffi(name = "unknown")]
+    Unknown {
+        #[uniffi(name = "napi")]
+        napi_value: u32,
+    },
+    #[uniffi(name = "Buffer")]
+    Buffer,
+}
+
+#[derive(Debug, uniffi::Object)]
+pub struct MatrixBuffer {
+    unknown_value: String,
+    napi_value: u32,
+}
+
+#[uniffi::export]
+impl MatrixBuffer {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            unknown_value: "object-unknown".to_owned(),
+            napi_value: 17,
+        })
+    }
+
+    pub fn unknown_value(&self) -> String {
+        self.unknown_value.clone()
+    }
+
+    pub fn napi_value(&self) -> u32 {
+        self.napi_value
+    }
+
+    pub fn buffer_value(&self) -> String {
+        "object-buffer".to_owned()
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Error)]
+pub enum MatrixError {
+    #[uniffi(name = "Detailed")]
+    Detailed {
+        unknown_value: String,
+        napi_value: u32,
+        buffer_value: String,
+    },
+}
+
+impl fmt::Display for MatrixError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Detailed {
+                unknown_value,
+                napi_value,
+                ..
+            } => write!(formatter, "detailed {unknown_value} {napi_value}"),
+        }
+    }
+}
+
+impl std::error::Error for MatrixError {}
+
+#[derive(Clone, Debug, Default, uniffi::Record)]
+pub struct MatrixProbeSnapshot {
+    pub stream_starts: u64,
+    pub stream_next_polls: u64,
+    pub stream_terminal_drops: u64,
+    pub stream_cancelled_drops: u64,
+    pub stream_drops: u64,
+}
+
+static PROBES: OnceLock<Mutex<HashMap<String, MatrixProbeSnapshot>>> = OnceLock::new();
+
+fn probes() -> &'static Mutex<HashMap<String, MatrixProbeSnapshot>> {
+    PROBES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn with_probe(probe_id: &str, update: impl FnOnce(&mut MatrixProbeSnapshot)) {
+    let mut probes = probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    update(probes.entry(probe_id.to_owned()).or_default());
+}
+
+fn increment(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
+}
+
+fn record_start(probe_id: &str) {
+    with_probe(probe_id, |probe| increment(&mut probe.stream_starts));
+}
+
+fn record_poll(probe_id: &str) {
+    with_probe(probe_id, |probe| increment(&mut probe.stream_next_polls));
+}
+
+fn record_drop(probe_id: &str, terminal: bool) {
+    with_probe(probe_id, |probe| {
+        increment(&mut probe.stream_drops);
+        if terminal {
+            increment(&mut probe.stream_terminal_drops);
+        } else {
+            increment(&mut probe.stream_cancelled_drops);
+        }
+    });
+}
+
+#[uniffi::export]
+pub fn reset_probe(probe_id: String) {
+    let mut probes = probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    probes.insert(probe_id, MatrixProbeSnapshot::default());
+}
+
+#[uniffi::export]
+pub fn probe_snapshot(probe_id: String) -> MatrixProbeSnapshot {
+    let probes = probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    probes.get(&probe_id).cloned().unwrap_or_default()
+}
+
+struct ProbedSequence<T> {
+    probe_id: String,
+    items: VecDeque<Result<T, MatrixError>>,
+    terminal: bool,
+    dropped: bool,
+}
+
+impl<T> ProbedSequence<T> {
+    fn new(probe_id: String, items: impl IntoIterator<Item = Result<T, MatrixError>>) -> Self {
+        Self {
+            probe_id,
+            items: items.into_iter().collect(),
+            terminal: false,
+            dropped: false,
+        }
+    }
+}
+
+impl<T> Unpin for ProbedSequence<T> {}
+
+impl<T> Stream for ProbedSequence<T> {
+    type Item = Result<T, MatrixError>;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        record_poll(&this.probe_id);
+        match this.items.pop_front() {
+            Some(Ok(value)) => Poll::Ready(Some(Ok(value))),
+            Some(Err(error)) => {
+                this.terminal = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            None => {
+                this.terminal = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+impl<T> Drop for ProbedSequence<T> {
+    fn drop(&mut self) {
+        if !self.dropped {
+            self.dropped = true;
+            record_drop(&self.probe_id, self.terminal);
+        }
+    }
+}
+
+struct PendingMatrixStream {
+    probe_id: String,
+    dropped: bool,
+}
+
+impl Stream for PendingMatrixStream {
+    type Item = Result<u32, MatrixError>;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        record_poll(&self.probe_id);
+        Poll::Pending
+    }
+}
+
+impl Drop for PendingMatrixStream {
+    fn drop(&mut self) {
+        if !self.dropped {
+            self.dropped = true;
+            record_drop(&self.probe_id, false);
+        }
+    }
+}
+
+struct LocalMatrixStream {
+    probe_id: String,
+    #[cfg(target_arch = "wasm32")]
+    cursor: Rc<Cell<u32>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    cursor: u32,
+    end: u32,
+    terminal: bool,
+    dropped: bool,
+}
+
+impl Unpin for LocalMatrixStream {}
+
+impl Stream for LocalMatrixStream {
+    type Item = Result<u32, MatrixError>;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        record_poll(&this.probe_id);
+        #[cfg(target_arch = "wasm32")]
+        let current = this.cursor.get();
+        #[cfg(not(target_arch = "wasm32"))]
+        let current = this.cursor;
+        if current >= this.end {
+            this.terminal = true;
+            return Poll::Ready(None);
+        }
+        #[cfg(target_arch = "wasm32")]
+        this.cursor.set(current + 1);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            this.cursor += 1;
+        }
+        Poll::Ready(Some(Ok(current)))
+    }
+}
+
+impl Drop for LocalMatrixStream {
+    fn drop(&mut self) {
+        if !self.dropped {
+            self.dropped = true;
+            record_drop(&self.probe_id, self.terminal);
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn record_items(probe_id: String) -> uniffi::UniFfiStream<MatrixRecord, MatrixError> {
+    record_start(&probe_id);
+    Box::pin(ProbedSequence::new(
+        probe_id,
+        [Ok(MatrixRecord {
+            unknown_value: "record-unknown".to_owned(),
+            napi_value: 7,
+            bytes: "record-bytes".to_owned(),
+        })],
+    ))
+}
+
+#[uniffi::export]
+pub fn enum_items(probe_id: String) -> uniffi::UniFfiStream<MatrixEnum, MatrixError> {
+    record_start(&probe_id);
+    Box::pin(ProbedSequence::new(
+        probe_id,
+        [Ok(MatrixEnum::Unknown { napi_value: 9 }), Ok(MatrixEnum::Buffer)],
+    ))
+}
+
+#[uniffi::export]
+pub fn buffer_items(probe_id: String) -> uniffi::UniFfiStream<Arc<MatrixBuffer>, MatrixError> {
+    record_start(&probe_id);
+    Box::pin(ProbedSequence::new(probe_id, [Ok(MatrixBuffer::new())]))
+}
+
+#[uniffi::export]
+pub fn typed_error_items(probe_id: String) -> uniffi::UniFfiStream<u32, MatrixError> {
+    record_start(&probe_id);
+    Box::pin(ProbedSequence::new(
+        probe_id,
+        [
+            Ok(7),
+            Err(MatrixError::Detailed {
+                unknown_value: "typed-unknown".to_owned(),
+                napi_value: 42,
+                buffer_value: "typed-buffer".to_owned(),
+            }),
+        ],
+    ))
+}
+
+#[uniffi::export]
+pub fn pending_items(probe_id: String) -> uniffi::UniFfiStream<u32, MatrixError> {
+    record_start(&probe_id);
+    Box::pin(PendingMatrixStream {
+        probe_id,
+        dropped: false,
+    })
+}
+
+#[uniffi::export]
+pub fn non_send_items(probe_id: String, count: u32) -> uniffi::UniFfiStream<u32, MatrixError> {
+    record_start(&probe_id);
+    Box::pin(LocalMatrixStream {
+        probe_id,
+        #[cfg(target_arch = "wasm32")]
+        cursor: Rc::new(Cell::new(0)),
+        #[cfg(not(target_arch = "wasm32"))]
+        cursor: 0,
+        end: count,
+        terminal: false,
+        dropped: false,
+    })
+}
+
+uniffi::setup_scaffolding!();
+"#,
+    )
+    .unwrap();
+
+    let target_dir = root.join("target-runtime-matrix-core");
+    let output = Command::new(&cargo)
+        .args(["build", "--manifest-path"])
+        .arg(crate_dir.join("Cargo.toml").as_std_path())
+        .env("CARGO_TARGET_DIR", target_dir.as_str())
+        .env_remove("RUSTFLAGS")
+        .output()
+        .expect("failed to invoke cargo for final JavaScript runtime matrix fixture");
+    assert!(
+        output.status.success(),
+        "final JavaScript runtime matrix fixture build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let lib_path = target_dir
+        .join("debug")
+        .join(cdylib_filename("runtime-matrix-core"));
+    assert!(
+        lib_path.exists(),
+        "expected final JavaScript runtime matrix cdylib at {lib_path}"
+    );
+    RuntimeMatrixFixture {
+        crate_dir,
+        lib_path,
+    }
+}
+
+pub fn generate_runtime_matrix_tree(
+    fixture: &RuntimeMatrixFixture,
+    out_dir: &Utf8PathBuf,
+    host_crates: Option<Utf8PathBuf>,
+    flavors: Vec<FlavorTarget>,
+) {
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: fixture.lib_path.clone(),
+            out_dir: out_dir.clone(),
+            artifact_dir: None,
+            config_override: None,
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: host_crates.map(|host_crates_dir| HostCrateOptions {
+                manifest_path: fixture.crate_dir.join("Cargo.toml"),
+                host_crates_dir,
+                logical_host_crates_dir: None,
+                logical_out_dir: None,
+                ohos_rs_dir: None,
+            }),
+            flavors,
+        },
+    )
+    .expect("generator should succeed for final JavaScript runtime matrix fixture");
+}
+
+/// The N-API and Wasm runtime matrix differ only in how they supply their raw
+/// bridge. Keep the assertions in one driver so both paths prove the same
+/// tagged step, typed payload, hostile identifier, and native-drop contracts.
+pub fn runtime_matrix_driver(
+    public_import: &str,
+    setup: &str,
+    raw_expression: &str,
+    raw_variant_property: &str,
+    non_send_assertions: &str,
+) -> String {
+    const TEMPLATE: &str = r#"
+import { createRequire } from "node:module";
+import * as root from "__UNIFFI_RUNTIME_MATRIX_PUBLIC_IMPORT__";
+
+const require = createRequire(import.meta.url);
+const api = root.runtime_matrix_core;
+__UNIFFI_RUNTIME_MATRIX_SETUP__
+const raw = __UNIFFI_RUNTIME_MATRIX_RAW__;
+// The raw N-API addon exposes a napi-rs enum discriminator as `type`, while
+// the Wasm shim emits its explicit `tag`.  The public TypeScript bridge
+// normalizes both into `tag`; keep the raw assertion deliberately backend
+// aware so this driver proves the transport boundary rather than masking it.
+const rawVariantProperty: "type" | "tag" = "__UNIFFI_RUNTIME_MATRIX_RAW_VARIANT_PROPERTY__";
+
+function assert(condition: boolean, label: string): void {
+  if (!condition) throw new Error(`FAIL ${label}`);
+}
+
+const rawStart = raw["ffi_runtime_matrix_core_record_items"];
+const rawNext = raw["ffi_runtime_matrix_core_record_items_stream_next"];
+const rawEnumStart = raw["ffi_runtime_matrix_core_enum_items"];
+const rawEnumNext = raw["ffi_runtime_matrix_core_enum_items_stream_next"];
+const rawBufferStart = raw["ffi_runtime_matrix_core_buffer_items"];
+const rawBufferNext = raw["ffi_runtime_matrix_core_buffer_items_stream_next"];
+const rawErrorStart = raw["ffi_runtime_matrix_core_typed_error_items"];
+const rawErrorNext = raw["ffi_runtime_matrix_core_typed_error_items_stream_next"];
+assert(typeof rawStart === "function" && typeof rawNext === "function", "raw record tagged stream exports");
+assert(typeof rawEnumStart === "function" && typeof rawEnumNext === "function", "raw enum tagged stream exports");
+assert(typeof rawBufferStart === "function" && typeof rawBufferNext === "function", "raw object tagged stream exports");
+assert(typeof rawErrorStart === "function" && typeof rawErrorNext === "function", "raw error tagged stream exports");
+const rawHandle = (rawStart as (probe: string) => unknown)("raw-record");
+const rawItem = await (rawNext as (handle: unknown) => Promise<unknown>)(rawHandle) as {
+  kind?: unknown;
+  value?: { unknown?: unknown; napi?: unknown; bytes?: unknown };
+};
+assert(rawItem.kind === "item" && rawItem.value?.unknown === "record-unknown"
+  && rawItem.value?.napi === 7 && rawItem.value?.bytes === "record-bytes", "raw Item tagged step");
+const rawDone = await (rawNext as (handle: unknown) => Promise<unknown>)(rawHandle) as { kind?: unknown };
+assert(rawDone.kind === "done", "raw Done tagged step");
+
+const rawEnumHandle = (rawEnumStart as (probe: string) => unknown)("raw-enum");
+const rawEnumItem = await (rawEnumNext as (handle: unknown) => Promise<unknown>)(rawEnumHandle) as {
+  kind?: unknown;
+  value?: { type?: unknown; tag?: unknown; napi?: unknown };
+};
+assert(rawEnumItem.kind === "item" && rawEnumItem.value?.[rawVariantProperty] === "unknown"
+  && rawEnumItem.value?.napi === 9, "raw enum Item preserves N-API type/napi payload");
+const rawBufferEnumItem = await (rawEnumNext as (handle: unknown) => Promise<unknown>)(rawEnumHandle) as {
+  kind?: unknown;
+  value?: { type?: unknown; tag?: unknown };
+};
+assert(rawBufferEnumItem.kind === "item" && rawBufferEnumItem.value?.[rawVariantProperty] === "Buffer",
+  "raw enum Item preserves Buffer identifier");
+assert((await (rawEnumNext as (handle: unknown) => Promise<unknown>)(rawEnumHandle) as { kind?: unknown }).kind === "done",
+  "raw enum stream reaches Done");
+
+const rawBufferHandle = (rawBufferStart as (probe: string) => unknown)("raw-object");
+const rawBufferItem = await (rawBufferNext as (handle: unknown) => Promise<unknown>)(rawBufferHandle) as {
+  kind?: unknown;
+  value?: unknown;
+};
+assert(rawBufferItem.kind === "item" && rawBufferItem.value != null, "raw object Item tagged step");
+const rawObject = api.MatrixBuffer.__fromHandle(rawBufferItem.value);
+assert(rawObject.__uniffi.raw === rawBufferItem.value && rawObject.unknownValue() === "object-unknown"
+  && rawObject.napiValue() === 17 && rawObject.bufferValue() === "object-buffer",
+  "public object bridge preserves raw object identity and methods");
+rawObject.dispose();
+assert((await (rawBufferNext as (handle: unknown) => Promise<unknown>)(rawBufferHandle) as { kind?: unknown }).kind === "done",
+  "raw object stream reaches Done");
+
+const rawErrorHandle = (rawErrorStart as (probe: string) => unknown)("raw-error");
+await (rawErrorNext as (handle: unknown) => Promise<unknown>)(rawErrorHandle);
+const rawError = await (rawErrorNext as (handle: unknown) => Promise<unknown>)(rawErrorHandle) as {
+  kind?: unknown;
+  error?: { type?: unknown; tag?: unknown; unknownValue?: unknown; napiValue?: unknown; bufferValue?: unknown };
+};
+assert(rawError.kind === "error" && rawError.error?.[rawVariantProperty] === "Detailed"
+  && rawError.error?.unknownValue === "typed-unknown" && rawError.error?.napiValue === 42
+  && rawError.error?.bufferValue === "typed-buffer", "raw Error tagged step and structured payload");
+
+api.resetProbe("done");
+const done = api.recordItems("done");
+const recordResult = await done.next();
+assert(recordResult.done === false && recordResult.value.unknown === "record-unknown"
+  && recordResult.value.napi === 7 && recordResult.value.bytes === "record-bytes",
+  "public record stream item preserves unknown/napi identifiers");
+assert((await done.next()).done === true, "public record stream reaches Done");
+const doneProbe = api.probeSnapshot("done");
+assert(doneProbe.streamStarts === 1n && doneProbe.streamDrops === 1n
+  && doneProbe.streamTerminalDrops === 1n && doneProbe.streamCancelledDrops === 0n,
+  "Done must drop Rust stream exactly once");
+
+const enums = api.enumItems("enum");
+const enumResult = await enums.next();
+assert(enumResult.done === false && enumResult.value.tag === "unknown" && enumResult.value.napi === 9,
+  "public enum stream item preserves hostile tag and field");
+const bufferEnumResult = await enums.next();
+assert(bufferEnumResult.done === false && bufferEnumResult.value.tag === "Buffer",
+  "public enum stream item preserves Buffer identifier");
+assert((await enums.next()).done === true, "public enum stream reaches Done");
+
+const buffers = api.bufferItems("object");
+const objectResult = await buffers.next();
+assert(objectResult.done === false && objectResult.value.unknownValue() === "object-unknown"
+  && objectResult.value.napiValue() === 17 && objectResult.value.bufferValue() === "object-buffer",
+  "public object stream item executes through bridge");
+objectResult.value.dispose();
+assert((await buffers.next()).done === true, "public object stream reaches Done");
+
+api.resetProbe("error");
+const typed = api.typedErrorItems("error");
+assert((await typed.next()).value === 7, "typed error stream first item");
+let typedError = false;
+try {
+  await typed.next();
+} catch (error) {
+  const typed = error as { variant?: unknown; data?: { tag?: unknown; unknownValue?: unknown; napiValue?: unknown; bufferValue?: unknown } };
+  typedError = error instanceof api.MatrixError && error instanceof api.UniffiError
+    && typed.variant === "Detailed" && typed.data?.tag === "Detailed"
+    && typed.data?.unknownValue === "typed-unknown" && typed.data?.napiValue === 42
+    && typed.data?.bufferValue === "typed-buffer";
+}
+assert(typedError, "public bridge must retain typed Rust error variant and fields");
+assert((await typed.next()).done === true, "typed error stream is terminal");
+const errorProbe = api.probeSnapshot("error");
+assert(errorProbe.streamStarts === 1n && errorProbe.streamDrops === 1n
+  && errorProbe.streamTerminalDrops === 1n && errorProbe.streamCancelledDrops === 0n,
+  "Error must drop Rust stream exactly once");
+
+api.resetProbe("cancel");
+const pending = api.pendingItems("cancel");
+const pendingNext = pending.next();
+await pending.cancel();
+const pendingResult = await Promise.race([
+  pendingNext,
+  new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); }),
+]);
+assert(pendingResult !== "timeout" && pendingResult.done === true, "pending native next settles after cancel");
+await pending.cancel();
+const cancelProbe = api.probeSnapshot("cancel");
+assert(cancelProbe.streamStarts === 1n && cancelProbe.streamDrops === 1n
+  && cancelProbe.streamTerminalDrops === 0n && cancelProbe.streamCancelledDrops === 1n,
+  "Cancel must drop Rust stream exactly once");
+
+__UNIFFI_RUNTIME_MATRIX_NON_SEND_ASSERTIONS__
+
+console.log("ok");
+"#;
+
+    TEMPLATE
+        .replace("__UNIFFI_RUNTIME_MATRIX_PUBLIC_IMPORT__", public_import)
+        .replace("__UNIFFI_RUNTIME_MATRIX_SETUP__", setup)
+        .replace("__UNIFFI_RUNTIME_MATRIX_RAW__", raw_expression)
+        .replace(
+            "__UNIFFI_RUNTIME_MATRIX_RAW_VARIANT_PROPERTY__",
+            raw_variant_property,
+        )
+        .replace(
+            "__UNIFFI_RUNTIME_MATRIX_NON_SEND_ASSERTIONS__",
+            non_send_assertions,
+        )
 }
 
 pub struct InputStreamFixture {

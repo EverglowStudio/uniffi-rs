@@ -1998,12 +1998,26 @@ fn validate_host_facade_bundle_for_package(
             package.lib_target_name
         );
     }
-    let identity_payload = serde_json::json!({
-        "packageName": bundle.package_name,
-        "libTarget": bundle.lib_target,
-        "components": bundle.components,
-    });
-    let expected = sha256_bytes(&serde_json::to_vec(&identity_payload)?);
+    // The host plan's identity intentionally covers only the selected
+    // component set.  Contract digests and bridge sentinels are separately
+    // bound by the bundle fingerprint, so recompute through the producer's
+    // shared canonical algorithm rather than serializing the richer bundle
+    // component records here.
+    let expected = uniffi_bindgen_javascript::host_crates::composite_host_identity(
+        &bundle.package_name,
+        &bundle.lib_target,
+        &bundle
+            .components
+            .iter()
+            .map(|component| {
+                (
+                    component.component.clone(),
+                    component.namespace.clone(),
+                    component.native_export_prefix.clone(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )?;
     if expected != bundle.host_composite_identity {
         bail!("OHOS facade bundle host composite identity mismatch");
     }
@@ -2282,9 +2296,12 @@ fn parse_owned_bundle_type_defs(
                 component.component
             )
         })?;
+        let contract = parse_bundle_component_contract(bundle, component, path)?;
+        let input_stream_type = RawInputStreamTypeExpectation::from_contract(&contract);
         let defs = parse_canonical_ohos_type_defs(
             entry.content.as_bytes(),
             &format!("{path}:{}", entry.file),
+            &input_stream_type,
         )?;
         owned.push(OwnedFacadeTypeDefs::new(component, defs)?);
     }
@@ -2294,6 +2311,92 @@ fn parse_owned_bundle_type_defs(
         .collect::<Vec<_>>();
     validate_raw_type_def_uniqueness(&flattened)?;
     Ok(owned)
+}
+
+/// Resolve a component's contract through its exact checked `contractFile`
+/// binding.  This is deliberately not a filename suffix or native-name
+/// lookup: the component identity in the bundle is the authoritative owner
+/// of the sidecar's generic input-stream allowance.
+fn parse_bundle_component_contract(
+    bundle: &HostFacadeBundle,
+    component: &HostFacadeComponentIdentity,
+    path: &Utf8Path,
+) -> Result<HarmonyFacadeContract> {
+    let entry = bundle
+        .contracts
+        .iter()
+        .find(|entry| entry.file == component.contract_file)
+        .with_context(|| {
+            format!(
+                "OHOS facade bundle component `{}` references a missing contract `{}` in {path}",
+                component.component, component.contract_file
+            )
+        })?;
+    if entry.sha256 != component.contract_sha256
+        || sha256_bytes(entry.content.as_bytes()) != entry.sha256
+    {
+        bail!(
+            "OHOS facade bundle component `{}` has an invalid checked contract binding `{}` in {path}",
+            component.component,
+            component.contract_file
+        );
+    }
+    let contract = parse_harmony_facade_contract(entry.content.as_bytes(), path)?;
+    if contract.component != component.component
+        || contract.namespace != component.namespace
+        || contract.native_export_prefix != component.native_export_prefix
+    {
+        bail!(
+            "OHOS facade bundle component `{}` does not exactly match its contract identity in {path}",
+            component.component
+        );
+    }
+    Ok(contract)
+}
+
+/// Re-read the exact installed contract before materializing a type-cache
+/// inventory.  This makes cache creation enforce the same component contract
+/// binding used by the read-only bundle preflight and later declaration
+/// emission.
+fn read_installed_bundle_component_contract(
+    type_dir: &Utf8Path,
+    bundle: &HostFacadeBundle,
+    component: &HostFacadeComponentIdentity,
+) -> Result<HarmonyFacadeContract> {
+    let entry = bundle
+        .contracts
+        .iter()
+        .find(|entry| entry.file == component.contract_file)
+        .with_context(|| {
+            format!(
+                "OHOS facade bundle component `{}` references a missing installed contract `{}`",
+                component.component, component.contract_file
+            )
+        })?;
+    if entry.sha256 != component.contract_sha256 {
+        bail!(
+            "OHOS facade bundle component `{}` has a mismatched contract checksum for `{}`",
+            component.component,
+            component.contract_file
+        );
+    }
+    let contract_path = type_dir.join(&entry.file);
+    let bytes = read_verified_regular_file(&contract_path)?;
+    if sha256_bytes(&bytes) != entry.sha256 {
+        bail!("OHOS facade contract changed after bundle installation: {contract_path}");
+    }
+    let contract = parse_harmony_facade_contract(&bytes, &contract_path)?;
+    if contract.component != component.component
+        || contract.namespace != component.namespace
+        || contract.native_export_prefix != component.native_export_prefix
+    {
+        bail!(
+            "installed OHOS facade contract `{}` does not exactly match component `{}`",
+            component.contract_file,
+            component.component
+        );
+    }
+    Ok(contract)
 }
 
 fn bridge_identity_export(native_export_prefix: &str, contract_digest: &str) -> String {
@@ -2359,13 +2462,34 @@ fn validate_host_facade_bundle_entries(bundle: &HostFacadeBundle, path: &Utf8Pat
         }
     }
     // Type sidecars are invocation inputs, not best-effort declaration
-    // fragments.  Parse their complete canonical grammar before a type-cache
-    // lock, work directory, Cargo invocation, or public declaration exists.
+    // fragments.  Parse their complete canonical grammar through each
+    // component's exact checked facade contract before a type-cache lock,
+    // work directory, Cargo invocation, or public declaration exists.
+    if bundle.type_sidecars.len() != bundle.components.len() {
+        bail!(
+            "required OHOS facade bundle must bind every component to one canonical type sidecar in {path}"
+        );
+    }
+    let sidecars = bundle
+        .type_sidecars
+        .iter()
+        .map(|entry| (entry.file.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
     let mut type_defs = Vec::new();
-    for entry in &bundle.type_sidecars {
+    for component in &bundle.components {
+        let sidecar_file = format!("{}.ohos-extra-types.d.ts", component.component);
+        let entry = sidecars.get(sidecar_file.as_str()).with_context(|| {
+            format!(
+                "OHOS facade bundle component `{}` is missing canonical sidecar `{sidecar_file}` in {path}",
+                component.component
+            )
+        })?;
+        let contract = parse_bundle_component_contract(bundle, component, path)?;
+        let input_stream_type = RawInputStreamTypeExpectation::from_contract(&contract);
         type_defs.extend(parse_canonical_ohos_type_defs(
             entry.content.as_bytes(),
             &format!("{path}:{}", entry.file),
+            &input_stream_type,
         )?);
     }
     validate_raw_type_def_uniqueness(&type_defs)?;
@@ -2471,33 +2595,65 @@ fn install_facade_bundle(
 fn write_facade_type_inventory(type_dir: &Utf8Path, bundle: &HostFacadeBundle) -> Result<()> {
     let mut type_definitions = Vec::new();
     let mut parsed_type_defs = Vec::new();
-    for entry in &bundle.type_sidecars {
-        let path = type_dir.join(&entry.file);
-        let bytes = read_verified_regular_file(&path)?;
-        let actual = sha256_bytes(&bytes);
-        if actual != entry.sha256 {
-            bail!("OHOS canonical type sidecar changed after bundle installation: {path}");
+    let mut contracts = Vec::new();
+    match bundle.mode {
+        FacadeBundleMode::RawOnly => {
+            if !bundle.components.is_empty()
+                || !bundle.contracts.is_empty()
+                || !bundle.type_sidecars.is_empty()
+            {
+                bail!(
+                    "raw-only OHOS facade bundle cannot install generated contracts or canonical type sidecars"
+                );
+            }
         }
-        parsed_type_defs.extend(parse_canonical_ohos_type_defs(&bytes, path.as_str())?);
-        type_definitions.push(serde_json::json!({
-            "file": entry.file,
-            "sha256": actual,
-        }));
+        FacadeBundleMode::Required => {
+            if bundle.components.len() != bundle.contracts.len()
+                || bundle.components.len() != bundle.type_sidecars.len()
+            {
+                bail!(
+                    "required OHOS facade bundle must bind every component to one contract and one canonical type sidecar"
+                );
+            }
+            let sidecars = bundle
+                .type_sidecars
+                .iter()
+                .map(|entry| (entry.file.as_str(), entry))
+                .collect::<BTreeMap<_, _>>();
+            for component in &bundle.components {
+                let contract =
+                    read_installed_bundle_component_contract(type_dir, bundle, component)?;
+                let input_stream_type = RawInputStreamTypeExpectation::from_contract(&contract);
+                let sidecar_file = format!("{}.ohos-extra-types.d.ts", component.component);
+                let entry = sidecars.get(sidecar_file.as_str()).with_context(|| {
+                    format!(
+                        "OHOS facade bundle component `{}` is missing canonical sidecar `{sidecar_file}`",
+                        component.component
+                    )
+                })?;
+                let path = type_dir.join(&entry.file);
+                let bytes = read_verified_regular_file(&path)?;
+                let actual = sha256_bytes(&bytes);
+                if actual != entry.sha256 {
+                    bail!("OHOS canonical type sidecar changed after bundle installation: {path}");
+                }
+                parsed_type_defs.extend(parse_canonical_ohos_type_defs(
+                    &bytes,
+                    path.as_str(),
+                    &input_stream_type,
+                )?);
+                type_definitions.push(serde_json::json!({
+                    "file": entry.file,
+                    "sha256": actual,
+                }));
+                contracts.push(serde_json::json!({
+                    "file": component.contract_file,
+                    "sha256": component.contract_sha256,
+                }));
+            }
+        }
     }
     validate_raw_type_def_uniqueness(&parsed_type_defs)?;
-    let mut contracts = Vec::new();
-    for entry in &bundle.contracts {
-        let path = type_dir.join(&entry.file);
-        let bytes = read_verified_regular_file(&path)?;
-        let actual = sha256_bytes(&bytes);
-        if actual != entry.sha256 {
-            bail!("OHOS facade contract changed after bundle installation: {path}");
-        }
-        contracts.push(serde_json::json!({
-            "file": entry.file,
-            "sha256": actual,
-        }));
-    }
     type_definitions.sort_by(|left, right| left["file"].as_str().cmp(&right["file"].as_str()));
     contracts.sort_by(|left, right| left["file"].as_str().cmp(&right["file"].as_str()));
     let inventory = serde_json::json!({
@@ -5263,7 +5419,11 @@ fn stage_component_facade_modules(
             .file_name()
             .context("OHOS component facade lacks a filename")?;
         let namespace = name
-            .strip_suffix(".d.ts")
+            // `.d.ets` is the ArkTS declaration extension that Hvigor keeps
+            // in Interface HARs. Match it before `.ets`, otherwise a valid
+            // `component.d.ets` would be misparsed as namespace
+            // `component.d`.
+            .strip_suffix(".d.ets")
             .or_else(|| name.strip_suffix(".ets"))
             .with_context(|| format!("unsafe OHOS component facade filename `{name}`"))?;
         validate_arkts_export_identifier(namespace)?;
@@ -5529,7 +5689,11 @@ fn copy_dist_to_package_libs(
         let Some(name) = source.file_name() else {
             continue;
         };
-        if name == "native-facade.d.ts" {
+        // Component facades are already staged under `src/main/ets/components`
+        // as ArkTS sources.  They are not native ABI directories and must not
+        // be copied beneath `libs`, where HSP inventory validation accepts
+        // only ABI directories containing `.so` files.
+        if name == "native-facade.d.ts" || name == "component-facades" {
             continue;
         }
         if file_type.is_symlink() {
@@ -7058,7 +7222,8 @@ struct FacadeComponentModule {
 struct ComponentStreamValueBinding {
     public: String,
     internal: String,
-    /// Classes need a source-level type alias alongside their value alias.
+    /// Classes use imported local bindings and re-exports rather than
+    /// ArkTS-unsafe aliases.
     is_class: bool,
 }
 
@@ -7067,6 +7232,11 @@ struct ComponentStreamProjection {
     values: Vec<ComponentStreamValueBinding>,
     /// `(public name, native-facade export)` aliases for shared stream types.
     types: Vec<(String, String)>,
+    /// Public stream factory names and callable types emitted in both the
+    /// implementation and declaration surfaces. These are deliberately
+    /// tracked alongside the projection rather than recovered from a second
+    /// contract traversal so that declaration coverage is exact.
+    explicit_value_declarations: BTreeMap<String, String>,
     declarations: String,
     foreign_namespaces: BTreeSet<String>,
 }
@@ -7200,16 +7370,17 @@ impl FacadeExports {
                 "export const {callable}: {function_type} = native.{callable};\n"
             ));
         }
-        out.push_str(&self.streams.render_native_facade(contract_digest));
+        out.push_str(
+            &self
+                .streams
+                .render_native_facade(contract_digest, self.has_owned_projection()),
+        );
         out
     }
 
     fn render_package_index(&self) -> String {
-        if self.is_composite_projection() {
-            return self.render_component_root_index();
-        }
         if self.has_owned_projection() {
-            return self.render_single_component_root_index();
+            return self.render_component_root_index();
         }
         let mut names = self
             .classes
@@ -7234,10 +7405,6 @@ impl FacadeExports {
         let type_exports = self.type_exports();
         append_explicit_type_reexport(&mut out, &type_exports, "./src/main/ets/native-facade");
         out
-    }
-
-    fn is_composite_projection(&self) -> bool {
-        self.owned_defs.len() > 1
     }
 
     fn has_owned_projection(&self) -> bool {
@@ -7290,6 +7457,20 @@ impl FacadeExports {
                 internal: names.stream_factory,
                 is_class: false,
             });
+            if result
+                .explicit_value_declarations
+                .insert(
+                    output.stream_factory.clone(),
+                    component_output_callable_type(output, projection),
+                )
+                .is_some()
+            {
+                bail!(
+                    "Harmony component namespace `{}` has duplicate stream factory declaration `{}`",
+                    projection.namespace,
+                    output.stream_factory,
+                );
+            }
             if expose_pull_class {
                 result.values.push(ComponentStreamValueBinding {
                     public: output.pull_class.clone(),
@@ -7331,6 +7512,17 @@ impl FacadeExports {
                     internal,
                     is_class: public != &input.factory,
                 });
+            }
+            if result
+                .explicit_value_declarations
+                .insert(input.factory.clone(), component_input_callable_type(input))
+                .is_some()
+            {
+                bail!(
+                    "Harmony component namespace `{}` has duplicate input stream factory declaration `{}`",
+                    projection.namespace,
+                    input.factory,
+                );
             }
             result
                 .declarations
@@ -7376,9 +7568,6 @@ impl FacadeExports {
     }
 
     fn component_modules(&self) -> Result<Vec<FacadeComponentModule>> {
-        if !self.is_composite_projection() {
-            return Ok(Vec::new());
-        }
         let mut modules = Vec::new();
         for owned in &self.owned_defs {
             let stream_projection = self.component_stream_projection(&owned.projection, true)?;
@@ -7403,30 +7592,16 @@ impl FacadeExports {
                     named_type_replacements.insert(def.name.clone(), public);
                 }
             }
-            let stream_explicit_declarations = self
-                .streams
-                .contracts
-                .iter()
-                .find(|contract| contract.component == owned.projection.component)
-                .map(|contract| {
-                    contract
-                        .output_streams
-                        .iter()
-                        .map(|output| output.stream_factory.clone())
-                        .chain(contract.input_streams.iter().flat_map(|input| {
-                            [
-                                input.writer_class.clone(),
-                                input.source_class.clone(),
-                                input.channel_class.clone(),
-                                input.factory.clone(),
-                            ]
-                        }))
-                        .collect::<BTreeSet<_>>()
-                })
-                .unwrap_or_default();
+            // Every stream factory has a hand-written public declaration in
+            // `stream_projection.declarations`, where raw bridge types are
+            // replaced with component-local names. Stream classes are
+            // re-exported below, so they must not also be redeclared here.
+            // In particular, never fall back to `typeof` in a `.d.ets` file:
+            // ArkTS rejects type queries there.
             let mut bindings = owned.public_bindings()?;
             bindings.retain(|binding| {
-                !(binding.raw.kind == "fn" && self.streams.hides_package_value(&binding.raw.name))
+                !self.streams.hides_package_def(&binding.raw)
+                    && !self.streams.hides_package_type_name(&binding.raw.name)
             });
             bindings.sort_by(|left, right| left.short.cmp(&right.short));
             let mut values = BTreeMap::<String, &'static str>::new();
@@ -7478,28 +7653,29 @@ impl FacadeExports {
                     types.insert(binding.public.clone());
                 }
             }
-            let value_bindings = bindings
+            let callable_bindings = bindings
                 .iter()
-                .filter(|binding| matches!(binding.raw.kind.as_str(), "fn" | "struct"))
+                .filter(|binding| binding.raw.kind == "fn")
+                .collect::<Vec<_>>();
+            let class_bindings = bindings
+                .iter()
+                .filter(|binding| binding.raw.kind == "struct")
                 .collect::<Vec<_>>();
             let type_bindings = bindings
                 .iter()
                 .filter(|binding| {
                     matches!(
                         binding.raw.kind.as_str(),
-                        "interface" | "string_enum" | "type" | "struct"
+                        "interface" | "string_enum" | "type"
                     )
                 })
                 .collect::<Vec<_>>();
-            let type_import_bindings = type_bindings
-                .iter()
-                .copied()
-                .filter(|binding| binding.raw.kind != "struct")
-                .collect::<Vec<_>>();
+            let type_import_bindings = type_bindings.clone();
             let stream_value_imports = stream_projection
                 .values
                 .iter()
                 .enumerate()
+                .filter(|(_, binding)| !binding.is_class)
                 .map(|(index, binding)| {
                     let imported = if binding.internal == binding.public {
                         format!("__uniffi_component_stream_value_{index}")
@@ -7508,6 +7684,11 @@ impl FacadeExports {
                     };
                     (binding, imported)
                 })
+                .collect::<Vec<_>>();
+            let stream_class_reexports = stream_projection
+                .values
+                .iter()
+                .filter(|binding| binding.is_class)
                 .collect::<Vec<_>>();
             let stream_type_imports = stream_projection
                 .types
@@ -7524,9 +7705,9 @@ impl FacadeExports {
                 .collect::<Vec<_>>();
             let mut source =
                 String::from("// AUTOGENERATED by UniFFI (Harmony component facade).\n");
-            if !value_bindings.is_empty() {
+            if !callable_bindings.is_empty() {
                 source.push_str("import {\n");
-                for binding in &value_bindings {
+                for binding in &callable_bindings {
                     source.push_str(&format!("  {},\n", binding.raw.name));
                 }
                 source.push_str("} from \"../native-facade\";\n");
@@ -7538,6 +7719,25 @@ impl FacadeExports {
                         source.push_str(&format!("  {},\n", binding.internal));
                     } else {
                         source.push_str(&format!("  {} as {},\n", binding.internal, imported));
+                    }
+                }
+                source.push_str("} from \"../native-facade\";\n");
+            }
+            if !class_bindings.is_empty() || !stream_class_reexports.is_empty() {
+                source.push_str("import {\n");
+                for binding in &class_bindings {
+                    if binding.raw.name == binding.short {
+                        source.push_str(&format!("  {},\n", binding.raw.name));
+                    } else {
+                        source.push_str(&format!("  {} as {},\n", binding.raw.name, binding.short));
+                    }
+                }
+                for binding in &stream_class_reexports {
+                    if binding.internal == binding.public {
+                        source.push_str(&format!("  {},\n", binding.internal));
+                    } else {
+                        source
+                            .push_str(&format!("  {} as {},\n", binding.internal, binding.public));
                     }
                 }
                 source.push_str("} from \"../native-facade\";\n");
@@ -7565,44 +7765,63 @@ impl FacadeExports {
                     "import type * as {namespace} from \"./{namespace}\";\n"
                 ));
             }
-            if !value_bindings.is_empty()
+            if !callable_bindings.is_empty()
                 || !stream_value_imports.is_empty()
+                || !class_bindings.is_empty()
+                || !stream_class_reexports.is_empty()
                 || !type_import_bindings.is_empty()
                 || !stream_type_imports.is_empty()
                 || !foreign_namespaces.is_empty()
             {
                 source.push('\n');
             }
-            for binding in &value_bindings {
-                source.push_str(&format!(
-                    "export const {} = {};\n",
-                    binding.short, binding.raw.name
-                ));
+            // ArkTS resolves exported callable annotation names in source
+            // order. Publish classes before any explicitly typed callable can
+            // mention them, including stream input channel/source classes.
+            for binding in &class_bindings {
+                source.push_str(&format!("export {{ {} }};\n", binding.short));
+            }
+            for binding in &stream_class_reexports {
+                source.push_str(&format!("export {{ {} }};\n", binding.public));
             }
             for binding in &type_bindings {
+                let type_parameters = render_type_parameters(&binding.raw.type_parameters);
                 source.push_str(&format!(
-                    "export type {} = {};\n",
-                    binding.short, binding.raw.name
+                    "export type {}{} = {}{};\n",
+                    binding.short, type_parameters, binding.raw.name, type_parameters
                 ));
-            }
-            for (binding, imported) in &stream_value_imports {
-                source.push_str(&format!(
-                    "export const {} = {};\n",
-                    binding.public, imported
-                ));
-                if binding.is_class {
-                    source.push_str(&format!("export type {} = {};\n", binding.public, imported));
-                }
             }
             for ((public, _), imported) in &stream_type_imports {
                 source.push_str(&format!("export type {public}<T> = {imported}<T>;\n"));
             }
+            for binding in &callable_bindings {
+                let raw_type = self
+                    .callable_types
+                    .get(&binding.raw.name)
+                    .expect("validated Harmony callable type is present");
+                source.push_str(&format!(
+                    "export const {}: {} = {};\n",
+                    binding.short,
+                    component_callable_public_type(raw_type, &named_type_replacements),
+                    binding.raw.name,
+                ));
+            }
+            for (binding, imported) in &stream_value_imports {
+                let callable_type = stream_projection
+                    .explicit_value_declarations
+                    .get(&binding.public)
+                    .expect("every projected stream callable has an explicit declaration");
+                source.push_str(&format!(
+                    "export const {}: {} = {};\n",
+                    binding.public, callable_type, imported
+                ));
+            }
 
             let mut declarations =
                 String::from("// AUTOGENERATED by UniFFI (Harmony component declarations).\n");
-            if !value_bindings.is_empty() {
+            if !callable_bindings.is_empty() {
                 declarations.push_str("import {\n");
-                for binding in &value_bindings {
+                for binding in &callable_bindings {
                     declarations.push_str(&format!("  {},\n", binding.raw.name));
                 }
                 declarations.push_str("} from \"../native-facade\";\n");
@@ -7615,6 +7834,26 @@ impl FacadeExports {
                     } else {
                         declarations
                             .push_str(&format!("  {} as {},\n", binding.internal, imported));
+                    }
+                }
+                declarations.push_str("} from \"../native-facade\";\n");
+            }
+            if !class_bindings.is_empty() || !stream_class_reexports.is_empty() {
+                declarations.push_str("import {\n");
+                for binding in &class_bindings {
+                    if binding.raw.name == binding.short {
+                        declarations.push_str(&format!("  {},\n", binding.raw.name));
+                    } else {
+                        declarations
+                            .push_str(&format!("  {} as {},\n", binding.raw.name, binding.short));
+                    }
+                }
+                for binding in &stream_class_reexports {
+                    if binding.internal == binding.public {
+                        declarations.push_str(&format!("  {},\n", binding.internal));
+                    } else {
+                        declarations
+                            .push_str(&format!("  {} as {},\n", binding.internal, binding.public));
                     }
                 }
                 declarations.push_str("} from \"../native-facade\";\n");
@@ -7642,50 +7881,51 @@ impl FacadeExports {
                     "import type * as {namespace} from \"./{namespace}\";\n"
                 ));
             }
-            if !value_bindings.is_empty()
+            if !callable_bindings.is_empty()
                 || !stream_value_imports.is_empty()
+                || !class_bindings.is_empty()
+                || !stream_class_reexports.is_empty()
                 || !type_import_bindings.is_empty()
                 || !stream_type_imports.is_empty()
                 || !foreign_namespaces.is_empty()
             {
                 declarations.push('\n');
             }
-            for binding in &value_bindings {
-                if binding.raw.kind == "fn" {
-                    let raw_type = self
-                        .callable_types
-                        .get(&binding.raw.name)
-                        .expect("validated Harmony callable type is present");
-                    declarations.push_str(&format!(
-                        "export declare const {}: {};\n",
-                        binding.short,
-                        component_callable_public_type(raw_type, &named_type_replacements)
-                    ));
-                } else {
-                    declarations.push_str(&format!(
-                        "export declare const {}: typeof {};\n",
-                        binding.short, binding.raw.name
-                    ));
-                }
+            for binding in &callable_bindings {
+                let raw_type = self
+                    .callable_types
+                    .get(&binding.raw.name)
+                    .expect("validated Harmony callable type is present");
+                declarations.push_str(&format!(
+                    "export declare const {}: {};\n",
+                    binding.short,
+                    component_callable_public_type(raw_type, &named_type_replacements)
+                ));
+            }
+            for binding in &class_bindings {
+                declarations.push_str(&format!("export {{ {} }};\n", binding.short));
             }
             for binding in &type_bindings {
+                let type_parameters = render_type_parameters(&binding.raw.type_parameters);
                 declarations.push_str(&format!(
-                    "export type {} = {};\n",
-                    binding.short, binding.raw.name
+                    "export type {}{} = {}{};\n",
+                    binding.short, type_parameters, binding.raw.name, type_parameters
                 ));
             }
-            for (binding, imported) in &stream_value_imports {
-                if stream_explicit_declarations.contains(&binding.public) {
-                    continue;
+            for (binding, _) in &stream_value_imports {
+                if !stream_projection
+                    .explicit_value_declarations
+                    .contains_key(&binding.public)
+                {
+                    bail!(
+                        "Harmony component namespace `{}` has stream callable `{}` without an explicit ArkTS declaration",
+                        owned.projection.namespace,
+                        binding.public,
+                    );
                 }
-                declarations.push_str(&format!(
-                    "export declare const {}: typeof {};\n",
-                    binding.public, imported
-                ));
-                if binding.is_class {
-                    declarations
-                        .push_str(&format!("export type {} = {};\n", binding.public, imported));
-                }
+            }
+            for binding in &stream_class_reexports {
+                declarations.push_str(&format!("export {{ {} }};\n", binding.public));
             }
             for ((public, _), imported) in &stream_type_imports {
                 declarations.push_str(&format!("export type {public}<T> = {imported}<T>;\n"));
@@ -7743,91 +7983,6 @@ impl FacadeExports {
         out
     }
 
-    fn render_single_component_root_index(&self) -> String {
-        self.render_single_component_root(false)
-    }
-
-    fn render_single_component_root_declarations(&self) -> String {
-        self.render_single_component_root(true)
-    }
-
-    fn render_single_component_root(&self, declaration: bool) -> String {
-        let owned = self
-            .owned_defs
-            .first()
-            .expect("single owned projection requires one component");
-        let stream_projection = self
-            .component_stream_projection(&owned.projection, false)
-            .expect("validated single component stream projection");
-        let mut values = BTreeMap::<String, String>::new();
-        let mut types = BTreeMap::<String, String>::new();
-        for binding in owned
-            .public_bindings()
-            .expect("validated single component public bindings")
-        {
-            if binding.raw.kind == "fn" && self.streams.hides_package_value(&binding.raw.name) {
-                continue;
-            }
-            if self.streams.hides_package_type_name(&binding.raw.name) {
-                continue;
-            }
-            match binding.raw.kind.as_str() {
-                "fn" | "struct" => {
-                    values.insert(binding.short, binding.raw.name);
-                }
-                "interface" | "string_enum" | "type" => {
-                    types.insert(binding.short, binding.raw.name);
-                }
-                other => panic!("validated single component has unsupported raw kind {other}"),
-            }
-        }
-        for binding in stream_projection.values {
-            if values
-                .insert(binding.public.clone(), binding.internal)
-                .is_some()
-            {
-                panic!(
-                    "validated single component has a duplicate stream value `{}`",
-                    binding.public
-                );
-            }
-        }
-        for (public, internal) in stream_projection.types {
-            if types.insert(public.clone(), internal).is_some() {
-                panic!("validated single component has a duplicate stream type `{public}`");
-            }
-        }
-        let mut out = if declaration {
-            String::from(TYPE_HEADER)
-        } else {
-            String::from("// AUTOGENERATED by UniFFI (Harmony package entry).\n")
-        };
-        let module = "./src/main/ets/native-facade";
-        if !values.is_empty() {
-            out.push_str("export {\n");
-            for (public, internal) in values {
-                if public == internal {
-                    out.push_str(&format!("  {internal},\n"));
-                } else {
-                    out.push_str(&format!("  {internal} as {public},\n"));
-                }
-            }
-            out.push_str(&format!("}} from \"{module}\";\n"));
-        }
-        if !types.is_empty() {
-            out.push_str("export type {\n");
-            for (public, internal) in types {
-                if public == internal {
-                    out.push_str(&format!("  {internal},\n"));
-                } else {
-                    out.push_str(&format!("  {internal} as {public},\n"));
-                }
-            }
-            out.push_str(&format!("}} from \"{module}\";\n"));
-        }
-        out
-    }
-
     fn type_exports(&self) -> Vec<String> {
         self.streams
             .native_types
@@ -7873,16 +8028,10 @@ fn render_harmony_declaration_surfaces(
     exports: &FacadeExports,
 ) -> HarmonyDeclarationSurfaces {
     let native = render_index_d_ts(exports.native_type_defs(defs));
-    if exports.is_composite_projection() {
-        return HarmonyDeclarationSurfaces {
-            native,
-            package_public: exports.render_component_root_declarations(),
-        };
-    }
     if exports.has_owned_projection() {
         return HarmonyDeclarationSurfaces {
             native,
-            package_public: exports.render_single_component_root_declarations(),
+            package_public: exports.render_component_root_declarations(),
         };
     }
     let mut package_public = render_index_d_ts(exports.package_public_defs(defs));
@@ -7923,7 +8072,7 @@ fn write_component_facade_modules(
             )
         })?;
         std::fs::write(
-            root.join(format!("{}.d.ts", module.namespace)),
+            root.join(format!("{}.d.ets", module.namespace)),
             &module.declarations,
         )
         .with_context(|| {
@@ -8354,6 +8503,21 @@ fn load_facade_type_inventory(type_dir: &Utf8Path) -> Result<FacadeTypeInventory
                     "required OHOS facade inventory type sidecars must exactly match its component identities"
                 );
             }
+            let expected_contracts = inventory
+                .components
+                .iter()
+                .map(|component| component.contract_file.clone())
+                .collect::<BTreeSet<_>>();
+            let actual_contracts = inventory
+                .contracts
+                .iter()
+                .map(|entry| entry.file.clone())
+                .collect::<BTreeSet<_>>();
+            if actual_contracts != expected_contracts {
+                bail!(
+                    "required OHOS facade inventory contracts must exactly match their component contractFile bindings"
+                );
+            }
         }
         other => bail!("unknown OHOS facade mode `{other}`"),
     }
@@ -8371,17 +8535,61 @@ fn load_harmony_facade_contracts(
     type_dir: &Utf8Path,
     inventory: &FacadeTypeInventory,
 ) -> Result<Vec<HarmonyFacadeContract>> {
+    if inventory.facade_mode == "raw-only" {
+        return Ok(Vec::new());
+    }
     let mut contracts = Vec::new();
-    for entry in &inventory.contracts {
-        let contract_path = type_dir.join(&entry.file);
-        let bytes = read_verified_regular_file(&contract_path)?;
-        if sha256_bytes(&bytes) != entry.sha256 {
-            bail!("OHOS facade contract changed before consumption: {contract_path}");
-        }
-        contracts.push(parse_harmony_facade_contract(&bytes, &contract_path)?);
+    for component in &inventory.components {
+        contracts.push(read_inventory_component_contract(
+            type_dir, inventory, component,
+        )?);
     }
     contracts.sort_by(|a, b| a.component.cmp(&b.component));
     Ok(contracts)
+}
+
+/// Resolve the declaration consumer's input-stream allowance through the
+/// exact `contractFile` recorded for this component.  The cache inventory is
+/// checksummed, but its sidecar is not permitted to select a contract by
+/// filename suffix, logical name, or bridge sentinel.
+fn read_inventory_component_contract(
+    type_dir: &Utf8Path,
+    inventory: &FacadeTypeInventory,
+    component: &HostFacadeComponentIdentity,
+) -> Result<HarmonyFacadeContract> {
+    let entry = inventory
+        .contracts
+        .iter()
+        .find(|entry| entry.file == component.contract_file)
+        .with_context(|| {
+            format!(
+                "OHOS facade inventory component `{}` references a missing contract `{}`",
+                component.component, component.contract_file
+            )
+        })?;
+    if entry.sha256 != component.contract_sha256 {
+        bail!(
+            "OHOS facade inventory component `{}` has a mismatched contract checksum for `{}`",
+            component.component,
+            component.contract_file
+        );
+    }
+    let contract_path = type_dir.join(&entry.file);
+    let bytes = read_verified_regular_file(&contract_path)?;
+    if sha256_bytes(&bytes) != entry.sha256 {
+        bail!("OHOS facade contract changed before consumption: {contract_path}");
+    }
+    let contract = parse_harmony_facade_contract(&bytes, &contract_path)?;
+    if contract.component != component.component
+        || contract.namespace != component.namespace
+        || contract.native_export_prefix != component.native_export_prefix
+    {
+        bail!(
+            "OHOS facade inventory component `{}` does not exactly match its contract identity",
+            component.component
+        );
+    }
+    Ok(contract)
 }
 
 fn validate_compiled_bridge_identities(
@@ -9929,7 +10137,11 @@ impl HarmonyStreamFacade {
         inputs
     }
 
-    fn render_native_facade(&self, contract_digest: Option<&str>) -> String {
+    fn render_native_facade(
+        &self,
+        contract_digest: Option<&str>,
+        export_owned_pull_classes: bool,
+    ) -> String {
         let mut out = String::new();
         let has_contract_anchor = contract_digest.is_some();
         if let Some(contract_digest) = contract_digest {
@@ -10389,7 +10601,7 @@ abstract class __UniFfiInputSource<T, E, N> {
                 &contract.native_export_prefix,
                 &self.owner_native_export_prefixes,
                 self.canonical_raw_stream_names,
-                self.is_composite(),
+                self.is_composite() || export_owned_pull_classes,
                 has_contract_anchor,
             ));
         }
@@ -10698,49 +10910,34 @@ fn render_component_output_declarations(
     )
 }
 
+fn component_output_callable_type(
+    output: &HarmonyOutputStreamContract,
+    current: &FacadeComponentProjection,
+) -> String {
+    format!(
+        "({}) => UniFfiStream<{}>",
+        component_harmony_arguments(&output.arguments, current),
+        component_descriptor_public_type(&output.item_type, current),
+    )
+}
+
 fn render_component_input_declarations(
     input: &HarmonyInputStreamContract,
     current: &FacadeComponentProjection,
 ) -> String {
-    let item_type = component_descriptor_public_type(&input.item_type, current);
-    let error_type = component_descriptor_public_type(&input.error_type, current);
-    let raw_prefix = format!("{}_", current.native_export_prefix);
-    let next_type = input
-        .next_type
-        .strip_prefix(&raw_prefix)
-        .unwrap_or(&input.next_type);
+    let _ = current;
     format!(
         r#"
 
-export declare class {source_class} {{
-  readonly handle: number;
-  next(error: Error | null, handle: number): Promise<{next_type}>;
-  cancel(error: Error | null, handle: number): void;
-}}
-
-export declare class {writer_class} {{
-  constructor(source: {source_class});
-  write(item: {item_type}): Promise<void>;
-  end(): void;
-  fail(error: UniFfiInputFailure<{error_type}>): void;
-}}
-
-export declare class {channel_class} {{
-  writer: {writer_class};
-  source: {source_class};
-  constructor();
-}}
-
 export declare function {factory}(): {channel_class};
 "#,
-        source_class = input.source_class,
-        next_type = next_type,
-        writer_class = input.writer_class,
-        item_type = item_type,
-        error_type = error_type,
         channel_class = input.channel_class,
         factory = input.factory,
     )
+}
+
+fn component_input_callable_type(input: &HarmonyInputStreamContract) -> String {
+    format!("() => {}", input.channel_class)
 }
 
 fn harmony_native_facade_arguments(
@@ -11131,25 +11328,81 @@ struct CanonicalOhosTypeDef {
     type_parameters: Vec<String>,
 }
 
+/// The raw input-stream declaration is the sole generic OHOS sidecar type.
+/// Its exact name is owned by the checked facade contract for one component;
+/// it is never recovered from a sidecar suffix, bridge sentinel, or an
+/// unqualified legacy type name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawInputStreamTypeExpectation {
+    name: String,
+    required: bool,
+}
+
+impl RawInputStreamTypeExpectation {
+    fn from_contract(contract: &HarmonyFacadeContract) -> Self {
+        Self {
+            name: uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_stream_type_for_prefix(
+                &contract.native_export_prefix,
+            ),
+            required: !contract.input_streams.is_empty(),
+        }
+    }
+
+    fn validate_coverage(&self, count: usize, path: &str) -> Result<()> {
+        if self.required && count != 1 {
+            bail!(
+                "canonical OHOS type sidecar {path} must declare exactly one raw input-stream type `{}` because its owning facade contract declares inputStreams",
+                self.name
+            );
+        }
+        Ok(())
+    }
+}
+
 impl CanonicalOhosTypeDef {
-    fn validate_producer_shape(&self) -> Result<()> {
-        if self.name == "UniffiInputStream" {
+    fn validate_producer_shape(
+        &self,
+        input_stream_type: Option<&RawInputStreamTypeExpectation>,
+    ) -> Result<bool> {
+        let Some(input_stream_type) = input_stream_type else {
+            if self.name == "UniffiInputStream" {
+                bail!(
+                    "canonical OHOS raw input-stream type `UniffiInputStream` has no owning facade contract"
+                );
+            }
+            if self.type_parameters.is_empty() {
+                return Ok(false);
+            }
+            bail!(
+                "canonical OHOS type `{}` must not declare typeParameters without an owning facade contract",
+                self.name
+            );
+        };
+        if self.name == input_stream_type.name {
+            if !input_stream_type.required {
+                bail!(
+                    "canonical OHOS raw input-stream type `{}` is not allowed because its owning facade contract declares no inputStreams",
+                    input_stream_type.name
+                );
+            }
             if self.kind == OhosTypeDefKind::Interface
                 && self.type_parameters.len() == 1
                 && self.type_parameters[0] == "T"
             {
-                return Ok(());
+                return Ok(true);
             }
             bail!(
-                "canonical OHOS type `UniffiInputStream` must be an interface with exact typeParameters [\"T\"]"
+                "canonical OHOS raw input-stream type `{}` must be an interface with exact typeParameters [\"T\"]",
+                input_stream_type.name
             );
         }
         if self.type_parameters.is_empty() {
-            Ok(())
+            Ok(false)
         } else {
             bail!(
-                "canonical OHOS type `{}` must not declare typeParameters; only `UniffiInputStream` may use exact [\"T\"]",
-                self.name
+                "canonical OHOS type `{}` must not declare typeParameters; only raw input-stream type `{}` from its owning facade contract may use exact [\"T\"]",
+                self.name,
+                input_stream_type.name
             )
         }
     }
@@ -11166,8 +11419,13 @@ impl From<CanonicalOhosTypeDef> for TypeDefLine {
     }
 }
 
-fn parse_canonical_ohos_type_defs(source: &[u8], path: &str) -> Result<Vec<TypeDefLine>> {
+fn parse_canonical_ohos_type_defs(
+    source: &[u8],
+    path: &str,
+    input_stream_type: &RawInputStreamTypeExpectation,
+) -> Result<Vec<TypeDefLine>> {
     let mut definitions = Vec::new();
+    let mut input_stream_type_count = 0usize;
     for (line_number, line) in BufReader::new(Cursor::new(source)).lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -11185,9 +11443,12 @@ fn parse_canonical_ohos_type_defs(source: &[u8], path: &str) -> Result<Vec<TypeD
                 line_number + 1
             )
         })?;
-        definition.validate_producer_shape()?;
+        if definition.validate_producer_shape(Some(input_stream_type))? {
+            input_stream_type_count += 1;
+        }
         definitions.push(definition.into());
     }
+    input_stream_type.validate_coverage(input_stream_type_count, path)?;
     validate_raw_type_def_uniqueness(&definitions)?;
     Ok(definitions)
 }
@@ -11292,7 +11553,9 @@ fn collect_owned_type_defs(
         if sha256_bytes(&bytes) != entry.sha256 {
             bail!("OHOS type definition changed before consumption: {path}");
         }
-        let defs = parse_canonical_ohos_type_defs(&bytes, &path.to_string())?;
+        let contract = read_inventory_component_contract(type_dir, inventory, component)?;
+        let input_stream_type = RawInputStreamTypeExpectation::from_contract(&contract);
+        let defs = parse_canonical_ohos_type_defs(&bytes, &path.to_string(), &input_stream_type)?;
         owned.push(OwnedFacadeTypeDefs::new(component, defs)?);
     }
     let flattened = owned
@@ -11313,7 +11576,7 @@ fn parse_type_def_line(line: &str) -> Result<Option<TypeDefLine>> {
     })?;
     let definition: CanonicalOhosTypeDef = serde_json::from_str(record)
         .with_context(|| format!("parsing exact OHOS type definition JSON line: {trimmed}"))?;
-    definition.validate_producer_shape()?;
+    definition.validate_producer_shape(None)?;
     Ok(Some(definition.into()))
 }
 
