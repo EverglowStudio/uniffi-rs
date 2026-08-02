@@ -29,7 +29,10 @@ pub(crate) enum JavascriptCommands {
     /// downstream only needs one ABI.
     Build(BuildArgs),
 
-    /// Build JavaScript + wasm bindings, emit the wasm host crate, and run wasm-bindgen.
+    /// Build JavaScript + wasm bindings, emit the wasm host crate, and run
+    /// UniFFI's in-process `wasm-bindgen-cli-support` runner.
+    ///
+    /// This does not invoke or require an external `wasm-bindgen` executable.
     ///
     /// This path targets downstream crates whose generated wasm host crate can
     /// directly call the Rust API described by the chosen UDL/library input.
@@ -44,7 +47,7 @@ pub(crate) enum JavascriptCommands {
 
 #[derive(Clone, Args)]
 pub(crate) struct BuildArgs {
-    /// Downstream core crate Cargo.toml.
+    /// Root package Cargo manifest.
     #[clap(long = "manifest-path")]
     manifest_path: Utf8PathBuf,
 
@@ -53,14 +56,14 @@ pub(crate) struct BuildArgs {
     out_dir: Utf8PathBuf,
 
     /// Optional override for the library/cdylib path used for JS generation.
-    /// When omitted, the command builds the crate at --manifest-path and derives
+    /// When omitted, the command builds the root package at --manifest-path and derives
     /// the cdylib location from Cargo metadata.
     #[clap(long = "library-path")]
     library_path: Option<Utf8PathBuf>,
 
     /// Optional UDL or source input passed directly to the JS generator.
     /// When set, this overrides the built-library path for generation, but
-    /// the downstream core crate is still built as part of the orchestration.
+    /// the root package is still built as part of the orchestration.
     #[clap(long)]
     source: Option<Utf8PathBuf>,
 
@@ -68,11 +71,13 @@ pub(crate) struct BuildArgs {
     #[clap(long = "host-crates-dir", default_value = "rust_modules")]
     host_crates_dir: Utf8PathBuf,
 
-    /// Directory for built non-source artifacts such as wasm-bindgen pkg and `.node` addons.
+    /// Directory for built non-source artifacts. With it, wasm-bindgen output
+    /// defaults to `<artifact-dir>/browser/pkg`; otherwise it uses `<out-dir>/browser/pkg`.
     #[clap(long = "artifact-dir")]
     artifact_dir: Option<Utf8PathBuf>,
 
-    /// Where to write the wasm-bindgen output tree. Defaults to `<out-dir>/browser/pkg`.
+    /// Where to write the wasm-bindgen output tree. Defaults to
+    /// `<artifact-dir>/browser/pkg` when --artifact-dir is set, otherwise `<out-dir>/browser/pkg`.
     #[clap(long = "wasm-bindgen-out-dir")]
     wasm_bindgen_out_dir: Option<Utf8PathBuf>,
 
@@ -96,11 +101,11 @@ pub(crate) struct BuildArgs {
     #[clap(long = "wasm-target-dir")]
     wasm_target_dir: Option<Utf8PathBuf>,
 
-    /// Build the downstream core crate and generated host crates in release mode.
+    /// Build the root package and generated host crates in release mode.
     #[clap(long)]
     release: bool,
 
-    /// Cargo features enabled on the downstream core crate. May be repeated or comma-separated.
+    /// Cargo features enabled on the root package. May be repeated or comma-separated.
     #[clap(long = "cargo-feature", value_delimiter = ',')]
     cargo_features: Vec<String>,
 
@@ -169,7 +174,7 @@ impl BuildArgs {
 
 #[derive(Clone, Args)]
 pub(crate) struct BuildWasmArgs {
-    /// Downstream core crate Cargo.toml.
+    /// Root package Cargo manifest.
     #[clap(long = "manifest-path")]
     pub(crate) manifest_path: Utf8PathBuf,
 
@@ -178,14 +183,14 @@ pub(crate) struct BuildWasmArgs {
     pub(crate) out_dir: Utf8PathBuf,
 
     /// Optional override for the library/cdylib path used for JS generation.
-    /// When omitted, the command builds the crate at --manifest-path and derives
+    /// When omitted, the command builds the root package at --manifest-path and derives
     /// the cdylib location from Cargo metadata.
     #[clap(long = "library-path")]
     pub(crate) library_path: Option<Utf8PathBuf>,
 
     /// Optional UDL or source input passed directly to the JS generator.
     /// When set, this overrides the built-library path for generation, but
-    /// the downstream core crate is still built as part of the orchestration.
+    /// the root package is still built as part of the orchestration.
     #[clap(long)]
     pub(crate) source: Option<Utf8PathBuf>,
 
@@ -196,11 +201,13 @@ pub(crate) struct BuildWasmArgs {
     #[clap(skip)]
     pub(crate) logical_host_crates_dir: Option<Utf8PathBuf>,
 
-    /// Directory for built non-source artifacts. Defaults to `<out-dir>/browser/pkg` for wasm-bindgen output when omitted.
+    /// Directory for built non-source artifacts. With it, wasm-bindgen output
+    /// defaults to `<artifact-dir>/browser/pkg`; otherwise it uses `<out-dir>/browser/pkg`.
     #[clap(long = "artifact-dir")]
     pub(crate) artifact_dir: Option<Utf8PathBuf>,
 
-    /// Where to write the wasm-bindgen output tree. Defaults to `<out-dir>/browser/pkg`.
+    /// Where to write the wasm-bindgen output tree. Defaults to
+    /// `<artifact-dir>/browser/pkg` when --artifact-dir is set, otherwise `<out-dir>/browser/pkg`.
     #[clap(long = "wasm-bindgen-out-dir")]
     pub(crate) wasm_bindgen_out_dir: Option<Utf8PathBuf>,
 
@@ -216,16 +223,16 @@ pub(crate) struct BuildWasmArgs {
     #[clap(long = "target-dir")]
     pub(crate) target_dir: Option<Utf8PathBuf>,
 
-    /// Cargo target directory for the downstream core build. Artifact
+    /// Cargo target directory for the root-package build. Artifact
     /// coordinators always set this outside the generation mirror.
     #[clap(long = "core-target-dir")]
     pub(crate) core_target_dir: Option<Utf8PathBuf>,
 
-    /// Build the downstream core crate and generated wasm host crate in release mode.
+    /// Build the root package and generated wasm host crate in release mode.
     #[clap(long)]
     pub(crate) release: bool,
 
-    /// Cargo features enabled on the downstream core crate. May be repeated or comma-separated.
+    /// Cargo features enabled on the root package. May be repeated or comma-separated.
     #[clap(long = "cargo-feature", value_delimiter = ',')]
     pub(crate) cargo_features: Vec<String>,
 
@@ -248,7 +255,7 @@ pub(crate) struct BuildWasmArgs {
 
 #[derive(Clone, Args)]
 pub(crate) struct BuildNapiArgs {
-    /// Downstream core crate Cargo.toml.
+    /// Root package Cargo manifest.
     #[clap(long = "manifest-path")]
     pub(crate) manifest_path: Utf8PathBuf,
 
@@ -257,14 +264,14 @@ pub(crate) struct BuildNapiArgs {
     pub(crate) out_dir: Utf8PathBuf,
 
     /// Optional override for the library/cdylib path used for JS generation.
-    /// When omitted, the command builds the crate at --manifest-path and derives
+    /// When omitted, the command builds the root package at --manifest-path and derives
     /// the cdylib location from Cargo metadata.
     #[clap(long = "library-path")]
     pub(crate) library_path: Option<Utf8PathBuf>,
 
     /// Optional UDL or source input passed directly to the JS generator.
     /// When set, this overrides the built-library path for generation, but
-    /// the downstream core crate is still built as part of the orchestration.
+    /// the root package is still built as part of the orchestration.
     #[clap(long)]
     pub(crate) source: Option<Utf8PathBuf>,
 
@@ -275,7 +282,9 @@ pub(crate) struct BuildNapiArgs {
     #[clap(skip)]
     pub(crate) logical_host_crates_dir: Option<Utf8PathBuf>,
 
-    /// Directory for built non-source artifacts. Defaults to copying `.node` addons next to generated backend files when omitted.
+    /// Directory for built non-source artifacts. With it, the composite addon
+    /// defaults to `<artifact-dir>/node/<host-stem>.node`; without it,
+    /// source-only single-component output retains its local addon fallback.
     #[clap(long = "artifact-dir")]
     pub(crate) artifact_dir: Option<Utf8PathBuf>,
 
@@ -291,11 +300,11 @@ pub(crate) struct BuildNapiArgs {
     #[clap(long = "target-dir")]
     pub(crate) target_dir: Option<Utf8PathBuf>,
 
-    /// Build the downstream core crate and generated napi host crate in release mode.
+    /// Build the root package and generated N-API host crate in release mode.
     #[clap(long)]
     pub(crate) release: bool,
 
-    /// Cargo features enabled on the downstream core crate. May be repeated or comma-separated.
+    /// Cargo features enabled on the root package. May be repeated or comma-separated.
     #[clap(long = "cargo-feature", value_delimiter = ',')]
     pub(crate) cargo_features: Vec<String>,
 
@@ -318,7 +327,7 @@ pub(crate) struct BuildNapiArgs {
 
 #[derive(Clone, Args)]
 pub(crate) struct BuildOhosArgs {
-    /// Downstream core crate Cargo.toml.
+    /// Root package Cargo manifest.
     #[clap(long = "manifest-path")]
     pub(crate) manifest_path: Utf8PathBuf,
 
@@ -341,7 +350,8 @@ pub(crate) struct BuildOhosArgs {
     #[clap(skip)]
     pub(crate) logical_host_crates_dir: Option<Utf8PathBuf>,
 
-    /// Build an existing OHOS host package or workspace instead of the generated single-package host manifest.
+    /// Use an existing or generated composite OHOS host manifest (package or
+    /// workspace) instead of the default generated composite host manifest.
     #[clap(long = "ohos-host-manifest-path")]
     pub(crate) ohos_host_manifest_path: Option<Utf8PathBuf>,
 
@@ -357,7 +367,8 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "dist-dir")]
     pub(crate) dist_dir: Option<Utf8PathBuf>,
 
-    /// OHPM package name for generated HAR metadata (supports scoped names like `@scope/name`).
+    /// OHPM package name for generated Harmony package metadata (HAR or HSP;
+    /// supports scoped names like `@scope/name`).
     #[clap(long = "package-name")]
     pub(crate) package_name: Option<String>,
 
@@ -365,19 +376,19 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "module-name")]
     pub(crate) module_name: Option<String>,
 
-    /// Semantic version override for generated OHPM package metadata.
+    /// Semantic version override for generated Harmony package metadata.
     #[clap(long = "package-version")]
     pub(crate) package_version: Option<String>,
 
-    /// Author override for generated OHPM package metadata.
+    /// Author override for generated Harmony package metadata.
     #[clap(long = "author")]
     pub(crate) author: Option<String>,
 
-    /// SPDX license override for generated OHPM package metadata.
+    /// SPDX license override for generated Harmony package metadata.
     #[clap(long = "license")]
     pub(crate) license: Option<String>,
 
-    /// Description override for generated OHPM package metadata.
+    /// Description override for generated Harmony package metadata.
     #[clap(long = "description")]
     pub(crate) description: Option<String>,
 
@@ -397,7 +408,7 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "device-type", value_delimiter = ',')]
     pub(crate) device_types: Vec<String>,
 
-    /// Final Harmony package kind. HAR remains the backward-compatible default.
+    /// Final Harmony package kind. HAR is the default; choose HSP explicitly.
     #[clap(long = "package-type", value_enum, default_value = "har")]
     pub(crate) package_kind: super::ohos::PackageKind,
 
@@ -453,7 +464,7 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "target-dir")]
     pub(crate) target_dir: Option<Utf8PathBuf>,
 
-    /// Cargo features enabled on the downstream core crate. May be repeated or comma-separated.
+    /// Cargo features enabled on the root package. May be repeated or comma-separated.
     #[clap(long = "cargo-feature", value_delimiter = ',')]
     pub(crate) cargo_features: Vec<String>,
 
@@ -493,7 +504,7 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "soname")]
     pub(crate) soname: Option<String>,
 
-    /// Build the downstream core crate and generated OHOS host crate in release mode.
+    /// Build the root package and generated OHOS host crate in release mode.
     #[clap(long)]
     pub(crate) release: bool,
 
@@ -1853,7 +1864,7 @@ fn build_ohos_internal(
     // metadata may create/update a missing lockfile, so obviously dangerous
     // outputs such as `--dist-dir .` must fail before invoking Cargo at all.
     // Once metadata is available, repeat the preflight with the complete
-    // workspace/local-source set before the first actual core build.
+    // workspace/local-source set before the first actual root-package build.
     let core_meta = cargo_package_metadata(&manifest_path)?;
     protected_dist_paths.push((
         "downstream Cargo workspace".to_string(),
@@ -3020,7 +3031,7 @@ fn emit_browser_auto_entrypoint(
         r#"// AUTOGENERATED by uniffi_bindgen_javascript (wasm web auto-entrypoint).
 //
 // This file is emitted by `uniffi-bindgen javascript build-wasm`
-// after `wasm-bindgen --target web` has produced the final JS glue
+// after UniFFI's in-process wasm-bindgen runner has produced the final JS glue
 // and `.wasm` asset. Advanced consumers can still import
 // `./index.ts` and call `initBackend(glue, init?)` manually.
 

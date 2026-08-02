@@ -21,7 +21,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-/// Rust stream type supported by the first native stream ABI slice.
+/// Rust stream type supported by the strict native output-stream ABI.
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded")))]
 pub type UniFfiStream<T, E> = Pin<Box<dyn Stream<Item = Result<T, E>> + Send + 'static>>;
 

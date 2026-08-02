@@ -4,10 +4,10 @@
 
 //! First-class JavaScript/TypeScript bindings generator for uniffi-rs.
 //!
-//! This crate emits a single high-level TypeScript API plus one or more
-//! flavor-specific backend adapters (wasm, napi) that satisfy a shared
-//! low-level FFI contract. Electron preload + renderer facades are emitted
-//! as a consumption form of the napi flavor.
+//! This crate emits one high-level TypeScript API per generated component plus
+//! one shared runtime, with flavor-specific backend adapters (wasm, N-API,
+//! and OHOS) that satisfy a shared low-level FFI contract. Electron preload +
+//! renderer facades are emitted as a consumption form of the N-API flavor.
 //!
 //! See `docs/manual/src/javascript/contract.md` for the stable contract
 //! these emitters target.
@@ -59,7 +59,7 @@ pub enum AbiFlavor {
 /// Top-level options for the JavaScript target.
 #[derive(Clone, Debug)]
 pub struct GenerateJsOptions {
-    /// Path to UDL file or compiled cdylib.
+    /// Path to a UDL file or compiled cdylib accepted by the UniFFI loader.
     pub source: Utf8PathBuf,
     /// Output directory. Component sources live below
     /// `components/<namespace>/`; each requested flavor also gets one stable,
@@ -78,7 +78,8 @@ pub struct GenerateJsOptions {
     /// Which flavors / consumption forms to emit.
     pub flavors: Vec<FlavorTarget>,
     /// Opt-in: also emit Rust host crates (`rust_modules/wasm`,
-    /// `rust_modules/napi`) that wrap the per-component bridge files.
+    /// `rust_modules/napi`, and/or `rust_modules/ohos`) that wrap the
+    /// per-component bridge files into package-level composite hosts.
     /// When `None`, behaviour is identical to pre-host-crates invocations.
     pub host_crates: Option<HostCrateOptions>,
 }

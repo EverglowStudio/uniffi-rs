@@ -16,8 +16,8 @@ Configuring the Rust scaffolding ready for WASM binding generators is done by op
 e.g.
 
 ```toml
-[dependendencies]
-uniffi = { version = "0.29.2", features = ["wasm-unstable-single-threaded"]}
+[dependencies]
+uniffi = { version = "0.32", features = ["wasm-unstable-single-threaded"] }
 ```
 
 ## Features
@@ -52,6 +52,26 @@ fn new() -> Arc<Self> {
 ```
 
 Note: as support for WASM threads evolves, this feature is likely to change or go away completely.
+
+## JavaScript wasm builds
+
+The fork-local JavaScript target provides an integrated wasm build path:
+
+```sh
+uniffi-bindgen javascript build-wasm \
+  --manifest-path <root-package>/Cargo.toml \
+  --out-dir <generated>
+```
+
+The command emits the wasm host crate, builds it for `wasm32-unknown-unknown`,
+and runs `wasm-bindgen-cli-support` in process to produce the JavaScript glue.
+An external `wasm-bindgen` executable, its CLI, and a source checkout are not
+prerequisites and are not probed as a reason to skip wasm execution.
+
+The generated host crate and emitted glue still rely on the Rust
+`wasm-bindgen` crate. This distinction matters: the crate/glue are build
+dependencies of the generated result, while the separately installed command
+line tool is not a required UniFFI test or build dependency.
 
 [gloo]: https://crates.io/crates/gloo
 [webdev/thread]: https://web.dev/articles/webassembly-threads#rust
