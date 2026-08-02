@@ -41,7 +41,7 @@ pub(crate) enum ArtifactsCommands {
 
 #[derive(Clone, Args)]
 pub(crate) struct BuildArgs {
-    /// Downstream core crate Cargo.toml.
+    /// Root package Cargo manifest.
     #[clap(long = "manifest-path")]
     manifest_path: Utf8PathBuf,
 
@@ -49,7 +49,8 @@ pub(crate) struct BuildArgs {
     #[clap(long, short)]
     out_dir: Option<Utf8PathBuf>,
 
-    /// Artifact target(s) to build. P0/P1 supports wasm, node, electron, and harmony.
+    /// Artifact target(s) to build: wasm, Mini Program, Node, Electron,
+    /// Harmony, Apple, and Android.
     #[clap(long = "target", value_enum)]
     target: Vec<ArtifactTargetArg>,
 
@@ -72,7 +73,10 @@ pub(crate) struct BuildArgs {
     #[clap(skip)]
     invocation_output_lock_held: bool,
 
-    /// Directory for built non-source artifacts such as wasm-bindgen pkg, `.node` addons, and OHOS dist output.
+    /// Directory for built non-source artifacts. With it, wasm-bindgen output
+    /// defaults to `<artifact-dir>/browser/pkg` and a composite Node/Electron
+    /// addon to `<artifact-dir>/node/<host-stem>.node`; otherwise wasm uses
+    /// `<out-dir>/browser/pkg` and source-only output retains its local fallback.
     #[clap(long = "artifact-dir")]
     artifact_dir: Option<Utf8PathBuf>,
 
@@ -84,11 +88,12 @@ pub(crate) struct BuildArgs {
     #[clap(long = "package-dir")]
     package_dir: Option<Utf8PathBuf>,
 
-    /// Build downstream core and generated host crates in release mode.
+    /// Build the root package and generated host crates in release mode.
     #[clap(long)]
     release: bool,
 
-    /// Cargo features enabled when building native Apple/Android/Harmony/N-API core artifacts. May be repeated or comma-separated.
+    /// Cargo features enabled on the root package for native Apple, Android,
+    /// Harmony, and N-API artifacts. May be repeated or comma-separated.
     #[clap(long = "cargo-feature", value_delimiter = ',')]
     cargo_features: Vec<String>,
 
@@ -112,7 +117,8 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     metadata_no_deps: bool,
 
-    /// Where to write the wasm-bindgen output tree. Defaults to `<out-dir>/browser/pkg`.
+    /// Where to write the wasm-bindgen output tree. Defaults to
+    /// `<artifact-dir>/browser/pkg` when --artifact-dir is set, otherwise `<out-dir>/browser/pkg`.
     #[clap(long = "wasm-bindgen-out-dir")]
     wasm_bindgen_out_dir: Option<Utf8PathBuf>,
 
@@ -128,7 +134,7 @@ pub(crate) struct BuildArgs {
     #[clap(long = "wasm-target-dir")]
     wasm_target_dir: Option<Utf8PathBuf>,
 
-    /// Invocation-private Cargo target directory for the downstream wasm core build.
+    /// Invocation-private Cargo target directory for the root-package wasm build.
     #[clap(skip)]
     wasm_core_target_dir: Option<Utf8PathBuf>,
 
@@ -136,7 +142,8 @@ pub(crate) struct BuildArgs {
     #[clap(long = "ohos-dist-dir")]
     pub(super) ohos_dist_dir: Option<Utf8PathBuf>,
 
-    /// OHPM package name for generated HAR metadata (supports scoped names like `@scope/name`).
+    /// OHPM package name for generated Harmony package metadata (HAR or HSP;
+    /// supports scoped names like `@scope/name`).
     #[clap(long = "ohos-package-name")]
     pub(super) ohos_package_name: Option<String>,
 
@@ -144,19 +151,19 @@ pub(crate) struct BuildArgs {
     #[clap(long = "ohos-module-name")]
     ohos_module_name: Option<String>,
 
-    /// Semantic version override for generated OHPM package metadata.
+    /// Semantic version override for generated Harmony package metadata.
     #[clap(long = "ohos-package-version")]
     ohos_package_version: Option<String>,
 
-    /// Author override for generated OHPM package metadata.
+    /// Author override for generated Harmony package metadata.
     #[clap(long = "ohos-author")]
     ohos_author: Option<String>,
 
-    /// SPDX license override for generated OHPM package metadata.
+    /// SPDX license override for generated Harmony package metadata.
     #[clap(long = "ohos-license")]
     ohos_license: Option<String>,
 
-    /// Description override for generated OHPM package metadata.
+    /// Description override for generated Harmony package metadata.
     #[clap(long = "ohos-description")]
     ohos_description: Option<String>,
 
@@ -176,7 +183,7 @@ pub(crate) struct BuildArgs {
     #[clap(long = "ohos-device-type", value_delimiter = ',')]
     ohos_device_types: Vec<String>,
 
-    /// Final Harmony package kind. HAR remains the backward-compatible default.
+    /// Final Harmony package kind. HAR is the default; choose HSP explicitly.
     #[clap(long = "ohos-package-type", value_enum, default_value = "har")]
     pub(super) ohos_package_kind: super::ohos::PackageKind,
 
@@ -308,7 +315,7 @@ pub(crate) struct BuildArgs {
     #[clap(long = "android-package-name")]
     android_package_name: Option<String>,
 
-    /// Optional AAR output path. Not implemented in P3.
+    /// Optional AAR output path for the Android target.
     #[clap(long = "android-aar-out")]
     android_aar_out: Option<Utf8PathBuf>,
 }

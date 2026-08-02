@@ -33,7 +33,8 @@ fn main() {
 }
 ```
 
-You can now run `uniffi-bindgen` from your project using `cargo run --features=uniffi/cli --bin uniffi-bindgen [args]`
+You can now run `uniffi-bindgen` from your project using
+`cargo run --features=uniffi/cli --bin uniffi-bindgen -- [args]`.
 
 ### Multi-crate workspaces
 
@@ -43,26 +44,34 @@ In a multiple crates workspace, you can create a separate crate for running `uni
   - Add this dependency to `Cargo.toml`: `uniffi = {version = "0.XX.0", features = ["cli"] }`
   - As above, add the `uniffi-bindgen` binary target
 
-Then you can run `uniffi-bindgen` from any crate in your project using `cargo run -p uniffi-bindgen [args]`
+Then you can run `uniffi-bindgen` from any crate in your project using
+`cargo run -p uniffi-bindgen -- [args]`.
 
-## Running uniffi-bindgen using a library file
+## Running uniffi-bindgen with a library file
 
-Use `generate --library` to generate foreign bindings by using a cdylib file built for your library.
-This can be more convenient than specifying the UDL file -- especially when multiple UniFFI-ed crates are built together in one library.
-This should be used where possible - some "external type" features don't work otherwise.
+`generate` takes its source as a positional argument and detects whether that
+argument is a UDL file, a compiled library, or `src:<crate-name>` for Rust
+sources. The old `--library` flag is deprecated and has no effect, so do not
+use it.
+
+Passing a compiled cdylib can be convenient when multiple UniFFI crates are
+built into one library. It is also the source form that carries the metadata
+for all of those crates together.
 
 In our example, we generate the bindings with:
-```
+```sh
 cargo build --release
-cargo run --bin uniffi-bindgen generate --library target/release/libmath.so --language kotlin --out-dir out
+cargo run --bin uniffi-bindgen -- \
+  generate target/release/libmath.so --language kotlin --out-dir out
 ```
-(probably `.dylib` on mac, good luck with `.dll`!)
+(Use `.dylib` on macOS or `.dll` on Windows.)
 
 Then look in the `out` directory.
 
-When using library mode, if multiple crates get built into the library that use UniFFI, all will have bindings generated for them.
+When several UniFFI crates are built into the same library, generation from
+that library produces bindings for all of them.
 
-Library mode comes with some extra requirements:
+Using a library source comes with some extra requirements:
 
   - It must be run from within the cargo workspace of your project
   - Each crate must use exactly 1 UDL file when compiling the Rust library.  However, crates can have
@@ -85,24 +94,24 @@ Use the `generate` command to generate bindings by specifying a UDL file.
 ### Kotlin
 
 From the example directory, run:
-```
-cargo run --bin uniffi-bindgen generate src/math.udl --language kotlin
+```sh
+cargo run --bin uniffi-bindgen -- generate src/math.udl --language kotlin
 ```
 then have a look at `src/uniffi/math/math.kt`
 
 ### Swift
 
 Run
-```
-cargo run --bin uniffi-bindgen generate src/math.udl --language swift
+```sh
+cargo run --bin uniffi-bindgen -- generate src/math.udl --language swift
 ```
 then check out `src/math.swift`
 
 ### Ruby
 
 Run
-```
-cargo run --bin uniffi-bindgen generate src/math.udl --language ruby
+```sh
+cargo run --bin uniffi-bindgen -- generate src/math.udl --language ruby
 ```
 then check out `src/math.rb`
 

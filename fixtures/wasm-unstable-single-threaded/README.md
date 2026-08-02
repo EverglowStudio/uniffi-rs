@@ -14,6 +14,11 @@ client crate with async UniFFI exports targeting `wasm32-unknown-unknown`
 async future `Send` checks will fail to compile. See
 [`../../docs/manual/src/wasm/configuration.md`](../../docs/manual/src/wasm/configuration.md)
 and
-[`../../uniffi_bindgen_javascript/docs/phase-7-uni-core-migration.md`](../../uniffi_bindgen_javascript/docs/phase-7-uni-core-migration.md).
+[`../../docs/stream-abi.md`](../../docs/stream-abi.md).
 This is a **client-crate** build prerequisite — the JS generator does
 not (and cannot) paper over it.
+
+JavaScript wasm build orchestration and its real wasm tests run
+`wasm-bindgen-cli-support` in process. They retain the generated
+`wasm-bindgen` crate and glue dependencies, but do not require, probe, or skip
+because of an externally installed `wasm-bindgen` executable or source checkout.

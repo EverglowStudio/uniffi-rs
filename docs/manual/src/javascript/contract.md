@@ -1,11 +1,14 @@
 # JavaScript Target Contract
 
-Status: **v1** (matches `UNIFFI_JS_CONTRACT_VERSION = 1`).
+Status: **current contract scope**. The internal JavaScript runtime backend ABI
+is `JS_RUNTIME_ABI_VERSION = 2`.
 
 This document defines the stable boundary between the artifacts emitted by
 `uniffi_bindgen_javascript` and the backend adapters/runtime that sit behind
 them. Any behavioral change to that boundary should update this document in
-the same change.
+the same change. The backend ABI is internal: applications use the generated
+public types and must regenerate them with the Rust library after an ABI
+change.
 
 The design is informed by:
 
@@ -18,22 +21,27 @@ The design is informed by:
 
 ```text
 application code
-   │   import * as core from "./generated/<flavor>"
+   │   import * as bindings from "./generated/<flavor>"
    ▼
-common/            high-level TS API shared by all flavors
-   │   depends on helpers from uniffi_runtime_javascript
+<flavor>/index.ts  namespace-only platform root
+   │   export * as <namespace> from each selected component
    ▼
-flavor adapter     backend-wasm.ts / backend-napi.ts / backend-ohos.ts / electron bridge
+components/<namespace>/common/  high-level TS API
+   │   delegates shared runtime state to shared/runtime.ts
+   ▼
+components/<namespace>/<flavor>/  backend adapter
    │
    ▼
-native Rust shim   wasm-bindgen / napi-rs / ohos-rs
+package-level composite host/artifact  wasm-bindgen / napi-rs / ohos-rs
 ```
 
-Applications may import only the flavor entrypoints and the shared public
-surface. They should not import backend adapters or runtime internals
-directly.
+The generated tree has one `shared/runtime.ts` implementation and one
+`components/<namespace>/...` subtree per selected component. Every platform
+root is namespace-only, including a single component; it never flattens
+component exports. Applications import only platform roots and their namespace
+members, not backend adapters or runtime internals directly.
 
-## `common/public-types.ts`
+## `components/<namespace>/common/public-types.ts`
 
 The generator emits a stable aggregation module for the high-level public
 surface:
@@ -53,7 +61,7 @@ All `i64`/`u64` values are represented as `bigint` in this public surface.
 Example:
 
 ```ts
-import type { UniCoreModule, Email } from "./generated/common/public-types.ts";
+import type { UniCoreModule, Email } from "./generated/components/uniCore/common/public-types.ts";
 
 export function render(core: UniCoreModule, email: Email) {
   return core.normalizeEmail(email);
@@ -221,20 +229,57 @@ export interface <Name> { <method>(<args>): <Ret> | Promise<<Ret>>; }
   object registry or callback-wrapper path.
 
 Support is still intentionally scoped: callback cancellation and the remaining
-non-string-key map shapes are not part of contract v1.
+non-string-key map shapes are not part of the current contract scope.
 
 ## Async
 
 - Async Rust exports surface as `Promise<T>` in TypeScript.
 - The public API does not expose polling primitives.
 - `async-rust-call.ts` adapts backend-specific async mechanics to `Promise`.
-- General async-function cancellation is not part of contract v1. Stream
-  handles have the explicit cancellation contract documented in
+- General async-function cancellation is not part of the current contract
+  scope. Stream handles have the explicit cancellation contract documented in
   `docs/stream-abi.md`.
 
-## Generated entrypoints
+## Output streams
 
-Every flavor entrypoint must expose the same high-level names:
+Rust output-stream functions return the public, controlled iterator type:
+
+```ts
+export interface UniFfiStream<T> extends AsyncIterable<T> {
+  next(): Promise<IteratorResult<T>>;
+  cancel(): Promise<void>;
+}
+```
+
+`UniFfiStream` is lazy, pull-based, and single-consumer. Constructing it does
+not start Rust; the first direct `next()` or iterator pull does. A direct
+consumer and an `AsyncIterator` cannot be mixed, and overlapping pulls fail
+instead of sending a second native request. The iterator's `return()` and
+`throw()`, and the stream's explicit `cancel()`, share one once-only
+cancellation path. A JavaScript finalizer is only a best-effort fallback, never
+a prompt-cleanup guarantee.
+
+The binding-internal step passed to `createUniFfiStream` has this exact
+structural shape:
+
+```ts
+type RawStreamStep<T, E> =
+  | { kind: "item"; value: T }
+  | { kind: "done" }
+  | { kind: "error"; error: E };
+```
+
+The lowercase `kind` values are the JavaScript representation of the native
+`Item` / `Done` / `Error` step. `done` has no payload, so an optional item is
+still a real `{ kind: "item", value: null }` value rather than an EOF
+sentinel. Every wasm, N-API, and Electron adapter validates this exact shape
+and preserves declared typed errors. There is no nullable EOF decoder, legacy
+export alias, or old runtime fallback. This output contract is distinct from a
+foreign input stream, whose JavaScript parameter type remains `AsyncIterable<T>`.
+
+## Component API aggregation
+
+The component's common API aggregation exposes its high-level names:
 
 ```ts
 export * from "./records";
@@ -245,19 +290,31 @@ export * from "./callbacks";
 export * from "./api";
 ```
 
-Application code should vary only in the chosen flavor entrypoint, for example:
+The standard platform root exposes each component only as a namespace:
 
 ```ts
-import * as core from "./generated/browser";
-// or, after `uniffi-bindgen javascript build-wasm --wasm-bindgen-target web`
-import * as core from "./generated/browser/index.web.ts";
-// or
-import * as core from "./generated/node";
-// or
-import * as core from "./generated/electron/renderer";
-// or
-import * as core from "./generated/harmony";
+// generated/node/index.ts
+export * as myCore from "../components/myCore/node/index.ts";
 ```
+
+Application code should vary only in the chosen flavor entrypoint, then select
+the stable component namespace, for example:
+
+```ts
+import * as bindings from "./generated/browser";
+const core = bindings.myCore;
+// or, after `uniffi-bindgen javascript build-wasm --wasm-bindgen-target web`
+import * as bindings from "./generated/browser/index.web.ts";
+// or
+import * as bindings from "./generated/node";
+// or
+import * as bindings from "./generated/electron";
+// or
+import * as bindings from "./generated/harmony";
+```
+
+`myCore` above is illustrative; each root exports only the selected generated
+namespace names. It does not flatten functions or types from a component.
 
 ## Built artifact directory
 
@@ -278,12 +335,13 @@ uniffi-bindgen artifacts build \
 When `--artifact-dir` is set:
 
 - wasm-bindgen output defaults to `<artifact-dir>/browser/pkg`
-- Node addons default to `<artifact-dir>/node/<namespace>.node`
-- Electron addons default to `<artifact-dir>/electron/<namespace>.node`
+- Composite Node/Electron hosts default to
+  `<artifact-dir>/node/<host-stem>.node`; source-only single-component output
+  retains its local `<namespace>.node` fallback
 - Harmony/OpenHarmony native dist output defaults to
   `<artifact-dir>/ohos/dist` and remains an intermediate
 - Harmony package sources default to `<artifact-dir>/ohos/package`
-- the compatibility HAR defaults to `<artifact-dir>/ohos/<package-stem>.har`
+- the default HAR package defaults to `<artifact-dir>/ohos/<package-stem>.har`
 - HSP mode defaults to `<artifact-dir>/ohos/<package-stem>.tgz`,
   `<package-stem>.hsp`, `<package-stem>-interface.har`, and
   `<artifact-dir>/ohos/module-project`
@@ -324,91 +382,111 @@ The generated package entrypoints are thin re-export facades:
 ```ts
 // src/index.web.ts
 export * from "./ffi/browser/index.web.ts";
-export type * from "./ffi/common/public-types.ts";
 
 // src/index.node.ts
 export * from "./ffi/node/index.ts";
-export type * from "./ffi/common/public-types.ts";
 ```
 
 The web happy path becomes:
 
 ```ts
-import { ready, welcomeAgent } from "./src/index.web.ts";
+import * as bindings from "./src/index.web.ts";
 
-await ready;
-console.log(welcomeAgent("Ada"));
+await bindings.ready;
+console.log(bindings.myCore.welcomeAgent("Ada"));
 ```
 
 The node happy path becomes:
 
 ```ts
-import { welcomeAgent } from "./src/index.node.ts";
+import * as bindings from "./src/index.node.ts";
 
-console.log(welcomeAgent("Ada"));
+console.log(bindings.myCore.welcomeAgent("Ada"));
 ```
 
-Managed mode emits deterministic schema-3 `artifact-manifest.json` metadata for
-build tools. The manifest is not the public runtime API. The following excerpt
-shows the fields that bind an integrated HSP generation to its sources and
-artifacts:
+Managed mode emits deterministic, exact-v4 `artifact-manifest.json` metadata
+for build tools. The manifest is not a public runtime API. Its full route
+inventory is required, and its identity starts with a canonical ordered
+component set and one composite host identity. This structurally complete Node
+example shows every required v4 field; inapplicable routes are explicit `null`:
 
 ```json
 {
-  "schemaVersion": 3,
+  "artifactManifestSchemaVersion": 4,
   "generator": "uniffi-bindgen-javascript",
-  "namespace": "my_core",
-  "targets": ["harmony"],
+  "components": [
+    {
+      "component": "my_core",
+      "namespace": "myCore",
+      "nativeExportPrefix": "ffi_my_core",
+      "source": {
+        "common": "src/ffi/components/myCore/common",
+        "browser": null,
+        "node": "src/ffi/components/myCore/node",
+        "electron": null,
+        "harmony": null,
+        "publicTypes": "src/ffi/components/myCore/common/public-types.ts"
+      }
+    }
+  ],
+  "hostCompositeIdentity": "0000000000000000000000000000000000000000000000000000000000000000",
+  "targets": ["node"],
   "source": {
     "root": "src/ffi",
-    "common": "src/ffi/common",
-    "harmony": "src/ffi/harmony",
-    "publicTypes": "src/ffi/common/public-types.ts"
+    "shared": "src/ffi/shared",
+    "browser": null,
+    "node": "src/ffi/node",
+    "electron": null,
+    "harmony": null,
+    "swift": null,
+    "kotlin": null
   },
   "entrypoints": {
-    "harmony": "artifacts/harmony/package/Index.ets"
+    "web": null,
+    "miniProgram": null,
+    "node": "src/index.node.ts",
+    "electron": null,
+    "harmony": null
   },
   "artifacts": {
-    "harmony": {
-      "kind": "hsp",
-      "integrated": true,
-      "har": null,
-      "runtimeHsp": "artifacts/harmony/my-core-ohos.hsp",
-      "interfaceHar": "artifacts/harmony/my-core-ohos-interface.har",
-      "tgz": "artifacts/harmony/my-core-ohos.tgz",
-      "dist": "artifacts/harmony/dist",
-      "facade": "artifacts/harmony/dist/native-facade.ets",
-      "facadeContract": "artifacts/harmony/dist/harmony-facade-contract.json",
-      "packageFacadeContract": "artifacts/harmony/package/harmony-facade-contract.json",
-      "types": "artifacts/harmony/dist/index.d.ts",
-      "package": "artifacts/harmony/package",
-      "moduleProject": "artifacts/harmony/module-project",
-      "moduleSource": "artifacts/harmony/module-project/library",
-      "usage": "artifacts/harmony/my-core-ohos-HSP_USAGE.md",
-      "packageMetadata": "artifacts/harmony/package/oh-package.json5",
-      "moduleMetadata": "artifacts/harmony/package/src/main/module.json5",
-      "buildProfile": "artifacts/harmony/package/build-profile.json5"
-    }
+    "wasm": null,
+    "miniProgram": null,
+    "node": {
+      "addon": "artifacts/node/my_core_uniffi_js_host.node",
+      "env": "UNIFFI_NAPI_PATH"
+    },
+    "electron": null,
+    "harmony": null,
+    "apple": null,
+    "android": null
   },
   "hostCrates": {
-    "ohos": "artifacts/rust/ohos/Cargo.toml"
+    "wasm": null,
+    "napi": "artifacts/rust/napi/Cargo.toml",
+    "ohos": null
   }
 }
 ```
 
-Each selected target adds only the fields applicable to it to the same
-generation. Web, Mini Program, Node, Electron, and Harmony have their
-corresponding entrypoints; host-crate paths exist only for wasm, N-API, and
-OHOS. Apple and Android add their applicable source and artifact fields without
-entrypoints or host-crate paths. Harmony's `kind`, `integrated`, archive paths,
-facade contracts, package/module/profile paths, and resolved package metadata
-describe the exact HAR or HSP generation; unselected and inapplicable fields
-are `null`. Managed mode does not generate `package.json` exports or npm
-publishing metadata.
+`component` is the canonical Rust crate identity: a Cargo package named
+`my-core` therefore appears here as `my_core`. Its public `namespace` remains
+the separately normalized `myCore` value.
+
+The selected N-API, wasm, and OHOS hosts are composite package-level artifacts,
+and all component source roots remain namespaced. Harmony records the exact HAR
+or HSP package kind, archive routes, facade contract, package/module/profile
+metadata, and host identity.
+
+Readers and writers accept only exact v4. They do not dual-read old schemas,
+adopt a legacy manifest, or invent compatibility aliases. A managed HAR↔HSP
+transition is valid only after the existing generation proves its exact
+historical routes and the current invocation proves its current route plan.
+Managed mode does not generate `package.json` exports or npm publishing
+metadata.
 
 ### Managed artifact transaction boundary
 
-Schema-3 publication uses the standalone `artifact_transaction` module shared
+Exact-v4 publication uses the standalone `artifact_transaction` module shared
 by the managed artifact CLI and the OHOS packager. A committed owner sidecar
 binds the public package identity and inventory. Destination locks, durable
 journal/record files, private candidates, and pre-commit backups let the next
@@ -428,23 +506,37 @@ deleting, adopting, or recovering unrelated or unowned filesystem content.
 
 ## Electron preload ↔ renderer message shape
 
-`contextBridge.exposeInMainWorld("__uniffi__", ...)` exposes a single bridge:
+The aggregate preload is the only code that calls
+`contextBridge.exposeInMainWorld("__uniffi__", ...)`. It publishes one bridge
+per namespace below `window.__uniffi__.components`:
 
 ```ts
 type BridgeMessage =
-  | { kind: "call"; id: number; target: string; method: string; args: unknown[] }
-  | { kind: "callback"; id: number; target: string; method: string; args: unknown[] }
-  | { kind: "drop"; id: number; target: string };
+  | { kind: "call"; id: number; method: string; args: unknown[] }
+  | { kind: "drop"; id: number };
 
 type BridgeResponse =
   | { kind: "ok"; id: number; value: unknown }
   | { kind: "err"; id: number; error: SerializedUniffiError };
 
-(msg: BridgeMessage) => Promise<BridgeResponse>
+type ComponentBridge = {
+  namespace: string;
+  __uniffiJsRuntimeAbiVersion: 2;
+  dispatchSync(message: BridgeMessage): BridgeResponse;
+  dispatchAsync(message: BridgeMessage): Promise<BridgeResponse>;
+};
+
+window.__uniffi__.components["myCore"] as ComponentBridge;
 ```
 
-- `target` identifies either a free-function namespace or an object type
 - `id` is a monotonic correlation ID
+- `call` carries the component-local low-level method key; callback dispatch is
+  an implementation detail of the preload-side callback registry, not a bridge
+  message kind
+- `drop` releases a renderer-held opaque handle from that component's preload
+  registry
+- generated renderer code uses `dispatchSync` for synchronous dispatch keys and
+  `dispatchAsync` only for keys marked async in the component metadata
 - `SerializedUniffiError` preserves `errorName`, `variant`, `data`, `message`,
   and `stack`
 - preload owns the real native-handle registry
@@ -458,13 +550,15 @@ module emitted by `wasm-bindgen`.
 Raw `.wasm` bytes are **not** a supported public input. Async exports,
 `bigint`, and `JsError` integration rely on the wasm-bindgen glue layer.
 
-`browser/index.ts` exports an explicit async initializer:
+Each component's `components/<namespace>/browser/index.ts` exports an explicit
+async initializer. The public `browser/index.ts` root only re-exports the
+component namespace, so callers select that namespace first:
 
 ```ts
-import { initBackend } from "./generated/browser";
+import { myCore } from "./generated/browser";
 import * as glue from "./pkg/<crate>.js";
 
-await initBackend(glue);
+await myCore.initBackend(glue);
 ```
 
 Signature:
@@ -476,39 +570,43 @@ export async function initBackend(
 ): Promise<void>;
 ```
 
-Applications must call `await initBackend(glue)` before any generated wasm API
-use. Later calls are no-ops. The napi and electron entrypoints remain
-synchronous to import.
+Applications must call `await myCore.initBackend(glue)` before using that
+component's generated wasm API. Later calls for the component are no-ops. The
+N-API and Electron component entrypoints remain synchronous to import.
 
 When the CLI runs `uniffi-bindgen javascript build-wasm`, `javascript build`,
 or `artifacts build --target wasm` with `--wasm-bindgen-target web`, it also
-emits `browser/index.web.ts` after the final wasm-bindgen file names are
-known. The CLI uses UniFFI's built-in wasm-bindgen runner by default; callers do
-not need a `wasm-bindgen` binary or source checkout. The auto-entrypoint imports
-the generated wasm-bindgen JS glue and `.wasm` asset URL, re-exports
-`browser/index.ts`, and exposes:
+emits `browser/index.web.ts` after the final wasm-bindgen file names are known.
+The CLI uses UniFFI's in-process `wasm-bindgen-cli-support` runner; callers do
+not need an external `wasm-bindgen` binary, CLI, or source checkout. The
+auto-entrypoint imports the generated wasm-bindgen JS glue and `.wasm` asset
+URL, re-exports the namespace-only `browser/index.ts` root, and exposes:
 
 ```ts
 export function init(input?: unknown): Promise<void>;
 export const ready: Promise<void>;
 ```
 
+`ready` eagerly calls `init()` with the generated wasm asset URL when the
+auto-entrypoint is evaluated; `init()` returns that same one-time promise.
 Bundler-based web applications may import this file and await `ready` instead
 of hand-writing the wasm-bindgen glue import. Advanced applications should keep
-using `browser/index.ts` when they need to control wasm initialization
-explicitly. The auto-entrypoint is target-specific and is not emitted for
-`--wasm-bindgen-target nodejs`.
+using `browser/index.ts` and call the chosen namespace's `initBackend()` when
+they need to control initialization explicitly. The auto-entrypoint is emitted
+only for `--wasm-bindgen-target web`.
 
 ## Mini Program wasm initialization
 
 `artifacts build --target mini-program` is a wasm consumption form, not a new
-ABI. It reuses the wasm-bindgen host crate, the `browser/` UniFFI adapter, and
-the shared `common/` public API, then emits a Mini Program-specific entrypoint:
+ABI. It reuses the wasm-bindgen host crate, the `browser/` UniFFI adapter, the
+single shared runtime, and the namespaced public API, then emits a Mini
+Program-specific entrypoint:
 
 ```ts
-import * as core from "@my/core/mini-program";
+import * as bindings from "@my/core/mini-program";
 
-await core.init("/assets/my_core_wasm_bg.wasm");
+await bindings.init("/assets/my_core_wasm_bg.wasm");
+const core = bindings.myCore;
 ```
 
 Managed layout writes `src/index.mini-program.ts`,
@@ -544,9 +642,12 @@ package at the path passed to `init`; the manifest records the default
 
 ## Node/N-API addon loading
 
-The generated `node/index.ts` remains synchronous to import and installs its
-backend immediately. By default the Node adapter loads the copied addon next to
-the generated adapter:
+Each generated `components/<namespace>/node/index.ts` remains synchronous to
+import and installs its component backend immediately; the public
+`node/index.ts` root only re-exports namespaces. A package/host build uses one
+canonical composite addon for every selected component. Source-only generation
+without a composite host retains the single-component fallback of loading an
+addon next to that component adapter:
 
 ```ts
 ./<namespace>.node
@@ -559,39 +660,54 @@ UNIFFI_<NAMESPACE_IN_SHOUTY_SNAKE>_NAPI_PATH=/absolute/path/to/addon.node
 UNIFFI_NAPI_PATH=/absolute/path/to/addon.node
 ```
 
-The namespace-specific variable wins over the generic variable. Relative
-override paths are resolved from the current process working directory. If
-loading fails, the generated adapter reports the namespace, the chosen path,
-and a hint to run `uniffi-bindgen javascript build-napi` or set the override.
+The component variable is formed by uppercasing the namespace, replacing each
+run of non-alphanumeric characters with one underscore, then wrapping it in
+`UNIFFI_` and `_NAPI_PATH`. A non-empty component value wins over a non-empty
+`UNIFFI_NAPI_PATH`; otherwise the generated default is used. Relative override
+paths resolve from the current process working directory. The default remains a
+module-relative path: relative to the Node adapter through `createRequire`, or
+relative to Electron's preload directory. If loading fails, the generated
+adapter reports the namespace, the chosen source, and a hint to run
+`uniffi-bindgen javascript build-napi` or set an override.
 
 ## Harmony/OpenHarmony through ohos-rs
 
 The generated `harmony/index.ts` entrypoint is a Node-API consumption form for
 Harmony/OpenHarmony. It installs the backend synchronously on import and
-re-exports the same high-level `common/` API as the browser, Node, and Electron
-entrypoints.
+exports the same namespace-only component roots as the browser, Node, and
+Electron entrypoints.
 
-Harmony does **not** use Node's `.node` addon loader. The generated backend
-imports the raw native module through the Harmony native module specifier:
+Harmony does **not** use Node's `.node` addon loader. A composite OHOS build
+imports one package-level native module through the Harmony native module
+specifier; source-only single-component generation instead uses its normalized
+namespace stem plus `_ohos`:
 
 ```ts
-import * as native from "lib<namespace>_ohos.so";
+import * as native from "lib<composite-host>.so";
+// source-only single component: "lib<namespace-stem>_ohos.so"
 ```
 
-The package root uses explicit value and type exports. Functions, classes,
-records, enums, callback interfaces, errors, stream item types, raw stream
-helpers, pull wrappers, event wrappers, and input-channel interfaces are all
-imported from that root. HAR and HSP Interface HAR consumers must not import
-implementation files under `src/main/ets` or the native module's declaration
+The package root exposes the public namespace values and types only. Output
+streams are Pull-only (`fooStream()` and its generated Pull class); there is no
+Event facade, `fooEvents`, flat component root, raw output start/next/cancel,
+or nullable EOF in that surface. Structured output errors preserve their typed
+variant and payload through `UniFfiStreamFailure<E>.nativeError`; a
+`BusinessError` shape belongs to the input-channel boundary, not the output
+stream contract. HAR and HSP Interface HAR consumers must not import
+implementation files under `src/main/ets` or the native module declaration
 directory.
 
 The generated OHOS host crate uses `ohos-rs` package names:
 
 ```toml
 napi-ohos = { version = "1.1.6", default-features = false, features = ["napi8", "tokio_rt"] }
-napi-derive-ohos = { version = "1.1.6", features = ["type-def"] }
+napi-derive-ohos = { version = "1.1.6", default-features = false, features = ["strict", "type-def"] }
 napi-build-ohos = "1.1.6"
 ```
+
+`type-def` is retained only as the upstream compile-only compatibility feature;
+UniFFI's checked canonical sidecar remains the source of raw declaration
+metadata.
 
 The emitted host keeps the `napi-ohos` Tokio cleanup hook safe when several
 native modules share one ArkTS process. HarmonyOS treats the hook argument as
@@ -602,13 +718,14 @@ left unchanged, and the same substitution is applied when removing a hook.
 ### Build entrypoints and parameters
 
 The direct orchestration entrypoint is `javascript build-ohos`. It generates
-`common/`, `harmony/`, and the OHOS host crate, then invokes UniFFI's built-in
-OHOS builder. It does not require an `ohrs` executable or an `ohos-rs` source
-checkout. A representative integrated HSP invocation is:
+`shared/runtime.ts`, namespaced `components/<namespace>/common` and
+`components/<namespace>/harmony` trees, plus the OHOS host crate, then invokes
+UniFFI's built-in OHOS builder. It does not require an `ohrs` executable or an
+`ohos-rs` source checkout. A representative integrated HSP invocation is:
 
 ```bash
 uniffi-bindgen javascript build-ohos \
-  --manifest-path <core Cargo.toml> \
+  --manifest-path <root-package>/Cargo.toml \
   --out-dir <generated> \
   --artifact-dir <artifact-root> \
   --package-name <ohpm-name> \
@@ -623,8 +740,11 @@ uniffi-bindgen javascript build-ohos \
 
 Package metadata flags are `--package-name`, `--module-name`,
 `--package-version`, `--author`, `--license`, `--description`,
-`--compatible-sdk-version`, `--compatible-sdk-type`, and repeatable or
-comma-separated `--device-type`. Package selection and build controls include
+`--compatible-sdk-version`, `--target-sdk-version`,
+`--compatible-sdk-type`, and repeatable or comma-separated `--device-type`.
+`--compatible-sdk-version` is the minimum runtime API, whereas
+`--target-sdk-version` defaults to the resolved compile SDK and is written into
+the generated Hvigor build profile. Package selection and build controls include
 `--package/-p`, `--cargo-feature`, `--arch`, `--cargo-bin`, `--target-dir`,
 `--static`, `--skip-libs`, `--dts-cache`, `--skip-check`, `--zigbuild`,
 `--bisheng`, `--skip-napi-check`, `--soname`, `--release`, and trailing Cargo
@@ -638,9 +758,10 @@ Package-kind and output flags are `--package-type har|hsp`,
 `--deveco-sdk-home` select the packaging tools and SDK. In
 `artifacts build --target harmony`, the same controls use the `--ohos-`
 prefix, for example `--ohos-package-name`, `--ohos-package-type`,
+`--ohos-compatible-sdk-version`, `--ohos-target-sdk-version`,
 `--ohos-integrated-hsp`, and `--ohos-tgz-out`.
 
-HAR is the compatibility default. HAR mode accepts `--no-har` for dist-only
+HAR is the default package kind. HAR mode accepts `--no-har` for dist-only
 output and can omit native libraries with `--skip-libs`; it rejects HSP mode
 and output flags. HSP mode rejects `--no-har`, `--skip-libs`, and `--har-out`,
 and requires the final runtime HSP, Interface HAR, and tgz to remain one
@@ -666,37 +787,61 @@ be semantic versions, and package descriptions are bounded. Device types
 default to `phone`, `tablet`, and `2in1`; supported explicit values are
 `phone`, `tablet`, `2in1`, `tv`, `wearable`, and `car`.
 
-The staged package root has this public shape:
+The staged package tree includes both the public surface and internal build
+metadata:
 
 ```text
 package/
   Index.ets
   Index.d.ets
-  harmony-facade-contract.json
+  harmony-facade-contract.json  # staging contract; omitted from the HSP Interface HAR
   oh-package.json5
   build-profile.json5
   src/main/module.json5
-  src/main/ets/native.ets
+  src/main/ets/native-facade.ets
+  src/main/ets/components/<namespace>.ets
+  src/main/ets/components/<namespace>.d.ets
   src/main/ets/harmonyFacadeContract.ets  # HSP
-  src/main/cpp/types/lib<namespace>_ohos/index.d.ts
-  src/main/cpp/types/lib<namespace>_ohos/oh-package.json5
-  libs/index.d.ts
+  src/main/cpp/types/lib<host-stem>/index.d.ts
+  src/main/cpp/types/lib<host-stem>/harmony-facade-contract.json  # internal HSP copy
+  src/main/cpp/types/lib<host-stem>/oh-package.json5
   libs/<abi>/*.so
 ```
 
-`oh-package.json5` points `main` and `types` at `Index.ets` and `Index.d.ets`,
-records the compatible SDK and native component metadata, and keeps the package
-unobfuscated and original. HSP sources declare `packageType: InterfaceHar`.
-`module.json5` uses `type: har` for HAR and `type: shared` plus
-`deliveryWithInstall: true` for HSP. The HSP build profile sets
+`oh-package.json5` points `main` and `types` at `Index.ets` and `Index.d.ets`.
+It records `compatibleSdkVersion` and `compatibleSdkType` when a compatible
+SDK is selected, repeats those fields in each `nativeComponents` record, maps
+the native module dependency to `file:./src/main/cpp/types/lib<host-stem>`, and
+keeps `obfuscated: false` and `artifactType: original`. HSP sources additionally
+declare `packageType: InterfaceHar`. `module.json5` uses `type: har` for HAR and
+`type: shared` plus `deliveryWithInstall: true` for HSP. The HSP build profile sets
 `generateSharedTgz: true` and
 `nativeLib.excludeSoFromInterfaceHar: true`; integrated mode also sets
 `arkOptions.integratedHsp: true`, while its generated project enables
 `buildOption.strictMode.useNormalizedOHMUrl: true`.
 
+`Index.d.ets` is the public declaration retained by the Interface HAR.
+`native-facade.d.ts` is the raw native declaration staged as the native module
+`index.d.ts`; it is not the public package contract. `native-facade.ets` and
+the staged public component `.ets` and `.d.ets` facade modules implement and
+declare the public Pull surface.
+
+For HSP publication, the Interface HAR deletes the package-root
+`harmony-facade-contract.json`. It retains exactly one internal native
+dependency copy at
+`src/main/cpp/types/lib<host-stem>/harmony-facade-contract.json` for native
+dependency validation; that file is not part of the public package root.
+
+For an HSP, `harmony-facade-contract.json` is the package aggregate contract
+with exact `hspFacadeAggregateSchemaVersion: 1`. It records the composite host
+identity, canonical component identities, components, and the output/input
+stream inventories. This v1 aggregate is distinct from each component's v4
+facade contract; readers reject a different aggregate schema rather than
+adopting a legacy contract.
+
 ### Published HAR and HSP artifacts
 
-The compatibility HAR is the output of the generated Hvigor `harTasks` build
+The default HAR is the output of the generated Hvigor `harTasks` build
 and OHPM prepublish validation, not a synthetic archive assembled by the
 caller. It contains the package metadata, compiled ArkTS surface, native
 declarations, and selected ABI libraries. `dist/` remains an intermediate and
@@ -708,7 +853,9 @@ reported runtime HSP and Interface HAR are extracted byte-for-byte from that
 same tgz. The runtime HSP owns the selected ABI `.so` files. Because
 `excludeSoFromInterfaceHar` is enabled, the Interface HAR contains no target
 native library, and a consuming HAP must not duplicate those libraries. The
-Interface HAR preserves the same explicit package-root values and types as HAR.
+Interface HAR preserves the same explicit public values and types as HAR, but
+deletes the package-root `harmony-facade-contract.json` and retains only its
+internal native dependency copy.
 
 Consumers declare the generated tgz with the exact OHPM package name as the
 dependency key. They must not depend on the extracted runtime `.hsp` or
@@ -719,16 +866,29 @@ HSP. HSP dependencies are not transitive, circular HSP dependencies are
 forbidden, and a HAR that depends on an HSP is application-internal rather than
 publishable to a second- or third-party repository.
 
+Core package and HAP evidence is validated before any optional CodeLinter
+probe. A standalone executable may come from `CODELINTER`, a conventional tool
+directory, or `PATH`; a DevEco plugin JavaScript file is not an executable
+substitute. If none is available, UniFFI records only CodeLinter availability:
+it does not discard the core evidence or invalidate the generated package
+contract.
+
 ## Versioning
 
-The generated runtime exposes:
+The exact current versions are:
 
-```ts
-export const UNIFFI_JS_CONTRACT_VERSION = 1;
-```
+| Boundary | Version |
+| --- | --- |
+| Harmony facade contract | v4 |
+| JavaScript host bundle | v3 |
+| JavaScript runtime backend ABI | v2 |
+| Managed artifact manifest | v4 |
+| HSP facade aggregate contract | v1 |
 
-If generated code and runtime disagree on this version, the runtime must fail
-fast rather than run with mixed assumptions.
+`JS_RUNTIME_ABI_VERSION` is internal and is checked fail-fast by generated
+backends. It is not an exported application constant. Exact schema readers and
+writers reject a different version rather than selecting a legacy migration
+path.
 
 ## Open items
 
@@ -736,4 +896,5 @@ fast rather than run with mixed assumptions.
 - non-string keyed record-like structures
 - `AbortSignal` integration for ordinary async calls and stream facades
 
-These are future contract extensions rather than v1 guarantees.
+These are future contract extensions rather than guarantees of the current
+contract scope.

@@ -24,26 +24,41 @@
 
 ### Fork-local JavaScript and Harmony changes
 
-- Added the JavaScript target's managed schema-3 package layout for browser,
-  Mini Program, Node, Electron, Harmony, Apple, and Android artifacts, with
-  generated public facades and a deterministic artifact manifest.
-- Added UniFFI's built-in OHOS builder, validated OHPM/Cargo package metadata,
-  and real Hvigor HAR and HSP packaging. HSP output includes one runtime HSP,
-  one SO-free Interface HAR, and their original release tgz; integrated and
-  application-bound HSP modes enforce their respective SDK, bundle, signing,
-  and normalized-OHM-URL constraints.
-- Added explicit Harmony package-root value/type exports, BusinessError-shaped
-  event streams, and named backpressured input channels. The raw stream ABI,
-  standard JavaScript `AsyncIterable`, and Harmony pull facade remain supported
-  compatibility surfaces.
-- Kept HAR as the default compatibility package while making HSP an additive
-  package kind. The `--no-har` dist-only path remains an explicit opt-in and
-  is not HSP output. A `--raw-only-facade` custom host only opts out of the
-  generated facade contract and can still produce a real HSP when it satisfies
-  the selected package kind's remaining constraints.
-- Moved managed and OHOS publication behind the standalone
-  `artifact_transaction` module without changing its cross-path owner,
-  journal, rollback, or fail-closed recovery semantics.
+- Updated the JavaScript target's managed package layout for browser, Mini
+  Program, Node, Electron, Harmony, Apple, and Android artifacts to use the
+  exact v4 manifest with canonical `components` and `hostCompositeIdentity`.
+  Manifest readers and writers reject other schemas rather than adopting or
+  dual-reading an older layout.
+- Updated JavaScript output streams to the strict native `Item` / `Done` /
+  `Error` contract. JavaScript uses a lazy, single-use `UniFfiStream<T>`
+  `AsyncIterable`; Swift exposes `UniFfiStream<Element>: AsyncSequence`; Kotlin
+  exposes `UniFfiStream<T>: Flow<T>`; and Harmony exposes only its typed Pull
+  surface, while `BusinessError` remains an input-stream concern. This is a
+  breaking native output ABI change: regenerate every binding together with
+  the Rust library; mixed old and new generated bindings are unsupported.
+- Updated generated JavaScript host builds to use one package-level composite
+  wasm, N-API, or OHOS artifact for selected components, while preserving the
+  documented source-only Node addon fallback.
+- Kept HAR as the default Harmony package kind and HSP as an explicit package
+  kind with the same public namespace surface. Managed HAR/HSP transitions
+  validate exact historical route evidence and the current route plan.
+- Clarified that UniFFI runs `wasm-bindgen-cli-support` in process for its
+  JavaScript wasm build path and tests. The Rust `wasm-bindgen` crate and
+  generated glue remain dependencies; an external `wasm-bindgen` CLI or source
+  checkout is not a prerequisite.
+- Kept managed and OHOS publication behind the standalone
+  `artifact_transaction` module, including its cross-path owner, journal,
+  rollback, and fail-closed recovery semantics.
+
+The exact current contract versions are:
+
+| Boundary | Version |
+| --- | --- |
+| Harmony facade contract | v4 |
+| JavaScript host bundle | v3 |
+| JavaScript runtime backend ABI | v2 |
+| Managed artifact manifest | v4 |
+| HSP facade aggregate contract | v1 |
 
 ## v0.32.0 (backend crates: v0.32.0) - (_2026-06-30_)
 
