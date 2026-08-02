@@ -65,12 +65,18 @@ fn package_entry_reexports_public_harmony_stream_interfaces() {
         package_hidden_next_envelopes: Vec::new(),
         host_composite_identity: String::new(),
         component_identities: Vec::new(),
+        owner_native_export_prefixes: BTreeMap::from([(
+            "fixture".to_string(),
+            uniffi_bindgen::interface::native_export_prefix_for_component("fixture"),
+        )]),
+        canonical_raw_stream_names: false,
     };
     let exports = FacadeExports {
         callables: vec!["items".to_string()],
         callable_types: BTreeMap::from([("items".to_string(), "() => bigint".to_string())]),
         classes: Vec::new(),
         streams,
+        owned_defs: Vec::new(),
     };
 
     assert_eq!(
@@ -109,4 +115,359 @@ fn no_stream_package_uses_only_raw_type_exports() {
     let package = exports.render_package_index();
     assert!(!package.contains("UniFfiStream"));
     assert_eq!(package.matches("export type {").count(), 1);
+}
+
+#[test]
+fn single_owned_component_projects_prefixed_raw_exports_to_flat_short_names() {
+    let component = "fixture-core";
+    let native_export_prefix =
+        uniffi_bindgen::interface::native_export_prefix_for_component(component);
+    let identity = HostFacadeComponentIdentity {
+        component: component.to_string(),
+        namespace: "fixture".to_string(),
+        native_export_prefix: native_export_prefix.clone(),
+        contract_file: "fixture-core.ohos-facade.json".to_string(),
+        contract_sha256: "a".repeat(64),
+        identity_export: bridge_identity_export(&native_export_prefix, &"a".repeat(64)),
+    };
+    let raw_payload = format!("{native_export_prefix}_Payload");
+    let raw_ping = format!("{native_export_prefix}_ping");
+    let owned = OwnedFacadeTypeDefs::new(
+        &identity,
+        vec![
+            def("interface", &raw_payload, "value: string"),
+            def(
+                "fn",
+                &raw_ping,
+                &format!("function {raw_ping}(): {raw_payload}"),
+            ),
+        ],
+    )
+    .unwrap();
+    let exports =
+        FacadeExports::from_owned_type_defs_and_contracts(vec![owned], Vec::new()).unwrap();
+    let index = exports.render_package_index();
+    let declarations = render_harmony_declaration_surfaces(&[], &exports).package_public;
+
+    for surface in [&index, &declarations] {
+        assert!(
+            surface.contains(&format!("{raw_ping} as ping")),
+            "{surface}"
+        );
+        assert!(
+            surface.contains(&format!("{raw_payload} as Payload")),
+            "{surface}"
+        );
+        assert!(
+            !surface.contains("components/fixture"),
+            "single-component package must remain flat:\n{surface}"
+        );
+    }
+}
+
+#[test]
+fn composite_stream_components_project_internal_helpers_and_cross_owner_types() {
+    let identity = |component: &str, namespace: &str| {
+        let native_export_prefix =
+            uniffi_bindgen::interface::native_export_prefix_for_component(component);
+        HostFacadeComponentIdentity {
+            component: component.to_string(),
+            namespace: namespace.to_string(),
+            native_export_prefix: native_export_prefix.clone(),
+            contract_file: format!("{component}.ohos-facade.json"),
+            contract_sha256: "b".repeat(64),
+            identity_export: bridge_identity_export(&native_export_prefix, &"b".repeat(64)),
+        }
+    };
+    let alpha_identity = identity("alpha-core", "alpha");
+    let beta_identity = identity("beta-core", "beta");
+    let alpha_prefix = &alpha_identity.native_export_prefix;
+    let beta_prefix = &beta_identity.native_export_prefix;
+    let alpha_shared = format!("{alpha_prefix}_Shared");
+    let beta_output =
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_output_stream_names_for_prefix(
+            beta_prefix,
+            "events",
+        );
+    let input_suffix = "SharedPayload";
+    let beta_input_stream =
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_stream_type_for_prefix(
+            beta_prefix,
+        );
+    let beta_input_next =
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_next_type_for_prefix(
+            beta_prefix,
+            input_suffix,
+        );
+    let alpha_owned = OwnedFacadeTypeDefs::new(
+        &alpha_identity,
+        vec![def("interface", &alpha_shared, "value: string")],
+    )
+    .unwrap();
+    let beta_owned = OwnedFacadeTypeDefs::new(
+        &beta_identity,
+        vec![
+            def(
+                "interface",
+                &beta_input_stream,
+                "handle: number\nnext(error: Error | null, handle: number): Promise<T>\ncancel(error: Error | null, handle: number): void",
+            ),
+            def(
+                "interface",
+                &beta_input_next,
+                &format!(
+                    "ok: boolean\ndone?: boolean\nvalue?: {alpha_shared}\nerror?: string"
+                ),
+            ),
+            def(
+                "interface",
+                &beta_output.step_type,
+                &format!(
+                    "kind: string\nvalue?: {alpha_shared}\nerror?: string"
+                ),
+            ),
+            def(
+                "fn",
+                &beta_output.function,
+                &format!(
+                    "function {}(input: {}<{}>): bigint",
+                    beta_output.function, beta_input_stream, beta_input_next
+                ),
+            ),
+            def(
+                "fn",
+                &beta_output.next_function,
+                &format!(
+                    "function {}(handle: bigint): Promise<{}>",
+                    beta_output.next_function, beta_output.step_type
+                ),
+            ),
+            def(
+                "fn",
+                &beta_output.cancel_function,
+                &format!("function {}(handle: bigint): void", beta_output.cancel_function),
+            ),
+        ],
+    )
+    .unwrap();
+    let alpha_contract = HarmonyFacadeContract {
+        facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+        component: alpha_identity.component.clone(),
+        namespace: alpha_identity.namespace.clone(),
+        native_export_prefix: alpha_prefix.clone(),
+        output_streams: Vec::new(),
+        input_streams: Vec::new(),
+    };
+    let shared_owner = HarmonyNamedTypeOwner {
+        component: alpha_identity.component.clone(),
+        namespace: alpha_identity.namespace.clone(),
+    };
+    let shared_type = || HarmonyTypeDescriptor::Named {
+        owner: shared_owner.clone(),
+        name: "Shared".to_string(),
+    };
+    let beta_contract = HarmonyFacadeContract {
+        facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+        component: beta_identity.component.clone(),
+        namespace: beta_identity.namespace.clone(),
+        native_export_prefix: beta_prefix.clone(),
+        output_streams: vec![HarmonyOutputStreamContract {
+            function: beta_output.function.clone(),
+            next_function: beta_output.next_function.clone(),
+            cancel_function: beta_output.cancel_function.clone(),
+            stream_factory: "eventsStream".to_string(),
+            pull_class: "EventsPullStream".to_string(),
+            step_type: beta_output.step_type.clone(),
+            item_type: shared_type(),
+            error_type: HarmonyTypeDescriptor::String,
+            arguments: vec![HarmonyFacadeArgument {
+                name: "input".to_string(),
+                r#type: HarmonyTypeDescriptor::InputSource {
+                    suffix: input_suffix.to_string(),
+                    next_type: beta_input_next.clone(),
+                },
+            }],
+        }],
+        input_streams: vec![HarmonyInputStreamContract {
+            suffix: input_suffix.to_string(),
+            canonical: "shared-payload".to_string(),
+            fingerprint: "c".repeat(64),
+            item_type: shared_type(),
+            error_type: HarmonyTypeDescriptor::String,
+            next_type: beta_input_next.clone(),
+            writer_class: "SharedPayloadInputWriter".to_string(),
+            source_class: "SharedPayloadInputSource".to_string(),
+            channel_class: "SharedPayloadInputChannel".to_string(),
+            factory: "createSharedPayloadInputChannel".to_string(),
+        }],
+    };
+    let exports = FacadeExports::from_owned_type_defs_and_contracts(
+        vec![alpha_owned, beta_owned],
+        vec![alpha_contract, beta_contract],
+    )
+    .unwrap();
+    let native = exports.render_native_facade("libfixture.so");
+    let modules = exports.component_modules().unwrap();
+    let beta = modules
+        .iter()
+        .find(|module| module.namespace == "beta")
+        .unwrap();
+    let root = exports.render_package_index();
+    let declarations = render_harmony_declaration_surfaces(&[], &exports).package_public;
+
+    for internal in [
+        "__uniffi_beta_eventsStream",
+        "__uniffi_beta_EventsPullStream",
+        "__uniffi_beta_SharedPayloadInputWriter",
+        "__uniffi_beta_SharedPayloadInputSource",
+        "__uniffi_beta_SharedPayloadInputChannel",
+        "__uniffi_beta_createSharedPayloadInputChannel",
+    ] {
+        assert!(
+            native.contains(internal),
+            "missing native stream helper `{internal}`:\n{native}"
+        );
+        assert!(
+            beta.source.contains(internal),
+            "missing component alias `{internal}`:\n{}",
+            beta.source
+        );
+    }
+    for public in [
+        "eventsStream",
+        "EventsPullStream",
+        "SharedPayloadInputWriter",
+        "SharedPayloadInputSource",
+        "SharedPayloadInputChannel",
+        "createSharedPayloadInputChannel",
+    ] {
+        assert!(
+            beta.source.contains(&format!("export const {public} =")),
+            "missing component public stream alias `{public}`:\n{}",
+            beta.source
+        );
+    }
+    assert!(
+        beta.declarations.contains(
+            "export declare function eventsStream(input: SharedPayloadInputSource): UniFfiStream<alpha.Shared>;"
+        ),
+        "cross-owner stream declaration must use the visible owner namespace:\n{}",
+        beta.declarations
+    );
+    assert!(
+        !beta.declarations.contains(&alpha_shared),
+        "component declaration leaked an invisible raw owner type:\n{}",
+        beta.declarations
+    );
+    assert!(beta
+        .declarations
+        .contains("import type * as alpha from \"./alpha\";"));
+    assert!(root.contains("export {\n  alpha,\n  beta,\n};"), "{root}");
+    assert!(
+        declarations.contains("import * as beta from \"./src/main/ets/components/beta\""),
+        "{declarations}"
+    );
+}
+
+#[test]
+fn single_owned_stream_component_keeps_a_flat_short_public_surface() {
+    let component = "fixture-core";
+    let native_export_prefix =
+        uniffi_bindgen::interface::native_export_prefix_for_component(component);
+    let identity = HostFacadeComponentIdentity {
+        component: component.to_string(),
+        namespace: "fixture".to_string(),
+        native_export_prefix: native_export_prefix.clone(),
+        contract_file: "fixture-core.ohos-facade.json".to_string(),
+        contract_sha256: "d".repeat(64),
+        identity_export: bridge_identity_export(&native_export_prefix, &"d".repeat(64)),
+    };
+    let payload = format!("{native_export_prefix}_Payload");
+    let raw_output =
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_output_stream_names_for_prefix(
+            &native_export_prefix,
+            "events",
+        );
+    let owned = OwnedFacadeTypeDefs::new(
+        &identity,
+        vec![
+            def("interface", &payload, "value: string"),
+            def(
+                "interface",
+                &raw_output.step_type,
+                &format!("kind: string\nvalue?: {payload}\nerror?: string"),
+            ),
+            def(
+                "fn",
+                &raw_output.function,
+                &format!("function {}(): bigint", raw_output.function),
+            ),
+            def(
+                "fn",
+                &raw_output.next_function,
+                &format!(
+                    "function {}(handle: bigint): Promise<{}>",
+                    raw_output.next_function, raw_output.step_type
+                ),
+            ),
+            def(
+                "fn",
+                &raw_output.cancel_function,
+                &format!(
+                    "function {}(handle: bigint): void",
+                    raw_output.cancel_function
+                ),
+            ),
+        ],
+    )
+    .unwrap();
+    let contract = HarmonyFacadeContract {
+        facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+        component: component.to_string(),
+        namespace: "fixture".to_string(),
+        native_export_prefix: native_export_prefix.clone(),
+        output_streams: vec![HarmonyOutputStreamContract {
+            function: raw_output.function.clone(),
+            next_function: raw_output.next_function.clone(),
+            cancel_function: raw_output.cancel_function.clone(),
+            stream_factory: "eventsStream".to_string(),
+            pull_class: "EventsPullStream".to_string(),
+            step_type: raw_output.step_type.clone(),
+            item_type: HarmonyTypeDescriptor::Named {
+                owner: HarmonyNamedTypeOwner {
+                    component: component.to_string(),
+                    namespace: "fixture".to_string(),
+                },
+                name: "Payload".to_string(),
+            },
+            error_type: HarmonyTypeDescriptor::String,
+            arguments: Vec::new(),
+        }],
+        input_streams: Vec::new(),
+    };
+    let exports =
+        FacadeExports::from_owned_type_defs_and_contracts(vec![owned], vec![contract]).unwrap();
+    let native = exports.render_native_facade("libfixture.so");
+    let index = exports.render_package_index();
+    let declarations = render_harmony_declaration_surfaces(&[], &exports).package_public;
+
+    assert!(
+        native.contains(&format!("UniFfiStream<{payload}>")),
+        "{native}"
+    );
+    for surface in [&index, &declarations] {
+        assert!(surface.contains("eventsStream"), "{surface}");
+        assert!(
+            surface.contains(&format!("{payload} as Payload")),
+            "{surface}"
+        );
+        assert!(
+            !surface.contains("components/fixture"),
+            "single stream facade must remain flat:\n{surface}"
+        );
+    }
+    assert!(
+        !index.contains("EventsPullStream"),
+        "single component must not expand its existing public surface with a pull helper:\n{index}"
+    );
 }

@@ -7,6 +7,27 @@ mod shared;
 
 use shared::*;
 use support::*;
+
+/// Every generated host is now one package-level composite addon.  Keep test
+/// staging aligned with the host plan instead of recreating legacy
+/// per-component `<namespace>.node` copies beside adapters.
+fn composite_host_cdylib_filename(package_name: &str) -> String {
+    let target = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(package_name);
+    cdylib_filename(&target)
+}
+
+fn install_composite_addon(
+    generated: &std::path::Path,
+    built_lib: &std::path::Path,
+    package_name: &str,
+) -> std::path::PathBuf {
+    let target = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(package_name);
+    let addon = generated.join("node").join(format!("{target}.node"));
+    std::fs::create_dir_all(addon.parent().unwrap()).unwrap();
+    std::fs::copy(built_lib, &addon).unwrap();
+    addon
+}
+
 #[test]
 fn host_crates_napi_raw_addon_is_bigint_native() {
     let Some(node) = which_node() else {
@@ -35,7 +56,7 @@ fn host_crates_napi_raw_addon_is_bigint_native() {
 
     let dylib = target_dir
         .join("debug")
-        .join(cdylib_filename("napi-compat-core-napi"));
+        .join(composite_host_cdylib_filename("napi-compat-core"));
     assert!(dylib.exists(), "expected raw cdylib at {}", dylib.display());
     let addon = tmp.path().join("napi_compat.node");
     std::fs::copy(&dylib, &addon).unwrap();
@@ -159,17 +180,13 @@ fn host_crates_napi_runs_stream_fixture() {
 
     let built_lib = target_dir
         .join("debug")
-        .join(cdylib_filename("stream-core-napi"));
+        .join(composite_host_cdylib_filename("stream-core"));
     assert!(
         built_lib.exists(),
         "expected built stream addon at {}",
         built_lib.display()
     );
-    std::fs::copy(
-        &built_lib,
-        out_dir.join("components/stream_core/node/stream_core.node"),
-    )
-    .unwrap();
+    install_composite_addon(out_dir.as_std_path(), &built_lib, "stream-core");
 
     std::fs::write(
         out_dir.join("stream-driver.ts"),
@@ -325,17 +342,13 @@ fn host_crates_napi_runs_input_stream_bidi_fixture() {
 
     let built_lib = target_dir
         .join("debug")
-        .join(cdylib_filename("input-stream-core-napi"));
+        .join(composite_host_cdylib_filename("input-stream-core"));
     assert!(
         built_lib.exists(),
         "expected built input stream addon at {}",
         built_lib.display()
     );
-    std::fs::copy(
-        &built_lib,
-        out_dir.join("components/input_stream_core/node/input_stream_core.node"),
-    )
-    .unwrap();
+    install_composite_addon(out_dir.as_std_path(), &built_lib, "input-stream-core");
 
     std::fs::write(
         out_dir.join("input-stream-driver.ts"),
@@ -610,7 +623,7 @@ fn generated_node_adapter_runs_temporal_fixture() {
         );
     }
 
-    let lib_name = cdylib_filename("napi-temporal-core-napi");
+    let lib_name = composite_host_cdylib_filename("napi-temporal-core");
     let built_lib = target_dir.join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
@@ -619,12 +632,7 @@ fn generated_node_adapter_runs_temporal_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon = generated.join("components/napi_temporal_core/node/napi_temporal_core.node");
-    std::fs::copy(&built_lib, &node_addon).unwrap();
-
-    let electron_dir = generated.join("components/napi_temporal_core/electron");
-    let electron_addon = electron_dir.join("napi_temporal_core.node");
-    std::fs::copy(&built_lib, &electron_addon).unwrap();
+    install_composite_addon(&generated, &built_lib, "napi-temporal-core");
 
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
@@ -821,7 +829,7 @@ fn host_crates_napi_runs_bigint_fixture() {
         );
     }
 
-    let lib_name = cdylib_filename("napi-compat-core-napi");
+    let lib_name = composite_host_cdylib_filename("napi-compat-core");
     let built_lib = target_dir.join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
@@ -830,12 +838,7 @@ fn host_crates_napi_runs_bigint_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon = generated.join("components/napi_compat/node/napi_compat.node");
-    std::fs::copy(&built_lib, &node_addon).unwrap();
-
-    let electron_dir = generated.join("components/napi_compat/electron");
-    let electron_addon = electron_dir.join("napi_compat.node");
-    std::fs::copy(&built_lib, &electron_addon).unwrap();
+    install_composite_addon(&generated, &built_lib, "napi-compat-core");
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -859,7 +862,7 @@ exports.__state = state;
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const raw = require("./components/napi_compat/node/napi_compat.node");
+const raw = require("./node/napi_compat_core_uniffi_js_host.node");
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -998,7 +1001,7 @@ fn host_crates_napi_runs_callback_return_fixture() {
         );
     }
 
-    let lib_name = cdylib_filename("napi-callback-return-core-napi");
+    let lib_name = composite_host_cdylib_filename("napi-callback-return-core");
     let built_lib = target_dir.join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
@@ -1007,12 +1010,7 @@ fn host_crates_napi_runs_callback_return_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon = generated.join("components/callback_return/node/callback_return.node");
-    std::fs::copy(&built_lib, &node_addon).unwrap();
-
-    let electron_dir = generated.join("components/callback_return/electron");
-    let electron_addon = electron_dir.join("callback_return.node");
-    std::fs::copy(&built_lib, &electron_addon).unwrap();
+    install_composite_addon(&generated, &built_lib, "napi-callback-return-core");
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -1392,7 +1390,7 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
         );
     }
 
-    let lib_name = cdylib_filename("napi-async-callback-core-napi");
+    let lib_name = composite_host_cdylib_filename("napi-async-callback-core");
     let built_lib = target_dir.join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
@@ -1401,12 +1399,7 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon = generated.join("components/async_callback/node/async_callback.node");
-    std::fs::copy(&built_lib, &node_addon).unwrap();
-
-    let electron_dir = generated.join("components/async_callback/electron");
-    let electron_addon = electron_dir.join("async_callback.node");
-    std::fs::copy(&built_lib, &electron_addon).unwrap();
+    install_composite_addon(&generated, &built_lib, "napi-async-callback-core");
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -1581,7 +1574,7 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
         );
     }
 
-    let lib_name = cdylib_filename("napi-fallible-async-callback-core-napi");
+    let lib_name = composite_host_cdylib_filename("napi-fallible-async-callback-core");
     let built_lib = target_dir.join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
@@ -1590,13 +1583,7 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon =
-        generated.join("components/fallible_async_callback/node/fallible_async_callback.node");
-    std::fs::copy(&built_lib, &node_addon).unwrap();
-
-    let electron_dir = generated.join("components/fallible_async_callback/electron");
-    let electron_addon = electron_dir.join("fallible_async_callback.node");
-    std::fs::copy(&built_lib, &electron_addon).unwrap();
+    install_composite_addon(&generated, &built_lib, "napi-fallible-async-callback-core");
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -2078,6 +2065,170 @@ console.log("ok");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("ok"),
         "custom electron driver did not print ok"
+    );
+}
+
+#[test]
+fn composite_napi_node_and_electron_share_one_addon_without_namespace_cross_calls() {
+    let node = locate_node_with_strip_types().expect(
+        "composite N-API runtime test requires Node.js 22.6+ with --experimental-strip-types",
+    );
+    let cargo = which_tool("cargo").expect("composite N-API runtime test requires cargo");
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = CompositeFixture::write(tmp.path());
+    fixture.build_cdylib();
+
+    let generated = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let hosts = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    fixture.generate(
+        &generated,
+        Some(hosts.clone()),
+        vec![FlavorTarget::Napi, FlavorTarget::Electron],
+    );
+
+    let host_target =
+        uniffi_bindgen_javascript::host_crates::composite_host_lib_target("composite-core");
+    let expected_addon_path = format!("../../../node/{host_target}.node");
+    for component in CANONICAL_COMPONENTS {
+        for flavor in ["node", "electron"] {
+            let adapter = std::fs::read_to_string(
+                fixture
+                    .generated_component_dir(&generated, component)
+                    .join(flavor)
+                    .join(match flavor {
+                        "node" => "backend-napi.ts",
+                        "electron" => "preload.cjs",
+                        _ => unreachable!(),
+                    }),
+            )
+            .unwrap();
+            assert!(
+                adapter.contains(&format!(
+                    "const __uniffiDefaultAddonPath = \"{expected_addon_path}\";"
+                )),
+                "{flavor} adapter for {} must use the canonical package addon path:\n{adapter}",
+                component.namespace,
+            );
+        }
+    }
+
+    let manifest = fixture.host_manifest_path(&hosts, "napi");
+    let target_dir = tmp.path().join("target-napi-composite-runtime");
+    let build = run_cargo_build(&manifest, &[], &target_dir).unwrap_or_else(|error| {
+        panic!("composite N-API runtime test could not invoke {cargo:?}: {error}")
+    });
+    assert!(
+        build.status.success(),
+        "composite N-API host build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let built_addon = target_dir.join("debug").join(cdylib_filename(&host_target));
+    assert!(
+        built_addon.exists(),
+        "expected one composite N-API cdylib at {}",
+        built_addon.display(),
+    );
+    let addon = install_composite_addon(generated.as_std_path(), &built_addon, "composite-core");
+    assert_eq!(
+        addon,
+        generated.join("node").join(format!("{host_target}.node")),
+        "composite N-API runtime must stage exactly the canonical package addon",
+    );
+    for component in CANONICAL_COMPONENTS {
+        assert!(
+            !fixture
+                .generated_component_dir(&generated, component)
+                .join("node")
+                .join(format!("{}.node", component.namespace))
+                .exists(),
+            "component {} must not get a duplicated node addon",
+            component.namespace,
+        );
+    }
+
+    let electron_stub = generated.join("electron/node_modules/electron");
+    std::fs::create_dir_all(&electron_stub).unwrap();
+    std::fs::write(
+        electron_stub.join("index.js"),
+        r#"exports.contextBridge = {
+  exposeInMainWorld(name, value) {
+    globalThis[name] = value;
+  },
+};
+"#,
+    )
+    .unwrap();
+
+    let driver = generated.join("composite-napi-driver.ts");
+    std::fs::write(
+        &driver,
+        format!(
+            r#"
+import {{ createRequire }} from "node:module";
+import * as root from "./node/index.ts";
+
+const require = createRequire(import.meta.url);
+const {{ alpha, beta }} = root;
+
+function assert(condition: boolean, label: string): void {{
+  if (!condition) throw new Error(`FAIL ${{label}}`);
+}}
+
+assert(alpha.ping() === "alpha-ping", "alpha ping must stay in alpha namespace");
+assert(beta.ping() === "beta-ping", "beta ping must stay in beta namespace");
+const alphaRecord = alpha.makeRecord();
+const betaRecord = beta.makeRecord();
+assert(alphaRecord.sentinel === "alpha-record", `alpha record=${{JSON.stringify(alphaRecord)}}`);
+assert(betaRecord.sentinel === "beta-record", `beta record=${{JSON.stringify(betaRecord)}}`);
+assert(alpha.echoRecord(alphaRecord).sentinel === "alpha-record", "alpha record round trip");
+assert(beta.echoRecord(betaRecord).sentinel === "beta-record", "beta record round trip");
+
+const alphaObject = alpha.SharedObject.new();
+const betaObject = beta.SharedObject.new();
+assert(alphaObject.sentinel() === "alpha-object", "alpha object must use alpha native exports");
+assert(betaObject.sentinel() === "beta-object", "beta object must use beta native exports");
+
+const alphaOwned = alpha.makeAlphaOwned();
+const alphaRoundTrip = beta.roundtripAlpha(alphaOwned);
+assert(alphaRoundTrip.sentinel === "alpha-owned", "beta must accept and return the alpha-owned external record");
+
+const components = require("./electron/preload.cjs");
+assert(components.alpha && components.beta, "aggregate Electron bridge must publish both namespaces");
+const electronAlpha = components.alpha.dispatchSync({{ kind: "call", id: 1, method: "ping", args: [] }});
+const electronBeta = components.beta.dispatchSync({{ kind: "call", id: 2, method: "ping", args: [] }});
+assert(electronAlpha.kind === "ok" && electronAlpha.value === "alpha-ping", "aggregate alpha route");
+assert(electronBeta.kind === "ok" && electronBeta.value === "beta-ping", "aggregate beta route");
+const electronAlphaRecord = components.alpha.dispatchSync({{ kind: "call", id: 3, method: "make_record", args: [] }});
+const electronBetaRecord = components.beta.dispatchSync({{ kind: "call", id: 4, method: "make_record", args: [] }});
+assert(electronAlphaRecord.kind === "ok" && electronAlphaRecord.value.sentinel === "alpha-record", "aggregate alpha record route");
+assert(electronBetaRecord.kind === "ok" && electronBetaRecord.value.sentinel === "beta-record", "aggregate beta record route");
+
+const addonPath = require.resolve("./node/{host_target}.node");
+const loadedAddons = Object.keys(require.cache).filter((path) => path === addonPath);
+assert(loadedAddons.length === 1, `expected exactly one loaded composite addon, got ${{loadedAddons.join(",")}}`);
+console.log("ok");
+"#,
+        ),
+    )
+    .unwrap();
+    let output = Command::new(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(&generated)
+        .output()
+        .expect("failed to run composite N-API Node/Electron driver");
+    assert!(
+        output.status.success(),
+        "composite N-API Node/Electron driver failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "composite N-API Node/Electron driver did not print ok",
     );
 }
 

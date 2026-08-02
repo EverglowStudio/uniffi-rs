@@ -2055,7 +2055,8 @@ fn validate_host_facade_bundle_for_package(
             "component contract digest",
             &package.manifest_path,
         )?;
-        let expected_export = bridge_identity_export(&component.contract_sha256);
+        let expected_export =
+            bridge_identity_export(&component.native_export_prefix, &component.contract_sha256);
         if component.identity_export != expected_export
             || contracts.get(component.contract_file.as_str())
                 != Some(&component.contract_sha256.as_str())
@@ -2171,7 +2172,11 @@ fn validate_host_facade_bundle_contracts(bundle: &HostFacadeBundle, path: &Utf8P
                 != uniffi_bindgen::interface::native_export_prefix_for_component(
                     &component.component,
                 )
-            || component.identity_export != bridge_identity_export(&component.contract_sha256)
+            || component.identity_export
+                != bridge_identity_export(
+                    &component.native_export_prefix,
+                    &component.contract_sha256,
+                )
         {
             bail!(
                 "OHOS facade bundle component `{}` does not exactly match its contract identity in {path}",
@@ -2195,30 +2200,22 @@ fn preflight_host_facade_bundle_semantics(
         return Ok(());
     }
 
-    let sidecars = bundle
-        .type_sidecars
+    let owned_defs = parse_owned_bundle_type_defs(bundle, path)?;
+    let defs = owned_defs
         .iter()
-        .map(|entry| (entry.file.as_str(), entry))
-        .collect::<BTreeMap<_, _>>();
-    let mut defs = Vec::new();
+        .flat_map(|owned| owned.defs.iter().cloned())
+        .collect::<Vec<_>>();
     let mut owner_type_names = BTreeMap::new();
-    for component in &bundle.components {
-        let sidecar_file = format!("{}.ohos-extra-types.d.ts", component.component);
-        let entry = sidecars.get(sidecar_file.as_str()).with_context(|| {
-            format!(
-                "OHOS facade bundle component `{}` is missing canonical sidecar `{sidecar_file}` in {path}",
-                component.component
-            )
-        })?;
-        let sidecar_defs = parse_canonical_ohos_type_defs(
-            entry.content.as_bytes(),
-            &format!("{path}:{}", entry.file),
-        )?;
+    let mut owner_native_export_prefixes = BTreeMap::new();
+    for owned in &owned_defs {
         owner_type_names.insert(
-            component.component.clone(),
-            collect_declared_type_names(&sidecar_defs),
+            owned.projection.component.clone(),
+            collect_declared_type_names(&owned.defs),
         );
-        defs.extend(sidecar_defs);
+        owner_native_export_prefixes.insert(
+            owned.projection.component.clone(),
+            owned.projection.native_export_prefix.clone(),
+        );
     }
     validate_raw_type_def_uniqueness(&defs)?;
 
@@ -2231,7 +2228,12 @@ fn preflight_host_facade_bundle_semantics(
         .collect::<Result<Vec<_>>>()?;
     contracts.sort_by(|left, right| left.component.cmp(&right.component));
     for contract in &contracts {
-        validate_harmony_facade_contract_owner_type_references(contract, &owner_type_names, path)?;
+        validate_harmony_facade_contract_owner_type_references(
+            contract,
+            &owner_type_names,
+            &owner_native_export_prefixes,
+            path,
+        )?;
     }
 
     let inventory = FacadeTypeInventory {
@@ -2258,21 +2260,72 @@ fn preflight_host_facade_bundle_semantics(
             .collect(),
     };
     validate_compiled_bridge_identities(&defs, &inventory, &contracts)?;
-    let _ = FacadeExports::from_type_defs_and_contracts(&defs, contracts)?;
+    let _ = FacadeExports::from_owned_type_defs_and_contracts(owned_defs, contracts)?;
     Ok(())
 }
 
-fn bridge_identity_export(contract_digest: &str) -> String {
-    let encoded = contract_digest
-        .bytes()
-        .map(|byte| match byte {
-            b'0'..=b'9' => (b'a' + (byte - b'0')) as char,
-            b'a'..=b'f' => (b'k' + (byte - b'a')) as char,
-            b'A'..=b'F' => (b'k' + (byte - b'A')) as char,
-            _ => '_',
-        })
-        .collect::<String>();
-    format!("uniffiohosbridgeidentity{encoded}")
+fn parse_owned_bundle_type_defs(
+    bundle: &HostFacadeBundle,
+    path: &Utf8Path,
+) -> Result<Vec<OwnedFacadeTypeDefs>> {
+    let sidecars = bundle
+        .type_sidecars
+        .iter()
+        .map(|entry| (entry.file.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut owned = Vec::new();
+    for component in &bundle.components {
+        let sidecar_file = format!("{}.ohos-extra-types.d.ts", component.component);
+        let entry = sidecars.get(sidecar_file.as_str()).with_context(|| {
+            format!(
+                "OHOS facade bundle component `{}` is missing canonical sidecar `{sidecar_file}` in {path}",
+                component.component
+            )
+        })?;
+        let defs = parse_canonical_ohos_type_defs(
+            entry.content.as_bytes(),
+            &format!("{path}:{}", entry.file),
+        )?;
+        owned.push(OwnedFacadeTypeDefs::new(component, defs)?);
+    }
+    let flattened = owned
+        .iter()
+        .flat_map(|component| component.defs.iter().cloned())
+        .collect::<Vec<_>>();
+    validate_raw_type_def_uniqueness(&flattened)?;
+    Ok(owned)
+}
+
+fn bridge_identity_export(native_export_prefix: &str, contract_digest: &str) -> String {
+    // Keep the consumer's re-computation on the producer's single canonical
+    // export-name rule.  The digest key is not itself a globally exported
+    // name: a composite addon may carry one sentinel per component.
+    uniffi_bindgen_javascript::flavors::napi::ohos_bridge_identity_export_for_prefix(
+        native_export_prefix,
+        contract_digest,
+    )
+}
+
+fn is_raw_bridge_identity_export(name: &str) -> bool {
+    // Do not hide a user callable merely because its name contains the
+    // sentinel substring.  Generated names are exactly
+    // `<ffi-prefix>_uniffiohosbridgeidentity<64 encoded-digest chars>`;
+    // bundle/inventory validation subsequently compares this candidate with
+    // the exact expected identity export for its component.
+    let Some((native_export_prefix, encoded_digest)) =
+        name.rsplit_once("_uniffiohosbridgeidentity")
+    else {
+        return false;
+    };
+    native_export_prefix.starts_with("ffi_")
+        && native_export_prefix.len() > "ffi_".len()
+        && native_export_prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && encoded_digest.len() == 64
+        && encoded_digest
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'p'))
 }
 
 fn validate_host_facade_bundle_entries(bundle: &HostFacadeBundle, path: &Utf8Path) -> Result<()> {
@@ -3906,7 +3959,8 @@ fn validate_hsp_facade_contract(bytes: &[u8]) -> Result<String> {
             || Utf8Path::new(&identity.contract_file).file_name()
                 != Some(identity.contract_file.as_str())
             || !identity.contract_file.ends_with(".ohos-facade.json")
-            || identity.identity_export != bridge_identity_export(&identity.contract_sha256)
+            || identity.identity_export
+                != bridge_identity_export(&identity.native_export_prefix, &identity.contract_sha256)
         {
             bail!("HSP facade contract has an invalid component identity binding");
         }
@@ -3946,7 +4000,8 @@ fn validate_hsp_facade_contract(bytes: &[u8]) -> Result<String> {
         .map(|input| (input.suffix.as_str(), input.next_type.as_str()))
         .collect::<BTreeMap<_, _>>();
     for output in &contract.output_streams {
-        validate_harmony_output_stream_contract_schema(output, path)?;
+        let native_export_prefix = hsp_output_stream_owner_prefix(output, &identities, path)?;
+        validate_harmony_output_stream_contract_schema(output, native_export_prefix, path)?;
         output.item_type.validate_owners(&identities, path)?;
         output.error_type.validate_owners(&identities, path)?;
         validate_hsp_input_source_references(&output.item_type, &input_streams, path)?;
@@ -3957,13 +4012,74 @@ fn validate_hsp_facade_contract(bytes: &[u8]) -> Result<String> {
         }
     }
     for input in &contract.input_streams {
-        validate_harmony_input_stream_contract_schema(input, path)?;
+        let native_export_prefix = hsp_input_stream_owner_prefix(input, &identities, path)?;
+        validate_harmony_input_stream_contract_schema(input, native_export_prefix, path)?;
         input.item_type.validate_owners(&identities, path)?;
         input.error_type.validate_owners(&identities, path)?;
         validate_hsp_input_source_references(&input.item_type, &input_streams, path)?;
         validate_hsp_input_source_references(&input.error_type, &input_streams, path)?;
     }
     Ok(sha256_bytes(bytes))
+}
+
+fn hsp_output_stream_owner_prefix<'a>(
+    output: &HarmonyOutputStreamContract,
+    identities: &'a BTreeMap<&str, (&str, &str)>,
+    path: &Utf8Path,
+) -> Result<&'a str> {
+    let function_short_name = output.stream_factory.strip_suffix("Stream").with_context(|| {
+        format!(
+            "HSP facade contract {path} has an output stream factory `{}` without the Stream suffix",
+            output.stream_factory
+        )
+    })?;
+    let matches = identities
+        .values()
+        .filter_map(|(_, prefix)| {
+            let expected =
+                uniffi_bindgen_javascript::flavors::napi::ohos_raw_output_stream_names_for_prefix(
+                    prefix,
+                    function_short_name,
+                );
+            (output.function == expected.function
+                && output.next_function == expected.next_function
+                && output.cancel_function == expected.cancel_function
+                && output.step_type == expected.step_type)
+                .then_some(*prefix)
+        })
+        .collect::<Vec<_>>();
+    let [native_export_prefix] = matches.as_slice() else {
+        bail!(
+            "HSP facade contract {path} cannot bind output stream `{}` to exactly one component nativeExportPrefix",
+            output.stream_factory
+        );
+    };
+    Ok(native_export_prefix)
+}
+
+fn hsp_input_stream_owner_prefix<'a>(
+    input: &HarmonyInputStreamContract,
+    identities: &'a BTreeMap<&str, (&str, &str)>,
+    path: &Utf8Path,
+) -> Result<&'a str> {
+    let matches = identities
+        .values()
+        .filter_map(|(_, prefix)| {
+            (input.next_type
+                == uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_next_type_for_prefix(
+                    prefix,
+                    &input.suffix,
+                ))
+            .then_some(*prefix)
+        })
+        .collect::<Vec<_>>();
+    let [native_export_prefix] = matches.as_slice() else {
+        bail!(
+            "HSP facade contract {path} cannot bind input stream `{}` to exactly one component nativeExportPrefix",
+            input.suffix
+        );
+    };
+    Ok(native_export_prefix)
 }
 
 fn validate_hsp_input_source_references(
@@ -5059,6 +5175,7 @@ fn stage_package(
         facade_source,
     )
     .with_context(|| format!("writing OHOS package native facade in {package_dir}"))?;
+    stage_component_facade_modules(package_dist_dir, package_dir)?;
     std::fs::write(
         package_dir.join("build-profile.json5"),
         render_build_profile_json5(metadata, kind, integrated_hsp)?,
@@ -5105,10 +5222,60 @@ fn validate_generated_facade(facade: &str, index: &str, native: &str) -> Result<
     if facade.contains("export * from") || index.contains("export * from") {
         bail!("generated Harmony package facade must use explicit exports; wildcard exports are not allowed");
     }
-    if index.contains(".so\"") || !index.contains("from \"./src/main/ets/native-facade\"") {
+    let has_internal_native_import = index.contains("from \"./src/main/ets/native-facade\"");
+    let has_component_module_import = index.contains("from \"./src/main/ets/components/");
+    if index.contains(".so\"") || (!has_internal_native_import && !has_component_module_import) {
         bail!(
-            "generated Harmony Index.ets must export only the internal native facade and must not reference a .so directly"
+            "generated Harmony Index.ets must export only the internal native/component facades and must not reference a .so directly"
         );
+    }
+    Ok(())
+}
+
+fn stage_component_facade_modules(
+    package_dist_dir: &Utf8Path,
+    package_dir: &Utf8Path,
+) -> Result<()> {
+    let source_root = package_dist_dir.join("component-facades");
+    if !path_entry_exists(&source_root)? {
+        return Ok(());
+    }
+    let destination_root = package_dir.join("src/main/ets/components");
+    std::fs::create_dir_all(&destination_root).with_context(|| {
+        format!("creating OHOS component facade staging directory {destination_root}")
+    })?;
+    let mut entries = std::fs::read_dir(&source_root)
+        .with_context(|| format!("reading OHOS component facade directory {source_root}"))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let file_type = entry.file_type()?;
+        let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+            anyhow::anyhow!(
+                "OHOS component facade path is not UTF-8: {}",
+                path.display()
+            )
+        })?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            bail!("OHOS component facade input must be a regular file: {path}");
+        }
+        let name = path
+            .file_name()
+            .context("OHOS component facade lacks a filename")?;
+        let namespace = name
+            .strip_suffix(".d.ts")
+            .or_else(|| name.strip_suffix(".ets"))
+            .with_context(|| format!("unsafe OHOS component facade filename `{name}`"))?;
+        validate_arkts_export_identifier(namespace)?;
+        let bytes = read_verified_regular_file(&path)?;
+        let destination = destination_root.join(name);
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&destination)
+            .with_context(|| format!("creating staged OHOS component facade {destination}"))?;
+        output.write_all(&bytes)?;
+        output.sync_all()?;
     }
     Ok(())
 }
@@ -6772,14 +6939,18 @@ fn native_lib_filename(lib_target_name: &str) -> String {
 
 fn emit_index_d_ts(dist_dir: &Utf8Path, type_dir: &Utf8Path, lib_target_name: &str) -> Result<()> {
     let inventory = load_facade_type_inventory(type_dir)?;
-    let mut defs = Vec::new();
-    collect_type_defs(type_dir, &inventory.type_definitions, &mut defs)?;
+    let owned_defs = collect_owned_type_defs(type_dir, &inventory)?;
+    let defs = owned_defs
+        .iter()
+        .flat_map(|owned| owned.defs.iter().cloned())
+        .collect::<Vec<_>>();
     let contracts = load_harmony_facade_contracts(type_dir, &inventory)?;
     validate_compiled_bridge_identities(&defs, &inventory, &contracts)?;
-    let mut exports = FacadeExports::from_type_defs_and_contracts(&defs, contracts)?;
+    let mut exports = FacadeExports::from_owned_type_defs_and_contracts(owned_defs, contracts)?;
     exports.streams.host_composite_identity = inventory.host_composite_identity.clone();
     exports.streams.component_identities = inventory.components.clone();
     let declarations = render_harmony_declaration_surfaces(&defs, &exports);
+    let component_modules = exports.component_modules()?;
     let contract = exports.render_contract_inventory()?;
     let contract_sha256 = sha256_bytes(contract.as_bytes());
     std::fs::write(dist_dir.join("native-facade.d.ts"), declarations.native)
@@ -6794,9 +6965,110 @@ fn emit_index_d_ts(dist_dir: &Utf8Path, type_dir: &Utf8Path, lib_target_name: &s
     .with_context(|| format!("writing OHOS native facade in {dist_dir}"))?;
     std::fs::write(dist_dir.join("Index.ets"), exports.render_package_index())
         .with_context(|| format!("writing OHOS package Index.ets source in {dist_dir}"))?;
+    write_component_facade_modules(dist_dir, &component_modules)?;
     std::fs::write(dist_dir.join("harmony-facade-contract.json"), contract)
         .with_context(|| format!("writing normalized OHOS facade contract in {dist_dir}"))?;
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FacadeComponentProjection {
+    component: String,
+    namespace: String,
+    native_export_prefix: String,
+}
+
+impl From<&HostFacadeComponentIdentity> for FacadeComponentProjection {
+    fn from(identity: &HostFacadeComponentIdentity) -> Self {
+        Self {
+            component: identity.component.clone(),
+            namespace: identity.namespace.clone(),
+            native_export_prefix: identity.native_export_prefix.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnedFacadeTypeDefs {
+    projection: FacadeComponentProjection,
+    defs: Vec<TypeDefLine>,
+}
+
+impl OwnedFacadeTypeDefs {
+    fn new(identity: &HostFacadeComponentIdentity, defs: Vec<TypeDefLine>) -> Result<Self> {
+        let projection = FacadeComponentProjection::from(identity);
+        let required_prefix = format!("{}_", projection.native_export_prefix);
+        for def in &defs {
+            validate_type_def_declared_name(def)?;
+            if !def.name.starts_with(&required_prefix) {
+                bail!(
+                    "OHOS canonical sidecar for component `{}` contains raw declaration `{}` outside its exact nativeExportPrefix `{}`",
+                    projection.component,
+                    def.name,
+                    projection.native_export_prefix,
+                );
+            }
+        }
+        Ok(Self { projection, defs })
+    }
+
+    fn public_bindings(&self) -> Result<Vec<FacadePublicBinding>> {
+        let required_prefix = format!("{}_", self.projection.native_export_prefix);
+        self.defs
+            .iter()
+            .filter(|def| !(def.kind == "fn" && is_raw_bridge_identity_export(&def.name)))
+            .map(|def| {
+                let short = def.name.strip_prefix(&required_prefix).with_context(|| {
+                    format!(
+                        "OHOS raw declaration `{}` is not owned by exact sidecar component `{}`",
+                        def.name, self.projection.component
+                    )
+                })?;
+                if short.is_empty() {
+                    bail!(
+                        "OHOS raw declaration `{}` has no public short name after component prefix",
+                        def.name
+                    );
+                }
+                Ok(FacadePublicBinding {
+                    projection: self.projection.clone(),
+                    raw: def.clone(),
+                    short: short.to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FacadePublicBinding {
+    projection: FacadeComponentProjection,
+    raw: TypeDefLine,
+    short: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FacadeComponentModule {
+    namespace: String,
+    source: String,
+    declarations: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ComponentStreamValueBinding {
+    public: String,
+    internal: String,
+    /// Classes need a source-level type alias alongside their value alias.
+    is_class: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ComponentStreamProjection {
+    values: Vec<ComponentStreamValueBinding>,
+    /// `(public name, native-facade export)` aliases for shared stream types.
+    types: Vec<(String, String)>,
+    declarations: String,
+    foreign_namespaces: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -6805,6 +7077,7 @@ struct FacadeExports {
     callable_types: BTreeMap<String, String>,
     classes: Vec<String>,
     streams: HarmonyStreamFacade,
+    owned_defs: Vec<OwnedFacadeTypeDefs>,
 }
 
 impl FacadeExports {
@@ -6813,13 +7086,37 @@ impl FacadeExports {
         Self::from_type_defs_and_contracts(defs, Vec::new())
     }
 
+    #[cfg(test)]
     fn from_type_defs_and_contracts(
         defs: &[TypeDefLine],
         contracts: Vec<HarmonyFacadeContract>,
     ) -> Result<Self> {
+        // Characterization fixtures predate component-prefixed raw stream
+        // declarations.  They remain a test-only compatibility surface;
+        // all generated/packaged facades use the canonical prefixed path.
+        Self::from_parts(defs, contracts, Vec::new(), false)
+    }
+
+    fn from_owned_type_defs_and_contracts(
+        owned_defs: Vec<OwnedFacadeTypeDefs>,
+        contracts: Vec<HarmonyFacadeContract>,
+    ) -> Result<Self> {
+        let defs = owned_defs
+            .iter()
+            .flat_map(|owned| owned.defs.iter().cloned())
+            .collect::<Vec<_>>();
+        Self::from_parts(&defs, contracts, owned_defs, true)
+    }
+
+    fn from_parts(
+        defs: &[TypeDefLine],
+        contracts: Vec<HarmonyFacadeContract>,
+        owned_defs: Vec<OwnedFacadeTypeDefs>,
+        canonical_raw_stream_names: bool,
+    ) -> Result<Self> {
         let mut values = BTreeMap::<String, &'static str>::new();
         for def in defs {
-            if def.kind == "fn" && def.name.starts_with("uniffiohosbridgeidentity") {
+            if def.kind == "fn" && is_raw_bridge_identity_export(&def.name) {
                 continue;
             }
             let kind = match def.kind.as_str() {
@@ -6849,7 +7146,9 @@ impl FacadeExports {
                 _ => unreachable!(),
             }
         }
-        exports.streams = HarmonyStreamFacade::new(defs, contracts, &exports)?;
+        exports.owned_defs = owned_defs;
+        exports.streams =
+            HarmonyStreamFacade::new(defs, contracts, &exports, canonical_raw_stream_names)?;
         exports.streams.native_types = collect_declared_type_names(defs)
             .into_iter()
             .filter(|name| !exports.classes.contains(name))
@@ -6906,6 +7205,12 @@ impl FacadeExports {
     }
 
     fn render_package_index(&self) -> String {
+        if self.is_composite_projection() {
+            return self.render_component_root_index();
+        }
+        if self.has_owned_projection() {
+            return self.render_single_component_root_index();
+        }
         let mut names = self
             .classes
             .iter()
@@ -6931,6 +7236,598 @@ impl FacadeExports {
         out
     }
 
+    fn is_composite_projection(&self) -> bool {
+        self.owned_defs.len() > 1
+    }
+
+    fn has_owned_projection(&self) -> bool {
+        !self.owned_defs.is_empty()
+    }
+
+    fn component_stream_projection(
+        &self,
+        projection: &FacadeComponentProjection,
+        expose_pull_class: bool,
+    ) -> Result<ComponentStreamProjection> {
+        let Some(contract) = self
+            .streams
+            .contracts
+            .iter()
+            .find(|contract| contract.component == projection.component)
+        else {
+            return Ok(ComponentStreamProjection::default());
+        };
+        let mut result = ComponentStreamProjection::default();
+        if !contract.output_streams.is_empty() {
+            result.values.push(ComponentStreamValueBinding {
+                public: "UniFfiStreamFailure".to_string(),
+                internal: "UniFfiStreamFailure".to_string(),
+                is_class: true,
+            });
+            result.types.extend([
+                ("UniFfiStream".to_string(), "UniFfiStream".to_string()),
+                (
+                    "UniFfiStreamResult".to_string(),
+                    "UniFfiStreamResult".to_string(),
+                ),
+            ]);
+        }
+        if !contract.input_streams.is_empty() {
+            result.values.push(ComponentStreamValueBinding {
+                public: "UniFfiInputFailure".to_string(),
+                internal: "UniFfiInputFailure".to_string(),
+                is_class: true,
+            });
+            result.types.push((
+                "UniFfiInputFailureData".to_string(),
+                "UniFfiInputFailureData".to_string(),
+            ));
+        }
+        for output in &contract.output_streams {
+            let names = self.streams.output_internal_names(contract, output);
+            result.values.push(ComponentStreamValueBinding {
+                public: output.stream_factory.clone(),
+                internal: names.stream_factory,
+                is_class: false,
+            });
+            if expose_pull_class {
+                result.values.push(ComponentStreamValueBinding {
+                    public: output.pull_class.clone(),
+                    internal: names.pull_class,
+                    is_class: true,
+                });
+            }
+            result
+                .declarations
+                .push_str(&render_component_output_declarations(output, projection));
+            collect_component_descriptor_namespaces(
+                &output.item_type,
+                projection,
+                &mut result.foreign_namespaces,
+            );
+            collect_component_descriptor_namespaces(
+                &output.error_type,
+                projection,
+                &mut result.foreign_namespaces,
+            );
+            for argument in &output.arguments {
+                collect_component_descriptor_namespaces(
+                    &argument.r#type,
+                    projection,
+                    &mut result.foreign_namespaces,
+                );
+            }
+        }
+        for input in &contract.input_streams {
+            let names = self.streams.input_internal_names(contract, input);
+            for (public, internal) in [
+                (&input.writer_class, names.writer_class),
+                (&input.source_class, names.source_class),
+                (&input.channel_class, names.channel_class),
+                (&input.factory, names.factory),
+            ] {
+                result.values.push(ComponentStreamValueBinding {
+                    public: public.clone(),
+                    internal,
+                    is_class: public != &input.factory,
+                });
+            }
+            result
+                .declarations
+                .push_str(&render_component_input_declarations(input, projection));
+            collect_component_descriptor_namespaces(
+                &input.item_type,
+                projection,
+                &mut result.foreign_namespaces,
+            );
+            collect_component_descriptor_namespaces(
+                &input.error_type,
+                projection,
+                &mut result.foreign_namespaces,
+            );
+        }
+        result
+            .values
+            .sort_by(|left, right| left.public.cmp(&right.public));
+        let mut seen_values = BTreeMap::new();
+        result
+            .values
+            .retain(|binding| match seen_values.get(&binding.public) {
+                Some(previous) if previous == &binding.internal => false,
+                Some(_) => true,
+                None => {
+                    seen_values.insert(binding.public.clone(), binding.internal.clone());
+                    true
+                }
+            });
+        if result.values.iter().any(|binding| {
+            seen_values
+                .get(&binding.public)
+                .is_some_and(|internal| internal != &binding.internal)
+        }) {
+            bail!(
+                "Harmony component namespace `{}` has incompatible generated stream value aliases",
+                projection.namespace
+            );
+        }
+        result.types.sort();
+        result.types.dedup();
+        Ok(result)
+    }
+
+    fn component_modules(&self) -> Result<Vec<FacadeComponentModule>> {
+        if !self.is_composite_projection() {
+            return Ok(Vec::new());
+        }
+        let mut modules = Vec::new();
+        for owned in &self.owned_defs {
+            let stream_projection = self.component_stream_projection(&owned.projection, true)?;
+            let mut foreign_namespaces = stream_projection.foreign_namespaces.clone();
+            let mut named_type_replacements = BTreeMap::new();
+            for type_owner in &self.owned_defs {
+                let required_prefix = format!("{}_", type_owner.projection.native_export_prefix);
+                for def in &type_owner.defs {
+                    if def.kind == "fn" || !def.name.starts_with(&required_prefix) {
+                        continue;
+                    }
+                    let short = def
+                        .name
+                        .strip_prefix(&required_prefix)
+                        .expect("checked canonical raw prefix");
+                    let public = if type_owner.projection.component == owned.projection.component {
+                        short.to_string()
+                    } else {
+                        foreign_namespaces.insert(type_owner.projection.namespace.clone());
+                        format!("{}.{}", type_owner.projection.namespace, short)
+                    };
+                    named_type_replacements.insert(def.name.clone(), public);
+                }
+            }
+            let stream_explicit_declarations = self
+                .streams
+                .contracts
+                .iter()
+                .find(|contract| contract.component == owned.projection.component)
+                .map(|contract| {
+                    contract
+                        .output_streams
+                        .iter()
+                        .map(|output| output.stream_factory.clone())
+                        .chain(contract.input_streams.iter().flat_map(|input| {
+                            [
+                                input.writer_class.clone(),
+                                input.source_class.clone(),
+                                input.channel_class.clone(),
+                                input.factory.clone(),
+                            ]
+                        }))
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let mut bindings = owned.public_bindings()?;
+            bindings.retain(|binding| {
+                !(binding.raw.kind == "fn" && self.streams.hides_package_value(&binding.raw.name))
+            });
+            bindings.sort_by(|left, right| left.short.cmp(&right.short));
+            let mut values = BTreeMap::<String, &'static str>::new();
+            let mut types = BTreeSet::new();
+            for binding in &bindings {
+                match binding.raw.kind.as_str() {
+                    "fn" => {
+                        if let Some(previous) = values.insert(binding.short.clone(), "callable") {
+                            bail!(
+                                "Harmony component namespace `{}` has duplicate public value `{}` ({previous} and callable)",
+                                owned.projection.namespace,
+                                binding.short
+                            );
+                        }
+                    }
+                    "struct" => {
+                        if let Some(previous) = values.insert(binding.short.clone(), "class") {
+                            bail!(
+                                "Harmony component namespace `{}` has duplicate public value `{}` ({previous} and class)",
+                                owned.projection.namespace,
+                                binding.short
+                            );
+                        }
+                        types.insert(binding.short.clone());
+                    }
+                    "interface" | "string_enum" | "type" => {
+                        types.insert(binding.short.clone());
+                    }
+                    other => bail!(
+                        "Harmony component namespace `{}` has unsupported raw declaration kind `{other}`",
+                        owned.projection.namespace
+                    ),
+                }
+            }
+            for binding in &stream_projection.values {
+                let kind = if binding.is_class {
+                    "class"
+                } else {
+                    "callable"
+                };
+                if let Some(previous) = values.insert(binding.public.clone(), kind) {
+                    bail!(
+                        "Harmony component namespace `{}` has duplicate public value `{}` ({previous} and {kind})",
+                        owned.projection.namespace,
+                        binding.public
+                    );
+                }
+                if binding.is_class {
+                    types.insert(binding.public.clone());
+                }
+            }
+            let value_bindings = bindings
+                .iter()
+                .filter(|binding| matches!(binding.raw.kind.as_str(), "fn" | "struct"))
+                .collect::<Vec<_>>();
+            let type_bindings = bindings
+                .iter()
+                .filter(|binding| {
+                    matches!(
+                        binding.raw.kind.as_str(),
+                        "interface" | "string_enum" | "type" | "struct"
+                    )
+                })
+                .collect::<Vec<_>>();
+            let type_import_bindings = type_bindings
+                .iter()
+                .copied()
+                .filter(|binding| binding.raw.kind != "struct")
+                .collect::<Vec<_>>();
+            let stream_value_imports = stream_projection
+                .values
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| {
+                    let imported = if binding.internal == binding.public {
+                        format!("__uniffi_component_stream_value_{index}")
+                    } else {
+                        binding.internal.clone()
+                    };
+                    (binding, imported)
+                })
+                .collect::<Vec<_>>();
+            let stream_type_imports = stream_projection
+                .types
+                .iter()
+                .enumerate()
+                .map(|(index, (public, internal))| {
+                    let imported = if internal == public {
+                        format!("__uniffi_component_stream_type_{index}")
+                    } else {
+                        internal.clone()
+                    };
+                    ((public, internal), imported)
+                })
+                .collect::<Vec<_>>();
+            let mut source =
+                String::from("// AUTOGENERATED by UniFFI (Harmony component facade).\n");
+            if !value_bindings.is_empty() {
+                source.push_str("import {\n");
+                for binding in &value_bindings {
+                    source.push_str(&format!("  {},\n", binding.raw.name));
+                }
+                source.push_str("} from \"../native-facade\";\n");
+            }
+            if !stream_value_imports.is_empty() {
+                source.push_str("import {\n");
+                for (binding, imported) in &stream_value_imports {
+                    if &binding.internal == imported {
+                        source.push_str(&format!("  {},\n", binding.internal));
+                    } else {
+                        source.push_str(&format!("  {} as {},\n", binding.internal, imported));
+                    }
+                }
+                source.push_str("} from \"../native-facade\";\n");
+            }
+            if !type_import_bindings.is_empty() {
+                source.push_str("import type {\n");
+                for binding in &type_import_bindings {
+                    source.push_str(&format!("  {},\n", binding.raw.name));
+                }
+                source.push_str("} from \"../native-facade\";\n");
+            }
+            if !stream_type_imports.is_empty() {
+                source.push_str("import type {\n");
+                for ((_, internal), imported) in &stream_type_imports {
+                    if *internal == imported {
+                        source.push_str(&format!("  {internal},\n"));
+                    } else {
+                        source.push_str(&format!("  {internal} as {imported},\n"));
+                    }
+                }
+                source.push_str("} from \"../native-facade\";\n");
+            }
+            for namespace in &foreign_namespaces {
+                source.push_str(&format!(
+                    "import type * as {namespace} from \"./{namespace}\";\n"
+                ));
+            }
+            if !value_bindings.is_empty()
+                || !stream_value_imports.is_empty()
+                || !type_import_bindings.is_empty()
+                || !stream_type_imports.is_empty()
+                || !foreign_namespaces.is_empty()
+            {
+                source.push('\n');
+            }
+            for binding in &value_bindings {
+                source.push_str(&format!(
+                    "export const {} = {};\n",
+                    binding.short, binding.raw.name
+                ));
+            }
+            for binding in &type_bindings {
+                source.push_str(&format!(
+                    "export type {} = {};\n",
+                    binding.short, binding.raw.name
+                ));
+            }
+            for (binding, imported) in &stream_value_imports {
+                source.push_str(&format!(
+                    "export const {} = {};\n",
+                    binding.public, imported
+                ));
+                if binding.is_class {
+                    source.push_str(&format!("export type {} = {};\n", binding.public, imported));
+                }
+            }
+            for ((public, _), imported) in &stream_type_imports {
+                source.push_str(&format!("export type {public}<T> = {imported}<T>;\n"));
+            }
+
+            let mut declarations =
+                String::from("// AUTOGENERATED by UniFFI (Harmony component declarations).\n");
+            if !value_bindings.is_empty() {
+                declarations.push_str("import {\n");
+                for binding in &value_bindings {
+                    declarations.push_str(&format!("  {},\n", binding.raw.name));
+                }
+                declarations.push_str("} from \"../native-facade\";\n");
+            }
+            if !stream_value_imports.is_empty() {
+                declarations.push_str("import {\n");
+                for (binding, imported) in &stream_value_imports {
+                    if &binding.internal == imported {
+                        declarations.push_str(&format!("  {},\n", binding.internal));
+                    } else {
+                        declarations
+                            .push_str(&format!("  {} as {},\n", binding.internal, imported));
+                    }
+                }
+                declarations.push_str("} from \"../native-facade\";\n");
+            }
+            if !type_import_bindings.is_empty() {
+                declarations.push_str("import type {\n");
+                for binding in &type_import_bindings {
+                    declarations.push_str(&format!("  {},\n", binding.raw.name));
+                }
+                declarations.push_str("} from \"../native-facade\";\n");
+            }
+            if !stream_type_imports.is_empty() {
+                declarations.push_str("import type {\n");
+                for ((_, internal), imported) in &stream_type_imports {
+                    if *internal == imported {
+                        declarations.push_str(&format!("  {internal},\n"));
+                    } else {
+                        declarations.push_str(&format!("  {internal} as {imported},\n"));
+                    }
+                }
+                declarations.push_str("} from \"../native-facade\";\n");
+            }
+            for namespace in &foreign_namespaces {
+                declarations.push_str(&format!(
+                    "import type * as {namespace} from \"./{namespace}\";\n"
+                ));
+            }
+            if !value_bindings.is_empty()
+                || !stream_value_imports.is_empty()
+                || !type_import_bindings.is_empty()
+                || !stream_type_imports.is_empty()
+                || !foreign_namespaces.is_empty()
+            {
+                declarations.push('\n');
+            }
+            for binding in &value_bindings {
+                if binding.raw.kind == "fn" {
+                    let raw_type = self
+                        .callable_types
+                        .get(&binding.raw.name)
+                        .expect("validated Harmony callable type is present");
+                    declarations.push_str(&format!(
+                        "export declare const {}: {};\n",
+                        binding.short,
+                        component_callable_public_type(raw_type, &named_type_replacements)
+                    ));
+                } else {
+                    declarations.push_str(&format!(
+                        "export declare const {}: typeof {};\n",
+                        binding.short, binding.raw.name
+                    ));
+                }
+            }
+            for binding in &type_bindings {
+                declarations.push_str(&format!(
+                    "export type {} = {};\n",
+                    binding.short, binding.raw.name
+                ));
+            }
+            for (binding, imported) in &stream_value_imports {
+                if stream_explicit_declarations.contains(&binding.public) {
+                    continue;
+                }
+                declarations.push_str(&format!(
+                    "export declare const {}: typeof {};\n",
+                    binding.public, imported
+                ));
+                if binding.is_class {
+                    declarations
+                        .push_str(&format!("export type {} = {};\n", binding.public, imported));
+                }
+            }
+            for ((public, _), imported) in &stream_type_imports {
+                declarations.push_str(&format!("export type {public}<T> = {imported}<T>;\n"));
+            }
+            declarations.push_str(&stream_projection.declarations);
+            modules.push(FacadeComponentModule {
+                namespace: owned.projection.namespace.clone(),
+                source,
+                declarations,
+            });
+        }
+        modules.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        Ok(modules)
+    }
+
+    fn render_component_root_index(&self) -> String {
+        let mut out = String::from("// AUTOGENERATED by UniFFI (Harmony package entry).\n");
+        let modules = self
+            .component_modules()
+            .expect("validated component facade projections render deterministically");
+        for module in &modules {
+            out.push_str(&format!(
+                "import * as {} from \"./src/main/ets/components/{}\";\n",
+                module.namespace, module.namespace
+            ));
+        }
+        if !modules.is_empty() {
+            out.push_str("\nexport {\n");
+            for module in &modules {
+                out.push_str(&format!("  {},\n", module.namespace));
+            }
+            out.push_str("};\n");
+        }
+        out
+    }
+
+    fn render_component_root_declarations(&self) -> String {
+        let mut out = String::from(TYPE_HEADER);
+        let modules = self
+            .component_modules()
+            .expect("validated component facade projections render deterministically");
+        for module in &modules {
+            out.push_str(&format!(
+                "import * as {} from \"./src/main/ets/components/{}\";\n",
+                module.namespace, module.namespace
+            ));
+        }
+        if !modules.is_empty() {
+            out.push_str("\nexport {\n");
+            for module in &modules {
+                out.push_str(&format!("  {},\n", module.namespace));
+            }
+            out.push_str("};\n");
+        }
+        out
+    }
+
+    fn render_single_component_root_index(&self) -> String {
+        self.render_single_component_root(false)
+    }
+
+    fn render_single_component_root_declarations(&self) -> String {
+        self.render_single_component_root(true)
+    }
+
+    fn render_single_component_root(&self, declaration: bool) -> String {
+        let owned = self
+            .owned_defs
+            .first()
+            .expect("single owned projection requires one component");
+        let stream_projection = self
+            .component_stream_projection(&owned.projection, false)
+            .expect("validated single component stream projection");
+        let mut values = BTreeMap::<String, String>::new();
+        let mut types = BTreeMap::<String, String>::new();
+        for binding in owned
+            .public_bindings()
+            .expect("validated single component public bindings")
+        {
+            if binding.raw.kind == "fn" && self.streams.hides_package_value(&binding.raw.name) {
+                continue;
+            }
+            if self.streams.hides_package_type_name(&binding.raw.name) {
+                continue;
+            }
+            match binding.raw.kind.as_str() {
+                "fn" | "struct" => {
+                    values.insert(binding.short, binding.raw.name);
+                }
+                "interface" | "string_enum" | "type" => {
+                    types.insert(binding.short, binding.raw.name);
+                }
+                other => panic!("validated single component has unsupported raw kind {other}"),
+            }
+        }
+        for binding in stream_projection.values {
+            if values
+                .insert(binding.public.clone(), binding.internal)
+                .is_some()
+            {
+                panic!(
+                    "validated single component has a duplicate stream value `{}`",
+                    binding.public
+                );
+            }
+        }
+        for (public, internal) in stream_projection.types {
+            if types.insert(public.clone(), internal).is_some() {
+                panic!("validated single component has a duplicate stream type `{public}`");
+            }
+        }
+        let mut out = if declaration {
+            String::from(TYPE_HEADER)
+        } else {
+            String::from("// AUTOGENERATED by UniFFI (Harmony package entry).\n")
+        };
+        let module = "./src/main/ets/native-facade";
+        if !values.is_empty() {
+            out.push_str("export {\n");
+            for (public, internal) in values {
+                if public == internal {
+                    out.push_str(&format!("  {internal},\n"));
+                } else {
+                    out.push_str(&format!("  {internal} as {public},\n"));
+                }
+            }
+            out.push_str(&format!("}} from \"{module}\";\n"));
+        }
+        if !types.is_empty() {
+            out.push_str("export type {\n");
+            for (public, internal) in types {
+                if public == internal {
+                    out.push_str(&format!("  {internal},\n"));
+                } else {
+                    out.push_str(&format!("  {internal} as {public},\n"));
+                }
+            }
+            out.push_str(&format!("}} from \"{module}\";\n"));
+        }
+        out
+    }
+
     fn type_exports(&self) -> Vec<String> {
         self.streams
             .native_types
@@ -6945,7 +7842,7 @@ impl FacadeExports {
 
     fn native_type_defs(&self, defs: &[TypeDefLine]) -> Vec<TypeDefLine> {
         defs.iter()
-            .filter(|def| !(def.kind == "fn" && def.name.starts_with("uniffiohosbridgeidentity")))
+            .filter(|def| !(def.kind == "fn" && is_raw_bridge_identity_export(&def.name)))
             .cloned()
             .collect()
     }
@@ -6976,6 +7873,18 @@ fn render_harmony_declaration_surfaces(
     exports: &FacadeExports,
 ) -> HarmonyDeclarationSurfaces {
     let native = render_index_d_ts(exports.native_type_defs(defs));
+    if exports.is_composite_projection() {
+        return HarmonyDeclarationSurfaces {
+            native,
+            package_public: exports.render_component_root_declarations(),
+        };
+    }
+    if exports.has_owned_projection() {
+        return HarmonyDeclarationSurfaces {
+            native,
+            package_public: exports.render_single_component_root_declarations(),
+        };
+    }
     let mut package_public = render_index_d_ts(exports.package_public_defs(defs));
     if !exports.streams.declaration_imports().is_empty() {
         package_public = package_public.replacen(
@@ -6989,6 +7898,42 @@ fn render_harmony_declaration_surfaces(
         native,
         package_public,
     }
+}
+
+fn write_component_facade_modules(
+    dist_dir: &Utf8Path,
+    modules: &[FacadeComponentModule],
+) -> Result<()> {
+    if modules.is_empty() {
+        return Ok(());
+    }
+    let root = dist_dir.join("component-facades");
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating OHOS component facade directory {root}"))?;
+    for module in modules {
+        validate_arkts_export_identifier(&module.namespace)?;
+        std::fs::write(
+            root.join(format!("{}.ets", module.namespace)),
+            &module.source,
+        )
+        .with_context(|| {
+            format!(
+                "writing OHOS component facade source for namespace `{}` in {root}",
+                module.namespace
+            )
+        })?;
+        std::fs::write(
+            root.join(format!("{}.d.ts", module.namespace)),
+            &module.declarations,
+        )
+        .with_context(|| {
+            format!(
+                "writing OHOS component facade declarations for namespace `{}` in {root}",
+                module.namespace
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn append_explicit_type_reexport(out: &mut String, names: &[String], module: &str) {
@@ -7194,6 +8139,35 @@ struct HarmonyStreamFacade {
     package_hidden_next_envelopes: Vec<TypeDefLine>,
     host_composite_identity: String,
     component_identities: Vec<HostFacadeComponentIdentity>,
+    owner_native_export_prefixes: BTreeMap<String, String>,
+    canonical_raw_stream_names: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HarmonyOutputInternalNames {
+    stream_factory: String,
+    pull_class: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HarmonyInputInternalNames {
+    writer_class: String,
+    source_class: String,
+    channel_class: String,
+    factory: String,
+    envelope: String,
+}
+
+fn self_or_contract_internal_name(
+    composite: bool,
+    contract: &HarmonyFacadeContract,
+    public_name: &str,
+) -> String {
+    if composite {
+        format!("__uniffi_{}_{}", contract.namespace, public_name)
+    } else {
+        public_name.to_string()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -7417,7 +8391,7 @@ fn validate_compiled_bridge_identities(
 ) -> Result<()> {
     let raw_sentinels = defs
         .iter()
-        .filter(|def| def.kind == "fn" && def.name.starts_with("uniffiohosbridgeidentity"))
+        .filter(|def| def.kind == "fn" && is_raw_bridge_identity_export(&def.name))
         .collect::<Vec<_>>();
     if inventory.facade_mode == "raw-only" {
         if !inventory.components.is_empty() || !contracts.is_empty() || !raw_sentinels.is_empty() {
@@ -7568,16 +8542,21 @@ fn validate_harmony_facade_contract_schema(
         bail!("OHOS facade contract {path} has an invalid component identity");
     }
     for output in &contract.output_streams {
-        validate_harmony_output_stream_contract_schema(output, path)?;
+        validate_harmony_output_stream_contract_schema(
+            output,
+            &contract.native_export_prefix,
+            path,
+        )?;
     }
     for input in &contract.input_streams {
-        validate_harmony_input_stream_contract_schema(input, path)?;
+        validate_harmony_input_stream_contract_schema(input, &contract.native_export_prefix, path)?;
     }
     Ok(())
 }
 
 fn validate_harmony_output_stream_contract_schema(
     output: &HarmonyOutputStreamContract,
+    native_export_prefix: &str,
     path: &Utf8Path,
 ) -> Result<()> {
     for name in [
@@ -7592,17 +8571,41 @@ fn validate_harmony_output_stream_contract_schema(
             format!("invalid generated identifier `{name}` in OHOS facade contract {path}")
         })?;
     }
-    output.item_type.validate(path, true)?;
-    output.error_type.validate(path, false)?;
     for argument in &output.arguments {
         validate_arkts_export_identifier(&argument.name)?;
-        argument.r#type.validate(path, true)?;
+        argument.r#type.validate(path, true, native_export_prefix)?;
     }
-    Ok(())
+    let function_short_name = output.stream_factory.strip_suffix("Stream").with_context(|| {
+        format!(
+            "OHOS facade contract {path} has an output stream factory `{}` without the Stream suffix",
+            output.stream_factory
+        )
+    })?;
+    let expected =
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_output_stream_names_for_prefix(
+            native_export_prefix,
+            function_short_name,
+        );
+    if output.function != expected.function
+        || output.next_function != expected.next_function
+        || output.cancel_function != expected.cancel_function
+        || output.step_type != expected.step_type
+    {
+        bail!(
+            "OHOS facade contract {path} has raw output-stream names that do not exactly match nativeExportPrefix `{native_export_prefix}`"
+        );
+    }
+    output
+        .item_type
+        .validate(path, true, native_export_prefix)?;
+    output
+        .error_type
+        .validate(path, false, native_export_prefix)
 }
 
 fn validate_harmony_input_stream_contract_schema(
     input: &HarmonyInputStreamContract,
+    native_export_prefix: &str,
     path: &Utf8Path,
 ) -> Result<()> {
     for name in [
@@ -7633,13 +8636,21 @@ fn validate_harmony_input_stream_contract_schema(
             input.suffix
         );
     }
-    input.item_type.validate(path, false)?;
-    input.error_type.validate(path, false)?;
+    input
+        .item_type
+        .validate(path, false, native_export_prefix)?;
+    input
+        .error_type
+        .validate(path, false, native_export_prefix)?;
     if input.source_class != format!("{}InputSource", input.suffix)
         || input.writer_class != format!("{}InputWriter", input.suffix)
         || input.channel_class != format!("{}InputChannel", input.suffix)
         || input.factory != format!("create{}InputChannel", input.suffix)
-        || input.next_type != format!("UniffiInputStream{}Next", input.suffix)
+        || input.next_type
+            != uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_next_type_for_prefix(
+                native_export_prefix,
+                &input.suffix,
+            )
     {
         bail!(
             "OHOS facade contract {path} has inconsistent generated names for input descriptor `{}`",
@@ -7684,18 +8695,44 @@ fn validate_harmony_facade_contract_owners(
 fn validate_harmony_facade_contract_owner_type_references(
     contract: &HarmonyFacadeContract,
     owner_type_names: &BTreeMap<String, BTreeSet<String>>,
+    owner_native_export_prefixes: &BTreeMap<String, String>,
     path: &Utf8Path,
 ) -> Result<()> {
     for output in &contract.output_streams {
-        validate_descriptor_owner_type_references(&output.item_type, owner_type_names, path)?;
-        validate_descriptor_owner_type_references(&output.error_type, owner_type_names, path)?;
+        validate_descriptor_owner_type_references(
+            &output.item_type,
+            owner_type_names,
+            owner_native_export_prefixes,
+            path,
+        )?;
+        validate_descriptor_owner_type_references(
+            &output.error_type,
+            owner_type_names,
+            owner_native_export_prefixes,
+            path,
+        )?;
         for argument in &output.arguments {
-            validate_descriptor_owner_type_references(&argument.r#type, owner_type_names, path)?;
+            validate_descriptor_owner_type_references(
+                &argument.r#type,
+                owner_type_names,
+                owner_native_export_prefixes,
+                path,
+            )?;
         }
     }
     for input in &contract.input_streams {
-        validate_descriptor_owner_type_references(&input.item_type, owner_type_names, path)?;
-        validate_descriptor_owner_type_references(&input.error_type, owner_type_names, path)?;
+        validate_descriptor_owner_type_references(
+            &input.item_type,
+            owner_type_names,
+            owner_native_export_prefixes,
+            path,
+        )?;
+        validate_descriptor_owner_type_references(
+            &input.error_type,
+            owner_type_names,
+            owner_native_export_prefixes,
+            path,
+        )?;
     }
     Ok(())
 }
@@ -7703,6 +8740,7 @@ fn validate_harmony_facade_contract_owner_type_references(
 fn validate_descriptor_owner_type_references(
     descriptor: &HarmonyTypeDescriptor,
     owner_type_names: &BTreeMap<String, BTreeSet<String>>,
+    owner_native_export_prefixes: &BTreeMap<String, String>,
     path: &Utf8Path,
 ) -> Result<()> {
     match descriptor {
@@ -7713,17 +8751,34 @@ fn validate_descriptor_owner_type_references(
                     owner.component
                 )
             })?;
-            if !names.contains(name) {
+            let native_export_prefix = owner_native_export_prefixes
+                .get(&owner.component)
+                .with_context(|| {
+                    format!(
+                        "named type `{name}` in {path} has an owner component `{}` without a native export prefix",
+                        owner.component
+                    )
+                })?;
+            let raw_name = uniffi_bindgen_javascript::native_exports::native_export_name_for_prefix(
+                native_export_prefix,
+                name,
+            );
+            if !names.contains(&raw_name) {
                 bail!(
-                    "named type `{name}` in {path} is not declared by owner component `{}`'s canonical sidecar",
-                    owner.component
+                    "named type `{name}` in {path} is not declared as raw `{raw_name}` by owner component `{}`'s canonical sidecar",
+                    owner.component,
                 );
             }
         }
         HarmonyTypeDescriptor::Optional { inner }
         | HarmonyTypeDescriptor::Sequence { inner }
         | HarmonyTypeDescriptor::Set { inner } => {
-            validate_descriptor_owner_type_references(inner, owner_type_names, path)?;
+            validate_descriptor_owner_type_references(
+                inner,
+                owner_type_names,
+                owner_native_export_prefixes,
+                path,
+            )?;
         }
         HarmonyTypeDescriptor::Number
         | HarmonyTypeDescriptor::Bigint
@@ -7736,7 +8791,12 @@ fn validate_descriptor_owner_type_references(
 }
 
 impl HarmonyTypeDescriptor {
-    fn validate(&self, path: &Utf8Path, allow_input: bool) -> Result<()> {
+    fn validate(
+        &self,
+        path: &Utf8Path,
+        allow_input: bool,
+        native_export_prefix: &str,
+    ) -> Result<()> {
         match self {
             Self::Named { owner, name } => {
                 uniffi_bindgen::interface::validate_harmony_component_identity(
@@ -7751,14 +8811,25 @@ impl HarmonyTypeDescriptor {
                 })
             }
             Self::Optional { inner } | Self::Sequence { inner } | Self::Set { inner } => {
-                inner.validate(path, false)
+                inner.validate(path, false, native_export_prefix)
             }
             Self::InputSource { suffix, next_type } => {
                 if !allow_input {
                     bail!("nested input source is not allowed in OHOS facade contract {path}");
                 }
                 validate_arkts_export_identifier(suffix)?;
-                validate_arkts_export_identifier(next_type)
+                validate_arkts_export_identifier(next_type)?;
+                if next_type
+                    != &uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_next_type_for_prefix(
+                        native_export_prefix,
+                        suffix,
+                    )
+                {
+                    bail!(
+                        "OHOS facade contract {path} has an input source next type that does not exactly match nativeExportPrefix `{native_export_prefix}`"
+                    );
+                }
+                Ok(())
             }
             Self::Number | Self::Bigint | Self::Boolean | Self::String | Self::ArrayBuffer => {
                 Ok(())
@@ -7822,25 +8893,114 @@ impl HarmonyTypeDescriptor {
         }
     }
 
-    fn raw_type(&self) -> String {
+    fn raw_type(
+        &self,
+        owner_native_export_prefixes: &BTreeMap<String, String>,
+        local_native_export_prefix: &str,
+        canonical_raw_stream_names: bool,
+    ) -> Result<String> {
         match self {
-            Self::InputSource { next_type, .. } => {
-                format!("UniffiInputStream<{next_type}>")
+            Self::InputSource { next_type, .. } => Ok(format!(
+                "{}<{next_type}>",
+                raw_input_stream_type_name(local_native_export_prefix, canonical_raw_stream_names,)
+            )),
+            Self::Named { owner, name } => {
+                let native_export_prefix = owner_native_export_prefixes
+                    .get(&owner.component)
+                    .with_context(|| {
+                        format!(
+                            "Harmony named type `{name}` has owner component `{}` without a native export prefix",
+                            owner.component
+                        )
+                    })?;
+                Ok(
+                    uniffi_bindgen_javascript::native_exports::native_export_name_for_prefix(
+                        native_export_prefix,
+                        name,
+                    ),
+                )
             }
-            _ => self.public_type(),
+            Self::Optional { inner } => Ok(format!(
+                "{} | undefined | null",
+                inner.raw_type(
+                    owner_native_export_prefixes,
+                    local_native_export_prefix,
+                    canonical_raw_stream_names,
+                )?
+            )),
+            Self::Sequence { inner } => Ok(format!(
+                "Array<{}>",
+                inner.raw_type(
+                    owner_native_export_prefixes,
+                    local_native_export_prefix,
+                    canonical_raw_stream_names,
+                )?
+            )),
+            Self::Set { inner } => Ok(format!(
+                "Set<{}>",
+                inner.raw_type(
+                    owner_native_export_prefixes,
+                    local_native_export_prefix,
+                    canonical_raw_stream_names,
+                )?
+            )),
+            Self::Number | Self::Bigint | Self::Boolean | Self::String | Self::ArrayBuffer => {
+                Ok(self.public_type())
+            }
         }
+    }
+}
+
+fn raw_input_stream_type_name(
+    native_export_prefix: &str,
+    canonical_raw_stream_names: bool,
+) -> String {
+    if canonical_raw_stream_names {
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_stream_type_for_prefix(
+            native_export_prefix,
+        )
+    } else {
+        "UniffiInputStream".to_string()
+    }
+}
+
+fn raw_input_next_type_name(
+    native_export_prefix: &str,
+    suffix: &str,
+    canonical_raw_stream_names: bool,
+) -> String {
+    if canonical_raw_stream_names {
+        uniffi_bindgen_javascript::flavors::napi::ohos_raw_input_next_type_for_prefix(
+            native_export_prefix,
+            suffix,
+        )
+    } else {
+        format!("UniffiInputStream{suffix}Next")
     }
 }
 
 fn validate_output_stream_raw_contract(
     defs: &[TypeDefLine],
     output: &HarmonyOutputStreamContract,
+    native_export_prefix: &str,
+    owner_native_export_prefixes: &BTreeMap<String, String>,
+    canonical_raw_stream_names: bool,
 ) -> Result<()> {
     let arguments = output
         .arguments
         .iter()
-        .map(|argument| format!("{}: {}", argument.name, argument.r#type.raw_type()))
-        .collect::<Vec<_>>()
+        .map(|argument| {
+            Ok(format!(
+                "{}: {}",
+                argument.name,
+                argument.r#type.raw_type(
+                    owner_native_export_prefixes,
+                    native_export_prefix,
+                    canonical_raw_stream_names,
+                )?
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?
         .join(", ");
     require_raw_function_signature(
         defs,
@@ -7870,8 +9030,16 @@ fn validate_output_stream_raw_contract(
     }
     let expected = format!(
         "kind: string\nvalue?: {}\nerror?: {}",
-        output.item_type.raw_type(),
-        output.error_type.raw_type()
+        output.item_type.raw_type(
+            owner_native_export_prefixes,
+            native_export_prefix,
+            canonical_raw_stream_names,
+        )?,
+        output.error_type.raw_type(
+            owner_native_export_prefixes,
+            native_export_prefix,
+            canonical_raw_stream_names,
+        )?
     );
     if normalize_raw_contract_text(&next.def) != normalize_raw_contract_text(&expected) {
         bail!(
@@ -7887,20 +9055,46 @@ fn validate_output_stream_raw_contract(
 fn validate_descriptor_type_references(
     descriptor: &HarmonyTypeDescriptor,
     raw_types: &BTreeSet<String>,
+    local_native_export_prefix: &str,
+    owner_native_export_prefixes: &BTreeMap<String, String>,
+    canonical_raw_stream_names: bool,
 ) -> Result<()> {
     match descriptor {
-        HarmonyTypeDescriptor::Named { name, .. } => {
-            if !raw_types.contains(name) {
-                bail!("Harmony facade type descriptor references missing raw type `{name}`");
+        HarmonyTypeDescriptor::Named { owner, name } => {
+            let native_export_prefix = owner_native_export_prefixes
+                .get(&owner.component)
+                .with_context(|| {
+                    format!(
+                        "Harmony facade type descriptor references owner component `{}` without a native export prefix",
+                        owner.component
+                    )
+                })?;
+            let raw_name = uniffi_bindgen_javascript::native_exports::native_export_name_for_prefix(
+                native_export_prefix,
+                name,
+            );
+            if !raw_types.contains(&raw_name) {
+                bail!("Harmony facade type descriptor references missing raw type `{raw_name}`");
             }
         }
         HarmonyTypeDescriptor::Optional { inner }
         | HarmonyTypeDescriptor::Sequence { inner }
         | HarmonyTypeDescriptor::Set { inner } => {
-            validate_descriptor_type_references(inner, raw_types)?;
+            validate_descriptor_type_references(
+                inner,
+                raw_types,
+                local_native_export_prefix,
+                owner_native_export_prefixes,
+                canonical_raw_stream_names,
+            )?;
         }
-        HarmonyTypeDescriptor::InputSource { next_type, .. } => {
-            if !raw_types.contains(next_type) {
+        HarmonyTypeDescriptor::InputSource { suffix, next_type } => {
+            let expected = raw_input_next_type_name(
+                local_native_export_prefix,
+                suffix,
+                canonical_raw_stream_names,
+            );
+            if next_type != &expected || !raw_types.contains(next_type) {
                 bail!("Harmony input source descriptor references missing next type `{next_type}`");
             }
         }
@@ -7916,15 +9110,23 @@ fn validate_descriptor_type_references(
 fn validate_input_stream_raw_contract(
     defs: &[TypeDefLine],
     input: &HarmonyInputStreamContract,
+    native_export_prefix: &str,
+    owner_native_export_prefixes: &BTreeMap<String, String>,
+    canonical_raw_stream_names: bool,
 ) -> Result<()> {
-    let input_stream = require_unique_type_def(defs, "UniffiInputStream")?;
+    let input_stream_name =
+        raw_input_stream_type_name(native_export_prefix, canonical_raw_stream_names);
+    let input_stream = require_unique_type_def(defs, &input_stream_name)?;
     if input_stream.kind != "interface" {
-        bail!("Harmony input stream bridge must be an exact `UniffiInputStream` interface");
+        bail!("Harmony input stream bridge must be an exact `{input_stream_name}` interface");
     }
-    validate_unique_input_stream_interface(&format!(
-        "export interface UniffiInputStream<T> {{\n{}\n}}",
-        input_stream.def
-    ))?;
+    validate_unique_named_input_stream_interface(
+        &format!(
+            "export interface {input_stream_name}<T> {{\n{}\n}}",
+            input_stream.def
+        ),
+        &input_stream_name,
+    )?;
     let next = require_unique_type_def(defs, &input.next_type)?;
     if next.kind != "interface" {
         bail!(
@@ -7935,8 +9137,16 @@ fn validate_input_stream_raw_contract(
     }
     let expected = format!(
         "ok: boolean\ndone?: boolean\nvalue?: {}\nerror?: {}",
-        input.item_type.raw_type(),
-        input.error_type.raw_type()
+        input.item_type.raw_type(
+            owner_native_export_prefixes,
+            native_export_prefix,
+            canonical_raw_stream_names,
+        )?,
+        input.error_type.raw_type(
+            owner_native_export_prefixes,
+            native_export_prefix,
+            canonical_raw_stream_names,
+        )?
     );
     if normalize_raw_contract_text(&next.def) != normalize_raw_contract_text(&expected) {
         bail!(
@@ -8047,6 +9257,10 @@ fn declaration_tokens(source: &str) -> Result<Vec<String>> {
 }
 
 fn validate_unique_input_stream_interface(source: &str) -> Result<()> {
+    validate_unique_named_input_stream_interface(source, "UniffiInputStream")
+}
+
+fn validate_unique_named_input_stream_interface(source: &str, interface_name: &str) -> Result<()> {
     const MAX_NESTING: usize = 128;
     const MAX_INTERFACE_TOKENS: usize = 4096;
     let tokens = declaration_tokens(source)?;
@@ -8076,14 +9290,14 @@ fn validate_unique_input_stream_interface(source: &str) -> Result<()> {
                 .is_some_and(|token| token == "interface")
             && tokens
                 .get(index + 2)
-                .is_some_and(|token| token == "UniffiInputStream");
+                .is_some_and(|token| token == interface_name);
         let unexported = depth == 0
             && tokens.get(index).is_some_and(|token| token == "interface")
             && tokens
                 .get(index + 1)
-                .is_some_and(|token| token == "UniffiInputStream");
+                .is_some_and(|token| token == interface_name);
         if unexported {
-            bail!("`UniffiInputStream<T>` must be a top-level exported interface");
+            bail!("`{interface_name}<T>` must be a top-level exported interface");
         }
         if !exported {
             index += 1;
@@ -8095,7 +9309,7 @@ fn validate_unique_input_stream_interface(source: &str) -> Result<()> {
             || header.get(2).map(String::as_str) != Some(">")
             || header.get(3).map(String::as_str) != Some("{")
         {
-            bail!("Harmony input stream requires exactly `export interface UniffiInputStream<T>`");
+            bail!("Harmony input stream requires exactly `export interface {interface_name}<T>`");
         }
         let body_start = index + 7;
         let mut cursor = body_start;
@@ -8125,7 +9339,7 @@ fn validate_unique_input_stream_interface(source: &str) -> Result<()> {
     }
     let [body] = bodies.as_slice() else {
         bail!(
-            "Harmony input stream requires exactly one top-level `export interface UniffiInputStream<T>`, found {}",
+            "Harmony input stream requires exactly one top-level `export interface {interface_name}<T>`, found {}",
             bodies.len()
         );
     };
@@ -8242,6 +9456,7 @@ impl HarmonyStreamFacade {
         defs: &[TypeDefLine],
         contracts: Vec<HarmonyFacadeContract>,
         raw_exports: &FacadeExports,
+        canonical_raw_stream_names: bool,
     ) -> Result<Self> {
         validate_raw_type_def_uniqueness(defs)?;
         if contracts.is_empty() {
@@ -8268,13 +9483,26 @@ impl HarmonyStreamFacade {
             .filter(|def| def.kind == "struct")
             .map(|def| def.name.as_str())
             .collect::<BTreeSet<_>>();
+        let owner_native_export_prefixes = contracts
+            .iter()
+            .map(|contract| {
+                (
+                    contract.component.clone(),
+                    contract.native_export_prefix.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if owner_native_export_prefixes.len() != contracts.len() {
+            bail!("duplicate Harmony stream facade contract component identity");
+        }
         for value in raw_values.intersection(&raw_types) {
             if !raw_classes.contains(value.as_str()) {
                 bail!("Harmony raw N-API value/type name collision for `{value}` is ambiguous");
             }
         }
         let mut generated_names = BTreeSet::new();
-        let mut input_by_suffix = BTreeMap::<String, HarmonyInputStreamContract>::new();
+        let mut input_by_component_and_suffix =
+            BTreeMap::<(String, String), HarmonyInputStreamContract>::new();
         let mut components = BTreeSet::new();
         let mut package_hidden_next_envelopes = Vec::new();
 
@@ -8351,12 +9579,36 @@ impl HarmonyStreamFacade {
                 );
             }
             for output in &contract.output_streams {
-                validate_descriptor_type_references(&output.item_type, &raw_types)?;
-                validate_descriptor_type_references(&output.error_type, &raw_types)?;
+                validate_descriptor_type_references(
+                    &output.item_type,
+                    &raw_types,
+                    &contract.native_export_prefix,
+                    &owner_native_export_prefixes,
+                    canonical_raw_stream_names,
+                )?;
+                validate_descriptor_type_references(
+                    &output.error_type,
+                    &raw_types,
+                    &contract.native_export_prefix,
+                    &owner_native_export_prefixes,
+                    canonical_raw_stream_names,
+                )?;
                 for argument in &output.arguments {
-                    validate_descriptor_type_references(&argument.r#type, &raw_types)?;
+                    validate_descriptor_type_references(
+                        &argument.r#type,
+                        &raw_types,
+                        &contract.native_export_prefix,
+                        &owner_native_export_prefixes,
+                        canonical_raw_stream_names,
+                    )?;
                 }
-                validate_output_stream_raw_contract(defs, output)?;
+                validate_output_stream_raw_contract(
+                    defs,
+                    output,
+                    &contract.native_export_prefix,
+                    &owner_native_export_prefixes,
+                    canonical_raw_stream_names,
+                )?;
                 for required in [
                     output.function.as_str(),
                     output.next_function.as_str(),
@@ -8381,7 +9633,9 @@ impl HarmonyStreamFacade {
                     package_hidden_next_envelopes.push(next_envelope.clone());
                 }
                 for value in [&output.stream_factory, &output.pull_class] {
-                    insert_generated_name(value, "value", &raw_names, &mut generated_names)?;
+                    let value =
+                        self_or_contract_internal_name(contracts.len() > 1, contract, value);
+                    insert_generated_name(&value, "value", &raw_names, &mut generated_names)?;
                 }
                 for argument in &output.arguments {
                     validate_arkts_export_identifier(&argument.name)?;
@@ -8408,13 +9662,35 @@ impl HarmonyStreamFacade {
                 }
             }
             for input in &contract.input_streams {
-                validate_descriptor_type_references(&input.item_type, &raw_types)?;
-                validate_descriptor_type_references(&input.error_type, &raw_types)?;
-                validate_input_stream_raw_contract(defs, input)?;
-                if !raw_types.contains("UniffiInputStream") {
+                validate_descriptor_type_references(
+                    &input.item_type,
+                    &raw_types,
+                    &contract.native_export_prefix,
+                    &owner_native_export_prefixes,
+                    canonical_raw_stream_names,
+                )?;
+                validate_descriptor_type_references(
+                    &input.error_type,
+                    &raw_types,
+                    &contract.native_export_prefix,
+                    &owner_native_export_prefixes,
+                    canonical_raw_stream_names,
+                )?;
+                validate_input_stream_raw_contract(
+                    defs,
+                    input,
+                    &contract.native_export_prefix,
+                    &owner_native_export_prefixes,
+                    canonical_raw_stream_names,
+                )?;
+                let input_stream_type = raw_input_stream_type_name(
+                    &contract.native_export_prefix,
+                    canonical_raw_stream_names,
+                );
+                if !raw_types.contains(&input_stream_type) {
                     bail!(
-                        "Harmony input stream `{}` requires missing native `UniffiInputStream` declaration",
-                        input.suffix
+                        "Harmony input stream `{}` requires missing native `{input_stream_type}` declaration",
+                        input.suffix,
                     );
                 }
                 if !raw_types.contains(&input.next_type) {
@@ -8424,8 +9700,10 @@ impl HarmonyStreamFacade {
                         input.next_type
                     );
                 }
-                if let Some(previous) = input_by_suffix.insert(input.suffix.clone(), input.clone())
-                {
+                if let Some(previous) = input_by_component_and_suffix.insert(
+                    (contract.component.clone(), input.suffix.clone()),
+                    input.clone(),
+                ) {
                     if previous != *input {
                         bail!(
                             "Harmony input stream suffix collision for `{}` has incompatible item/error metadata",
@@ -8440,10 +9718,16 @@ impl HarmonyStreamFacade {
                     &input.channel_class,
                     &input.factory,
                 ] {
-                    insert_generated_name(value, "value", &raw_names, &mut generated_names)?;
+                    let value =
+                        self_or_contract_internal_name(contracts.len() > 1, contract, value);
+                    insert_generated_name(&value, "value", &raw_names, &mut generated_names)?;
                 }
                 insert_generated_name(
-                    &format!("__{}InputNextEnvelope", input.suffix),
+                    &self_or_contract_internal_name(
+                        contracts.len() > 1,
+                        contract,
+                        &format!("__{}InputNextEnvelope", input.suffix),
+                    ),
                     "private type",
                     &raw_names,
                     &mut generated_names,
@@ -8460,6 +9744,8 @@ impl HarmonyStreamFacade {
             package_hidden_next_envelopes,
             host_composite_identity: String::new(),
             component_identities: Vec::new(),
+            owner_native_export_prefixes,
+            canonical_raw_stream_names,
         })
     }
 
@@ -8496,6 +9782,43 @@ impl HarmonyStreamFacade {
 
     fn has_streams(&self) -> bool {
         self.has_outputs() || self.has_inputs()
+    }
+
+    fn is_composite(&self) -> bool {
+        self.contracts.len() > 1
+    }
+
+    fn internal_name(&self, contract: &HarmonyFacadeContract, public_name: &str) -> String {
+        if self.is_composite() {
+            format!("__uniffi_{}_{}", contract.namespace, public_name)
+        } else {
+            public_name.to_string()
+        }
+    }
+
+    fn output_internal_names(
+        &self,
+        contract: &HarmonyFacadeContract,
+        output: &HarmonyOutputStreamContract,
+    ) -> HarmonyOutputInternalNames {
+        HarmonyOutputInternalNames {
+            stream_factory: self.internal_name(contract, &output.stream_factory),
+            pull_class: self.internal_name(contract, &output.pull_class),
+        }
+    }
+
+    fn input_internal_names(
+        &self,
+        contract: &HarmonyFacadeContract,
+        input: &HarmonyInputStreamContract,
+    ) -> HarmonyInputInternalNames {
+        HarmonyInputInternalNames {
+            writer_class: self.internal_name(contract, &input.writer_class),
+            source_class: self.internal_name(contract, &input.source_class),
+            channel_class: self.internal_name(contract, &input.channel_class),
+            factory: self.internal_name(contract, &input.factory),
+            envelope: self.internal_name(contract, &format!("__{}InputNextEnvelope", input.suffix)),
+        }
     }
 
     fn has_outputs(&self) -> bool {
@@ -8549,7 +9872,34 @@ impl HarmonyStreamFacade {
         outputs
     }
 
+    fn outputs_with_contract(&self) -> Vec<(&HarmonyFacadeContract, &HarmonyOutputStreamContract)> {
+        let mut outputs = self
+            .contracts
+            .iter()
+            .flat_map(|contract| {
+                contract
+                    .output_streams
+                    .iter()
+                    .map(move |output| (contract, output))
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_by(|(left_contract, left), (right_contract, right)| {
+            left_contract
+                .component
+                .cmp(&right_contract.component)
+                .then_with(|| left.function.cmp(&right.function))
+        });
+        outputs
+    }
+
     fn inputs(&self) -> Vec<&HarmonyInputStreamContract> {
+        if self.is_composite() {
+            return self
+                .inputs_with_contract()
+                .into_iter()
+                .map(|(_, input)| input)
+                .collect();
+        }
         let mut inputs = BTreeMap::new();
         for contract in &self.contracts {
             for input in &contract.input_streams {
@@ -8557,6 +9907,26 @@ impl HarmonyStreamFacade {
             }
         }
         inputs.into_values().collect()
+    }
+
+    fn inputs_with_contract(&self) -> Vec<(&HarmonyFacadeContract, &HarmonyInputStreamContract)> {
+        let mut inputs = self
+            .contracts
+            .iter()
+            .flat_map(|contract| {
+                contract
+                    .input_streams
+                    .iter()
+                    .map(move |input| (contract, input))
+            })
+            .collect::<Vec<_>>();
+        inputs.sort_by(|(left_contract, left), (right_contract, right)| {
+            left_contract
+                .component
+                .cmp(&right_contract.component)
+                .then_with(|| left.suffix.cmp(&right.suffix))
+        });
+        inputs
     }
 
     fn render_native_facade(&self, contract_digest: Option<&str>) -> String {
@@ -9001,12 +10371,25 @@ abstract class __UniFfiInputSource<T, E, N> {
 }
 "#,
         );
-        for input in self.inputs() {
-            out.push_str(&render_harmony_input_implementation(input));
+        for (contract, input) in self.inputs_with_contract() {
+            let names = self.input_internal_names(contract, input);
+            out.push_str(&render_harmony_input_implementation(
+                input,
+                &names,
+                &contract.native_export_prefix,
+                &self.owner_native_export_prefixes,
+                self.canonical_raw_stream_names,
+            ));
         }
-        for output in self.outputs() {
+        for (contract, output) in self.outputs_with_contract() {
+            let names = self.output_internal_names(contract, output);
             out.push_str(&render_harmony_output_implementation(
                 output,
+                &names,
+                &contract.native_export_prefix,
+                &self.owner_native_export_prefixes,
+                self.canonical_raw_stream_names,
+                self.is_composite(),
                 has_contract_anchor,
             ));
         }
@@ -9080,11 +10463,18 @@ export declare class UniFfiInputFailure<E> extends Error implements BusinessErro
 "#,
             );
         }
-        for input in self.inputs() {
-            out.push_str(&render_harmony_input_declarations(input));
+        for (contract, input) in self.inputs_with_contract() {
+            let names = self.input_internal_names(contract, input);
+            out.push_str(&render_harmony_input_declarations(
+                input,
+                &names,
+                &contract.native_export_prefix,
+                self.canonical_raw_stream_names,
+            ));
         }
-        for output in self.outputs() {
-            out.push_str(&render_harmony_output_declarations(output));
+        for (contract, output) in self.outputs_with_contract() {
+            let names = self.output_internal_names(contract, output);
+            out.push_str(&render_harmony_output_declarations(output, &names));
         }
         out
     }
@@ -9184,6 +10574,218 @@ fn harmony_arguments(arguments: &[HarmonyFacadeArgument]) -> String {
         .join(", ")
 }
 
+fn component_descriptor_public_type(
+    descriptor: &HarmonyTypeDescriptor,
+    current: &FacadeComponentProjection,
+) -> String {
+    match descriptor {
+        HarmonyTypeDescriptor::Number => "number".to_string(),
+        HarmonyTypeDescriptor::Bigint => "bigint".to_string(),
+        HarmonyTypeDescriptor::Boolean => "boolean".to_string(),
+        HarmonyTypeDescriptor::String => "string".to_string(),
+        HarmonyTypeDescriptor::ArrayBuffer => "ArrayBuffer".to_string(),
+        HarmonyTypeDescriptor::Named { owner, name } => {
+            if owner.component == current.component {
+                name.clone()
+            } else {
+                format!("{}.{}", owner.namespace, name)
+            }
+        }
+        HarmonyTypeDescriptor::Optional { inner } => format!(
+            "{} | undefined | null",
+            component_descriptor_public_type(inner, current)
+        ),
+        HarmonyTypeDescriptor::Sequence { inner } => {
+            format!(
+                "Array<{}>",
+                component_descriptor_public_type(inner, current)
+            )
+        }
+        HarmonyTypeDescriptor::Set { inner } => {
+            format!("Set<{}>", component_descriptor_public_type(inner, current))
+        }
+        HarmonyTypeDescriptor::InputSource { suffix, .. } => format!("{suffix}InputSource"),
+    }
+}
+
+fn collect_component_descriptor_namespaces(
+    descriptor: &HarmonyTypeDescriptor,
+    current: &FacadeComponentProjection,
+    namespaces: &mut BTreeSet<String>,
+) {
+    match descriptor {
+        HarmonyTypeDescriptor::Named { owner, .. } => {
+            if owner.component != current.component {
+                namespaces.insert(owner.namespace.clone());
+            }
+        }
+        HarmonyTypeDescriptor::Optional { inner }
+        | HarmonyTypeDescriptor::Sequence { inner }
+        | HarmonyTypeDescriptor::Set { inner } => {
+            collect_component_descriptor_namespaces(inner, current, namespaces);
+        }
+        HarmonyTypeDescriptor::Number
+        | HarmonyTypeDescriptor::Bigint
+        | HarmonyTypeDescriptor::Boolean
+        | HarmonyTypeDescriptor::String
+        | HarmonyTypeDescriptor::ArrayBuffer
+        | HarmonyTypeDescriptor::InputSource { .. } => {}
+    }
+}
+
+fn component_harmony_arguments(
+    arguments: &[HarmonyFacadeArgument],
+    current: &FacadeComponentProjection,
+) -> String {
+    arguments
+        .iter()
+        .map(|argument| {
+            format!(
+                "{}: {}",
+                argument.name,
+                component_descriptor_public_type(&argument.r#type, current)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn replace_arkts_identifiers(source: &str, replacements: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0usize;
+    let bytes = source.as_bytes();
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$') {
+            let start = index;
+            index += 1;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$'))
+            {
+                index += 1;
+            }
+            let identifier = &source[start..index];
+            if let Some(replacement) = replacements.get(identifier) {
+                out.push_str(replacement);
+            } else {
+                out.push_str(identifier);
+            }
+        } else {
+            out.push(byte as char);
+            index += 1;
+        }
+    }
+    out
+}
+
+fn component_callable_public_type(
+    raw_type: &str,
+    replacements: &BTreeMap<String, String>,
+) -> String {
+    replace_arkts_identifiers(raw_type, replacements)
+}
+
+fn render_component_output_declarations(
+    output: &HarmonyOutputStreamContract,
+    current: &FacadeComponentProjection,
+) -> String {
+    format!(
+        "\nexport declare function {}({}): UniFfiStream<{}>;\n",
+        output.stream_factory,
+        component_harmony_arguments(&output.arguments, current),
+        component_descriptor_public_type(&output.item_type, current),
+    )
+}
+
+fn render_component_input_declarations(
+    input: &HarmonyInputStreamContract,
+    current: &FacadeComponentProjection,
+) -> String {
+    let item_type = component_descriptor_public_type(&input.item_type, current);
+    let error_type = component_descriptor_public_type(&input.error_type, current);
+    let raw_prefix = format!("{}_", current.native_export_prefix);
+    let next_type = input
+        .next_type
+        .strip_prefix(&raw_prefix)
+        .unwrap_or(&input.next_type);
+    format!(
+        r#"
+
+export declare class {source_class} {{
+  readonly handle: number;
+  next(error: Error | null, handle: number): Promise<{next_type}>;
+  cancel(error: Error | null, handle: number): void;
+}}
+
+export declare class {writer_class} {{
+  constructor(source: {source_class});
+  write(item: {item_type}): Promise<void>;
+  end(): void;
+  fail(error: UniFfiInputFailure<{error_type}>): void;
+}}
+
+export declare class {channel_class} {{
+  writer: {writer_class};
+  source: {source_class};
+  constructor();
+}}
+
+export declare function {factory}(): {channel_class};
+"#,
+        source_class = input.source_class,
+        next_type = next_type,
+        writer_class = input.writer_class,
+        item_type = item_type,
+        error_type = error_type,
+        channel_class = input.channel_class,
+        factory = input.factory,
+    )
+}
+
+fn harmony_native_facade_arguments(
+    arguments: &[HarmonyFacadeArgument],
+    owner_native_export_prefixes: &BTreeMap<String, String>,
+    local_native_export_prefix: &str,
+    canonical_raw_stream_names: bool,
+) -> String {
+    arguments
+        .iter()
+        .map(|argument| {
+            format!(
+                "{}: {}",
+                argument.name,
+                harmony_native_facade_type(
+                    &argument.r#type,
+                    owner_native_export_prefixes,
+                    local_native_export_prefix,
+                    canonical_raw_stream_names,
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn harmony_native_facade_type(
+    descriptor: &HarmonyTypeDescriptor,
+    owner_native_export_prefixes: &BTreeMap<String, String>,
+    local_native_export_prefix: &str,
+    canonical_raw_stream_names: bool,
+) -> String {
+    if canonical_raw_stream_names {
+        descriptor
+            .raw_type(
+                owner_native_export_prefixes,
+                local_native_export_prefix,
+                canonical_raw_stream_names,
+            )
+            .expect("validated Harmony stream raw type")
+    } else {
+        descriptor.public_type()
+    }
+}
+
 fn harmony_argument_names(arguments: &[HarmonyFacadeArgument]) -> String {
     arguments
         .iter()
@@ -9194,10 +10796,25 @@ fn harmony_argument_names(arguments: &[HarmonyFacadeArgument]) -> String {
 
 fn render_harmony_output_implementation(
     output: &HarmonyOutputStreamContract,
+    names: &HarmonyOutputInternalNames,
+    local_native_export_prefix: &str,
+    owner_native_export_prefixes: &BTreeMap<String, String>,
+    canonical_raw_stream_names: bool,
+    export_pull_class: bool,
     include_contract_anchor: bool,
 ) -> String {
-    let args = harmony_arguments(&output.arguments);
-    let item_type = output.item_type.public_type();
+    let args = harmony_native_facade_arguments(
+        &output.arguments,
+        owner_native_export_prefixes,
+        local_native_export_prefix,
+        canonical_raw_stream_names,
+    );
+    let item_type = harmony_native_facade_type(
+        &output.item_type,
+        owner_native_export_prefixes,
+        local_native_export_prefix,
+        canonical_raw_stream_names,
+    );
     let pass = harmony_argument_names(&output.arguments);
     let fields = output
         .arguments
@@ -9206,7 +10823,12 @@ fn render_harmony_output_implementation(
         .map(|(index, argument)| {
             format!(
                 "  private __arg{index}: {};\n",
-                argument.r#type.public_type()
+                harmony_native_facade_type(
+                    &argument.r#type,
+                    owner_native_export_prefixes,
+                    local_native_export_prefix,
+                    canonical_raw_stream_names,
+                )
             )
         })
         .collect::<String>();
@@ -9232,7 +10854,7 @@ fn render_harmony_output_implementation(
     format!(
         r#"
 
-class {pull_class} extends __UniFfiPullStream<{item_type}, {error_type}> {{
+{pull_export}class {pull_class} extends __UniFfiPullStream<{item_type}, {error_type}> {{
 {fields}  constructor({args}) {{
     super();
 {assignments}  }}
@@ -9261,9 +10883,15 @@ export function {stream_factory}({args}): UniFfiStream<{item_type}> {{
 {contract_anchor}  return new {pull_class}({call_args});
 }}
 "#,
-        pull_class = output.pull_class,
+        pull_class = names.pull_class,
+        pull_export = if export_pull_class { "export " } else { "" },
         item_type = item_type,
-        error_type = output.error_type.public_type(),
+        error_type = harmony_native_facade_type(
+            &output.error_type,
+            owner_native_export_prefixes,
+            local_native_export_prefix,
+            canonical_raw_stream_names,
+        ),
         fields = fields,
         args = args,
         assignments = assignments,
@@ -9273,15 +10901,33 @@ export function {stream_factory}({args}): UniFfiStream<{item_type}> {{
         next_function = output.next_function,
         step_type = output.step_type,
         cancel_function = output.cancel_function,
-        stream_factory = output.stream_factory,
+        stream_factory = names.stream_factory,
         contract_anchor = contract_anchor,
     )
 }
 
-fn render_harmony_input_implementation(input: &HarmonyInputStreamContract) -> String {
-    let envelope = format!("__{}InputNextEnvelope", input.suffix);
-    let item_type = input.item_type.public_type();
-    let error_type = input.error_type.public_type();
+fn render_harmony_input_implementation(
+    input: &HarmonyInputStreamContract,
+    names: &HarmonyInputInternalNames,
+    local_native_export_prefix: &str,
+    owner_native_export_prefixes: &BTreeMap<String, String>,
+    canonical_raw_stream_names: bool,
+) -> String {
+    let envelope = &names.envelope;
+    let item_type = harmony_native_facade_type(
+        &input.item_type,
+        owner_native_export_prefixes,
+        local_native_export_prefix,
+        canonical_raw_stream_names,
+    );
+    let error_type = harmony_native_facade_type(
+        &input.error_type,
+        owner_native_export_prefixes,
+        local_native_export_prefix,
+        canonical_raw_stream_names,
+    );
+    let input_stream_type =
+        raw_input_stream_type_name(local_native_export_prefix, canonical_raw_stream_names);
     format!(
         r#"
 
@@ -9298,7 +10944,7 @@ class {envelope} implements {next_type} {{
 
 export class {source_class}
   extends __UniFfiInputSource<{item_type}, {error_type}, {envelope}>
-  implements UniffiInputStream<{next_type}> {{
+  implements {input_stream_type}<{next_type}> {{
   protected valueEnvelope(item: {item_type}): {envelope} {{
     const result: {envelope} = new {envelope}(true);
     result.done = false;
@@ -9357,14 +11003,18 @@ export function {factory}(): {channel_class} {{
         next_type = input.next_type,
         item_type = item_type,
         error_type = error_type,
-        source_class = input.source_class,
-        writer_class = input.writer_class,
-        channel_class = input.channel_class,
-        factory = input.factory,
+        source_class = names.source_class,
+        writer_class = names.writer_class,
+        channel_class = names.channel_class,
+        factory = names.factory,
+        input_stream_type = input_stream_type,
     )
 }
 
-fn render_harmony_output_declarations(output: &HarmonyOutputStreamContract) -> String {
+fn render_harmony_output_declarations(
+    output: &HarmonyOutputStreamContract,
+    names: &HarmonyOutputInternalNames,
+) -> String {
     let args = harmony_arguments(&output.arguments);
     let item_type = output.item_type.public_type();
     format!(
@@ -9374,17 +11024,24 @@ export declare function {stream_factory}({args}): UniFfiStream<{item_type}>;
 "#,
         item_type = item_type,
         args = args,
-        stream_factory = output.stream_factory,
+        stream_factory = names.stream_factory,
     )
 }
 
-fn render_harmony_input_declarations(input: &HarmonyInputStreamContract) -> String {
+fn render_harmony_input_declarations(
+    input: &HarmonyInputStreamContract,
+    names: &HarmonyInputInternalNames,
+    local_native_export_prefix: &str,
+    canonical_raw_stream_names: bool,
+) -> String {
     let item_type = input.item_type.public_type();
     let error_type = input.error_type.public_type();
+    let input_stream_type =
+        raw_input_stream_type_name(local_native_export_prefix, canonical_raw_stream_names);
     format!(
         r#"
 
-export declare class {source_class} implements UniffiInputStream<{next_type}> {{
+export declare class {source_class} implements {input_stream_type}<{next_type}> {{
   readonly handle: number;
   next(error: Error | null, handle: number): Promise<{next_type}>;
   cancel(error: Error | null, handle: number): void;
@@ -9405,13 +11062,14 @@ export declare class {channel_class} {{
 
 export declare function {factory}(): {channel_class};
 "#,
-        source_class = input.source_class,
+        source_class = names.source_class,
         next_type = input.next_type,
-        writer_class = input.writer_class,
+        writer_class = names.writer_class,
         item_type = item_type,
         error_type = error_type,
-        channel_class = input.channel_class,
-        factory = input.factory,
+        channel_class = names.channel_class,
+        factory = names.factory,
+        input_stream_type = input_stream_type,
     )
 }
 
@@ -9606,6 +11264,43 @@ fn collect_type_defs(
     }
     validate_raw_type_def_uniqueness(defs)?;
     Ok(())
+}
+
+fn collect_owned_type_defs(
+    type_dir: &Utf8Path,
+    inventory: &FacadeTypeInventory,
+) -> Result<Vec<OwnedFacadeTypeDefs>> {
+    if inventory.facade_mode != "required" {
+        return Ok(Vec::new());
+    }
+    let entries = inventory
+        .type_definitions
+        .iter()
+        .map(|entry| (entry.file.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut owned = Vec::new();
+    for component in &inventory.components {
+        let file = format!("{}.ohos-extra-types.d.ts", component.component);
+        let entry = entries.get(file.as_str()).with_context(|| {
+            format!(
+                "OHOS facade inventory is missing canonical sidecar `{file}` for component `{}`",
+                component.component
+            )
+        })?;
+        let path = type_dir.join(&entry.file);
+        let bytes = read_verified_regular_file(&path)?;
+        if sha256_bytes(&bytes) != entry.sha256 {
+            bail!("OHOS type definition changed before consumption: {path}");
+        }
+        let defs = parse_canonical_ohos_type_defs(&bytes, &path.to_string())?;
+        owned.push(OwnedFacadeTypeDefs::new(component, defs)?);
+    }
+    let flattened = owned
+        .iter()
+        .flat_map(|component| component.defs.iter().cloned())
+        .collect::<Vec<_>>();
+    validate_raw_type_def_uniqueness(&flattened)?;
+    Ok(owned)
 }
 
 fn parse_type_def_line(line: &str) -> Result<Option<TypeDefLine>> {

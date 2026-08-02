@@ -7,9 +7,9 @@
 
 use anyhow::{bail, ensure, Result};
 use heck::{ToSnakeCase, ToUpperCamelCase};
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::parse2;
+use syn::{parse2, Attribute, Item, LitStr, Meta};
 use uniffi_bindgen::interface::{
     Argument, AsType, Callable, ComponentInterface, Constructor, Enum, Field, Function, Method,
     Object, ObjectImpl, Record, TraitKind, Type, Variant,
@@ -64,7 +64,8 @@ fn render_rust(ci: &ComponentInterface, target: NapiTarget) -> Result<String> {
     let generator = Generator::new(ci, target);
     generator.validate()?;
     let tokens = generator.render()?;
-    let file = parse2::<syn::File>(tokens)?;
+    let mut file = parse2::<syn::File>(tokens)?;
+    namespace_napi_exports(&mut file, ci)?;
     Ok(format!(
         "{}\n{}",
         target.banner(),
@@ -78,7 +79,7 @@ pub fn render_ohos_rust(
     contract_digest: &str,
 ) -> Result<String> {
     ensure!(
-        identity_export == super::ohos_bridge_identity_export(contract_digest),
+        identity_export == super::ohos_bridge_identity_export(ci, contract_digest),
         "invalid OHOS bridge identity export"
     );
     ensure!(
@@ -87,9 +88,10 @@ pub fn render_ohos_rust(
     );
     let mut rust = render_rust(ci, NapiTarget::Ohos)?;
     let identity_ident = rust_ident(identity_export);
+    let identity_js_name = LitStr::new(identity_export, Span::call_site());
     let identity_tokens = quote! {
         #[allow(non_snake_case)]
-        #[napi]
+        #[napi(js_name = #identity_js_name)]
         pub fn #identity_ident() -> String {
             #contract_digest.to_string()
         }
@@ -97,6 +99,56 @@ pub fn render_ohos_rust(
     let identity_file = parse2::<syn::File>(identity_tokens)?;
     rust.push_str(&prettyplease::unparse(&identity_file));
     Ok(rust)
+}
+
+/// `include!` modules keep Rust names private to their component, but
+/// napi-rs registers every `#[napi]` item in the one addon-wide JavaScript
+/// export table.  Rewrite every generated export attribute after the normal
+/// renderer has produced its Rust AST so functions, object/record/enum
+/// classes and stream helper types all use the same authoritative component
+/// prefix.  Failing closed here is preferable to silently leaving an
+/// unprefixed export in a composite addon.
+fn namespace_napi_exports(file: &mut syn::File, ci: &ComponentInterface) -> Result<()> {
+    for item in &mut file.items {
+        let (attributes, raw_name) = match item {
+            Item::Fn(item) => (&mut item.attrs, item.sig.ident.to_string()),
+            Item::Struct(item) => (&mut item.attrs, item.ident.to_string()),
+            Item::Enum(item) => (&mut item.attrs, item.ident.to_string()),
+            _ => continue,
+        };
+        namespace_napi_attributes(attributes, ci, &raw_name)?;
+    }
+    Ok(())
+}
+
+fn namespace_napi_attributes(
+    attributes: &mut [Attribute],
+    ci: &ComponentInterface,
+    raw_name: &str,
+) -> Result<()> {
+    for attribute in attributes {
+        if !attribute.path().is_ident("napi") {
+            continue;
+        }
+        let js_name = crate::native_exports::native_export_name(ci, raw_name);
+        let js_name = LitStr::new(&js_name, Span::call_site());
+        let rewritten = match &attribute.meta {
+            Meta::Path(_) => syn::parse_quote!(#[napi(js_name = #js_name)]),
+            Meta::List(list) => {
+                let existing = &list.tokens;
+                if existing.is_empty() {
+                    syn::parse_quote!(#[napi(js_name = #js_name)])
+                } else {
+                    syn::parse_quote!(#[napi(#existing, js_name = #js_name)])
+                }
+            }
+            Meta::NameValue(_) => {
+                bail!("generated #[napi] attribute on `{raw_name}` has an unsupported form")
+            }
+        };
+        *attribute = rewritten;
+    }
+    Ok(())
 }
 
 pub(crate) struct Generator<'a> {
@@ -959,6 +1011,24 @@ impl<'a> Generator<'a> {
             #[napi]
             pub struct #ident(#inner_type);
 
+            impl #ident {
+                // Keep the core object representation private to the N-API
+                // wrapper.  Composite component bridge modules use these
+                // crate-visible methods rather than exposing the tuple field,
+                // which would make napi-rs try to convert the core Arc.
+                pub(crate) fn __uniffi_from_core(value: #inner_type) -> Self {
+                    Self(value)
+                }
+
+                pub(crate) fn __uniffi_core_clone(&self) -> #inner_type {
+                    self.0.clone()
+                }
+
+                pub(crate) fn __uniffi_core_ref(&self) -> &#inner_type {
+                    &self.0
+                }
+            }
+
             #(#constructors)*
             #(#methods)*
         })
@@ -1107,7 +1177,7 @@ impl<'a> Generator<'a> {
             .then(|| quote!(env: None,));
         Ok(quote! {
             impl #ident {
-                fn __uniffi_from_callback_registry(
+                pub(crate) fn __uniffi_from_callback_registry(
                     __uniffi_callback_registry_id: u32,
                     #(#registry_args),*
                 ) -> Self {
@@ -1928,7 +1998,7 @@ impl<'a> Generator<'a> {
                 #[napi]
                 pub fn #fn_ident(__uniffi_env: Env, #receiver_ident: napi::bindgen_prelude::ClassInstance<'_, #object_ident>, #(#args),*) -> napi::bindgen_prelude::Result<napi::bindgen_prelude::PromiseRaw<'static, #output_ty>> {
                     #(#lowered_bindings)*
-                    let __uniffi_core = (*(#receiver_ident)).0.clone();
+                    let __uniffi_core = (*(#receiver_ident)).__uniffi_core_clone();
                     let __uniffi_future = async move {
                         #body
                     };
@@ -1945,9 +2015,9 @@ impl<'a> Generator<'a> {
             })
         } else {
             let receiver = if method.takes_self_by_arc() {
-                quote!((*(#receiver_ident)).0.clone())
+                quote!((*(#receiver_ident)).__uniffi_core_clone())
             } else {
-                quote!((*(#receiver_ident)).0.as_ref())
+                quote!((*(#receiver_ident)).__uniffi_core_ref().as_ref())
             };
             let call = quote!(#receiver.#method_ident(#(#lowered),*));
             let body = self.render_result_body(call, method.return_type(), method.throws_type())?;
@@ -2334,14 +2404,14 @@ impl<'a> Generator<'a> {
                 let next_ident = self.input_stream_next_result_ident(ty)?;
                 Ok(quote!(__UniffiInputStream<#next_ident>))
             }
-            Type::Object { name, imp, .. } => {
-                let ident = rust_ident(name);
+            Type::Object { imp, .. } => {
+                let bridge_path = self.bridge_type_path(ty);
                 match imp {
                     ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
-                        Ok(quote!(napi::bindgen_prelude::ClassInstance<'_, #ident>))
+                        Ok(quote!(napi::bindgen_prelude::ClassInstance<'_, #bridge_path>))
                     }
                     ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
-                        Ok(quote!(#ident))
+                        Ok(quote!(#bridge_path))
                     }
                 }
             }
@@ -2403,14 +2473,14 @@ impl<'a> Generator<'a> {
             Type::Boolean => Ok(quote!(bool)),
             Type::String => Ok(quote!(String)),
             Type::Bytes => Ok(quote!(napi::bindgen_prelude::Buffer)),
-            Type::Record { name, .. } | Type::Enum { name, .. } => {
-                let ident = rust_ident(name);
-                Ok(quote!(#ident))
+            Type::Record { .. } | Type::Enum { .. } => {
+                let bridge_path = self.bridge_type_path(ty);
+                Ok(quote!(#bridge_path))
             }
             Type::Object { name, imp, .. } => match imp {
                 ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
-                    let ident = rust_ident(name);
-                    Ok(quote!(#ident))
+                    let bridge_path = self.bridge_type_path(ty);
+                    Ok(quote!(#bridge_path))
                 }
                 ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     bail!("callback trait `{name}` is not supported as a nested or return value")
@@ -2443,9 +2513,9 @@ impl<'a> Generator<'a> {
             }
             Type::Timestamp => Ok(quote!(__UniffiTimestamp)),
             Type::Duration => Ok(quote!(__UniffiDuration)),
-            Type::CallbackInterface { name, .. } => {
-                let ident = rust_ident(name);
-                Ok(quote!(#ident))
+            Type::CallbackInterface { .. } => {
+                let bridge_path = self.bridge_type_path(ty);
+                Ok(quote!(#bridge_path))
             }
             Type::Custom { builtin, .. } => self.bridge_value_type(builtin),
         }
@@ -2476,7 +2546,7 @@ impl<'a> Generator<'a> {
             })),
             Type::Object { imp, .. } => match imp {
                 ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
-                    Ok(quote!((*(#ident)).0.clone()))
+                    Ok(quote!((*(#ident)).__uniffi_core_clone()))
                 }
                 ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     let trait_path = self.core_type_path(ty.clone());
@@ -2558,7 +2628,7 @@ impl<'a> Generator<'a> {
             Type::Record { .. } | Type::Enum { .. } => Ok(quote!(#expr.into())),
             Type::Object { imp, .. } => match imp {
                 ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
-                    Ok(quote!(#expr.0.clone()))
+                    Ok(quote!(#expr.__uniffi_core_clone()))
                 }
                 ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     bail!("callback traits are not supported here")
@@ -2638,8 +2708,8 @@ impl<'a> Generator<'a> {
             Type::Record { .. } | Type::Enum { .. } => Ok(quote!(#expr.into())),
             Type::Object { name, imp, .. } => match imp {
                 ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
-                    let ident = rust_ident(name);
-                    Ok(quote!(#ident(#expr)))
+                    let bridge_path = self.bridge_type_path(ty);
+                    Ok(quote!(#bridge_path::__uniffi_from_core(#expr)))
                 }
                 ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => bail!(
                     "callback trait `{name}` cannot be returned to JavaScript in the napi bridge"
@@ -2775,14 +2845,14 @@ impl<'a> Generator<'a> {
                 let value = self.callback_bridge_type(value_type)?;
                 Ok(quote!(std::collections::HashMap<#key, #value>))
             }
-            Type::Object { name, imp, .. } => match imp {
+            Type::Object { imp, .. } => match imp {
                 ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
-                    let ident = rust_ident(name);
-                    Ok(quote!(napi::bindgen_prelude::ClassInstance<'static, #ident>))
+                    let bridge_path = self.bridge_type_path(ty);
+                    Ok(quote!(napi::bindgen_prelude::ClassInstance<'static, #bridge_path>))
                 }
                 ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
-                    let ident = rust_ident(name);
-                    Ok(quote!(#ident))
+                    let bridge_path = self.bridge_type_path(ty);
+                    Ok(quote!(#bridge_path))
                 }
             },
             _ => self.bridge_return_type(ty),
@@ -2824,7 +2894,7 @@ impl<'a> Generator<'a> {
             Type::Record { .. } | Type::Enum { .. } => Ok(quote!(#expr.into())),
             Type::Object { imp, .. } => match imp {
                 ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
-                    Ok(quote!((*(#expr)).0.clone()))
+                    Ok(quote!((*(#expr)).__uniffi_core_clone()))
                 }
                 ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                     let core_path = self.core_type_path(ty.clone());
@@ -2899,12 +2969,11 @@ impl<'a> Generator<'a> {
     fn lower_callback_handle_expr(&self, expr: TokenStream, ty: &Type) -> Result<TokenStream> {
         match ty {
             Type::Object {
-                name,
                 imp: ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly),
                 ..
             }
-            | Type::CallbackInterface { name, .. } => {
-                let ident = rust_ident(name);
+            | Type::CallbackInterface { .. } => {
+                let bridge_path = self.bridge_type_path(ty);
                 let core_path = self.core_type_path(ty.clone());
                 let dispatch_args = self
                     .callback_registry_field_defs()?
@@ -2913,7 +2982,7 @@ impl<'a> Generator<'a> {
                     .collect::<Vec<_>>();
                 Ok(quote!({
                     let __handle = #expr;
-                    std::sync::Arc::new(#ident::__uniffi_from_callback_registry(
+                    std::sync::Arc::new(#bridge_path::__uniffi_from_callback_registry(
                         __handle.id,
                         #(#dispatch_args),*
                     )) as std::sync::Arc<dyn #core_path>
@@ -3014,6 +3083,47 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Path to a generated bridge item, not to the downstream core item.
+    ///
+    /// Composite hosts include every generated bridge in a private sibling
+    /// module.  A foreign named UniFFI type therefore cannot use its short
+    /// bridge name from this component's module: resolve it through the
+    /// stable owner module derived from the metadata crate root.  The host
+    /// emitter uses the exact same helper for its `include!` modules.
+    fn bridge_item_path(&self, module_path: &str, name: &str) -> TokenStream {
+        let ident = rust_ident(name);
+        if crate::host_crates::component_bridge_module_name(module_path)
+            == crate::host_crates::component_bridge_module_name(self.ci.crate_name())
+        {
+            quote!(#ident)
+        } else {
+            let owner_module = rust_ident(&crate::host_crates::component_bridge_module_name(
+                module_path,
+            ));
+            quote!(crate::#owner_module::#ident)
+        }
+    }
+
+    fn bridge_type_path(&self, ty: &Type) -> TokenStream {
+        match ty {
+            Type::Record { module_path, name }
+            | Type::Enum { module_path, name }
+            | Type::CallbackInterface { module_path, name }
+            | Type::Object {
+                module_path, name, ..
+            }
+            | Type::Custom {
+                module_path, name, ..
+            } => self.bridge_item_path(module_path, name),
+            _ => unreachable!("bridge_type_path only supports named types"),
+        }
+    }
+
+    fn is_local_module_path(&self, module_path: &str) -> bool {
+        crate::host_crates::component_bridge_module_name(module_path)
+            == crate::host_crates::component_bridge_module_name(self.ci.crate_name())
+    }
+
     fn core_item_path(&self, module_path: &str, name: &str) -> TokenStream {
         let module = rust_path(module_path);
         let ident = rust_ident(name);
@@ -3028,6 +3138,9 @@ impl<'a> Generator<'a> {
     }
 
     fn core_record_path(&self, module_path: &str, name: &str) -> TokenStream {
+        if !self.is_local_module_path(module_path) {
+            return self.core_item_path(module_path, name);
+        }
         let Some(record) = self.ci.get_record_definition(name) else {
             return self.core_item_path(module_path, name);
         };
@@ -3038,6 +3151,9 @@ impl<'a> Generator<'a> {
     }
 
     fn core_enum_path(&self, module_path: &str, name: &str) -> TokenStream {
+        if !self.is_local_module_path(module_path) {
+            return self.core_item_path(module_path, name);
+        }
         let Some(enum_) = self.ci.get_enum_definition(name) else {
             return self.core_item_path(module_path, name);
         };
@@ -3843,7 +3959,7 @@ mod renamed_record_core_path_tests {
         let ci = dual_model_fixture();
         let napi = render_napi_rust(&ci).expect("NAPI codegen must succeed");
         let digest = "0".repeat(64);
-        let identity = ohos_bridge_identity_export(&digest);
+        let identity = ohos_bridge_identity_export(&ci, &digest);
         let ohos = render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed");
 
         for generated in [&napi, &ohos] {
@@ -3942,7 +4058,7 @@ mod async_object_receiver_tests {
     fn async_object_methods_drop_napi_receivers_before_awaiting_core_futures() {
         let ci = fixture();
         let digest = "0".repeat(64);
-        let identity = ohos_bridge_identity_export(&digest);
+        let identity = ohos_bridge_identity_export(&ci, &digest);
         let rendered = [
             render_napi_rust(&ci).expect("NAPI codegen must succeed"),
             render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed"),
@@ -3955,7 +4071,7 @@ mod async_object_receiver_tests {
                 "async object receiver must start a synchronous N-API Promise boundary:\n{source}"
             );
             assert!(
-                compact.contains("let__uniffi_core=(*(handle)).0.clone();"),
+                compact.contains("let__uniffi_core=(*(handle)).__uniffi_core_clone();"),
                 "async object receiver did not clone the core Arc:\n{source}"
             );
             assert!(
@@ -4045,7 +4161,7 @@ mod float32_bridge_tests {
     fn float32_record_uses_js_number_f64_and_preserves_core_f32_contract() {
         let ci = fixture();
         let digest = "0".repeat(64);
-        let identity = ohos_bridge_identity_export(&digest);
+        let identity = ohos_bridge_identity_export(&ci, &digest);
         let rendered = [
             render_napi_rust(&ci).expect("NAPI codegen must succeed"),
             render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed"),
@@ -4516,5 +4632,52 @@ mod input_stream_descriptor_tests {
         assert!(lifted.contains("< u64 as :: uniffi :: Lift"), "{lifted}");
         assert!(!lifted.contains("BigInt as :: uniffi :: Lift"), "{lifted}");
         assert!(lifted.contains("BigInt :: from"), "{lifted}");
+    }
+
+    #[test]
+    fn external_bridge_types_use_the_owner_crate_module_not_the_local_namespace() {
+        let ci = callable_fixture();
+        let generator = Generator::new(&ci, NapiTarget::Node);
+        let expected_owner_module =
+            crate::host_crates::component_bridge_module_name("alpha-core::types");
+
+        for ty in [
+            Type::Record {
+                module_path: "alpha-core::types".into(),
+                name: "Shared".into(),
+            },
+            Type::Enum {
+                module_path: "alpha-core::types".into(),
+                name: "Shared".into(),
+            },
+            Type::Object {
+                module_path: "alpha-core::types".into(),
+                name: "SharedObject".into(),
+                imp: ObjectImpl::Struct,
+            },
+            Type::CallbackInterface {
+                module_path: "alpha-core::types".into(),
+                name: "SharedCallback".into(),
+            },
+        ] {
+            let bridge = generator.bridge_type_path(&ty).to_string();
+            assert!(
+                bridge.contains(&format!("crate :: {expected_owner_module} ::")),
+                "foreign bridge type must use the canonical owner module: {bridge}"
+            );
+            assert!(
+                !bridge.starts_with("Shared"),
+                "foreign bridge type must never use an unqualified local name: {bridge}"
+            );
+        }
+
+        let same_short_name = Type::Record {
+            module_path: ci.crate_name().into(),
+            name: "Shared".into(),
+        };
+        assert_eq!(
+            generator.bridge_type_path(&same_short_name).to_string(),
+            "Shared"
+        );
     }
 }

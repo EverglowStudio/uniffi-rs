@@ -216,7 +216,7 @@ fn emits_real_tree_for_all_flavors() {
         .expect("a .rs bridge file should exist under the arithmetic node component");
     let rust_bridge = std::fs::read_to_string(&rust_path).unwrap();
     assert!(
-        rust_bridge.contains("#[napi]"),
+        rust_bridge.contains("#[napi"),
         "node/*.rs should be real napi-rs bridge"
     );
     assert!(
@@ -234,7 +234,7 @@ fn emits_real_tree_for_all_flavors() {
         .expect("a .rs wasm shim should exist under the arithmetic browser component");
     let wasm_rs = std::fs::read_to_string(&wasm_rs_path).unwrap();
     assert!(
-        wasm_rs.contains("#[wasm_bindgen]"),
+        wasm_rs.contains("#[wasm_bindgen"),
         "browser/*.rs should be a wasm-bindgen shim, got:\n{wasm_rs}"
     );
     assert!(

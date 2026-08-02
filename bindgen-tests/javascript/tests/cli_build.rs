@@ -490,6 +490,10 @@ fn cli_build_orchestrates_full_javascript_tree() {
     let artifact_dir = Utf8PathBuf::from_path_buf(tmp.path().join("artifacts")).unwrap();
     let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target-napi")).unwrap();
     let (manifest, source) = shared::write_cli_wasm_fixture(tmp.path());
+    let composite_addon = format!(
+        "{}.node",
+        uniffi_bindgen_javascript::host_crates::composite_host_lib_target("cli-wasm-fixture")
+    );
 
     let output = Command::new(cli.as_std_path())
         .current_dir(&root)
@@ -544,23 +548,28 @@ fn cli_build_orchestrates_full_javascript_tree() {
     assert!(host_dir.join("napi/Cargo.toml").exists());
     assert!(
         !out_dir
-            .join("components/cli_wasm/node/cli_wasm.node")
+            .join("components/cli_wasm/node")
+            .join(&composite_addon)
             .exists(),
         "--artifact-dir should keep node addon out of the generated source tree"
     );
     assert!(
         !out_dir
-            .join("components/cli_wasm/electron/cli_wasm.node")
+            .join("components/cli_wasm/electron")
+            .join(&composite_addon)
             .exists(),
         "--artifact-dir should keep electron addon out of the generated source tree"
     );
     assert!(
-        artifact_dir.join("node/cli_wasm.node").exists(),
+        artifact_dir.join("node").join(&composite_addon).exists(),
         "missing node addon in artifact dir"
     );
     assert!(
-        artifact_dir.join("electron/cli_wasm.node").exists(),
-        "missing electron addon in artifact dir"
+        !artifact_dir
+            .join("electron")
+            .join(&composite_addon)
+            .exists(),
+        "composite Electron must reuse the Node addon rather than publish a duplicate"
     );
 
     let browser_pkg = artifact_dir.join("browser/pkg");
@@ -588,6 +597,11 @@ fn cli_build_orchestrates_full_javascript_tree() {
         "combined build should leave wasm-bindgen TypeScript declarations in browser/pkg: {pkg_entries:?}"
     );
 
+    let aggregate_preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    assert!(
+        aggregate_preload.contains("components/cli_wasm/electron/preload.cjs"),
+        "aggregate Electron preload must route through the component preload:\n{aggregate_preload}"
+    );
     let preload =
         std::fs::read_to_string(out_dir.join("components/cli_wasm/electron/preload.cjs")).unwrap();
     assert!(
@@ -595,13 +609,13 @@ fn cli_build_orchestrates_full_javascript_tree() {
         "combined build electron preload should expose sync and async dispatch:\n{preload}"
     );
     assert!(
-        preload.contains("../../../artifacts/electron/cli_wasm.node"),
-        "preload should load the addon from --artifact-dir:\n{preload}"
+        preload.contains(&format!("../../../artifacts/node/{composite_addon}")),
+        "component Electron preload should reuse the Node addon from --artifact-dir:\n{preload}"
     );
     let node_backend =
         std::fs::read_to_string(out_dir.join("components/cli_wasm/node/backend-napi.ts")).unwrap();
     assert!(
-        node_backend.contains("../../../artifacts/node/cli_wasm.node"),
+        node_backend.contains(&format!("../../../artifacts/node/{composite_addon}")),
         "node backend should load the addon from --artifact-dir:\n{node_backend}"
     );
 
@@ -794,6 +808,32 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         );
     }
 
+    let manifest_path = package_dir.join("artifact-manifest.json");
+    let manifest_text = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(
+        !manifest_text.contains(package_dir.as_str()),
+        "managed manifest must be relative-only:\n{manifest_text}"
+    );
+    let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+    let browser_glue = manifest_json["artifacts"]["wasm"]["glue"]
+        .as_str()
+        .expect("managed wasm artifact manifest must name its glue");
+    let browser_wasm = manifest_json["artifacts"]["wasm"]["wasm"]
+        .as_str()
+        .expect("managed wasm artifact manifest must name its wasm binary");
+    let mini_glue_path = manifest_json["artifacts"]["miniProgram"]["glue"]
+        .as_str()
+        .expect("managed Mini Program artifact manifest must name its glue");
+    let mini_wasm_path = manifest_json["artifacts"]["miniProgram"]["wasm"]
+        .as_str()
+        .expect("managed Mini Program artifact manifest must name its wasm binary");
+    let mini_default_wasm_path = manifest_json["artifacts"]["miniProgram"]["defaultWasmPath"]
+        .as_str()
+        .expect("managed Mini Program artifact manifest must name its default wasm path");
+    let node_addon_path = manifest_json["artifacts"]["node"]["addon"]
+        .as_str()
+        .expect("managed Node artifact manifest must name its addon");
+
     for path in [
         "src/index.web.ts",
         "src/index.mini-program.ts",
@@ -807,16 +847,24 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "src/ffi/node/index.ts",
         "artifacts/rust/wasm/Cargo.toml",
         "artifacts/rust/napi/Cargo.toml",
-        "artifacts/browser/pkg/cli_wasm_fixture_wasm.js",
-        "artifacts/browser/pkg/cli_wasm_fixture_wasm_bg.wasm",
-        "artifacts/mini-program/cli_wasm_fixture_wasm.js",
-        "artifacts/mini-program/cli_wasm_fixture_wasm_bg.wasm",
-        "artifacts/node/cli_wasm.node",
         "artifact-manifest.json",
         ".gitignore",
     ] {
         let file = package_dir.join(path);
         assert!(file.exists(), "missing managed layout file: {file}");
+    }
+    for path in [
+        browser_glue,
+        browser_wasm,
+        mini_glue_path,
+        mini_wasm_path,
+        node_addon_path,
+    ] {
+        let file = package_dir.join(path);
+        assert!(
+            file.exists(),
+            "managed artifact manifest points to a missing file: {file}"
+        );
     }
 
     let web_entry = std::fs::read_to_string(package_dir.join("src/index.web.ts")).unwrap();
@@ -864,10 +912,7 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "Mini Program entry should validate WXWebAssembly.instantiate:\n{mini_runtime}"
     );
 
-    let mini_glue = std::fs::read_to_string(
-        package_dir.join("artifacts/mini-program/cli_wasm_fixture_wasm.js"),
-    )
-    .unwrap();
+    let mini_glue = std::fs::read_to_string(package_dir.join(mini_glue_path)).unwrap();
     for forbidden in ["fetch(", "import.meta.url", "?url", "window", "document"] {
         assert!(
             !mini_glue.contains(forbidden),
@@ -903,27 +948,42 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "managed gitignore must not hide reviewable FFI source:\n{gitignore}"
     );
 
-    let manifest_text =
-        std::fs::read_to_string(package_dir.join("artifact-manifest.json")).unwrap();
-    assert!(
-        !manifest_text.contains(package_dir.as_str()),
-        "managed manifest must be relative-only:\n{manifest_text}"
-    );
-    let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
-    assert_eq!(manifest_json["artifactManifestSchemaVersion"], 3);
+    assert_eq!(manifest_json["artifactManifestSchemaVersion"], 4);
     assert!(manifest_json.get("schemaVersion").is_none());
     assert_eq!(
         manifest_json["targets"],
         serde_json::json!(["wasm", "mini-program", "node"])
     );
     assert_eq!(manifest_json["source"]["root"], "src/ffi");
+    assert_eq!(manifest_json["source"]["shared"], "src/ffi/shared");
+    assert_eq!(manifest_json["source"]["browser"], "src/ffi/browser");
+    assert_eq!(manifest_json["source"]["node"], "src/ffi/node");
+    let components = manifest_json["components"]
+        .as_array()
+        .expect("managed manifest must describe its component contracts");
+    assert_eq!(components.len(), 1, "fixture must have one component");
+    let component = &components[0];
+    assert_eq!(component["component"], "cli_wasm_fixture");
+    assert_eq!(component["namespace"], "cli_wasm");
     assert_eq!(
-        manifest_json["source"]["common"],
+        component["nativeExportPrefix"],
+        uniffi_bindgen::interface::native_export_prefix_for_component("cli_wasm_fixture")
+    );
+    assert_eq!(
+        component["source"]["common"],
         "src/ffi/components/cli_wasm/common"
     );
     assert_eq!(
-        manifest_json["source"]["publicTypes"],
+        component["source"]["publicTypes"],
         "src/ffi/components/cli_wasm/common/public-types.ts"
+    );
+    assert_eq!(
+        component["source"]["browser"],
+        "src/ffi/components/cli_wasm/browser"
+    );
+    assert_eq!(
+        component["source"]["node"],
+        "src/ffi/components/cli_wasm/node"
     );
     assert_eq!(manifest_json["entrypoints"]["web"], "src/index.web.ts");
     assert_eq!(
@@ -931,26 +991,29 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "src/index.mini-program.ts"
     );
     assert_eq!(manifest_json["entrypoints"]["node"], "src/index.node.ts");
+    let wasm_stem =
+        uniffi_bindgen_javascript::host_crates::composite_host_lib_target("cli-wasm-fixture");
     assert_eq!(
-        manifest_json["artifacts"]["wasm"]["wasm"],
-        "artifacts/browser/pkg/cli_wasm_fixture_wasm_bg.wasm"
+        browser_glue,
+        format!("artifacts/browser/pkg/{wasm_stem}.js")
     );
     assert_eq!(
-        manifest_json["artifacts"]["miniProgram"]["glue"],
-        "artifacts/mini-program/cli_wasm_fixture_wasm.js"
+        browser_wasm,
+        format!("artifacts/browser/pkg/{wasm_stem}_bg.wasm")
     );
     assert_eq!(
-        manifest_json["artifacts"]["miniProgram"]["wasm"],
-        "artifacts/mini-program/cli_wasm_fixture_wasm_bg.wasm"
+        mini_glue_path,
+        format!("artifacts/mini-program/{wasm_stem}.js")
     );
     assert_eq!(
-        manifest_json["artifacts"]["miniProgram"]["defaultWasmPath"],
-        "/assets/cli_wasm_fixture_wasm_bg.wasm"
+        mini_wasm_path,
+        format!("artifacts/mini-program/{wasm_stem}_bg.wasm")
     );
     assert_eq!(
-        manifest_json["artifacts"]["node"]["addon"],
-        "artifacts/node/cli_wasm.node"
+        mini_default_wasm_path,
+        format!("/assets/{wasm_stem}_bg.wasm")
     );
+    assert_eq!(node_addon_path, format!("artifacts/node/{wasm_stem}.node"));
     assert!(manifest_json["artifacts"]["harmony"].is_null());
 
     std::fs::write(
@@ -962,6 +1025,7 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
     let mini_driver = r#"
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import * as realGlue from "./__MINI_GLUE__";
 
 function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (actual !== expected) {
@@ -976,7 +1040,7 @@ const calls: string[] = [];
     async instantiate(path: string, imports: WebAssembly.Imports): Promise<WebAssembly.WebAssemblyInstantiatedSource> {
         calls.push(path);
         const localPath = path.startsWith("/assets/")
-            ? `artifacts/mini-program/${path.slice("/assets/".length)}`
+            ? "__MINI_WASM_ARTIFACT__"
             : path;
         const bytes = await readFile(resolve(localPath));
         return WebAssembly.instantiate(bytes, imports);
@@ -985,15 +1049,34 @@ const calls: string[] = [];
 
 const miniRoot = await import("./src/index.mini-program.ts");
 const mini = miniRoot.cli_wasm;
-await miniRoot.init("/assets/cli_wasm_fixture_wasm_bg.wasm");
-assertEq(calls[0], "/assets/cli_wasm_fixture_wasm_bg.wasm", "WXWebAssembly path");
+let defaultCalls = 0;
+// Keep the real named wasm-bindgen exports, but make `default` explicitly
+// read-only. The generated Mini Program coordinator must shadow it on a
+// derived object before passing the glue to component backends.
+const frozenGlue = Object.freeze({
+    ...realGlue,
+    default: async (wasmPath: string): Promise<unknown> => {
+        defaultCalls += 1;
+        return realGlue.default(wasmPath);
+    },
+});
+await miniRoot.initWithGlue(frozenGlue, "__MINI_DEFAULT_WASM_PATH__");
+assertEq(calls[0], "__MINI_DEFAULT_WASM_PATH__", "WXWebAssembly path");
+assertEq(defaultCalls, 1, "frozen glue default initialization count");
 assertEq(mini.add(2n, 3n), 5n, "mini.add");
 assertEq(mini.slowAdd(20n, 22n), 42n, "mini.slowAdd");
 assertEq(await mini.asyncAdd(30n, 12n), 42n, "mini.asyncAdd");
-await miniRoot.init("/assets/ignored.wasm");
+await Promise.all([
+    miniRoot.initWithGlue(frozenGlue, "/assets/ignored.wasm"),
+    miniRoot.init("/assets/ignored-again.wasm"),
+]);
 assertEq(calls.length, 1, "mini init idempotent");
+assertEq(defaultCalls, 1, "frozen glue default idempotent");
 console.log("mini-program managed runtime ok");
-"#;
+"#
+    .replace("__MINI_GLUE__", mini_glue_path)
+    .replace("__MINI_WASM_ARTIFACT__", mini_wasm_path)
+    .replace("__MINI_DEFAULT_WASM_PATH__", mini_default_wasm_path);
     std::fs::write(
         package_dir.join("mini-program-smoke.ts").as_std_path(),
         mini_driver,

@@ -465,11 +465,11 @@ crate-type = ["rlib"]
     // Representative dispatch keys. If any of these drift we want a
     // loud failure pointing at this exact file.
     let expected: &[(&str, &str)] = &[
-        ("greet_with", "greetWith"),
-        ("counter_new", "counterNew"),
-        ("counter_with_initial", "counterWithInitial"),
-        ("counter_get", "counterGet"),
-        ("run_job", "runJob"),
+        ("greet_with", "ffi_mapping_greet_with"),
+        ("counter_new", "ffi_mapping_counter_new"),
+        ("counter_with_initial", "ffi_mapping_counter_with_initial"),
+        ("counter_get", "ffi_mapping_counter_get"),
+        ("run_job", "ffi_mapping_run_job"),
     ];
 
     let backend_napi =
@@ -1406,8 +1406,11 @@ fn js_async_iterable_stream_stub_contract() {
         std::fs::read_to_string(out_dir.join("components/stream_core/node/backend-napi.ts"))
             .unwrap();
     assert!(
-        backend.contains("\"count_events_stream_next\": \"countEventsStreamNext\"")
-            && backend.contains("\"count_events_stream_cancel\": \"countEventsStreamCancel\"")
+        backend
+            .contains("\"count_events_stream_next\": \"ffi_stream_core_count_events_stream_next\"")
+            && backend.contains(
+                "\"count_events_stream_cancel\": \"ffi_stream_core_count_events_stream_cancel\""
+            )
             && backend.contains("__uniffiJsRuntimeAbiVersion")
             && backend.contains("__uniffiNormalizeStreamStep"),
         "napi backend name map should include stream next/cancel:\n{backend}"
@@ -1758,7 +1761,7 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
     }
     assert_eq!(
         contract["outputStreams"][0]["stepType"],
-        "UniffiCountEventsStreamNext"
+        "ffi_stream_core_UniffiCountEventsStreamNext"
     );
     assert_eq!(
         contract["outputStreams"][0]["streamFactory"],
@@ -1770,8 +1773,16 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|stream| stream["function"] == "optionalEvents")
+        .find(|stream| stream["function"] == "ffi_stream_core_optionalEvents")
         .expect("facade contract must retain the optional stream item descriptor");
+    assert_eq!(
+        optional_stream["nextFunction"],
+        "ffi_stream_core_optionalEventsStreamNext"
+    );
+    assert_eq!(
+        optional_stream["cancelFunction"],
+        "ffi_stream_core_optionalEventsStreamCancel"
+    );
     assert_eq!(
         optional_stream["itemType"],
         serde_json::json!({
@@ -1781,7 +1792,7 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
     );
     assert_eq!(
         optional_stream["stepType"],
-        "UniffiOptionalEventsStreamNext"
+        "ffi_stream_core_UniffiOptionalEventsStreamNext"
     );
 
     let extra_types = std::fs::read_to_string(
@@ -1797,13 +1808,13 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
             )
             .unwrap()
         })
-        .find(|definition| definition["name"] == "UniffiOptionalEventsStreamNext")
+        .find(|definition| definition["name"] == "ffi_stream_core_UniffiOptionalEventsStreamNext")
         .expect("OHOS sidecar must declare the optional stream envelope");
     assert_eq!(optional_step["kind"], "interface");
     assert_eq!(optional_step["typeParameters"], serde_json::json!([]));
     assert_eq!(
         optional_step["def"],
-        "kind: string\nvalue?: number | undefined | null\nerror?: StreamError"
+        "kind: string\nvalue?: number | undefined | null\nerror?: ffi_stream_core_StreamError"
     );
 
     let root_index = std::fs::read_to_string(out_dir.join("harmony/index.ts")).unwrap();
@@ -2041,13 +2052,30 @@ fn input_stream_bidi_static_generation_contract() {
         .as_str()
         .unwrap()
         .to_string();
+    let input_stream_type = "ffi_input_stream_core_UniffiInputStream";
     assert!(factory.starts_with("createItemRecordCounterEventErrorEnumStreamErrorFingerprint"));
     assert!(factory.ends_with("InputChannel"));
     assert_eq!(contract["inputStreams"][0]["itemType"]["kind"], "named");
     assert_eq!(contract["inputStreams"][0]["errorType"]["kind"], "named");
     assert_eq!(
+        input_next_type,
+        format!("ffi_input_stream_core_UniffiInputStream{input_suffix}Next")
+    );
+    assert_eq!(
+        contract["outputStreams"][0]["function"],
+        "ffi_input_stream_core_runningSum"
+    );
+    assert_eq!(
+        contract["outputStreams"][0]["nextFunction"],
+        "ffi_input_stream_core_runningSumStreamNext"
+    );
+    assert_eq!(
+        contract["outputStreams"][0]["cancelFunction"],
+        "ffi_input_stream_core_runningSumStreamCancel"
+    );
+    assert_eq!(
         contract["outputStreams"][0]["stepType"],
-        "UniffiRunningSumStreamNext"
+        "ffi_input_stream_core_UniffiRunningSumStreamNext"
     );
     let extra_types = std::fs::read_to_string(
         out_dir
@@ -2063,8 +2091,8 @@ fn input_stream_bidi_static_generation_contract() {
             )
             .unwrap()
         })
-        .find(|definition| definition["name"] == "UniffiInputStream")
-        .expect("OHOS sidecar must declare UniffiInputStream");
+        .find(|definition| definition["name"] == input_stream_type)
+        .expect("OHOS sidecar must declare the canonical prefixed UniffiInputStream");
     assert_eq!(input_stream_def["kind"], "interface");
     assert_eq!(input_stream_def["typeParameters"], serde_json::json!(["T"]));
     assert!(input_stream_def["def"]
@@ -2322,7 +2350,7 @@ fn napi_callback_args_are_lifted_with_js_stub() {
         out_dir.join("stub-addon.cjs"),
         r#"
 module.exports = {
-  emitEvent(sink) {
+  ffi_callback_shape_emit_event(sink) {
     sink.onEvent({ type: "Started", messageId: "msg-3" });
   },
 };
@@ -2417,7 +2445,7 @@ exports.contextBridge = {
         out_dir.join("stub-addon.cjs"),
         r#"
 module.exports = {
-  emitEvent(sink) {
+  ffi_callback_shape_emit_event(sink) {
     sink.onEvent({ type: "Started", messageId: "msg-3" });
   },
 };

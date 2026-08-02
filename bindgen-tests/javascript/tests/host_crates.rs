@@ -29,7 +29,8 @@ fn emits_host_crate_tree_when_opted_in() {
     }
 
     let wasm_toml = std::fs::read_to_string(host_dir.join("wasm/Cargo.toml")).unwrap();
-    assert!(wasm_toml.contains("name = \"uniffi-example-arithmetic-wasm\""));
+    assert!(wasm_toml.contains("name = \"uniffi-example-arithmetic-uniffi-js-host\""));
+    assert!(wasm_toml.contains("name = \"uniffi_example_arithmetic_uniffi_js_host\""));
     assert!(wasm_toml.contains("crate-type = [\"cdylib\""));
     assert!(wasm_toml.contains("wasm-bindgen ="));
     assert!(wasm_toml.contains("wasm-bindgen-futures"));
@@ -37,7 +38,7 @@ fn emits_host_crate_tree_when_opted_in() {
     assert!(!wasm_toml.contains("serde ="));
     assert!(wasm_toml.contains("js-sys"));
     assert!(
-        wasm_toml.contains("uniffi-example-arithmetic = { path ="),
+        wasm_toml.contains("arithmetical = { package = \"uniffi-example-arithmetic\", path ="),
         "wasm Cargo.toml should path-depend on core crate, got:\n{wasm_toml}"
     );
     assert!(
@@ -54,14 +55,15 @@ fn emits_host_crate_tree_when_opted_in() {
     );
 
     let napi_toml = std::fs::read_to_string(host_dir.join("napi/Cargo.toml")).unwrap();
-    assert!(napi_toml.contains("name = \"uniffi-example-arithmetic-napi\""));
+    assert!(napi_toml.contains("name = \"uniffi-example-arithmetic-uniffi-js-host\""));
+    assert!(napi_toml.contains("name = \"uniffi_example_arithmetic_uniffi_js_host\""));
     assert!(napi_toml.contains("crate-type = [\"cdylib\"]"));
     assert!(napi_toml.contains("napi = "));
     assert!(napi_toml.contains("napi-derive"));
     assert!(napi_toml.contains("napi-build"));
     assert!(napi_toml.contains("async-trait = \"0.1\""));
     assert!(
-        napi_toml.contains("uniffi-example-arithmetic = { path ="),
+        napi_toml.contains("arithmetical = { package = \"uniffi-example-arithmetic\", path ="),
         "napi Cargo.toml should path-depend on core crate, got:\n{napi_toml}"
     );
     assert!(napi_toml.contains("[workspace]"));
@@ -131,8 +133,8 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
 
     let toml = std::fs::read_to_string(host_dir.join("ohos/Cargo.toml")).unwrap();
     for required in [
-        "name = \"uniffi-example-arithmetic-ohos\"",
-        "name = \"arithmetic_ohos\"",
+        "name = \"uniffi-example-arithmetic-uniffi-js-host\"",
+        "name = \"uniffi_example_arithmetic_uniffi_js_host\"",
         "napi-ohos = { version = \"1.1.6\"",
         "napi-derive-ohos = { version = \"1.1.6\", default-features = false, features = [\"strict\", \"type-def\"] }",
         "napi-build-ohos = \"1.1.6\"",
@@ -536,6 +538,325 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+}
+
+#[test]
+fn composite_host_crates_are_deterministic_complete_and_compile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let forward_root = tmp.path().join("forward");
+    let reverse_root = tmp.path().join("reverse");
+
+    let forward = CompositeFixture::write(&forward_root);
+    forward.build_cdylib();
+    let forward_out = Utf8PathBuf::from_path_buf(forward_root.join("generated")).unwrap();
+    let forward_hosts = Utf8PathBuf::from_path_buf(forward_root.join("rust_modules")).unwrap();
+    forward.generate(
+        &forward_out,
+        Some(forward_hosts.clone()),
+        vec![
+            FlavorTarget::Wasm,
+            FlavorTarget::Napi,
+            FlavorTarget::Electron,
+            FlavorTarget::Harmony,
+        ],
+    );
+
+    let reverse = CompositeFixture::write_reversed(&reverse_root);
+    reverse.build_cdylib();
+    let reverse_out = Utf8PathBuf::from_path_buf(reverse_root.join("generated")).unwrap();
+    let reverse_hosts = Utf8PathBuf::from_path_buf(reverse_root.join("rust_modules")).unwrap();
+    reverse.generate(
+        &reverse_out,
+        Some(reverse_hosts.clone()),
+        vec![
+            FlavorTarget::Wasm,
+            FlavorTarget::Napi,
+            FlavorTarget::Electron,
+            FlavorTarget::Harmony,
+        ],
+    );
+
+    assert_eq!(
+        regular_tree_snapshot(forward_out.as_std_path(), forward.root().as_std_path()),
+        regular_tree_snapshot(reverse_out.as_std_path(), reverse.root().as_std_path()),
+        "reverse Cargo dependency/re-export order must not change generated source",
+    );
+    assert_eq!(
+        regular_tree_snapshot(forward_hosts.as_std_path(), forward.root().as_std_path()),
+        regular_tree_snapshot(reverse_hosts.as_std_path(), reverse.root().as_std_path()),
+        "reverse Cargo dependency/re-export order must not change host crates or OHOS bundle",
+    );
+
+    let host_package = "composite-core-uniffi-js-host";
+    let host_target = "composite_core_uniffi_js_host";
+    for flavor in ["wasm", "napi", "ohos"] {
+        let manifest = forward.host_manifest_path(&forward_hosts, flavor);
+        let cargo_toml = std::fs::read_to_string(&manifest).unwrap();
+        assert!(
+            cargo_toml.contains(&format!("name = \"{host_package}\"")),
+            "{flavor} host must use the one composite package:\n{cargo_toml}"
+        );
+        assert!(
+            cargo_toml.contains(&format!("name = \"{host_target}\"")),
+            "{flavor} host must use the one composite lib target:\n{cargo_toml}"
+        );
+        for component in CANONICAL_COMPONENTS {
+            assert!(
+                cargo_toml.contains(&format!(
+                    "{} = {{ package = \"{}\", path =",
+                    component.crate_name, component.package_name,
+                )),
+                "{flavor} host must directly depend on {}:\n{cargo_toml}",
+                component.package_name,
+            );
+            let dependency_line = cargo_toml
+                .lines()
+                .find(|line| line.starts_with(&format!("{} = ", component.crate_name)))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{flavor} host has no dependency line for {}:\n{cargo_toml}",
+                        component.crate_name
+                    )
+                });
+            assert!(
+                dependency_line.contains("default-features = false"),
+                "{flavor} host component dependencies must not enable unrelated component defaults:\n{cargo_toml}",
+            );
+        }
+
+        let lib_rs =
+            std::fs::read_to_string(forward_hosts.join(flavor).join("src/lib.rs")).unwrap();
+        for component in CANONICAL_COMPONENTS {
+            let encoded_crate_root = component
+                .crate_name
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert!(
+                lib_rs.contains(&format!("mod __uniffi_component_{encoded_crate_root}"))
+                    && lib_rs.contains(&format!(
+                        "components/{}/{}/{}",
+                        component.namespace,
+                        match flavor {
+                            "wasm" => "browser",
+                            "napi" => "node",
+                            "ohos" => "harmony",
+                            _ => unreachable!(),
+                        },
+                        component.bridge_filename,
+                    )),
+                "{flavor} host must include {} in an isolated module:\n{lib_rs}",
+                component.namespace,
+            );
+        }
+    }
+
+    let bundle: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(forward_hosts.join("ohos/uniffi-ohos-facade-bundle.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bundle["hostBundleSchemaVersion"], 3);
+    assert_eq!(bundle["packageName"], host_package);
+    assert_eq!(bundle["libTarget"], host_target);
+    assert_eq!(bundle["components"].as_array().map(Vec::len), Some(2));
+    assert_eq!(bundle["contracts"].as_array().map(Vec::len), Some(2));
+    assert_eq!(bundle["typeSidecars"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        bundle["fingerprint"].as_str().map(str::len),
+        Some(64),
+        "OHOS bundle fingerprint must be an exact SHA-256",
+    );
+
+    let components = bundle["components"].as_array().unwrap();
+    let identity_components = components
+        .iter()
+        .map(|component| {
+            (
+                component["component"].as_str().unwrap().to_string(),
+                component["namespace"].as_str().unwrap().to_string(),
+                component["nativeExportPrefix"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identity_components,
+        vec![
+            (
+                "alpha_core".to_string(),
+                "alpha".to_string(),
+                "ffi_alpha_core".to_string()
+            ),
+            (
+                "beta_core".to_string(),
+                "beta".to_string(),
+                "ffi_beta_core".to_string()
+            ),
+        ],
+        "bundle components must preserve stable crate/namespace/native-prefix ownership",
+    );
+    assert_eq!(
+        bundle["hostCompositeIdentity"],
+        uniffi_bindgen_javascript::host_crates::composite_host_identity(
+            host_package,
+            host_target,
+            &identity_components,
+        )
+        .unwrap(),
+        "bundle identity must be recomputable from its exact component tuple",
+    );
+
+    for component in components {
+        let namespace = component["namespace"].as_str().unwrap();
+        let crate_name = component["component"].as_str().unwrap();
+        let contract_file = component["contractFile"].as_str().unwrap();
+        let identity_export = component["identityExport"].as_str().unwrap();
+        assert_eq!(component["contractSha256"].as_str().map(str::len), Some(64));
+        assert!(
+            std::fs::read_to_string(
+                forward_out
+                    .join("components")
+                    .join(namespace)
+                    .join("harmony")
+                    .join(contract_file),
+            )
+            .unwrap()
+            .contains(crate_name),
+            "each bundle contract must be the exact generated component contract"
+        );
+        let sidecar = forward_out
+            .join("components")
+            .join(namespace)
+            .join("harmony")
+            .join(format!("{crate_name}.ohos-extra-types.d.ts"));
+        let bridge = forward.generated_bridge_path(
+            &forward_out,
+            component_for_namespace(namespace),
+            "harmony",
+        );
+        assert!(
+            std::fs::read_to_string(&sidecar)
+                .unwrap()
+                .contains(identity_export)
+                && std::fs::read_to_string(&bridge)
+                    .unwrap()
+                    .contains(identity_export),
+            "OHOS sidecar and bridge must carry the same component identity export",
+        );
+    }
+
+    let napi_target = forward_root.join("target-napi");
+    let host_feature_args = ["--features", "composite_core/host-gate"];
+    let napi = run_cargo_check(
+        &forward.host_manifest_path(&forward_hosts, "napi"),
+        &host_feature_args,
+        &napi_target,
+    )
+    .expect("cargo must be available for composite N-API host checking");
+    assert!(
+        napi.status.success(),
+        "composite N-API host check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&napi.stdout),
+        String::from_utf8_lossy(&napi.stderr),
+    );
+
+    let wasm_target = forward_root.join("target-wasm");
+    let wasm = run_cargo_check(
+        &forward.host_manifest_path(&forward_hosts, "wasm"),
+        &[
+            "--target",
+            "wasm32-unknown-unknown",
+            "--features",
+            "composite_core/host-gate",
+        ],
+        &wasm_target,
+    )
+    .expect("cargo must be available for composite wasm host checking");
+    assert!(
+        wasm.status.success(),
+        "composite wasm host check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&wasm.stdout),
+        String::from_utf8_lossy(&wasm.stderr),
+    );
+
+    let ohos_target = forward_root.join("target-ohos");
+    let ohos = run_cargo_check(
+        &forward.host_manifest_path(&forward_hosts, "ohos"),
+        &[
+            "--target",
+            "aarch64-unknown-linux-ohos",
+            "--features",
+            "composite_core/host-gate",
+        ],
+        &ohos_target,
+    )
+    .expect("cargo must be available for composite OHOS host checking");
+    assert!(
+        ohos.status.success(),
+        "composite OHOS host check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ohos.stdout),
+        String::from_utf8_lossy(&ohos.stderr),
+    );
+}
+
+fn component_for_namespace(namespace: &str) -> CompositeComponent {
+    CANONICAL_COMPONENTS
+        .into_iter()
+        .find(|component| component.namespace == namespace)
+        .unwrap_or_else(|| panic!("unexpected composite namespace `{namespace}`"))
+}
+
+fn regular_tree_snapshot(
+    root: &std::path::Path,
+    fixture_root: &std::path::Path,
+) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn visit(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        output: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        let mut entries = std::fs::read_dir(dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                visit(root, &path, output);
+            } else if file_type.is_file() {
+                output.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            } else {
+                panic!(
+                    "composite generated tree contains an unsupported non-file entry: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    visit(root, root, &mut output);
+    let fixture_root = fixture_root.to_string_lossy();
+    output
+        .into_iter()
+        .map(|(path, contents)| {
+            let contents = match String::from_utf8(contents) {
+                Ok(contents) => contents
+                    .replace(fixture_root.as_ref(), "<composite-fixture-root>")
+                    .into_bytes(),
+                Err(error) => error.into_bytes(),
+            };
+            (path, contents)
+        })
+        .collect()
 }
 pub fn generate_arithmetic_with_host_crates(out_dir: &Utf8PathBuf, host_crates_dir: &Utf8PathBuf) {
     let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");

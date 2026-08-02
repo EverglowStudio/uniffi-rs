@@ -18,6 +18,9 @@ use crate::{AbiFlavor, JsConfig};
 #[derive(Clone, Debug, Default)]
 pub struct FlavorEmitOptions {
     pub default_addon_path: Option<String>,
+    /// One composite OHOS cdylib can serve many generated component
+    /// adapters. When absent, retain the standalone component default.
+    pub ohos_native_library_stem: Option<String>,
 }
 
 pub fn emit(
@@ -29,6 +32,8 @@ pub fn emit(
     match flavor {
         AbiFlavor::Wasm => wasm::emit(dir, component),
         AbiFlavor::Napi => napi::emit(dir, component, options.default_addon_path.as_deref()),
-        AbiFlavor::Ohos => napi::emit_ohos(dir, component),
+        AbiFlavor::Ohos => {
+            napi::emit_ohos(dir, component, options.ohos_native_library_stem.as_deref())
+        }
     }
 }

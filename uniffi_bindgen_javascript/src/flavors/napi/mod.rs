@@ -51,17 +51,21 @@ pub fn emit(
     Ok(())
 }
 
-pub fn emit_ohos(dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()> {
+pub fn emit_ohos(
+    dir: &Utf8Path,
+    component: &Component<JsConfig>,
+    composite_native_library_stem: Option<&str>,
+) -> Result<()> {
     let ci = &component.ci;
 
     let facade_contract = render_ohos_facade_contract(ci)?;
     let contract_digest = sha256_text(&facade_contract);
-    let identity_export = ohos_bridge_identity_export(&contract_digest);
+    let identity_export = ohos_bridge_identity_export(ci, &contract_digest);
     let rust_source = codegen::render_ohos_rust(ci, &identity_export, &contract_digest)?;
-    let adapter = render_ohos_backend_adapter(ci);
+    let adapter = render_ohos_backend_adapter(ci, composite_native_library_stem);
     let extra_types = render_ohos_extra_types(ci, &identity_export)?;
     let stream_helpers = render_ohos_stream_helpers(ci);
-    let index = render_ohos_index(ci);
+    let index = render_ohos_index(ci, composite_native_library_stem);
 
     // Finish every render and validation before touching the output tree.  In
     // particular, canonical sidecar collection can still reject generated
@@ -89,7 +93,78 @@ fn sha256_text(value: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
-pub(crate) fn ohos_bridge_identity_export(contract_digest: &str) -> String {
+pub(crate) fn ohos_bridge_identity_export(
+    ci: &uniffi_bindgen::ComponentInterface,
+    contract_digest: &str,
+) -> String {
+    ohos_bridge_identity_export_for_prefix(&ci.native_export_prefix(), contract_digest)
+}
+
+pub fn ohos_bridge_identity_export_for_prefix(
+    native_export_prefix: &str,
+    contract_digest: &str,
+) -> String {
+    crate::native_exports::native_export_name_for_prefix(
+        native_export_prefix,
+        &ohos_bridge_identity_key(contract_digest),
+    )
+}
+
+/// Exact raw addon names for one output-stream surface.  The public stream
+/// factory and pull class deliberately remain short component API names; only
+/// these native bridge declarations are prefixed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OhosRawOutputStreamNames {
+    pub function: String,
+    pub next_function: String,
+    pub cancel_function: String,
+    pub step_type: String,
+}
+
+pub fn ohos_raw_output_stream_names_for_prefix(
+    native_export_prefix: &str,
+    function_short_name: &str,
+) -> OhosRawOutputStreamNames {
+    let next_key = crate::dispatch_key::stream_next_key(function_short_name);
+    let cancel_key = crate::dispatch_key::stream_cancel_key(function_short_name);
+    let next_short_name = crate::js_names::function_name(&next_key);
+    let cancel_short_name = crate::js_names::function_name(&cancel_key);
+    let step_short_name = format!(
+        "Uniffi{}StreamNext",
+        function_short_name.to_upper_camel_case()
+    );
+    OhosRawOutputStreamNames {
+        function: crate::native_exports::native_export_name_for_prefix(
+            native_export_prefix,
+            function_short_name,
+        ),
+        next_function: crate::native_exports::native_export_name_for_prefix(
+            native_export_prefix,
+            &next_short_name,
+        ),
+        cancel_function: crate::native_exports::native_export_name_for_prefix(
+            native_export_prefix,
+            &cancel_short_name,
+        ),
+        step_type: crate::native_exports::native_export_name_for_prefix(
+            native_export_prefix,
+            &step_short_name,
+        ),
+    }
+}
+
+pub fn ohos_raw_input_stream_type_for_prefix(native_export_prefix: &str) -> String {
+    crate::native_exports::native_export_name_for_prefix(native_export_prefix, "UniffiInputStream")
+}
+
+pub fn ohos_raw_input_next_type_for_prefix(native_export_prefix: &str, suffix: &str) -> String {
+    crate::native_exports::native_export_name_for_prefix(
+        native_export_prefix,
+        &format!("UniffiInputStream{suffix}Next"),
+    )
+}
+
+fn ohos_bridge_identity_key(contract_digest: &str) -> String {
     let encoded = contract_digest
         .bytes()
         .map(|byte| match byte {
@@ -232,8 +307,8 @@ fn render_backend_adapter(
          {prelude}\
          \n\
          // Generator-computed map from `common/api.ts` low-level\n\
-         // snake_case dispatch keys to the `lowerCamelCase` names that\n\
-         // {runtime_label} actually exports on the native module. Keeping this\n\
+         // snake_case dispatch keys to canonical component-prefixed names\n\
+         // that {runtime_label} exports on the native module. Keeping this\n\
          // as a static literal (not a runtime heuristic) means the two\n\
          // sides can't drift: `name_map::collect` walks the same IR\n\
          // shape `api_module/mod.rs` walks.\n\
@@ -404,11 +479,11 @@ fn render_backend_adapter(
                      // so the generated backend intentionally treats those\n\
                      // destructor calls as idempotent no-ops.\n\
                      if (__uniffiIsObjectFreeKey(name)) return (_handle: {dynamic_type}): void => {{}};\n\
-                     // Translate low-level key → addon export name. Fall\n\
-                     // back to the raw name so anything the generator didn't\n\
-                     // put in the map still surfaces a clear `undefined`\n\
-                     // rather than silently hitting an unrelated member.\n\
-                     const exportName = __uniffiNameMap[name] ?? name;\n\
+                     // Translate a low-level key to one exact native export.\n\
+                     // There is deliberately no short-name fallback: in a\n\
+                     // composite addon it could select another component.\n\
+                     const exportName = __uniffiNameMap[name];\n\
+                     if (typeof exportName !== \"string\") return undefined;\n\
                      const v = (native as Record<string, {dynamic_type}>)[exportName];\n\
                      if (typeof v !== \"function\") return v;\n\
                      const fn = v as (...args: {dynamic_type}[]) => {dynamic_type};\n\
@@ -459,12 +534,15 @@ fn render_backend_adapter(
     )
 }
 
-fn render_ohos_backend_adapter(ci: &uniffi_bindgen::ComponentInterface) -> String {
+fn render_ohos_backend_adapter(
+    ci: &uniffi_bindgen::ComponentInterface,
+    composite_native_library_stem: Option<&str>,
+) -> String {
     let namespace = ci.namespace();
-    let native_module = format!(
-        "lib{}.so",
-        crate::js_names::ohos_native_library_stem(namespace)
-    );
+    let native_stem = composite_native_library_stem
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| crate::js_names::ohos_native_library_stem(namespace));
+    let native_module = format!("lib{native_stem}.so");
     render_backend_adapter(
         ci,
         BackendAdapterTarget::Ohos {
@@ -509,12 +587,15 @@ fn render_index(ci: &uniffi_bindgen::ComponentInterface) -> String {
     )
 }
 
-fn render_ohos_index(ci: &uniffi_bindgen::ComponentInterface) -> String {
+fn render_ohos_index(
+    ci: &uniffi_bindgen::ComponentInterface,
+    composite_native_library_stem: Option<&str>,
+) -> String {
     let namespace = ci.namespace();
-    let native_module = format!(
-        "lib{}.so",
-        crate::js_names::ohos_native_library_stem(namespace)
-    );
+    let native_stem = composite_native_library_stem
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| crate::js_names::ohos_native_library_stem(namespace));
+    let native_module = format!("lib{native_stem}.so");
     format!(
         "// AUTOGENERATED by uniffi_bindgen_javascript (harmony/ohos flavor).\n\
          //\n\
@@ -665,9 +746,10 @@ fn render_ohos_extra_types(
     let mut definitions = OhosTypeDefCollector::default();
 
     for record in ci.record_definitions() {
+        let record_name = ohos_raw_export_name(ci, record.name());
         definitions.insert(
             "interface",
-            record.name(),
+            &record_name,
             record
                 .fields()
                 .iter()
@@ -675,30 +757,35 @@ fn render_ohos_extra_types(
                     Ok(format!(
                         "{}: {}",
                         crate::js_names::field_name(field.name()),
-                        ohos_napi_ts_type(&field.as_type())?
+                        ohos_raw_napi_ts_type(ci, &field.as_type())?
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?
                 .join("\n"),
         )?;
         for constructor in record.constructors() {
-            definitions.insert_callable(
+            let constructor_name = ohos_raw_export_name(
+                ci,
                 &crate::js_names::function_name(&crate::dispatch_key::constructor_key(
                     record.name(),
                     constructor,
                 )),
-                constructor,
-                None,
-            )?;
+            );
+            definitions.insert_callable(ci, &constructor_name, constructor, None)?;
         }
         for method in record.methods() {
-            definitions.insert_callable(
+            let method_name = ohos_raw_export_name(
+                ci,
                 &crate::js_names::function_name(&crate::dispatch_key::method_key(
                     record.name(),
                     method,
                 )),
+            );
+            definitions.insert_callable(
+                ci,
+                &method_name,
                 method,
-                Some(("self_", record.name())),
+                Some(("self_", record_name.as_str())),
             )?;
         }
     }
@@ -720,7 +807,7 @@ fn render_ohos_extra_types(
                             Ok(format!(
                                 "{}: {}",
                                 crate::js_names::field_name(field.name()),
-                                ohos_napi_ts_type(&field.as_type())?
+                                ohos_raw_napi_ts_type(ci, &field.as_type())?
                             ))
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -730,11 +817,11 @@ fn render_ohos_extra_types(
                 })
                 .collect::<Result<Vec<_>>>()?
                 .join("\n");
-            definitions.insert("type", enum_.name(), arms)?;
+            definitions.insert("type", &ohos_raw_export_name(ci, enum_.name()), arms)?;
         } else {
             definitions.insert(
                 "string_enum",
-                enum_.name(),
+                &ohos_raw_export_name(ci, enum_.name()),
                 enum_
                     .variants()
                     .iter()
@@ -744,23 +831,28 @@ fn render_ohos_extra_types(
             )?;
         }
         for constructor in enum_.constructors() {
-            definitions.insert_callable(
+            let constructor_name = ohos_raw_export_name(
+                ci,
                 &crate::js_names::function_name(&crate::dispatch_key::constructor_key(
                     enum_.name(),
                     constructor,
                 )),
-                constructor,
-                None,
-            )?;
+            );
+            definitions.insert_callable(ci, &constructor_name, constructor, None)?;
         }
         for method in enum_.methods() {
-            definitions.insert_callable(
+            let method_name = ohos_raw_export_name(
+                ci,
                 &crate::js_names::function_name(&crate::dispatch_key::method_key(
                     enum_.name(),
                     method,
                 )),
+            );
+            definitions.insert_callable(
+                ci,
+                &method_name,
                 method,
-                Some(("self_", enum_.name())),
+                Some(("self_", &ohos_raw_export_name(ci, enum_.name()))),
             )?;
         }
     }
@@ -768,32 +860,38 @@ fn render_ohos_extra_types(
     for object in ci.object_definitions() {
         match object.imp() {
             ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
-                definitions.insert("struct", object.name(), String::new())?;
+                let object_name = ohos_raw_export_name(ci, object.name());
+                definitions.insert("struct", &object_name, String::new())?;
                 for constructor in object.constructors() {
-                    definitions.insert_callable(
+                    let constructor_name = ohos_raw_export_name(
+                        ci,
                         &crate::js_names::function_name(&crate::dispatch_key::constructor_key(
                             object.name(),
                             constructor,
                         )),
-                        constructor,
-                        None,
-                    )?;
+                    );
+                    definitions.insert_callable(ci, &constructor_name, constructor, None)?;
                 }
                 for method in object.methods() {
-                    definitions.insert_callable(
+                    let method_name = ohos_raw_export_name(
+                        ci,
                         &crate::js_names::function_name(&crate::dispatch_key::object_method_key(
                             method,
                         )),
+                    );
+                    definitions.insert_callable(
+                        ci,
+                        &method_name,
                         method,
-                        Some(("handle", object.name())),
+                        Some(("handle", object_name.as_str())),
                     )?;
                 }
             }
             ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                 definitions.insert(
                     "interface",
-                    object.name(),
-                    render_ohos_callback_definition(object.name(), &object.methods())?,
+                    &ohos_raw_export_name(ci, object.name()),
+                    render_ohos_callback_definition(ci, object.name(), &object.methods())?,
                 )?;
                 for method in object
                     .methods()
@@ -802,12 +900,8 @@ fn render_ohos_extra_types(
                 {
                     definitions.insert(
                         "interface",
-                        &format!(
-                            "Uniffi{}{}CallbackResult",
-                            object.name(),
-                            method.name().to_upper_camel_case()
-                        ),
-                        render_ohos_callback_result_definition(method)?,
+                        &ohos_raw_callback_result_name(ci, object.name(), method),
+                        render_ohos_callback_result_definition(ci, method)?,
                     )?;
                 }
             }
@@ -817,8 +911,8 @@ fn render_ohos_extra_types(
     for callback in ci.callback_interface_definitions() {
         definitions.insert(
             "interface",
-            callback.name(),
-            render_ohos_callback_definition(callback.name(), &callback.methods())?,
+            &ohos_raw_export_name(ci, callback.name()),
+            render_ohos_callback_definition(ci, callback.name(), &callback.methods())?,
         )?;
         for method in callback
             .methods()
@@ -827,17 +921,17 @@ fn render_ohos_extra_types(
         {
             definitions.insert(
                 "interface",
-                &format!(
-                    "Uniffi{}{}CallbackResult",
-                    callback.name(),
-                    method.name().to_upper_camel_case()
-                ),
-                render_ohos_callback_result_definition(method)?,
+                &ohos_raw_callback_result_name(ci, callback.name(), method),
+                render_ohos_callback_result_definition(ci, method)?,
             )?;
         }
     }
 
-    definitions.insert("interface", "UniffiCallbackHandle", "id: number")?;
+    definitions.insert(
+        "interface",
+        &ohos_raw_export_name(ci, "UniffiCallbackHandle"),
+        "id: number",
+    )?;
 
     for function in ci.function_definitions() {
         if let Some(Type::Stream {
@@ -846,61 +940,72 @@ fn render_ohos_extra_types(
             ..
         }) = function.return_type()
         {
-            let function_name = crate::js_names::function_name(function.name());
-            let class_prefix = function.name().to_upper_camel_case();
-            let next_name = crate::js_names::function_name(&crate::dispatch_key::stream_next_key(
-                function.name(),
-            ));
-            let cancel_name = crate::js_names::function_name(
-                &crate::dispatch_key::stream_cancel_key(function.name()),
+            let function_short_name = crate::js_names::function_name(function.name());
+            let raw_names = ohos_raw_output_stream_names_for_prefix(
+                &ci.native_export_prefix(),
+                &function_short_name,
             );
             definitions.insert(
                 "fn",
-                &function_name,
-                render_ohos_callable_declaration(&function_name, function, None, Some("bigint"))?,
+                &raw_names.function,
+                render_ohos_callable_declaration(
+                    ci,
+                    &raw_names.function,
+                    function,
+                    None,
+                    Some("bigint"),
+                )?,
             )?;
-            let step_type = format!("Uniffi{class_prefix}StreamNext");
             definitions.insert(
                 "interface",
-                &step_type,
+                &raw_names.step_type,
                 format!(
                     "kind: string\nvalue?: {}\nerror?: {}",
-                    ohos_napi_ts_type(item_type)?,
-                    ohos_napi_ts_type(error_type)?
+                    ohos_raw_napi_ts_type(ci, item_type)?,
+                    ohos_raw_napi_ts_type(ci, error_type)?
                 ),
             )?;
             definitions.insert(
                 "fn",
-                &next_name,
-                format!("function {next_name}(handle: bigint): Promise<{step_type}>"),
+                &raw_names.next_function,
+                format!(
+                    "function {}(handle: bigint): Promise<{}>",
+                    raw_names.next_function, raw_names.step_type
+                ),
             )?;
             definitions.insert(
                 "fn",
-                &cancel_name,
-                format!("function {cancel_name}(handle: bigint): void"),
+                &raw_names.cancel_function,
+                format!(
+                    "function {}(handle: bigint): void",
+                    raw_names.cancel_function
+                ),
             )?;
         } else {
-            let function_name = crate::js_names::function_name(function.name());
-            definitions.insert_callable(&function_name, function, None)?;
+            let function_name =
+                ohos_raw_export_name(ci, &crate::js_names::function_name(function.name()));
+            definitions.insert_callable(ci, &function_name, function, None)?;
         }
     }
 
     if !codegen::collect_input_stream_descriptors(ci)?.is_empty() {
         definitions.insert_with_type_parameters(
             "interface",
-            "UniffiInputStream",
+            &ohos_raw_input_stream_type_for_prefix(&ci.native_export_prefix()),
             "handle: number;\nnext(error: Error | null, handle: number): Promise<T>;\ncancel(error: Error | null, handle: number): void;",
             vec!["T".to_string()],
         )?;
     }
     for descriptor in codegen::collect_input_stream_descriptors(ci)? {
+        let next_type =
+            ohos_raw_input_next_type_for_prefix(&ci.native_export_prefix(), descriptor.suffix());
         definitions.insert(
             "interface",
-            &format!("UniffiInputStream{}Next", descriptor.suffix()),
+            &next_type,
             format!(
                 "ok: boolean\ndone?: boolean\nvalue?: {}\nerror?: {}",
-                ohos_napi_ts_type(descriptor.item_type())?,
-                ohos_napi_ts_type(descriptor.error_type())?
+                ohos_raw_napi_ts_type(ci, descriptor.item_type())?,
+                ohos_raw_napi_ts_type(ci, descriptor.error_type())?
             ),
         )?;
     }
@@ -950,6 +1055,7 @@ impl OhosTypeDefCollector {
 
     fn insert_callable(
         &mut self,
+        ci: &uniffi_bindgen::ComponentInterface,
         name: &str,
         callable: &dyn Callable,
         receiver: Option<(&str, &str)>,
@@ -957,7 +1063,7 @@ impl OhosTypeDefCollector {
         self.insert(
             "fn",
             name,
-            render_ohos_callable_declaration(name, callable, receiver, None)?,
+            render_ohos_callable_declaration(ci, name, callable, receiver, None)?,
         )
     }
 
@@ -979,6 +1085,7 @@ impl OhosTypeDefCollector {
 }
 
 fn render_ohos_callable_declaration(
+    ci: &uniffi_bindgen::ComponentInterface,
     name: &str,
     callable: &dyn Callable,
     receiver: Option<(&str, &str)>,
@@ -996,7 +1103,7 @@ fn render_ohos_callable_declaration(
                 Ok(format!(
                     "{}: {}",
                     crate::js_names::field_name(argument.name()),
-                    ohos_napi_ts_type(&argument.as_type())?
+                    ohos_raw_napi_ts_type(ci, &argument.as_type())?
                 ))
             })
             .collect::<Result<Vec<_>>>()?,
@@ -1004,7 +1111,7 @@ fn render_ohos_callable_declaration(
     let result = match forced_return {
         Some(value) => value.to_string(),
         None => match callable.return_type() {
-            Some(value) => ohos_napi_ts_type(value)?,
+            Some(value) => ohos_raw_napi_ts_type(ci, value)?,
             None => "void".to_string(),
         },
     };
@@ -1019,7 +1126,11 @@ fn render_ohos_callable_declaration(
     ))
 }
 
-fn render_ohos_callback_definition(name: &str, methods: &[&Method]) -> Result<String> {
+fn render_ohos_callback_definition(
+    ci: &uniffi_bindgen::ComponentInterface,
+    name: &str,
+    methods: &[&Method],
+) -> Result<String> {
     let mut definition = String::new();
     for method in methods {
         let args = method
@@ -1029,21 +1140,17 @@ fn render_ohos_callback_definition(name: &str, methods: &[&Method]) -> Result<St
                 Ok(format!(
                     "{}: {}",
                     crate::js_names::field_name(arg.name()),
-                    ohos_napi_ts_type(&arg.as_type())?
+                    ohos_raw_napi_ts_type(ci, &arg.as_type())?
                 ))
             })
             .collect::<Result<Vec<_>>>()?
             .join(", ");
         let ret = if method.throws_type().is_some() {
-            format!(
-                "Uniffi{}{}CallbackResult",
-                name,
-                method.name().to_upper_camel_case()
-            )
+            ohos_raw_callback_result_name(ci, name, method)
         } else {
             method
                 .return_type()
-                .map(ohos_napi_ts_type)
+                .map(|ty| ohos_raw_napi_ts_type(ci, ty))
                 .transpose()?
                 .unwrap_or_else(|| "void".to_string())
         };
@@ -1060,14 +1167,21 @@ fn render_ohos_callback_definition(name: &str, methods: &[&Method]) -> Result<St
     Ok(definition)
 }
 
-fn render_ohos_callback_result_definition(method: &Method) -> Result<String> {
+fn render_ohos_callback_result_definition(
+    ci: &uniffi_bindgen::ComponentInterface,
+    method: &Method,
+) -> Result<String> {
     let mut fields = vec!["ok: boolean".to_string()];
     if let Some(return_type) = method.return_type() {
-        fields.push(format!("value?: {}", ohos_napi_ts_type(return_type)?));
+        fields.push(format!(
+            "value?: {}",
+            ohos_raw_napi_ts_type(ci, return_type)?
+        ));
     }
     fields.push(format!(
         "error?: {}",
-        ohos_napi_ts_type(
+        ohos_raw_napi_ts_type(
+            ci,
             method
                 .throws_type()
                 .expect("callback result definitions are only emitted for fallible methods")
@@ -1328,7 +1442,7 @@ fn render_ohos_facade_contract(ci: &uniffi_bindgen::ComponentInterface) -> Resul
                 fingerprint: descriptor.fingerprint().to_string(),
                 item_type: ohos_facade_type_descriptor(ci, descriptor.item_type())?,
                 error_type: ohos_facade_type_descriptor(ci, descriptor.error_type())?,
-                next_type: format!("UniffiInputStream{suffix}Next"),
+                next_type: ohos_raw_input_next_type_for_prefix(&ci.native_export_prefix(), &suffix),
                 writer_class: format!("{suffix}InputWriter"),
                 source_class: format!("{suffix}InputSource"),
                 channel_class: format!("{suffix}InputChannel"),
@@ -1349,7 +1463,9 @@ fn render_ohos_facade_contract(ci: &uniffi_bindgen::ComponentInterface) -> Resul
             continue;
         };
         let function_name = crate::js_names::function_name(function.name());
-        let class_prefix = function.name().to_upper_camel_case();
+        let raw_names =
+            ohos_raw_output_stream_names_for_prefix(&ci.native_export_prefix(), &function_name);
+        let class_prefix = function_name.to_upper_camel_case();
         let arguments = function
             .arguments()
             .iter()
@@ -1361,19 +1477,15 @@ fn render_ohos_facade_contract(ci: &uniffi_bindgen::ComponentInterface) -> Resul
             })
             .collect::<Result<Vec<_>>>()?;
         output_streams.push(OhosOutputStreamContract {
-            next_function: crate::js_names::function_name(&crate::dispatch_key::stream_next_key(
-                function.name(),
-            )),
-            cancel_function: crate::js_names::function_name(
-                &crate::dispatch_key::stream_cancel_key(function.name()),
-            ),
+            next_function: raw_names.next_function,
+            cancel_function: raw_names.cancel_function,
             stream_factory: format!("{function_name}Stream"),
             pull_class: format!("{class_prefix}PullStream"),
-            step_type: format!("Uniffi{class_prefix}StreamNext"),
+            step_type: raw_names.step_type,
             item_type: ohos_facade_type_descriptor(ci, item_type)?,
             error_type: ohos_facade_type_descriptor(ci, error_type)?,
             arguments,
-            function: function_name,
+            function: raw_names.function,
         });
     }
 
@@ -1803,6 +1915,88 @@ fn ohos_facade_type_descriptor(
     })
 }
 
+/// The OHOS sidecar describes the addon-wide raw N-API table, rather than the
+/// component's short TypeScript API.  Every named declaration therefore uses
+/// the same component prefix that `namespace_napi_exports` writes into the
+/// generated Rust `#[napi(js_name = ...)]` attributes.  Foreign named types
+/// retain their true owner component's prefix; callers never infer ownership
+/// by stripping a prefix from a user-provided name.
+fn ohos_raw_export_name(ci: &uniffi_bindgen::ComponentInterface, short_name: &str) -> String {
+    crate::native_exports::native_export_name(ci, short_name)
+}
+
+fn ohos_raw_callback_result_name(
+    ci: &uniffi_bindgen::ComponentInterface,
+    callback_name: &str,
+    method: &Method,
+) -> String {
+    ohos_raw_export_name(
+        ci,
+        &format!(
+            "Uniffi{}{}CallbackResult",
+            callback_name,
+            method.name().to_upper_camel_case()
+        ),
+    )
+}
+
+fn ohos_raw_named_type(root: &uniffi_bindgen::ComponentInterface, ty: &Type) -> Result<String> {
+    let (module_path, name) = match ty {
+        Type::Record { module_path, name }
+        | Type::Enum { module_path, name }
+        | Type::Object {
+            module_path, name, ..
+        }
+        | Type::CallbackInterface { module_path, name } => (module_path.as_str(), name.as_str()),
+        _ => unreachable!("only named UniFFI types reach OHOS raw type rendering"),
+    };
+    let owner = ohos_named_type_component(root, module_path, "OHOS raw sidecar type")?;
+    Ok(ohos_raw_export_name(owner, name))
+}
+
+fn ohos_raw_napi_ts_type(ci: &uniffi_bindgen::ComponentInterface, ty: &Type) -> Result<String> {
+    Ok(match ty {
+        Type::InputStream { .. } => format!(
+            "{}<{}>",
+            ohos_raw_export_name(ci, "UniffiInputStream"),
+            ohos_raw_export_name(
+                ci,
+                &format!(
+                    "UniffiInputStream{}Next",
+                    codegen::describe_input_stream_type(ty)?.suffix()
+                ),
+            )
+        ),
+        Type::Optional { inner_type } => {
+            format!(
+                "{} | undefined | null",
+                ohos_raw_napi_ts_type(ci, inner_type)?
+            )
+        }
+        Type::Sequence { inner_type } => {
+            format!("Array<{}>", ohos_raw_napi_ts_type(ci, inner_type)?)
+        }
+        Type::Map { value_type, .. } => {
+            format!("Record<string, {}>", ohos_raw_napi_ts_type(ci, value_type)?)
+        }
+        Type::Box { inner_type }
+        | Type::Custom {
+            builtin: inner_type,
+            ..
+        } => ohos_raw_napi_ts_type(ci, inner_type)?,
+        Type::Set { inner_type } => format!("Set<{}>", ohos_raw_napi_ts_type(ci, inner_type)?),
+        Type::Stream { item_type, .. } => {
+            format!("AsyncIterable<{}>", ohos_raw_napi_ts_type(ci, item_type)?)
+        }
+        Type::Record { .. }
+        | Type::Enum { .. }
+        | Type::Object { .. }
+        | Type::CallbackInterface { .. } => ohos_raw_named_type(ci, ty)?,
+        _ => ohos_native_ts_type(ty),
+    })
+}
+
+#[cfg(test)]
 fn ohos_napi_ts_type(ty: &Type) -> Result<String> {
     Ok(match ty {
         Type::InputStream { .. } => format!(
@@ -2307,7 +2501,7 @@ mod ohos_facade_type_tests {
         assert!(node.contains("Record<string, unknown>"));
         assert!(node.contains("__uniffiJsRuntimeAbiVersion"));
 
-        let ohos = render_ohos_backend_adapter(&ci);
+        let ohos = render_ohos_backend_adapter(&ci, None);
         assert!(ohos.contains("import * as native from \"libunknown_chat_ohos.so\";"));
         assert!(ohos.contains("type UniffiValue = UniffiPrimitive | object;"));
         assert!(ohos.contains("__uniffiJsRuntimeAbiVersion"));
@@ -2354,7 +2548,7 @@ mod ohos_facade_type_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("sentinel.txt"), "preserve this directory").unwrap();
 
-        let error = emit_ohos(&dir, &component).unwrap_err().to_string();
+        let error = emit_ohos(&dir, &component, None).unwrap_err().to_string();
         assert!(error.contains("generated name collision"), "{error}");
         assert_eq!(
             std::fs::read_to_string(dir.join("sentinel.txt")).unwrap(),

@@ -99,17 +99,18 @@ fn render_preload(
          const addon = require(addonCandidate.specifier);\n\
          \n\
          // Generator-computed map from the low-level snake_case keys used\n\
-         // by `common/api.ts` to the `lowerCamelCase` names napi-rs\n\
-         // actually puts on the addon. Same source of truth as\n\
+         // by `common/api.ts` to exact component-prefixed native names.\n\
+         // Same source of truth as\n\
          // `node/backend-napi.ts` — see\n\
          // `uniffi_bindgen_javascript/src/name_map.rs`.\n\
          const __uniffiNameMap = {name_map_literal};\n\
          \n\
          {enum_shape_helpers}\n\
          function resolveMethod(method) {{\n\
-             const exportName = Object.prototype.hasOwnProperty.call(__uniffiNameMap, method)\n\
-                 ? __uniffiNameMap[method]\n\
-                 : method;\n\
+             const exportName = __uniffiNameMap[method];\n\
+             if (typeof exportName !== \"string\") {{\n\
+                 throw new Error(\"unknown uniffi method: \" + method + \" (no canonical native export mapping)\");\n\
+             }}\n\
              const fn = addon[exportName];\n\
              if (typeof fn !== \"function\") {{\n\
                  throw new Error(\n\
