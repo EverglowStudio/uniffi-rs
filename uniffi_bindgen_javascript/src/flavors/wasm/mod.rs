@@ -54,7 +54,7 @@ use camino::Utf8Path;
 use fs_err as fs;
 use uniffi_bindgen::Component;
 
-use crate::JsConfig;
+use crate::{JsConfig, JS_RUNTIME_ABI_VERSION};
 
 pub(crate) mod codegen;
 
@@ -103,7 +103,7 @@ export interface WasmBindgenGlue {{
 }}
 
 export interface WasmBackend {{
-    readonly __uniffiAbiVersion: 2;
+    readonly __uniffiJsRuntimeAbiVersion: {JS_RUNTIME_ABI_VERSION};
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     [method: string]: any;
 }}
@@ -243,7 +243,7 @@ export async function adaptWasmBindgenGlue(
     }};
     return new Proxy({{}} as WasmBackend, {{
         get(_t, name: string) {{
-            if (name === "__uniffiAbiVersion") return 2;
+            if (name === "__uniffiJsRuntimeAbiVersion") return {JS_RUNTIME_ABI_VERSION};
             const v = (g as Record<string, unknown>)[name];
             if (typeof v !== "function") return undefined;
             const fn = v as (...args: unknown[]) => unknown;

@@ -80,7 +80,7 @@ namespace async_callback_return {
     );
     let napi_rs = std::fs::read_to_string(out_dir.join("node/async_callback_return.rs")).unwrap();
     assert!(
-        napi_rs.contains("__UniffiCallbackHandle")
+        napi_rs.contains("UniffiCallbackHandle")
             && napi_rs.contains("__uniffi_from_callback_registry"),
         "napi bridge should emit callback-return registry support:\n{napi_rs}"
     );
@@ -644,16 +644,26 @@ function errorName(error: unknown): string {
   return error instanceof UniffiError ? error.errorName : "";
 }
 
-for (const backend of [{}, { __uniffiAbiVersion: 1 }, { __uniffiAbiVersion: 3 }]) {
+for (const [backend, expectedGot] of [
+  [{}, undefined],
+  [{ __uniffiJsRuntimeAbiVersion: 1 }, 1],
+  [{ __uniffiJsRuntimeAbiVersion: 3 }, 3],
+] as const) {
   let rejected = false;
   try {
     __installBackend(backend);
   } catch (error) {
-    rejected = errorName(error) === "UniffiAbiMismatch";
+    const mismatch = (error as UniffiError).data as {
+      jsRuntimeAbiVersion?: { expected?: number; got?: unknown };
+    } | null;
+    rejected = errorName(error) === "UniffiAbiMismatch"
+      && mismatch?.jsRuntimeAbiVersion?.expected === 2
+      && mismatch?.jsRuntimeAbiVersion?.got === expectedGot
+      && (error as UniffiError).message.includes("jsRuntimeAbiVersion");
   }
   assert(rejected, "backend ABI mismatch is rejected before installation");
 }
-__installBackend({ __uniffiAbiVersion: 2 });
+__installBackend({ __uniffiJsRuntimeAbiVersion: 2 });
 
 let idleStarts = 0;
 let idleCancels = 0;
@@ -1038,12 +1048,26 @@ function assert(ok: boolean, label: string): void { if (!ok) throw new Error("FA
 function name(error: unknown): string { return error instanceof UniffiError ? error.errorName : ""; }
 async function flush(): Promise<void> { await Promise.resolve(); await new Promise<void>((resolve) => setTimeout(resolve, 0)); }
 
-for (const backend of [{}, { __uniffiAbiVersion: 1 }, { __uniffiAbiVersion: 3 }]) {
+for (const [backend, expectedGot] of [
+  [{}, undefined],
+  [{ __uniffiJsRuntimeAbiVersion: 1 }, 1],
+  [{ __uniffiJsRuntimeAbiVersion: 3 }, 3],
+] as const) {
   let rejected = false;
-  try { __installBackend(backend); } catch (error) { rejected = name(error) === "UniffiAbiMismatch"; }
+  try {
+    __installBackend(backend);
+  } catch (error) {
+    const mismatch = (error as UniffiError).data as {
+      jsRuntimeAbiVersion?: { expected?: number; got?: unknown };
+    } | null;
+    rejected = name(error) === "UniffiAbiMismatch"
+      && mismatch?.jsRuntimeAbiVersion?.expected === 2
+      && mismatch?.jsRuntimeAbiVersion?.got === expectedGot
+      && (error as UniffiError).message.includes("jsRuntimeAbiVersion");
+  }
   assert(rejected, "ABI mismatch rejects before install");
 }
-__installBackend({ __uniffiAbiVersion: 2 });
+__installBackend({ __uniffiJsRuntimeAbiVersion: 2 });
 
 let starts = 0;
 let pulls = 0;
@@ -1355,7 +1379,7 @@ fn js_async_iterable_stream_stub_contract() {
     assert!(
         backend.contains("\"count_events_stream_next\": \"countEventsStreamNext\"")
             && backend.contains("\"count_events_stream_cancel\": \"countEventsStreamCancel\"")
-            && backend.contains("__uniffiAbiVersion")
+            && backend.contains("__uniffiJsRuntimeAbiVersion")
             && backend.contains("__uniffiNormalizeStreamStep"),
         "napi backend name map should include stream next/cancel:\n{backend}"
     );
@@ -1411,7 +1435,7 @@ let errorNextCalls = 0;
 const streams = new Map<string, { values: Array<unknown>; errorAt?: number; nextCalls: number }>();
 
 __installBackend({
-  __uniffiAbiVersion: 2,
+  __uniffiJsRuntimeAbiVersion: 2,
   count_events(count: number) {
     const handle = `h${nextId++}`;
     streams.set(handle, {
@@ -1572,7 +1596,7 @@ assert(cancelCount === beforeThrow, "throw before first pull should not start or
 
 let resolvePending: ((value: unknown) => void) | null = null;
 __installBackend({
-  __uniffiAbiVersion: 2,
+  __uniffiJsRuntimeAbiVersion: 2,
   count_events() { return "pending"; },
   count_events_stream_next() {
     return new Promise((resolve) => { resolvePending = resolve; });
@@ -1608,7 +1632,7 @@ assert(consumedRejected, "second iterator should throw");
 
 const beforeMalformed = cancelCount;
 __installBackend({
-  __uniffiAbiVersion: 2,
+  __uniffiJsRuntimeAbiVersion: 2,
   optional_events() { return "malformed"; },
   async optional_events_stream_next() { return {}; },
   optional_events_stream_cancel() { cancelCount += 1; },
@@ -1664,7 +1688,11 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         &std::fs::read(out_dir.join("harmony/stream_core.ohos-facade.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(contract["schemaVersion"], 4);
+    assert_eq!(contract["facadeContractSchemaVersion"], 4);
+    assert_eq!(contract["component"], "stream_core");
+    assert_eq!(contract["namespace"], "stream_core");
+    assert_eq!(contract["nativeExportPrefix"], "ffi_stream_core");
+    assert!(contract.get("schemaVersion").is_none());
     assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 6);
     for output in contract["outputStreams"].as_array().unwrap() {
         let fields = output
@@ -1699,6 +1727,44 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         "countEventsStream"
     );
     assert!(contract["inputStreams"].as_array().unwrap().is_empty());
+
+    let optional_stream = contract["outputStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stream| stream["function"] == "optionalEvents")
+        .expect("facade contract must retain the optional stream item descriptor");
+    assert_eq!(
+        optional_stream["itemType"],
+        serde_json::json!({
+            "kind": "optional",
+            "inner": { "kind": "number" },
+        })
+    );
+    assert_eq!(
+        optional_stream["stepType"],
+        "UniffiOptionalEventsStreamNext"
+    );
+
+    let extra_types =
+        std::fs::read_to_string(out_dir.join("harmony/stream_core.ohos-extra-types.d.ts")).unwrap();
+    let optional_step = extra_types
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(
+                line.strip_prefix("type_def:")
+                    .expect("OHOS sidecar must use only type_def records"),
+            )
+            .unwrap()
+        })
+        .find(|definition| definition["name"] == "UniffiOptionalEventsStreamNext")
+        .expect("OHOS sidecar must declare the optional stream envelope");
+    assert_eq!(optional_step["kind"], "interface");
+    assert_eq!(optional_step["typeParameters"], serde_json::json!([]));
+    assert_eq!(
+        optional_step["def"],
+        "kind: string\nvalue?: number | undefined | null\nerror?: StreamError"
+    );
 
     let index = std::fs::read_to_string(out_dir.join("harmony/index.ts")).unwrap();
     assert!(
@@ -1910,7 +1976,11 @@ fn input_stream_bidi_static_generation_contract() {
         &std::fs::read(out_dir.join("harmony/input_stream_core.ohos-facade.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(contract["schemaVersion"], 4);
+    assert_eq!(contract["facadeContractSchemaVersion"], 4);
+    assert_eq!(contract["component"], "input_stream_core");
+    assert_eq!(contract["namespace"], "input_stream_core");
+    assert_eq!(contract["nativeExportPrefix"], "ffi_input_stream_core");
+    assert!(contract.get("schemaVersion").is_none());
     assert_eq!(contract["inputStreams"].as_array().unwrap().len(), 1);
     let factory = contract["inputStreams"][0]["factory"].as_str().unwrap();
     let input_suffix = contract["inputStreams"][0]["suffix"]
@@ -1932,8 +2002,23 @@ fn input_stream_bidi_static_generation_contract() {
     let extra_types =
         std::fs::read_to_string(out_dir.join("harmony/input_stream_core.ohos-extra-types.d.ts"))
             .unwrap();
-    assert!(extra_types.contains("export interface __UniffiInputStream<T>"));
-    assert!(extra_types.contains("next(error: Error | null, handle: number): Promise<T>"));
+    let input_stream_def = extra_types
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(
+                line.strip_prefix("type_def:")
+                    .expect("OHOS sidecar must use only type_def records"),
+            )
+            .unwrap()
+        })
+        .find(|definition| definition["name"] == "UniffiInputStream")
+        .expect("OHOS sidecar must declare UniffiInputStream");
+    assert_eq!(input_stream_def["kind"], "interface");
+    assert_eq!(input_stream_def["typeParameters"], serde_json::json!(["T"]));
+    assert!(input_stream_def["def"]
+        .as_str()
+        .unwrap()
+        .contains("next(error: Error | null, handle: number): Promise<T>"));
 
     let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
     for needle in [
@@ -1994,7 +2079,7 @@ fn input_stream_bidi_static_generation_contract() {
         );
     }
     assert!(
-        napi_rs.contains(&format!("__UniffiInputStream{input_suffix}Ops")),
+        napi_rs.contains(&format!("UniffiInputStream{input_suffix}Ops")),
         "napi bridge must use the canonical contract suffix `{input_suffix}`:\n{napi_rs}"
     );
     let wasm_rs = std::fs::read_to_string(out_dir.join("browser/input_stream_core.rs")).unwrap();
@@ -2550,7 +2635,7 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
         "__uniffiLowerShape",
         "__uniffiLiftShape",
         "__uniffiCallback",
-        "__uniffiAbiVersion",
+        "__uniffiJsRuntimeAbiVersion",
         "then(",
     ] {
         assert!(

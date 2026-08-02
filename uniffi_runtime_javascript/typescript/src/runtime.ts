@@ -10,7 +10,7 @@
 // This is deliberately private to the generated runtime.  Flavor adapters
 // may be distributed independently from the high-level API, so installation
 // verifies their exact ABI rather than silently accepting an older backend.
-const __UNIFFI_JS_ABI_VERSION = 2;
+const JS_RUNTIME_ABI_VERSION = 2;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -97,19 +97,21 @@ export function __installBackend(backend: UniffiBackend): void {
     try {
         actualVersion =
             backend !== null && backend !== undefined
-                ? backend.__uniffiAbiVersion
+                ? backend.__uniffiJsRuntimeAbiVersion
                 : undefined;
     } catch {
         actualVersion = undefined;
     }
-    if (actualVersion !== __UNIFFI_JS_ABI_VERSION) {
+    if (actualVersion !== JS_RUNTIME_ABI_VERSION) {
         throw new UniffiError({
             errorName: "UniffiAbiMismatch",
             data: {
-                expected: __UNIFFI_JS_ABI_VERSION,
-                actual: actualVersion,
+                jsRuntimeAbiVersion: {
+                    expected: JS_RUNTIME_ABI_VERSION,
+                    got: actualVersion,
+                },
             },
-            message: `incompatible UniFFI JavaScript backend ABI: expected ${__UNIFFI_JS_ABI_VERSION}, got ${String(actualVersion)}`,
+            message: `incompatible UniFFI JavaScript backend jsRuntimeAbiVersion: expected ${JS_RUNTIME_ABI_VERSION}, got ${String(actualVersion)}`,
         });
     }
     __uniffiBackend = backend;

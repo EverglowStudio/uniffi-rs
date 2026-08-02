@@ -30,7 +30,7 @@ use camino::Utf8Path;
 use fs_err as fs;
 use uniffi_bindgen::Component;
 
-use crate::JsConfig;
+use crate::{JsConfig, JS_RUNTIME_ABI_VERSION};
 
 pub fn emit(
     dir: &Utf8Path,
@@ -357,7 +357,7 @@ fn render_preload(
          \n\
          contextBridge.exposeInMainWorld(\"__uniffi__\", {{\n\
              namespace: \"{namespace}\",\n\
-             __uniffiAbiVersion: 2,\n\
+             __uniffiJsRuntimeAbiVersion: {JS_RUNTIME_ABI_VERSION},\n\
              dispatchSync,\n\
              dispatchAsync,\n\
          }});\n"
@@ -397,7 +397,7 @@ fn render_renderer(namespace: &str, async_keys: &[String]) -> String {
              interface Window {{\n\
                  __uniffi__: {{\n\
                      namespace: string;\n\
-                     __uniffiAbiVersion: 2;\n\
+                     __uniffiJsRuntimeAbiVersion: {JS_RUNTIME_ABI_VERSION};\n\
                      dispatchSync: (msg: BridgeMessage) => BridgeResponse;\n\
                      dispatchAsync: (msg: BridgeMessage) => Promise<BridgeResponse>;\n\
                  }};\n\
@@ -453,8 +453,8 @@ fn render_renderer(namespace: &str, async_keys: &[String]) -> String {
          \n\
          const backend = new Proxy({{}}, {{\n\
              get(_t, method: string) {{\n\
-                 if (method === \"__uniffiAbiVersion\") {{\n\
-                     return window.__uniffi__.__uniffiAbiVersion;\n\
+                 if (method === \"__uniffiJsRuntimeAbiVersion\") {{\n\
+                     return window.__uniffi__.__uniffiJsRuntimeAbiVersion;\n\
                  }}\n\
                  if (method.startsWith(\"__uniffi_\") && method.endsWith(\"_object_free\")) {{\n\
                      // `common/objects.ts` calls the wasm-style destructor\n\

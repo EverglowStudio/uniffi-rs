@@ -469,6 +469,61 @@ fn push_expected_identity(
     }
 }
 
+/// A crash after publishing the candidate but before replacing the final owner
+/// sidecar leaves the previous sidecar beside two journal-witnessed roots. The
+/// old sidecar cannot validate at the public pathname any longer: its root was
+/// atomically moved to the backup. For test-residue cleanup only, accept that
+/// precise topology after checking both immutable journal identities and the
+/// old generation's rebased content inventory. This never adopts a root from
+/// a name alone.
+#[cfg(unix)]
+fn stale_managed_owner_matches_backed_up_generation_with_budget(
+    owner: &ManagedPackageOwner,
+    public_root: &Utf8Path,
+    parent: &Utf8Path,
+    records: &[(ManagedPackageJournal, DurableRecordWitness)],
+    budget: &mut TraversalBudget,
+) -> Result<bool> {
+    let public_identity = persistent_fs_identity(public_root, true)?;
+    let Some((journal, _)) = records.iter().rev().find(|(journal, _)| {
+        matches!(
+            journal.state.as_str(),
+            "candidatePublished" | "publishingFinalOwner"
+        ) && journal.previous_root_identity.as_ref() == Some(&owner.root_identity)
+            && journal.backup_root_identity.as_ref() == Some(&owner.root_identity)
+            && journal.candidate_root_identity.as_ref() == Some(&public_identity)
+            && journal.published_root_identity.as_ref() == Some(&public_identity)
+    }) else {
+        return Ok(false);
+    };
+
+    let backup = parent.join(&journal.backup_name);
+    if !path_entry_exists(&backup)? || persistent_fs_identity(&backup, true)? != owner.root_identity
+    {
+        return Ok(false);
+    }
+
+    // `rename(public, backup)` necessarily changes the root directory's ctime,
+    // so validate every owned entry's exact content/identity after rebasing its
+    // absolute path, while intentionally not applying the old root epoch.
+    for entry in &owner.entries {
+        let relative = Utf8Path::new(&entry.path)
+            .strip_prefix(public_root)
+            .with_context(|| {
+                format!(
+                    "stale managed owner entry escapes its public root: {}",
+                    entry.path
+                )
+            })?;
+        let rebased_path = backup.join(relative);
+        let mut rebased = entry.clone();
+        rebased.path = rebased_path.to_string();
+        validate_hsp_generation_entry_content_with_budget(&rebased, &rebased_path, budget)
+            .context("validating stale managed owner against its backed-up generation")?;
+    }
+    Ok(true)
+}
+
 #[cfg(unix)]
 fn capture_managed_test_directory(
     path: &Utf8Path,
@@ -882,14 +937,34 @@ fn plan_exact_managed_test_cleanup_with_budget(
             );
         }
         require_exited_managed_generation(generation, "managed final owner")?;
-        if super::super::artifact_transaction::engine::path_entry_exists(public_root)? {
-            validate_managed_owner_with_budget(public_root, &owner, budget)?;
+        let owner_still_binds_public_root = if path_entry_exists(public_root)? {
+            if persistent_fs_identity(public_root, true)? == owner.root_identity {
+                validate_managed_owner_with_budget(public_root, &owner, budget)?;
+                true
+            } else {
+                stale_managed_owner_matches_backed_up_generation_with_budget(
+                    &owner,
+                    public_root,
+                    parent,
+                    &records,
+                    budget,
+                )?
+            }
+        } else {
+            false
+        };
+        if !owner_still_binds_public_root && path_entry_exists(public_root)? {
+            bail!(
+                "managed test final owner does not match its live public root or an exact backed-up generation: {final_owner}"
+            );
         }
-        push_expected_identity(
-            &mut expected_directories,
-            public_root.to_path_buf(),
-            &Some(owner.root_identity.clone()),
-        );
+        if owner_still_binds_public_root {
+            push_expected_identity(
+                &mut expected_directories,
+                public_root.to_path_buf(),
+                &Some(owner.root_identity.clone()),
+            );
+        }
         parsed_owners.push(owner);
         owner_records.push(("managed test final owner".into(), witness));
     }
@@ -1474,6 +1549,19 @@ fn unique_tmp_dir(name: &str) -> Utf8PathBuf {
     .unwrap()
 }
 
+/// Managed package transactions may create an absent package root, or replace
+/// a root proved by a current owner record.  Tests must not accidentally feed
+/// them an arbitrary pre-created directory.
+fn fresh_managed_package_root(root: &Utf8Path) -> Utf8PathBuf {
+    std::fs::create_dir_all(root).unwrap();
+    let package = root.join("package");
+    assert!(
+        !package.exists(),
+        "managed package transaction root must start absent: {package}"
+    );
+    package
+}
+
 fn regular_file_snapshot(root: &Utf8Path) -> std::collections::BTreeMap<Utf8PathBuf, Vec<u8>> {
     fn visit(
         root: &Utf8Path,
@@ -1591,9 +1679,9 @@ fn populate_private_harmony(
     std::fs::write(
             package.join("oh-package.json5"),
             if hsp {
-                r#"{"name":"uni-core-ohos","version":"0.1.0","main":"Index.ets","packageType":"InterfaceHar"}"#
+                r#"{"name":"uni-core-ohos","version":"0.1.0","main":"Index.ets","types":"Index.d.ets","packageType":"InterfaceHar","dependencies":{"libuni_core.so":"file:./src/main/cpp/types/libuni_core"},"obfuscated":false,"artifactType":"original"}"#
             } else {
-                r#"{"name":"uni-core-ohos","version":"0.1.0","main":"Index.ets"}"#
+                r#"{"name":"uni-core-ohos","version":"0.1.0","main":"Index.ets","types":"Index.d.ets","dependencies":{"libuni_core.so":"file:./src/main/cpp/types/libuni_core"},"obfuscated":false,"artifactType":"original"}"#
             },
         )
         .unwrap();
@@ -1614,11 +1702,11 @@ fn populate_private_harmony(
     std::fs::write(
             package.join("build-profile.json5"),
             if hsp && args.ohos_integrated_hsp {
-                r#"{"apiType":"stageMode","buildOption":{"generateSharedTgz":true,"nativeLib":{"excludeSoFromInterfaceHar":true},"arkOptions":{"integratedHsp":true}}}"#
+                r#"{"apiType":"stageMode","buildOption":{"resOptions":{"copyCodeResource":{"enable":false}},"generateSharedTgz":true,"nativeLib":{"excludeSoFromInterfaceHar":true},"arkOptions":{"integratedHsp":true}},"targets":[{"name":"default","config":{"deviceType":["phone"]}}]}"#
             } else if hsp {
-                r#"{"apiType":"stageMode","buildOption":{"generateSharedTgz":true,"nativeLib":{"excludeSoFromInterfaceHar":true}}}"#
+                r#"{"apiType":"stageMode","buildOption":{"resOptions":{"copyCodeResource":{"enable":false}},"generateSharedTgz":true,"nativeLib":{"excludeSoFromInterfaceHar":true}},"targets":[{"name":"default","config":{"deviceType":["phone"]}}]}"#
             } else {
-                r#"{"apiType":"stageMode"}"#
+                r#"{"apiType":"stageMode","buildOption":{"resOptions":{"copyCodeResource":{"enable":false}}},"targets":[{"name":"default","config":{"deviceType":["phone"]}}]}"#
             },
         )
         .unwrap();
@@ -2013,18 +2101,974 @@ fn managed_layout_derives_package_paths() {
     let _ = std::fs::remove_dir_all(package_dir.as_std_path());
 }
 
+fn exact_node_managed_manifest(namespace: &str) -> serde_json::Value {
+    serde_json::json!({
+        "artifactManifestSchemaVersion": 3,
+        "generator": "uniffi-bindgen-javascript",
+        "namespace": namespace,
+        "targets": ["node"],
+        "source": {
+            "root": "src/ffi",
+            "common": "src/ffi/common",
+            "browser": null,
+            "node": "src/ffi/node",
+            "electron": null,
+            "harmony": null,
+            "swift": null,
+            "kotlin": null,
+            "publicTypes": "src/ffi/common/public-types.ts"
+        },
+        "entrypoints": {
+            "web": null,
+            "miniProgram": null,
+            "node": "src/index.node.ts",
+            "electron": null,
+            "harmony": null
+        },
+        "artifacts": {
+            "wasm": null,
+            "miniProgram": null,
+            "node": {
+                "addon": "artifacts/node/fixture.node",
+                "env": "UNIFFI_FIXTURE_NAPI_PATH"
+            },
+            "electron": null,
+            "harmony": null,
+            "apple": null,
+            "android": null
+        },
+        "hostCrates": {
+            "wasm": null,
+            "napi": "artifacts/rust/napi/Cargo.toml",
+            "ohos": null
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+enum CurrentHarmonyManifestShape {
+    IntegratedHsp,
+    Har,
+    Dist,
+}
+
+impl CurrentHarmonyManifestShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::IntegratedHsp => "integrated HSP",
+            Self::Har => "HAR",
+            Self::Dist => "dist",
+        }
+    }
+}
+
+/// The three Harmony shapes emitted by the current producer.  Keep these as
+/// in-memory fixtures so the strict reader is checked against the producer's
+/// required `null` fields rather than a hand-relaxed historical manifest.
+fn current_harmony_managed_manifest(shape: CurrentHarmonyManifestShape) -> serde_json::Value {
+    let hsp = matches!(shape, CurrentHarmonyManifestShape::IntegratedHsp);
+    let har = matches!(shape, CurrentHarmonyManifestShape::Har);
+    let package = hsp || har;
+
+    let mut package_metadata = serde_json::json!({
+        "name": "uni-core-ohos",
+        "version": "0.1.0",
+        "main": "Index.ets",
+        "types": "Index.d.ets",
+        "description": "Uni Core test package",
+        "author": "Uni Core Team",
+        "license": "MPL-2.0",
+        "dependencies": {
+            "libuni_core.so": "file:./src/main/cpp/types/libuni_core"
+        },
+        "obfuscated": false,
+        "artifactType": "original"
+    });
+    if hsp {
+        package_metadata["packageType"] = serde_json::json!("InterfaceHar");
+        package_metadata["compatibleSdkVersion"] = serde_json::json!("5.0.1(13)");
+        package_metadata["compatibleSdkType"] = serde_json::json!("HarmonyOS");
+        package_metadata["nativeComponents"] = serde_json::json!([{
+            "name": "libuni_core.so",
+            "compatibleSdkVersion": "5.0.1(13)",
+            "compatibleSdkType": "HarmonyOS"
+        }]);
+    }
+    let mut module_metadata = serde_json::json!({
+        "name": "uni_core_ohos",
+        "type": if hsp { "shared" } else { "har" },
+        "deviceTypes": ["phone", "tablet", "2in1"]
+    });
+    if hsp {
+        module_metadata["deliveryWithInstall"] = serde_json::json!(true);
+    }
+    let build_profile = if hsp {
+        serde_json::json!({
+            "apiType": "stageMode",
+            "buildOption": {
+                "resOptions": { "copyCodeResource": { "enable": false } },
+                "generateSharedTgz": true,
+                "nativeLib": { "excludeSoFromInterfaceHar": true },
+                "arkOptions": { "integratedHsp": true }
+            },
+            "targets": [{
+                "name": "default",
+                "config": { "deviceType": ["phone", "tablet", "2in1"] },
+                "runtimeOS": "HarmonyOS"
+            }]
+        })
+    } else {
+        serde_json::json!({
+            "apiType": "stageMode",
+            "buildOption": {
+                "resOptions": { "copyCodeResource": { "enable": false } }
+            },
+            "targets": [{
+                "name": "default",
+                "config": { "deviceType": ["phone", "tablet", "2in1"] }
+            }]
+        })
+    };
+    let metadata = serde_json::json!({
+        "package": package_metadata,
+        "module": module_metadata,
+        "buildProfile": build_profile
+    });
+
+    serde_json::json!({
+        "artifactManifestSchemaVersion": 3,
+        "generator": "uniffi-bindgen-javascript",
+        "namespace": "uni_core",
+        "targets": ["harmony"],
+        "source": {
+            "root": "src/ffi",
+            "common": "src/ffi/common",
+            "browser": null,
+            "node": null,
+            "electron": null,
+            "harmony": "src/ffi/harmony",
+            "swift": null,
+            "kotlin": null,
+            "publicTypes": "src/ffi/common/public-types.ts"
+        },
+        "entrypoints": {
+            "web": null,
+            "miniProgram": null,
+            "node": null,
+            "electron": null,
+            "harmony": if package {
+                "artifacts/harmony/package/Index.ets"
+            } else {
+                "artifacts/harmony/dist/Index.ets"
+            }
+        },
+        "artifacts": {
+            "wasm": null,
+            "miniProgram": null,
+            "node": null,
+            "electron": null,
+            "harmony": {
+                "kind": if hsp { "hsp" } else if har { "har" } else { "dist" },
+                "integrated": hsp,
+                "har": if har { serde_json::json!("artifacts/harmony/uni-core-ohos.har") } else { serde_json::Value::Null },
+                "runtimeHsp": if hsp { serde_json::json!("artifacts/harmony/uni-core-ohos.hsp") } else { serde_json::Value::Null },
+                "interfaceHar": if hsp { serde_json::json!("artifacts/harmony/uni-core-ohos-interface.har") } else { serde_json::Value::Null },
+                "tgz": if hsp { serde_json::json!("artifacts/harmony/uni-core-ohos.tgz") } else { serde_json::Value::Null },
+                "dist": "artifacts/harmony/dist",
+                "facade": "artifacts/harmony/dist/native-facade.ets",
+                "facadeContract": "artifacts/harmony/dist/harmony-facade-contract.json",
+                "packageFacadeContract": if package { serde_json::json!("artifacts/harmony/package/harmony-facade-contract.json") } else { serde_json::Value::Null },
+                "types": "artifacts/harmony/dist/native-facade.d.ts",
+                "package": if package { serde_json::json!("artifacts/harmony/package") } else { serde_json::Value::Null },
+                "moduleProject": if hsp { serde_json::json!("artifacts/harmony/module-project") } else { serde_json::Value::Null },
+                "moduleSource": if hsp { serde_json::json!("artifacts/harmony/module-project/library") } else { serde_json::Value::Null },
+                "usage": if hsp { serde_json::json!("artifacts/harmony/uni-core-ohos-HSP_USAGE.md") } else { serde_json::Value::Null },
+                "packageMetadata": if package { serde_json::json!("artifacts/harmony/package/oh-package.json5") } else { serde_json::Value::Null },
+                "moduleMetadata": if package { serde_json::json!("artifacts/harmony/package/src/main/module.json5") } else { serde_json::Value::Null },
+                "buildProfile": if package { serde_json::json!("artifacts/harmony/package/build-profile.json5") } else { serde_json::Value::Null },
+                "metadata": if package { metadata } else { serde_json::Value::Null }
+            },
+            "apple": null,
+            "android": null
+        },
+        "hostCrates": {
+            "wasm": null,
+            "napi": null,
+            "ohos": "artifacts/rust/ohos/Cargo.toml"
+        }
+    })
+}
+
 #[test]
-fn managed_package_root_transaction_preserves_carried_files_and_fail_closes_owned_changes() {
-    let root = unique_tmp_dir("managed-package-root-transaction");
-    let package = root.join("package");
-    std::fs::create_dir_all(&package).unwrap();
-    std::fs::write(package.join("package.json"), "{\"private\":true}\n").unwrap();
+fn exact_managed_manifest_accepts_current_harmony_shapes_and_rejects_shape_drift() {
+    for shape in [
+        CurrentHarmonyManifestShape::IntegratedHsp,
+        CurrentHarmonyManifestShape::Har,
+        CurrentHarmonyManifestShape::Dist,
+    ] {
+        let label = shape.label();
+        let fixture = current_harmony_managed_manifest(shape);
+
+        // `/source/browser` is the first producer-owned nullable string in
+        // all three shapes.  It must be a JSON null, not an omitted optional
+        // field or an unconstrained serde_json::Value.
+        let source_browser = fixture.pointer("/source/browser").unwrap();
+        assert!(
+            source_browser.is_null(),
+            "{label} fixture drifted at /source/browser"
+        );
+        let nullable: ManifestNullable<String> = serde_json::from_value(source_browser.clone())
+            .unwrap_or_else(|error| {
+                panic!("{label} producer null at /source/browser did not parse: {error}")
+            });
+        assert!(!nullable.is_value());
+        let mini_program = fixture.pointer("/artifacts/miniProgram").unwrap();
+        let nullable: ManifestNullable<ManagedArtifactManifestMiniProgram> =
+            serde_json::from_value(mini_program.clone()).unwrap_or_else(|error| {
+                panic!("{label} producer null at /artifacts/miniProgram did not parse: {error}")
+            });
+        assert!(!nullable.is_value());
+        if !matches!(shape, CurrentHarmonyManifestShape::Dist) {
+            let metadata = fixture.pointer("/artifacts/harmony/metadata").unwrap();
+            serde_json::from_value::<ManagedArtifactManifestHarmonyStagedMetadata>(
+                metadata.clone(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{label} producer metadata at /artifacts/harmony/metadata did not parse: {error}")
+            });
+        }
+
+        let bytes = serde_json::to_vec(&fixture).unwrap();
+        parse_exact_managed_artifact_manifest(
+            &bytes,
+            "uni_core",
+            &format!("{label} current producer fixture"),
+        )
+        .unwrap_or_else(|error| panic!("{label} current producer fixture was rejected: {error:#}"));
+
+        // `runtimeHsp` is required in every current shape: a string for HSP
+        // and an explicit null for HAR/dist.  Missing it must not be silently
+        // treated as null.
+        let mut missing = fixture.clone();
+        missing["artifacts"]["harmony"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtimeHsp");
+        assert!(parse_exact_managed_artifact_manifest(
+            &serde_json::to_vec(&missing).unwrap(),
+            "uni_core",
+            &format!("{label} missing /artifacts/harmony/runtimeHsp"),
+        )
+        .is_err());
+        let error = serde_json::from_value::<ManagedArtifactManifestHarmony>(
+            missing["artifacts"]["harmony"].clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error}").contains("missing field `runtimeHsp`"),
+            "{error}"
+        );
+
+        let mut unknown = fixture.clone();
+        unknown["artifacts"]["harmony"]["unexpected"] = serde_json::json!(true);
+        assert!(parse_exact_managed_artifact_manifest(
+            &serde_json::to_vec(&unknown).unwrap(),
+            "uni_core",
+            &format!("{label} unknown /artifacts/harmony/unexpected"),
+        )
+        .is_err());
+        let error = serde_json::from_value::<ManagedArtifactManifestHarmony>(
+            unknown["artifacts"]["harmony"].clone(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error}").contains("unknown field `unexpected`"),
+            "{error}"
+        );
+
+        if !matches!(shape, CurrentHarmonyManifestShape::Dist) {
+            let metadata = fixture.pointer("/artifacts/harmony/metadata").unwrap();
+            let mut missing = metadata.clone();
+            missing["package"].as_object_mut().unwrap().remove("types");
+            let error =
+                serde_json::from_value::<ManagedArtifactManifestHarmonyStagedMetadata>(missing)
+                    .unwrap_err();
+            assert!(
+                format!("{error}").contains("missing field `types`"),
+                "{error}"
+            );
+
+            let mut unknown = metadata.clone();
+            unknown["package"]["unexpected"] = serde_json::json!(true);
+            let error =
+                serde_json::from_value::<ManagedArtifactManifestHarmonyStagedMetadata>(unknown)
+                    .unwrap_err();
+            assert!(
+                format!("{error}").contains("unknown field `unexpected`"),
+                "{error}"
+            );
+        }
+    }
+}
+
+fn current_harmony_fallback_metadata_manifest() -> serde_json::Value {
+    let mut fixture = current_harmony_managed_manifest(CurrentHarmonyManifestShape::IntegratedHsp);
+    let package = fixture
+        .pointer_mut("/artifacts/harmony/metadata/package")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    for field in ["types", "dependencies", "nativeComponents"] {
+        package.remove(field);
+    }
+    fixture["artifacts"]["harmony"]["metadata"]["buildProfile"] = serde_json::json!({
+        "apiType": "stageMode",
+        "buildOption": {
+            "generateSharedTgz": true,
+            "nativeLib": { "excludeSoFromInterfaceHar": true },
+            "arkOptions": { "integratedHsp": true }
+        }
+    });
+    fixture
+}
+
+#[test]
+fn exact_managed_manifest_accepts_current_harmony_fallback_metadata_and_rejects_drift() {
+    let fixture = current_harmony_fallback_metadata_manifest();
+    parse_exact_managed_artifact_manifest(
+        &serde_json::to_vec(&fixture).unwrap(),
+        "uni_core",
+        "current fallback Harmony producer fixture",
+    )
+    .unwrap();
+
+    let metadata = fixture.pointer("/artifacts/harmony/metadata").unwrap();
+    let mut missing = metadata.clone();
+    missing["package"]
+        .as_object_mut()
+        .unwrap()
+        .remove("artifactType");
+    let error = serde_json::from_value::<ManagedArtifactManifestHarmonyFallbackMetadata>(missing)
+        .unwrap_err();
+    assert!(
+        format!("{error}").contains("missing field `artifactType`"),
+        "{error}"
+    );
+
+    let mut unknown = metadata.clone();
+    unknown["buildProfile"]["unexpected"] = serde_json::json!(true);
+    let error = serde_json::from_value::<ManagedArtifactManifestHarmonyFallbackMetadata>(unknown)
+        .unwrap_err();
+    assert!(
+        format!("{error}").contains("unknown field `unexpected`"),
+        "{error}"
+    );
+}
+
+fn publish_exact_node_managed_fixture(layout: &ManagedLayout, manifest: &serde_json::Value) {
+    // The generic test-only transaction layout deliberately omits the
+    // manifest hook.  It still uses the production transaction's fresh-root,
+    // exact owner, journal, and publication path to produce a genuine current
+    // owner record.  The public layout below re-enables exact manifest
+    // validation when the fixture is exercised.
+    let publication_layout = ManagedLayout {
+        package_dir: layout.package_dir.clone(),
+        source_root: layout.source_root.clone(),
+        artifact_root: layout.artifact_root.clone(),
+        host_crates_root: layout.host_crates_root.clone(),
+        manifest_path: layout.manifest_path.clone(),
+        namespace: None,
+    };
+    let mut transaction = ManagedPackageTransaction::begin(&publication_layout).unwrap();
+    let package = transaction.private_root.clone();
+    std::fs::create_dir_all(package.join("src/ffi/common")).unwrap();
+    std::fs::create_dir_all(package.join("src/ffi/node")).unwrap();
+    std::fs::create_dir_all(package.join("artifacts/node")).unwrap();
+    std::fs::create_dir_all(package.join("artifacts/rust/napi")).unwrap();
+    std::fs::write(
+        package.join("src/ffi/common/public-types.ts"),
+        "export type Fixture = string;\n",
+    )
+    .unwrap();
+    std::fs::write(package.join("src/ffi/node/index.ts"), "export {};\n").unwrap();
+    std::fs::write(package.join("src/index.node.ts"), "export {};\n").unwrap();
+    std::fs::write(
+        package.join("artifacts/node/fixture.node"),
+        b"fixture addon",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("artifacts/rust/napi/Cargo.toml"),
+        "[package]\nname = \"fixture-napi\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("artifact-manifest.json"),
+        serde_json::to_vec_pretty(manifest).unwrap(),
+    )
+    .unwrap();
+    let owner = transaction.prepare_owner().unwrap();
+    transaction.commit(owner).unwrap();
+}
+
+fn write_exact_node_managed_fixture(root: &Utf8Path, namespace: &str) -> ManagedLayout {
+    let package = fresh_managed_package_root(root);
     let layout = ManagedLayout {
         package_dir: package.clone(),
         source_root: package.join("src/ffi"),
         artifact_root: package.join("artifacts"),
         host_crates_root: package.join("artifacts/rust"),
         manifest_path: package.join("artifact-manifest.json"),
+        namespace: Some(namespace.into()),
+    };
+    publish_exact_node_managed_fixture(&layout, &exact_node_managed_manifest(namespace));
+    layout
+}
+
+fn rewrite_exact_node_managed_manifest(layout: &ManagedLayout, manifest: &serde_json::Value) {
+    publish_exact_node_managed_fixture(layout, manifest);
+}
+
+fn assert_managed_preflight_rejects_without_mutation(
+    layout: &ManagedLayout,
+    root: &Utf8Path,
+    expected_error: &str,
+) {
+    let parent = layout.package_dir.parent().unwrap();
+    let before_files = regular_file_snapshot(parent);
+    let before_names = std::fs::read_dir(parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut args = empty_build_args();
+    // Reaching Cargo would turn this into an OS executable error; the exact
+    // preflight error below proves that transaction/backend work never starts.
+    args.cargo_bin = root.join("must-not-run-cargo").to_string();
+    let error = build_managed_package(
+        args,
+        ExpandedTargets {
+            node: true,
+            ..Default::default()
+        },
+        layout.clone(),
+    )
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains(expected_error), "{error}");
+    assert_eq!(regular_file_snapshot(parent), before_files);
+    assert_eq!(
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        before_names
+    );
+    assert!(
+        managed_record_paths(parent, &managed_package_digest(&layout.package_dir)).is_empty(),
+        "manifest preflight wrote a managed transaction journal"
+    );
+}
+
+#[test]
+fn managed_existing_manifest_preflight_rejects_owner_and_exact_schema_before_mutation() {
+    let root = unique_tmp_dir("managed-existing-manifest-preflight");
+    let layout = write_exact_node_managed_fixture(&root, "fixture");
+    validate_existing_managed_manifest(&layout, "fixture").unwrap();
+    validate_managed_owner(
+        &layout.package_dir,
+        &parse_managed_owner(&layout.package_dir).unwrap(),
+    )
+    .unwrap();
+
+    // A controlled component modified behind a current sidecar is rejected
+    // by the exact owner inventory before manifest parsing or transaction IO.
+    std::fs::write(layout.package_dir.join("src/index.node.ts"), "export{x};\n").unwrap();
+    let owner_error = validate_managed_owner(
+        &layout.package_dir,
+        &parse_managed_owner(&layout.package_dir).unwrap(),
+    )
+    .unwrap_err();
+    let owner_error = format!("{owner_error:#}");
+    assert!(owner_error.contains("owner hash"), "{owner_error}");
+    assert_managed_preflight_rejects_without_mutation(
+        &layout,
+        &root,
+        "managed package controlled entry",
+    );
+
+    // The deliberate owner mismatch invalidates its generation's mutation
+    // witness.  Start a separate fresh publication for parser cases instead
+    // of rewriting a sidecar or treating the damaged root as adoptable.
+    std::fs::remove_dir_all(&root).unwrap();
+    let layout = write_exact_node_managed_fixture(&root, "fixture");
+
+    // Once the owner checksum is current, every legacy/foreign manifest
+    // shape is still rejected before locks, journals, candidates, or Cargo.
+    let namespace_mismatch = exact_node_managed_manifest("other");
+    rewrite_exact_node_managed_manifest(&layout, &namespace_mismatch);
+    assert_managed_preflight_rejects_without_mutation(&layout, &root, "namespace mismatch");
+
+    let mut unsafe_path = exact_node_managed_manifest("fixture");
+    unsafe_path["source"]["root"] = serde_json::Value::String("../escape".into());
+    rewrite_exact_node_managed_manifest(&layout, &unsafe_path);
+    assert_managed_preflight_rejects_without_mutation(&layout, &root, "unsafe path");
+
+    let mut legacy = exact_node_managed_manifest("fixture");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("artifactManifestSchemaVersion");
+    legacy["schemaVersion"] = serde_json::json!(3);
+    rewrite_exact_node_managed_manifest(&layout, &legacy);
+    assert_managed_preflight_rejects_without_mutation(&layout, &root, "schema mismatch");
+
+    let mut unknown = exact_node_managed_manifest("fixture");
+    unknown["unknown"] = serde_json::json!(true);
+    rewrite_exact_node_managed_manifest(&layout, &unknown);
+    assert_managed_preflight_rejects_without_mutation(&layout, &root, "unknown field");
+
+    let sidecar = managed_owner_path(&layout.package_dir);
+    std::fs::remove_dir_all(root).ok();
+    let _ = std::fs::remove_file(sidecar);
+}
+
+#[cfg(unix)]
+struct ManagedHspFrontendTestTools {
+    ohpm: Utf8PathBuf,
+    hvigorw: Utf8PathBuf,
+    sdk_home: Utf8PathBuf,
+    counter: Utf8PathBuf,
+}
+
+#[cfg(unix)]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(unix)]
+fn write_managed_hsp_frontend_tool(path: &Utf8Path, label: &str, counter: &Utf8Path, status: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(
+        path,
+        format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\t%s\\n' '{label}' \"$PWD\" >> {}\nexit {status}\n",
+            shell_single_quote(counter.as_str()),
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn managed_hsp_frontend_test_tools(root: &Utf8Path) -> ManagedHspFrontendTestTools {
+    let sdk_home = root.join("fake-sdk");
+    std::fs::create_dir_all(sdk_home.join("default")).unwrap();
+    std::fs::write(
+        sdk_home.join("default/sdk-pkg.json"),
+        r#"{"data":{"platformVersion":"6.0.0","apiVersion":"20"}}"#,
+    )
+    .unwrap();
+
+    let counter = root.join("hsp-frontend-tool-counter");
+    std::fs::write(&counter, "").unwrap();
+    let ohpm = root.join("fake-ohpm");
+    let hvigorw = root.join("fake-hvigorw");
+    write_managed_hsp_frontend_tool(&ohpm, "ohpm", &counter, 0);
+    // The second probe fails deliberately.  This proves that an allowed root
+    // reaches both frontend tools without starting the managed transaction.
+    write_managed_hsp_frontend_tool(&hvigorw, "hvigorw", &counter, 97);
+
+    ManagedHspFrontendTestTools {
+        ohpm,
+        hvigorw,
+        sdk_home,
+        counter,
+    }
+}
+
+#[cfg(unix)]
+fn managed_hsp_top_level_args(
+    manifest_path: &Utf8Path,
+    package_dir: &Utf8Path,
+    tools: &ManagedHspFrontendTestTools,
+) -> BuildArgs {
+    let mut args = empty_build_args();
+    args.manifest_path = manifest_path.to_path_buf();
+    args.target = vec![ArtifactTargetArg::Harmony];
+    args.managed_layout = true;
+    args.package_dir = Some(package_dir.to_path_buf());
+    args.out_dir = None;
+    args.ohos_package_kind = super::super::ohos::PackageKind::Hsp;
+    args.ohos_integrated_hsp = true;
+    args.ohos_package_name = Some("@uniffi/uni-core".into());
+    args.ohos_compatible_sdk_version = Some("5.0.1(13)".into());
+    args.ohos_compatible_sdk_type = Some("HarmonyOS".into());
+    args.ohos_hvigorw = Some(tools.hvigorw.as_str().to_owned());
+    args.ohos_ohpm = Some(tools.ohpm.as_str().to_owned());
+    args.ohos_deveco_sdk_home = Some(tools.sdk_home.clone());
+    args
+}
+
+#[cfg(unix)]
+fn managed_hsp_test_directory_names(root: &Utf8Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect()
+}
+
+#[cfg(unix)]
+fn capture_managed_hsp_preflight_records(
+    parent: &Utf8Path,
+    package: &Utf8Path,
+) -> Vec<(Utf8PathBuf, Vec<u8>, DurableRecordWitness)> {
+    managed_record_paths(parent, &managed_package_digest(package))
+        .into_iter()
+        .map(|path| {
+            let (bytes, witness) =
+                exact_test_record_witness(&path, 1024 * 1024, "managed HSP preflight journal")
+                    .unwrap();
+            (path, bytes, witness)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn assert_managed_hsp_top_level_rejects_before_tools(
+    manifest_path: &Utf8Path,
+    package: &Utf8Path,
+    tools: &ManagedHspFrontendTestTools,
+    scratch: &Utf8Path,
+    expected_error: &str,
+) {
+    let parent = package.parent().unwrap();
+    let parent_names = managed_hsp_test_directory_names(parent);
+    let package_snapshot = path_entry_exists(package)
+        .unwrap()
+        .then(|| capture_directory_for_cleanup(package).unwrap());
+    let owner_path = managed_owner_path(package);
+    let owner_before = path_entry_exists(&owner_path).unwrap().then(|| {
+        exact_test_record_witness(&owner_path, 1024 * 1024, "managed HSP preflight owner").unwrap()
+    });
+    let journals_before = capture_managed_hsp_preflight_records(parent, package);
+    let scratch_snapshot = capture_directory_for_cleanup(scratch).unwrap();
+
+    let error = format!(
+        "{:#}",
+        build(managed_hsp_top_level_args(manifest_path, package, tools)).unwrap_err()
+    );
+    assert!(error.contains(expected_error), "{error:#}");
+    assert!(
+        std::fs::read_to_string(&tools.counter).unwrap().is_empty(),
+        "managed HSP preflight ran a frontend tool before rejecting `{expected_error}`"
+    );
+    validate_directory_capture(scratch, &scratch_snapshot).unwrap();
+    assert_eq!(managed_hsp_test_directory_names(parent), parent_names);
+
+    match package_snapshot {
+        Some(snapshot) => validate_directory_capture(package, &snapshot).unwrap(),
+        None => assert!(!path_entry_exists(package).unwrap()),
+    }
+    match owner_before {
+        Some((bytes, witness)) => {
+            let (actual, observed) = exact_test_record_witness(
+                &owner_path,
+                1024 * 1024,
+                "managed HSP preflight owner after rejection",
+            )
+            .unwrap();
+            assert_eq!(actual, bytes);
+            assert_eq!(observed, witness);
+        }
+        None => assert!(!path_entry_exists(&owner_path).unwrap()),
+    }
+    let journal_paths = managed_record_paths(parent, &managed_package_digest(package));
+    assert_eq!(
+        journal_paths,
+        journals_before
+            .iter()
+            .map(|(path, _, _)| path.clone())
+            .collect::<Vec<_>>()
+    );
+    for (path, bytes, witness) in journals_before {
+        let (actual, observed) = exact_test_record_witness(
+            &path,
+            1024 * 1024,
+            "managed HSP preflight journal after rejection",
+        )
+        .unwrap();
+        assert_eq!(actual, bytes);
+        assert_eq!(observed, witness);
+    }
+}
+
+#[cfg(unix)]
+fn assert_managed_hsp_top_level_reaches_frontend_tools(
+    manifest_path: &Utf8Path,
+    package: &Utf8Path,
+    tools: &ManagedHspFrontendTestTools,
+    scratch: &Utf8Path,
+) {
+    let parent = package.parent().unwrap();
+    let parent_names = managed_hsp_test_directory_names(parent);
+    let package_snapshot = path_entry_exists(package)
+        .unwrap()
+        .then(|| capture_directory_for_cleanup(package).unwrap());
+    let owner_path = managed_owner_path(package);
+    let owner_before = path_entry_exists(&owner_path).unwrap().then(|| {
+        exact_test_record_witness(
+            &owner_path,
+            1024 * 1024,
+            "managed HSP preflight owner before tool probe",
+        )
+        .unwrap()
+    });
+    let journals_before = capture_managed_hsp_preflight_records(parent, package);
+    let scratch_names = managed_hsp_test_directory_names(scratch);
+
+    let error = format!(
+        "{:#}",
+        build(managed_hsp_top_level_args(manifest_path, package, tools)).unwrap_err()
+    );
+    assert!(error.contains("Harmony command"), "{error:#}");
+
+    let calls = std::fs::read_to_string(&tools.counter)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (tool, cwd) = line
+                .split_once('\t')
+                .expect("fake frontend tool counter must include its probe directory");
+            (tool.to_string(), Utf8PathBuf::from(cwd))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(tool, _)| tool.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ohpm", "hvigorw"]
+    );
+    for (_, probe) in calls {
+        assert_eq!(probe.file_name(), Some("mirror"));
+        assert!(
+            !probe.exists() && !probe.parent().unwrap().exists(),
+            "frontend probe invocation root survived cleanup: {probe}"
+        );
+    }
+    assert_eq!(managed_hsp_test_directory_names(scratch), scratch_names);
+    assert_eq!(managed_hsp_test_directory_names(parent), parent_names);
+
+    match package_snapshot {
+        Some(snapshot) => validate_directory_capture(package, &snapshot).unwrap(),
+        None => assert!(!path_entry_exists(package).unwrap()),
+    }
+    match owner_before {
+        Some((bytes, witness)) => {
+            let (actual, observed) = exact_test_record_witness(
+                &owner_path,
+                1024 * 1024,
+                "managed HSP preflight owner after tool probe",
+            )
+            .unwrap();
+            assert_eq!(actual, bytes);
+            assert_eq!(observed, witness);
+        }
+        None => assert!(!path_entry_exists(&owner_path).unwrap()),
+    }
+    assert_eq!(
+        managed_record_paths(parent, &managed_package_digest(package)),
+        journals_before
+            .iter()
+            .map(|(path, _, _)| path.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[cfg(unix)]
+const MANAGED_HSP_TOP_LEVEL_PREFLIGHT_CHILD_ROOT: &str =
+    "UNIFFI_MANAGED_HSP_TOP_LEVEL_PREFLIGHT_CHILD_ROOT";
+
+#[cfg(unix)]
+fn run_managed_hsp_top_level_preflight_test(root: &Utf8Path) {
+    // Exercise `build`, the `artifacts build` command handler, rather than
+    // calling `build_managed_package` directly.
+    let manifest_path = write_test_manifest(&root.join("core"));
+    let scratch = root.join("hsp-preflight-scratch");
+    assert!(scratch.is_dir(), "child HSP scratch directory is missing");
+
+    for label in ["empty", "unowned", "legacy-owner"] {
+        let case = root.join(label);
+        std::fs::create_dir_all(&case).unwrap();
+        let package = case.join("package");
+        std::fs::create_dir(&package).unwrap();
+        if label != "empty" {
+            std::fs::write(package.join("user-sentinel"), label).unwrap();
+        }
+        if label == "legacy-owner" {
+            let legacy_owner = ManagedPackageOwner {
+                owner: MANAGED_PACKAGE_OWNER_KIND.into(),
+                schema_version: 2,
+                generation: "legacy".into(),
+                state: "committed".into(),
+                root_identity: persistent_fs_identity(&package, true).unwrap(),
+                root_mutation_token: None,
+                entries: Vec::new(),
+            };
+            std::fs::write(
+                managed_owner_path(&package),
+                serde_json::to_vec_pretty(&legacy_owner).unwrap(),
+            )
+            .unwrap();
+        }
+        let tools = managed_hsp_frontend_test_tools(&case);
+        let expected = if label == "legacy-owner" {
+            "unsupported managed package owner record"
+        } else {
+            "refusing unowned or legacy managed package root"
+        };
+        assert_managed_hsp_top_level_rejects_before_tools(
+            &manifest_path,
+            &package,
+            &tools,
+            &scratch,
+            expected,
+        );
+    }
+
+    let manifest_cases: [(&str, &str, fn(&mut serde_json::Value)); 3] = [
+        (
+            "incompatible-manifest",
+            "schema mismatch",
+            |manifest: &mut serde_json::Value| {
+                manifest["artifactManifestSchemaVersion"] = serde_json::json!(999);
+            },
+        ),
+        (
+            "unknown-manifest-field",
+            "unknown field `unexpected`",
+            |manifest: &mut serde_json::Value| {
+                manifest["unexpected"] = serde_json::json!(true);
+            },
+        ),
+        (
+            "missing-manifest-field",
+            "missing field `generator`",
+            |manifest: &mut serde_json::Value| {
+                manifest.as_object_mut().unwrap().remove("generator");
+            },
+        ),
+    ];
+    for (label, expected_error, mutate) in manifest_cases {
+        let case = root.join(label);
+        let layout = write_exact_node_managed_fixture(&case, "uni_core");
+        let mut manifest = exact_node_managed_manifest("uni_core");
+        mutate(&mut manifest);
+        rewrite_exact_node_managed_manifest(&layout, &manifest);
+        let tools = managed_hsp_frontend_test_tools(&case);
+        assert_managed_hsp_top_level_rejects_before_tools(
+            &manifest_path,
+            &layout.package_dir,
+            &tools,
+            &scratch,
+            expected_error,
+        );
+    }
+
+    let residue_case = root.join("transaction-residue");
+    std::fs::create_dir_all(&residue_case).unwrap();
+    let residue_package = canonicalize_invocation_output(&residue_case.join("package")).unwrap();
+    let residue = test_managed_prepared_journal_for_generation(
+        &residue_package,
+        exited_managed_test_generation(),
+    );
+    let residue_parent = residue_package.parent().unwrap();
+    let residue_witness = write_test_managed_journal(residue_parent, &residue);
+    std::fs::create_dir(residue_parent.join(&residue.candidate_name)).unwrap();
+    let tools = managed_hsp_frontend_test_tools(&residue_case);
+    assert_managed_hsp_top_level_rejects_before_tools(
+        &manifest_path,
+        &residue_package,
+        &tools,
+        &scratch,
+        "previous managed package transaction",
+    );
+    assert!(residue_witness.path.is_file());
+
+    let absent_case = root.join("absent-current");
+    std::fs::create_dir_all(&absent_case).unwrap();
+    let absent_package = absent_case.join("package");
+    let tools = managed_hsp_frontend_test_tools(&absent_case);
+    assert_managed_hsp_top_level_reaches_frontend_tools(
+        &manifest_path,
+        &absent_package,
+        &tools,
+        &scratch,
+    );
+
+    let current_case = root.join("current-exact");
+    let current = write_exact_node_managed_fixture(&current_case, "uni_core");
+    let tools = managed_hsp_frontend_test_tools(&current_case);
+    assert_managed_hsp_top_level_reaches_frontend_tools(
+        &manifest_path,
+        &current.package_dir,
+        &tools,
+        &scratch,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_hsp_top_level_preflights_existing_package_before_frontend_tools() {
+    if let Some(root) = std::env::var_os(MANAGED_HSP_TOP_LEVEL_PREFLIGHT_CHILD_ROOT) {
+        let root = Utf8PathBuf::from_path_buf(root.into())
+            .expect("managed HSP top-level child root must be UTF-8");
+        run_managed_hsp_top_level_preflight_test(&root);
+        return;
+    }
+
+    // `OHOS_NDK_HOME` and `TMPDIR` are process-global.  Run the actual
+    // top-level invocation in an exact-filtered child so this test cannot
+    // redirect sibling managed tests into its scratch directory.
+    let temp = tempfile::tempdir().unwrap();
+    let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+    let ndk = root.join("fake-ndk");
+    let scratch = root.join("hsp-preflight-scratch");
+    std::fs::create_dir_all(&ndk).unwrap();
+    std::fs::create_dir_all(&scratch).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cli::artifacts::tests::managed_hsp_top_level_preflights_existing_package_before_frontend_tools",
+            "--nocapture",
+        ])
+        .env(MANAGED_HSP_TOP_LEVEL_PREFLIGHT_CHILD_ROOT, &root)
+        .env("OHOS_NDK_HOME", &ndk)
+        .env("TMPDIR", &scratch)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "managed HSP top-level child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn managed_package_root_transaction_preserves_carried_files_and_fail_closes_owned_changes() {
+    let root = unique_tmp_dir("managed-package-root-transaction");
+    let package = fresh_managed_package_root(&root);
+    let layout = ManagedLayout {
+        package_dir: package.clone(),
+        source_root: package.join("src/ffi"),
+        artifact_root: package.join("artifacts"),
+        host_crates_root: package.join("artifacts/rust"),
+        manifest_path: package.join("artifact-manifest.json"),
+        namespace: None,
     };
 
     let mut transaction = ManagedPackageTransaction::begin(&layout).unwrap();
@@ -2044,6 +3088,11 @@ fn managed_package_root_transaction_preserves_carried_files_and_fail_closes_owne
     assert!(wasm_target.starts_with(transaction.build_temp.path.clone()));
     assert!(wasm_core_target.starts_with(&transaction.build_temp.path));
     assert_ne!(wasm_target, wasm_core_target);
+    std::fs::write(
+        transaction.private_root.join("package.json"),
+        "{\"private\":true}\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(transaction.private_root.join("src/ffi/node")).unwrap();
     std::fs::write(
         transaction.private_root.join("src/ffi/node/index.ts"),
@@ -2052,7 +3101,7 @@ fn managed_package_root_transaction_preserves_carried_files_and_fail_closes_owne
     .unwrap();
     std::fs::write(
             transaction.private_root.join("artifact-manifest.json"),
-            "{\"schemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"node\"]}\n",
+            "{\"artifactManifestSchemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"node\"]}\n",
         )
         .unwrap();
     let owner = transaction.prepare_owner().unwrap();
@@ -2139,14 +3188,14 @@ fn managed_seed_registration_never_adopts_inserted_or_replaced_objects() {
 #[test]
 fn committed_managed_owner_rejects_root_aba_and_missing_schema3_witnesses() {
     let root = unique_tmp_dir("managed-owner-schema3-witness");
-    let package = root.join("package");
-    std::fs::create_dir_all(&package).unwrap();
+    let package = fresh_managed_package_root(&root);
     let layout = ManagedLayout {
         package_dir: package.clone(),
         source_root: package.join("src/ffi"),
         artifact_root: package.join("artifacts"),
         host_crates_root: package.join("artifacts/rust"),
         manifest_path: package.join("artifact-manifest.json"),
+        namespace: None,
     };
     let mut transaction = ManagedPackageTransaction::begin(&layout).unwrap();
     std::fs::create_dir_all(transaction.private_root.join("src/ffi/node")).unwrap();
@@ -2157,7 +3206,7 @@ fn committed_managed_owner_rejects_root_aba_and_missing_schema3_witnesses() {
     .unwrap();
     std::fs::write(
             transaction.private_root.join("artifact-manifest.json"),
-            "{\"schemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"node\"]}\n",
+            "{\"artifactManifestSchemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"node\"]}\n",
         )
         .unwrap();
     let owner = transaction.prepare_owner().unwrap();
@@ -2184,8 +3233,11 @@ fn committed_managed_owner_rejects_root_aba_and_missing_schema3_witnesses() {
         .unwrap()
         .remove("parentMutationToken");
     std::fs::write(&sidecar, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
-    let missing_parent = parse_managed_owner(&package).unwrap();
-    assert!(validate_managed_owner(&package, &missing_parent).is_err());
+    let error = parse_managed_owner(&package).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("missing field `parentMutationToken`"),
+        "{error:#}"
+    );
 
     std::fs::write(&sidecar, &original_owner).unwrap();
     let displaced = root.join("package-displaced");
@@ -2203,15 +3255,14 @@ fn committed_managed_owner_rejects_root_aba_and_missing_schema3_witnesses() {
 #[test]
 fn managed_precommit_error_restores_old_root_and_rebinds_owner() {
     let root = unique_tmp_dir("managed-precommit-rollback");
-    let package = root.join("package");
-    std::fs::create_dir_all(&package).unwrap();
-    std::fs::write(package.join("package.json"), "{\"private\":true}\n").unwrap();
+    let package = fresh_managed_package_root(&root);
     let layout = ManagedLayout {
         package_dir: package.clone(),
         source_root: package.join("src/ffi"),
         artifact_root: package.join("artifacts"),
         host_crates_root: package.join("artifacts/rust"),
         manifest_path: package.join("artifact-manifest.json"),
+        namespace: None,
     };
 
     let mut first = ManagedPackageTransaction::begin(&layout).unwrap();
@@ -2222,8 +3273,13 @@ fn managed_precommit_error_restores_old_root_and_rebinds_owner() {
     )
     .unwrap();
     std::fs::write(
+        first.private_root.join("package.json"),
+        "{\"private\":true}\n",
+    )
+    .unwrap();
+    std::fs::write(
             first.private_root.join("artifact-manifest.json"),
-            "{\"schemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"node\"]}\n",
+            "{\"artifactManifestSchemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"node\"]}\n",
         )
         .unwrap();
     let owner = first.prepare_owner().unwrap();
@@ -2310,14 +3366,14 @@ fn managed_precommit_error_restores_old_root_and_rebinds_owner() {
 #[test]
 fn managed_precommit_journal_fault_matrix_restores_old_generation_without_residue() {
     let root = unique_tmp_dir("managed-precommit-journal-faults");
-    let package = root.join("package");
-    std::fs::create_dir_all(&package).unwrap();
+    let package = fresh_managed_package_root(&root);
     let layout = ManagedLayout {
         package_dir: package.clone(),
         source_root: package.join("src/ffi"),
         artifact_root: package.join("artifacts"),
         host_crates_root: package.join("artifacts/rust"),
         manifest_path: package.join("artifact-manifest.json"),
+        namespace: None,
     };
     let mut first = ManagedPackageTransaction::begin(&layout).unwrap();
     std::fs::create_dir_all(first.private_root.join("src/ffi/node")).unwrap();
@@ -2328,7 +3384,7 @@ fn managed_precommit_journal_fault_matrix_restores_old_generation_without_residu
     .unwrap();
     std::fs::write(
             first.private_root.join("artifact-manifest.json"),
-            "{\"schemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"node\"]}\n",
+            "{\"artifactManifestSchemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"node\"]}\n",
         )
         .unwrap();
     let owner = first.prepare_owner().unwrap();
@@ -2392,18 +3448,24 @@ fn managed_postcommit_partial_cleanup_retains_complete_old_generation_snapshot()
     use std::io::Read as _;
 
     let root = unique_tmp_dir("managed-postcommit-snapshot");
-    let package = root.join("package");
-    std::fs::create_dir_all(&package).unwrap();
-    std::fs::write(package.join("package.json"), "{\"private\":true}\n").unwrap();
+    let package = fresh_managed_package_root(&root);
     let layout = ManagedLayout {
         package_dir: package.clone(),
         source_root: package.join("src/ffi"),
         artifact_root: package.join("artifacts"),
         host_crates_root: package.join("artifacts/rust"),
         manifest_path: package.join("artifact-manifest.json"),
+        namespace: None,
     };
 
     let write_generation = |transaction: &mut ManagedPackageTransaction, value: u8| {
+        if value == 1 {
+            std::fs::write(
+                transaction.private_root.join("package.json"),
+                "{\"private\":true}\n",
+            )
+            .unwrap();
+        }
         std::fs::create_dir_all(transaction.private_root.join("src/ffi/node")).unwrap();
         std::fs::write(
             transaction.private_root.join("src/ffi/node/index.ts"),
@@ -2413,7 +3475,7 @@ fn managed_postcommit_partial_cleanup_retains_complete_old_generation_snapshot()
         std::fs::write(
                 transaction.private_root.join("artifact-manifest.json"),
                 format!(
-                    "{{\"schemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"generation\":{value},\"targets\":[\"node\"]}}\n"
+                    "{{\"artifactManifestSchemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"generation\":{value},\"targets\":[\"node\"]}}\n"
                 ),
             )
             .unwrap();
@@ -2560,7 +3622,8 @@ fn managed_layout_derives_and_commits_integrated_hsp_generation() {
         serde_json::from_slice(&std::fs::read(package_dir.join("artifact-manifest.json")).unwrap())
             .unwrap();
     let hsp = &manifest["artifacts"]["harmony"];
-    assert_eq!(manifest["schemaVersion"], 3);
+    assert_eq!(manifest["artifactManifestSchemaVersion"], 3);
+    assert!(manifest.get("schemaVersion").is_none());
     assert_eq!(hsp["kind"], "hsp");
     assert_eq!(hsp["integrated"], true);
     assert!(hsp["har"].is_null());
@@ -3032,6 +4095,7 @@ fn managed_package_lock_child() {
         artifact_root: package_dir.join("artifacts"),
         host_crates_root: package_dir.join("artifacts/rust"),
         manifest_path: package_dir.join("artifact-manifest.json"),
+        namespace: None,
     };
     let mut transaction = ManagedPackageTransaction::begin(&layout).unwrap();
     let acquired = std::env::var_os("UNIFFI_MANAGED_LOCK_CHILD_ACQUIRED").unwrap();
@@ -3053,7 +4117,7 @@ fn managed_package_lock_child() {
             std::fs::write(
                     transaction.private_root.join("artifact-manifest.json"),
                     format!(
-                        "{{\"schemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"harmony\"],\"mode\":{}}}\n",
+                        "{{\"artifactManifestSchemaVersion\":3,\"generator\":\"uniffi-bindgen-javascript\",\"targets\":[\"harmony\"],\"mode\":{}}}\n",
                         serde_json::to_string(&mode).unwrap()
                     ),
                 )
@@ -3069,7 +4133,7 @@ fn managed_package_lock_child() {
 
 #[cfg(unix)]
 #[test]
-fn managed_package_root_lock_serializes_concurrent_processes() {
+fn managed_package_active_journal_fails_closed_before_lock_and_retry_commits() {
     use std::time::{Duration, Instant};
 
     fn wait_for(path: &Utf8Path, timeout: Duration) {
@@ -3080,8 +4144,26 @@ fn managed_package_root_lock_serializes_concurrent_processes() {
         }
     }
 
+    fn wait_for_exit(
+        child: &mut std::process::Child,
+        timeout: Duration,
+    ) -> std::process::ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                started.elapsed() < timeout,
+                "timed out waiting for child process {} to exit",
+                child.id()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     let package_dir = unique_tmp_dir("managed-harmony-lock");
-    write_test_manifest(&package_dir);
+    assert!(!package_dir.exists());
     let control_dir = package_dir.parent().unwrap().join(format!(
         ".{}-lock-control",
         package_dir.file_name().unwrap()
@@ -3112,19 +4194,27 @@ fn managed_package_root_lock_serializes_concurrent_processes() {
         let mut first = spawn_child(&first_acquired, &first_release, first_mode);
         wait_for(&first_acquired, Duration::from_secs(10));
         let mut second = spawn_child(&second_acquired, &second_release, second_mode);
-        let second_pid = second.id();
-        std::thread::sleep(Duration::from_millis(150));
+        let second_status = wait_for_exit(&mut second, Duration::from_secs(10));
         assert!(
             !second_acquired.exists(),
-            "second managed invocation acquired the output lock concurrently"
+            "second managed invocation crossed active-journal preflight"
+        );
+        assert!(
+            !second_status.success(),
+            "active managed journal must fail closed before another process acquires the root lock"
         );
         std::fs::write(&first_release, b"release").unwrap();
-        wait_for(&second_acquired, Duration::from_secs(10));
-        std::fs::write(&second_release, b"release").unwrap();
         assert!(first.wait().unwrap().success());
-        assert!(second.wait().unwrap().success());
+
         if second_mode != "fail" {
-            final_owner_producer = Some(second_pid);
+            let retry_acquired = control_dir.join(format!("{index}-retry-acquired"));
+            let retry_release = control_dir.join(format!("{index}-retry-release"));
+            let mut retry = spawn_child(&retry_acquired, &retry_release, second_mode);
+            let retry_pid = retry.id();
+            wait_for(&retry_acquired, Duration::from_secs(10));
+            std::fs::write(&retry_release, b"release").unwrap();
+            assert!(retry.wait().unwrap().success());
+            final_owner_producer = Some(retry_pid);
         }
     }
     assert_eq!(
@@ -3530,8 +4620,7 @@ fn managed_nested_random_tempdir_residue_is_discovered_but_not_reowned() {
     std::fs::write(&sentinel, b"must survive managed residue cleanup").unwrap();
     let sentinel_before = std::fs::symlink_metadata(&sentinel).unwrap();
     let nested = outer.join("nested");
-    let package = nested.join("package");
-    write_test_manifest(&package);
+    let package = fresh_managed_package_root(&nested);
     let control = nested.join(".package-nested-control");
     std::fs::create_dir(&control).unwrap();
     let acquired = control.join("acquired");
@@ -3574,7 +4663,10 @@ fn managed_nested_random_tempdir_residue_is_discovered_but_not_reowned() {
             .any(|report| report.contains(public.as_str()) && report.contains("non-empty")),
         "historical non-empty root was not reported as preserved: {cleanup_reports:?}"
     );
-    assert!(package.exists() && control.exists());
+    // The crash happened during a first publication, so the public package
+    // root legitimately remains absent; the exact journal/candidate residue
+    // and unrelated control must still be preserved rather than adopted.
+    assert!(!package.exists() && control.exists());
     assert!(!managed_record_paths(&nested, &digest).is_empty());
 
     let sentinel_after = std::fs::symlink_metadata(&sentinel).unwrap();
@@ -3656,7 +4748,7 @@ fn managed_package_kill_preserves_durable_journal_and_fails_closed() {
     use std::time::{Duration, Instant};
 
     let package_dir = unique_tmp_dir("managed-package-kill");
-    write_test_manifest(&package_dir);
+    assert!(!package_dir.exists());
     let control = package_dir.parent().unwrap().join(format!(
         ".{}-kill-control",
         package_dir.file_name().unwrap()
@@ -3694,6 +4786,7 @@ fn managed_package_kill_preserves_durable_journal_and_fails_closed() {
         artifact_root: package_dir.join("artifacts"),
         host_crates_root: package_dir.join("artifacts/rust"),
         manifest_path: package_dir.join("artifact-manifest.json"),
+        namespace: None,
     };
     let public = canonicalize_invocation_output(&package_dir).unwrap();
     let digest = managed_package_digest(&public);
@@ -3723,8 +4816,16 @@ fn managed_package_kill_preserves_durable_journal_and_fails_closed() {
 
 #[cfg(unix)]
 #[test]
-fn managed_package_all_rename_boundaries_are_durable_and_fail_closed() {
+fn managed_package_all_rename_boundaries_are_durable_and_recover_or_fail_closed() {
     use std::time::{Duration, Instant};
+
+    fn wait_for(path: &Utf8Path, timeout: Duration) {
+        let started = Instant::now();
+        while !path.exists() {
+            assert!(started.elapsed() < timeout, "timed out waiting for {path}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     for boundary in [
         "journalDurable",
@@ -3744,7 +4845,7 @@ fn managed_package_all_rename_boundaries_are_durable_and_fail_closed() {
         "afterJournalCleanup",
     ] {
         let package_dir = unique_tmp_dir(&format!("managed-crash-{boundary}"));
-        write_test_manifest(&package_dir);
+        assert!(!package_dir.exists());
         let parent = package_dir.parent().unwrap().to_path_buf();
         let control = parent.join(format!(
             ".{}-{boundary}-control",
@@ -3754,6 +4855,28 @@ fn managed_package_all_rename_boundaries_are_durable_and_fail_closed() {
         let acquired = control.join("acquired");
         let release = control.join("release");
         let reached = control.join("reached");
+
+        // Cleanup-boundary crash points only exist while replacing a current
+        // package.  Publish that owner through the same child transaction
+        // path first; do not hand-write or adopt an existing public root.
+        let seed_acquired = control.join("seed-acquired");
+        let seed_release = control.join("seed-release");
+        let mut seed = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::artifacts::tests::managed_package_lock_child",
+                "--nocapture",
+            ])
+            .env("UNIFFI_MANAGED_LOCK_CHILD_PACKAGE", &package_dir)
+            .env("UNIFFI_MANAGED_LOCK_CHILD_ACQUIRED", &seed_acquired)
+            .env("UNIFFI_MANAGED_LOCK_CHILD_RELEASE", &seed_release)
+            .env("UNIFFI_MANAGED_LOCK_CHILD_MODE", "hsp")
+            .spawn()
+            .unwrap();
+        wait_for(&seed_acquired, Duration::from_secs(10));
+        std::fs::write(&seed_release, b"release").unwrap();
+        assert!(seed.wait().unwrap().success());
+
         std::fs::write(&release, b"release").unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -3769,15 +4892,7 @@ fn managed_package_all_rename_boundaries_are_durable_and_fail_closed() {
             .env("UNIFFI_TEST_MANAGED_CRASH_REACHED", &reached)
             .spawn()
             .unwrap();
-        let producer_pid = child.id();
-        let started = Instant::now();
-        while !reached.exists() {
-            assert!(
-                started.elapsed() < Duration::from_secs(60),
-                "timed out waiting for crash boundary {boundary}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for(&reached, Duration::from_secs(60));
         assert!(!child.wait().unwrap().success());
 
         let public = canonicalize_invocation_output(&package_dir).unwrap();
@@ -3789,27 +4904,44 @@ fn managed_package_all_rename_boundaries_are_durable_and_fail_closed() {
             artifact_root: package_dir.join("artifacts"),
             host_crates_root: package_dir.join("artifacts/rust"),
             manifest_path: package_dir.join("artifact-manifest.json"),
+            namespace: None,
         };
         if boundary == "afterJournalCleanup" {
             assert!(journals.is_empty());
-            let transaction = ManagedPackageTransaction::begin(&layout).unwrap();
-            let error = transaction.abort(anyhow::anyhow!(
-                "test-only afterJournalCleanup startup probe"
-            ));
-            assert!(error
-                .to_string()
-                .contains("test-only afterJournalCleanup startup probe"));
-            validate_managed_owner(&public, &parse_managed_owner(&public).unwrap()).unwrap();
         } else {
             assert!(!journals.is_empty(), "missing journal chain at {boundary}");
-            assert!(
-                ManagedPackageTransaction::begin(&layout).is_err(),
-                "next invocation crossed crash boundary {boundary}"
-            );
+        }
+
+        // A current committed terminal may be completed by the exact
+        // recovery engine before a new transaction starts.  Earlier or
+        // ambiguous terminals remain fail-closed.  Both outcomes are
+        // intentional; a successful retry must still be a controlled abort
+        // and leave the recovered owner valid.
+        match ManagedPackageTransaction::begin(&layout) {
+            Ok(transaction) => {
+                let error = transaction.abort(anyhow::anyhow!(
+                    "test-only {boundary} startup recovery probe"
+                ));
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("test-only {boundary} startup recovery probe")),
+                    "{boundary}: {error:#}"
+                );
+                if super::super::artifact_transaction::engine::path_entry_exists(&public).unwrap() {
+                    validate_managed_owner(&public, &parse_managed_owner(&public).unwrap())
+                        .unwrap();
+                }
+            }
+            Err(_) if boundary != "afterJournalCleanup" => {}
+            Err(error) => panic!("afterJournalCleanup recovery probe failed: {error:#}"),
         }
 
         let control = control.canonicalize_utf8().unwrap();
-        cleanup_exact_managed_test_case(&public, &[control], Some(producer_pid)).unwrap();
+        // Depending on the exact crash point the live final owner belongs to
+        // either the exited seed publisher or the exited crash publisher.
+        // Both are verified from their durable generation witnesses.
+        cleanup_exact_managed_test_case(&public, &[control], None).unwrap();
     }
 }
 
@@ -3819,7 +4951,7 @@ fn managed_package_guard_preserves_same_path_replacement() {
     use std::time::{Duration, Instant};
 
     let package_dir = unique_tmp_dir("managed-package-replacement");
-    write_test_manifest(&package_dir);
+    assert!(!package_dir.exists());
     let control = package_dir.parent().unwrap().join(format!(
         ".{}-replacement-control",
         package_dir.file_name().unwrap()
@@ -3917,29 +5049,37 @@ fn managed_package_guard_preserves_same_path_replacement() {
         "managed replacement test displaced original",
     )
     .unwrap();
-    let public_cleanup = capture_managed_test_directory(
-        &public,
-        std::slice::from_ref(latest.previous_root_identity.as_ref().unwrap()),
-        "managed replacement test public root",
-    )
-    .unwrap();
     let build = public.parent().unwrap().join(&latest.build_name);
     let control_cleanup = capture_unplanned_but_pid_bound_test_directory(
         &control,
         "managed replacement test synchronization root",
     )
     .unwrap();
-    let mut directories = vec![
-        public_cleanup,
-        replacement,
-        displaced_original,
-        control_cleanup,
-    ];
+    let mut directories = vec![replacement, displaced_original, control_cleanup];
+    if super::super::artifact_transaction::engine::path_entry_exists(&public).unwrap() {
+        let identity = latest
+            .previous_root_identity
+            .as_ref()
+            .or(latest.published_root_identity.as_ref())
+            .expect("present managed replacement public root has a journal identity");
+        directories.push(
+            capture_managed_test_directory(
+                &public,
+                std::slice::from_ref(identity),
+                "managed replacement test public root",
+            )
+            .unwrap(),
+        );
+    }
     if super::super::artifact_transaction::engine::path_entry_exists(&build).unwrap() {
+        let identity = latest
+            .build_root_identity
+            .as_ref()
+            .expect("present managed replacement build root has a journal identity");
         directories.push(
             capture_managed_test_directory(
                 &build,
-                std::slice::from_ref(latest.build_root_identity.as_ref().unwrap()),
+                std::slice::from_ref(identity),
                 "managed replacement test build root",
             )
             .unwrap(),
@@ -4046,7 +5186,8 @@ fn managed_layout_emits_entries_and_relative_manifest() {
         "manifest must not contain absolute package paths:\n{manifest_text}"
     );
     let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
-    assert_eq!(manifest["schemaVersion"], 3);
+    assert_eq!(manifest["artifactManifestSchemaVersion"], 3);
+    assert!(manifest.get("schemaVersion").is_none());
     assert_eq!(manifest["namespace"], "uni_core");
     assert_eq!(
         manifest["targets"],

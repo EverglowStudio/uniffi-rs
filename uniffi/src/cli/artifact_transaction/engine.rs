@@ -38,7 +38,6 @@ pub(in crate::cli) const TYPE_CACHE_OWNER_KIND: &str = "uniffi-ohos-type-cache";
 pub(in crate::cli) const TYPE_CACHE_WORK_MARKER: &str = ".uniffi-ohos-type-work-owner";
 pub(in crate::cli) const TYPE_CACHE_WORK_NEXT_MARKER: &str = ".uniffi-ohos-type-work-owner.next";
 pub(in crate::cli) const OWNED_TREE_SCHEMA_VERSION: u64 = 4;
-pub(in crate::cli) const OWNER_SCHEMA_VERSION: u64 = 2;
 pub(in crate::cli) const TYPE_WORK_SCHEMA_VERSION: u64 = 3;
 pub(in crate::cli) const MAX_HSP_ARCHIVE_ENTRIES: usize = 4_096;
 pub(in crate::cli) const MAX_EPHEMERAL_BUILD_ENTRIES: usize = 500_000;
@@ -772,6 +771,7 @@ pub(in crate::cli) struct OwnedTreeMarker {
     pub(in crate::cli) owner: String,
     pub(in crate::cli) schema_version: u64,
     pub(in crate::cli) generation: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) identity: Option<TypeCacheIdentity>,
     pub(in crate::cli) root_identity: PersistentFsIdentity,
     pub(in crate::cli) entries: Vec<OwnedTreeMarkerEntry>,
@@ -782,11 +782,12 @@ pub(in crate::cli) struct OwnedTreeMarker {
 pub(in crate::cli) struct OwnedTreeMarkerEntry {
     pub(crate) path: String,
     pub(crate) kind: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) sha256: Option<String>,
     pub(crate) identity: PersistentFsIdentity,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) link_target: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) resolved_target: Option<String>,
 }
 
@@ -1638,9 +1639,9 @@ pub(in crate::cli) struct TypeCacheIdentity {
     pub(in crate::cli) package_name: String,
     pub(in crate::cli) lib_target: String,
     pub(in crate::cli) host_composite_identity: String,
-    pub(in crate::cli) bundle_schema_version: u64,
+    pub(in crate::cli) host_bundle_schema_version: u64,
     pub(in crate::cli) bundle_fingerprint: String,
-    pub(in crate::cli) contract_abi_version: u64,
+    pub(in crate::cli) facade_contract_schema_version: u64,
     pub(in crate::cli) facade_mode: String,
 }
 
@@ -1914,17 +1915,16 @@ pub(in crate::cli) struct HspGenerationEntry {
     pub(crate) path: String,
     pub(crate) kind: String,
     pub(crate) identity: PersistentFsIdentity,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) len: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) sha256: Option<String>,
     pub(crate) inventory: Vec<OwnedTreeMarkerEntry>,
-    #[serde(default)]
     pub(crate) mutation_tokens: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) root_mutation_token: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) parent_mutation_token: Option<String>,
-    #[serde(default)]
     pub(crate) has_hsp_owner_markers: bool,
 }
 
@@ -1959,35 +1959,34 @@ pub(in crate::cli) struct DirectTransactionRecord {
     pub(in crate::cli) generation: String,
     pub(in crate::cli) sequence: u64,
     pub(in crate::cli) state: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) previous_record_name: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) previous_record_identity: Option<PersistentFsIdentity>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) previous_record_digest: Option<String>,
     pub(in crate::cli) final_owner_path: String,
     pub(in crate::cli) destinations: Vec<DirectDestinationRecord>,
-    #[serde(default)]
     pub(in crate::cli) anchor_witnesses: Vec<DurableRecordWitness>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) previous_owner_witness: Option<DurableRecordWitness>,
-    #[serde(default)]
     pub(in crate::cli) previous_entries: Vec<HspGenerationEntry>,
-    #[serde(default)]
     pub(in crate::cli) next_entries: Vec<HspGenerationEntry>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) mutation: Option<DirectMutationEvent>,
     /// Exact final-owner successor established by this transaction.  The
     /// normal commit path binds this to the registered new generation; a
     /// rollback/recovery rebind binds it to the refreshed previous generation.
     /// Terminal records repeat the complete witness so an anchor-free suffix
     /// remains independently auditable.
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) owner_successor: Option<DirectOwnerSuccessor>,
     /// Recovery-only plan for rebinding the previous owner.  This is repeated
     /// from the first typed recovery-owner event through the terminal record,
     /// making the candidate bytes and previous generation immutable before the
     /// replacement rename.
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) recovery_owner_generation: Option<String>,
-    #[serde(default)]
     pub(in crate::cli) recovery_owner_entries: Vec<HspGenerationEntry>,
 }
 
@@ -1999,7 +1998,9 @@ pub(in crate::cli) struct DirectMutationEvent {
     pub(in crate::cli) index: usize,
     pub(in crate::cli) source_path: String,
     pub(in crate::cli) destination_path: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) source_witness: Option<HspGenerationEntry>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) destination_witness: Option<HspGenerationEntry>,
 }
 
@@ -2020,13 +2021,10 @@ pub(in crate::cli) struct DirectAnchorRecord {
     pub(in crate::cli) plan_digest: String,
     pub(in crate::cli) generation: String,
     pub(in crate::cli) prepared_record: String,
-    #[serde(default)]
     pub(in crate::cli) final_owner_path: String,
-    #[serde(default)]
     pub(in crate::cli) destinations: Vec<DirectDestinationRecord>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) previous_owner_witness: Option<DurableRecordWitness>,
-    #[serde(default)]
     pub(in crate::cli) previous_entries: Vec<HspGenerationEntry>,
 }
 
@@ -11816,21 +11814,12 @@ pub(in crate::cli) fn validate_type_cache_transition(
         root,
         TYPE_CACHE_OWNER_MARKER,
         TYPE_CACHE_OWNER_KIND,
-        &[TYPE_CACHE_WORK_MARKER],
+        &[TYPE_CACHE_WORK_MARKER, TYPE_CACHE_WORK_NEXT_MARKER],
     )?;
     if snapshot.identity.as_ref() != Some(expected) {
         bail!("transitional OHOS type-cache identity mismatch in {root}");
     }
     Ok(snapshot)
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(in crate::cli) struct TypeWorkMarkerV2 {
-    pub(in crate::cli) owner: String,
-    pub(in crate::cli) schema_version: u64,
-    pub(in crate::cli) identity: TypeCacheIdentity,
-    pub(in crate::cli) entries: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -11840,12 +11829,30 @@ pub(in crate::cli) enum TypeWorkEntryState {
     Complete,
 }
 
+/// Deserialize a JSON key that is required even when its current value is
+/// allowed to be `null`.
+///
+/// Keeping the field type as `Option<T>` preserves the producer's explicit
+/// `null` serialization, while a custom field deserializer prevents Serde's
+/// bare-`Option` missing-key fallback from accepting a truncated current
+/// journal as that same `None` value.
+fn deserialize_required_nullable<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::cli) struct TypeWorkJournalEntry {
     pub(in crate::cli) path: String,
     pub(in crate::cli) kind: String,
     pub(in crate::cli) state: TypeWorkEntryState,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) sha256: Option<String>,
 }
 
@@ -11858,18 +11865,6 @@ pub(in crate::cli) struct TypeWorkMarkerV3 {
     pub(in crate::cli) revision: u64,
     pub(in crate::cli) identity: TypeCacheIdentity,
     pub(in crate::cli) entries: Vec<TypeWorkJournalEntry>,
-}
-
-#[derive(Debug)]
-pub(in crate::cli) enum TypeWorkMarkerVersion {
-    Legacy(TypeWorkMarkerV2),
-    Journal(TypeWorkMarkerV3),
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::cli) struct TypeWorkSchemaProbe {
-    pub(in crate::cli) schema_version: u64,
 }
 
 pub(in crate::cli) fn write_type_work_marker(
@@ -11907,41 +11902,22 @@ pub(in crate::cli) fn write_type_work_marker(
     Ok(())
 }
 
-pub(in crate::cli) fn parse_type_work_marker(bytes: &[u8]) -> Result<TypeWorkMarkerVersion> {
-    let probe: TypeWorkSchemaProbe = serde_json::from_slice(bytes)?;
-    match probe.schema_version {
-        OWNER_SCHEMA_VERSION => Ok(TypeWorkMarkerVersion::Legacy(serde_json::from_slice(
-            bytes,
-        )?)),
-        TYPE_WORK_SCHEMA_VERSION => Ok(TypeWorkMarkerVersion::Journal(serde_json::from_slice(
-            bytes,
-        )?)),
-        version => bail!("unsupported OHOS type-work marker schema {version}"),
+pub(in crate::cli) fn parse_type_work_marker(bytes: &[u8]) -> Result<TypeWorkMarkerV3> {
+    let raw: serde_json::Value =
+        serde_json::from_slice(bytes).context("parsing OHOS type-work marker JSON")?;
+    let version = raw.get("schemaVersion").and_then(serde_json::Value::as_u64);
+    if version != Some(TYPE_WORK_SCHEMA_VERSION) {
+        let got = match raw.get("schemaVersion") {
+            Some(value) => value.to_string(),
+            None => "missing".to_string(),
+        };
+        bail!(
+            "unsupported OHOS type-work marker schema {got}; expected {}",
+            TYPE_WORK_SCHEMA_VERSION
+        );
     }
-}
-
-pub(in crate::cli) fn validate_legacy_type_work_marker(
-    value: &TypeWorkMarkerV2,
-    work_dir: &Utf8Path,
-    identity: &TypeCacheIdentity,
-    expected_entries: &BTreeSet<String>,
-) -> Result<()> {
-    let marker_entries = value.entries.iter().cloned().collect::<BTreeSet<_>>();
-    if value.owner != "uniffi-ohos-type-work"
-        || value.schema_version != OWNER_SCHEMA_VERSION
-        || &value.identity != identity
-        || marker_entries.len() != value.entries.len()
-        || &marker_entries != expected_entries
-    {
-        bail!("refusing unowned OHOS type-cache work directory {work_dir}");
-    }
-    for entry in &value.entries {
-        validate_inventory_path(entry, TYPE_CACHE_WORK_MARKER)?;
-        if Utf8Path::new(entry).file_name() != Some(entry.as_str()) {
-            bail!("OHOS type-work inventory entries must be flat files: `{entry}`");
-        }
-    }
-    Ok(())
+    let value: TypeWorkMarkerV3 = serde_json::from_slice(bytes)?;
+    Ok(value)
 }
 
 pub(in crate::cli) fn validate_type_work_journal(
@@ -12055,11 +12031,30 @@ pub(in crate::cli) fn validate_actual_type_work_entries(
     marker: &TypeWorkMarkerV3,
 ) -> Result<BTreeMap<String, OwnedTreeEntry>> {
     let completed = type_work_completed_entries(marker);
-    let actual = collect_owned_tree_entries_ignoring(
-        work_dir,
-        TYPE_CACHE_WORK_MARKER,
-        &[TYPE_CACHE_WORK_NEXT_MARKER],
-    )?;
+    // A completed cache owner can coexist with the work journal only in the
+    // narrow marker-last publication window.  Prove that owner against its
+    // own exact inventory before ignoring it; a foreign file using the owner
+    // filename remains an unjournaled work payload and is never adopted.
+    let has_exact_transition_owner = if path_entry_exists(&work_dir.join(TYPE_CACHE_OWNER_MARKER))?
+    {
+        let owner = validate_owned_tree_ignoring(
+            work_dir,
+            TYPE_CACHE_OWNER_MARKER,
+            TYPE_CACHE_OWNER_KIND,
+            &[TYPE_CACHE_WORK_MARKER, TYPE_CACHE_WORK_NEXT_MARKER],
+        )?;
+        if owner.identity.as_ref() != Some(&marker.identity) {
+            bail!("transitional OHOS type-cache identity mismatch in {work_dir}");
+        }
+        true
+    } else {
+        false
+    };
+    let mut ignored = vec![TYPE_CACHE_WORK_NEXT_MARKER];
+    if has_exact_transition_owner {
+        ignored.push(TYPE_CACHE_OWNER_MARKER);
+    }
+    let actual = collect_owned_tree_entries_ignoring(work_dir, TYPE_CACHE_WORK_MARKER, &ignored)?;
     for (path, entry) in &actual {
         let content = (entry.kind.clone(), entry.sha256.clone());
         if completed.get(path) != Some(&content) {
@@ -12079,16 +12074,8 @@ pub(in crate::cli) fn recover_type_work_next_marker(
         return Ok(());
     }
     let current_path = work_dir.join(TYPE_CACHE_WORK_MARKER);
-    let current = match parse_type_work_marker(&read_verified_regular_file(&current_path)?)? {
-        TypeWorkMarkerVersion::Journal(value) => value,
-        TypeWorkMarkerVersion::Legacy(_) => {
-            bail!("legacy OHOS type-work marker cannot own a journal successor")
-        }
-    };
-    let next = match parse_type_work_marker(&read_verified_regular_file(&next_path)?)? {
-        TypeWorkMarkerVersion::Journal(value) => value,
-        TypeWorkMarkerVersion::Legacy(_) => bail!("OHOS type-work successor must use schema 3"),
-    };
+    let current = parse_type_work_marker(&read_verified_regular_file(&current_path)?)?;
+    let next = parse_type_work_marker(&read_verified_regular_file(&next_path)?)?;
     validate_type_work_journal(&current, work_dir, identity, expected_entries)?;
     validate_type_work_journal(&next, work_dir, identity, expected_entries)?;
     validate_journal_successor(&current, &next)?;
@@ -12102,20 +12089,164 @@ pub(in crate::cli) fn validate_type_work_marker(
     work_dir: &Utf8Path,
     identity: &TypeCacheIdentity,
     expected_entries: &BTreeSet<String>,
-) -> Result<TypeWorkMarkerVersion> {
+) -> Result<TypeWorkMarkerV3> {
     recover_type_work_next_marker(work_dir, identity, expected_entries)?;
     let path = work_dir.join(TYPE_CACHE_WORK_MARKER);
     let bytes = read_verified_regular_file(&path)?;
     let value = parse_type_work_marker(&bytes)?;
-    match &value {
-        TypeWorkMarkerVersion::Legacy(value) => {
-            validate_legacy_type_work_marker(value, work_dir, identity, expected_entries)?
-        }
-        TypeWorkMarkerVersion::Journal(value) => {
-            validate_type_work_journal(value, work_dir, identity, expected_entries)?
-        }
+    validate_type_work_journal(&value, work_dir, identity, expected_entries)?;
+    Ok(value)
+}
+
+/// Validate a persisted work journal without promoting a pending successor or
+/// otherwise changing the filesystem.  Startup performs this pass before it
+/// creates the cache root or acquires its output lock, then repeats it while
+/// locked before recovery is allowed to mutate a current journal.
+pub(in crate::cli) fn validate_type_work_marker_read_only(
+    work_dir: &Utf8Path,
+    identity: &TypeCacheIdentity,
+    expected_entries: &BTreeSet<String>,
+) -> Result<TypeWorkMarkerV3> {
+    let path = work_dir.join(TYPE_CACHE_WORK_MARKER);
+    let value = parse_type_work_marker(&read_verified_regular_file(&path)?)?;
+    validate_type_work_journal(&value, work_dir, identity, expected_entries)?;
+
+    let next_path = work_dir.join(TYPE_CACHE_WORK_NEXT_MARKER);
+    if path_entry_exists(&next_path)? {
+        let next = parse_type_work_marker(&read_verified_regular_file(&next_path)?)?;
+        validate_type_work_journal(&next, work_dir, identity, expected_entries)?;
+        validate_journal_successor(&value, &next)?;
+        validate_actual_type_work_entries(work_dir, &next)?;
+    } else {
+        validate_actual_type_work_entries(work_dir, &value)?;
     }
     Ok(value)
+}
+
+pub(in crate::cli) fn validate_type_cache_transition_read_only(
+    root: &Utf8Path,
+    expected: &TypeCacheIdentity,
+    expected_entries: &BTreeSet<String>,
+) -> Result<OwnedTreeSnapshot> {
+    validate_type_work_marker_read_only(root, expected, expected_entries)?;
+    let snapshot = validate_owned_tree_ignoring(
+        root,
+        TYPE_CACHE_OWNER_MARKER,
+        TYPE_CACHE_OWNER_KIND,
+        &[TYPE_CACHE_WORK_MARKER, TYPE_CACHE_WORK_NEXT_MARKER],
+    )?;
+    if snapshot.identity.as_ref() != Some(expected) {
+        bail!("transitional OHOS type-cache identity mismatch in {root}");
+    }
+    Ok(snapshot)
+}
+
+/// A cleanup-recovery residue may have already removed some entries from an
+/// otherwise exact current owner inventory.  It is safe to continue only when
+/// every surviving entry still matches that immutable inventory; this is not
+/// an adoption path for a markerless or foreign tree.
+pub(in crate::cli) fn validate_type_cache_residue_read_only(
+    root: &Utf8Path,
+    identity: &TypeCacheIdentity,
+    extra_ignored: &[&str],
+) -> Result<()> {
+    if validate_type_cache(root, identity).is_ok() {
+        return Ok(());
+    }
+    validate_partial_type_cache_residue_ignoring(root, identity, extra_ignored).with_context(
+        || format!("validating exact current OHOS type-cache cleanup residue {root}"),
+    )?;
+    Ok(())
+}
+
+pub(in crate::cli) fn preflight_type_work_residue(
+    path: &Utf8Path,
+    identity: &TypeCacheIdentity,
+    expected_entries: &BTreeSet<String>,
+) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading OHOS type-work residue {path}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("OHOS type-work residue must be a real directory: {path}");
+    }
+    let has_owner = path_entry_exists(&path.join(TYPE_CACHE_OWNER_MARKER))?;
+    let has_work = path_entry_exists(&path.join(TYPE_CACHE_WORK_MARKER))?;
+    match (has_owner, has_work) {
+        (true, true) => {
+            validate_type_cache_transition_read_only(path, identity, expected_entries)?;
+        }
+        (true, false) => {
+            validate_type_cache_residue_read_only(path, identity, &[])?;
+        }
+        (false, true) => {
+            validate_type_work_marker_read_only(path, identity, expected_entries)?;
+        }
+        (false, false) => {
+            bail!("refusing unowned OHOS type-work residue before mutation: {path}");
+        }
+    }
+    Ok(())
+}
+
+/// Read-only compatibility gate for every path that startup recovery could
+/// later remove, promote, or rename.  In particular schema-2 work markers are
+/// rejected in place, even when their payload is empty.
+pub(in crate::cli) fn preflight_type_cache_startup_inputs(
+    root: &Utf8Path,
+    stem: &str,
+    cache_dir: Option<&Utf8Path>,
+    identity: &TypeCacheIdentity,
+    expected_entries: &BTreeSet<String>,
+) -> Result<()> {
+    let root_metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading OHOS type cache root {root}"))
+        }
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!("OHOS type cache root must be a real directory: {root}");
+    }
+
+    if let Some(cache_dir) = cache_dir {
+        if path_entry_exists(cache_dir)? {
+            validate_type_cache(cache_dir, identity)?;
+        }
+    }
+
+    let fixed_work = root.join(format!(".{stem}.work"));
+    if path_entry_exists(&fixed_work)? {
+        preflight_type_work_residue(&fixed_work, identity, expected_entries)?;
+    }
+
+    let backup_prefix = format!(".{stem}.backup-");
+    let ephemeral_prefix = format!(".{stem}.work-");
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("reading OHOS type-cache startup residue root {root}"))?
+    {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("OHOS type-cache residue name is not UTF-8 in {root}"))?;
+        if !name.starts_with(&backup_prefix) && !name.starts_with(&ephemeral_prefix) {
+            continue;
+        }
+        let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+            anyhow::anyhow!(
+                "OHOS type-cache residue path is not UTF-8: {}",
+                path.display()
+            )
+        })?;
+        if name.starts_with(&backup_prefix) {
+            validate_type_cache_residue_read_only(&path, identity, &[])
+                .with_context(|| format!("preflighting OHOS type-cache backup {path}"))?;
+        } else {
+            preflight_type_work_residue(&path, identity, expected_entries)?;
+        }
+    }
+    Ok(())
 }
 
 pub(in crate::cli) fn durable_verified_file_sha256(path: &Utf8Path) -> Result<String> {
@@ -12187,12 +12318,7 @@ pub(in crate::cli) fn complete_type_work_file(
     expected_entries: &BTreeSet<String>,
     path: &str,
 ) -> Result<()> {
-    let marker = match validate_type_work_marker(work_dir, identity, expected_entries)? {
-        TypeWorkMarkerVersion::Journal(value) => value,
-        TypeWorkMarkerVersion::Legacy(_) => {
-            bail!("cannot update legacy OHOS type-work marker in {work_dir}")
-        }
-    };
+    let marker = validate_type_work_marker(work_dir, identity, expected_entries)?;
     let digest = durable_verified_file_sha256(&work_dir.join(path))?;
     let mut next = marker.clone();
     let entry = next
@@ -12223,12 +12349,7 @@ pub(in crate::cli) fn complete_type_work_file_from_marker(
     path: &str,
 ) -> Result<()> {
     let marker_path = work_dir.join(TYPE_CACHE_WORK_MARKER);
-    let marker = match parse_type_work_marker(&read_verified_regular_file(&marker_path)?)? {
-        TypeWorkMarkerVersion::Journal(value) => value,
-        TypeWorkMarkerVersion::Legacy(_) => {
-            bail!("cannot update legacy OHOS type-work marker in {work_dir}")
-        }
-    };
+    let marker = parse_type_work_marker(&read_verified_regular_file(&marker_path)?)?;
     let expected_entries = marker
         .entries
         .iter()
@@ -12243,9 +12364,12 @@ pub(in crate::cli) struct TypeCachePlan {
     pub(in crate::cli) identity: TypeCacheIdentity,
     pub(in crate::cli) work_entries: BTreeSet<String>,
     pub(in crate::cli) stem: String,
-    pub(in crate::cli) primary_entry: String,
+    /// Some older callers cached a raw primary declaration alongside the
+    /// typed sidecars.  Current exact-schema generation may intentionally
+    /// have no raw primary at all; that is not a cache miss or a reason to run
+    /// Cargo before the typed bundle is validated.
+    pub(in crate::cli) primary_entry: Option<String>,
     pub(in crate::cli) dts_cache: bool,
-    pub(in crate::cli) require_cached_primary: bool,
 }
 
 pub(in crate::cli) struct TypeCacheInitialization<'a> {
@@ -12286,13 +12410,32 @@ impl InvocationTypeCache {
             stem,
             primary_entry,
             dts_cache,
-            require_cached_primary,
         } = plan;
         let root = target_dir.join(TYPE_ROOT);
+        let cache_dir = dts_cache.then(|| root.join(&stem));
+        // Do not create a lock, cache root, work directory, or journal until
+        // every pre-existing residue is proven to use the exact current
+        // journal format.  This keeps incompatible schema-2 residue intact.
+        preflight_type_cache_startup_inputs(
+            &root,
+            &stem,
+            cache_dir.as_deref(),
+            &identity,
+            &work_entries,
+        )?;
         ensure_real_type_cache_directory(&root)?;
         let lock_path = root.join(format!(".{stem}.uniffi.lock"));
         let lock = OutputLock::acquire(&lock_path, "OHOS type cache")?;
-        let cache_dir = dts_cache.then(|| root.join(&stem));
+        // Repeat the exact same read-only validation under the output lock so
+        // a replacement between the first pass and lock acquisition cannot be
+        // adopted by recovery below.
+        preflight_type_cache_startup_inputs(
+            &root,
+            &stem,
+            cache_dir.as_deref(),
+            &identity,
+            &work_entries,
+        )?;
         // Cache mode deliberately uses a stable type-output path so Cargo can
         // be genuinely Fresh and the verified raw definitions can be copied
         // from the committed cache.  Non-cache mode owns no persistent raw
@@ -12332,11 +12475,14 @@ impl InvocationTypeCache {
         write_type_work_marker(&work_dir, &identity, &work_entries)?;
 
         let result = (|| -> Result<()> {
-            if let Some(cache_dir) = cache_dir.as_ref().filter(|_| previous.is_some()) {
-                let raw = cache_dir.join(&primary_entry);
+            if let (Some(cache_dir), Some(primary_entry)) = (
+                cache_dir.as_ref().filter(|_| previous.is_some()),
+                primary_entry.as_deref(),
+            ) {
+                let raw = cache_dir.join(primary_entry);
                 if raw.exists() {
                     let bytes = read_verified_regular_file(&raw)?;
-                    let destination = work_dir.join(&primary_entry);
+                    let destination = work_dir.join(primary_entry);
                     let mut output = OpenOptions::new()
                         .create_new(true)
                         .write(true)
@@ -12345,9 +12491,7 @@ impl InvocationTypeCache {
                         format!("copying cached OHOS native type definitions from {raw}")
                     })?;
                     output.sync_all()?;
-                    complete_type_work_file(&work_dir, &identity, &work_entries, &primary_entry)?;
-                } else if require_cached_primary {
-                    bail!("cached OHOS native type definitions are missing from {cache_dir}");
+                    complete_type_work_file(&work_dir, &identity, &work_entries, primary_entry)?;
                 }
             }
             initialize(&mut TypeCacheInitialization {
@@ -12379,17 +12523,6 @@ impl InvocationTypeCache {
             .expect("type cache work directory is available before commit")
     }
 
-    pub(in crate::cli) fn record_completed_entry(&self, path: &str) -> Result<()> {
-        complete_type_work_file(self.work_dir(), &self.identity, &self.work_entries, path)
-    }
-
-    pub(in crate::cli) fn record_completed_entry_if_present(&self, path: &str) -> Result<()> {
-        if path_entry_exists(&self.work_dir().join(path))? {
-            self.record_completed_entry(path)?;
-        }
-        Ok(())
-    }
-
     pub(in crate::cli) fn commit(&mut self) -> Result<()> {
         self.commit_with_cleanup_hook(|_| Ok(()))
     }
@@ -12407,13 +12540,7 @@ impl InvocationTypeCache {
             .work_dir
             .take()
             .context("OHOS type cache transaction was already committed")?;
-        let marker = match validate_type_work_marker(&work_dir, &self.identity, &self.work_entries)?
-        {
-            TypeWorkMarkerVersion::Journal(value) => value,
-            TypeWorkMarkerVersion::Legacy(_) => {
-                bail!("cannot commit legacy OHOS type-work marker in {work_dir}")
-            }
-        };
+        let marker = validate_type_work_marker(&work_dir, &self.identity, &self.work_entries)?;
         validate_actual_type_work_entries(&work_dir, &marker)?;
         // Persist the complete owner inventory before removing the work
         // marker. This deliberately avoids a crash window in which the tree
@@ -13534,14 +13661,8 @@ pub(in crate::cli) fn validate_work_marker_bytes_for_cleanup(
     identity: &TypeCacheIdentity,
     expected_entries: &BTreeSet<String>,
 ) -> Result<()> {
-    match parse_type_work_marker(bytes)? {
-        TypeWorkMarkerVersion::Legacy(value) => {
-            validate_legacy_type_work_marker(&value, root, identity, expected_entries)
-        }
-        TypeWorkMarkerVersion::Journal(value) => {
-            validate_type_work_journal(&value, root, identity, expected_entries)
-        }
-    }
+    let value = parse_type_work_marker(bytes)?;
+    validate_type_work_journal(&value, root, identity, expected_entries)
 }
 
 pub(in crate::cli) fn remove_type_work_marker_bound<B>(
@@ -13685,32 +13806,19 @@ where
 {
     let cleanup = TypeCleanupRoot::open(root)?;
     let marker = validate_type_work_marker(root, identity, expected_entries)?;
-    let declared = match marker {
-        TypeWorkMarkerVersion::Legacy(_) => {
-            let actual = collect_owned_tree_entries_ignoring(
-                root,
-                TYPE_CACHE_WORK_MARKER,
-                &[TYPE_CACHE_WORK_NEXT_MARKER],
-            )?;
-            if !actual.is_empty() {
-                bail!("legacy schema 2 OHOS type-work payload has no persistent content identity");
+    let declared = {
+        let completed = validate_actual_type_work_entries(root, &marker)?;
+        let actual = collect_owned_tree_entries_ignoring(
+            root,
+            TYPE_CACHE_WORK_MARKER,
+            &[TYPE_CACHE_WORK_NEXT_MARKER],
+        )?;
+        for (path, entry) in &actual {
+            if completed.get(path) != Some(entry) {
+                bail!("interrupted OHOS type work contains unjournaled entry `{path}`");
             }
-            BTreeMap::new()
         }
-        TypeWorkMarkerVersion::Journal(value) => {
-            let completed = validate_actual_type_work_entries(root, &value)?;
-            let actual = collect_owned_tree_entries_ignoring(
-                root,
-                TYPE_CACHE_WORK_MARKER,
-                &[TYPE_CACHE_WORK_NEXT_MARKER],
-            )?;
-            for (path, entry) in &actual {
-                if completed.get(path) != Some(entry) {
-                    bail!("interrupted OHOS type work contains unjournaled entry `{path}`");
-                }
-            }
-            completed
-        }
+        completed
     };
     remove_type_payload_entries(
         &cleanup,
@@ -13955,7 +14063,6 @@ where
     Ok(())
 }
 
-pub(in crate::cli) const MANAGED_PACKAGE_OWNER_FILE: &str = ".uniffi-managed-package-owner.json";
 pub(in crate::cli) const MANAGED_PACKAGE_OWNER_KIND: &str = "uniffi-managed-package";
 pub(in crate::cli) const MANAGED_PACKAGE_OWNER_SCHEMA_VERSION: u64 = 3;
 pub(in crate::cli) const MANAGED_PACKAGE_JOURNAL_KIND: &str = "uniffi-managed-package-transaction";
@@ -13965,6 +14072,14 @@ pub(in crate::cli) const MANAGED_PACKAGE_JOURNAL_SCHEMA_VERSION: u64 = 2;
 /// build-argument rebasing remain in the artifact orchestrator.
 pub(in crate::cli) trait ManagedTransactionLayout {
     fn package_root(&self) -> &Utf8Path;
+
+    /// Artifact-specific callers supply an exact, read-only validation of
+    /// their existing package metadata.  The transaction repeats this hook
+    /// after acquiring its lock, before it can write a journal or create a
+    /// candidate directory.
+    fn preflight_existing_package(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -13975,7 +14090,6 @@ pub(in crate::cli) struct ManagedPackageOwner {
     pub(in crate::cli) generation: String,
     pub(in crate::cli) state: String,
     pub(in crate::cli) root_identity: PersistentFsIdentity,
-    #[serde(default)]
     pub(in crate::cli) root_mutation_token: Option<String>,
     pub(in crate::cli) entries: Vec<HspGenerationEntry>,
 }
@@ -13988,8 +14102,11 @@ pub(in crate::cli) struct ManagedPackageJournal {
     pub(in crate::cli) package_identity: String,
     pub(in crate::cli) generation: String,
     pub(in crate::cli) sequence: u64,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) previous_record_name: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) previous_record_identity: Option<PersistentFsIdentity>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) previous_record_digest: Option<String>,
     pub(in crate::cli) state: String,
     pub(in crate::cli) public_root: String,
@@ -13997,18 +14114,23 @@ pub(in crate::cli) struct ManagedPackageJournal {
     pub(in crate::cli) build_name: String,
     pub(in crate::cli) backup_name: String,
     pub(in crate::cli) failed_name: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) previous_root_identity: Option<PersistentFsIdentity>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) candidate_root_identity: Option<PersistentFsIdentity>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) build_root_identity: Option<PersistentFsIdentity>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) backup_root_identity: Option<PersistentFsIdentity>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) published_root_identity: Option<PersistentFsIdentity>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) cleanup_snapshot_name: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) cleanup_snapshot_identity: Option<PersistentFsIdentity>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) cleanup_snapshot_digest: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(in crate::cli) cleanup_snapshot_len: Option<u64>,
 }
 
@@ -14333,10 +14455,6 @@ pub(in crate::cli) fn capture_managed_entries_with_budget(
     Ok(entries)
 }
 
-pub(in crate::cli) fn managed_embedded_owner_path(root: &Utf8Path) -> Utf8PathBuf {
-    root.join(MANAGED_PACKAGE_OWNER_FILE)
-}
-
 pub(in crate::cli) fn managed_owner_path(root: &Utf8Path) -> Utf8PathBuf {
     let stable_root = canonicalize_invocation_output(root).unwrap_or_else(|_| root.to_path_buf());
     let digest = managed_package_digest(&stable_root);
@@ -14346,29 +14464,29 @@ pub(in crate::cli) fn managed_owner_path(root: &Utf8Path) -> Utf8PathBuf {
         .join(format!(".uniffi-managed-package-owner-{digest}.json"))
 }
 
+#[cfg(test)]
 pub(in crate::cli) fn parse_managed_owner(root: &Utf8Path) -> Result<ManagedPackageOwner> {
     let sidecar = managed_owner_path(root);
-    let marker = if path_entry_exists(&sidecar)? {
-        sidecar
-    } else {
-        managed_embedded_owner_path(root)
-    };
     let bytes = read_verified_regular_file_bounded(
-        &marker,
+        &sidecar,
         16 * 1024 * 1024,
         "managed package owner record",
     )?;
-    let owner: ManagedPackageOwner = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing managed package owner record {marker}"))?;
+    parse_managed_owner_bytes(&bytes, &sidecar)
+}
+
+pub(in crate::cli) fn parse_managed_owner_bytes(
+    bytes: &[u8],
+    sidecar: &Utf8Path,
+) -> Result<ManagedPackageOwner> {
+    let owner: ManagedPackageOwner = serde_json::from_slice(bytes)
+        .with_context(|| format!("parsing managed package owner record {sidecar}"))?;
     if owner.owner != MANAGED_PACKAGE_OWNER_KIND
-        || !matches!(
-            owner.schema_version,
-            2 | MANAGED_PACKAGE_OWNER_SCHEMA_VERSION
-        )
+        || owner.schema_version != MANAGED_PACKAGE_OWNER_SCHEMA_VERSION
         || owner.generation.is_empty()
         || !matches!(owner.state.as_str(), "prepared" | "committed")
     {
-        bail!("unsupported managed package owner record: {marker}");
+        bail!("unsupported managed package owner record: {sidecar}");
     }
     Ok(owner)
 }
@@ -14397,11 +14515,12 @@ pub(in crate::cli) fn validate_managed_owner_with_budget(
     if persistent_fs_identity(root, true)? != owner.root_identity {
         bail!("managed package root identity changed: {root}");
     }
-    if owner.schema_version >= 3 {
-        let current_root_token = directory_mutation_token_for_owner(root)?;
-        if owner.root_mutation_token.as_deref() != Some(current_root_token.as_str()) {
-            bail!("managed package root mutation witness changed: {root}");
-        }
+    if owner.schema_version != MANAGED_PACKAGE_OWNER_SCHEMA_VERSION {
+        bail!("unsupported managed package owner schema in {root}");
+    }
+    let current_root_token = directory_mutation_token_for_owner(root)?;
+    if owner.root_mutation_token.as_deref() != Some(current_root_token.as_str()) {
+        bail!("managed package root mutation witness changed: {root}");
     }
     let mut actual_paths = BTreeSet::new();
     for (path, kind) in managed_controlled_paths(root) {
@@ -14430,55 +14549,9 @@ pub(in crate::cli) fn validate_managed_owner_with_budget(
         bail!("managed package controlled path set changed from its committed owner record");
     }
     for entry in &owner.entries {
-        if owner.schema_version >= 3 {
-            validate_hsp_generation_entry_with_budget(entry, Utf8Path::new(&entry.path), budget)
-                .context("validating managed package controlled entry")?;
-        } else {
-            validate_hsp_generation_entry_content_with_budget(
-                entry,
-                Utf8Path::new(&entry.path),
-                budget,
-            )
-            .context("validating legacy managed package controlled entry")?;
-        }
+        validate_hsp_generation_entry_with_budget(entry, Utf8Path::new(&entry.path), budget)
+            .context("validating managed package controlled entry")?;
     }
-    Ok(())
-}
-
-pub(in crate::cli) fn validate_legacy_managed_package_with_budget(
-    root: &Utf8Path,
-    budget: &mut TraversalBudget,
-) -> Result<()> {
-    let controlled = managed_controlled_paths(root)
-        .into_iter()
-        .map(|(path, kind)| Ok((path_entry_exists(&path)?, path, kind)))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(|(exists, path, kind)| exists.then_some((path, kind)))
-        .collect::<Vec<_>>();
-    if controlled.is_empty() {
-        return Ok(());
-    }
-    let manifest = root.join("artifact-manifest.json");
-    let bytes = read_verified_regular_file_bounded(
-        &manifest,
-        16 * 1024 * 1024,
-        "legacy managed artifact manifest",
-    )
-    .with_context(|| {
-        format!(
-            "refusing unowned managed controlled paths under {root}; a compatible artifact-manifest.json is required for one-time adoption"
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if !matches!(value["schemaVersion"].as_u64(), Some(2 | 3))
-        || value["generator"] != "uniffi-bindgen-javascript"
-    {
-        bail!("refusing incompatible legacy managed package at {root}");
-    }
-    // Capturing every controlled root proves it is bounded, regular and free
-    // of symlink/special-file sentinels before the one-time owner migration.
-    let _ = capture_managed_entries_with_budget(root, root, budget)?;
     Ok(())
 }
 
@@ -14966,6 +15039,103 @@ pub(in crate::cli) fn managed_crash_sync_point(label: &str) {
     std::process::abort();
 }
 
+/// Complete read-only startup evidence for a managed package generation.  It
+/// is deliberately captured before lock acquisition and then captured again
+/// while locked; only the second copy is used for publication.
+pub(in crate::cli) struct ManagedPackagePreflight {
+    pub(in crate::cli) public_root: Utf8PathBuf,
+    pub(in crate::cli) parent: Utf8PathBuf,
+    pub(in crate::cli) package_identity: String,
+    pub(in crate::cli) previous_owner: Option<ManagedPackageOwner>,
+    pub(in crate::cli) previous_owner_witness: Option<DurableRecordWitness>,
+    pub(in crate::cli) captured_root: Option<OwnedTreeSnapshot>,
+    pub(in crate::cli) previous_root_identity: Option<PersistentFsIdentity>,
+}
+
+/// Verify every already-existing managed input without creating a lock, a
+/// parent directory, a journal, or a candidate.  A package root is owned only
+/// by an exact current sidecar; an embedded/legacy owner or a markerless root
+/// is intentionally left in place and rejected.
+pub(in crate::cli) fn preflight_managed_package(
+    layout: &impl ManagedTransactionLayout,
+) -> Result<ManagedPackagePreflight> {
+    let requested_root = layout.package_root();
+    match std::fs::symlink_metadata(requested_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("managed package root must be a real directory: {requested_root}")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("preflighting managed package root"),
+    }
+    let public_root = canonicalize_invocation_output(requested_root)?;
+    let parent = public_root
+        .parent()
+        .context("managed package root has no parent")?
+        .to_path_buf();
+    match std::fs::symlink_metadata(&parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("managed package parent must be a real directory: {parent}")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading managed package parent {parent}"))
+        }
+    }
+    let package_identity = managed_package_digest(&public_root);
+    if path_entry_exists(&parent)? {
+        audit_managed_transaction_residue(&parent, &public_root, &package_identity)?;
+    }
+
+    let sidecar = managed_owner_path(&public_root);
+    let public_exists = path_entry_exists(&public_root)?;
+    let (previous_owner, previous_owner_witness, captured_root, previous_root_identity) =
+        if public_exists {
+            if !path_entry_exists(&sidecar)? {
+                bail!(
+                    "refusing unowned or legacy managed package root before mutation: {public_root}; exact current owner sidecar {sidecar} is required"
+                );
+            }
+            let mut budget = TraversalBudget::managed();
+            let (bytes, identity) = read_verified_regular_file_bounded_with_identity(
+                &sidecar,
+                16 * 1024 * 1024,
+                "managed package final owner sidecar",
+            )?;
+            let owner = parse_managed_owner_bytes(&bytes, &sidecar)?;
+            validate_managed_owner_with_budget(&public_root, &owner, &mut budget)?;
+            let captured = capture_directory_for_cleanup_with_budget(&public_root, &mut budget)?;
+            (
+                Some(owner),
+                Some(DurableRecordWitness {
+                    path: sidecar,
+                    identity,
+                    sha256: managed_record_digest(&bytes),
+                    len: bytes.len() as u64,
+                }),
+                Some(captured),
+                Some(persistent_fs_identity(&public_root, true)?),
+            )
+        } else {
+            if path_entry_exists(&sidecar)? {
+                bail!(
+                    "managed package final owner sidecar exists without its public root; preserving both for recovery: {sidecar}"
+                );
+            }
+            (None, None, None, None)
+        };
+    Ok(ManagedPackagePreflight {
+        public_root,
+        parent,
+        package_identity,
+        previous_owner,
+        previous_owner_witness,
+        captured_root,
+        previous_root_identity,
+    })
+}
+
 impl ManagedPackageTransaction {
     pub(in crate::cli) fn committed_error(
         &self,
@@ -15198,69 +15368,30 @@ impl ManagedPackageTransaction {
     }
 
     pub(in crate::cli) fn begin(layout: &impl ManagedTransactionLayout) -> Result<Self> {
-        let requested_root = layout.package_root();
-        match std::fs::symlink_metadata(requested_root) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                bail!("managed package root must be a real directory: {requested_root}")
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("preflighting managed package root"),
-        }
-        let public_root = canonicalize_invocation_output(requested_root)?;
+        // No output-lock, parent directory, journal, candidate, or rename is
+        // allowed until existing ownership and artifact inputs are exact.
+        let initial = preflight_managed_package(layout)?;
+        layout.preflight_existing_package()?;
         let locks = OutputLockSet::acquire(
-            std::slice::from_ref(&public_root),
+            std::slice::from_ref(&initial.public_root),
             "managed package root transaction",
         )?;
-        let parent = public_root
-            .parent()
-            .context("managed package root has no parent")?
-            .to_path_buf();
+        // Re-read the complete input set while locked.  The first pass only
+        // decides whether it is safe to acquire a lock; this pass supplies the
+        // identity-bound snapshots used below.
+        let startup = preflight_managed_package(layout)?;
+        layout.preflight_existing_package()?;
+        let ManagedPackagePreflight {
+            public_root,
+            parent,
+            package_identity,
+            previous_owner,
+            previous_owner_witness,
+            captured_root,
+            previous_root_identity,
+        } = startup;
         std::fs::create_dir_all(&parent)
             .with_context(|| format!("creating managed package parent {parent}"))?;
-        let package_identity = managed_package_digest(&public_root);
-        audit_managed_transaction_residue(&parent, &public_root, &package_identity)?;
-
-        let public_exists = path_entry_exists(&public_root)?;
-        let mut startup_budget = TraversalBudget::managed();
-        let (previous_owner, previous_owner_witness, captured_root) = if public_exists {
-            let sidecar = managed_owner_path(&public_root);
-            let embedded = managed_embedded_owner_path(&public_root);
-            let has_sidecar = path_entry_exists(&sidecar)?;
-            let previous_owner = if has_sidecar || path_entry_exists(&embedded)? {
-                let owner = parse_managed_owner(&public_root)?;
-                validate_managed_owner_with_budget(&public_root, &owner, &mut startup_budget)?;
-                Some(owner)
-            } else {
-                validate_legacy_managed_package_with_budget(&public_root, &mut startup_budget)?;
-                None
-            };
-            let previous_owner_witness = if has_sidecar {
-                let (bytes, identity) = read_verified_regular_file_bounded_with_identity(
-                    &sidecar,
-                    16 * 1024 * 1024,
-                    "managed package final owner sidecar",
-                )?;
-                Some(DurableRecordWitness {
-                    path: sidecar,
-                    identity,
-                    sha256: managed_record_digest(&bytes),
-                    len: bytes.len() as u64,
-                })
-            } else {
-                None
-            };
-            let captured =
-                capture_directory_for_cleanup_with_budget(&public_root, &mut startup_budget)?;
-            (previous_owner, previous_owner_witness, Some(captured))
-        } else {
-            (None, None, None)
-        };
-        let previous_root_identity = if public_exists {
-            Some(persistent_fs_identity(&public_root, true)?)
-        } else {
-            None
-        };
         let generation = new_managed_generation();
         let candidate_name =
             format!(".uniffi-managed-package-{package_identity}-{generation}-next");
@@ -15454,25 +15585,11 @@ impl ManagedPackageTransaction {
         for path in paths {
             self.private.remove_seeded_path(path, &mut budget)?;
         }
-        let copied_owner = managed_embedded_owner_path(&self.private_root);
-        if path_entry_exists(&copied_owner)? {
-            self.private
-                .remove_seeded_path(MANAGED_PACKAGE_OWNER_FILE, &mut budget)?;
-        }
         Ok(())
     }
 
     pub(in crate::cli) fn prepare_owner(&mut self) -> Result<ManagedPackageOwner> {
         let mut budget = TraversalBudget::managed();
-        let copied_owner = managed_embedded_owner_path(&self.private_root);
-        if path_entry_exists(&copied_owner)? {
-            remove_current_regular_file_for_cleanup_with_budget(
-                &copied_owner,
-                "copied managed owner",
-                &mut budget,
-            )
-            .with_context(|| format!("removing copied managed owner {copied_owner}"))?;
-        }
         let entries = capture_managed_entries_with_budget(
             &self.private_root,
             &self.public_root,
@@ -15503,10 +15620,6 @@ impl ManagedPackageTransaction {
         match (&self.previous_owner, &self.captured_root) {
             (Some(owner), Some(captured)) => {
                 validate_managed_owner_with_budget(&self.public_root, owner, budget)?;
-                validate_directory_capture_with_budget(&self.public_root, captured, budget)
-            }
-            (None, Some(captured)) => {
-                validate_legacy_managed_package_with_budget(&self.public_root, budget)?;
                 validate_directory_capture_with_budget(&self.public_root, captured, budget)
             }
             (None, None) if !path_entry_exists(&self.public_root)? => Ok(()),

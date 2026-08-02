@@ -188,7 +188,7 @@ impl<'a> Generator<'a> {
             struct __UniffiDuration(pub ::std::time::Duration);
 
             #[napi(object)]
-            pub struct __UniffiCallbackHandle {
+            pub struct UniffiCallbackHandle {
                 pub id: u32,
             }
 
@@ -2747,7 +2747,7 @@ impl<'a> Generator<'a> {
 
     fn callback_async_bridge_type(&self, ty: &Type) -> Result<TokenStream> {
         if callback_metadata::is_callback_return_type(ty) {
-            Ok(quote!(__UniffiCallbackHandle))
+            Ok(quote!(UniffiCallbackHandle))
         } else if callback_metadata::contains_callback_return_type(ty) {
             bail!(
                 "async callback methods returning nested callback traits/interfaces are not supported in the N-API/Electron backend yet"
@@ -3125,7 +3125,7 @@ impl<'a> Generator<'a> {
 
     fn callback_result_ident(&self, object: &Object, method: &Method) -> syn::Ident {
         format_ident!(
-            "__Uniffi{}{}CallbackResult",
+            "Uniffi{}{}CallbackResult",
             object.name(),
             method.name().to_upper_camel_case()
         )
@@ -3139,22 +3139,19 @@ impl<'a> Generator<'a> {
     }
 
     fn stream_next_struct_ident(&self, function: &Function) -> syn::Ident {
-        format_ident!(
-            "__Uniffi{}StreamNext",
-            function.name().to_upper_camel_case()
-        )
+        format_ident!("Uniffi{}StreamNext", function.name().to_upper_camel_case())
     }
 
     fn input_stream_next_result_ident(&self, ty: &Type) -> Result<syn::Ident> {
         Ok(format_ident!(
-            "__UniffiInputStream{}Next",
+            "UniffiInputStream{}Next",
             describe_input_stream_type(ty)?.suffix()
         ))
     }
 
     fn input_stream_ops_ident(&self, ty: &Type) -> Result<syn::Ident> {
         Ok(format_ident!(
-            "__UniffiInputStream{}Ops",
+            "UniffiInputStream{}Ops",
             describe_input_stream_type(ty)?.suffix()
         ))
     }
@@ -4446,7 +4443,7 @@ mod input_stream_descriptor_tests {
         let rust = render_napi_rust(&ci).unwrap();
         for descriptor in &descriptors {
             assert!(rust.contains(&format!(
-                "struct __UniffiInputStream{}Next",
+                "struct UniffiInputStream{}Next",
                 descriptor.suffix()
             )));
         }

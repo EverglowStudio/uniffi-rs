@@ -43,6 +43,27 @@ use crate::{callback_metadata, JsConfig};
 const RUNTIME_TS: &str =
     include_str!("../../../uniffi_runtime_javascript/typescript/src/runtime.ts");
 
+#[cfg(test)]
+mod runtime_abi_contract_tests {
+    use super::RUNTIME_TS;
+    use crate::JS_RUNTIME_ABI_VERSION;
+
+    #[test]
+    fn copied_runtime_uses_the_exact_rust_abi_constant_and_no_legacy_sentinel() {
+        assert!(
+            RUNTIME_TS.contains(&format!(
+                "const JS_RUNTIME_ABI_VERSION = {JS_RUNTIME_ABI_VERSION};"
+            )),
+            "copied runtime ABI constant drifted from the Rust generator"
+        );
+        assert!(
+            !RUNTIME_TS.contains("__uniffiAbiVersion")
+                && !RUNTIME_TS.contains("__UNIFFI_JS_ABI_VERSION"),
+            "copied runtime still accepts a legacy ABI sentinel"
+        );
+    }
+}
+
 pub fn emit(common_dir: &Utf8Path, component: &Component<JsConfig>) -> Result<()> {
     let ci = &component.ci;
     let config = &component.config;

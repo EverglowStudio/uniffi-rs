@@ -4,11 +4,8 @@ fn def(kind: &str, name: &str, definition: &str) -> TypeDefLine {
     TypeDefLine {
         kind: kind.to_string(),
         name: name.to_string(),
-        original_name: None,
         def: definition.to_string(),
-        js_doc: None,
-        js_mod: Some("__TOP_LEVEL_MODULE__".to_string()),
-        extends: None,
+        type_parameters: Vec::new(),
     }
 }
 
@@ -45,8 +42,12 @@ fn package_entry_reexports_raw_types_without_duplicating_value_classes() {
 fn package_entry_reexports_public_harmony_stream_interfaces() {
     let streams = HarmonyStreamFacade {
         contracts: vec![HarmonyFacadeContract {
-            schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+            facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
             component: "fixture".to_string(),
+            namespace: "fixture".to_string(),
+            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                "fixture",
+            ),
             output_streams: vec![HarmonyOutputStreamContract {
                 function: "items".to_string(),
                 next_function: "itemsStreamNext".to_string(),

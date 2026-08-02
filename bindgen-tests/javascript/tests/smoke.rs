@@ -62,7 +62,11 @@ fn emits_real_tree_for_all_flavors() {
         &std::fs::read(out_dir.join("harmony/arithmetical.ohos-facade.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(harmony_contract["schemaVersion"], 4);
+    assert_eq!(harmony_contract["facadeContractSchemaVersion"], 4);
+    assert_eq!(harmony_contract["component"], "arithmetical");
+    assert_eq!(harmony_contract["namespace"], "arithmetic");
+    assert_eq!(harmony_contract["nativeExportPrefix"], "ffi_arithmetical");
+    assert!(harmony_contract.get("schemaVersion").is_none());
     assert!(harmony_contract["outputStreams"]
         .as_array()
         .unwrap()
@@ -159,7 +163,9 @@ fn emits_real_tree_for_all_flavors() {
     );
 
     let runtime = std::fs::read_to_string(out_dir.join("common/runtime.ts")).unwrap();
-    assert!(runtime.contains("const __UNIFFI_JS_ABI_VERSION = 2"));
+    assert!(runtime.contains("const JS_RUNTIME_ABI_VERSION = 2"));
+    assert!(runtime.contains("__uniffiJsRuntimeAbiVersion"));
+    assert!(runtime.contains("jsRuntimeAbiVersion"));
     assert!(runtime.contains("class UniffiError"));
     assert!(runtime.contains("class UniffiObjectHandle"));
     assert!(runtime.contains("function toU64"));
@@ -303,7 +309,7 @@ import { add, sub, div, equal } from "./common/api.ts";
 import { ArithmeticError } from "./common/errors.ts";
 
 __installBackend({
-    __uniffiAbiVersion: 2,
+    __uniffiJsRuntimeAbiVersion: 2,
     add(a, b) {
         // The generator lowers u64 args via toU64 into bigint.
         // Return a bigint — the high-level contract is bigint-first.

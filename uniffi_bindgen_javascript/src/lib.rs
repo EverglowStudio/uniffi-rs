@@ -38,6 +38,10 @@ pub mod host_crates;
 pub mod js_names;
 pub mod name_map;
 
+/// Exact internal ABI spoken by the generated JavaScript runtime and every
+/// generated backend adapter. This is deliberately not a public binding API.
+pub(crate) const JS_RUNTIME_ABI_VERSION: u32 = 2;
+
 pub use host_crates::HostCrateOptions;
 
 /// Which low-level ABI flavor a generated backend speaks.
@@ -423,22 +427,22 @@ fn relative_path_from_dir(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {
 /// Empty for now; add fields here only when they are part of the
 /// supported long-term JavaScript target configuration surface.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JsConfig {
-    #[serde(alias = "custom_types", alias = "customTypes")]
+    #[serde(default)]
     pub custom_types: BTreeMap<String, CustomTypeConfig>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CustomTypeConfig {
+    #[serde(default)]
     pub imports: Vec<String>,
-    #[serde(alias = "type_name")]
+    #[serde(default)]
     pub type_name: Option<String>,
-    #[serde(alias = "lift")]
+    #[serde(default)]
     pub into_custom: String,
-    #[serde(alias = "lower")]
+    #[serde(default)]
     pub from_custom: String,
 }
 
@@ -451,6 +455,7 @@ struct RootConfig {
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct BindingsConfig {
+    #[serde(default)]
     javascript: JsConfig,
 }
 
@@ -510,6 +515,87 @@ fn merge_toml(into: &mut toml::Value, from: toml::Value) {
             }
         }
         (into, from) => *into = from,
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::JsConfig;
+
+    fn parse(input: &str) -> anyhow::Result<JsConfig> {
+        JsConfig::from_root_toml(toml::from_str(input)?)
+    }
+
+    #[test]
+    fn javascript_config_accepts_only_the_canonical_custom_type_shape() {
+        let config = parse(
+            r#"
+                [bindings.javascript.customTypes.MyType]
+                typeName = "MyType"
+                imports = []
+                intoCustom = "{}"
+                fromCustom = "{}"
+            "#,
+        )
+        .unwrap();
+
+        let custom = config.custom_type("MyType").unwrap();
+        assert_eq!(custom.public_type("Fallback"), "MyType");
+        assert_eq!(custom.into_custom_expr("value"), "value");
+        assert_eq!(custom.from_custom_expr("value"), "value");
+    }
+
+    #[test]
+    fn javascript_config_rejects_legacy_aliases_and_unknown_subtree_fields() {
+        for (label, input) in [
+            ("custom_types", "[bindings.javascript]\ncustom_types = {}\n"),
+            (
+                "type_name",
+                "[bindings.javascript.customTypes.MyType]\ntype_name = \"MyType\"\n",
+            ),
+            (
+                "into_custom",
+                "[bindings.javascript.customTypes.MyType]\ninto_custom = \"{}\"\n",
+            ),
+            (
+                "from_custom",
+                "[bindings.javascript.customTypes.MyType]\nfrom_custom = \"{}\"\n",
+            ),
+            (
+                "lift",
+                "[bindings.javascript.customTypes.MyType]\nlift = \"{}\"\n",
+            ),
+            (
+                "lower",
+                "[bindings.javascript.customTypes.MyType]\nlower = \"{}\"\n",
+            ),
+            (
+                "unknown javascript field",
+                "[bindings.javascript]\nunknown = true\n",
+            ),
+            (
+                "unknown custom type field",
+                "[bindings.javascript.customTypes.MyType]\nunknown = true\n",
+            ),
+        ] {
+            let error = parse(input).unwrap_err().to_string();
+            assert!(
+                error.contains(label.split(' ').next().unwrap()),
+                "{label} must be rejected with a useful parse error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_config_remains_optional_and_does_not_reject_other_bindings() {
+        assert!(parse("[bindings.swift]\nmoduleName = \"Example\"\n")
+            .unwrap()
+            .custom_types
+            .is_empty());
+        assert!(parse("[bindings.kotlin]\npackageName = \"example\"\n")
+            .unwrap()
+            .custom_types
+            .is_empty());
     }
 }
 

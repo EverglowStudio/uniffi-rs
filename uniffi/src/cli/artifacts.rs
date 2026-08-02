@@ -11,7 +11,8 @@ use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::MetadataCommand;
 use clap::{Args, Subcommand, ValueEnum};
-use std::collections::BTreeSet;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -341,12 +342,897 @@ pub(super) struct ManagedLayout {
     pub(super) artifact_root: Utf8PathBuf,
     host_crates_root: Utf8PathBuf,
     pub(super) manifest_path: Utf8PathBuf,
+    /// Only test-only transaction fixtures may omit this value. Production
+    /// managed layouts always supply it so existing manifests are validated
+    /// as complete generated artifact packages before a transaction starts.
+    namespace: Option<String>,
 }
 
 impl ManagedTransactionLayout for ManagedLayout {
     fn package_root(&self) -> &Utf8Path {
         &self.package_dir
     }
+
+    fn preflight_existing_package(&self) -> Result<()> {
+        self.namespace
+            .as_deref()
+            .map(|namespace| validate_existing_managed_manifest(self, namespace))
+            .transpose()?
+            .unwrap_or(());
+        Ok(())
+    }
+}
+
+/// A nullable field that must still be present in the serialized manifest.
+/// `Option<T>` would silently accept a missing key, which is an old-schema
+/// compatibility path rather than a legitimate target-specific absence.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ManifestNullable<T> {
+    Value(T),
+    // A unit variant is serde's exact JSON `null` representation.  Keeping
+    // this distinct from `Option<T>` preserves the surrounding struct's
+    // required-key check: omitted fields remain a schema error.
+    Null,
+}
+
+impl<T> ManifestNullable<T> {
+    fn is_value(&self) -> bool {
+        matches!(self, Self::Value(_))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifest {
+    artifact_manifest_schema_version: u64,
+    generator: String,
+    namespace: String,
+    targets: Vec<String>,
+    source: ManagedArtifactManifestSource,
+    entrypoints: ManagedArtifactManifestEntrypoints,
+    artifacts: ManagedArtifactManifestArtifacts,
+    host_crates: ManagedArtifactManifestHostCrates,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestSource {
+    root: String,
+    common: ManifestNullable<String>,
+    browser: ManifestNullable<String>,
+    node: ManifestNullable<String>,
+    electron: ManifestNullable<String>,
+    harmony: ManifestNullable<String>,
+    swift: ManifestNullable<String>,
+    kotlin: ManifestNullable<String>,
+    public_types: ManifestNullable<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestEntrypoints {
+    web: ManifestNullable<String>,
+    mini_program: ManifestNullable<String>,
+    node: ManifestNullable<String>,
+    electron: ManifestNullable<String>,
+    harmony: ManifestNullable<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestArtifacts {
+    wasm: ManifestNullable<ManagedArtifactManifestWasm>,
+    mini_program: ManifestNullable<ManagedArtifactManifestMiniProgram>,
+    node: ManifestNullable<ManagedArtifactManifestAddon>,
+    electron: ManifestNullable<ManagedArtifactManifestAddon>,
+    harmony: ManifestNullable<ManagedArtifactManifestHarmony>,
+    apple: ManifestNullable<ManagedArtifactManifestApple>,
+    android: ManifestNullable<ManagedArtifactManifestAndroid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestWasm {
+    glue: String,
+    wasm: String,
+    dts: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestMiniProgram {
+    glue: String,
+    wasm: String,
+    default_wasm_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestAddon {
+    addon: String,
+    env: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmony {
+    kind: String,
+    integrated: bool,
+    har: ManifestNullable<String>,
+    runtime_hsp: ManifestNullable<String>,
+    interface_har: ManifestNullable<String>,
+    tgz: ManifestNullable<String>,
+    dist: String,
+    facade: String,
+    facade_contract: String,
+    package_facade_contract: ManifestNullable<String>,
+    types: String,
+    package: ManifestNullable<String>,
+    module_project: ManifestNullable<String>,
+    module_source: ManifestNullable<String>,
+    usage: ManifestNullable<String>,
+    package_metadata: ManifestNullable<String>,
+    module_metadata: ManifestNullable<String>,
+    build_profile: ManifestNullable<String>,
+    metadata: ManifestNullable<ManagedArtifactManifestHarmonyMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ManagedArtifactManifestHarmonyMetadata {
+    // `render_oh_package_json5` / `render_build_profile_json5` write this
+    // complete staged shape during a real Harmony package publication.
+    Staged(ManagedArtifactManifestHarmonyStagedMetadata),
+    // `render_manifest_with_read_roots` also has a no-staged-package fallback
+    // used before Harmony package files exist.  It is a distinct current
+    // producer shape, not a permissive legacy fallback.
+    Fallback(ManagedArtifactManifestHarmonyFallbackMetadata),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyStagedMetadata {
+    package: ManagedArtifactManifestHarmonyStagedPackageMetadata,
+    module: ManagedArtifactManifestHarmonyModuleMetadata,
+    build_profile: ManagedArtifactManifestHarmonyStagedBuildProfile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyFallbackMetadata {
+    package: ManagedArtifactManifestHarmonyFallbackPackageMetadata,
+    module: ManagedArtifactManifestHarmonyModuleMetadata,
+    build_profile: ManagedArtifactManifestHarmonyFallbackBuildProfile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyStagedPackageMetadata {
+    name: String,
+    version: String,
+    main: String,
+    types: String,
+    #[serde(rename = "packageType")]
+    package_type: Option<String>,
+    description: Option<String>,
+    author: Option<String>,
+    license: Option<String>,
+    dependencies: BTreeMap<String, String>,
+    compatible_sdk_version: Option<String>,
+    compatible_sdk_type: Option<String>,
+    native_components: Option<Vec<ManagedArtifactManifestHarmonyNativeComponent>>,
+    obfuscated: bool,
+    artifact_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyFallbackPackageMetadata {
+    name: String,
+    version: String,
+    main: String,
+    #[serde(rename = "packageType")]
+    package_type: Option<String>,
+    description: Option<String>,
+    author: Option<String>,
+    license: Option<String>,
+    compatible_sdk_version: Option<String>,
+    compatible_sdk_type: Option<String>,
+    obfuscated: bool,
+    artifact_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyNativeComponent {
+    name: String,
+    compatible_sdk_version: String,
+    compatible_sdk_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyModuleMetadata {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    device_types: Vec<String>,
+    delivery_with_install: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyFallbackBuildProfile {
+    api_type: String,
+    build_option: Option<ManagedArtifactManifestHarmonyFallbackBuildOption>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyFallbackBuildOption {
+    generate_shared_tgz: Option<bool>,
+    native_lib: Option<ManagedArtifactManifestHarmonyNativeLib>,
+    ark_options: Option<ManagedArtifactManifestHarmonyArkOptions>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyStagedBuildProfile {
+    api_type: String,
+    build_option: ManagedArtifactManifestHarmonyStagedBuildOption,
+    targets: Vec<ManagedArtifactManifestHarmonyBuildTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyStagedBuildOption {
+    res_options: ManagedArtifactManifestHarmonyResOptions,
+    generate_shared_tgz: Option<bool>,
+    native_lib: Option<ManagedArtifactManifestHarmonyNativeLib>,
+    ark_options: Option<ManagedArtifactManifestHarmonyArkOptions>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyResOptions {
+    copy_code_resource: ManagedArtifactManifestHarmonyCopyCodeResource,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyCopyCodeResource {
+    enable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyBuildTarget {
+    name: String,
+    config: ManagedArtifactManifestHarmonyBuildTargetConfig,
+    // The generated Harmony profile spells its acronym as `runtimeOS`, not
+    // serde's default `runtimeOs` camel-case conversion.
+    #[serde(rename = "runtimeOS")]
+    runtime_os: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyBuildTargetConfig {
+    device_type: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyNativeLib {
+    exclude_so_from_interface_har: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHarmonyArkOptions {
+    integrated_hsp: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestApple {
+    xcframework: String,
+    package: String,
+    product: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestAndroid {
+    jni_libs: String,
+    aar: ManifestNullable<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestHostCrates {
+    wasm: ManifestNullable<String>,
+    napi: ManifestNullable<String>,
+    ohos: ManifestNullable<String>,
+}
+
+const ARTIFACT_MANIFEST_SCHEMA_VERSION: u64 = 3;
+
+fn artifact_manifest_version_diagnostic(value: &serde_json::Value) -> String {
+    match value.get("artifactManifestSchemaVersion") {
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        Some(serde_json::Value::String(value)) => format!("`{value}`"),
+        Some(_) => "a non-integer value".to_string(),
+        None => "missing".to_string(),
+    }
+}
+
+fn validate_manifest_relative_path(path: &str, label: &str) -> Result<()> {
+    let path = Utf8Path::new(path);
+    if path.as_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component.as_str(), "" | "." | ".."))
+    {
+        bail!("managed artifact manifest `{label}` has an unsafe path `{path}`");
+    }
+    Ok(())
+}
+
+fn validate_manifest_nullable_path(value: &ManifestNullable<String>, label: &str) -> Result<()> {
+    if let ManifestNullable::Value(path) = value {
+        validate_manifest_relative_path(path, label)?;
+    }
+    Ok(())
+}
+
+fn validate_manifest_harmony_metadata(
+    value: &ManifestNullable<ManagedArtifactManifestHarmonyMetadata>,
+    kind: &str,
+    integrated: bool,
+) -> Result<()> {
+    let ManifestNullable::Value(value) = value else {
+        return Ok(());
+    };
+    let validate_package = |name: &str,
+                            version: &str,
+                            main: &str,
+                            package_type: Option<&str>,
+                            description: Option<&str>,
+                            author: Option<&str>,
+                            license: Option<&str>,
+                            compatible_sdk_version: Option<&str>,
+                            compatible_sdk_type: Option<&str>,
+                            artifact_type: &str|
+     -> Result<()> {
+        if name.is_empty()
+            || version.is_empty()
+            || main.is_empty()
+            || artifact_type.is_empty()
+            || package_type.is_some_and(str::is_empty)
+            || description.is_some_and(str::is_empty)
+            || author.is_some_and(str::is_empty)
+            || license.is_some_and(str::is_empty)
+            || compatible_sdk_version.is_some_and(str::is_empty)
+            || compatible_sdk_type.is_some_and(str::is_empty)
+            || compatible_sdk_version.is_some() != compatible_sdk_type.is_some()
+        {
+            bail!("managed artifact manifest Harmony package metadata is invalid");
+        }
+        Ok(())
+    };
+    let validate_module = |module: &ManagedArtifactManifestHarmonyModuleMetadata| -> Result<()> {
+        if module.name.is_empty()
+            || module.kind.is_empty()
+            || module.device_types.is_empty()
+            || module.device_types.iter().any(|value| value.is_empty())
+        {
+            bail!("managed artifact manifest Harmony module metadata is invalid");
+        }
+        Ok(())
+    };
+    let validate_fallback_option = |option: &ManagedArtifactManifestHarmonyFallbackBuildOption| {
+        if let Some(native) = &option.native_lib {
+            let _ = native.exclude_so_from_interface_har;
+        }
+        if let Some(ark) = &option.ark_options {
+            let _ = ark.integrated_hsp;
+        }
+        let _ = option.generate_shared_tgz;
+    };
+
+    match value {
+        ManagedArtifactManifestHarmonyMetadata::Fallback(value) => {
+            let package = &value.package;
+            validate_package(
+                &package.name,
+                &package.version,
+                &package.main,
+                package.package_type.as_deref(),
+                package.description.as_deref(),
+                package.author.as_deref(),
+                package.license.as_deref(),
+                package.compatible_sdk_version.as_deref(),
+                package.compatible_sdk_type.as_deref(),
+                &package.artifact_type,
+            )?;
+            validate_module(&value.module)?;
+            if value.build_profile.api_type.is_empty() {
+                bail!("managed artifact manifest Harmony fallback build profile is invalid");
+            }
+            if let Some(option) = &value.build_profile.build_option {
+                validate_fallback_option(option);
+            }
+            validate_harmony_metadata_target_shape(
+                &package.package_type,
+                &value.module,
+                value.build_profile.build_option.as_ref().map(|option| {
+                    (
+                        option.generate_shared_tgz,
+                        option.ark_options.as_ref().map(|ark| ark.integrated_hsp),
+                    )
+                }),
+                kind,
+                integrated,
+            )?;
+            let _ = package.obfuscated;
+            let _ = value.module.delivery_with_install;
+        }
+        ManagedArtifactManifestHarmonyMetadata::Staged(value) => {
+            let package = &value.package;
+            validate_package(
+                &package.name,
+                &package.version,
+                &package.main,
+                package.package_type.as_deref(),
+                package.description.as_deref(),
+                package.author.as_deref(),
+                package.license.as_deref(),
+                package.compatible_sdk_version.as_deref(),
+                package.compatible_sdk_type.as_deref(),
+                &package.artifact_type,
+            )?;
+            if package.types.is_empty()
+                || package.dependencies.is_empty()
+                || package
+                    .dependencies
+                    .iter()
+                    .any(|(name, path)| name.is_empty() || path.is_empty())
+                || package.compatible_sdk_version.is_some() != package.native_components.is_some()
+            {
+                bail!("managed artifact manifest staged Harmony package metadata is invalid");
+            }
+            if let Some(components) = &package.native_components {
+                if components.is_empty()
+                    || components.iter().any(|component| {
+                        component.name.is_empty()
+                            || component.compatible_sdk_version.is_empty()
+                            || component.compatible_sdk_type.is_empty()
+                    })
+                {
+                    bail!("managed artifact manifest staged Harmony native components are invalid");
+                }
+            }
+            validate_module(&value.module)?;
+            let profile = &value.build_profile;
+            if profile.api_type.is_empty()
+                || profile.targets.is_empty()
+                || profile.targets.iter().any(|target| {
+                    target.name.is_empty()
+                        || target.config.device_type.is_empty()
+                        || target
+                            .config
+                            .device_type
+                            .iter()
+                            .any(|device| device.is_empty())
+                        || target.runtime_os.as_deref().is_some_and(str::is_empty)
+                })
+            {
+                bail!("managed artifact manifest staged Harmony build profile is invalid");
+            }
+            let option = &profile.build_option;
+            let _ = option.res_options.copy_code_resource.enable;
+            if let Some(native) = &option.native_lib {
+                let _ = native.exclude_so_from_interface_har;
+            }
+            if let Some(ark) = &option.ark_options {
+                let _ = ark.integrated_hsp;
+            }
+            let _ = option.generate_shared_tgz;
+            validate_harmony_metadata_target_shape(
+                &package.package_type,
+                &value.module,
+                Some((
+                    option.generate_shared_tgz,
+                    option.ark_options.as_ref().map(|ark| ark.integrated_hsp),
+                )),
+                kind,
+                integrated,
+            )?;
+            let _ = package.obfuscated;
+            let _ = value.module.delivery_with_install;
+        }
+    }
+    Ok(())
+}
+
+fn validate_harmony_metadata_target_shape(
+    package_type: &Option<String>,
+    module: &ManagedArtifactManifestHarmonyModuleMetadata,
+    build_flags: Option<(Option<bool>, Option<bool>)>,
+    kind: &str,
+    integrated: bool,
+) -> Result<()> {
+    let hsp = kind == "hsp";
+    let har = kind == "har";
+    if !hsp && !har {
+        bail!("managed artifact manifest has Harmony metadata for a non-package target");
+    }
+    let expected_package_type = hsp.then_some("InterfaceHar");
+    let expected_module_kind = if hsp { "shared" } else { "har" };
+    if package_type.as_deref() != expected_package_type
+        || module.kind != expected_module_kind
+        || module.delivery_with_install != hsp.then_some(true)
+    {
+        bail!("managed artifact manifest Harmony metadata does not match its target kind");
+    }
+    match (hsp, build_flags) {
+        (true, Some((Some(true), ark_integrated)))
+            if ark_integrated == integrated.then_some(true) => {}
+        (false, Some((None, None))) | (false, None) => {}
+        _ => {
+            bail!("managed artifact manifest Harmony build metadata does not match its target kind")
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_harmony_artifact_shape(value: &ManagedArtifactManifestHarmony) -> Result<()> {
+    let exact_presence = |actual: bool, expected: bool, label: &str| -> Result<()> {
+        if actual != expected {
+            bail!(
+                "managed artifact manifest Harmony field `{label}` does not match its target kind"
+            );
+        }
+        Ok(())
+    };
+    let hsp = value.kind == "hsp";
+    let har = value.kind == "har";
+    let package = hsp || har;
+    exact_presence(value.har.is_value(), har, "har")?;
+    exact_presence(value.runtime_hsp.is_value(), hsp, "runtimeHsp")?;
+    exact_presence(value.interface_har.is_value(), hsp, "interfaceHar")?;
+    exact_presence(value.tgz.is_value(), hsp, "tgz")?;
+    exact_presence(
+        value.package_facade_contract.is_value(),
+        package,
+        "packageFacadeContract",
+    )?;
+    exact_presence(value.package.is_value(), package, "package")?;
+    exact_presence(value.module_project.is_value(), hsp, "moduleProject")?;
+    exact_presence(value.module_source.is_value(), hsp, "moduleSource")?;
+    exact_presence(value.usage.is_value(), hsp, "usage")?;
+    exact_presence(
+        value.package_metadata.is_value(),
+        package,
+        "packageMetadata",
+    )?;
+    exact_presence(value.module_metadata.is_value(), package, "moduleMetadata")?;
+    exact_presence(value.build_profile.is_value(), package, "buildProfile")?;
+    exact_presence(value.metadata.is_value(), package, "metadata")?;
+    validate_manifest_harmony_metadata(&value.metadata, &value.kind, value.integrated)
+}
+
+fn validate_exact_managed_artifact_manifest(
+    manifest: &ManagedArtifactManifest,
+    expected_namespace: &str,
+) -> Result<()> {
+    if manifest.artifact_manifest_schema_version != ARTIFACT_MANIFEST_SCHEMA_VERSION {
+        bail!(
+            "managed artifact manifest schema mismatch: expected {}, got {}",
+            ARTIFACT_MANIFEST_SCHEMA_VERSION,
+            manifest.artifact_manifest_schema_version
+        );
+    }
+    if manifest.generator != "uniffi-bindgen-javascript" {
+        bail!("managed artifact manifest has an unexpected generator");
+    }
+    if manifest.namespace != expected_namespace {
+        bail!(
+            "managed artifact manifest namespace mismatch: expected `{expected_namespace}`, got `{}`",
+            manifest.namespace
+        );
+    }
+    validate_manifest_relative_path(&manifest.source.root, "source.root")?;
+    for (label, value) in [
+        ("source.common", &manifest.source.common),
+        ("source.browser", &manifest.source.browser),
+        ("source.node", &manifest.source.node),
+        ("source.electron", &manifest.source.electron),
+        ("source.harmony", &manifest.source.harmony),
+        ("source.swift", &manifest.source.swift),
+        ("source.kotlin", &manifest.source.kotlin),
+        ("source.publicTypes", &manifest.source.public_types),
+        ("entrypoints.web", &manifest.entrypoints.web),
+        (
+            "entrypoints.miniProgram",
+            &manifest.entrypoints.mini_program,
+        ),
+        ("entrypoints.node", &manifest.entrypoints.node),
+        ("entrypoints.electron", &manifest.entrypoints.electron),
+        ("entrypoints.harmony", &manifest.entrypoints.harmony),
+        ("hostCrates.wasm", &manifest.host_crates.wasm),
+        ("hostCrates.napi", &manifest.host_crates.napi),
+        ("hostCrates.ohos", &manifest.host_crates.ohos),
+    ] {
+        validate_manifest_nullable_path(value, label)?;
+    }
+    match &manifest.artifacts.wasm {
+        ManifestNullable::Value(value) => {
+            validate_manifest_relative_path(&value.glue, "artifacts.wasm.glue")?;
+            validate_manifest_relative_path(&value.wasm, "artifacts.wasm.wasm")?;
+            validate_manifest_relative_path(&value.dts, "artifacts.wasm.dts")?;
+        }
+        ManifestNullable::Null => {}
+    }
+    match &manifest.artifacts.mini_program {
+        ManifestNullable::Value(value) => {
+            validate_manifest_relative_path(&value.glue, "artifacts.miniProgram.glue")?;
+            validate_manifest_relative_path(&value.wasm, "artifacts.miniProgram.wasm")?;
+            if !value.default_wasm_path.starts_with('/') || value.default_wasm_path.contains("..") {
+                bail!("managed artifact manifest Mini Program default wasm path is invalid");
+            }
+        }
+        ManifestNullable::Null => {}
+    }
+    for (label, value) in [
+        ("artifacts.node", &manifest.artifacts.node),
+        ("artifacts.electron", &manifest.artifacts.electron),
+    ] {
+        if let ManifestNullable::Value(value) = value {
+            validate_manifest_relative_path(&value.addon, label)?;
+            if value.env.is_empty() {
+                bail!("managed artifact manifest `{label}` has an empty environment key");
+            }
+        }
+    }
+    if let ManifestNullable::Value(value) = &manifest.artifacts.harmony {
+        if !matches!(value.kind.as_str(), "dist" | "har" | "hsp")
+            || (value.integrated && value.kind != "hsp")
+        {
+            bail!("managed artifact manifest Harmony artifact kind is invalid");
+        }
+        validate_manifest_relative_path(&value.dist, "artifacts.harmony.dist")?;
+        validate_manifest_relative_path(&value.facade, "artifacts.harmony.facade")?;
+        validate_manifest_relative_path(
+            &value.facade_contract,
+            "artifacts.harmony.facadeContract",
+        )?;
+        validate_manifest_relative_path(&value.types, "artifacts.harmony.types")?;
+        for (label, value) in [
+            ("artifacts.harmony.har", &value.har),
+            ("artifacts.harmony.runtimeHsp", &value.runtime_hsp),
+            ("artifacts.harmony.interfaceHar", &value.interface_har),
+            ("artifacts.harmony.tgz", &value.tgz),
+            (
+                "artifacts.harmony.packageFacadeContract",
+                &value.package_facade_contract,
+            ),
+            ("artifacts.harmony.package", &value.package),
+            ("artifacts.harmony.moduleProject", &value.module_project),
+            ("artifacts.harmony.moduleSource", &value.module_source),
+            ("artifacts.harmony.usage", &value.usage),
+            ("artifacts.harmony.packageMetadata", &value.package_metadata),
+            ("artifacts.harmony.moduleMetadata", &value.module_metadata),
+            ("artifacts.harmony.buildProfile", &value.build_profile),
+        ] {
+            validate_manifest_nullable_path(value, label)?;
+        }
+        validate_manifest_harmony_artifact_shape(value)?;
+    }
+    if let ManifestNullable::Value(value) = &manifest.artifacts.apple {
+        validate_manifest_relative_path(&value.xcframework, "artifacts.apple.xcframework")?;
+        validate_manifest_relative_path(&value.package, "artifacts.apple.package")?;
+        if value.product.is_empty() {
+            bail!("managed artifact manifest Apple product is empty");
+        }
+    }
+    if let ManifestNullable::Value(value) = &manifest.artifacts.android {
+        validate_manifest_relative_path(&value.jni_libs, "artifacts.android.jniLibs")?;
+        validate_manifest_nullable_path(&value.aar, "artifacts.android.aar")?;
+    }
+
+    let canonical_targets = [
+        "wasm",
+        "mini-program",
+        "node",
+        "electron",
+        "harmony",
+        "apple",
+        "android",
+    ];
+    let targets = manifest
+        .targets
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if targets.len() != manifest.targets.len()
+        || manifest
+            .targets
+            .iter()
+            .any(|target| !canonical_targets.contains(&target.as_str()))
+        || manifest.targets
+            != canonical_targets
+                .into_iter()
+                .filter(|target| targets.contains(target))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+    {
+        bail!("managed artifact manifest targets are invalid or non-canonical");
+    }
+    let has = |target| targets.contains(target);
+    let has_js =
+        has("wasm") || has("mini-program") || has("node") || has("electron") || has("harmony");
+    let exact_presence = |actual: bool, expected: bool, label: &str| -> Result<()> {
+        if actual != expected {
+            bail!(
+                "managed artifact manifest target section `{label}` is inconsistent with targets"
+            );
+        }
+        Ok(())
+    };
+    exact_presence(manifest.source.common.is_value(), has_js, "source.common")?;
+    exact_presence(
+        manifest.source.public_types.is_value(),
+        has_js,
+        "source.publicTypes",
+    )?;
+    exact_presence(
+        manifest.source.browser.is_value(),
+        has("wasm") || has("mini-program"),
+        "source.browser",
+    )?;
+    exact_presence(manifest.source.node.is_value(), has("node"), "source.node")?;
+    exact_presence(
+        manifest.source.electron.is_value(),
+        has("electron"),
+        "source.electron",
+    )?;
+    exact_presence(
+        manifest.source.harmony.is_value(),
+        has("harmony"),
+        "source.harmony",
+    )?;
+    exact_presence(
+        manifest.source.swift.is_value(),
+        has("apple"),
+        "source.swift",
+    )?;
+    exact_presence(
+        manifest.source.kotlin.is_value(),
+        has("android"),
+        "source.kotlin",
+    )?;
+    exact_presence(
+        manifest.entrypoints.web.is_value(),
+        has("wasm"),
+        "entrypoints.web",
+    )?;
+    exact_presence(
+        manifest.entrypoints.mini_program.is_value(),
+        has("mini-program"),
+        "entrypoints.miniProgram",
+    )?;
+    exact_presence(
+        manifest.entrypoints.node.is_value(),
+        has("node"),
+        "entrypoints.node",
+    )?;
+    exact_presence(
+        manifest.entrypoints.electron.is_value(),
+        has("electron"),
+        "entrypoints.electron",
+    )?;
+    exact_presence(
+        manifest.entrypoints.harmony.is_value(),
+        has("harmony"),
+        "entrypoints.harmony",
+    )?;
+    exact_presence(
+        manifest.artifacts.wasm.is_value(),
+        has("wasm"),
+        "artifacts.wasm",
+    )?;
+    exact_presence(
+        manifest.artifacts.mini_program.is_value(),
+        has("mini-program"),
+        "artifacts.miniProgram",
+    )?;
+    exact_presence(
+        manifest.artifacts.node.is_value(),
+        has("node"),
+        "artifacts.node",
+    )?;
+    exact_presence(
+        manifest.artifacts.electron.is_value(),
+        has("electron"),
+        "artifacts.electron",
+    )?;
+    exact_presence(
+        manifest.artifacts.harmony.is_value(),
+        has("harmony"),
+        "artifacts.harmony",
+    )?;
+    exact_presence(
+        manifest.artifacts.apple.is_value(),
+        has("apple"),
+        "artifacts.apple",
+    )?;
+    exact_presence(
+        manifest.artifacts.android.is_value(),
+        has("android"),
+        "artifacts.android",
+    )?;
+    exact_presence(
+        manifest.host_crates.wasm.is_value(),
+        has("wasm") || has("mini-program"),
+        "hostCrates.wasm",
+    )?;
+    exact_presence(
+        manifest.host_crates.napi.is_value(),
+        has("node") || has("electron"),
+        "hostCrates.napi",
+    )?;
+    exact_presence(
+        manifest.host_crates.ohos.is_value(),
+        has("harmony"),
+        "hostCrates.ohos",
+    )?;
+    Ok(())
+}
+
+fn parse_exact_managed_artifact_manifest(
+    bytes: &[u8],
+    expected_namespace: &str,
+    label: &str,
+) -> Result<(ManagedArtifactManifest, serde_json::Value)> {
+    let raw: serde_json::Value =
+        serde_json::from_slice(bytes).with_context(|| format!("parsing {label}"))?;
+    if raw
+        .get("artifactManifestSchemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(ARTIFACT_MANIFEST_SCHEMA_VERSION)
+    {
+        bail!(
+            "{label} schema mismatch: expected {}, got {}",
+            ARTIFACT_MANIFEST_SCHEMA_VERSION,
+            artifact_manifest_version_diagnostic(&raw)
+        );
+    }
+    let typed: ManagedArtifactManifest =
+        serde_json::from_slice(bytes).with_context(|| format!("parsing exact {label}"))?;
+    validate_exact_managed_artifact_manifest(&typed, expected_namespace)?;
+    Ok((typed, raw))
+}
+
+fn validate_existing_managed_manifest(layout: &ManagedLayout, namespace: &str) -> Result<()> {
+    if !path_entry_exists(&layout.package_dir)? {
+        return Ok(());
+    }
+    let bytes = super::artifact_transaction::read_verified_regular_file_bounded(
+        &layout.manifest_path,
+        16 * 1024 * 1024,
+        "existing managed artifact manifest",
+    )?;
+    let (_, raw) = parse_exact_managed_artifact_manifest(
+        &bytes,
+        namespace,
+        "existing managed artifact manifest",
+    )?;
+    validate_managed_manifest_paths(layout, &raw)?;
+    Ok(())
 }
 
 fn managed_private_args(
@@ -483,6 +1369,12 @@ impl InvocationMirror {
 }
 
 impl ManagedLayout {
+    fn exact_namespace(&self) -> Result<&str> {
+        self.namespace
+            .as_deref()
+            .context("managed artifact layout lacks its exact namespace")
+    }
+
     pub(super) fn rebased(&self, from: &Utf8Path, to: &Utf8Path) -> Result<Self> {
         let rebase = |path: &Utf8Path| -> Result<Utf8PathBuf> {
             Ok(to
@@ -496,6 +1388,7 @@ impl ManagedLayout {
             artifact_root: rebase(&self.artifact_root)?,
             host_crates_root: rebase(&self.host_crates_root)?,
             manifest_path: rebase(&self.manifest_path)?,
+            namespace: self.namespace.clone(),
         })
     }
 
@@ -506,6 +1399,7 @@ impl ManagedLayout {
             artifact_root: mirror.map(&self.artifact_root)?,
             host_crates_root: mirror.map(&self.host_crates_root)?,
             manifest_path: mirror.map(&self.manifest_path)?,
+            namespace: self.namespace.clone(),
         })
     }
 
@@ -622,6 +1516,7 @@ impl ManagedLayout {
             artifact_root,
             host_crates_root,
             manifest_path,
+            namespace: Some(meta.lib_target_name),
         }))
     }
 
@@ -859,7 +1754,7 @@ node_modules/\n\
             serde_json::Value::Null
         };
         let manifest = serde_json::json!({
-            "schemaVersion": 3,
+            "artifactManifestSchemaVersion": ARTIFACT_MANIFEST_SCHEMA_VERSION,
             "generator": "uniffi-bindgen-javascript",
             "namespace": namespace,
             "targets": self.manifest_targets(targets),
@@ -954,6 +1849,12 @@ node_modules/\n\
             },
         });
         let manifest = self.merge_existing_manifest(manifest)?;
+        let bytes = serde_json::to_vec(&manifest)?;
+        parse_exact_managed_artifact_manifest(
+            &bytes,
+            self.exact_namespace()?,
+            "managed artifact manifest candidate",
+        )?;
         let text = serde_json::to_string_pretty(&manifest)?;
         Ok(format!("{text}\n"))
     }
@@ -1078,15 +1979,11 @@ node_modules/\n\
 
         let existing_text = std::fs::read_to_string(&self.manifest_path)
             .with_context(|| format!("reading managed artifact manifest {}", self.manifest_path))?;
-        let existing: serde_json::Value = serde_json::from_str(&existing_text)
-            .with_context(|| format!("parsing managed artifact manifest {}", self.manifest_path))?;
-
-        let compatible = existing.get("schemaVersion") == manifest.get("schemaVersion")
-            && existing.get("generator") == manifest.get("generator")
-            && existing.get("namespace") == manifest.get("namespace");
-        if !compatible {
-            return Ok(manifest);
-        }
+        let (_, existing) = parse_exact_managed_artifact_manifest(
+            existing_text.as_bytes(),
+            self.exact_namespace()?,
+            "existing managed artifact manifest",
+        )?;
 
         let current_targets = manifest
             .get("targets")
@@ -2017,26 +2914,42 @@ fn validate_managed_manifest_candidate(layout: &ManagedLayout, cargo_bin: &str) 
         16 * 1024 * 1024,
         "managed artifact manifest candidate",
     )?;
-    let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if manifest["schemaVersion"] != 3 || manifest["generator"] != "uniffi-bindgen-javascript" {
-        bail!("managed artifact manifest candidate has an unsupported schema");
-    }
-    let targets = manifest["targets"]
-        .as_array()
-        .context("managed manifest targets must be an array")?;
-    let mut unique = BTreeSet::new();
-    for target in targets {
-        let target = target
-            .as_str()
-            .context("managed manifest target must be a string")?;
-        if !matches!(
-            target,
-            "wasm" | "mini-program" | "node" | "electron" | "harmony" | "apple" | "android"
-        ) || !unique.insert(target)
-        {
-            bail!("managed manifest has an invalid or duplicate target `{target}`");
+    let (_, manifest) = parse_exact_managed_artifact_manifest(
+        &bytes,
+        layout.exact_namespace()?,
+        "managed artifact manifest candidate",
+    )?;
+    let host_crates = validate_managed_manifest_paths(layout, &manifest)?;
+    for manifest_path in host_crates.into_iter().flatten() {
+        let output = Command::new(cargo_bin)
+            .args([
+                "metadata",
+                "--format-version=1",
+                "--no-deps",
+                "--manifest-path",
+            ])
+            .arg(&manifest_path)
+            .output()
+            .with_context(|| format!("running Cargo metadata for managed host {manifest_path}"))?;
+        if !output.status.success() {
+            bail!(
+                "managed host Cargo metadata failed for {manifest_path}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
+    Ok(())
+}
+
+/// Validate every path used by a manifest without invoking Cargo.  This is
+/// shared by existing-package preflight and the post-build candidate check;
+/// callers that need host metadata execute it only after this exact parser and
+/// filesystem validation succeed.
+fn validate_managed_manifest_paths(
+    layout: &ManagedLayout,
+    manifest: &serde_json::Value,
+) -> Result<Vec<Option<Utf8PathBuf>>> {
     let canonical_root = layout.package_dir.canonicalize_utf8()?;
     let validate_path = |pointer: &str, directory: bool| -> Result<Option<Utf8PathBuf>> {
         let value = manifest
@@ -2120,30 +3033,10 @@ fn validate_managed_manifest_candidate(layout: &ManagedLayout, cargo_bin: &str) 
     ] {
         validate_path(pointer, false)?;
     }
-    for pointer in ["/hostCrates/wasm", "/hostCrates/napi", "/hostCrates/ohos"] {
-        if let Some(manifest_path) = validate_path(pointer, false)? {
-            let output = Command::new(cargo_bin)
-                .args([
-                    "metadata",
-                    "--format-version=1",
-                    "--no-deps",
-                    "--manifest-path",
-                ])
-                .arg(&manifest_path)
-                .output()
-                .with_context(|| {
-                    format!("running Cargo metadata for managed host {manifest_path}")
-                })?;
-            if !output.status.success() {
-                bail!(
-                    "managed host Cargo metadata failed for {manifest_path}: {}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-    }
-    Ok(())
+    ["/hostCrates/wasm", "/hostCrates/napi", "/hostCrates/ohos"]
+        .into_iter()
+        .map(|pointer| validate_path(pointer, false))
+        .collect()
 }
 
 fn build_private_target_set(args: &BuildArgs, targets: &ExpandedTargets) -> Result<()> {
@@ -2220,7 +3113,27 @@ fn build(mut args: BuildArgs) -> Result<()> {
     if targets.mini_program && args.wasm_bindgen_target != WasmBindgenTargetArg::Web {
         bail!("--target mini-program requires --wasm-bindgen-target web");
     }
+
+    // Managed HSP derives its public layout without touching the filesystem so
+    // existing ownership, residue, and manifest evidence can fail closed
+    // before frontend tool probing creates an invocation root.
+    let mut managed_layout = if args.managed_layout
+        && targets.harmony
+        && args.ohos_package_kind == super::ohos::PackageKind::Hsp
+    {
+        ManagedLayout::apply(&mut args, &targets)?
+    } else {
+        None
+    };
     if targets.harmony {
+        if let Some(layout) = managed_layout.as_ref() {
+            preflight_managed_package(layout).context(
+                "preflighting existing managed package owner and transaction residue before Harmony HSP tools",
+            )?;
+            layout.preflight_existing_package().context(
+                "preflighting existing managed artifact manifest before Harmony HSP tools",
+            )?;
+        }
         super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
             package_kind: args.ohos_package_kind,
             integrated_hsp: args.ohos_integrated_hsp,
@@ -2239,9 +3152,11 @@ fn build(mut args: BuildArgs) -> Result<()> {
             ohpm: args.ohos_ohpm.as_deref(),
             deveco_sdk_home: args.ohos_deveco_sdk_home.as_deref(),
         })
-        .context("preflighting Harmony HSP before managed layout or target generation")?;
+        .context("preflighting Harmony HSP before target generation")?;
     }
-    let managed_layout = ManagedLayout::apply(&mut args, &targets)?;
+    if managed_layout.is_none() {
+        managed_layout = ManagedLayout::apply(&mut args, &targets)?;
+    }
     if let Some(layout) = managed_layout {
         return build_managed_package(args, targets, layout);
     }

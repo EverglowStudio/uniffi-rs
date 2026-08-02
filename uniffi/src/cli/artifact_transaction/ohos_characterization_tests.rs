@@ -3079,7 +3079,7 @@ fn write_fake_dist(root: &Utf8Path, lib_target_name: &str) -> Utf8PathBuf {
         .unwrap();
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"schemaVersion\":4,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"hspFacadeAggregateSchemaVersion\":1,\"components\":[],\"componentIdentities\":[],\"hostCompositeIdentity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outputStreams\":[],\"inputStreams\":[]}",
     )
     .unwrap();
     std::fs::write(dist.join("arm64-v8a").join(native), "fake").unwrap();
@@ -3106,7 +3106,7 @@ fn write_invocation_dist(dist: &Utf8Path, arches: &[&str], with_native: bool) ->
         )?;
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"schemaVersion\":4,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"hspFacadeAggregateSchemaVersion\":1,\"components\":[],\"componentIdentities\":[],\"hostCompositeIdentity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outputStreams\":[],\"inputStreams\":[]}",
     )?;
     if with_native {
         for arch in arches {
@@ -3306,6 +3306,63 @@ fn ohos_env_uses_target_wrapper_without_overriding_cargo_rustflags() {
     assert!(envs.vars["OPENCV_CLANG_ARGS"].contains("native/sysroot/usr/lib/aarch64-linux-ohos"));
 
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn strict_type_def_compatibility_feature_compiles_without_upstream_raw_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let crate_dir = temp.path().join("strict_type_def_compatibility");
+    let source_dir = crate_dir.join("src");
+    let poison_dir = temp.path().join("upstream-type-def-poison");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::create_dir_all(&poison_dir).unwrap();
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        r#"[package]
+name = "uniffi-ohos-type-def-env-clean"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi-ohos = { version = "1.1.6", default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive-ohos = { version = "1.1.6", default-features = false, features = ["strict", "type-def"] }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        source_dir.join("lib.rs"),
+        r#"use napi_derive_ohos::napi;
+
+#[napi]
+pub fn answer() -> u32 {
+    42
+}
+"#,
+    )
+    .unwrap();
+
+    let mut command = std::process::Command::new(env!("CARGO"));
+    command
+        .args(["check", "--manifest-path"])
+        .arg(crate_dir.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", temp.path().join("target"))
+        .env("NAPI_TYPE_DEF_TMP_FOLDER", &poison_dir)
+        .env("TYPE_DEF_TMP_PATH", "poisoned-upstream-type-def-path");
+    suppress_ohos_upstream_type_def_output(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "strict + type-def compatibility crate failed to compile:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        std::fs::read_dir(&poison_dir).unwrap().next().is_none(),
+        "upstream napi type-def producer wrote raw output despite explicit environment removal"
+    );
 }
 
 #[test]
@@ -4409,7 +4466,7 @@ fn skip_libs_disables_artifact_copy() {
 
 #[test]
 fn renders_type_defs_from_ohos_json_lines() {
-    let json = r#"type_def:{"kind":"fn","name":"add","def":"function add(a: number): number;","js_doc":null,"js_mod":null}"#;
+    let json = r#"type_def:{"kind":"fn","name":"add","def":"function add(a: number): number;","typeParameters":[]}"#;
     let def = parse_type_def_line(json).unwrap().unwrap();
     let rendered = render_index_d_ts(vec![def]);
     assert!(rendered.contains("export declare function add(a: number): number;"));
@@ -4418,44 +4475,36 @@ fn renders_type_defs_from_ohos_json_lines() {
 
 #[test]
 fn ohos_type_renderer_rewrites_only_buffer_type_tokens() {
-    let def = |kind: &str, name: &str, body: &str, js_doc: Option<&str>| TypeDefLine {
+    let def = |kind: &str, name: &str, body: &str| TypeDefLine {
         kind: kind.into(),
         name: name.into(),
-        original_name: None,
         def: body.into(),
-        js_doc: js_doc.map(Into::into),
-        js_mod: None,
-        extends: None,
+        type_parameters: Vec::new(),
     };
     let defs = vec![
         def(
             "interface",
             "BufferPool",
             "Buffer: Buffer\nBufferPool: BufferPool\nqualified: Custom.Buffer\nliteral: \"Buffer\"",
-            Some("/** unknown napi:: .node Buffer */\n"),
         ),
         def(
             "fn",
             "napi_service",
             "function napi_service(Buffer: Buffer, BufferPool: BufferPool, qualified: Custom.Buffer): Buffer;",
-            None,
         ),
         def(
-            "enum",
+            "string_enum",
             "napi_ohos_bridge",
-            "Buffer = 0, BufferPool = 1",
-            None,
+            "Buffer = 'Buffer', BufferPool = 'BufferPool'",
         ),
         def(
             "type",
             "runtime_unknown_value",
             "{ payload: Buffer, literal: \"Buffer\", qualified: Custom.Buffer }",
-            None,
         ),
     ];
 
     let rendered = render_index_d_ts(defs);
-    assert!(rendered.contains("/** unknown napi:: .node Buffer */"));
     assert!(rendered.contains("export interface BufferPool"));
     assert!(rendered.contains("Buffer: ArrayBuffer"));
     assert!(rendered.contains("BufferPool: BufferPool"));
@@ -4464,14 +4513,13 @@ fn ohos_type_renderer_rewrites_only_buffer_type_tokens() {
     assert!(rendered.contains(
         "export declare function napi_service(Buffer: ArrayBuffer, BufferPool: BufferPool, qualified: Custom.Buffer): ArrayBuffer;"
     ));
-    assert!(rendered.contains("export declare const enum napi_ohos_bridge"));
-    assert!(rendered.contains("Buffer = 0, BufferPool = 1"));
+    assert!(rendered.contains("export type napi_ohos_bridge = 'Buffer' | 'BufferPool';"));
     assert!(rendered.contains("payload: ArrayBuffer"));
 }
 
 #[test]
 fn renders_ohos_string_enum_as_literal_union() {
-    let json = r#"type_def:{"kind":"string_enum","name":"LocalAiBackend","def":"Auto = 'Auto',\n Onnx = 'Onnx',\n Mlx = 'Mlx'","js_doc":null,"js_mod":null}"#;
+    let json = r#"type_def:{"kind":"string_enum","name":"LocalAiBackend","def":"Auto = 'Auto',\n Onnx = 'Onnx',\n Mlx = 'Mlx'","typeParameters":[]}"#;
     let def = parse_type_def_line(json).unwrap().unwrap();
     let rendered = render_index_d_ts(vec![def]);
 
@@ -4480,12 +4528,48 @@ fn renders_ohos_string_enum_as_literal_union() {
 }
 
 #[test]
-fn preserves_original_napi_type_names_as_public_aliases() {
-    let json = r#"type_def:{"kind":"interface","name":"UniffiOutputStreamStep","original_name":"__UniffiOutputStreamStep","def":"kind: string\\nvalue?: string\\nerror?: string","js_doc":null,"js_mod":null}"#;
-    let def = parse_type_def_line(json).unwrap().unwrap();
-    let rendered = render_index_d_ts(vec![def]);
-    assert!(rendered.contains("export interface UniffiOutputStreamStep"));
-    assert!(rendered.contains("export type __UniffiOutputStreamStep = UniffiOutputStreamStep;"));
+fn rejects_legacy_original_napi_type_name_aliases() {
+    let json = r#"type_def:{"kind":"interface","name":"UniffiOutputStreamStep","original_name":"__UniffiOutputStreamStep","def":"kind: string\\nvalue?: string\\nerror?: string","typeParameters":[]}"#;
+    let error = format!("{:#}", parse_type_def_line(json).unwrap_err());
+    assert!(error.contains("unknown field `original_name`"), "{error}");
+}
+
+#[test]
+fn rejects_noncanonical_ohos_type_kind_and_type_parameters() {
+    let cases = [
+        (
+            r#"type_def:{"kind":"enum","name":"LegacyEnum","def":"Value = 0","typeParameters":[]}"#,
+            "unknown variant `enum`",
+        ),
+        (
+            r#"type_def:{"kind":"interface","name":"MissingParameters","def":"value: string"}"#,
+            "missing field `typeParameters`",
+        ),
+        (
+            r#"type_def:{"kind":"interface","name":"UniffiInputStream","def":"value: string","typeParameters":[]}"#,
+            "exact typeParameters",
+        ),
+        (
+            r#"type_def:{"kind":"interface","name":"UniffiInputStream","def":"value: string","typeParameters":["T","U"]}"#,
+            "exact typeParameters",
+        ),
+        (
+            r#"type_def:{"kind":"interface","name":"UniffiInputStream","def":"value: string","typeParameters":["T","T"]}"#,
+            "exact typeParameters",
+        ),
+        (
+            r#"type_def:{"kind":"interface","name":"OtherGeneric","def":"value: string","typeParameters":["T"]}"#,
+            "must not declare typeParameters",
+        ),
+    ];
+
+    for (line, expected) in cases {
+        let error = format!("{:#}", parse_type_def_line(line).unwrap_err());
+        assert!(
+            error.contains(expected),
+            "expected `{expected}` in `{error}`"
+        );
+    }
 }
 
 #[test]
@@ -4493,11 +4577,8 @@ fn facade_matches_runtime_value_declarations_and_keeps_types_type_only() {
     let def = |kind: &str, name: &str, body: &str| TypeDefLine {
         kind: kind.into(),
         name: name.into(),
-        original_name: None,
         def: body.into(),
-        js_doc: None,
-        js_mod: None,
-        extends: None,
+        type_parameters: Vec::new(),
     };
     let defs = vec![
         def("interface", "Greeting", "  text: string"),
@@ -4607,17 +4688,14 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
     const INPUT_CANONICAL: &str = "fixture-number-string";
     const INPUT_FINGERPRINT: &str = "8b30e3aa815a2f4a";
     const INPUT_SUFFIX: &str = "NumberStringFingerprint8b30e3aa815a2f4a";
-    const INPUT_NEXT: &str = "__UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext";
+    const INPUT_NEXT: &str = "UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext";
     let def = |kind: &str, name: &str, body: &str| TypeDefLine {
         kind: kind.into(),
         name: name.into(),
-        original_name: None,
         def: body.into(),
-        js_doc: None,
-        js_mod: None,
-        extends: None,
+        type_parameters: Vec::new(),
     };
-    let mut defs = vec![
+    let defs = vec![
             def(
                 "fn",
                 "countEvents",
@@ -4641,7 +4719,7 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
             def(
                 "fn",
                 "echoEvents",
-                "function echoEvents(events: __UniffiInputStream<__UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext>): bigint",
+                "function echoEvents(events: UniffiInputStream<UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext>): bigint",
             ),
             def(
                 "fn",
@@ -4653,29 +4731,18 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
                 "echoEventsStreamCancel",
                 "function echoEventsStreamCancel(handle: bigint): void",
             ),
-            def("raw", "", "export interface __UniffiInputStream<T> {"),
-            def("raw", "", "handle: number;"),
-            def(
-                "raw",
-                "",
-                "next(error: Error | null, handle: number): Promise<T>;",
-            ),
-            def(
-                "raw",
-                "",
-                "cancel(error: Error | null, handle: number): void;",
-            ),
-            def("raw", "", "}"),
+            TypeDefLine {
+                kind: "interface".into(),
+                name: "UniffiInputStream".into(),
+                def: "handle: number;\nnext(error: Error | null, handle: number): Promise<T>;\ncancel(error: Error | null, handle: number): void;".into(),
+                type_parameters: vec!["T".into()],
+            },
             def(
                 "interface",
                 INPUT_NEXT,
                 "ok: boolean\ndone?: boolean\nvalue?: number\nerror?: string",
             ),
         ];
-    defs.iter_mut()
-        .find(|def| def.name == "FixtureNext")
-        .expect("fixture output next envelope exists")
-        .original_name = Some("__FixtureNext".into());
     let input = HarmonyInputStreamContract {
         suffix: INPUT_SUFFIX.into(),
         canonical: INPUT_CANONICAL.into(),
@@ -4708,8 +4775,12 @@ fn test_harmony_stream_contract() -> (Vec<TypeDefLine>, Vec<HarmonyFacadeContrac
         }
     };
     let contracts = vec![HarmonyFacadeContract {
-        schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+        facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
         component: "fixture".into(),
+        namespace: "fixture".into(),
+        native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+            "fixture",
+        ),
         output_streams: vec![
             output(
                 "countEvents",
@@ -4749,7 +4820,7 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
             "export function countEventsStream(count: number): UniFfiStream<number>",
             "export function echoEventsStream(events: NumberStringFingerprint8b30e3aa815a2f4aInputSource): UniFfiStream<number>",
             "export function createNumberStringFingerprint8b30e3aa815a2f4aInputChannel()",
-            "implements __UniffiInputStream<__UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext>",
+            "implements UniffiInputStream<UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext>",
             "readonly next = (_error: Error | null, handle: number)",
             "private state: number = __UNIFFI_STREAM_IDLE",
             "class __UniFfiStreamStep<T, E>",
@@ -4807,7 +4878,7 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
             "public and adapter exports must hide output raw `{raw}`:\nfacade:\n{facade}\nindex:\n{index}\ndeclarations:\n{declarations}"
         );
     }
-    for raw_type in ["FixtureNext", "__FixtureNext"] {
+    for raw_type in ["FixtureNext"] {
         assert!(
             facade.contains(raw_type),
             "native facade must retain output next envelope `{raw_type}`:\n{facade}"
@@ -4846,7 +4917,10 @@ fn structured_harmony_stream_contract_renders_reachable_arkts_facade() {
         );
     }
     let inventory: Value = serde_json::from_str(&inventory).unwrap();
-    assert_eq!(inventory["schemaVersion"], FACADE_CONTRACT_SCHEMA_VERSION);
+    assert_eq!(
+        inventory["hspFacadeAggregateSchemaVersion"],
+        HSP_FACADE_AGGREGATE_SCHEMA_VERSION
+    );
     let output = &inventory["outputStreams"][0];
     let fields = output
         .as_object()
@@ -4883,11 +4957,8 @@ fn harmony_contract_digest_anchor_is_private_and_reachable_without_output_stream
     let ordinary_defs = vec![TypeDefLine {
         kind: "fn".into(),
         name: "add".into(),
-        original_name: None,
         def: "function add(left: number, right: number): number".into(),
-        js_doc: None,
-        js_mod: None,
-        extends: None,
+        type_parameters: Vec::new(),
     }];
     let ordinary = FacadeExports::from_type_defs_and_contracts(&ordinary_defs, Vec::new()).unwrap();
     let ordinary_digest = "b".repeat(64);
@@ -4976,11 +5047,8 @@ fn native_declarations_retain_output_raw_contract_while_package_stays_public() {
     defs.push(TypeDefLine {
         kind: "fn".into(),
         name: "greeting".into(),
-        original_name: None,
         def: "function greeting(name: string): string".into(),
-        js_doc: None,
-        js_mod: None,
-        extends: None,
+        type_parameters: Vec::new(),
     });
     let exports = FacadeExports::from_type_defs_and_contracts(&defs, contracts).unwrap();
     let declarations = render_harmony_declaration_surfaces(&defs, &exports);
@@ -5006,7 +5074,7 @@ fn native_declarations_retain_output_raw_contract_while_package_stays_public() {
             declarations.package_public
         );
     }
-    for raw_type in ["FixtureNext", "__FixtureNext"] {
+    for raw_type in ["FixtureNext"] {
         assert!(
             declarations.native.contains(raw_type),
             "native declarations must retain output next envelope `{raw_type}`:\n{}",
@@ -5045,11 +5113,8 @@ fn harmony_stream_contract_rejects_missing_raw_export_and_public_collision() {
     defs.push(TypeDefLine {
         kind: "fn".into(),
         name: "countEventsStream".into(),
-        original_name: None,
         def: "function countEventsStream(): void".into(),
-        js_doc: None,
-        js_mod: None,
-        extends: None,
+        type_parameters: Vec::new(),
     });
     let error = FacadeExports::from_type_defs_and_contracts(&defs, contracts)
         .unwrap_err()
@@ -5096,7 +5161,7 @@ fn harmony_stream_contract_rejects_wrong_signatures_envelopes_and_duplicates() {
 
     let (mut defs, contracts) = test_harmony_stream_contract();
     defs.iter_mut()
-        .find(|def| def.kind == "interface" && def.name.contains("InputStream"))
+        .find(|def| def.name == "UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext")
         .unwrap()
         .def = "ok: boolean\ndone?: boolean\nvalue?: string\nerror?: string".into();
     let error = FacadeExports::from_type_defs_and_contracts(&defs, contracts)
@@ -5126,7 +5191,7 @@ fn harmony_stream_contract_rejects_wrong_signatures_envelopes_and_duplicates() {
     let error = FacadeExports::from_type_defs_and_contracts(&defs, contracts)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("duplicate raw OHOS type"), "{error}");
+    assert!(error.contains("duplicate raw OHOS declaration"), "{error}");
 
     let (mut defs, contracts) = test_harmony_stream_contract();
     defs.iter_mut()
@@ -5142,7 +5207,7 @@ fn harmony_stream_contract_rejects_wrong_signatures_envelopes_and_duplicates() {
 #[test]
 fn input_stream_interface_parser_is_semantic_unique_and_comment_safe() {
     let valid = r#"
-export interface __UniffiInputStream < T > {
+export interface UniffiInputStream < T > {
   cancel(error: Error | null, handle: number): void
   handle: number;
   next(error: Error | null, handle: number): Promise<T>;
@@ -5151,19 +5216,19 @@ export interface __UniffiInputStream < T > {
     validate_unique_input_stream_interface(valid).unwrap();
 
     for invalid in [
-        r#"export interface __UniffiInputStream<T> {
+        r#"export interface UniffiInputStream<T> {
 handle: string; next(error: Error | null, handle: string): Promise<string>;
 cancel(error: Error | null, handle: string): string;
 }
-/* export interface __UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; } */"#,
-        r#"const fake = "export interface __UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }";"#,
-        r#"export interface __UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }
-export interface __UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }"#,
-        r#"export interface __UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; extra:string; }"#,
-        r#"export interface __UniffiInputStream<T> { handle:number; cancel(error:Error|null,handle:number):void; }"#,
-        r#"export interface __UniffiInputStream<T> { handle:string; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }"#,
-        r#"export interface __UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):T; cancel(error:Error|null,handle:number):void; }"#,
-        r#"export interface __UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):Promise<void>; }"#,
+/* export interface UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; } */"#,
+        r#"const fake = "export interface UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }";"#,
+        r#"export interface UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }
+export interface UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }"#,
+        r#"export interface UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; extra:string; }"#,
+        r#"export interface UniffiInputStream<T> { handle:number; cancel(error:Error|null,handle:number):void; }"#,
+        r#"export interface UniffiInputStream<T> { handle:string; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }"#,
+        r#"export interface UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):T; cancel(error:Error|null,handle:number):void; }"#,
+        r#"export interface UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):Promise<void>; }"#,
     ] {
         assert!(
             validate_unique_input_stream_interface(invalid).is_err(),
@@ -5174,7 +5239,7 @@ export interface __UniffiInputStream<T> { handle:number; next(error:Error|null,h
 
 #[test]
 fn input_stream_interface_parser_rejects_unbalanced_and_oversized_sources() {
-    let valid = "export interface __UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }";
+    let valid = "export interface UniffiInputStream<T> { handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }";
     for invalid in [format!("{valid}}}"), format!("{{{valid}"), "}".to_string()] {
         assert!(
             validate_unique_input_stream_interface(&invalid).is_err(),
@@ -5201,7 +5266,7 @@ fn input_stream_interface_parser_rejects_unbalanced_and_oversized_sources() {
     assert!(validate_unique_input_stream_interface(&too_many_tokens).is_err());
 
     let oversized_body = format!(
-            "export interface __UniffiInputStream<T> {{ {} handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }}",
+            "export interface UniffiInputStream<T> {{ {} handle:number; next(error:Error|null,handle:number):Promise<T>; cancel(error:Error|null,handle:number):void; }}",
             ";".repeat(4097)
         );
     assert!(validate_unique_input_stream_interface(&oversized_body).is_err());
@@ -5215,22 +5280,23 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
     let raw_fn = |name: &str, body: &str| TypeDefLine {
         kind: "fn".into(),
         name: name.into(),
-        original_name: None,
         def: body.into(),
-        js_doc: None,
-        js_mod: None,
-        extends: None,
+        type_parameters: Vec::new(),
     };
     let (mut defs, contracts) = test_harmony_stream_contract();
     let digest = sha256_bytes(b"fixture canonical contract");
     let sentinel = bridge_identity_export(&digest);
     defs.push(raw_fn(&sentinel, &format!("function {sentinel}(): string")));
     let inventory = FacadeTypeInventory {
-        schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+        facade_inventory_schema_version: FACADE_INVENTORY_SCHEMA_VERSION,
         facade_mode: "required".into(),
         host_composite_identity: sha256_bytes(b"fixture host"),
         components: vec![HostFacadeComponentIdentity {
             component: "fixture".into(),
+            namespace: "fixture".into(),
+            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                "fixture",
+            ),
             contract_file: "fixture.ohos-facade.json".into(),
             contract_sha256: digest.clone(),
             identity_export: sentinel.clone(),
@@ -5283,6 +5349,9 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
     let mut multi_contracts = contracts.clone();
     let mut second_contract = contracts[0].clone();
     second_contract.component = "fixture_second".into();
+    second_contract.namespace = "fixture_second".into();
+    second_contract.native_export_prefix =
+        uniffi_bindgen::interface::native_export_prefix_for_component("fixture_second");
     multi_contracts.push(second_contract);
     let second_digest = sha256_bytes(b"fixture second canonical contract");
     let second_sentinel = bridge_identity_export(&second_digest);
@@ -5295,6 +5364,10 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
         .components
         .push(HostFacadeComponentIdentity {
             component: "fixture_second".into(),
+            namespace: "fixture_second".into(),
+            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                "fixture_second",
+            ),
             contract_file: "fixture_second.ohos-facade.json".into(),
             contract_sha256: second_digest.clone(),
             identity_export: second_sentinel,
@@ -5315,8 +5388,12 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
 #[test]
 fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions() {
     let (_, contracts) = test_harmony_stream_contract();
+    let parse = |value: &Value| {
+        let bytes = serde_json::to_vec(value).unwrap();
+        parse_harmony_facade_contract(&bytes, Utf8Path::new("contract.json"))
+    };
     let mut legacy_v3 = serde_json::to_value(&contracts[0]).unwrap();
-    legacy_v3["schemaVersion"] = Value::from(3);
+    legacy_v3["facadeContractSchemaVersion"] = Value::from(3);
     let legacy_output = legacy_v3["outputStreams"][0].as_object_mut().unwrap();
     let step_type = legacy_output.remove("stepType").unwrap();
     legacy_output.insert("nextType".into(), step_type);
@@ -5328,34 +5405,38 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
         "eventsClass".into(),
         Value::String("CountEventsEventsStream".into()),
     );
-    let error = format!(
-        "{:#}",
-        parse_harmony_facade_contract(&legacy_v3, Utf8Path::new("contract.json")).unwrap_err()
-    );
+    let error = format!("{:#}", parse(&legacy_v3).unwrap_err());
     assert!(
         error.contains("expected 4") && error.contains("got 3"),
         "legacy v3 must fail before v4 shape parsing: {error}"
     );
 
     let mut non_integer_version = serde_json::to_value(&contracts[0]).unwrap();
-    non_integer_version["schemaVersion"] = Value::String("4".into());
-    let error = format!(
-        "{:#}",
-        parse_harmony_facade_contract(&non_integer_version, Utf8Path::new("contract.json"))
-            .unwrap_err()
+    non_integer_version["facadeContractSchemaVersion"] = Value::String("4".into());
+    let error = format!("{:#}", parse(&non_integer_version).unwrap_err());
+    assert!(
+        error.contains("expected 4") && error.contains("got \"4\""),
+        "{error}"
     );
-    assert!(error.contains("must be an integer"), "{error}");
+
+    let mut generic_schema_version = serde_json::to_value(&contracts[0]).unwrap();
+    generic_schema_version
+        .as_object_mut()
+        .unwrap()
+        .remove("facadeContractSchemaVersion");
+    generic_schema_version["schemaVersion"] = Value::from(4);
+    let error = format!("{:#}", parse(&generic_schema_version).unwrap_err());
+    assert!(
+        error.contains("expected 4") && error.contains("got missing"),
+        "{error}"
+    );
 
     let mut missing_v4_field = serde_json::to_value(&contracts[0]).unwrap();
     missing_v4_field["outputStreams"][0]
         .as_object_mut()
         .unwrap()
         .remove("stepType");
-    let error = format!(
-        "{:#}",
-        parse_harmony_facade_contract(&missing_v4_field, Utf8Path::new("contract.json"))
-            .unwrap_err()
-    );
+    let error = format!("{:#}", parse(&missing_v4_field).unwrap_err());
     assert!(error.contains("missing field"), "{error}");
 
     let mut unknown = serde_json::to_value(&contracts[0]).unwrap();
@@ -5363,39 +5444,26 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
         .as_object_mut()
         .unwrap()
         .insert("futureUnsafeField".into(), Value::String("x".into()));
-    let error = format!(
-        "{:#}",
-        parse_harmony_facade_contract(&unknown, Utf8Path::new("contract.json")).unwrap_err()
-    );
+    let error = format!("{:#}", parse(&unknown).unwrap_err());
     assert!(error.contains("unknown field"), "{error}");
 
     let mut malicious = serde_json::to_value(&contracts[0]).unwrap();
     malicious["inputStreams"][0]["suffix"] = Value::String("Bad;Injected".into());
-    let error = format!(
-        "{:#}",
-        parse_harmony_facade_contract(&malicious, Utf8Path::new("contract.json")).unwrap_err()
-    );
+    let error = format!("{:#}", parse(&malicious).unwrap_err());
     assert!(error.contains("invalid generated identifier"), "{error}");
 
     let mut malformed_type = serde_json::to_value(&contracts[0]).unwrap();
     malformed_type["outputStreams"][0]["itemType"]["kind"] =
         Value::String("recordIndexSignature".into());
-    let error = format!(
-        "{:#}",
-        parse_harmony_facade_contract(&malformed_type, Utf8Path::new("contract.json"),)
-            .unwrap_err()
-    );
+    let error = format!("{:#}", parse(&malformed_type).unwrap_err());
     assert!(error.contains("unknown variant"), "{error}");
 
     let (mut defs, contracts) = test_harmony_stream_contract();
     defs.push(TypeDefLine {
         kind: "interface".into(),
         name: "__UniFfiPullStream".into(),
-        original_name: None,
         def: "value: number".into(),
-        js_doc: None,
-        js_mod: None,
-        extends: None,
+        type_parameters: Vec::new(),
     });
     let error = FacadeExports::from_type_defs_and_contracts(&defs, contracts)
         .unwrap_err()
@@ -5409,16 +5477,16 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
     defs.push(TypeDefLine {
         kind: "interface".into(),
         name: "countEvents".into(),
-        original_name: None,
         def: "value: number".into(),
-        js_doc: None,
-        js_mod: None,
-        extends: None,
+        type_parameters: Vec::new(),
     });
     let error = FacadeExports::from_type_defs_and_contracts(&defs, contracts)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("value/type name collision"), "{error}");
+    assert!(
+        error.contains("duplicate raw OHOS declaration") && error.contains("countEvents"),
+        "{error}"
+    );
 
     for name in [
         "UniFfiStreamFailure",
@@ -5433,11 +5501,8 @@ fn harmony_stream_contract_strict_schema_blocks_injection_and_private_collisions
         defs.push(TypeDefLine {
             kind: "interface".into(),
             name: name.into(),
-            original_name: None,
             def: "value: number".into(),
-            js_doc: None,
-            js_mod: None,
-            extends: None,
+            type_parameters: Vec::new(),
         });
         let error = FacadeExports::from_type_defs_and_contracts(&defs, contracts)
             .unwrap_err()
@@ -5539,14 +5604,29 @@ fn facade_inventory_ignores_stale_unlisted_contracts() {
     )
     .unwrap();
     std::fs::write(
+        root.join("fixture.ohos-extra-types.d.ts"),
+        "type_def:{\"kind\":\"fn\",\"name\":\"uniffiohosbridgeidentityfixture\",\"def\":\"function uniffiohosbridgeidentityfixture(): string\",\"typeParameters\":[]}\n",
+    )
+    .unwrap();
+    std::fs::write(
         root.join(FACADE_INVENTORY_FILE),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": FACADE_CONTRACT_SCHEMA_VERSION,
-            "facadeMode": "raw-only",
-            "hostCompositeIdentity": sha256_bytes(b"raw-only"),
-            "components": [],
+            "facadeInventorySchemaVersion": FACADE_INVENTORY_SCHEMA_VERSION,
+            "facadeMode": "required",
+            "hostCompositeIdentity": sha256_bytes(b"fixture-host"),
+            "components": [{
+                "component": "fixture",
+                "namespace": "fixture",
+                "nativeExportPrefix": uniffi_bindgen::interface::native_export_prefix_for_component("fixture"),
+                "contractFile": "current.ohos-facade.json",
+                "contractSha256": sha256_bytes(&current_bytes),
+                "identityExport": bridge_identity_export(&sha256_bytes(&current_bytes)),
+            }],
             "bundleFingerprint": "0".repeat(64),
-            "typeDefinitions": [],
+            "typeDefinitions": [{
+                "file": "fixture.ohos-extra-types.d.ts",
+                "sha256": sha256_bytes(b"type_def:{\"kind\":\"fn\",\"name\":\"uniffiohosbridgeidentityfixture\",\"def\":\"function uniffiohosbridgeidentityfixture(): string\",\"typeParameters\":[]}\n"),
+            }],
             "contracts": [{
                 "file": "current.ohos-facade.json",
                 "sha256": sha256_bytes(&current_bytes),
@@ -5565,19 +5645,28 @@ fn facade_inventory_ignores_stale_unlisted_contracts() {
 
 fn test_host_facade_bundle() -> HostFacadeBundle {
     let contract_content = serde_json::to_string(&serde_json::json!({
-        "schemaVersion": FACADE_CONTRACT_SCHEMA_VERSION,
+        "facadeContractSchemaVersion": FACADE_CONTRACT_SCHEMA_VERSION,
         "component": "cache_fixture",
+        "namespace": "cache_fixture",
+        "nativeExportPrefix": uniffi_bindgen::interface::native_export_prefix_for_component("cache_fixture"),
         "outputStreams": [],
         "inputStreams": [],
     }))
     .unwrap();
-    let sidecar_content = "export interface CacheFixture { value: number; }\n".to_string();
     let contract_sha256 = sha256_bytes(contract_content.as_bytes());
+    let identity_export = bridge_identity_export(&contract_sha256);
+    let sidecar_content = format!(
+        "type_def:{{\"kind\":\"fn\",\"name\":\"{identity_export}\",\"def\":\"function {identity_export}(): string\",\"typeParameters\":[]}}\n"
+    );
     let components = vec![HostFacadeComponentIdentity {
         component: "cache_fixture".into(),
+        namespace: "cache_fixture".into(),
+        native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+            "cache_fixture",
+        ),
         contract_file: "cache_fixture.ohos-facade.json".into(),
         contract_sha256: contract_sha256.clone(),
-        identity_export: bridge_identity_export(&contract_sha256),
+        identity_export,
     }];
     let host_identity = serde_json::json!({
         "packageName": "cache-host",
@@ -5585,7 +5674,7 @@ fn test_host_facade_bundle() -> HostFacadeBundle {
         "components": components,
     });
     let mut bundle = HostFacadeBundle {
-        schema_version: FACADE_BUNDLE_SCHEMA_VERSION,
+        host_bundle_schema_version: HOST_BUNDLE_SCHEMA_VERSION,
         fingerprint: String::new(),
         package_name: "cache-host".into(),
         lib_target: "cache_host".into(),
@@ -5605,6 +5694,32 @@ fn test_host_facade_bundle() -> HostFacadeBundle {
     };
     bundle.fingerprint = bundle.computed_fingerprint().unwrap();
     bundle
+}
+
+fn write_required_host_facade_bundle(path: &Utf8Path, bundle: &HostFacadeBundle) {
+    let entries = |entries: &[HostFacadeBundleEntry]| {
+        entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "file": entry.file,
+                    "sha256": entry.sha256,
+                    "content": entry.content,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let value = serde_json::json!({
+        "hostBundleSchemaVersion": bundle.host_bundle_schema_version,
+        "fingerprint": bundle.fingerprint,
+        "packageName": bundle.package_name,
+        "libTarget": bundle.lib_target,
+        "hostCompositeIdentity": bundle.host_composite_identity,
+        "components": bundle.components,
+        "contracts": entries(&bundle.contracts),
+        "typeSidecars": entries(&bundle.type_sidecars),
+    });
+    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
 }
 
 #[test]
@@ -5640,6 +5755,271 @@ fn required_host_facade_bundle_rejects_empty_sidecar_only_and_wrong_host() {
     other_host.cargo_package_id = "cache-host 1.0.0 (other source)".into();
     other_host.name = "other-cache-host".into();
     assert!(validate_host_facade_bundle_for_package(&bundle, &other_host).is_err());
+}
+
+#[test]
+fn required_bundle_semantic_preflight_rejects_generated_name_collision_without_cache_or_output() {
+    let root = temp_test_dir("uniffi-ohos-bundle-semantic-preflight");
+    let target = root.join("target");
+    let output = root.join("output");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(target.join("sentinel.txt"), "cache remains untouched").unwrap();
+    std::fs::write(output.join("sentinel.txt"), "output remains untouched").unwrap();
+    let target_before = regular_file_snapshot(&target);
+    let output_before = regular_file_snapshot(&output);
+
+    let mut bundle = test_host_facade_bundle();
+    bundle.type_sidecars[0].content.push_str(
+        "type_def:{\"kind\":\"interface\",\"name\":\"__uniffiFacadeContractDigest\",\"def\":\"value: number\",\"typeParameters\":[]}\n",
+    );
+    bundle.type_sidecars[0].sha256 = sha256_bytes(bundle.type_sidecars[0].content.as_bytes());
+    bundle.fingerprint = bundle.computed_fingerprint().unwrap();
+    let bundle_path = root.join("bundle.json");
+    write_required_host_facade_bundle(&bundle_path, &bundle);
+
+    let error = load_host_facade_bundle(&FacadeMode::Required(bundle_path))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("private helper") && error.contains("collision"),
+        "{error}"
+    );
+    assert_eq!(regular_file_snapshot(&target), target_before);
+    assert_eq!(regular_file_snapshot(&output), output_before);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_without_mutation() {
+    let root = temp_test_dir("uniffi-ohos-owner-type-preflight");
+    let target = root.join("target");
+    let output = root.join("output");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(target.join("sentinel.txt"), "cache remains untouched").unwrap();
+    std::fs::write(output.join("sentinel.txt"), "output remains untouched").unwrap();
+    let target_before = regular_file_snapshot(&target);
+    let output_before = regular_file_snapshot(&output);
+
+    let (mut fixture_defs, mut fixture_contracts) = test_harmony_stream_contract();
+    let mut fixture_contract = fixture_contracts.remove(0);
+    fixture_contract.output_streams[0].item_type = HarmonyTypeDescriptor::Named {
+        owner: HarmonyNamedTypeOwner {
+            component: "owner_fixture".into(),
+            namespace: "owner_fixture".into(),
+        },
+        name: "Shared".into(),
+    };
+    fixture_defs.push(TypeDefLine {
+        kind: "interface".into(),
+        name: "Shared".into(),
+        def: "value: number".into(),
+        type_parameters: Vec::new(),
+    });
+    let fixture_content = serde_json::to_string(&fixture_contract).unwrap();
+    let fixture_digest = sha256_bytes(fixture_content.as_bytes());
+    let fixture_identity_export = bridge_identity_export(&fixture_digest);
+    fixture_defs.push(TypeDefLine {
+        kind: "fn".into(),
+        name: fixture_identity_export.clone(),
+        def: format!("function {fixture_identity_export}(): string"),
+        type_parameters: Vec::new(),
+    });
+    let sidecar = |defs: &[TypeDefLine]| {
+        defs.iter()
+            .map(|def| {
+                format!(
+                    "type_def:{}\n",
+                    serde_json::to_string(&serde_json::json!({
+                        "kind": def.kind,
+                        "name": def.name,
+                        "def": def.def,
+                        "typeParameters": def.type_parameters,
+                    }))
+                    .unwrap()
+                )
+            })
+            .collect::<String>()
+    };
+    let fixture_sidecar = sidecar(&fixture_defs);
+
+    let owner_contract = HarmonyFacadeContract {
+        facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+        component: "owner_fixture".into(),
+        namespace: "owner_fixture".into(),
+        native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+            "owner_fixture",
+        ),
+        output_streams: Vec::new(),
+        input_streams: Vec::new(),
+    };
+    let owner_content = serde_json::to_string(&owner_contract).unwrap();
+    let owner_digest = sha256_bytes(owner_content.as_bytes());
+    let owner_identity_export = bridge_identity_export(&owner_digest);
+    let owner_sidecar = format!(
+        "type_def:{{\"kind\":\"fn\",\"name\":\"{owner_identity_export}\",\"def\":\"function {owner_identity_export}(): string\",\"typeParameters\":[]}}\n"
+    );
+    let components = vec![
+        HostFacadeComponentIdentity {
+            component: "fixture".into(),
+            namespace: "fixture".into(),
+            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                "fixture",
+            ),
+            contract_file: "fixture.ohos-facade.json".into(),
+            contract_sha256: fixture_digest.clone(),
+            identity_export: fixture_identity_export,
+        },
+        HostFacadeComponentIdentity {
+            component: "owner_fixture".into(),
+            namespace: "owner_fixture".into(),
+            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                "owner_fixture",
+            ),
+            contract_file: "owner_fixture.ohos-facade.json".into(),
+            contract_sha256: owner_digest.clone(),
+            identity_export: owner_identity_export,
+        },
+    ];
+    let host_identity = serde_json::json!({
+        "packageName": "owner-host",
+        "libTarget": "owner_host",
+        "components": components,
+    });
+    let mut bundle = HostFacadeBundle {
+        host_bundle_schema_version: HOST_BUNDLE_SCHEMA_VERSION,
+        fingerprint: String::new(),
+        package_name: "owner-host".into(),
+        lib_target: "owner_host".into(),
+        host_composite_identity: sha256_bytes(&serde_json::to_vec(&host_identity).unwrap()),
+        components,
+        contracts: vec![
+            HostFacadeBundleEntry {
+                file: "fixture.ohos-facade.json".into(),
+                sha256: fixture_digest,
+                content: fixture_content,
+            },
+            HostFacadeBundleEntry {
+                file: "owner_fixture.ohos-facade.json".into(),
+                sha256: owner_digest,
+                content: owner_content,
+            },
+        ],
+        type_sidecars: vec![
+            HostFacadeBundleEntry {
+                file: "fixture.ohos-extra-types.d.ts".into(),
+                sha256: sha256_bytes(fixture_sidecar.as_bytes()),
+                content: fixture_sidecar,
+            },
+            HostFacadeBundleEntry {
+                file: "owner_fixture.ohos-extra-types.d.ts".into(),
+                sha256: sha256_bytes(owner_sidecar.as_bytes()),
+                content: owner_sidecar,
+            },
+        ],
+        mode: FacadeBundleMode::Required,
+    };
+    bundle.fingerprint = bundle.computed_fingerprint().unwrap();
+    let bundle_path = root.join("bundle.json");
+    write_required_host_facade_bundle(&bundle_path, &bundle);
+
+    let error = load_host_facade_bundle(&FacadeMode::Required(bundle_path))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("not declared by owner component `owner_fixture`"),
+        "{error}"
+    );
+    assert_eq!(regular_file_snapshot(&target), target_before);
+    assert_eq!(regular_file_snapshot(&output), output_before);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn host_bundle_version_checksum_and_identity_rejections_do_not_mutate_cache_or_output() {
+    let root = temp_test_dir("uniffi-ohos-host-bundle-no-mutation");
+    let target = root.join("target");
+    let output = root.join("output");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(target.join("sentinel.txt"), "cache remains untouched").unwrap();
+    std::fs::write(output.join("sentinel.txt"), "output remains untouched").unwrap();
+    let target_before = regular_file_snapshot(&target);
+    let output_before = regular_file_snapshot(&output);
+    let bundle_path = root.join("bundle.json");
+    let valid = test_host_facade_bundle();
+
+    let reject = |label: &str, bytes: Vec<u8>, expected: &str| {
+        std::fs::write(&bundle_path, bytes).unwrap();
+        let error = load_host_facade_bundle(&FacadeMode::Required(bundle_path.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{label}: {error}");
+        assert_eq!(regular_file_snapshot(&target), target_before, "{label}");
+        assert_eq!(regular_file_snapshot(&output), output_before, "{label}");
+    };
+
+    write_required_host_facade_bundle(&bundle_path, &valid);
+    let mut version_two: Value =
+        serde_json::from_slice(&std::fs::read(&bundle_path).unwrap()).unwrap();
+    version_two["hostBundleSchemaVersion"] = Value::from(2);
+    reject(
+        "v2",
+        serde_json::to_vec(&version_two).unwrap(),
+        "expected 3",
+    );
+
+    let mut generic_schema: Value =
+        serde_json::from_slice(&std::fs::read(&bundle_path).unwrap()).unwrap();
+    generic_schema
+        .as_object_mut()
+        .unwrap()
+        .remove("hostBundleSchemaVersion");
+    generic_schema["schemaVersion"] = Value::from(3);
+    reject(
+        "generic schemaVersion",
+        serde_json::to_vec(&generic_schema).unwrap(),
+        "expected 3, got missing",
+    );
+
+    let mut unknown_schema: Value =
+        serde_json::from_slice(&std::fs::read(&bundle_path).unwrap()).unwrap();
+    unknown_schema["hostBundleSchemaVersion"] = Value::from(99);
+    reject(
+        "unknown schema",
+        serde_json::to_vec(&unknown_schema).unwrap(),
+        "expected 3, got 99",
+    );
+
+    let mut checksum_mismatch = valid.clone();
+    checksum_mismatch.contracts[0].content.push(' ');
+    checksum_mismatch.fingerprint = checksum_mismatch.computed_fingerprint().unwrap();
+    write_required_host_facade_bundle(&bundle_path, &checksum_mismatch);
+    reject(
+        "embedded checksum",
+        std::fs::read(&bundle_path).unwrap(),
+        "checksum mismatch",
+    );
+
+    let mut wrong_identity = valid.clone();
+    wrong_identity.components[0].native_export_prefix = "ffi_wrong".into();
+    let identity_payload = serde_json::json!({
+        "packageName": wrong_identity.package_name,
+        "libTarget": wrong_identity.lib_target,
+        "components": wrong_identity.components,
+    });
+    wrong_identity.host_composite_identity =
+        sha256_bytes(&serde_json::to_vec(&identity_payload).unwrap());
+    wrong_identity.fingerprint = wrong_identity.computed_fingerprint().unwrap();
+    write_required_host_facade_bundle(&bundle_path, &wrong_identity);
+    reject(
+        "identity",
+        std::fs::read(&bundle_path).unwrap(),
+        "invalid nativeExportPrefix",
+    );
+
+    std::fs::remove_dir_all(root).ok();
 }
 
 fn test_type_cache_path(
@@ -5681,12 +6061,9 @@ fn commit_test_type_cache(
     target: &Utf8Path,
     package: &HostPackage,
     bundle: &HostFacadeBundle,
-    raw: &str,
 ) -> Utf8PathBuf {
     let mut transaction = InvocationTypeCache::new(target, package, true, bundle).unwrap();
-    std::fs::write(transaction.work_dir().join(&package.name), raw).unwrap();
-    transaction.record_completed_entry(&package.name).unwrap();
-    write_facade_type_inventory(transaction.work_dir(), package, bundle).unwrap();
+    write_facade_type_inventory(transaction.work_dir(), bundle).unwrap();
     transaction.commit().unwrap();
     test_type_cache_path(target, package, bundle)
 }
@@ -5705,27 +6082,34 @@ fn resume_after_type_cleanup_interruption(
             .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
         && std::fs::read_dir(residue).unwrap().next().is_none();
     if markerless_empty {
+        let parent = residue.parent().unwrap();
+        let before_files = regular_file_snapshot(parent);
+        let before_names = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>();
         let error = InvocationTypeCache::new(target, package, dts_cache, bundle)
             .err()
-            .expect("markerless empty cleanup residue must be preserved")
-            .to_string();
-        assert!(error.contains("preserved"), "{error}");
-        assert!(!residue.exists());
+            .expect("markerless cleanup residue must fail before mutation");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("unowned OHOS type-work residue before mutation")
+                || error.contains("preflighting OHOS type-cache backup"),
+            "{error}"
+        );
+        assert_eq!(regular_file_snapshot(parent), before_files);
+        assert_eq!(
+            std::fs::read_dir(parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect::<BTreeSet<_>>(),
+            before_names
+        );
+        std::fs::remove_dir(residue).unwrap();
     }
     let next = InvocationTypeCache::new(target, package, dts_cache, bundle).unwrap();
     assert!(!residue.exists());
     drop(next);
-}
-
-fn find_preserved_type_residue(parent: &Utf8Path, label: &str) -> Utf8PathBuf {
-    std::fs::read_dir(parent)
-        .unwrap()
-        .map(|entry| Utf8PathBuf::from_path_buf(entry.unwrap().path()).unwrap())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.contains(&format!(".preserved-{label}-")))
-        })
-        .unwrap_or_else(|| panic!("missing preserved {label} residue in {parent}"))
 }
 
 #[cfg(unix)]
@@ -5741,25 +6125,18 @@ fn type_cache_uses_static_bundle_exact_inventory_and_transactional_switches() {
     let bundle = test_host_facade_bundle();
     {
         let mut transaction = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-        std::fs::write(
-            transaction.work_dir().join(&package.name),
-            r#"{"kind":"fn","name":"cached","def":"function cached(): void"}"#,
-        )
-        .unwrap();
-        transaction.record_completed_entry(&package.name).unwrap();
-        write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+        write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
         transaction.commit().unwrap();
     }
     let cache = test_type_cache_path(&target, &package, &bundle);
     let original = regular_file_snapshot(&cache);
     assert!(cache.join("cache_fixture.ohos-facade.json").exists());
 
-    // A second invocation models Cargo fresh: the raw type file comes
-    // from the owned cache while the static bundle is installed anew.
+    // A second invocation models Cargo fresh: exact static sidecars are
+    // installed anew without a raw-primary cache entry.
     {
         let mut transaction = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-        assert!(transaction.work_dir().join(&package.name).exists());
-        write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+        write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
         transaction.commit().unwrap();
     }
     assert_eq!(
@@ -5770,14 +6147,13 @@ fn type_cache_uses_static_bundle_exact_inventory_and_transactional_switches() {
 
     // Dropping a failed invocation preserves the last committed cache.
     {
-        let transaction = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-        std::fs::write(transaction.work_dir().join(&package.name), "damaged").unwrap();
+        let _transaction = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
     }
     assert_eq!(regular_file_snapshot(&cache), committed);
     assert_ne!(original, BTreeMap::new());
 
     let mut colliding = bundle.clone();
-    colliding.contracts[0].file = package.name.clone();
+    colliding.contracts[0].file = FACADE_INVENTORY_FILE.into();
     colliding.fingerprint = colliding.computed_fingerprint().unwrap();
     let error = InvocationTypeCache::new(&target, &package, true, &colliding)
         .err()
@@ -5792,7 +6168,7 @@ fn type_cache_uses_static_bundle_exact_inventory_and_transactional_switches() {
     let empty_cache = test_type_cache_path(&target, &package, &empty);
     {
         let mut transaction = InvocationTypeCache::new(&target, &package, true, &empty).unwrap();
-        write_facade_type_inventory(transaction.work_dir(), &package, &empty).unwrap();
+        write_facade_type_inventory(transaction.work_dir(), &empty).unwrap();
         transaction.commit().unwrap();
     }
     assert!(cache.join("cache_fixture.ohos-facade.json").exists());
@@ -5804,12 +6180,10 @@ fn type_cache_uses_static_bundle_exact_inventory_and_transactional_switches() {
     assert!(inventory.contracts.is_empty());
     assert!(inventory.type_definitions.is_empty());
 
-    // Switching back reinstalls only the selected static bundle while
-    // retaining the committed raw native type definition.
+    // Switching back reinstalls only the selected static bundle.
     {
         let mut transaction = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-        assert!(transaction.work_dir().join(&package.name).exists());
-        write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+        write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
         transaction.commit().unwrap();
     }
     assert_eq!(
@@ -5875,16 +6249,14 @@ fn type_cache_recovers_committed_work_complete_backup_and_ephemeral_work() {
     let transition_cache = test_type_cache_path(&transition_target, &package, &bundle);
     let mut transition =
         InvocationTypeCache::new(&transition_target, &package, true, &bundle).unwrap();
-    std::fs::write(transition.work_dir().join(&package.name), "transition raw").unwrap();
-    transition.record_completed_entry(&package.name).unwrap();
-    write_facade_type_inventory(transition.work_dir(), &package, &bundle).unwrap();
+    write_facade_type_inventory(transition.work_dir(), &bundle).unwrap();
     let transition_work = transition.work_dir().to_path_buf();
     write_owned_tree_marker_with_identity_ignoring(
         &transition_work,
         TYPE_CACHE_OWNER_MARKER,
         TYPE_CACHE_OWNER_KIND,
         Some(&identity),
-        &[TYPE_CACHE_WORK_MARKER],
+        &[TYPE_CACHE_WORK_MARKER, TYPE_CACHE_WORK_NEXT_MARKER],
     )
     .unwrap();
     transition.work_dir = None;
@@ -5892,22 +6264,17 @@ fn type_cache_recovers_committed_work_complete_backup_and_ephemeral_work() {
     let recovered = InvocationTypeCache::new(&transition_target, &package, true, &bundle).unwrap();
     assert!(transition_cache.is_dir());
     assert!(!transition_cache.join(TYPE_CACHE_WORK_MARKER).exists());
-    assert_eq!(
-        std::fs::read_to_string(recovered.work_dir().join(&package.name)).unwrap(),
-        "transition raw"
-    );
+    assert!(transition_cache.join(FACADE_INVENTORY_FILE).is_file());
+    assert!(recovered
+        .work_dir()
+        .join(&bundle.contracts[0].file)
+        .is_file());
     drop(recovered);
 
     // Simulate a crash after a complete work tree received its exact
     // owner marker but before the atomic publish rename.
     let mut interrupted = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-    std::fs::write(
-        interrupted.work_dir().join(&package.name),
-        "committed work raw",
-    )
-    .unwrap();
-    interrupted.record_completed_entry(&package.name).unwrap();
-    write_facade_type_inventory(interrupted.work_dir(), &package, &bundle).unwrap();
+    write_facade_type_inventory(interrupted.work_dir(), &bundle).unwrap();
     let committed_work = interrupted.work_dir().to_path_buf();
     std::fs::remove_file(committed_work.join(TYPE_CACHE_WORK_MARKER)).unwrap();
     write_owned_tree_marker_with_identity(
@@ -5922,10 +6289,7 @@ fn type_cache_recovers_committed_work_complete_backup_and_ephemeral_work() {
 
     let recovered = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
     assert!(cache.is_dir());
-    assert_eq!(
-        std::fs::read_to_string(recovered.work_dir().join(&package.name)).unwrap(),
-        "committed work raw"
-    );
+    assert!(cache.join(FACADE_INVENTORY_FILE).is_file());
     drop(recovered);
 
     // Simulate a crash after moving the committed cache to its backup but
@@ -5939,10 +6303,7 @@ fn type_cache_recovers_committed_work_complete_backup_and_ephemeral_work() {
     let recovered = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
     assert!(cache.is_dir());
     assert!(!backup.exists());
-    assert_eq!(
-        std::fs::read_to_string(recovered.work_dir().join(&package.name)).unwrap(),
-        "committed work raw"
-    );
+    assert!(cache.join(FACADE_INVENTORY_FILE).is_file());
     drop(recovered);
 
     // Non-cache mode uses unique work paths to force real Cargo type
@@ -5967,7 +6328,7 @@ fn type_cache_precise_cleanup_recovers_every_work_owner_and_backup_boundary() {
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
     let identity = TypeCacheIdentity::new(&package, &bundle).unwrap();
-    let work_entries = expected_type_work_entries(&package, &bundle).unwrap();
+    let work_entries = expected_type_work_entries(&bundle).unwrap();
 
     // Pure work-marker cleanup retains that marker until every audited
     // payload is gone. A markerless empty root is preserved with one
@@ -5975,8 +6336,6 @@ fn type_cache_precise_cleanup_recovers_every_work_owner_and_backup_boundary() {
     for interrupt_after in 1..=(work_entries.len() + 1) {
         let target = root.join(format!("pure-work-{interrupt_after}"));
         let mut transaction = InvocationTypeCache::new(&target, &package, false, &bundle).unwrap();
-        std::fs::write(transaction.work_dir().join(&package.name), "raw").unwrap();
-        transaction.record_completed_entry(&package.name).unwrap();
         let work = transaction.work_dir().to_path_buf();
         let steps = collect_owned_tree_entries(&work, TYPE_CACHE_WORK_MARKER)
             .unwrap()
@@ -6011,16 +6370,14 @@ fn type_cache_precise_cleanup_recovers_every_work_owner_and_backup_boundary() {
     for interrupt_after in 1..=(work_entries.len() + 2) {
         let target = root.join(format!("owner-work-{interrupt_after}"));
         let mut transaction = InvocationTypeCache::new(&target, &package, false, &bundle).unwrap();
-        std::fs::write(transaction.work_dir().join(&package.name), "raw").unwrap();
-        transaction.record_completed_entry(&package.name).unwrap();
-        write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+        write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
         let work = transaction.work_dir().to_path_buf();
         write_owned_tree_marker_with_identity_ignoring(
             &work,
             TYPE_CACHE_OWNER_MARKER,
             TYPE_CACHE_OWNER_KIND,
             Some(&identity),
-            &[TYPE_CACHE_WORK_MARKER],
+            &[TYPE_CACHE_WORK_MARKER, TYPE_CACHE_WORK_NEXT_MARKER],
         )
         .unwrap();
         std::fs::remove_file(work.join(TYPE_CACHE_WORK_MARKER)).unwrap();
@@ -6051,9 +6408,7 @@ fn type_cache_precise_cleanup_recovers_every_work_owner_and_backup_boundary() {
         let cache = test_type_cache_path(&target, &package, &bundle);
         {
             let mut first = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-            std::fs::write(first.work_dir().join(&package.name), "stable raw").unwrap();
-            first.record_completed_entry(&package.name).unwrap();
-            write_facade_type_inventory(first.work_dir(), &package, &bundle).unwrap();
+            write_facade_type_inventory(first.work_dir(), &bundle).unwrap();
             first.commit().unwrap();
         }
         let old_entries = validate_type_cache(&cache, &identity)
@@ -6061,16 +6416,14 @@ fn type_cache_precise_cleanup_recovers_every_work_owner_and_backup_boundary() {
             .entries
             .len();
         let mut replacement = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-        std::fs::write(replacement.work_dir().join(&package.name), "stable raw").unwrap();
-        replacement.record_completed_entry(&package.name).unwrap();
-        write_facade_type_inventory(replacement.work_dir(), &package, &bundle).unwrap();
+        write_facade_type_inventory(replacement.work_dir(), &bundle).unwrap();
         let work = replacement.work_dir().to_path_buf();
         write_owned_tree_marker_with_identity_ignoring(
             &work,
             TYPE_CACHE_OWNER_MARKER,
             TYPE_CACHE_OWNER_KIND,
             Some(&identity),
-            &[TYPE_CACHE_WORK_MARKER],
+            &[TYPE_CACHE_WORK_MARKER, TYPE_CACHE_WORK_NEXT_MARKER],
         )
         .unwrap();
         std::fs::remove_file(work.join(TYPE_CACHE_WORK_MARKER)).unwrap();
@@ -6117,7 +6470,7 @@ fn type_cache_precise_cleanup_recovers_every_work_owner_and_backup_boundary() {
 }
 
 #[test]
-fn type_cache_preserves_every_markerless_backup_and_resumes() {
+fn type_cache_rejects_every_markerless_backup_without_mutation() {
     let root = temp_test_dir("uniffi-ohos-type-cache-markerless-backup");
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
@@ -6128,9 +6481,7 @@ fn type_cache_preserves_every_markerless_backup_and_resumes() {
         {
             let mut transaction =
                 InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-            std::fs::write(transaction.work_dir().join(&package.name), "stable raw").unwrap();
-            transaction.record_completed_entry(&package.name).unwrap();
-            write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+            write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
             transaction.commit().unwrap();
         }
         let backup = cache.parent().unwrap().join(format!(
@@ -6148,17 +6499,32 @@ fn type_cache_preserves_every_markerless_backup_and_resumes() {
         } else if variant == "unknown" {
             std::fs::write(backup.join("foreign"), "must survive").unwrap();
         }
-        let expected = regular_file_snapshot(&backup);
+        let parent = cache.parent().unwrap();
+        let before_files = regular_file_snapshot(parent);
+        let before_names = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>();
         let error = InvocationTypeCache::new(&target, &package, true, &bundle)
             .err()
-            .expect("every markerless backup must fail closed")
-            .to_string();
-        assert!(error.contains("durable root ownership"), "{error}");
-        let preserved = find_preserved_type_residue(cache.parent().unwrap(), "backup");
-        assert_eq!(regular_file_snapshot(&preserved), expected);
+            .expect("every markerless backup must fail before recovery mutation");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("preflighting OHOS type-cache backup"),
+            "{error}"
+        );
+        assert_eq!(regular_file_snapshot(parent), before_files);
+        assert_eq!(
+            std::fs::read_dir(parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect::<BTreeSet<_>>(),
+            before_names
+        );
+        assert!(backup.is_dir());
+        std::fs::remove_dir_all(&backup).unwrap();
         let next = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
         drop(next);
-        assert!(preserved.is_dir());
     }
     std::fs::remove_dir_all(root).ok();
 }
@@ -6170,7 +6536,7 @@ fn type_cache_markers_reject_unknown_fields_and_unowned_crash_residue() {
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
     let identity = TypeCacheIdentity::new(&package, &bundle).unwrap();
-    let work_entries = expected_type_work_entries(&package, &bundle).unwrap();
+    let work_entries = expected_type_work_entries(&bundle).unwrap();
     let mut transaction = InvocationTypeCache::new(&target, &package, false, &bundle).unwrap();
     let work = transaction.work_dir().to_path_buf();
     let marker_path = work.join(TYPE_CACHE_WORK_MARKER);
@@ -6210,7 +6576,7 @@ fn type_cache_markers_reject_unknown_fields_and_unowned_crash_residue() {
     let error = validate_type_work_marker(&work, &identity, &work_entries)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("invalid type"), "{error}");
+    assert!(error.contains("expected 3"), "{error}");
 
     let duplicate_owner = String::from_utf8(original_marker.clone())
         .unwrap()
@@ -6251,11 +6617,542 @@ fn type_cache_markers_reject_unknown_fields_and_unowned_crash_residue() {
 
     transaction.work_dir = None;
     drop(transaction);
+    let before_files = regular_file_snapshot(&target);
+    let before_names = std::fs::read_dir(target.join(TYPE_ROOT))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<BTreeSet<_>>();
     let error = InvocationTypeCache::new(&target, &package, false, &bundle)
         .err()
-        .expect("unknown work marker field must fail closed")
-        .to_string();
-    assert!(error.contains("preserved unproven"), "{error}");
+        .expect("legacy or expanded work journal must fail before recovery mutation");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("refusing unowned OHOS type-cache work directory"),
+        "{error}"
+    );
+    assert_eq!(regular_file_snapshot(&target), before_files);
+    assert_eq!(
+        std::fs::read_dir(target.join(TYPE_ROOT))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>(),
+        before_names
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn type_work_journal_requires_explicit_null_sha256_before_mutation() {
+    let root = temp_test_dir("uniffi-ohos-type-work-required-null");
+    let target = root.join("target");
+    let package = test_host_package("cache-host", "1.0.0", "cache_host");
+    let bundle = test_host_facade_bundle();
+    let identity = TypeCacheIdentity::new(&package, &bundle).unwrap();
+    let expected = expected_type_work_entries(&bundle).unwrap();
+    let cache = commit_test_type_cache(&target, &package, &bundle);
+    let mut interrupted = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
+    let work = interrupted.work_dir().to_path_buf();
+    let marker_path = work.join(TYPE_CACHE_WORK_MARKER);
+    let original_marker = std::fs::read(&marker_path).unwrap();
+    let parsed = parse_type_work_marker(&original_marker).unwrap();
+    validate_type_work_journal(&parsed, &work, &identity, &expected).unwrap();
+    let planned_entries = parsed
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.state == TypeWorkEntryState::Planned).then_some(index))
+        .collect::<Vec<_>>();
+    assert!(!planned_entries.is_empty());
+    assert!(planned_entries
+        .iter()
+        .all(|index| parsed.entries[*index].sha256.is_none()));
+    let mut canonical_marker = serde_json::to_string_pretty(&parsed).unwrap();
+    canonical_marker.push('\n');
+    assert_eq!(canonical_marker.as_bytes(), original_marker.as_slice());
+
+    let sentinel = target.join("required-null-sentinel");
+    std::fs::write(&sentinel, b"type-work sentinel must survive").unwrap();
+    interrupted.work_dir = None;
+    drop(interrupted);
+
+    let stem = format!("{}-{}", package.name, identity.digest().unwrap());
+    let lock = target.join(TYPE_ROOT).join(format!(".{stem}.uniffi.lock"));
+    assert!(
+        lock.is_file(),
+        "interrupted type-work journal lost its lock"
+    );
+    std::fs::remove_file(&lock).unwrap();
+
+    let original: serde_json::Value = serde_json::from_slice(&original_marker).unwrap();
+    for index in planned_entries {
+        let mut missing = original.clone();
+        assert!(missing["entries"].as_array_mut().unwrap()[index]
+            .as_object_mut()
+            .unwrap()
+            .remove("sha256")
+            .is_some());
+        std::fs::write(&marker_path, serde_json::to_vec_pretty(&missing).unwrap()).unwrap();
+
+        let before = regular_file_snapshot(&target);
+        let error = InvocationTypeCache::new(&target, &package, true, &bundle)
+            .err()
+            .expect("a current type-work marker missing sha256 must fail before mutation");
+        let error = format!("{error:#}");
+        assert!(error.contains("missing field"), "{error}");
+        assert!(error.contains("sha256"), "{error}");
+        assert!(
+            work.is_dir(),
+            "missing sha256 removed or renamed work residue"
+        );
+        assert!(!lock.exists(), "missing sha256 created a type-cache lock");
+        assert_eq!(regular_file_snapshot(&target), before);
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"type-work sentinel must survive"
+        );
+        assert!(cache.is_dir(), "missing sha256 changed the published cache");
+    }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+struct RequiredNullableManagedLayout {
+    package_root: Utf8PathBuf,
+}
+
+impl ManagedTransactionLayout for RequiredNullableManagedLayout {
+    fn package_root(&self) -> &Utf8Path {
+        &self.package_root
+    }
+}
+
+fn required_nullable_managed_prepared_journal(public_root: &Utf8Path) -> ManagedPackageJournal {
+    let package_identity = managed_package_digest(public_root);
+    let generation = new_managed_generation();
+    let public_name = public_root.file_name().unwrap();
+    ManagedPackageJournal {
+        owner: MANAGED_PACKAGE_JOURNAL_KIND.into(),
+        schema_version: MANAGED_PACKAGE_JOURNAL_SCHEMA_VERSION,
+        package_identity: package_identity.clone(),
+        generation: generation.clone(),
+        sequence: 0,
+        previous_record_name: None,
+        previous_record_identity: None,
+        previous_record_digest: None,
+        state: "prepared".into(),
+        public_root: public_root.to_string(),
+        candidate_name: format!(".uniffi-managed-package-{package_identity}-{generation}-next"),
+        build_name: format!(".uniffi-managed-package-{package_identity}-{generation}-build"),
+        backup_name: format!(
+            ".uniffi-managed-package-{package_identity}-{generation}-{public_name}-backup"
+        ),
+        failed_name: format!(
+            ".uniffi-managed-package-{package_identity}-{generation}-{public_name}-failed"
+        ),
+        previous_root_identity: None,
+        candidate_root_identity: None,
+        build_root_identity: None,
+        backup_root_identity: None,
+        published_root_identity: None,
+        cleanup_snapshot_name: None,
+        cleanup_snapshot_identity: None,
+        cleanup_snapshot_digest: None,
+        cleanup_snapshot_len: None,
+    }
+}
+
+fn remove_current_fixture_key(value: &mut serde_json::Value, pointer: &str) -> String {
+    let (parent_pointer, field) = pointer
+        .rsplit_once('/')
+        .expect("current fixture key must use a JSON pointer");
+    let parent = if parent_pointer.is_empty() {
+        value
+    } else {
+        value
+            .pointer_mut(parent_pointer)
+            .expect("current fixture JSON pointer parent is missing")
+    };
+    assert!(
+        parent
+            .as_object_mut()
+            .expect("current fixture pointer parent must be an object")
+            .remove(field)
+            .is_some(),
+        "current fixture key is absent: {pointer}"
+    );
+    field.to_string()
+}
+
+fn assert_current_durable_fixture_requires_keys<T>(bytes: &[u8], keys: &[&str])
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let current: T = serde_json::from_slice(bytes).unwrap();
+    let mut canonical = serde_json::to_vec_pretty(&current).unwrap();
+    canonical.push(b'\n');
+    assert_eq!(canonical, bytes);
+    for key in keys {
+        let mut missing: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let field = remove_current_fixture_key(&mut missing, key);
+        let error = match serde_json::from_value::<T>(missing) {
+            Ok(_) => panic!("current durable fixture accepted a missing key: {key}"),
+            Err(error) => error,
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains("missing field"), "{key}: {error}");
+        assert!(error.contains(&field), "{key}: {error}");
+    }
+}
+
+fn current_durable_direct_destination() -> DirectDestinationRecord {
+    DirectDestinationRecord {
+        label: "current durable fixture output".into(),
+        path: "/tmp/current-durable-fixture-output".into(),
+        kind: "file".into(),
+        destination_digest: "a".repeat(64),
+        candidate: "/tmp/current-durable-fixture-candidate".into(),
+        backup: "/tmp/current-durable-fixture-backup".into(),
+        anchor: "/tmp/current-durable-fixture-anchor.json".into(),
+    }
+}
+
+#[test]
+fn current_durable_producer_fixtures_require_every_nullable_and_defaulted_key() {
+    let root = temp_test_dir("uniffi-current-durable-required-keys");
+
+    let owned_root = root.join("owned");
+    std::fs::create_dir_all(owned_root.join("directory")).unwrap();
+    std::fs::write(owned_root.join("file"), b"owned current fixture").unwrap();
+    let owned_marker_name = ".current-owned-tree-marker";
+    write_owned_tree_marker(&owned_root, owned_marker_name, "current-owned-tree").unwrap();
+    let owned_marker_bytes = std::fs::read(owned_root.join(owned_marker_name)).unwrap();
+    let owned_marker: serde_json::Value = serde_json::from_slice(&owned_marker_bytes).unwrap();
+    assert_eq!(owned_marker["identity"], serde_json::Value::Null);
+    assert_eq!(owned_marker["entries"][0]["path"], "directory");
+    assert_eq!(owned_marker["entries"][1]["path"], "file");
+    assert_eq!(
+        owned_marker["entries"][0]["sha256"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        owned_marker["entries"][0]["link_target"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        owned_marker["entries"][0]["resolved_target"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        owned_marker["entries"][1]["link_target"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        owned_marker["entries"][1]["resolved_target"],
+        serde_json::Value::Null
+    );
+    assert_current_durable_fixture_requires_keys::<OwnedTreeMarker>(
+        &owned_marker_bytes,
+        &[
+            "/identity",
+            "/entries/0/sha256",
+            "/entries/0/link_target",
+            "/entries/0/resolved_target",
+            "/entries/1/link_target",
+            "/entries/1/resolved_target",
+        ],
+    );
+
+    let hsp_directory = root.join("hsp-directory");
+    std::fs::create_dir(&hsp_directory).unwrap();
+    let hsp_file = root.join("hsp-file");
+    std::fs::write(&hsp_file, b"hsp current fixture").unwrap();
+    let directory_entry =
+        capture_generic_generation_entry(&hsp_directory, &hsp_directory, true).unwrap();
+    let file_entry = capture_generic_generation_entry(&hsp_file, &hsp_file, false).unwrap();
+    let (_, hsp_owner_bytes) =
+        direct_owner_record_bytes("current-durable-fixture", vec![directory_entry, file_entry])
+            .unwrap();
+    let hsp_owner: serde_json::Value = serde_json::from_slice(&hsp_owner_bytes).unwrap();
+    assert_eq!(hsp_owner["entries"][0]["kind"], "directory");
+    assert_eq!(hsp_owner["entries"][1]["kind"], "file");
+    assert_eq!(hsp_owner["entries"][0]["len"], serde_json::Value::Null);
+    assert_eq!(hsp_owner["entries"][0]["sha256"], serde_json::Value::Null);
+    assert_eq!(
+        hsp_owner["entries"][0]["parentMutationToken"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        hsp_owner["entries"][1]["rootMutationToken"],
+        serde_json::Value::Null
+    );
+    assert_current_durable_fixture_requires_keys::<HspGenerationJournal>(
+        &hsp_owner_bytes,
+        &[
+            "/entries/0/len",
+            "/entries/0/sha256",
+            "/entries/0/mutationTokens",
+            "/entries/0/rootMutationToken",
+            "/entries/0/parentMutationToken",
+            "/entries/0/hasHspOwnerMarkers",
+            "/entries/1/len",
+            "/entries/1/sha256",
+            "/entries/1/mutationTokens",
+            "/entries/1/rootMutationToken",
+            "/entries/1/parentMutationToken",
+            "/entries/1/hasHspOwnerMarkers",
+        ],
+    );
+
+    let plan_ready = DirectTransactionRecord {
+        owner: "uniffi-artifacts-transaction".into(),
+        schema_version: HSP_GENERATION_SCHEMA_VERSION,
+        plan_digest: "b".repeat(64),
+        generation: new_generation_id(),
+        sequence: 0,
+        state: "planReady".into(),
+        previous_record_name: None,
+        previous_record_identity: None,
+        previous_record_digest: None,
+        final_owner_path: "/tmp/current-durable-fixture-owner.json".into(),
+        destinations: vec![current_durable_direct_destination()],
+        anchor_witnesses: Vec::new(),
+        previous_owner_witness: None,
+        previous_entries: Vec::new(),
+        next_entries: Vec::new(),
+        mutation: None,
+        owner_successor: None,
+        recovery_owner_generation: None,
+        recovery_owner_entries: Vec::new(),
+    };
+    let plan_ready_bytes = serialize_direct_transaction_record(&plan_ready).unwrap();
+    assert_current_durable_fixture_requires_keys::<DirectTransactionRecord>(
+        &plan_ready_bytes,
+        &[
+            "/previousRecordName",
+            "/previousRecordIdentity",
+            "/previousRecordDigest",
+            "/anchorWitnesses",
+            "/previousOwnerWitness",
+            "/previousEntries",
+            "/nextEntries",
+            "/mutation",
+            "/ownerSuccessor",
+            "/recoveryOwnerGeneration",
+            "/recoveryOwnerEntries",
+        ],
+    );
+
+    let mut after_snapshot_cleanup = plan_ready.clone();
+    after_snapshot_cleanup.sequence = 1;
+    after_snapshot_cleanup.state = "afterSnapshotCleanup-generic-000000".into();
+    after_snapshot_cleanup.mutation = Some(DirectMutationEvent {
+        participant: "generic".into(),
+        operation: "afterSnapshotCleanup".into(),
+        index: 0,
+        source_path: "/tmp/current-durable-fixture-snapshot.tar.gz".into(),
+        destination_path: String::new(),
+        source_witness: None,
+        destination_witness: None,
+    });
+    let after_snapshot_cleanup_bytes =
+        serialize_direct_transaction_record(&after_snapshot_cleanup).unwrap();
+    assert_current_durable_fixture_requires_keys::<DirectTransactionRecord>(
+        &after_snapshot_cleanup_bytes,
+        &["/mutation/sourceWitness", "/mutation/destinationWitness"],
+    );
+
+    let anchor = DirectAnchorRecord {
+        owner: "uniffi-artifacts-anchor".into(),
+        schema_version: HSP_GENERATION_SCHEMA_VERSION,
+        destination_digest: "c".repeat(64),
+        plan_digest: "b".repeat(64),
+        generation: plan_ready.generation.clone(),
+        prepared_record: "/tmp/current-durable-fixture-plan-ready.json".into(),
+        final_owner_path: plan_ready.final_owner_path.clone(),
+        destinations: plan_ready.destinations.clone(),
+        previous_owner_witness: None,
+        previous_entries: Vec::new(),
+    };
+    let mut anchor_bytes = serde_json::to_vec_pretty(&anchor).unwrap();
+    anchor_bytes.push(b'\n');
+    assert_current_durable_fixture_requires_keys::<DirectAnchorRecord>(
+        &anchor_bytes,
+        &[
+            "/finalOwnerPath",
+            "/destinations",
+            "/previousOwnerWitness",
+            "/previousEntries",
+        ],
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn managed_journal_requires_explicit_null_fields_before_mutation() {
+    let root = temp_test_dir("uniffi-managed-journal-required-null");
+    let requested_public_root = root.join("package");
+    let public_root = canonicalize_invocation_output(&requested_public_root).unwrap();
+    let parent = public_root.parent().unwrap();
+    let layout = RequiredNullableManagedLayout {
+        package_root: requested_public_root.clone(),
+    };
+    let journal = required_nullable_managed_prepared_journal(&public_root);
+    let original = serialize_managed_journal(&journal).unwrap();
+    let parsed: ManagedPackageJournal = serde_json::from_slice(&original).unwrap();
+    validate_managed_journal(&parsed, &parsed.package_identity, &public_root).unwrap();
+    assert_eq!(serialize_managed_journal(&parsed).unwrap(), original);
+
+    let nullable_fields = [
+        "previousRecordName",
+        "previousRecordIdentity",
+        "previousRecordDigest",
+        "previousRootIdentity",
+        "candidateRootIdentity",
+        "buildRootIdentity",
+        "backupRootIdentity",
+        "publishedRootIdentity",
+        "cleanupSnapshotName",
+        "cleanupSnapshotIdentity",
+        "cleanupSnapshotDigest",
+        "cleanupSnapshotLen",
+    ];
+    let original_value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    for field in nullable_fields {
+        assert_eq!(original_value[field], serde_json::Value::Null, "{field}");
+    }
+    let record = managed_journal_record_path(parent, &journal);
+    let sentinel = parent.join("required-null-sentinel");
+    std::fs::write(&sentinel, b"managed journal sentinel must survive").unwrap();
+
+    // The producer's explicit-null sequence-0 record reaches recovery-chain
+    // validation; it is not mistaken for a missing-field parse failure.
+    std::fs::write(&record, &original).unwrap();
+    let error = match preflight_managed_package(&layout) {
+        Ok(_) => panic!("an interrupted managed journal unexpectedly passed preflight"),
+        Err(error) => error,
+    };
+    let error = format!("{error:#}");
+    assert!(error.contains("stopped in state `prepared`"), "{error}");
+    assert!(!requested_public_root.exists());
+
+    for field in nullable_fields {
+        let mut missing = original_value.clone();
+        assert!(missing.as_object_mut().unwrap().remove(field).is_some());
+        std::fs::write(&record, serde_json::to_vec_pretty(&missing).unwrap()).unwrap();
+
+        let before_files = regular_file_snapshot(parent);
+        let before_names = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>();
+        let error = ManagedPackageTransaction::begin(&layout)
+            .err()
+            .expect("a current managed journal missing a nullable key must fail before mutation");
+        let error = format!("{error:#}");
+        assert!(error.contains("missing field"), "{error}");
+        assert!(error.contains(field), "{error}");
+        assert!(
+            !requested_public_root.exists(),
+            "missing {field} created the public root"
+        );
+        assert_eq!(
+            regular_file_snapshot(parent),
+            before_files,
+            "missing {field}"
+        );
+        assert_eq!(
+            std::fs::read_dir(parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect::<BTreeSet<_>>(),
+            before_names,
+            "missing {field}"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"managed journal sentinel must survive"
+        );
+    }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn managed_journal_accepts_non_null_predecessor_and_snapshot_recovery_chain() {
+    let root = temp_test_dir("uniffi-managed-journal-required-null-successor");
+    let requested_public_root = root.join("package");
+    let public_root = canonicalize_invocation_output(&requested_public_root).unwrap();
+    let parent = public_root.parent().unwrap();
+    let mut journal = required_nullable_managed_prepared_journal(&public_root);
+    let mut records = match write_new_managed_journal(parent, &journal).unwrap() {
+        DurableRecordWrite::Durable(witness) => vec![witness],
+        DurableRecordWrite::NotCreated(error) => {
+            panic!("initial current managed journal was not created: {error:#}")
+        }
+        DurableRecordWrite::CreatedDurabilityUncertain { error, .. } => {
+            panic!("initial current managed journal durability was uncertain: {error:#}")
+        }
+    };
+    let snapshot_name = format!(
+        ".uniffi-managed-package-{}-{}-previous-generation.tar.gz",
+        journal.package_identity, journal.generation
+    );
+    let snapshot = parent.join(&snapshot_name);
+    let snapshot_bytes = b"current managed cleanup snapshot";
+    std::fs::write(&snapshot, snapshot_bytes).unwrap();
+    let snapshot_identity = persistent_fs_identity(&snapshot, false).unwrap();
+    let mut preserve_records = false;
+
+    for state in [
+        "candidateCreated",
+        "building",
+        "candidateReady",
+        "buildClean",
+        "renamingPublicToBackup",
+        "publicBackedUp",
+        "renamingCandidateToPublic",
+        "candidatePublished",
+        "publishingFinalOwner",
+        "committed",
+        "snapshottingBackup",
+        "snapshotReady",
+    ] {
+        journal.state = state.into();
+        if state == "snapshotReady" {
+            journal.cleanup_snapshot_name = Some(snapshot_name.clone());
+            journal.cleanup_snapshot_identity = Some(snapshot_identity.clone());
+            journal.cleanup_snapshot_digest = Some(sha256_bytes(snapshot_bytes));
+            journal.cleanup_snapshot_len = Some(snapshot_bytes.len() as u64);
+        }
+        append_managed_journal(parent, &mut journal, &mut records, &mut preserve_records).unwrap();
+    }
+    assert!(!preserve_records);
+    assert!(journal.previous_record_name.is_some());
+    assert!(journal.previous_record_identity.is_some());
+    assert!(journal.previous_record_digest.is_some());
+    assert!(journal.cleanup_snapshot_name.is_some());
+    assert!(journal.cleanup_snapshot_identity.is_some());
+    assert!(journal.cleanup_snapshot_digest.is_some());
+    assert!(journal.cleanup_snapshot_len.is_some());
+
+    let successor_path = managed_journal_record_path(parent, &journal);
+    let successor_bytes = std::fs::read(&successor_path).unwrap();
+    let parsed: ManagedPackageJournal = serde_json::from_slice(&successor_bytes).unwrap();
+    assert_eq!(parsed, journal);
+    validate_managed_journal(&parsed, &parsed.package_identity, &public_root).unwrap();
+
+    let before = regular_file_snapshot(parent);
+    let error = audit_managed_transaction_residue(parent, &public_root, &journal.package_identity)
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("stopped in state `snapshotReady`"),
+        "{error}"
+    );
+    assert!(!error.contains("missing field"), "{error}");
+    assert_eq!(regular_file_snapshot(parent), before);
+
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -6266,20 +7163,16 @@ fn type_cache_cleanup_failure_keeps_committed_new_cache_and_recovers() {
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
     let identity = TypeCacheIdentity::new(&package, &bundle).unwrap();
-    let work_entries = expected_type_work_entries(&package, &bundle).unwrap();
+    let work_entries = expected_type_work_entries(&bundle).unwrap();
     let cache = test_type_cache_path(&target, &package, &bundle);
     {
         let mut transaction = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-        std::fs::write(transaction.work_dir().join(&package.name), "old raw").unwrap();
-        transaction.record_completed_entry(&package.name).unwrap();
-        write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+        write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
         transaction.commit().unwrap();
     }
 
     let mut transaction = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-    std::fs::write(transaction.work_dir().join(&package.name), "old raw").unwrap();
-    transaction.record_completed_entry(&package.name).unwrap();
-    write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+    write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
     let work = transaction.work_dir().to_path_buf();
     validate_type_work_marker(&work, &identity, &work_entries).unwrap();
     std::fs::remove_file(work.join(TYPE_CACHE_WORK_MARKER)).unwrap();
@@ -6294,28 +7187,20 @@ fn type_cache_cleanup_failure_keeps_committed_new_cache_and_recovers() {
     transaction.work_dir = None;
     let error =
         publish_type_cache_with_cleanup(&work, &cache, previous.as_ref(), &identity, |backup| {
-            std::fs::remove_file(backup.join(&package.name))?;
+            std::fs::remove_file(backup.join(&bundle.contracts[0].file))?;
             Err(std::io::Error::other("injected partial cleanup failure").into())
         })
         .unwrap_err()
         .to_string();
     assert!(error.contains("cleaning previous"), "{error}");
     validate_type_cache(&cache, &identity).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(cache.join(&package.name)).unwrap(),
-        "old raw"
-    );
+    assert!(cache.join(FACADE_INVENTORY_FILE).is_file());
 
-    // The damaged backup is exact-inventory audit residue only; the next
-    // invocation removes it and continues from the complete new cache.
-    drop(transaction);
-    let next = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(next.work_dir().join(&package.name)).unwrap(),
-        "old raw"
-    );
     let cache_name = cache.file_name().unwrap();
     let backup_prefix = format!(".{cache_name}.backup-");
+    drop(transaction);
+    let next = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
+    assert!(next.work_dir().join(&bundle.contracts[0].file).is_file());
     assert!(std::fs::read_dir(cache.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
@@ -6325,12 +7210,11 @@ fn type_cache_cleanup_failure_keeps_committed_new_cache_and_recovers() {
 }
 
 #[test]
-fn type_work_journal_preserves_changed_known_payloads_without_blocking_next_build() {
+fn type_work_journal_rejects_changed_known_payloads_without_mutation() {
     let root = temp_test_dir("uniffi-ohos-type-work-journal-changes");
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
     let changed_paths = [
-        package.name.as_str(),
         FACADE_INVENTORY_FILE,
         bundle.contracts[0].file.as_str(),
         bundle.type_sidecars[0].file.as_str(),
@@ -6338,10 +7222,10 @@ fn type_work_journal_preserves_changed_known_payloads_without_blocking_next_buil
 
     for (index, changed_path) in changed_paths.into_iter().enumerate() {
         let target = root.join(format!("target-{index}"));
-        let cache = commit_test_type_cache(&target, &package, &bundle, "stable raw");
+        let cache = commit_test_type_cache(&target, &package, &bundle);
         let published = regular_file_snapshot(&cache);
         let mut interrupted = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-        write_facade_type_inventory(interrupted.work_dir(), &package, &bundle).unwrap();
+        write_facade_type_inventory(interrupted.work_dir(), &bundle).unwrap();
         let work = interrupted.work_dir().to_path_buf();
         interrupted.work_dir = None;
         drop(interrupted);
@@ -6351,72 +7235,135 @@ fn type_work_journal_preserves_changed_known_payloads_without_blocking_next_buil
             format!("USER-CONTENT-MUST-SURVIVE-{index}"),
         )
         .unwrap();
+        let before_files = regular_file_snapshot(&target);
+        let before_names = std::fs::read_dir(cache.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>();
         let error = InvocationTypeCache::new(&target, &package, true, &bundle)
             .err()
-            .expect("changed journaled payload must fail closed")
-            .to_string();
-        assert!(error.contains("preserved unproven"), "{error}");
-        let preserved = find_preserved_type_residue(cache.parent().unwrap(), "work");
+            .expect("changed journaled payload must fail before recovery mutation");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("OHOS type-work contains unjournaled or changed entry"),
+            "{error}"
+        );
         assert_eq!(
-            std::fs::read_to_string(preserved.join(changed_path)).unwrap(),
+            std::fs::read_to_string(work.join(changed_path)).unwrap(),
             format!("USER-CONTENT-MUST-SURVIVE-{index}")
         );
         assert_eq!(regular_file_snapshot(&cache), published);
-
-        // The preserved name is outside both work/backup scan prefixes;
-        // the next invocation can use a fresh work tree without deleting it.
-        let next = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-        drop(next);
-        assert!(preserved.exists());
+        assert_eq!(regular_file_snapshot(&target), before_files);
+        assert_eq!(
+            std::fs::read_dir(cache.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect::<BTreeSet<_>>(),
+            before_names
+        );
     }
     std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn type_work_journal_preserves_pending_and_legacy_schema2_payloads() {
-    let root = temp_test_dir("uniffi-ohos-type-work-journal-legacy");
+fn type_work_journal_rejects_unjournaled_current_payloads_without_mutation() {
+    let root = temp_test_dir("uniffi-ohos-type-work-journal-current");
+    let package = test_host_package("cache-host", "1.0.0", "cache_host");
+    let bundle = test_host_facade_bundle();
+    let target = root.join("pending");
+    let cache = commit_test_type_cache(&target, &package, &bundle);
+    let published = regular_file_snapshot(&cache);
+    let mut interrupted = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
+    let work = interrupted.work_dir().to_path_buf();
+    std::fs::write(work.join(&package.name), "USER-CONTENT-MUST-SURVIVE").unwrap();
+    interrupted.work_dir = None;
+    drop(interrupted);
+
+    let before_files = regular_file_snapshot(&target);
+    let before_names = std::fs::read_dir(cache.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<BTreeSet<_>>();
+    let error = InvocationTypeCache::new(&target, &package, true, &bundle)
+        .err()
+        .expect("unjournaled current work payload must fail before recovery mutation");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("OHOS type-work contains unjournaled or changed entry"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join(&package.name)).unwrap(),
+        "USER-CONTENT-MUST-SURVIVE"
+    );
+    assert_eq!(regular_file_snapshot(&cache), published);
+    assert_eq!(regular_file_snapshot(&target), before_files);
+    assert_eq!(
+        std::fs::read_dir(cache.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>(),
+        before_names
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn type_work_schema2_empty_and_nonempty_residue_fail_without_mutation() {
+    let root = temp_test_dir("uniffi-ohos-type-work-schema2-no-mutation");
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
     let identity = TypeCacheIdentity::new(&package, &bundle).unwrap();
-    let expected = expected_type_work_entries(&package, &bundle).unwrap();
+    let expected = expected_type_work_entries(&bundle).unwrap();
 
-    for legacy in [false, true] {
-        let target = root.join(if legacy { "legacy" } else { "pending" });
-        let cache = commit_test_type_cache(&target, &package, &bundle, "published raw");
+    for (label, payload) in [
+        ("empty", None),
+        ("payload", Some("USER-CONTENT-MUST-SURVIVE")),
+    ] {
+        let target = root.join(label);
+        let cache = commit_test_type_cache(&target, &package, &bundle);
         let published = regular_file_snapshot(&cache);
         let mut interrupted = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
         let work = interrupted.work_dir().to_path_buf();
-        std::fs::write(work.join(&package.name), "USER-CONTENT-MUST-SURVIVE").unwrap();
-        if legacy {
-            let legacy_marker = TypeWorkMarkerV2 {
-                owner: "uniffi-ohos-type-work".into(),
-                schema_version: OWNER_SCHEMA_VERSION,
-                identity: identity.clone(),
-                entries: expected.iter().cloned().collect(),
-            };
-            std::fs::write(
-                work.join(TYPE_CACHE_WORK_MARKER),
-                serde_json::to_vec_pretty(&legacy_marker).unwrap(),
-            )
-            .unwrap();
+        if let Some(payload) = payload {
+            std::fs::write(work.join(&package.name), payload).unwrap();
         }
+        let legacy_marker = serde_json::json!({
+            "owner": "uniffi-ohos-type-work",
+            "schemaVersion": 2,
+            "identity": identity.clone(),
+            "entries": expected.iter().cloned().collect::<Vec<_>>(),
+        });
+        std::fs::write(
+            work.join(TYPE_CACHE_WORK_MARKER),
+            serde_json::to_vec_pretty(&legacy_marker).unwrap(),
+        )
+        .unwrap();
         interrupted.work_dir = None;
         drop(interrupted);
 
+        let stem = format!("{}-{}", package.name, identity.digest().unwrap());
+        let lock = target.join(TYPE_ROOT).join(format!(".{stem}.uniffi.lock"));
+        std::fs::remove_file(&lock).unwrap();
+        let before = regular_file_snapshot(&target);
         let error = InvocationTypeCache::new(&target, &package, true, &bundle)
             .err()
-            .expect("unproven work payload must be preserved")
+            .expect("schema-2 work residue must fail before any mutation")
             .to_string();
-        assert!(error.contains("preserved unproven"), "{error}");
-        let preserved = find_preserved_type_residue(cache.parent().unwrap(), "work");
-        assert_eq!(
-            std::fs::read_to_string(preserved.join(&package.name)).unwrap(),
-            "USER-CONTENT-MUST-SURVIVE"
+        assert!(error.contains("expected 3"), "{error}");
+        assert!(
+            work.exists(),
+            "schema-2 work residue was removed or renamed"
         );
+        assert!(!lock.exists(), "schema-2 residue created a type-cache lock");
+        assert_eq!(regular_file_snapshot(&target), before);
         assert_eq!(regular_file_snapshot(&cache), published);
-        let next = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-        drop(next);
-        assert!(preserved.exists());
+        if let Some(payload) = payload {
+            assert_eq!(
+                std::fs::read_to_string(work.join(&package.name)).unwrap(),
+                payload
+            );
+        }
     }
     std::fs::remove_dir_all(root).ok();
 }
@@ -6428,22 +7375,19 @@ fn type_work_journal_recovers_a_durable_successor_snapshot() {
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
     let identity = TypeCacheIdentity::new(&package, &bundle).unwrap();
-    let expected = expected_type_work_entries(&package, &bundle).unwrap();
+    let expected = expected_type_work_entries(&bundle).unwrap();
     let mut interrupted = InvocationTypeCache::new(&target, &package, false, &bundle).unwrap();
     let work = interrupted.work_dir().to_path_buf();
-    std::fs::write(work.join(&package.name), "durable raw").unwrap();
-    let marker = match validate_type_work_marker(&work, &identity, &expected).unwrap() {
-        TypeWorkMarkerVersion::Journal(value) => value,
-        TypeWorkMarkerVersion::Legacy(_) => panic!("new work must use schema 3"),
-    };
+    std::fs::write(work.join(FACADE_INVENTORY_FILE), "durable inventory").unwrap();
+    let marker = validate_type_work_marker(&work, &identity, &expected).unwrap();
     let mut next = marker.clone();
-    let raw = next
+    let inventory = next
         .entries
         .iter_mut()
-        .find(|entry| entry.path == package.name)
+        .find(|entry| entry.path == FACADE_INVENTORY_FILE)
         .unwrap();
-    raw.state = TypeWorkEntryState::Complete;
-    raw.sha256 = Some(sha256_bytes(b"durable raw"));
+    inventory.state = TypeWorkEntryState::Complete;
+    inventory.sha256 = Some(sha256_bytes(b"durable inventory"));
     next.revision += 1;
     let mut text = serde_json::to_string_pretty(&next).unwrap();
     text.push('\n');
@@ -6456,6 +7400,9 @@ fn type_work_journal_recovers_a_durable_successor_snapshot() {
         .sync_all()
         .unwrap();
     sync_directory(&work).unwrap();
+    let before_read_only = regular_file_snapshot(&work);
+    validate_type_work_marker_read_only(&work, &identity, &expected).unwrap();
+    assert_eq!(regular_file_snapshot(&work), before_read_only);
     interrupted.work_dir = None;
     drop(interrupted);
 
@@ -6473,10 +7420,9 @@ fn type_cleanup_binds_payload_and_marker_removal_to_opened_identity() {
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
     let identity = TypeCacheIdentity::new(&package, &bundle).unwrap();
-    let cache = commit_test_type_cache(&target, &package, &bundle, "stable raw");
+    let cache = commit_test_type_cache(&target, &package, &bundle);
     let published = regular_file_snapshot(&cache);
     let file_targets = [
-        package.name.as_str(),
         FACADE_INVENTORY_FILE,
         bundle.contracts[0].file.as_str(),
         bundle.type_sidecars[0].file.as_str(),
@@ -6588,20 +7534,18 @@ fn type_cleanup_binds_work_marker_directory_and_root_identity() {
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
     let identity = TypeCacheIdentity::new(&package, &bundle).unwrap();
-    let expected = expected_type_work_entries(&package, &bundle).unwrap();
+    let expected = expected_type_work_entries(&bundle).unwrap();
 
     let target = root.join("work-target");
     let mut transaction = InvocationTypeCache::new(&target, &package, false, &bundle).unwrap();
-    std::fs::write(transaction.work_dir().join(&package.name), "raw").unwrap();
-    transaction.record_completed_entry(&package.name).unwrap();
-    write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+    write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
     let work = transaction.work_dir().to_path_buf();
     write_owned_tree_marker_with_identity_ignoring(
         &work,
         TYPE_CACHE_OWNER_MARKER,
         TYPE_CACHE_OWNER_KIND,
         Some(&identity),
-        &[TYPE_CACHE_WORK_MARKER],
+        &[TYPE_CACHE_WORK_MARKER, TYPE_CACHE_WORK_NEXT_MARKER],
     )
     .unwrap();
     transaction.work_dir = None;
@@ -6696,7 +7640,7 @@ fn type_cleanup_binds_work_marker_directory_and_root_identity() {
 
 #[cfg(unix)]
 #[test]
-fn type_cache_commit_error_does_not_drop_replacement_root() {
+fn type_cache_commit_error_does_not_adopt_replacement_root() {
     use std::os::unix::fs::MetadataExt;
 
     let root = temp_test_dir("uniffi-ohos-type-commit-drop-identity");
@@ -6704,9 +7648,7 @@ fn type_cache_commit_error_does_not_drop_replacement_root() {
     let package = test_host_package("cache-host", "1.0.0", "cache_host");
     let bundle = test_host_facade_bundle();
     let mut transaction = InvocationTypeCache::new(&target, &package, false, &bundle).unwrap();
-    std::fs::write(transaction.work_dir().join(&package.name), "raw").unwrap();
-    transaction.record_completed_entry(&package.name).unwrap();
-    write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+    write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
 
     let work = transaction.work_dir().to_path_buf();
     let displaced_root = root.join("displaced-owned-root");
@@ -6735,28 +7677,44 @@ fn type_cache_commit_error_does_not_drop_replacement_root() {
         "the originally opened owned root remains inspectable"
     );
     let replacement_identity = std::fs::symlink_metadata(&work).unwrap();
+    let parent = work.parent().unwrap();
+    let before_files = regular_file_snapshot(parent);
+    let before_names = std::fs::read_dir(parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<BTreeSet<_>>();
     let error = InvocationTypeCache::new(&target, &package, false, &bundle)
         .err()
-        .expect("the next transaction must preserve unowned markerless residue")
-        .to_string();
-    assert!(error.contains("preserved"), "{error}");
-    let preserved = find_preserved_type_residue(work.parent().unwrap(), "work");
-    let preserved_identity = std::fs::symlink_metadata(&preserved).unwrap();
-    assert_eq!(
-        (preserved_identity.dev(), preserved_identity.ino()),
-        (replacement_identity.dev(), replacement_identity.ino()),
-        "startup recovery must retain the replacement directory object"
+        .expect("the next transaction must reject an unowned markerless residue");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("unowned OHOS type-work residue before mutation"),
+        "{error}"
     );
+    let visible_identity = std::fs::symlink_metadata(&work).unwrap();
+    assert_eq!(
+        (visible_identity.dev(), visible_identity.ino()),
+        (replacement_identity.dev(), replacement_identity.ino()),
+        "strict preflight must retain the replacement directory object"
+    );
+    assert_eq!(regular_file_snapshot(parent), before_files);
+    assert_eq!(
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>(),
+        before_names
+    );
+    std::fs::remove_dir(&work).unwrap();
     let next = InvocationTypeCache::new(&target, &package, false, &bundle).unwrap();
     assert_ne!(next.work_dir(), work);
     drop(next);
-    assert!(preserved.is_dir());
     std::fs::remove_dir_all(root).ok();
 }
 
 #[cfg(unix)]
 #[test]
-fn type_cache_preserves_markerless_empty_residue_for_every_prefix() {
+fn type_cache_rejects_markerless_empty_residue_for_every_prefix_without_mutation() {
     use std::os::unix::fs::MetadataExt;
 
     let root = temp_test_dir("uniffi-ohos-markerless-empty-residue");
@@ -6774,46 +7732,78 @@ fn type_cache_preserves_markerless_empty_residue_for_every_prefix() {
         transaction.work_dir = None;
         drop(transaction);
 
+        let parent = residue.parent().unwrap();
+        let before_files = regular_file_snapshot(parent);
+        let before_names = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>();
         let error = InvocationTypeCache::new(&target, &package, dts_cache, &bundle)
             .err()
-            .expect("markerless empty work must be preserved before retry")
-            .to_string();
-        assert!(error.contains("preserved"), "{error}");
-        let preserved = find_preserved_type_residue(residue.parent().unwrap(), "work");
-        let preserved_identity = std::fs::symlink_metadata(&preserved).unwrap();
+            .expect("markerless empty work must fail before recovery mutation");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("unowned OHOS type-work residue before mutation"),
+            "{error}"
+        );
+        let visible_identity = std::fs::symlink_metadata(&residue).unwrap();
         assert_eq!(
-            (preserved_identity.dev(), preserved_identity.ino()),
+            (visible_identity.dev(), visible_identity.ino()),
             (identity.dev(), identity.ino()),
             "{name} work prefix must not authorize empty-root deletion"
         );
+        assert_eq!(regular_file_snapshot(parent), before_files);
+        assert_eq!(
+            std::fs::read_dir(parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect::<BTreeSet<_>>(),
+            before_names
+        );
+        std::fs::remove_dir(&residue).unwrap();
         let next = InvocationTypeCache::new(&target, &package, dts_cache, &bundle).unwrap();
         drop(next);
-        assert!(preserved.is_dir());
     }
 
     let target = root.join("backup");
-    let cache = commit_test_type_cache(&target, &package, &bundle, "stable raw");
+    let cache = commit_test_type_cache(&target, &package, &bundle);
     let backup = cache.parent().unwrap().join(format!(
         ".{}.backup-markerless-empty",
         cache.file_name().unwrap()
     ));
     std::fs::create_dir(&backup).unwrap();
     let identity = std::fs::symlink_metadata(&backup).unwrap();
+    let parent = backup.parent().unwrap();
+    let before_files = regular_file_snapshot(parent);
+    let before_names = std::fs::read_dir(parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<BTreeSet<_>>();
     let error = InvocationTypeCache::new(&target, &package, true, &bundle)
         .err()
-        .expect("markerless empty backup must be preserved before retry")
-        .to_string();
-    assert!(error.contains("preserved"), "{error}");
-    let preserved = find_preserved_type_residue(backup.parent().unwrap(), "backup");
-    let preserved_identity = std::fs::symlink_metadata(&preserved).unwrap();
+        .expect("markerless empty backup must fail before recovery mutation");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("preflighting OHOS type-cache backup"),
+        "{error}"
+    );
+    let visible_identity = std::fs::symlink_metadata(&backup).unwrap();
     assert_eq!(
-        (preserved_identity.dev(), preserved_identity.ino()),
+        (visible_identity.dev(), visible_identity.ino()),
         (identity.dev(), identity.ino()),
         "backup prefix must not authorize empty-root deletion"
     );
+    assert_eq!(regular_file_snapshot(parent), before_files);
+    assert_eq!(
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>(),
+        before_names
+    );
+    std::fs::remove_dir(&backup).unwrap();
     let next = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
     drop(next);
-    assert!(preserved.is_dir());
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -6939,8 +7929,9 @@ fn type_cache_identity_lock_serializes_shared_target_and_rejects_unowned_mutatio
             .expect("unowned cache must fail closed")
     );
     assert!(
-        error.contains("damaged OHOS type cache")
-            && (error.contains("ownership marker") || error.contains("unowned")),
+        error.contains("reading uniffi-ohos-type-cache ownership marker")
+            || error.contains("ownership marker")
+            || error.contains("unowned"),
         "{error}"
     );
     std::fs::remove_dir_all(root).ok();
@@ -6967,13 +7958,15 @@ fn type_cache_rejects_symlink_root_and_hardlinked_owned_files() {
     std::fs::remove_file(target.join(TYPE_ROOT)).unwrap();
 
     let mut transaction = InvocationTypeCache::new(&target, &package, true, &bundle).unwrap();
-    std::fs::write(transaction.work_dir().join(&package.name), "raw").unwrap();
-    transaction.record_completed_entry(&package.name).unwrap();
-    write_facade_type_inventory(transaction.work_dir(), &package, &bundle).unwrap();
+    write_facade_type_inventory(transaction.work_dir(), &bundle).unwrap();
     transaction.commit().unwrap();
     drop(transaction);
     let cache = test_type_cache_path(&target, &package, &bundle);
-    std::fs::hard_link(cache.join(&package.name), cache.join("raw-alias")).unwrap();
+    std::fs::hard_link(
+        cache.join(&bundle.contracts[0].file),
+        cache.join("facade-alias"),
+    )
+    .unwrap();
     let error = format!(
         "{:#}",
         InvocationTypeCache::new(&target, &package, true, &bundle)
@@ -7017,8 +8010,8 @@ interface InputNext {
   value?: number;
   error?: string;
 }
-type __UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext = InputNext;
-interface __UniffiInputStream<N> {
+type UniffiInputStreamNumberStringFingerprint8b30e3aa815a2f4aNext = InputNext;
+interface UniffiInputStream<N> {
   handle: number;
   next(error: Error | null, handle: number): Promise<N>;
   cancel(error: Error | null, handle: number): void;
@@ -7031,7 +8024,7 @@ class __StubState {
   extraMalformedKind: string = '';
   reject: boolean = false;
   delayed: boolean = false;
-  source: __UniffiInputStream<InputNext> | null = null;
+  source: UniffiInputStream<InputNext> | null = null;
 }
 const __typedError = { variant: 'StorageInvalidated', data: { generation: 7 }, message: 'typed failure' };
 const __startError: Error = new Error('start failure');
@@ -7122,7 +8115,7 @@ const native = {
     __cancelCalls += 1;
     __states.delete(handle);
   },
-  echoEvents(source: __UniffiInputStream<InputNext>): bigint {
+  echoEvents(source: UniffiInputStream<InputNext>): bigint {
     __startCalls += 1;
     const handle: bigint = __nextHandle;
     __nextHandle += 1n;
@@ -7134,7 +8127,7 @@ const native = {
   async echoEventsStreamNext(handle: bigint): Promise<FixtureNext> {
     __nextCalls += 1;
     const state: __StubState = __states.get(handle) as __StubState;
-    const source: __UniffiInputStream<InputNext> = state.source as __UniffiInputStream<InputNext>;
+    const source: UniffiInputStream<InputNext> = state.source as UniffiInputStream<InputNext>;
     const input: InputNext = await source.next(null, source.handle);
     if (!input.ok) {
       __states.delete(handle);
@@ -7427,13 +8420,13 @@ console.log('harmony-stream-runtime-ok');
 }
 
 #[test]
-fn collects_extensionless_ohos_type_def_files() {
+fn rejects_noncanonical_ohos_type_definition_files() {
     let root = temp_test_dir("uniffi-ohos-type-defs");
-    let content = r#"{"kind":"fn","name":"welcomeAgent","def":"function welcomeAgent(agentName: string): string","js_doc":null,"js_mod":null}"#;
+    let content = r#"{"kind":"fn","name":"welcomeAgent","def":"function welcomeAgent(agentName: string): string"}"#;
     std::fs::write(root.join("uni-core-ohos"), content).unwrap();
 
     let mut defs = Vec::new();
-    collect_type_defs(
+    let error = collect_type_defs(
         &root,
         &[FacadeInventoryFile {
             file: "uni-core-ohos".into(),
@@ -7441,10 +8434,9 @@ fn collects_extensionless_ohos_type_def_files() {
         }],
         &mut defs,
     )
-    .unwrap();
-    let rendered = render_index_d_ts(defs);
-
-    assert!(rendered.contains("export declare function welcomeAgent(agentName: string): string"));
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("exact `type_def:` envelope"), "{error}");
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -7684,7 +8676,7 @@ fn generates_har_with_package_root_and_no_absolute_paths() {
         .unwrap();
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"schemaVersion\":4,\"components\":[],\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"hspFacadeAggregateSchemaVersion\":1,\"components\":[],\"componentIdentities\":[],\"hostCompositeIdentity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outputStreams\":[],\"inputStreams\":[]}",
     )
     .unwrap();
     std::fs::write(dist.join("arm64-v8a/libdemo_ohos.so"), "fake").unwrap();
@@ -8766,7 +9758,7 @@ fn normalized_so_error_cleans_its_exact_sealed_provenance_root() {
 
 fn test_hsp_facade_contract() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
-        "schemaVersion": FACADE_CONTRACT_SCHEMA_VERSION,
+        "hspFacadeAggregateSchemaVersion": HSP_FACADE_AGGREGATE_SCHEMA_VERSION,
         "components": [],
         "componentIdentities": [],
         "hostCompositeIdentity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
