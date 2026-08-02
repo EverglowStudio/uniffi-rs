@@ -881,7 +881,8 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "managed manifest must be relative-only:\n{manifest_text}"
     );
     let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
-    assert_eq!(manifest_json["schemaVersion"], 3);
+    assert_eq!(manifest_json["artifactManifestSchemaVersion"], 3);
+    assert!(manifest_json.get("schemaVersion").is_none());
     assert_eq!(
         manifest_json["targets"],
         serde_json::json!(["wasm", "mini-program", "node"])

@@ -88,6 +88,133 @@ use uniffi_meta::{
 pub type Literal = LiteralMetadata;
 pub type DefaultValue = DefaultValueMetadata;
 
+/// Return the stable prefix used by UniFFI's native C ABI exports for a
+/// component.
+///
+/// Artifact schemas must not invent a second notion of component identity
+/// from an output filename.  Keep the prefix alongside the interface model so
+/// contract producers, host bundles, and consumers all derive it from the
+/// same native-symbol rule.
+pub fn native_export_prefix_for_component(component: &str) -> String {
+    // Cargo package spellings may use `-`, while the Rust/C symbol spelling
+    // is an identifier.  This is the same normalization already used by the
+    // generated Harmony facade when it reserves component-derived names.
+    format!("ffi_{}", component.replace('-', "_"))
+}
+
+/// Whether `value` is reserved by the ArkTS declaration grammar used by the
+/// Harmony binding surfaces.
+pub fn is_arkts_reserved_identifier(value: &str) -> bool {
+    matches!(
+        value,
+        "abstract"
+            | "as"
+            | "async"
+            | "await"
+            | "boolean"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "constructor"
+            | "continue"
+            | "debugger"
+            | "declare"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "from"
+            | "function"
+            | "get"
+            | "if"
+            | "implements"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "interface"
+            | "is"
+            | "keyof"
+            | "let"
+            | "module"
+            | "namespace"
+            | "never"
+            | "new"
+            | "null"
+            | "number"
+            | "object"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "readonly"
+            | "require"
+            | "return"
+            | "set"
+            | "static"
+            | "string"
+            | "super"
+            | "switch"
+            | "symbol"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "undefined"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
+fn validate_harmony_identifier(value: &str, label: &str) -> Result<()> {
+    let mut chars = value.chars();
+    if !chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == '$')
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+        || is_arkts_reserved_identifier(value)
+    {
+        bail!("invalid Harmony {label} `{value}`");
+    }
+    Ok(())
+}
+
+/// Validate the identity fields carried through the checksummed Harmony
+/// facade contracts and host bundle.  Components are allowed to retain a
+/// Cargo-style dash, but their native ABI spelling is normalized to `_`.
+pub fn validate_harmony_component_identity(component: &str, namespace: &str) -> Result<()> {
+    if component.is_empty()
+        || component.len() > 256
+        || namespace.is_empty()
+        || namespace.len() > 256
+        || component == "."
+        || component == ".."
+        || component.contains("..")
+        || component.contains(['/', '\\'])
+    {
+        bail!("invalid Harmony component identity `{component}`");
+    }
+    validate_harmony_identifier(&component.replace('-', "_"), "component identity")?;
+    validate_harmony_identifier(namespace, "namespace identity")?;
+    validate_harmony_identifier(
+        &native_export_prefix_for_component(component),
+        "native export prefix",
+    )?;
+    Ok(())
+}
+
 /// The main public interface for this module, representing the complete details of an interface exposed
 /// by a rust component and the details of consuming it via an extern-C FFI layer.
 #[derive(Clone, Debug, Default)]
@@ -196,6 +323,11 @@ impl ComponentInterface {
     /// The crate this interfaces lives in.
     pub fn crate_name(&self) -> &str {
         &self.types.namespace.crate_name
+    }
+
+    /// The stable prefix used by this component's native C ABI exports.
+    pub fn native_export_prefix(&self) -> String {
+        native_export_prefix_for_component(self.ffi_namespace())
     }
 
     pub fn uniffi_contract_version(&self) -> u32 {
@@ -517,7 +649,7 @@ impl ComponentInterface {
     /// ABI as the scaffolding
     pub fn ffi_uniffi_contract_version(&self) -> FfiFunction {
         FfiFunction {
-            name: format!("ffi_{}_uniffi_contract_version", self.ffi_namespace()),
+            name: format!("{}_uniffi_contract_version", self.native_export_prefix()),
             is_async: false,
             arguments: vec![],
             return_type: Some(FfiType::UInt32),
@@ -531,7 +663,7 @@ impl ComponentInterface {
     /// complex data types across the FFI.
     pub fn ffi_rustbuffer_alloc(&self) -> FfiFunction {
         FfiFunction {
-            name: format!("ffi_{}_rustbuffer_alloc", self.ffi_namespace()),
+            name: format!("{}_rustbuffer_alloc", self.native_export_prefix()),
             is_async: false,
             arguments: vec![FfiArgument {
                 name: "size".to_string(),
@@ -548,7 +680,7 @@ impl ComponentInterface {
     /// complex data types across the FFI.
     pub fn ffi_rustbuffer_from_bytes(&self) -> FfiFunction {
         FfiFunction {
-            name: format!("ffi_{}_rustbuffer_from_bytes", self.ffi_namespace()),
+            name: format!("{}_rustbuffer_from_bytes", self.native_export_prefix()),
             is_async: false,
             arguments: vec![FfiArgument {
                 name: "bytes".to_string(),
@@ -565,7 +697,7 @@ impl ComponentInterface {
     /// complex data types returned across the FFI.
     pub fn ffi_rustbuffer_free(&self) -> FfiFunction {
         FfiFunction {
-            name: format!("ffi_{}_rustbuffer_free", self.ffi_namespace()),
+            name: format!("{}_rustbuffer_free", self.native_export_prefix()),
             is_async: false,
             arguments: vec![FfiArgument {
                 name: "buf".to_string(),
@@ -582,7 +714,7 @@ impl ComponentInterface {
     /// complex data types across the FFI.
     pub fn ffi_rustbuffer_reserve(&self) -> FfiFunction {
         FfiFunction {
-            name: format!("ffi_{}_rustbuffer_reserve", self.ffi_namespace()),
+            name: format!("{}_rustbuffer_reserve", self.native_export_prefix()),
             is_async: false,
             arguments: vec![
                 FfiArgument {
@@ -673,9 +805,13 @@ impl ComponentInterface {
     }
 
     fn rust_future_ffi_fn_name(&self, base_name: &str, return_ffi_type: Option<FfiType>) -> String {
-        let namespace = self.ffi_namespace();
         let return_type_name = FfiType::return_type_name(return_ffi_type.as_ref());
-        format!("ffi_{namespace}_{base_name}_{return_type_name}")
+        format!(
+            "{}_{}_{}",
+            self.native_export_prefix(),
+            base_name,
+            return_type_name
+        )
     }
 
     /// Does this interface contain async functions?
@@ -1573,6 +1709,42 @@ mod test {
 
     // Note that much of the functionality of `ComponentInterface` is tested via its interactions
     // with specific member types, in the sub-modules defining those member types.
+
+    #[test]
+    fn harmony_component_identity_uses_the_real_native_ffi_prefix() {
+        validate_harmony_component_identity("demo_core", "demoNamespace").unwrap();
+        validate_harmony_component_identity("demo-core", "demoNamespace").unwrap();
+        assert_eq!(
+            native_export_prefix_for_component("demo-core"),
+            "ffi_demo_core"
+        );
+
+        let ci = ComponentInterface::new("demo-core");
+        assert_eq!(ci.native_export_prefix(), "ffi_demo_core");
+        assert_eq!(
+            ci.ffi_uniffi_contract_version().name,
+            "ffi_demo_core_uniffi_contract_version"
+        );
+        assert_eq!(
+            ci.ffi_rustbuffer_alloc().name,
+            "ffi_demo_core_rustbuffer_alloc"
+        );
+
+        for (component, namespace) in [
+            ("", "valid"),
+            ("..", "valid"),
+            ("bad/component", "valid"),
+            (r"bad\component", "valid"),
+            ("valid", "class"),
+            ("valid", "bad.name"),
+            ("valid", ""),
+        ] {
+            assert!(
+                validate_harmony_component_identity(component, namespace).is_err(),
+                "invalid Harmony identity `{component}/{namespace}` unexpectedly passed"
+            );
+        }
+    }
 
     #[test]
     fn test_duplicate_type_names_are_an_error() {

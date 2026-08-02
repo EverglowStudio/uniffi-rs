@@ -132,10 +132,9 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
         "name = \"uniffi-example-arithmetic-ohos\"",
         "name = \"arithmetic_ohos\"",
         "napi-ohos = { version = \"1.1.6\"",
-        "napi-derive-ohos = { version = \"1.1.6\"",
+        "napi-derive-ohos = { version = \"1.1.6\", default-features = false, features = [\"strict\", \"type-def\"] }",
         "napi-build-ohos = \"1.1.6\"",
         "features = [\"napi8\", \"tokio_rt\"]",
-        "features = [\"type-def\"]",
         "[workspace]",
     ] {
         assert!(
@@ -143,6 +142,10 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
             "OHOS Cargo.toml missing `{required}`:\n{toml}"
         );
     }
+    assert!(
+        !toml.contains("napi-derive-backend-ohos"),
+        "OHOS host must not add an independent type-definition backend:\n{toml}"
+    );
     for forbidden in ["/Users/frain/Developer/refer/uni/ohos-rs", "ohos-rs/crates"] {
         assert!(
             !toml.contains(forbidden),
@@ -157,7 +160,12 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
         &std::fs::read(host_dir.join("ohos/uniffi-ohos-facade-bundle.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(bundle["schemaVersion"], 2);
+    assert_eq!(bundle["hostBundleSchemaVersion"], 3);
+    assert_eq!(bundle["components"][0]["namespace"], "arithmetic");
+    assert_eq!(
+        bundle["components"][0]["nativeExportPrefix"],
+        "ffi_arithmetical"
+    );
     assert!(bundle["fingerprint"]
         .as_str()
         .is_some_and(|value| value.len() == 64));

@@ -995,7 +995,6 @@ fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
 
 fn managed_command(root: &Path, arch: &str) -> Command {
     let package = root.join("package");
-    std::fs::create_dir_all(&package).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_uniffi-bindgen"));
     command
         .current_dir(repository_root())
@@ -1225,7 +1224,6 @@ fn hsp_managed_command(root: &Path) -> Command {
 
 fn hsp_managed_command_with_hvigor(root: &Path, hvigorw: &Path) -> Command {
     let package = root.join("package");
-    std::fs::create_dir_all(&package).unwrap();
     let sdk = deveco_sdk_home();
     let mut command = Command::new(env!("CARGO_BIN_EXE_uniffi-bindgen"));
     command
@@ -1270,7 +1268,6 @@ fn hsp_managed_command_with_hvigor(root: &Path, hvigorw: &Path) -> Command {
 
 fn har_managed_command(root: &Path) -> Command {
     let package = root.join("package");
-    std::fs::create_dir_all(&package).unwrap();
     let sdk = deveco_sdk_home();
     let mut command = Command::new(env!("CARGO_BIN_EXE_uniffi-bindgen"));
     command
@@ -1355,7 +1352,7 @@ fn assert_published_wasm_stream_consumer(
     let output = metadata.output().unwrap();
     assert_success(output, &metadata);
 
-    let driver = root.join("post-publish-wasm-driver.ts");
+    let driver = root.join("post-publish-wasm-driver.mts");
     std::fs::write(
         &driver,
         r#"
@@ -1385,11 +1382,7 @@ console.log("published managed wasm stream smoke ok");
     .unwrap();
     let mut node = Command::new("node");
     node.current_dir(root)
-        .args([
-            "--experimental-default-type=module",
-            "--experimental-strip-types",
-            "--no-warnings",
-        ])
+        .args(["--experimental-strip-types", "--no-warnings"])
         .arg(&driver)
         .env("UNIFFI_TEST_PUBLISHED_WASM_GLUE", &published_glue)
         .env("UNIFFI_TEST_PUBLISHED_WASM_BYTES", &published_wasm);
@@ -1435,7 +1428,7 @@ fn assert_direct_web_wasm_consumer(root: &Path, public: &Path, label: &str) {
     let output = metadata.output().unwrap();
     assert_success(output, &metadata);
 
-    let driver = root.join("fresh-direct-wasm-driver.ts");
+    let driver = root.join("fresh-direct-wasm-driver.mts");
     std::fs::write(
         &driver,
         r#"
@@ -1461,21 +1454,17 @@ console.log("direct wasm stream smoke ok");
     )
     .unwrap();
     let mut node = Command::new("node");
-    node.args([
-        "--experimental-default-type=module",
-        "--experimental-strip-types",
-        "--no-warnings",
-    ])
-    .arg(&driver)
-    .env(
-        "UNIFFI_TEST_WASM_ENTRY",
-        format!(
-            "file://{}",
-            std::fs::canonicalize(&entry).unwrap().display()
-        ),
-    )
-    .env("UNIFFI_TEST_WASM_GLUE", &published_glue)
-    .env("UNIFFI_TEST_WASM_BYTES", &published_wasm);
+    node.args(["--experimental-strip-types", "--no-warnings"])
+        .arg(&driver)
+        .env(
+            "UNIFFI_TEST_WASM_ENTRY",
+            format!(
+                "file://{}",
+                std::fs::canonicalize(&entry).unwrap().display()
+            ),
+        )
+        .env("UNIFFI_TEST_WASM_GLUE", &published_glue)
+        .env("UNIFFI_TEST_WASM_BYTES", &published_wasm);
     let output = node.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert_success(output, &node);
@@ -2803,7 +2792,8 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
     )
     .unwrap();
     let harmony = &manifest["artifacts"]["harmony"];
-    assert_eq!(manifest["schemaVersion"], 3);
+    assert_eq!(manifest["artifactManifestSchemaVersion"], 3);
+    assert!(manifest.get("schemaVersion").is_none());
     assert!(manifest["targets"]
         .as_array()
         .unwrap()
@@ -3802,12 +3792,23 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
     assert!(native_declarations.contains("function countEventsStreamNext("));
     assert!(!declarations.contains("countEventsStreamNext"));
     assert!(!declarations.contains("countEvents("));
-    assert!(declarations.contains("export interface __UniffiInputStream<T>"));
-    assert_eq!(contract["schemaVersion"], 4);
+    assert!(declarations.contains("export interface UniffiInputStream<T>"));
+    assert_eq!(contract["hspFacadeAggregateSchemaVersion"], 1);
+    assert!(contract.get("schemaVersion").is_none());
     assert!(contract["hostCompositeIdentity"]
         .as_str()
         .is_some_and(|value| value.len() == 64));
     assert_eq!(contract["componentIdentities"].as_array().unwrap().len(), 1);
+    let identity = &contract["componentIdentities"][0];
+    let component = identity["component"].as_str().unwrap();
+    assert_eq!(contract["components"][0], component);
+    assert!(identity["namespace"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert_eq!(
+        identity["nativeExportPrefix"],
+        format!("ffi_{}", component.replace('-', "_"))
+    );
     for public_source in [&facade, &declarations, &package_index] {
         assert!(!public_source.contains("uniffiohosbridgeidentity"));
         assert!(!public_source.contains("EventsStream"));
@@ -4508,7 +4509,6 @@ fn public_ohos_cli_preserves_cargo_config_wrapper_chain() {
     let package = root.join("package");
     std::fs::create_dir_all(config_cwd.join(".cargo")).unwrap();
     std::fs::create_dir_all(core.join("src")).unwrap();
-    std::fs::create_dir_all(&package).unwrap();
     let uniffi = Path::new(env!("CARGO_MANIFEST_DIR"));
     std::fs::write(
         core.join("Cargo.toml"),
