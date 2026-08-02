@@ -1378,7 +1378,12 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
             FlavorTarget::Electron => "electron",
             FlavorTarget::Wasm | FlavorTarget::Harmony => continue,
         };
-        let flavor_dir = args.out_dir.join(subdir);
+        let namespace = generated_component_namespace(&args.out_dir, subdir)?;
+        let flavor_dir = args
+            .out_dir
+            .join("components")
+            .join(&namespace)
+            .join(subdir);
         ensure_single_generated_rs(&flavor_dir)
             .with_context(|| format!("finding generated Rust bridge in {flavor_dir}"))?;
         let addon_stem = generated_addon_stem(&flavor_dir)
@@ -2295,6 +2300,7 @@ mod tests {
         let actual_out = root.join("private/generated");
         let logical_out = root.join("public/generated");
         let logical_mini = root.join("public/artifacts/mini-program");
+        std::fs::create_dir_all(actual_out.join("components/demo/browser")).unwrap();
         rebase_mini_program_auto_entrypoint(&actual_out, &logical_out, &logical_mini, "demo_wasm")
             .unwrap();
         let entry =
@@ -2302,6 +2308,16 @@ mod tests {
         assert!(
             entry.contains("import * as glue from \"../../artifacts/mini-program/demo_wasm.js\";"),
             "private entrypoint did not encode its public relative import: {entry}"
+        );
+        assert!(
+            entry.contains("import { demo } from \"./index.ts\";"),
+            "Mini Program entrypoint did not route initialization through its root namespace: {entry}"
+        );
+        assert!(
+            entry.contains(
+                "import type { WasmBindgenGlue } from \"../components/demo/browser/index.ts\";"
+            ),
+            "Mini Program entrypoint did not resolve its component type through the namespaced tree: {entry}"
         );
         assert!(!entry.contains("private"));
     }
@@ -2415,6 +2431,49 @@ fn ensure_single_generated_rs(dir: &Utf8Path) -> Result<()> {
     }
 }
 
+/// Host-backed build commands still operate on exactly one selected
+/// component in the 05B namespaced-source stage. Resolve that component from
+/// the generated tree rather than reviving a flat output fallback.
+fn generated_component_namespace(out_dir: &Utf8Path, flavor: &str) -> Result<String> {
+    let components_dir = out_dir.join("components");
+    let mut namespaces = Vec::new();
+    for entry in std::fs::read_dir(&components_dir)
+        .with_context(|| format!("reading generated component root {components_dir}"))?
+    {
+        let entry = entry.with_context(|| format!("reading an entry below {components_dir}"))?;
+        let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+            anyhow::anyhow!(
+                "generated component path is not UTF-8 below {components_dir}: {}",
+                path.display()
+            )
+        })?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("reading file type for generated component path {path}"))?
+            .is_dir()
+        {
+            continue;
+        }
+        let namespace = path
+            .file_name()
+            .with_context(|| format!("generated component directory has no name: {path}"))?
+            .to_string();
+        if path.join(flavor).is_dir() {
+            namespaces.push(namespace);
+        }
+    }
+    namespaces.sort();
+    match namespaces.as_slice() {
+        [namespace] => Ok(namespace.clone()),
+        [] => bail!(
+            "no generated JavaScript component with `{flavor}` flavor found below {components_dir}"
+        ),
+        _ => bail!(
+            "expected one generated JavaScript component with `{flavor}` flavor below {components_dir}, found {namespaces:?}; multi-component host composition is deferred to stage 05C"
+        ),
+    }
+}
+
 fn generated_addon_stem(dir: &Utf8Path) -> Result<String> {
     for file_name in ["backend-napi.ts", "preload.cjs"] {
         let path = dir.join(file_name);
@@ -2462,6 +2521,8 @@ fn emit_browser_auto_entrypoint(
         return Ok(());
     }
 
+    let namespace = generated_component_namespace(out_dir, "browser")?;
+
     std::fs::create_dir_all(&browser_dir)
         .with_context(|| format!("creating browser output dir {browser_dir}"))?;
     let browser_dir_abs = browser_dir
@@ -2493,14 +2554,14 @@ fn emit_browser_auto_entrypoint(
 
 import * as glue from "{glue_path}";
 import wasmUrl from "{wasm_url_path}";
-import {{ initBackend }} from "./index.ts";
+import {{ {namespace} }} from "./index.ts";
 
 export * from "./index.ts";
 
 let readyPromise: Promise<void> | null = null;
 
 export function init(input: unknown = wasmUrl): Promise<void> {{
-    readyPromise ??= initBackend(glue, input);
+    readyPromise ??= {namespace}.initBackend(glue, input);
     return readyPromise;
 }}
 
@@ -2789,6 +2850,7 @@ fn write_mini_program_auto_entrypoint(
     };
     let glue_path = format!("{rel_artifact_dir}/{wasm_bindgen_stem}.js");
     let default_wasm_path = mini_program_default_wasm_path(wasm_bindgen_stem);
+    let namespace = generated_component_namespace(actual_out_dir, "browser")?;
 
     let source = format!(
         r#"// AUTOGENERATED by uniffi_bindgen_javascript (wasm Mini Program auto-entrypoint).
@@ -2798,7 +2860,8 @@ fn write_mini_program_auto_entrypoint(
 // calls `WXWebAssembly.instantiate(packagePath, imports)`.
 
 import * as glue from "{glue_path}";
-import {{ initBackend, type WasmBindgenGlue }} from "./index.ts";
+import {{ {namespace} }} from "./index.ts";
+import type {{ WasmBindgenGlue }} from "../components/{namespace}/browser/index.ts";
 
 export * from "./index.ts";
 
@@ -2834,7 +2897,7 @@ export function initWithGlue(
     wasmPath: string,
 ): Promise<void> {{
     assertWXWebAssembly();
-    readyPromise ??= initBackend(customGlue, wasmPath);
+    readyPromise ??= {namespace}.initBackend(customGlue, wasmPath);
     return readyPromise;
 }}
 "#,

@@ -165,12 +165,17 @@ fn host_crates_napi_runs_stream_fixture() {
         "expected built stream addon at {}",
         built_lib.display()
     );
-    std::fs::copy(&built_lib, out_dir.join("node/stream_core.node")).unwrap();
+    std::fs::copy(
+        &built_lib,
+        out_dir.join("components/stream_core/node/stream_core.node"),
+    )
+    .unwrap();
 
     std::fs::write(
         out_dir.join("stream-driver.ts"),
         r#"
-import { countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } from "./node/index.ts";
+import * as root from "./node/index.ts";
+const { countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } = root.stream_core;
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -326,12 +331,17 @@ fn host_crates_napi_runs_input_stream_bidi_fixture() {
         "expected built input stream addon at {}",
         built_lib.display()
     );
-    std::fs::copy(&built_lib, out_dir.join("node/input_stream_core.node")).unwrap();
+    std::fs::copy(
+        &built_lib,
+        out_dir.join("components/input_stream_core/node/input_stream_core.node"),
+    )
+    .unwrap();
 
     std::fs::write(
         out_dir.join("input-stream-driver.ts"),
         r#"
-import { runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } from "./node/index.ts";
+import * as root from "./node/index.ts";
+const { runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } = root.input_stream_core;
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -496,13 +506,14 @@ fn generated_node_adapter_runs_custom_types_fixture() {
     std::fs::write(
         &driver,
         r#"
-import {
+import * as root from "./node/index.ts";
+const {
   formatContactWith,
   formatEmailWith,
   normalizeContact,
   normalizeEmail,
   normalizeMany,
-} from "./node/index.ts";
+} = root.custom_js_core;
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -608,14 +619,14 @@ fn generated_node_adapter_runs_temporal_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon = generated.join("node/napi_temporal_core.node");
+    let node_addon = generated.join("components/napi_temporal_core/node/napi_temporal_core.node");
     std::fs::copy(&built_lib, &node_addon).unwrap();
 
-    let electron_dir = generated.join("electron");
+    let electron_dir = generated.join("components/napi_temporal_core/electron");
     let electron_addon = electron_dir.join("napi_temporal_core.node");
     std::fs::copy(&built_lib, &electron_addon).unwrap();
 
-    let electron_stub = electron_dir.join("node_modules/electron");
+    let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
         electron_stub.join("index.js"),
@@ -635,7 +646,8 @@ exports.__state = state;
     std::fs::write(
         &driver,
         r#"
-import {
+import * as root from "./node/index.ts";
+const {
     returnTimestamp,
     returnDuration,
     add,
@@ -645,8 +657,8 @@ import {
     roundtripBundle,
     roundtripEvent,
     getFarFutureTimestamp,
-} from "./node/index.ts";
-import { UniffiError } from "./common/runtime.ts";
+    UniffiError,
+} = root.napi_temporal_core;
 
 const ts = new Date("2024-01-02T03:04:05.283Z");
 const tsRound = returnTimestamp(ts);
@@ -818,13 +830,13 @@ fn host_crates_napi_runs_bigint_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon = generated.join("node/napi_compat.node");
+    let node_addon = generated.join("components/napi_compat/node/napi_compat.node");
     std::fs::copy(&built_lib, &node_addon).unwrap();
 
-    let electron_dir = generated.join("electron");
+    let electron_dir = generated.join("components/napi_compat/electron");
     let electron_addon = electron_dir.join("napi_compat.node");
     std::fs::copy(&built_lib, &electron_addon).unwrap();
-    let electron_stub = electron_dir.join("node_modules/electron");
+    let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
         electron_stub.join("index.js"),
@@ -847,7 +859,7 @@ exports.__state = state;
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const raw = require("./node/napi_compat.node");
+const raw = require("./components/napi_compat/node/napi_compat.node");
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -881,7 +893,8 @@ expectThrow("raw u64 overflow", () => raw.roundtripU64(18446744073709551616n), /
 expectThrow("raw i64 overflow", () => raw.roundtripI64(9223372036854775808n), /i64/i);
 expectThrow("raw i64 underflow", () => raw.roundtripI64(-9223372036854775809n), /i64/i);
 
-const nodeApi = await import("./node/index.ts");
+const nodeRoot = await import("./node/index.ts");
+const nodeApi = nodeRoot.napi_compat;
 expectBigint(nodeApi.roundtripU64(18446744073709551615n), 18446744073709551615n, "node api roundtripU64");
 expectBigint(nodeApi.roundtripI64(-9223372036854775808n), -9223372036854775808n, "node api roundtripI64");
 expectBigint(await nodeApi.asyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "node api asyncRoundtripU64");
@@ -893,7 +906,7 @@ expectThrow("node api counter use-after-dispose", () => nodeCounter.get(), /disp
 assert(await nodeApi.slowAdd(20, 22, 300n) === 42, "node api slowAdd mixed args");
 
 require("./electron/preload.cjs");
-const bridge = (globalThis as any).__uniffi__;
+const bridge = (globalThis as any).__uniffi__.components["napi_compat"];
 assert(bridge && typeof bridge.dispatchSync === "function", "electron preload bridge");
 let res = bridge.dispatchSync({ kind: "call", id: 1, method: "roundtrip_u64", args: [18446744073709551615n] });
 assert(res.kind === "ok", `electron sync response kind ${res.kind}`);
@@ -994,13 +1007,13 @@ fn host_crates_napi_runs_callback_return_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon = generated.join("node/callback_return.node");
+    let node_addon = generated.join("components/callback_return/node/callback_return.node");
     std::fs::copy(&built_lib, &node_addon).unwrap();
 
-    let electron_dir = generated.join("electron");
+    let electron_dir = generated.join("components/callback_return/electron");
     let electron_addon = electron_dir.join("callback_return.node");
     std::fs::copy(&built_lib, &electron_addon).unwrap();
-    let electron_stub = electron_dir.join("node_modules/electron");
+    let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
         electron_stub.join("index.js"),
@@ -1016,7 +1029,9 @@ exports.__state = state;
     )
     .unwrap();
 
-    let callbacks = std::fs::read_to_string(generated.join("common/callbacks.ts")).unwrap();
+    let callbacks =
+        std::fs::read_to_string(generated.join("components/callback_return/common/callbacks.ts"))
+            .unwrap();
     assert!(
         callbacks.contains("interface ValueProvider")
             && callbacks.contains("makePayload(): Payload")
@@ -1026,12 +1041,16 @@ exports.__state = state;
         "common/callbacks.ts should expose a return-capable callback interface:\n{callbacks}"
     );
 
-    let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(generated.join("components/callback_return/electron/preload.cjs"))
+            .unwrap();
     assert!(
         preload.contains("__uniffiCallback"),
         "electron preload must keep unwrapping callback markers for callback returns"
     );
-    let renderer = std::fs::read_to_string(generated.join("electron/renderer.ts")).unwrap();
+    let renderer =
+        std::fs::read_to_string(generated.join("components/callback_return/electron/renderer.ts"))
+            .unwrap();
     assert!(
         renderer.contains("__installBackend"),
         "electron renderer must still install the backend"
@@ -1041,8 +1060,10 @@ exports.__state = state;
     std::fs::write(
         &driver,
         r#"
-import { invokeValueProviderGetValue, invokeValueProviderMakePayload } from "./node/index.ts";
-import {
+import * as nodeRoot from "./node/index.ts";
+const {
+    invokeValueProviderGetValue,
+    invokeValueProviderMakePayload,
     Counter,
     ProviderError,
     englishGreeter,
@@ -1054,15 +1075,16 @@ import {
     invokeValueProviderRunAsyncHostLogger,
     invokeValueProviderRunCheckedAsyncHostLogger,
     invokeValueProviderRunHostLogger,
-} from "./node/index.ts";
-import { UniffiError } from "./common/runtime.ts";
+    UniffiError,
+} = nodeRoot.callback_return;
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 // Simulate the renderer global before importing the electron entry.
 (globalThis as any).window = globalThis as any;
 require("./electron/preload.cjs");
-const electronApi = await import("./electron/renderer.ts");
+const electronRoot = await import("./electron/index.ts");
+const electronApi = electronRoot.callback_return;
 
 const provider = {
     getValue() {
@@ -1188,7 +1210,7 @@ for (const [label, fn] of [
 
 (globalThis as any).window = globalThis as any;
 require("./electron/preload.cjs");
-const bridge = (globalThis as any).__uniffi__;
+const bridge = (globalThis as any).__uniffi__.components["callback_return"];
 if (!bridge || typeof bridge.dispatchSync !== "function") {
     throw new Error("missing electron preload bridge");
 }
@@ -1379,13 +1401,13 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon = generated.join("node/async_callback.node");
+    let node_addon = generated.join("components/async_callback/node/async_callback.node");
     std::fs::copy(&built_lib, &node_addon).unwrap();
 
-    let electron_dir = generated.join("electron");
+    let electron_dir = generated.join("components/async_callback/electron");
     let electron_addon = electron_dir.join("async_callback.node");
     std::fs::copy(&built_lib, &electron_addon).unwrap();
-    let electron_stub = electron_dir.join("node_modules/electron");
+    let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
         electron_stub.join("index.js"),
@@ -1398,7 +1420,9 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
     )
     .unwrap();
 
-    let callbacks = std::fs::read_to_string(generated.join("common/callbacks.ts")).unwrap();
+    let callbacks =
+        std::fs::read_to_string(generated.join("components/async_callback/common/callbacks.ts"))
+            .unwrap();
     assert!(
         callbacks.contains("note(msg: string): void | Promise<void>;")
             && callbacks.contains("compute(a: number, b: number): number | Promise<number>;")
@@ -1407,7 +1431,8 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
             && callbacks.contains("Promise.resolve(__uniffiCallbackObject.compute"),
         "common/callbacks.ts should expose and lower async callback methods:\n{callbacks}"
     );
-    let api = std::fs::read_to_string(generated.join("common/api.ts")).unwrap();
+    let api =
+        std::fs::read_to_string(generated.join("components/async_callback/common/api.ts")).unwrap();
     for needle in [
         "asyncMethods: {",
         "\"note\": true",
@@ -1419,7 +1444,7 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
             "common/api.ts should mark async callback methods with `{needle}`:\n{api}"
         );
     }
-    let bridge_path = std::fs::read_dir(generated.join("node"))
+    let bridge_path = std::fs::read_dir(generated.join("components/async_callback/node"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "rs"))
@@ -1431,7 +1456,9 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
             && bridge.contains(".call_async(Ok"),
         "napi bridge should implement async callback methods through TSFN Promise:\n{bridge}"
     );
-    let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(generated.join("components/async_callback/electron/preload.cjs"))
+            .unwrap();
     assert!(
         preload.contains("asyncMethods")
             && preload.contains("const liftedArgs = callArgs.map(__uniffiLiftShape);")
@@ -1443,7 +1470,8 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
     std::fs::write(
         &driver,
         r#"
-import { runAsyncWorker } from "./node/index.ts";
+import * as nodeRoot from "./node/index.ts";
+const { runAsyncWorker } = nodeRoot.async_callback;
 import { createRequire } from "node:module";
 
 globalThis.window = globalThis;
@@ -1484,7 +1512,8 @@ assert(nodeRecord.total === 43, `node total=${nodeRecord.total}`);
 assert(nodeCase.calls.join(",") === "node:start,node:done", `node calls=${nodeCase.calls.join(",")}`);
 
 require("./electron/preload.cjs");
-const electronApi = await import("./electron/renderer.ts");
+const electronRoot = await import("./electron/index.ts");
+const electronApi = electronRoot.async_callback;
 const electronCase = makeWorker("electron");
 const electronRecord = await electronApi.runAsyncWorker(electronCase.worker as any);
 assert(electronRecord.total === 43, `electron total=${electronRecord.total}`);
@@ -1561,13 +1590,14 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
     );
 
     let generated = tmp.path().join("generated");
-    let node_addon = generated.join("node/fallible_async_callback.node");
+    let node_addon =
+        generated.join("components/fallible_async_callback/node/fallible_async_callback.node");
     std::fs::copy(&built_lib, &node_addon).unwrap();
 
-    let electron_dir = generated.join("electron");
+    let electron_dir = generated.join("components/fallible_async_callback/electron");
     let electron_addon = electron_dir.join("fallible_async_callback.node");
     std::fs::copy(&built_lib, &electron_addon).unwrap();
-    let electron_stub = electron_dir.join("node_modules/electron");
+    let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
         electron_stub.join("index.js"),
@@ -1580,7 +1610,10 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
     )
     .unwrap();
 
-    let callbacks = std::fs::read_to_string(generated.join("common/callbacks.ts")).unwrap();
+    let callbacks = std::fs::read_to_string(
+        generated.join("components/fallible_async_callback/common/callbacks.ts"),
+    )
+    .unwrap();
     for needle in [
         "checkedVoid(fail: boolean): void | Promise<void>;",
         "checkedValue(fail: boolean): number | Promise<number>;",
@@ -1592,7 +1625,9 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
             "common/callbacks.ts should expose async fallible callbacks via `{needle}`:\n{callbacks}"
         );
     }
-    let api = std::fs::read_to_string(generated.join("common/api.ts")).unwrap();
+    let api =
+        std::fs::read_to_string(generated.join("components/fallible_async_callback/common/api.ts"))
+            .unwrap();
     for needle in [
         "fallibleMethods: {",
         "\"checkedVoid\": \"flat\"",
@@ -1605,7 +1640,7 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
             "common/api.ts should mark async fallible callback methods with `{needle}`:\n{api}"
         );
     }
-    let bridge_path = std::fs::read_dir(generated.join("node"))
+    let bridge_path = std::fs::read_dir(generated.join("components/fallible_async_callback/node"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "rs"))
@@ -1617,7 +1652,10 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
             && bridge.contains(".call_async(Ok"),
         "napi bridge should implement fallible async callback methods through TSFN Promise:\n{bridge}"
     );
-    let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
+    let preload = std::fs::read_to_string(
+        generated.join("components/fallible_async_callback/electron/preload.cjs"),
+    )
+    .unwrap();
     assert!(
         preload.contains("fallibleMethods")
             && preload.contains("asyncMethods")
@@ -1631,13 +1669,14 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
         &driver,
         r#"
 import { createRequire } from "node:module";
-import {
+import * as nodeRoot from "./node/index.ts";
+const {
   ProviderError,
   invokeCheckedRecord,
   invokeCheckedValue,
   invokeCheckedVoid,
-} from "./node/index.ts";
-import { UniffiError } from "./common/runtime.ts";
+  UniffiError,
+} = nodeRoot.fallible_async_callback;
 
 globalThis.window = globalThis;
 const require = createRequire(import.meta.url);
@@ -1703,7 +1742,8 @@ await expectTypedError("node checkedRecord", () => invokeCheckedRecord(nodeCase.
 assert(nodeCase.calls.join(",") === "node:void:false,node:value:false,node:record:false,node:void:true,node:value:true,node:record:true", `node calls=${nodeCase.calls.join(",")}`);
 
 require("./electron/preload.cjs");
-const electronApi = await import("./electron/renderer.ts");
+const electronRoot = await import("./electron/index.ts");
+const electronApi = electronRoot.fallible_async_callback;
 const electronCase = makeProvider("electron");
 assert(await electronApi.invokeCheckedVoid(electronCase.provider as any, false) === true, "electron checkedVoid(false)");
 assert(await electronApi.invokeCheckedValue(electronCase.provider as any, false) === 77, "electron checkedValue(false)");
@@ -1754,12 +1794,16 @@ fn custom_types_surface_and_raw_napi_execute() {
     let (generated, manifest) = generate_custom_napi_tree(tmp.path());
     let addon = build_custom_napi_addon(tmp.path(), &generated, &manifest);
 
-    let public_types = std::fs::read_to_string(generated.join("common/public-types.ts")).unwrap();
+    let public_types =
+        std::fs::read_to_string(generated.join("components/custom_js_core/common/public-types.ts"))
+            .unwrap();
     assert!(
         public_types.contains("export type { Email } from \"./custom-types.ts\";"),
         "public-types.ts should re-export custom types:\n{public_types}"
     );
-    let custom_types = std::fs::read_to_string(generated.join("common/custom-types.ts")).unwrap();
+    let custom_types =
+        std::fs::read_to_string(generated.join("components/custom_js_core/common/custom-types.ts"))
+            .unwrap();
     for needle in [
         "type { EmailAddress } from \"./email.ts\"",
         "emailAddressFromString",
@@ -1777,7 +1821,9 @@ fn custom_types_surface_and_raw_napi_execute() {
         !custom_types.contains("unknown /* custom"),
         "custom-types.ts must not leave custom types as unknown:\n{custom_types}"
     );
-    let bridge = std::fs::read_to_string(generated.join("node/custom_js_core.rs")).unwrap();
+    let bridge =
+        std::fs::read_to_string(generated.join("components/custom_js_core/node/custom_js_core.rs"))
+            .unwrap();
     assert!(
         bridge.contains("::uniffi::Lift") && bridge.contains("::uniffi::Lower"),
         "napi bridge should use uniffi Lift/Lower for custom types:\n{bridge}"
@@ -1864,7 +1910,8 @@ fn custom_types_generated_node_adapter_executes() {
     std::fs::write(
         &driver,
         r#"
-import * as api from "./generated/node/index.ts";
+import * as root from "./generated/node/index.ts";
+const api = root.custom_js_core;
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -1939,7 +1986,11 @@ fn custom_types_generated_electron_renderer_executes() {
     let tmp = tempfile::tempdir().unwrap();
     let (generated, manifest) = generate_custom_napi_tree(tmp.path());
     let addon = build_custom_napi_addon(tmp.path(), &generated, &manifest);
-    std::fs::copy(&addon, generated.join("electron/custom_js_core.node")).unwrap();
+    std::fs::copy(
+        &addon,
+        generated.join("components/custom_js_core/electron/custom_js_core.node"),
+    )
+    .unwrap();
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -1963,7 +2014,8 @@ globalThis.window = globalThis;
 
 const require = createRequire(import.meta.url);
 require("./generated/electron/preload.cjs");
-const api = await import("./generated/electron/renderer.ts");
+const root = await import("./generated/electron/index.ts");
+const api = root.custom_js_core;
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);

@@ -331,13 +331,14 @@ fn write_benchmark_driver(root: &std::path::Path, glue_js_name: &str) -> std::pa
             r#"
 import {{ createRequire }} from "node:module";
 import {{ performance }} from "node:perf_hooks";
-import * as nodeCore from "./generated/node/index.ts";
-import {{ initBackend }} from "./generated/browser/index.ts";
+import * as nodeRoot from "./generated/node/index.ts";
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/{glue_js_name}");
-await initBackend(glue);
-const wasmCore = await import("./generated/browser/index.ts");
+const nodeCore = nodeRoot.js_benchmark_fixture;
+const browserRoot = await import("./generated/browser/index.ts");
+const wasmCore = browserRoot.js_benchmark_fixture;
+await wasmCore.initBackend(glue);
 
 const iterations = Number(process.env.UNIFFI_JS_BENCH_ITERS ?? "200");
 const streamRepetitions = Number(process.env.UNIFFI_JS_STREAM_BENCH_REPS ?? "3");

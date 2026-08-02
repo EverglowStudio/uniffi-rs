@@ -153,23 +153,28 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
     }
 
     for path in [
-        "common/api.ts",
+        "shared/runtime.ts",
         "node/index.ts",
-        "node/backend-napi.ts",
+        "components/cli_napi/common/api.ts",
+        "components/cli_napi/node/index.ts",
+        "components/cli_napi/node/backend-napi.ts",
         "electron/index.ts",
         "electron/preload.cjs",
-        "electron/renderer.ts",
+        "components/cli_napi/electron/index.ts",
+        "components/cli_napi/electron/preload.cjs",
+        "components/cli_napi/electron/renderer.ts",
     ] {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing generated N-API file: {file}");
     }
-    assert_single_node_addon(out_dir.join("node"));
-    assert_single_node_addon(out_dir.join("electron"));
+    assert_single_node_addon(out_dir.join("components/cli_napi/node"));
+    assert_single_node_addon(out_dir.join("components/cli_napi/electron"));
     assert!(
         host_dir.join("napi/Cargo.toml").exists(),
         "missing generated napi host crate"
     );
-    let backend_napi = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    let backend_napi =
+        std::fs::read_to_string(out_dir.join("components/cli_napi/node/backend-napi.ts")).unwrap();
     assert!(
         backend_napi.contains("UNIFFI_CLI_NAPI_NAPI_PATH")
             && backend_napi.contains("UNIFFI_NAPI_PATH")
@@ -191,8 +196,8 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
     let driver = tmp.path().join("generated-adapter-driver.ts");
     std::fs::write(
         &driver,
-        "import { add } from './generated/node/index.ts';\n\
-         const value = add(2n, 3n);\n\
+        "import * as root from './generated/node/index.ts';\n\
+         const value = root.cli_napi.add(2n, 3n);\n\
          if (value !== 5n) throw new Error(`expected 5n, got ${value}`);\n\
          console.log('ok');\n",
     )
@@ -215,7 +220,7 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
         "generated N-API adapter driver did not print ok"
     );
 
-    let default_addon = single_node_addon(out_dir.join("node"));
+    let default_addon = single_node_addon(out_dir.join("components/cli_napi/node"));
     let override_addon = tmp.path().join("override_cli_napi.node");
     std::fs::copy(&default_addon, &override_addon).unwrap();
     std::fs::remove_file(&default_addon).unwrap();

@@ -168,20 +168,22 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
     }
 
     for path in [
-        "common/api.ts",
+        "shared/runtime.ts",
         "browser/index.ts",
         "browser/index.web.ts",
-        "browser/backend-wasm.ts",
+        "components/cli_wasm/common/api.ts",
+        "components/cli_wasm/browser/index.ts",
+        "components/cli_wasm/browser/backend-wasm.ts",
     ] {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing generated JS file: {file}");
     }
-    let browser_rs = std::fs::read_dir(out_dir.join("browser"))
+    let browser_rs = std::fs::read_dir(out_dir.join("components/cli_wasm/browser"))
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
-        .expect("browser/ should contain a wasm shim");
+        .expect("the cli_wasm browser component should contain a wasm shim");
     let browser_rs_text = std::fs::read_to_string(&browser_rs).unwrap();
     assert!(
         browser_rs_text.contains("#[wasm_bindgen]"),
@@ -197,7 +199,7 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
         "generated wasm host crate should include the per-component shim"
     );
     assert!(
-        host_lib_text.contains("browser/"),
+        host_lib_text.contains("components/cli_wasm/browser/"),
         "generated wasm host crate should point at the browser shim"
     );
 
@@ -231,9 +233,10 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
     assert!(
         web_entry.contains(&format!("{glue_stem}.js"))
             && web_entry.contains(&format!("{glue_stem}_bg.wasm?url"))
+            && web_entry.contains("import { cli_wasm } from \"./index.ts\";")
             && web_entry.contains("export const ready: Promise<void> = init();")
             && web_entry.contains("export * from \"./index.ts\";"),
-        "browser auto-entrypoint should import the real wasm-bindgen output and re-export the explicit entrypoint:\n{web_entry}"
+        "browser auto-entrypoint should initialize through the root namespace, import the real wasm-bindgen output, and re-export the explicit entrypoint:\n{web_entry}"
     );
 }
 #[test]
@@ -281,9 +284,11 @@ fn cli_build_wasm_orchestrates_arithmetic_fixture() {
     }
 
     for path in [
-        "common/api.ts",
+        "shared/runtime.ts",
         "browser/index.ts",
-        "browser/backend-wasm.ts",
+        "components/cli_wasm/common/api.ts",
+        "components/cli_wasm/browser/index.ts",
+        "components/cli_wasm/browser/backend-wasm.ts",
     ] {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing generated JS file: {file}");

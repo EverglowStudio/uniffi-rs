@@ -5,8 +5,9 @@
 //! Optional Rust host-crate emitter for the JavaScript target.
 //!
 //! Downstream Node/Electron consumers need a `cdylib` Rust crate that
-//! `#[napi]`-exports the generated `node/<crate>.rs`; browsers need a
-//! `cdylib` that `#[wasm_bindgen]`-exports `browser/<crate>.rs`. Before
+//! `#[napi]`-exports the generated `components/<namespace>/node/<crate>.rs`;
+//! browsers need a `cdylib` that `#[wasm_bindgen]`-exports
+//! `components/<namespace>/browser/<crate>.rs`. Before
 //! this module existed, each downstream project had to hand-maintain
 //! `crates/<name>-wasm` and `crates/<name>-napi` shim crates. This
 //! module generates those shim crates from the downstream `Cargo.toml`
@@ -132,7 +133,8 @@ pub fn load_metadata(manifest_path: &Utf8Path) -> Result<CoreCrateMetadata> {
 /// Emit `<host_crates_dir>/wasm/*` and `<host_crates_dir>/napi/*`.
 ///
 /// `out_dir` is the JS target's `--out-dir` (already populated with
-/// `browser/<crate>.rs` and `node/<crate>.rs` by earlier steps).
+/// `components/<namespace>/browser/<crate>.rs` and
+/// `components/<namespace>/node/<crate>.rs` by earlier steps).
 /// `crate_names` is the list of uniffi component crate names for which
 /// `.rs` bridge files were written — both host crates `include!` one
 /// module per crate.
@@ -154,6 +156,15 @@ pub fn emit(
             "host-crate emission received mismatched component and namespace identities: {} components, {} namespaces",
             crate_names.len(),
             namespaces.len()
+        );
+    }
+    // Composite host crates have their own identity and artifact rules in
+    // stage 05C. Reject them before metadata reads or any output mutation;
+    // stage 05B intentionally keeps the established single-component host
+    // workflow working on the new namespaced source tree.
+    if crate_names.len() != 1 {
+        bail!(
+            "JavaScript host-crate emission supports one component during namespaced-layout stage 05B; selected namespaces: {namespaces:?}. Multi-component host composition is deferred to stage 05C"
         );
     }
     if !want_wasm && !want_napi && !want_ohos {
@@ -210,6 +221,7 @@ pub fn emit(
             &logical_host_dir,
             &logical_out_dir,
             crate_names,
+            namespaces,
             meta,
         )?;
     }
@@ -220,6 +232,7 @@ pub fn emit(
             &out_dir_abs,
             &logical_out_dir,
             crate_names,
+            namespaces,
             meta,
         )?;
     }
@@ -243,6 +256,7 @@ fn emit_wasm(
     logical_host_dir: &Utf8Path,
     out_dir: &Utf8Path,
     crate_names: &[String],
+    namespaces: &[String],
     meta: &CoreCrateMetadata,
 ) -> Result<()> {
     let crate_dir = host_dir.join("wasm");
@@ -299,8 +313,12 @@ fn emit_wasm(
          // wasm-bindgen shim into this crate, so `cargo build --target\n\
          // wasm32-unknown-unknown` produces the final `cdylib`.\n\n",
     );
-    for crate_name in crate_names {
-        let rs_path = out_dir.join("browser").join(format!("{crate_name}.rs"));
+    for (crate_name, namespace) in crate_names.iter().zip(namespaces) {
+        let rs_path = out_dir
+            .join("components")
+            .join(namespace)
+            .join("browser")
+            .join(format!("{crate_name}.rs"));
         let rel = relative_path(&logical_src_dir, &rs_path);
         lib_rs.push_str(&format!("include!(\"{rel}\");\n"));
     }
@@ -314,6 +332,7 @@ fn emit_napi(
     actual_out_dir: &Utf8Path,
     logical_out_dir: &Utf8Path,
     crate_names: &[String],
+    namespaces: &[String],
     meta: &CoreCrateMetadata,
 ) -> Result<()> {
     let crate_dir = host_dir.join("napi");
@@ -371,14 +390,20 @@ fn emit_napi(
          // napi-rs bridge into this crate, so `cargo build` produces the\n\
          // final `.node` cdylib consumed by the generated `backend-napi.ts`.\n\n",
     );
-    for crate_name in crate_names {
-        let actual_node_rs_path = actual_out_dir.join("node").join(format!("{crate_name}.rs"));
+    for (crate_name, namespace) in crate_names.iter().zip(namespaces) {
+        let actual_node_rs_path = actual_out_dir
+            .join("components")
+            .join(namespace)
+            .join("node")
+            .join(format!("{crate_name}.rs"));
         let flavor = if actual_node_rs_path.exists() {
             "node"
         } else {
             "electron"
         };
         let rs_path = logical_out_dir
+            .join("components")
+            .join(namespace)
             .join(flavor)
             .join(format!("{crate_name}.rs"));
         let rel = relative_path(&logical_src_dir, &rs_path);
@@ -534,8 +559,10 @@ mod __uniffi_napi_cleanup_hook_key {
 
 "#,
     );
-    for crate_name in crate_names {
+    for (crate_name, namespace) in crate_names.iter().zip(namespaces) {
         let rs_path = logical_out_dir
+            .join("components")
+            .join(namespace)
             .join("harmony")
             .join(format!("{crate_name}.rs"));
         let rel = relative_path(&logical_src_dir, &rs_path);
@@ -571,8 +598,10 @@ fn preflight_ohos_host_emission(
     // Execute them now, before `emit` creates even the top-level host dir.
     let _ = render_ohos_dependencies(ohos_rs_dir, &logical_crate_dir)?;
     let _ = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &logical_crate_dir)?;
-    for crate_name in crate_names {
+    for (crate_name, namespace) in crate_names.iter().zip(namespaces) {
         let rs_path = logical_out_dir
+            .join("components")
+            .join(namespace)
             .join("harmony")
             .join(format!("{crate_name}.rs"));
         let _ = relative_path(&logical_crate_dir.join("src"), &rs_path);
@@ -611,7 +640,11 @@ fn render_ohos_facade_bundle(
     let mut components = Vec::new();
     for (crate_name, expected_namespace) in crate_names.iter().zip(namespaces) {
         let contract_file = format!("{crate_name}.ohos-facade.json");
-        let contract_path = actual_out_dir.join("harmony").join(&contract_file);
+        let contract_path = actual_out_dir
+            .join("components")
+            .join(expected_namespace)
+            .join("harmony")
+            .join(&contract_file);
         let contract_content = fs::read_to_string(&contract_path)
             .with_context(|| format!("reading generated OHOS facade contract {contract_path}"))?;
         let contract = crate::flavors::napi::parse_ohos_facade_contract(&contract_content)
@@ -632,7 +665,11 @@ fn render_ohos_facade_bundle(
         let contract_digest = sha256_text(&contract_content);
         let identity_export = crate::flavors::napi::ohos_bridge_identity_export(&contract_digest);
         let sidecar_file = format!("{crate_name}.ohos-extra-types.d.ts");
-        let sidecar_path = actual_out_dir.join("harmony").join(&sidecar_file);
+        let sidecar_path = actual_out_dir
+            .join("components")
+            .join(expected_namespace)
+            .join("harmony")
+            .join(&sidecar_file);
         let sidecar_content = fs::read_to_string(&sidecar_path)
             .with_context(|| format!("reading generated OHOS type sidecar {sidecar_path}"))?;
         crate::flavors::napi::validate_ohos_extra_types(&sidecar_content, &identity_export)
@@ -1054,8 +1091,9 @@ edition = "2021"
         let out = root.join("generated");
         let host = root.join("host");
         write_minimal_lib(&core);
-        std::fs::create_dir_all(out.join("harmony")).unwrap();
-        std::fs::write(out.join("harmony/demo_core.rs"), "").unwrap();
+        let harmony = out.join("components/demo_core/harmony");
+        std::fs::create_dir_all(&harmony).unwrap();
+        std::fs::write(harmony.join("demo_core.rs"), "").unwrap();
         for (name, body) in [
             ("native-facade.ets", "export default {};\n"),
             ("Index.ets", "export default {};\n"),
@@ -1068,14 +1106,14 @@ edition = "2021"
                 "{\"facadeContractSchemaVersion\":4,\"component\":\"demo_core\",\"namespace\":\"demo_core\",\"nativeExportPrefix\":\"ffi_demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
             ),
         ] {
-            std::fs::write(out.join("harmony").join(name), body).unwrap();
+            std::fs::write(harmony.join(name), body).unwrap();
         }
         let contract_content =
-            std::fs::read_to_string(out.join("harmony/demo_core.ohos-facade.json")).unwrap();
+            std::fs::read_to_string(harmony.join("demo_core.ohos-facade.json")).unwrap();
         let identity_export =
             crate::flavors::napi::ohos_bridge_identity_export(&sha256_text(&contract_content));
         std::fs::write(
-            out.join("harmony/demo_core.ohos-extra-types.d.ts"),
+            harmony.join("demo_core.ohos-extra-types.d.ts"),
             format!(
                 "type_def:{{\"kind\":\"fn\",\"name\":\"{identity_export}\",\"def\":\"function {identity_export}(): string\",\"typeParameters\":[]}}\n"
             ),
@@ -1155,7 +1193,9 @@ edition.workspace = true
         assert!(lib_rs.contains("__wrap_napi_remove_env_cleanup_hook"));
         assert!(lib_rs.contains("unique_arg(fun, arg)"));
         assert!(
-            lib_rs.contains("include!(\"../../../generated/harmony/demo_core.rs\");"),
+            lib_rs.contains(
+                "include!(\"../../../generated/components/demo_core/harmony/demo_core.rs\");"
+            ),
             "logical publication paths were not used for include!: {lib_rs}"
         );
         let bundle_path = host.join("ohos/uniffi-ohos-facade-bundle.json");
@@ -1212,15 +1252,16 @@ edition.workspace = true
         let generated = root.join("generated");
         let host = root.join("host-must-not-exist");
         write_minimal_lib(&core);
-        std::fs::create_dir_all(generated.join("harmony")).unwrap();
-        std::fs::write(generated.join("harmony/demo_core.rs"), "").unwrap();
+        let harmony = generated.join("components/demo_core/harmony");
+        std::fs::create_dir_all(&harmony).unwrap();
+        std::fs::write(harmony.join("demo_core.rs"), "").unwrap();
         std::fs::write(
-            generated.join("harmony/demo_core.ohos-facade.json"),
+            harmony.join("demo_core.ohos-facade.json"),
             "{\"facadeContractSchemaVersion\":4,\"component\":\"demo_core\",\"namespace\":\"demo_core\",\"nativeExportPrefix\":\"ffi_demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
         )
         .unwrap();
         std::fs::write(
-            generated.join("harmony/demo_core.ohos-extra-types.d.ts"),
+            harmony.join("demo_core.ohos-extra-types.d.ts"),
             "not canonical OHOS type metadata\n",
         )
         .unwrap();

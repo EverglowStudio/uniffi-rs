@@ -2109,14 +2109,14 @@ fn exact_node_managed_manifest(namespace: &str) -> serde_json::Value {
         "targets": ["node"],
         "source": {
             "root": "src/ffi",
-            "common": "src/ffi/common",
+            "common": format!("src/ffi/components/{namespace}/common"),
             "browser": null,
             "node": "src/ffi/node",
             "electron": null,
             "harmony": null,
             "swift": null,
             "kotlin": null,
-            "publicTypes": "src/ffi/common/public-types.ts"
+            "publicTypes": format!("src/ffi/components/{namespace}/common/public-types.ts")
         },
         "entrypoints": {
             "web": null,
@@ -2242,14 +2242,14 @@ fn current_harmony_managed_manifest(shape: CurrentHarmonyManifestShape) -> serde
         "targets": ["harmony"],
         "source": {
             "root": "src/ffi",
-            "common": "src/ffi/common",
+            "common": "src/ffi/components/uni_core/common",
             "browser": null,
             "node": null,
             "electron": null,
             "harmony": "src/ffi/harmony",
             "swift": null,
             "kotlin": null,
-            "publicTypes": "src/ffi/common/public-types.ts"
+            "publicTypes": "src/ffi/components/uni_core/common/public-types.ts"
         },
         "entrypoints": {
             "web": null,
@@ -2481,12 +2481,14 @@ fn publish_exact_node_managed_fixture(layout: &ManagedLayout, manifest: &serde_j
     };
     let mut transaction = ManagedPackageTransaction::begin(&publication_layout).unwrap();
     let package = transaction.private_root.clone();
-    std::fs::create_dir_all(package.join("src/ffi/common")).unwrap();
+    let namespace = manifest["namespace"].as_str().unwrap();
+    let common = package.join(format!("src/ffi/components/{namespace}/common"));
+    std::fs::create_dir_all(&common).unwrap();
     std::fs::create_dir_all(package.join("src/ffi/node")).unwrap();
     std::fs::create_dir_all(package.join("artifacts/node")).unwrap();
     std::fs::create_dir_all(package.join("artifacts/rust/napi")).unwrap();
     std::fs::write(
-        package.join("src/ffi/common/public-types.ts"),
+        common.join("public-types.ts"),
         "export type Fixture = string;\n",
     )
     .unwrap();
@@ -5156,20 +5158,20 @@ fn managed_layout_emits_entries_and_relative_manifest() {
 
     let web = std::fs::read_to_string(package_dir.join("src/index.web.ts")).unwrap();
     assert!(web.contains("export * from \"./ffi/browser/index.web.ts\";"));
-    assert!(web.contains("export type * from \"./ffi/common/public-types.ts\";"));
+    assert!(!web.contains("public-types.ts"));
 
     let mini_program =
         std::fs::read_to_string(package_dir.join("src/index.mini-program.ts")).unwrap();
     assert!(mini_program.contains("export * from \"./ffi/browser/index.mini-program.ts\";"));
-    assert!(mini_program.contains("export type * from \"./ffi/common/public-types.ts\";"));
+    assert!(!mini_program.contains("public-types.ts"));
 
     let node = std::fs::read_to_string(package_dir.join("src/index.node.ts")).unwrap();
     assert!(node.contains("export * from \"./ffi/node/index.ts\";"));
-    assert!(node.contains("export type * from \"./ffi/common/public-types.ts\";"));
+    assert!(!node.contains("public-types.ts"));
 
     let electron = std::fs::read_to_string(package_dir.join("src/index.electron.ts")).unwrap();
-    assert!(electron.contains("export * from \"./ffi/electron/renderer.ts\";"));
-    assert!(electron.contains("export type * from \"./ffi/common/public-types.ts\";"));
+    assert!(electron.contains("export * from \"./ffi/electron/index.ts\";"));
+    assert!(!electron.contains("public-types.ts"));
 
     let gitignore = std::fs::read_to_string(package_dir.join(".gitignore")).unwrap();
     assert!(gitignore.contains("# UniFFI generated build artifacts"));
@@ -5202,7 +5204,14 @@ fn managed_layout_emits_entries_and_relative_manifest() {
         ])
     );
     assert_eq!(manifest["source"]["root"], "src/ffi");
-    assert_eq!(manifest["source"]["common"], "src/ffi/common");
+    assert_eq!(
+        manifest["source"]["common"],
+        "src/ffi/components/uni_core/common"
+    );
+    assert_eq!(
+        manifest["source"]["publicTypes"],
+        "src/ffi/components/uni_core/common/public-types.ts"
+    );
     assert_eq!(manifest["source"]["swift"], "src/ffi/swift");
     assert_eq!(manifest["source"]["kotlin"], "src/ffi/kotlin");
     assert_eq!(manifest["entrypoints"]["electron"], "src/index.electron.ts");

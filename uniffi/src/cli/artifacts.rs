@@ -354,11 +354,16 @@ impl ManagedTransactionLayout for ManagedLayout {
     }
 
     fn preflight_existing_package(&self) -> Result<()> {
-        self.namespace
-            .as_deref()
-            .map(|namespace| validate_existing_managed_manifest(self, namespace))
-            .transpose()?
-            .unwrap_or(());
+        let Some(fallback_namespace) = self.namespace.as_deref() else {
+            return Ok(());
+        };
+        // The Cargo lib target and UniFFI namespace are independently named.
+        // When a prior generated JS tree is present, its sole component
+        // directory is the canonical namespace for manifest validation.
+        let namespace = self
+            .generated_component_namespace()?
+            .unwrap_or_else(|| fallback_namespace.to_string());
+        validate_existing_managed_manifest(self, &namespace)?;
         Ok(())
     }
 }
@@ -1375,6 +1380,60 @@ impl ManagedLayout {
             .context("managed artifact layout lacks its exact namespace")
     }
 
+    /// Resolve the one selected generated component from the namespaced source
+    /// tree. Managed JS builds produce a host-backed single component in 05B;
+    /// accepting zero/multiple/invalid directory entries here would make a
+    /// manifest silently point at the wrong public API.
+    fn generated_component_namespace(&self) -> Result<Option<String>> {
+        let components_dir = self.source_root.join("components");
+        if !components_dir.exists() {
+            return Ok(None);
+        }
+        let mut namespaces = Vec::new();
+        for entry in std::fs::read_dir(&components_dir)
+            .with_context(|| format!("reading generated component root {components_dir}"))?
+        {
+            let entry = entry.with_context(|| format!("reading entry below {components_dir}"))?;
+            let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+                anyhow::anyhow!(
+                    "generated managed component path is not UTF-8 below {components_dir}: {}",
+                    path.display()
+                )
+            })?;
+            if !entry
+                .file_type()
+                .with_context(|| format!("reading file type for generated component path {path}"))?
+                .is_dir()
+            {
+                continue;
+            }
+            let namespace = path
+                .file_name()
+                .with_context(|| format!("generated component directory has no name: {path}"))?
+                .to_string();
+            namespaces.push(namespace);
+        }
+        namespaces.sort();
+        match namespaces.as_slice() {
+            [] => Ok(None),
+            [namespace] => Ok(Some(namespace.clone())),
+            _ => bail!(
+                "managed JavaScript source tree has multiple component namespaces below {components_dir}: {namespaces:?}; multi-component artifact composition is deferred to stage 05C"
+            ),
+        }
+    }
+
+    fn refresh_generated_component_namespace(&mut self) -> Result<()> {
+        let namespace = self.generated_component_namespace()?.with_context(|| {
+            format!(
+                "generated managed JavaScript source tree has no component namespace below {}",
+                self.source_root.join("components")
+            )
+        })?;
+        self.namespace = Some(namespace);
+        Ok(())
+    }
+
     pub(super) fn rebased(&self, from: &Utf8Path, to: &Utf8Path) -> Result<Self> {
         let rebase = |path: &Utf8Path| -> Result<Utf8PathBuf> {
             Ok(to
@@ -1562,7 +1621,6 @@ impl ManagedLayout {
         self.write_entrypoint(
             &entrypoint,
             &self.source_root.join("browser/index.web.ts"),
-            &self.source_root.join("common/public-types.ts"),
             "web",
         )
     }
@@ -1572,27 +1630,20 @@ impl ManagedLayout {
         self.write_entrypoint(
             &entrypoint,
             &self.source_root.join("browser/index.mini-program.ts"),
-            &self.source_root.join("common/public-types.ts"),
             "mini-program",
         )
     }
 
     fn emit_node_entrypoint(&self) -> Result<()> {
         let entrypoint = self.package_dir.join("src/index.node.ts");
-        self.write_entrypoint(
-            &entrypoint,
-            &self.source_root.join("node/index.ts"),
-            &self.source_root.join("common/public-types.ts"),
-            "node",
-        )
+        self.write_entrypoint(&entrypoint, &self.source_root.join("node/index.ts"), "node")
     }
 
     fn emit_electron_entrypoint(&self) -> Result<()> {
         let entrypoint = self.package_dir.join("src/index.electron.ts");
         self.write_entrypoint(
             &entrypoint,
-            &self.source_root.join("electron/renderer.ts"),
-            &self.source_root.join("common/public-types.ts"),
+            &self.source_root.join("electron/index.ts"),
             "electron",
         )
     }
@@ -1601,7 +1652,6 @@ impl ManagedLayout {
         &self,
         entrypoint: &Utf8Path,
         runtime_entry: &Utf8Path,
-        public_types: &Utf8Path,
         label: &str,
     ) -> Result<()> {
         let parent = entrypoint
@@ -1610,17 +1660,22 @@ impl ManagedLayout {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating managed {label} entrypoint dir {parent}"))?;
         let runtime_spec = module_specifier(parent, runtime_entry)?;
-        let public_types_spec = module_specifier(parent, public_types)?;
         let source = format!(
             "// AUTOGENERATED by uniffi_bindgen_javascript (managed {label} entrypoint).\n\
              // Do not edit by hand.\n\
              \n\
-             export * from \"{runtime_spec}\";\n\
-             export type * from \"{public_types_spec}\";\n",
+             export * from \"{runtime_spec}\";\n",
         );
         std::fs::write(entrypoint, source)
             .with_context(|| format!("writing managed {label} entrypoint {entrypoint}"))?;
         Ok(())
+    }
+
+    fn component_source_root(&self) -> Result<Utf8PathBuf> {
+        Ok(self
+            .source_root
+            .join("components")
+            .join(self.exact_namespace()?))
     }
 
     fn emit_gitignore(&self) -> Result<()> {
@@ -1723,7 +1778,7 @@ node_modules/\n\
         harmony_source_root: Option<&Utf8Path>,
         artifact_read_root: Option<&Utf8Path>,
     ) -> Result<String> {
-        let namespace = &meta.lib_target_name;
+        let namespace = self.exact_namespace()?;
         let wasm_stem = format!("{}_wasm", rust_identifier(&meta.package_name));
         let node_env = format!("UNIFFI_{}_NAPI_PATH", namespace.to_ascii_uppercase());
         let harmony_package = args
@@ -1760,14 +1815,14 @@ node_modules/\n\
             "targets": self.manifest_targets(targets),
             "source": {
                 "root": self.rel(&self.source_root)?,
-                "common": if self.has_js(targets) { serde_json::Value::String(self.rel(&self.source_root.join("common"))?) } else { serde_json::Value::Null },
+                "common": if self.has_js(targets) { serde_json::Value::String(self.rel(&self.component_source_root()?.join("common"))?) } else { serde_json::Value::Null },
                 "browser": if targets.wasm || targets.mini_program { serde_json::Value::String(self.rel(&self.source_root.join("browser"))?) } else { serde_json::Value::Null },
                 "node": if targets.node { serde_json::Value::String(self.rel(&self.source_root.join("node"))?) } else { serde_json::Value::Null },
                 "electron": if targets.electron { serde_json::Value::String(self.rel(&self.source_root.join("electron"))?) } else { serde_json::Value::Null },
                 "harmony": if targets.harmony { serde_json::Value::String(self.rel(&self.source_root.join("harmony"))?) } else { serde_json::Value::Null },
                 "swift": if targets.apple { serde_json::Value::String(self.rel(&self.source_root.join("swift"))?) } else { serde_json::Value::Null },
                 "kotlin": if targets.android { serde_json::Value::String(self.rel(&self.source_root.join("kotlin"))?) } else { serde_json::Value::Null },
-                "publicTypes": if self.has_js(targets) { serde_json::Value::String(self.rel(&self.source_root.join("common/public-types.ts"))?) } else { serde_json::Value::Null },
+                "publicTypes": if self.has_js(targets) { serde_json::Value::String(self.rel(&self.component_source_root()?.join("common/public-types.ts"))?) } else { serde_json::Value::Null },
             },
             "entrypoints": {
                 "web": if targets.wasm { serde_json::Value::String("src/index.web.ts".to_string()) } else { serde_json::Value::Null },
@@ -3088,12 +3143,21 @@ fn build_managed_package(
     layout: ManagedLayout,
 ) -> Result<()> {
     let mut transaction = ManagedPackageTransaction::begin(&layout)?;
-    let private_layout = layout.rebased(&layout.package_dir, transaction.candidate_root())?;
+    let mut private_layout = layout.rebased(&layout.package_dir, transaction.candidate_root())?;
     let prepared = (|| -> Result<ManagedPackageOwner> {
         clear_managed_selected_roots(&mut transaction, &targets)?;
         let private_args = managed_private_args(&transaction, &layout, &public_args)?;
         build_private_target_set(&private_args, &targets)?;
         rebase_private_javascript_host_crates(&public_args, &private_args, &targets)?;
+        if private_layout.has_js(&targets) {
+            private_layout.refresh_generated_component_namespace()?;
+        } else if let Some(namespace) = private_layout.generated_component_namespace()? {
+            // Incremental managed builds may add a non-JS target to an
+            // existing package. Preserve the already-published UniFFI
+            // namespace rather than reverting its manifest to the Cargo lib
+            // target name.
+            private_layout.namespace = Some(namespace);
+        }
         let meta = cargo_package_metadata(&public_args.manifest_path)?;
         private_layout
             .emit(&targets, &meta, &private_args)

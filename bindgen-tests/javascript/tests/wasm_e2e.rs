@@ -166,7 +166,7 @@ pub async fn async_add(a: u64, b: u64) -> u64 { a.wrapping_add(b) }
     // 4. Shim crate: cdylib with the generated wasm-bindgen Rust file.
     let shim = root.join("shim");
     std::fs::create_dir_all(shim.join("src")).unwrap();
-    let gen_rs = gen_dir.join("browser/wasm_scalar.rs");
+    let gen_rs = gen_dir.join("components/wasm_scalar/browser/wasm_scalar.rs");
     let shim_src = std::fs::read_to_string(&gen_rs)
         .unwrap_or_else(|_| panic!("generated shim missing at {gen_rs}"));
     std::fs::write(shim.join("src/lib.rs"), shim_src).unwrap();
@@ -239,9 +239,8 @@ wasm_scalar = { path = "../biz" }
     //    then exercise sync / fallible / async scalar paths.
     let driver = r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import { add, checkedSub, asyncAdd } from "./gen/common/api.ts";
-import { UniffiError } from "./gen/common/runtime.ts";
+import * as root from "./gen/browser/index.ts";
+const { initBackend, add, checkedSub, asyncAdd, UniffiError } = root.wasm_scalar;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_scalar_shim.js");
@@ -416,9 +415,8 @@ pub fn buy(sku: String, qty: u32) -> Result<u32, CheckoutError> {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import { makeUser, greetUser, invert, bigger, buy } from "./gen/common/api.ts";
-import { UniffiError } from "./gen/common/runtime.ts";
+import * as root from "./gen/browser/index.ts";
+const { initBackend, makeUser, greetUser, invert, bigger, buy, UniffiError } = root.wasm_rec;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_rec_shim.js");
@@ -521,8 +519,8 @@ pub fn rename_users(input: HashMap<String, User>) -> HashMap<String, User> {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import { bumpCounts, renameUsers } from "./gen/common/api.ts";
+import * as root from "./gen/browser/index.ts";
+const { initBackend, bumpCounts, renameUsers } = root.wasm_map;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_map_shim.js");
@@ -629,16 +627,17 @@ pub fn get_far_future_timestamp() -> SystemTime {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import {
+import * as root from "./gen/browser/index.ts";
+const {
+    initBackend,
     returnTimestamp,
     returnDuration,
     add,
     diff,
     optional,
     getFarFutureTimestamp,
-} from "./gen/common/api.ts";
-import { UniffiError } from "./gen/common/runtime.ts";
+    UniffiError,
+} = root.wasm_time;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_time_shim.js");
@@ -737,8 +736,8 @@ impl Counter {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import { Counter } from "./gen/common/api.ts";
+import * as root from "./gen/browser/index.ts";
+const { initBackend, Counter } = root.wasm_obj;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_obj_shim.js");
@@ -799,8 +798,8 @@ impl Counter {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import { Counter } from "./gen/common/api.ts";
+import * as root from "./gen/browser/index.ts";
+const { initBackend, Counter } = root.wasm_arc;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_arc_shim.js");
@@ -867,8 +866,8 @@ pub fn call_greeter(greeter: Arc<dyn Greeter>, name: String) -> String {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import { englishGreeter, chineseGreeter, callGreeter } from "./gen/common/api.ts";
+import * as root from "./gen/browser/index.ts";
+const { initBackend, englishGreeter, chineseGreeter, callGreeter } = root.wasm_trait;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_trait_shim.js");
@@ -930,8 +929,8 @@ pub fn run_job(logger: Arc<dyn Logger>) {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import { runJob } from "./gen/common/api.ts";
+import * as root from "./gen/browser/index.ts";
+const { initBackend, runJob } = root.wasm_cb;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_cb_shim.js");
@@ -1008,8 +1007,8 @@ pub async fn run_async_worker(worker: Arc<dyn AsyncWorker>) -> WorkRecord {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import { runAsyncWorker } from "./gen/common/api.ts";
+import * as root from "./gen/browser/index.ts";
+const { initBackend, runAsyncWorker } = root.wasm_async_cb;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_async_cb_shim.js");
@@ -1226,8 +1225,9 @@ pub async fn invoke_maker_checked_make_async_logger(
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import {
+import * as root from "./gen/browser/index.ts";
+const {
+    initBackend,
     Counter,
     ProviderError,
     englishGreeter,
@@ -1238,7 +1238,7 @@ import {
     invokeMakerCheckedMakeAsyncLogger,
     invokeMakerRunHostLogger,
     invokeMakerRunLogger,
-} from "./gen/common/api.ts";
+} = root.wasm_cb_object;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_cb_object_shim.js");
@@ -1456,16 +1456,17 @@ pub fn invoke_value_provider_checked_void(
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import {
+import * as root from "./gen/browser/index.ts";
+const {
+  initBackend,
   ProviderError,
   invokeValueProviderCheckedPayload,
   invokeValueProviderCheckedValue,
   invokeValueProviderCheckedVoid,
   invokeValueProviderGetValue,
   invokeValueProviderMakePayload,
-} from "./gen/common/api.ts";
-import { UniffiError } from "./gen/common/runtime.ts";
+  UniffiError,
+} = root.wasm_fallible_cb;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_fallible_cb_shim.js");
@@ -1618,14 +1619,15 @@ pub async fn invoke_checked_record(worker: Arc<dyn CheckedWorker>, fail: bool) -
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import {
+import * as root from "./gen/browser/index.ts";
+const {
   ProviderError,
   invokeCheckedRecord,
   invokeCheckedValue,
   invokeCheckedVoid,
-} from "./gen/common/api.ts";
-import { initBackend } from "./gen/browser/index.ts";
-import { UniffiError } from "./gen/common/runtime.ts";
+  initBackend,
+  UniffiError,
+} = root.wasm_fallible_async_cb;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_fallible_async_cb_shim.js");
@@ -1795,14 +1797,15 @@ pub fn format_contact_with(formatter: std::sync::Arc<dyn EmailFormatter>, value:
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import { initBackend } from "./gen/browser/index.ts";
-import {
+import * as root from "./gen/browser/index.ts";
+const {
+  initBackend,
   formatContactWith,
   formatEmailWith,
   normalizeContact,
   normalizeEmail,
   normalizeMany,
-} from "./gen/common/api.ts";
+} = root.wasm_custom;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/wasm_custom_shim.js");
@@ -1863,7 +1866,7 @@ fromCustom = "emailAddressToString({})"
 "#,
         ),
         generated_files: &[(
-            "common/email.ts",
+            "components/wasm_custom/common/email.ts",
             r#"
 export type EmailAddress = { value: string };
 export function emailAddressFromString(value: string): EmailAddress {
@@ -1944,7 +1947,8 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
         tmp.path().join("wasm-input-stream-driver.ts"),
         r#"
 import { createRequire } from "node:module";
-import { initBackend, runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } from "./generated/browser/index.ts";
+import * as root from "./generated/browser/index.ts";
+const { initBackend, runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } = root.input_stream_core;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/input_stream_core_wasm.js");
@@ -2165,7 +2169,8 @@ fn host_crates_wasm_runs_stream_fixture() {
         tmp.path().join("wasm-stream-driver.ts"),
         r#"
 import { createRequire } from "node:module";
-import { initBackend, countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } from "./generated/browser/index.ts";
+import * as root from "./generated/browser/index.ts";
+const { initBackend, countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } = root.stream_core;
 
 const require = createRequire(import.meta.url);
 const glue = require("./pkg/stream_core_wasm.js");
@@ -2398,7 +2403,7 @@ crate-type = ["rlib"]
     // Shim crate.
     let shim = root.join("shim");
     std::fs::create_dir_all(shim.join("src")).unwrap();
-    let gen_rs = gen_dir.join(format!("browser/{name}.rs"));
+    let gen_rs = gen_dir.join(format!("components/{name}/browser/{name}.rs"));
     let shim_src = std::fs::read_to_string(&gen_rs)
         .unwrap_or_else(|_| panic!("generated shim missing at {gen_rs}"));
     // Regression: the wasm shim must NEVER pull in serde in any form.

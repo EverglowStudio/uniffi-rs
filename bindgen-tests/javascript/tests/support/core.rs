@@ -7,7 +7,8 @@
 //!
 //! `runs_common_api_under_node` is the execution-level check for the
 //! high-level common API. It installs a pure-JS stub backend, imports
-//! the generated `common/api.ts` via Node's `--experimental-strip-types`,
+//! the generated `components/<namespace>/common/api.ts` via Node's
+//! `--experimental-strip-types`,
 //! and exercises free functions, object lifecycle, error marshalling,
 //! and the numeric conversion path. Requires Node >= 22.6; older/missing
 //! nodes cause the test to be skipped with an eprintln rather than fail.

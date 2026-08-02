@@ -8,8 +8,8 @@
 //! `docs/manual/src/javascript/contract.md` under the
 //! "Electron preload ↔ renderer message shape" section:
 //!
-//! - preload.cjs loads the `.node` addon, owns a handle registry, and
-//!   exposes a single `(msg) => Promise<response>` bridge function via
+//! - each component preload module loads its `.node` addon and owns a handle
+//!   registry; the generated aggregate root is the only file that calls
 //!   `contextBridge.exposeInMainWorld("__uniffi__", ...)`.
 //! - renderer.ts installs an `__uniffiBackend` Proxy that forwards every
 //!   call through the bridge, so `common/api.ts` runs unchanged inside
@@ -71,12 +71,11 @@ fn render_preload(
          //\n\
          // Generic preload for namespace `{namespace}`. Loads the compiled\n\
          // napi addon, owns the handle registry, serialises errors, and\n\
-         // exposes a single bridge function via contextBridge. The shape\n\
-         // is pinned in docs/manual/src/javascript/contract.md.\n\
+         // exports one bridge object. The aggregate preload is the only\n\
+         // file that installs contextBridge, so components cannot overwrite\n\
+         // one another. The shape is pinned in docs/manual/src/javascript/contract.md.\n\
          \n\
          const path = require(\"node:path\");\n\
-         const {{ contextBridge }} = require(\"electron\");\n\
-         \n\
          const __uniffiSpecificNapiPathEnv = \"{env_var}\";\n\
          const __uniffiDefaultAddonPath = \"{default_addon_path}\";\n\
          \n\
@@ -355,7 +354,7 @@ fn render_preload(
              }}\n\
          }}\n\
          \n\
-         contextBridge.exposeInMainWorld(\"__uniffi__\", {{\n\
+         module.exports = Object.freeze({{\n\
              namespace: \"{namespace}\",\n\
              __uniffiJsRuntimeAbiVersion: {JS_RUNTIME_ABI_VERSION},\n\
              dispatchSync,\n\
@@ -393,23 +392,27 @@ fn render_renderer(namespace: &str, async_keys: &[String]) -> String {
          import {{ __installBackend, UniffiError }} from \"../common/runtime.ts\";\n\
          export * from \"../common/api.ts\";\n\
          \n\
-         declare global {{\n\
-             interface Window {{\n\
-                 __uniffi__: {{\n\
-                     namespace: string;\n\
-                     __uniffiJsRuntimeAbiVersion: {JS_RUNTIME_ABI_VERSION};\n\
-                     dispatchSync: (msg: BridgeMessage) => BridgeResponse;\n\
-                     dispatchAsync: (msg: BridgeMessage) => Promise<BridgeResponse>;\n\
-                 }};\n\
-             }}\n\
-         }}\n\
-         \n\
          type BridgeMessage =\n\
              | {{ kind: \"call\"; id: number; method: string; args: unknown[] }}\n\
              | {{ kind: \"drop\"; id: number }};\n\
          type BridgeResponse =\n\
              | {{ kind: \"ok\"; id: number; value: unknown }}\n\
              | {{ kind: \"err\"; id: number; error: {{ errorName: string; variant: string | null; data: unknown; message: string; stack?: string }} }};\n\
+         type ComponentBridge = {{\n\
+             namespace: string;\n\
+             __uniffiJsRuntimeAbiVersion: {JS_RUNTIME_ABI_VERSION};\n\
+             dispatchSync: (msg: BridgeMessage) => BridgeResponse;\n\
+             dispatchAsync: (msg: BridgeMessage) => Promise<BridgeResponse>;\n\
+         }};\n\
+         declare global {{\n\
+             interface Window {{\n\
+                 __uniffi__: {{ components: Record<string, ComponentBridge> }};\n\
+             }}\n\
+         }}\n\
+         const __uniffiBridge = window.__uniffi__.components[\"{namespace}\"];\n\
+         if (!__uniffiBridge) {{\n\
+             throw new Error(\"missing Electron UniFFI bridge for namespace `{namespace}`\");\n\
+         }}\n\
          \n\
          /** Generator-computed: dispatch keys flagged `async` in the IR. */\n\
          const ASYNC_METHODS: Set<string> = {async_set_literal};\n\
@@ -430,7 +433,7 @@ fn render_renderer(namespace: &str, async_keys: &[String]) -> String {
          function callSync(method: string, ...args: unknown[]): unknown {{\n\
              const id = nextCallId++;\n\
              return unwrap(\n\
-                 window.__uniffi__.dispatchSync({{ kind: \"call\", id, method, args }}),\n\
+                 __uniffiBridge.dispatchSync({{ kind: \"call\", id, method, args }}),\n\
              );\n\
          }}\n\
          \n\
@@ -440,21 +443,21 @@ fn render_renderer(namespace: &str, async_keys: &[String]) -> String {
                  typeof handle === \"object\" &&\n\
                  (handle as {{ __uniffiHandle?: boolean }}).__uniffiHandle === true\n\
              ) {{\n\
-                 unwrap(window.__uniffi__.dispatchSync({{ kind: \"drop\", id: (handle as {{ id: number }}).id }}));\n\
+                 unwrap(__uniffiBridge.dispatchSync({{ kind: \"drop\", id: (handle as {{ id: number }}).id }}));\n\
              }}\n\
          }}\n\
          \n\
          async function callAsync(method: string, ...args: unknown[]): Promise<unknown> {{\n\
              const id = nextCallId++;\n\
              return unwrap(\n\
-                 await window.__uniffi__.dispatchAsync({{ kind: \"call\", id, method, args }}),\n\
+                 await __uniffiBridge.dispatchAsync({{ kind: \"call\", id, method, args }}),\n\
              );\n\
          }}\n\
          \n\
          const backend = new Proxy({{}}, {{\n\
              get(_t, method: string) {{\n\
                  if (method === \"__uniffiJsRuntimeAbiVersion\") {{\n\
-                     return window.__uniffi__.__uniffiJsRuntimeAbiVersion;\n\
+                     return __uniffiBridge.__uniffiJsRuntimeAbiVersion;\n\
                  }}\n\
                  if (method.startsWith(\"__uniffi_\") && method.endsWith(\"_object_free\")) {{\n\
                      // `common/objects.ts` calls the wasm-style destructor\n\
