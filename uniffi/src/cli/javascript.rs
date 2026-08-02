@@ -4,7 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::{CargoOpt, DependencyKind, MetadataCommand, Package};
 use clap::{Args, Subcommand, ValueEnum};
 use std::process::Command;
 use uniffi_bindgen::{
@@ -1184,8 +1184,12 @@ fn build_wasm_inner(
         );
     }
 
-    let wasm_cargo_args =
-        dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+    let wasm_cargo_args = host_dependency_cargo_feature_args(
+        &manifest_path,
+        &wasm_manifest,
+        &[],
+        &args.cargo_features,
+    )?;
     let wasm_cargo_args = wasm_cargo_args
         .iter()
         .map(String::as_str)
@@ -1334,8 +1338,12 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
     }
 
     let target_dir = args.target_dir.as_ref().map(resolve_cwd_path).transpose()?;
-    let napi_cargo_args =
-        dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+    let napi_cargo_args = host_dependency_cargo_feature_args(
+        &manifest_path,
+        &napi_manifest,
+        &[],
+        &args.cargo_features,
+    )?;
     let napi_cargo_args = napi_cargo_args
         .iter()
         .map(String::as_str)
@@ -1372,33 +1380,63 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
         );
     }
 
-    for flavor in flavors {
+    let mut generated_by_flavor = Vec::new();
+    for flavor in &flavors {
         let subdir = match flavor {
             FlavorTarget::Napi => "node",
             FlavorTarget::Electron => "electron",
             FlavorTarget::Wasm | FlavorTarget::Harmony => continue,
         };
-        let namespace = generated_component_namespace(&args.out_dir, subdir)?;
-        let flavor_dir = args
-            .out_dir
-            .join("components")
-            .join(&namespace)
-            .join(subdir);
-        ensure_single_generated_rs(&flavor_dir)
-            .with_context(|| format!("finding generated Rust bridge in {flavor_dir}"))?;
-        let addon_stem = generated_addon_stem(&flavor_dir)
-            .with_context(|| format!("finding generated addon name in {flavor_dir}"))?;
-        let addon_dir = args
-            .artifact_dir
-            .as_ref()
-            .map(|dir| dir.join(subdir))
-            .unwrap_or_else(|| flavor_dir.clone());
-        let addon_path = addon_dir.join(format!("{addon_stem}.node"));
-        std::fs::create_dir_all(&addon_dir)
-            .with_context(|| format!("creating addon output dir {addon_dir}"))?;
-        std::fs::copy(&napi_artifact, &addon_path)
-            .with_context(|| format!("copying built napi addon {napi_artifact} to {addon_path}"))?;
+        let components = generated_components(&args.out_dir, subdir)?;
+        for component in &components {
+            let flavor_dir = args
+                .out_dir
+                .join("components")
+                .join(&component.namespace)
+                .join(subdir);
+            let bridge = ensure_single_generated_rs(&flavor_dir)
+                .with_context(|| format!("finding generated Rust bridge in {flavor_dir}"))?;
+            if bridge != component.component {
+                bail!(
+                    "generated JavaScript component `{}` namespace `{}` has bridge `{bridge}` in {flavor_dir}; expected its exact component crate name",
+                    component.component,
+                    component.namespace,
+                );
+            }
+            let addon_stem = generated_addon_stem(&flavor_dir)
+                .with_context(|| format!("finding generated addon name in {flavor_dir}"))?;
+            if addon_stem != napi_meta.lib_target_name {
+                bail!(
+                    "generated JavaScript component `{}` namespace `{}` points at addon `{addon_stem}`, but composite N-API host target is `{}`",
+                    component.component,
+                    component.namespace,
+                    napi_meta.lib_target_name,
+                );
+            }
+        }
+        generated_by_flavor.push((subdir, components));
     }
+    let Some((_, first_components)) = generated_by_flavor.first() else {
+        bail!("N-API build selected no N-API/Electron generation flavors");
+    };
+    for (subdir, components) in &generated_by_flavor[1..] {
+        if components != first_components {
+            bail!(
+                "generated JavaScript component set differs between N-API and `{subdir}` flavors; composite addon publication requires one exact component set"
+            );
+        }
+    }
+    let addon_dir = args
+        .artifact_dir
+        .as_ref()
+        .map(|dir| dir.join("node"))
+        .unwrap_or_else(|| args.out_dir.join("node"));
+    let addon_path = addon_dir.join(format!("{}.node", napi_meta.lib_target_name));
+    std::fs::create_dir_all(&addon_dir)
+        .with_context(|| format!("creating composite addon output dir {addon_dir}"))?;
+    std::fs::copy(&napi_artifact, &addon_path).with_context(|| {
+        format!("copying built composite napi addon {napi_artifact} to {addon_path}")
+    })?;
 
     Ok(())
 }
@@ -1645,8 +1683,12 @@ fn planned_direct_ohos_hsp_outputs(
                     .join("uniffi-ohos-facade-bundle.json"),
             )
         };
-        let mut cargo_args =
-            dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+        let mut cargo_args = host_dependency_cargo_feature_args(
+            &manifest_path,
+            &custom_manifest,
+            &args.cargo_args,
+            &args.cargo_features,
+        )?;
         cargo_args.extend(args.cargo_args.clone());
         let mut additional_source_roots = core_meta.local_source_roots.clone();
         additional_source_roots.push(("core-workspace".into(), core_meta.workspace_root.clone()));
@@ -1701,7 +1743,10 @@ fn planned_direct_ohos_hsp_outputs(
         });
     }
 
-    let generated_host_package = format!("{}-ohos", core_meta.package_name);
+    let generated_host_package =
+        uniffi_bindgen_javascript::host_crates::composite_host_package_name(
+            &core_meta.package_name,
+        );
     Ok(vec![super::ohos::planned_generated_hsp_outputs(
         super::ohos::GeneratedHspOutputPreflight {
             dist_dir: &dist_dir,
@@ -1840,8 +1885,12 @@ fn build_ohos_internal(
             } else {
                 args.arch.clone()
             };
-            let mut ohos_cargo_args =
-                dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+            let mut ohos_cargo_args = host_dependency_cargo_feature_args(
+                &manifest_path,
+                custom_manifest,
+                &args.cargo_args,
+                &args.cargo_features,
+            )?;
             ohos_cargo_args.extend(args.cargo_args.clone());
             let mut additional_source_roots = core_meta.local_source_roots.clone();
             additional_source_roots
@@ -1893,7 +1942,10 @@ fn build_ohos_internal(
             })
             .context("preflighting custom multi-package HSP host before core generation")?;
         } else {
-            let generated_host_package = format!("{}-ohos", core_meta.package_name);
+            let generated_host_package =
+                uniffi_bindgen_javascript::host_crates::composite_host_package_name(
+                    &core_meta.package_name,
+                );
             super::ohos::preflight_generated_hsp_outputs(
                 super::ohos::GeneratedHspOutputPreflight {
                     dist_dir: &dist_dir,
@@ -1982,8 +2034,12 @@ fn build_ohos_internal(
     } else {
         args.arch.clone()
     };
-    let mut ohos_cargo_args =
-        dependency_cargo_feature_args(&core_meta.package_name, &args.cargo_features);
+    let mut ohos_cargo_args = host_dependency_cargo_feature_args(
+        &manifest_path,
+        &ohos_manifest,
+        &args.cargo_args,
+        &args.cargo_features,
+    )?;
     ohos_cargo_args.extend(args.cargo_args);
     let mut additional_source_roots = core_meta.local_source_roots.clone();
     additional_source_roots.push(("core-workspace".into(), core_meta.workspace_root.clone()));
@@ -2045,26 +2101,196 @@ fn add_cargo_feature_args(command: &mut Command, features: &[String]) {
     }
 }
 
-fn dependency_cargo_feature_args(package_name: &str, features: &[String]) -> Vec<String> {
+/// Scope downstream feature selection to the exact dependency alias used by
+/// the host Cargo manifest.  A core package can have a different package
+/// name, Rust lib target and host dependency alias; querying the host resolve
+/// graph is the only way to avoid silently targeting the wrong package in a
+/// custom host manifest.
+fn host_dependency_cargo_feature_args(
+    core_manifest_path: &Utf8Path,
+    host_manifest_path: &Utf8Path,
+    cargo_args: &[String],
+    features: &[String],
+) -> Result<Vec<String>> {
     if features.is_empty() {
-        Vec::new()
-    } else {
-        vec![
-            "--features".to_string(),
-            features
-                .iter()
-                .map(|feature| format!("{package_name}/{feature}"))
-                .collect::<Vec<_>>()
-                .join(","),
-        ]
+        return Ok(Vec::new());
     }
+    let mut metadata_command = MetadataCommand::new();
+    metadata_command
+        .manifest_path(host_manifest_path.as_std_path())
+        // A custom host may make its core dependency optional.  Inspect all
+        // feature-gated direct edges, then restrict the eventual Cargo build
+        // to the uniquely resolved core alias below.
+        .features(CargoOpt::AllFeatures);
+    let metadata = metadata_command.exec().with_context(|| {
+        format!("running cargo metadata for host manifest {host_manifest_path}")
+    })?;
+    let canonical_core_manifest = canonicalize_or_keep(core_manifest_path);
+    let canonical_host_manifest = canonicalize_or_keep(host_manifest_path);
+    let core_package = cargo_package_for_manifest(&metadata, &canonical_core_manifest).with_context(|| {
+        format!(
+            "host manifest {host_manifest_path} does not resolve downstream core package {core_manifest_path}"
+        )
+    })?;
+    let resolve = metadata.resolve.as_ref().with_context(|| {
+        format!(
+            "cargo metadata for host manifest {host_manifest_path} did not include a resolve graph"
+        )
+    })?;
+    let host_packages = if let Some(host_package) =
+        cargo_package_for_manifest(&metadata, &canonical_host_manifest)
+    {
+        vec![host_package]
+    } else {
+        let selector = cargo_package_selector(cargo_args)?;
+        let use_default_members = selector.is_none()
+            && !cargo_requests_workspace_members(cargo_args)
+            && metadata.workspace_default_members.is_available()
+            && !metadata.workspace_default_members.is_empty();
+        let member_ids: &[cargo_metadata::PackageId] = if use_default_members {
+            &metadata.workspace_default_members
+        } else {
+            &metadata.workspace_members
+        };
+        let mut members = member_ids
+            .iter()
+            .filter_map(|id| metadata.packages.iter().find(|package| package.id == *id))
+            .collect::<Vec<_>>();
+        if let Some(selector) = selector.as_deref() {
+            members.retain(|package| cargo_package_matches_selector(package, selector));
+            if members.is_empty() {
+                bail!(
+                    "virtual host workspace {host_manifest_path} has no member matching Cargo package selector `{selector}`"
+                );
+            }
+        }
+        members
+    };
+
+    let mut resolved = Vec::new();
+    for host_package in host_packages {
+        let host_node = resolve
+            .nodes
+            .iter()
+            .find(|node| node.id == host_package.id)
+            .with_context(|| {
+                format!(
+                    "cargo metadata resolve graph has no node for host package {}",
+                    host_package.name
+                )
+            })?;
+        let mut keys = host_node
+            .deps
+            .iter()
+            .filter(|dependency| dependency.pkg == core_package.id)
+            .filter(|dependency| {
+                dependency
+                    .dep_kinds
+                    .iter()
+                    .any(|kind| kind.kind == DependencyKind::Normal)
+            })
+            .map(|dependency| dependency.name.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        match keys.as_slice() {
+            [] => {}
+            [key] if !key.is_empty() => {
+                resolved.push((host_package.name.to_string(), key.clone()));
+            }
+            _ => bail!(
+                "host package {} in {host_manifest_path} has ambiguous direct aliases ({}) for core package {} ({core_manifest_path}); cannot scope requested core features",
+                host_package.name,
+                keys.join(", "),
+                core_package.name,
+            ),
+        }
+    }
+    let root_dependency_key = match resolved.as_slice() {
+        [(_, key)] => key,
+        [] => bail!(
+            "host manifest {host_manifest_path} has no uniquely selected direct normal dependency on core package {} ({core_manifest_path}); cannot scope requested core features",
+            core_package.name
+        ),
+        _ => bail!(
+            "host manifest {host_manifest_path} has multiple workspace members with direct aliases ({}) for core package {} ({core_manifest_path}); pass --package to select one host member",
+            resolved
+                .iter()
+                .map(|(package, key)| format!("{package}:{key}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            core_package.name,
+        ),
+    };
+    Ok(vec![
+        "--features".to_string(),
+        features
+            .iter()
+            .map(|feature| format!("{root_dependency_key}/{feature}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    ])
+}
+
+fn cargo_package_for_manifest<'a>(
+    metadata: &'a cargo_metadata::Metadata,
+    manifest_path: &Utf8Path,
+) -> Option<&'a Package> {
+    metadata.packages.iter().find(|package| {
+        Utf8PathBuf::from_path_buf(package.manifest_path.clone().into_std_path_buf())
+            .ok()
+            .map(|path| canonicalize_or_keep(&path) == manifest_path)
+            .unwrap_or(false)
+    })
+}
+
+fn cargo_package_selector(cargo_args: &[String]) -> Result<Option<String>> {
+    let mut selector = None;
+    let mut index = 0;
+    while index < cargo_args.len() {
+        let value = &cargo_args[index];
+        let candidate = match value.as_str() {
+            "--package" | "-p" => {
+                index += 1;
+                cargo_args.get(index).with_context(|| {
+                    format!("Cargo argument `{value}` requires a package selector")
+                })?
+            }
+            _ if value.starts_with("--package=") => &value["--package=".len()..],
+            _ if value.starts_with("-p") && value.len() > 2 => &value[2..],
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        match &selector {
+            None => selector = Some(candidate.to_string()),
+            Some(existing) if existing == candidate => {}
+            Some(existing) => bail!(
+                "multiple Cargo package selectors are ambiguous for host feature routing: `{existing}` and `{candidate}`"
+            ),
+        }
+        index += 1;
+    }
+    Ok(selector)
+}
+
+fn cargo_requests_workspace_members(cargo_args: &[String]) -> bool {
+    cargo_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--workspace" | "--all"))
+}
+
+fn cargo_package_matches_selector(package: &Package, selector: &str) -> bool {
+    selector == package.name.as_str() || selector == format!("{}@{}", package.name, package.version)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        dependency_cargo_feature_args, rebase_mini_program_auto_entrypoint, BuildWasmArgs,
-        WasmBindgenTargetArg, WasmTargetIsolationGuard,
+        emit_browser_auto_entrypoint, host_dependency_cargo_feature_args,
+        rebase_mini_program_auto_entrypoint, BuildWasmArgs, WasmBindgenTargetArg,
+        WasmTargetIsolationGuard,
     };
     #[cfg(windows)]
     use super::{wasm_preflight_nofollow, windows_wasm_semantic_path_key};
@@ -2094,28 +2320,149 @@ mod tests {
     }
 
     #[test]
-    fn napi_and_ohos_dependency_feature_args_are_package_qualified() {
-        let args = dependency_cargo_feature_args(
-            "uni-core",
+    fn host_dependency_feature_args_use_the_resolved_host_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let core = root.join("core");
+        let host = root.join("host");
+        std::fs::create_dir_all(core.join("src")).unwrap();
+        std::fs::create_dir_all(host.join("src")).unwrap();
+        std::fs::write(core.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        std::fs::write(host.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        std::fs::write(
+            core.join("Cargo.toml"),
+            r#"[package]
+name = "core-package"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "core_bridge"
+
+[features]
+local-llm = []
+local-llm-vision = []
+local-llm-audio = []
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            host.join("Cargo.toml"),
+            r#"[package]
+name = "custom-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+custom_core_alias = { package = "core-package", path = "../core" }
+"#,
+        )
+        .unwrap();
+
+        let args = host_dependency_cargo_feature_args(
+            &core.join("Cargo.toml"),
+            &host.join("Cargo.toml"),
+            &[],
             &[
                 "local-llm".to_string(),
                 "local-llm-vision".to_string(),
                 "local-llm-audio".to_string(),
             ],
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             args,
             vec![
                 "--features".to_string(),
-                "uni-core/local-llm,uni-core/local-llm-vision,uni-core/local-llm-audio".to_string(),
+                "custom_core_alias/local-llm,custom_core_alias/local-llm-vision,custom_core_alias/local-llm-audio".to_string(),
             ]
         );
     }
 
     #[test]
-    fn napi_and_ohos_dependency_feature_args_are_empty_without_features() {
-        assert!(dependency_cargo_feature_args("uni-core", &[]).is_empty());
+    fn host_dependency_feature_args_support_virtual_workspace_package_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let core = root.join("core");
+        let workspace = root.join("host-workspace");
+        for package in [&core, &workspace.join("host-a"), &workspace.join("host-b")] {
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            std::fs::write(package.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        }
+        std::fs::write(
+            core.join("Cargo.toml"),
+            r#"[package]
+name = "core-package"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+host-gate = []
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            r#"[workspace]
+members = ["host-a", "host-b"]
+default-members = ["host-b"]
+resolver = "3"
+"#,
+        )
+        .unwrap();
+        for (name, alias) in [("host-a", "core_for_a"), ("host-b", "core_for_b")] {
+            std::fs::write(
+                workspace.join(name).join("Cargo.toml"),
+                format!(
+                    r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+{alias} = {{ package = "core-package", path = "../../core" }}
+"#,
+                ),
+            )
+            .unwrap();
+        }
+
+        let default_args = host_dependency_cargo_feature_args(
+            &core.join("Cargo.toml"),
+            &workspace.join("Cargo.toml"),
+            &[],
+            &["host-gate".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            default_args,
+            vec!["--features".to_string(), "core_for_b/host-gate".to_string()]
+        );
+
+        let package_args = host_dependency_cargo_feature_args(
+            &core.join("Cargo.toml"),
+            &workspace.join("Cargo.toml"),
+            &["--package".to_string(), "host-a".to_string()],
+            &["host-gate".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            package_args,
+            vec!["--features".to_string(), "core_for_a/host-gate".to_string()]
+        );
+    }
+
+    #[test]
+    fn host_dependency_feature_args_are_empty_without_features() {
+        assert!(host_dependency_cargo_feature_args(
+            camino::Utf8Path::new("missing-core/Cargo.toml"),
+            camino::Utf8Path::new("missing-host/Cargo.toml"),
+            &[],
+            &[],
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -2300,7 +2647,14 @@ mod tests {
         let actual_out = root.join("private/generated");
         let logical_out = root.join("public/generated");
         let logical_mini = root.join("public/artifacts/mini-program");
-        std::fs::create_dir_all(actual_out.join("components/demo/browser")).unwrap();
+        for (namespace, bridge) in [("demo", "demo"), ("other", "other")] {
+            let browser_dir = actual_out
+                .join("components")
+                .join(namespace)
+                .join("browser");
+            std::fs::create_dir_all(&browser_dir).unwrap();
+            std::fs::write(browser_dir.join(format!("{bridge}.rs")), "// bridge").unwrap();
+        }
         rebase_mini_program_auto_entrypoint(&actual_out, &logical_out, &logical_mini, "demo_wasm")
             .unwrap();
         let entry =
@@ -2310,8 +2664,8 @@ mod tests {
             "private entrypoint did not encode its public relative import: {entry}"
         );
         assert!(
-            entry.contains("import { demo } from \"./index.ts\";"),
-            "Mini Program entrypoint did not route initialization through its root namespace: {entry}"
+            entry.contains("import { demo, other } from \"./index.ts\";"),
+            "Mini Program entrypoint did not import every root namespace: {entry}"
         );
         assert!(
             entry.contains(
@@ -2319,7 +2673,77 @@ mod tests {
             ),
             "Mini Program entrypoint did not resolve its component type through the namespaced tree: {entry}"
         );
+        assert!(
+            entry.contains("await Promise.all([")
+                && entry.contains("demo.initBackend(initializedGlue)")
+                && entry.contains("other.initBackend(initializedGlue)"),
+            "Mini Program entrypoint did not initialize all component backends from one glue module: {entry}"
+        );
+        assert_eq!(
+            entry.matches("initializedModule.default as").count(),
+            1,
+            "Mini Program entrypoint should initialize wasm-bindgen glue once: {entry}"
+        );
+        assert_eq!(
+            entry
+                .matches("Object.defineProperty(initializedGlue, \"default\"")
+                .count(),
+            1,
+            "Mini Program entrypoint should shadow a read-only module default exactly once: {entry}"
+        );
+        assert!(
+            !entry.contains("initializedGlue.default ="),
+            "Mini Program entrypoint must not assign through a read-only module prototype: {entry}"
+        );
+        assert_eq!(
+            entry.matches("demo.initBackend(initializedGlue)").count(),
+            1
+        );
+        assert_eq!(
+            entry.matches("other.initBackend(initializedGlue)").count(),
+            1
+        );
         assert!(!entry.contains("private"));
+    }
+
+    #[test]
+    fn browser_entrypoint_safely_shadows_read_only_default_for_all_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let out = root.join("generated");
+        let glue = root.join("artifacts/browser/pkg");
+        for namespace in ["alpha", "beta"] {
+            let browser_dir = out.join("components").join(namespace).join("browser");
+            std::fs::create_dir_all(&browser_dir).unwrap();
+            std::fs::write(browser_dir.join(format!("{namespace}.rs")), "// bridge").unwrap();
+        }
+        std::fs::create_dir_all(&glue).unwrap();
+
+        emit_browser_auto_entrypoint(&out, &glue, "composite_host", WasmBindgenTargetArg::Web)
+            .unwrap();
+
+        let entry = std::fs::read_to_string(out.join("browser/index.web.ts")).unwrap();
+        assert!(entry.contains("import { alpha, beta } from \"./index.ts\";"));
+        assert_eq!(entry.matches("initializedModule.default as").count(), 1);
+        assert_eq!(
+            entry
+                .matches("Object.defineProperty(initializedGlue, \"default\"")
+                .count(),
+            1,
+            "Browser entrypoint should shadow a read-only module default exactly once: {entry}"
+        );
+        assert!(
+            !entry.contains("initializedGlue.default ="),
+            "Browser entrypoint must not assign through a read-only module prototype: {entry}"
+        );
+        assert_eq!(
+            entry.matches("alpha.initBackend(initializedGlue)").count(),
+            1
+        );
+        assert_eq!(
+            entry.matches("beta.initBackend(initializedGlue)").count(),
+            1
+        );
     }
 }
 
@@ -2411,7 +2835,7 @@ fn resolve_cwd_path(path: &Utf8PathBuf) -> Result<Utf8PathBuf> {
     }
 }
 
-fn ensure_single_generated_rs(dir: &Utf8Path) -> Result<()> {
+fn ensure_single_generated_rs(dir: &Utf8Path) -> Result<String> {
     let mut stems = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {dir}"))? {
         let entry = entry?;
@@ -2425,18 +2849,26 @@ fn ensure_single_generated_rs(dir: &Utf8Path) -> Result<()> {
         }
     }
     match stems.as_slice() {
-        [_stem] => Ok(()),
+        [stem] => Ok(stem.clone()),
         [] => bail!("no generated Rust bridge (*.rs) found in {dir}"),
         _ => bail!("multiple generated Rust bridges found in {dir}: {stems:?}"),
     }
 }
 
-/// Host-backed build commands still operate on exactly one selected
-/// component in the 05B namespaced-source stage. Resolve that component from
-/// the generated tree rather than reviving a flat output fallback.
-fn generated_component_namespace(out_dir: &Utf8Path, flavor: &str) -> Result<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GeneratedComponent {
+    component: String,
+    namespace: String,
+    native_export_prefix: String,
+}
+
+/// Resolve every selected component for one generated flavor. Each namespace
+/// still owns exactly one bridge file; this function only pluralizes the
+/// package-level discovery and verifies that component/namespace/prefix
+/// identities are canonical before any build command copies an artifact.
+fn generated_components(out_dir: &Utf8Path, flavor: &str) -> Result<Vec<GeneratedComponent>> {
     let components_dir = out_dir.join("components");
-    let mut namespaces = Vec::new();
+    let mut components = Vec::new();
     for entry in std::fs::read_dir(&components_dir)
         .with_context(|| format!("reading generated component root {components_dir}"))?
     {
@@ -2458,20 +2890,44 @@ fn generated_component_namespace(out_dir: &Utf8Path, flavor: &str) -> Result<Str
             .file_name()
             .with_context(|| format!("generated component directory has no name: {path}"))?
             .to_string();
-        if path.join(flavor).is_dir() {
-            namespaces.push(namespace);
+        let flavor_dir = path.join(flavor);
+        if flavor_dir.is_dir() {
+            let component = ensure_single_generated_rs(&flavor_dir)?;
+            let native_export_prefix =
+                uniffi_bindgen::interface::native_export_prefix_for_component(&component);
+            components.push(GeneratedComponent {
+                component,
+                namespace,
+                native_export_prefix,
+            });
         }
     }
-    namespaces.sort();
-    match namespaces.as_slice() {
-        [namespace] => Ok(namespace.clone()),
-        [] => bail!(
+    components.sort_by(|left, right| {
+        (&left.component, &left.namespace, &left.native_export_prefix).cmp(&(
+            &right.component,
+            &right.namespace,
+            &right.native_export_prefix,
+        ))
+    });
+    if components.is_empty() {
+        bail!(
             "no generated JavaScript component with `{flavor}` flavor found below {components_dir}"
-        ),
-        _ => bail!(
-            "expected one generated JavaScript component with `{flavor}` flavor below {components_dir}, found {namespaces:?}; multi-component host composition is deferred to stage 05C"
-        ),
+        );
     }
+    let mut component_names = std::collections::BTreeSet::new();
+    let mut namespaces = std::collections::BTreeSet::new();
+    let mut prefixes = std::collections::BTreeSet::new();
+    for component in &components {
+        if !component_names.insert(component.component.as_str())
+            || !namespaces.insert(component.namespace.as_str())
+            || !prefixes.insert(component.native_export_prefix.as_str())
+        {
+            bail!(
+                "generated JavaScript components for `{flavor}` have a duplicate canonical identity field: {component:?}"
+            );
+        }
+    }
+    Ok(components)
 }
 
 fn generated_addon_stem(dir: &Utf8Path) -> Result<String> {
@@ -2521,7 +2977,23 @@ fn emit_browser_auto_entrypoint(
         return Ok(());
     }
 
-    let namespace = generated_component_namespace(out_dir, "browser")?;
+    let components = generated_components(out_dir, "browser")?;
+    let namespace_imports = components
+        .iter()
+        .map(|component| component.namespace.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let glue_type_namespace = &components[0].namespace;
+    let component_initializers = components
+        .iter()
+        .map(|component| {
+            format!(
+                "        {}.initBackend(initializedGlue),",
+                component.namespace
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     std::fs::create_dir_all(&browser_dir)
         .with_context(|| format!("creating browser output dir {browser_dir}"))?;
@@ -2554,14 +3026,30 @@ fn emit_browser_auto_entrypoint(
 
 import * as glue from "{glue_path}";
 import wasmUrl from "{wasm_url_path}";
-import {{ {namespace} }} from "./index.ts";
+import {{ {namespace_imports} }} from "./index.ts";
+import type {{ WasmBindgenGlue }} from "../components/{glue_type_namespace}/browser/index.ts";
 
 export * from "./index.ts";
 
 let readyPromise: Promise<void> | null = null;
 
+async function installAll(input: unknown): Promise<void> {{
+    const initializedModule = await glue;
+    if (typeof initializedModule.default === "function") {{
+        await (initializedModule.default as (value?: unknown) => Promise<unknown>)(input);
+    }}
+    // Keep every named wasm-bindgen export through the module prototype while
+    // hiding `default`: each namespace adapter must install its scoped backend
+    // without initializing the one composite glue module a second time.
+    const initializedGlue = Object.create(initializedModule) as WasmBindgenGlue;
+    Object.defineProperty(initializedGlue, "default", {{ value: undefined }});
+    await Promise.all([
+{component_initializers}
+    ]);
+}}
+
 export function init(input: unknown = wasmUrl): Promise<void> {{
-    readyPromise ??= {namespace}.initBackend(glue, input);
+    readyPromise ??= installAll(input);
     return readyPromise;
 }}
 
@@ -2850,7 +3338,23 @@ fn write_mini_program_auto_entrypoint(
     };
     let glue_path = format!("{rel_artifact_dir}/{wasm_bindgen_stem}.js");
     let default_wasm_path = mini_program_default_wasm_path(wasm_bindgen_stem);
-    let namespace = generated_component_namespace(actual_out_dir, "browser")?;
+    let components = generated_components(actual_out_dir, "browser")?;
+    let namespace_imports = components
+        .iter()
+        .map(|component| component.namespace.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let glue_type_namespace = &components[0].namespace;
+    let component_initializers = components
+        .iter()
+        .map(|component| {
+            format!(
+                "        {}.initBackend(initializedGlue),",
+                component.namespace
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let source = format!(
         r#"// AUTOGENERATED by uniffi_bindgen_javascript (wasm Mini Program auto-entrypoint).
@@ -2860,8 +3364,8 @@ fn write_mini_program_auto_entrypoint(
 // calls `WXWebAssembly.instantiate(packagePath, imports)`.
 
 import * as glue from "{glue_path}";
-import {{ {namespace} }} from "./index.ts";
-import type {{ WasmBindgenGlue }} from "../components/{namespace}/browser/index.ts";
+import {{ {namespace_imports} }} from "./index.ts";
+import type {{ WasmBindgenGlue }} from "../components/{glue_type_namespace}/browser/index.ts";
 
 export * from "./index.ts";
 
@@ -2897,8 +3401,23 @@ export function initWithGlue(
     wasmPath: string,
 ): Promise<void> {{
     assertWXWebAssembly();
-    readyPromise ??= {namespace}.initBackend(customGlue, wasmPath);
+    readyPromise ??= installAll(customGlue, wasmPath);
     return readyPromise;
+}}
+
+async function installAll(
+    customGlue: WasmBindgenGlue | Promise<WasmBindgenGlue>,
+    wasmPath: string,
+): Promise<void> {{
+    const initializedModule = await customGlue;
+    if (typeof initializedModule.default === "function") {{
+        await (initializedModule.default as (value?: unknown) => Promise<unknown>)(wasmPath);
+    }}
+    const initializedGlue = Object.create(initializedModule) as WasmBindgenGlue;
+    Object.defineProperty(initializedGlue, "default", {{ value: undefined }});
+    await Promise.all([
+{component_initializers}
+    ]);
 }}
 "#,
     );

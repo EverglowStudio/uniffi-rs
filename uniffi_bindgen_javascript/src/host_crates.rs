@@ -23,11 +23,100 @@
 
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::{CargoOpt, DependencyKind, MetadataCommand, Package, PackageId, TargetKind};
 use fs_err as fs;
 use sha2::{Digest, Sha256};
 
 const HOST_BUNDLE_SCHEMA_VERSION: u32 = 3;
+
+/// Canonical identity of one selected JavaScript component before Cargo
+/// dependency planning.  The generator supplies these in stable order, but
+/// the planner independently verifies that order and every native prefix so a
+/// host crate can never accidentally bind a bridge to a similarly named
+/// package.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct HostComponentIdentity {
+    pub(crate) crate_name: String,
+    pub(crate) namespace: String,
+    pub(crate) native_export_prefix: String,
+}
+
+impl HostComponentIdentity {
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "component `{}` (namespace `{}`, native export prefix `{}`)",
+            self.crate_name, self.namespace, self.native_export_prefix
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlannedPackageDependency {
+    /// Rust extern-crate key written in every generated host Cargo.toml.
+    dependency_key: String,
+    /// Resolved Cargo package identity.  Package names alone are not unique
+    /// enough to prove that an aliased direct dependency is the dependency
+    /// selected by the current root resolve graph.
+    package_id: PackageId,
+    /// Cargo package name, which may differ from its Rust lib target.
+    package_name: String,
+    package_dir: Utf8PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedComponentDependency {
+    identity: HostComponentIdentity,
+    package: PlannedPackageDependency,
+}
+
+/// A complete, read-only host plan.  It is created before the generator owns
+/// its first output path, which makes missing/ambiguous Cargo mappings fail
+/// closed without leaving a partial source or host tree behind.
+#[derive(Clone, Debug)]
+pub(crate) struct HostCratePlan {
+    meta: CoreCrateMetadata,
+    /// Every generated host crate depends on its root package exactly once so
+    /// `--features <root-lib>/<feature>` has a stable owner even when the
+    /// root package is not one of the selected UniFFI components.
+    root_dependency: PlannedPackageDependency,
+    components: Vec<PlannedComponentDependency>,
+}
+
+impl HostCratePlan {
+    pub(crate) fn napi_artifact_stem(&self) -> String {
+        composite_host_lib_target(&self.meta.package_name)
+    }
+
+    pub(crate) fn wasm_artifact_stem(&self) -> String {
+        composite_host_lib_target(&self.meta.package_name)
+    }
+
+    pub(crate) fn ohos_artifact_stem(&self) -> String {
+        composite_host_lib_target(&self.meta.package_name)
+    }
+
+    fn ohos_host_package_name(&self) -> String {
+        composite_host_package_name(&self.meta.package_name)
+    }
+
+    fn ohos_composite_identity(&self) -> Result<String> {
+        composite_host_identity(
+            &self.ohos_host_package_name(),
+            &self.ohos_artifact_stem(),
+            &self
+                .components
+                .iter()
+                .map(|component| {
+                    (
+                        component.identity.crate_name.clone(),
+                        component.identity.namespace.clone(),
+                        component.identity.native_export_prefix.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+}
 
 /// Caller-supplied metadata + CLI flags for host-crate emission.
 #[derive(Clone, Debug)]
@@ -108,6 +197,20 @@ pub fn load_metadata(manifest_path: &Utf8Path) -> Result<CoreCrateMetadata> {
         })
         .or_else(|| cargo_metadata.root_package())
         .with_context(|| format!("cargo metadata did not resolve package {manifest_path}"))?;
+    core_metadata_from_package(manifest_path, &value, package)
+}
+
+/// Build host-manifest metadata from a Cargo-resolved root package while
+/// retaining the source TOML only for exact rendering of the `uniffi`
+/// dependency declaration.  Keeping this separate lets [`plan`] use the same
+/// all-features Cargo metadata snapshot for both resolve-graph mapping and
+/// package metadata, rather than risking a second, differently-featured
+/// query.
+fn core_metadata_from_package(
+    manifest_path: &Utf8Path,
+    value: &toml::Value,
+    package: &Package,
+) -> Result<CoreCrateMetadata> {
     let package_name = package.name.to_string();
     let package_version = package.version.to_string();
     let description = package.description.clone();
@@ -130,6 +233,473 @@ pub fn load_metadata(manifest_path: &Utf8Path) -> Result<CoreCrateMetadata> {
     })
 }
 
+/// Resolve every selected UniFFI component against the root package's direct
+/// Cargo dependencies.  The generated bridge uses the component's Rust lib
+/// target as an extern-crate path, so accepting a transitive dependency, a
+/// package-name lookalike, or an alias mismatch would produce a host crate
+/// that compiles only by accident (or routes to the wrong component).
+pub(crate) fn plan(
+    options: &HostCrateOptions,
+    identities: &[HostComponentIdentity],
+    want_wasm: bool,
+    want_napi: bool,
+    want_ohos: bool,
+) -> Result<HostCratePlan> {
+    if identities.is_empty() {
+        bail!("host-crate generation requires at least one selected component");
+    }
+
+    let mut canonical_identities = identities.to_vec();
+    canonical_identities.sort();
+    if canonical_identities != identities {
+        bail!(
+            "host-crate component identities must be supplied in canonical (crate, namespace, native prefix) order"
+        );
+    }
+    for identity in identities {
+        let expected =
+            uniffi_bindgen::interface::native_export_prefix_for_component(&identity.crate_name);
+        if identity.crate_name.is_empty()
+            || identity.namespace.is_empty()
+            || identity.native_export_prefix != expected
+        {
+            bail!(
+                "host-crate component identity is invalid for {}",
+                identity.describe()
+            );
+        }
+    }
+
+    let mut metadata_command = MetadataCommand::new();
+    metadata_command.manifest_path(options.manifest_path.as_std_path());
+    // The generated source has already selected its actual components.  Plan
+    // over every optional direct edge so a feature-gated component selected by
+    // that source is not accidentally invisible to this independent Cargo
+    // metadata invocation.  We still reject any ambiguous package mapping.
+    metadata_command.features(CargoOpt::AllFeatures);
+    let metadata = metadata_command.exec().with_context(|| {
+        format!(
+            "running cargo metadata for composite host manifest {}",
+            options.manifest_path
+        )
+    })?;
+    let canonical_manifest = options
+        .manifest_path
+        .canonicalize_utf8()
+        .unwrap_or_else(|_| options.manifest_path.clone());
+    let root = metadata
+        .packages
+        .iter()
+        .find(|package| {
+            Utf8PathBuf::from_path_buf(package.manifest_path.clone().into_std_path_buf())
+                .ok()
+                .map(|path| path.canonicalize_utf8().unwrap_or(path) == canonical_manifest)
+                .unwrap_or(false)
+        })
+        .with_context(|| {
+            format!(
+                "host manifest {} must name one real root package; virtual workspaces are not supported",
+                options.manifest_path
+            )
+    })?;
+    let manifest_text = fs::read_to_string(&options.manifest_path)
+        .with_context(|| format!("reading manifest at {}", options.manifest_path))?;
+    let manifest_value: toml::Value = toml::from_str(&manifest_text)
+        .with_context(|| format!("parsing {}", options.manifest_path))?;
+    let root_meta = core_metadata_from_package(&options.manifest_path, &manifest_value, root)?;
+    let resolve = metadata.resolve.as_ref().with_context(|| {
+        format!(
+            "cargo metadata for host manifest {} did not include a resolve graph",
+            options.manifest_path
+        )
+    })?;
+    let root_node = resolve
+        .nodes
+        .iter()
+        .find(|node| node.id == root.id)
+        .with_context(|| {
+            format!(
+                "cargo metadata resolve graph has no node for root package {}",
+                root.name
+            )
+        })?;
+    let root_dependency = planned_root_dependency(root)?;
+    let direct_packages = resolved_direct_normal_packages(&metadata, root, root_node)?;
+
+    let mut components = Vec::with_capacity(identities.len());
+    for identity in identities {
+        let expected_lib_target = rust_crate_key(&identity.crate_name);
+        let mut candidates = Vec::new();
+
+        if package_exposes_lib_target(root, &expected_lib_target) {
+            candidates.push(planned_package_dependency(root, &expected_lib_target)?);
+        }
+
+        for package in &direct_packages {
+            if package_exposes_lib_target(package, &expected_lib_target) {
+                // `NodeDep.name` proved this is a direct dependency selected
+                // by the current root resolve graph (including aliases), but
+                // the generated bridge imports the library target.  Render
+                // that target as the host dependency key instead of copying
+                // the root manifest's alias.
+                candidates.push(planned_package_dependency(package, &expected_lib_target)?);
+            }
+        }
+
+        candidates.sort_by(|left, right| {
+            (left.dependency_key.as_str(), left.package_id.to_string())
+                .cmp(&(right.dependency_key.as_str(), right.package_id.to_string()))
+        });
+        candidates.dedup_by(|left, right| {
+            left.dependency_key == right.dependency_key && left.package_id == right.package_id
+        });
+        match candidates.as_slice() {
+            [package] => components.push(PlannedComponentDependency {
+                identity: identity.clone(),
+                package: package.clone(),
+            }),
+            [] => bail!(
+                "host-crate component {} is not an exact lib target of the root package or one of its direct normal dependencies",
+                identity.describe()
+            ),
+            _ => bail!(
+                "host-crate component {} has multiple direct package mappings; use one exact dependency key/lib target",
+                identity.describe()
+            ),
+        }
+    }
+
+    let mut dependency_owners = std::collections::BTreeMap::<String, (String, Vec<String>)>::new();
+    dependency_owners.insert(
+        root_dependency.dependency_key.clone(),
+        (
+            root_dependency.package_id.to_string(),
+            vec![format!("root package `{}`", root_dependency.package_name)],
+        ),
+    );
+    let mut collisions = Vec::new();
+    for component in &components {
+        let package = &component.package;
+        let owner = component.identity.describe();
+        match dependency_owners.entry(package.dependency_key.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((package.package_id.to_string(), vec![owner]));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let (existing_package_id, owners) = entry.get_mut();
+                if *existing_package_id == package.package_id.to_string() {
+                    owners.push(owner);
+                } else {
+                    collisions.push((
+                        package.dependency_key.clone(),
+                        existing_package_id.clone(),
+                        package.package_id.to_string(),
+                        owners.clone(),
+                        owner,
+                    ));
+                }
+            }
+        }
+    }
+    if !collisions.is_empty() {
+        let details = collisions
+            .into_iter()
+            .map(|(key, left_id, right_id, owners, owner)| {
+                format!(
+                    "`{key}` => package {left_id} ({}) conflicts with package {right_id} ({owner})",
+                    owners.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("host-crate direct dependency key collision: {details}");
+    }
+    validate_fixed_runtime_dependency_keys(
+        &root_dependency,
+        &components,
+        want_wasm,
+        want_napi,
+        want_ohos,
+    )?;
+
+    Ok(HostCratePlan {
+        meta: root_meta,
+        root_dependency,
+        components,
+    })
+}
+
+/// Dependency keys occupied by the requested generated host runtimes. Check
+/// them while planning, before any generated source or host directory is
+/// created, rather than emitting an invalid duplicate TOML key after source
+/// generation.  Flavor-specific keys stay scoped to the requested flavors so
+/// a wasm-only component named `napi`, for example, remains valid.
+fn validate_fixed_runtime_dependency_keys(
+    root_dependency: &PlannedPackageDependency,
+    components: &[PlannedComponentDependency],
+    want_wasm: bool,
+    want_napi: bool,
+    want_ohos: bool,
+) -> Result<()> {
+    let mut occupied = vec![root_dependency];
+    occupied.extend(components.iter().map(|component| &component.package));
+    let mut fixed_keys = vec!["uniffi".to_string(), "async_trait".to_string()];
+    if want_wasm {
+        fixed_keys.extend(
+            ["wasm_bindgen", "wasm_bindgen_futures", "js_sys"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    if want_napi {
+        fixed_keys.extend(
+            ["napi", "napi_derive", "napi_build"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    if want_ohos {
+        fixed_keys.extend(
+            ["napi_ohos", "napi_derive_ohos", "napi_build_ohos"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    fixed_keys.push(composite_host_lib_target(&root_dependency.package_name));
+    let collisions = occupied
+        .into_iter()
+        .filter(|dependency| fixed_keys.contains(&dependency.dependency_key))
+        .map(|dependency| {
+            format!(
+                "`{}` (package {})",
+                dependency.dependency_key, dependency.package_id
+            )
+        })
+        .collect::<Vec<_>>();
+    if !collisions.is_empty() {
+        bail!(
+            "host-crate dependency key collides with a fixed generated runtime dependency: {}",
+            collisions.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Return the direct, normal packages selected by the root package's current
+/// Cargo resolve node.  `Package.dependencies` alone cannot distinguish
+/// aliases or multiple package IDs with the same package name; `NodeDep` can.
+fn resolved_direct_normal_packages<'a>(
+    metadata: &'a cargo_metadata::Metadata,
+    root: &Package,
+    root_node: &cargo_metadata::Node,
+) -> Result<Vec<&'a Package>> {
+    let mut direct_packages = Vec::new();
+    for dependency in root
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::Normal)
+    {
+        let source_key = rust_crate_key(
+            dependency
+                .rename
+                .as_deref()
+                .unwrap_or(dependency.name.as_str()),
+        );
+        let mut matches = Vec::new();
+        for node_dependency in &root_node.deps {
+            if !node_dependency
+                .dep_kinds
+                .iter()
+                .any(|kind| kind.kind == DependencyKind::Normal)
+            {
+                continue;
+            }
+            if rust_crate_key(&node_dependency.name) != source_key {
+                continue;
+            }
+            let package = metadata
+                .packages
+                .iter()
+                .find(|package| package.id == node_dependency.pkg)
+                .with_context(|| {
+                    format!(
+                        "cargo metadata resolve node for {} references missing package {}",
+                        root.name, node_dependency.pkg
+                    )
+                })?;
+            if package.name != dependency.name {
+                continue;
+            }
+            matches.push(package);
+        }
+        matches.sort_by_key(|package| package.id.to_string());
+        matches.dedup_by(|left, right| left.id == right.id);
+        if matches.len() > 1 {
+            let ids = matches
+                .iter()
+                .map(|package| package.id.to_string())
+                .collect::<Vec<_>>();
+            bail!(
+                "host-crate direct dependency alias `{}` for package `{}` resolves to multiple package IDs: {}",
+                dependency.rename.as_deref().unwrap_or(&dependency.name),
+                dependency.name,
+                ids.join(", ")
+            );
+        }
+        direct_packages.extend(matches);
+    }
+    direct_packages.sort_by_key(|package| package.id.to_string());
+    direct_packages.dedup_by(|left, right| left.id == right.id);
+    Ok(direct_packages)
+}
+
+fn planned_root_dependency(package: &Package) -> Result<PlannedPackageDependency> {
+    let target = unique_lib_target(package)?;
+    planned_package_dependency(package, &target)
+}
+
+fn planned_package_dependency(
+    package: &Package,
+    dependency_key: &str,
+) -> Result<PlannedPackageDependency> {
+    Ok(PlannedPackageDependency {
+        dependency_key: dependency_key.to_string(),
+        package_id: package.id.clone(),
+        package_name: package.name.to_string(),
+        package_dir: package_dir(package)?,
+    })
+}
+
+fn unique_lib_target(package: &Package) -> Result<String> {
+    let mut targets = package
+        .targets
+        .iter()
+        .filter(|target| {
+            target
+                .kind
+                .iter()
+                .any(|kind| matches!(kind, TargetKind::Lib | TargetKind::CDyLib))
+        })
+        .map(|target| target.name.clone())
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    match targets.as_slice() {
+        [target] => Ok(target.clone()),
+        [] => bail!(
+            "root package `{}` has no Rust lib/cdylib target for generated host feature ownership",
+            package.name
+        ),
+        _ => bail!(
+            "root package `{}` has multiple Rust lib/cdylib targets ({}) and cannot provide one generated host feature owner",
+            package.name,
+            targets.join(", ")
+        ),
+    }
+}
+
+fn rust_crate_key(value: &str) -> String {
+    value.replace('-', "_")
+}
+
+/// Stable private Rust module name for one generated component bridge.
+///
+/// The per-component bridge files are included into sibling modules in every
+/// generated composite host crate.  Their Rust type metadata identifies an
+/// owner by crate root, not by its public JavaScript namespace, so this name
+/// must be derived from that same normalized crate-root identity.  Keeping
+/// the encoding here makes host inclusion and cross-component bridge paths
+/// share one contract even when a component's Cargo package, Rust lib target,
+/// and JavaScript namespace differ.
+pub(crate) fn component_bridge_module_name(component_or_module_path: &str) -> String {
+    let crate_root = component_or_module_path
+        .split("::")
+        .next()
+        .unwrap_or(component_or_module_path);
+    let crate_root = rust_crate_key(crate_root);
+    let encoded = crate_root
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("__uniffi_component_{encoded}")
+}
+
+fn package_exposes_lib_target(package: &Package, expected: &str) -> bool {
+    package.targets.iter().any(|target| {
+        target.name == expected
+            && target
+                .kind
+                .iter()
+                .any(|kind| matches!(kind, TargetKind::Lib | TargetKind::CDyLib))
+    })
+}
+
+fn package_dir(package: &Package) -> Result<Utf8PathBuf> {
+    Utf8PathBuf::from_path_buf(package.manifest_path.clone().into_std_path_buf())
+        .map_err(|path| anyhow::anyhow!("Cargo manifest path is not UTF-8: {}", path.display()))?
+        .parent()
+        .map(Utf8Path::to_path_buf)
+        .context("Cargo package manifest has no parent directory")
+}
+
+/// Stable logical Cargo package name shared by all generated JavaScript host
+/// flavors. The host directories and artifact extensions remain flavor
+/// specific, but this tuple is intentionally identical for wasm, N-API and
+/// OHOS so a package-level manifest has one unambiguous host identity.
+pub fn composite_host_package_name(package_name: &str) -> String {
+    format!("{package_name}-uniffi-js-host")
+}
+
+/// Stable logical library target shared by all generated JavaScript host
+/// flavors. See [`composite_host_package_name`].
+pub fn composite_host_lib_target(package_name: &str) -> String {
+    format!("{}_uniffi_js_host", rust_crate_key(package_name))
+}
+
+/// Canonical composite-host identity shared by generated host bundles and
+/// artifact manifests.  It deliberately excludes generated contract text:
+/// contract/sidecar integrity belongs to the OHOS bundle fingerprint, while
+/// this digest means exactly "this host target contains this component set".
+///
+/// Callers may supply identities in loader order; the serialized payload is
+/// always sorted by the complete `(component, namespace, nativeExportPrefix)`
+/// tuple so equivalent selections have one stable identity.
+pub fn composite_host_identity(
+    package_name: &str,
+    lib_target: &str,
+    components: &[(String, String, String)],
+) -> Result<String> {
+    let mut components = components
+        .iter()
+        .map(|(component, namespace, native_export_prefix)| {
+            serde_json::json!({
+                "component": component,
+                "namespace": namespace,
+                "nativeExportPrefix": native_export_prefix,
+            })
+        })
+        .collect::<Vec<_>>();
+    components.sort_by(|left, right| {
+        (
+            left["component"].as_str(),
+            left["namespace"].as_str(),
+            left["nativeExportPrefix"].as_str(),
+        )
+            .cmp(&(
+                right["component"].as_str(),
+                right["namespace"].as_str(),
+                right["nativeExportPrefix"].as_str(),
+            ))
+    });
+    let payload = serde_json::json!({
+        "packageName": package_name,
+        "libTarget": lib_target,
+        "components": components,
+    });
+    Ok(sha256_bytes(&serde_json::to_vec(&payload)?))
+}
+
 /// Emit `<host_crates_dir>/wasm/*` and `<host_crates_dir>/napi/*`.
 ///
 /// `out_dir` is the JS target's `--out-dir` (already populated with
@@ -138,34 +708,16 @@ pub fn load_metadata(manifest_path: &Utf8Path) -> Result<CoreCrateMetadata> {
 /// `crate_names` is the list of uniffi component crate names for which
 /// `.rs` bridge files were written — both host crates `include!` one
 /// module per crate.
-pub fn emit(
+pub(crate) fn emit(
     options: &HostCrateOptions,
     out_dir: &Utf8Path,
-    crate_names: &[String],
-    meta: &CoreCrateMetadata,
+    plan: &HostCratePlan,
     want_wasm: bool,
     want_napi: bool,
     want_ohos: bool,
-    namespaces: &[String],
 ) -> Result<()> {
-    if crate_names.is_empty() {
+    if plan.components.is_empty() {
         bail!("host-crate emission requested but no components were generated");
-    }
-    if crate_names.len() != namespaces.len() {
-        bail!(
-            "host-crate emission received mismatched component and namespace identities: {} components, {} namespaces",
-            crate_names.len(),
-            namespaces.len()
-        );
-    }
-    // Composite host crates have their own identity and artifact rules in
-    // stage 05C. Reject them before metadata reads or any output mutation;
-    // stage 05B intentionally keeps the established single-component host
-    // workflow working on the new namespaced source tree.
-    if crate_names.len() != 1 {
-        bail!(
-            "JavaScript host-crate emission supports one component during namespaced-layout stage 05B; selected namespaces: {namespaces:?}. Multi-component host composition is deferred to stage 05C"
-        );
     }
     if !want_wasm && !want_napi && !want_ohos {
         return Ok(());
@@ -206,24 +758,15 @@ pub fn emit(
             &logical_host_dir,
             &out_dir_abs,
             &logical_out_dir,
-            crate_names,
-            meta,
+            plan,
             options.ohos_rs_dir.as_ref(),
-            namespaces,
         )?;
     }
 
     fs::create_dir_all(&host_dir_abs)?;
 
     if want_wasm {
-        emit_wasm(
-            &host_dir_abs,
-            &logical_host_dir,
-            &logical_out_dir,
-            crate_names,
-            namespaces,
-            meta,
-        )?;
+        emit_wasm(&host_dir_abs, &logical_host_dir, &logical_out_dir, plan)?;
     }
     if want_napi {
         emit_napi(
@@ -231,9 +774,7 @@ pub fn emit(
             &logical_host_dir,
             &out_dir_abs,
             &logical_out_dir,
-            crate_names,
-            namespaces,
-            meta,
+            plan,
         )?;
     }
     if want_ohos {
@@ -242,10 +783,8 @@ pub fn emit(
             &logical_host_dir,
             &out_dir_abs,
             &logical_out_dir,
-            crate_names,
-            meta,
+            plan,
             options.ohos_rs_dir.as_ref(),
-            namespaces,
         )?;
     }
     Ok(())
@@ -255,9 +794,7 @@ fn emit_wasm(
     host_dir: &Utf8Path,
     logical_host_dir: &Utf8Path,
     out_dir: &Utf8Path,
-    crate_names: &[String],
-    namespaces: &[String],
-    meta: &CoreCrateMetadata,
+    plan: &HostCratePlan,
 ) -> Result<()> {
     let crate_dir = host_dir.join("wasm");
     let logical_crate_dir = logical_host_dir.join("wasm");
@@ -265,8 +802,9 @@ fn emit_wasm(
     let logical_src_dir = logical_crate_dir.join("src");
     fs::create_dir_all(&src_dir)?;
 
-    let rel_core = relative_path(&logical_crate_dir, &meta.crate_dir);
-    let package_name = format!("{}-wasm", meta.package_name);
+    let package_name = composite_host_package_name(&plan.meta.package_name);
+    let lib_name = plan.wasm_artifact_stem();
+    let component_dependencies = render_host_dependencies(plan, &logical_crate_dir)?;
 
     let cargo_toml = format!(
         "# AUTOGENERATED by uniffi_bindgen_javascript (host crate: wasm).\n\
@@ -279,10 +817,11 @@ fn emit_wasm(
          publish = false\n\
          \n\
          [lib]\n\
+         name = \"{lib_name}\"\n\
          crate-type = [\"cdylib\", \"rlib\"]\n\
          \n\
          [dependencies]\n\
-         {core_name} = {{ path = \"{rel_core}\" }}\n\
+         {component_dependencies}\
          {uniffi_dep}\
          async-trait = \"0.1\"\n\
          wasm-bindgen = \"=0.2.117\"\n\
@@ -300,9 +839,9 @@ fn emit_wasm(
          [workspace]\n\
          resolver = \"3\"\n",
         package_name = package_name,
-        core_name = meta.package_name,
-        rel_core = rel_core,
-        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
+        lib_name = lib_name,
+        component_dependencies = component_dependencies,
+        uniffi_dep = render_uniffi_dependency(plan.meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
     );
     fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -313,14 +852,16 @@ fn emit_wasm(
          // wasm-bindgen shim into this crate, so `cargo build --target\n\
          // wasm32-unknown-unknown` produces the final `cdylib`.\n\n",
     );
-    for (crate_name, namespace) in crate_names.iter().zip(namespaces) {
+    for component in &plan.components {
+        let crate_name = &component.identity.crate_name;
+        let namespace = &component.identity.namespace;
         let rs_path = out_dir
             .join("components")
             .join(namespace)
             .join("browser")
             .join(format!("{crate_name}.rs"));
         let rel = relative_path(&logical_src_dir, &rs_path);
-        lib_rs.push_str(&format!("include!(\"{rel}\");\n"));
+        lib_rs.push_str(&component_module_include(crate_name, &rel));
     }
     fs::write(src_dir.join("lib.rs"), lib_rs)?;
     Ok(())
@@ -331,9 +872,7 @@ fn emit_napi(
     logical_host_dir: &Utf8Path,
     actual_out_dir: &Utf8Path,
     logical_out_dir: &Utf8Path,
-    crate_names: &[String],
-    namespaces: &[String],
-    meta: &CoreCrateMetadata,
+    plan: &HostCratePlan,
 ) -> Result<()> {
     let crate_dir = host_dir.join("napi");
     let logical_crate_dir = logical_host_dir.join("napi");
@@ -341,8 +880,9 @@ fn emit_napi(
     let logical_src_dir = logical_crate_dir.join("src");
     fs::create_dir_all(&src_dir)?;
 
-    let rel_core = relative_path(&logical_crate_dir, &meta.crate_dir);
-    let package_name = format!("{}-napi", meta.package_name);
+    let package_name = composite_host_package_name(&plan.meta.package_name);
+    let lib_name = plan.napi_artifact_stem();
+    let component_dependencies = render_host_dependencies(plan, &logical_crate_dir)?;
 
     let cargo_toml = format!(
         "# AUTOGENERATED by uniffi_bindgen_javascript (host crate: napi).\n\
@@ -357,10 +897,11 @@ fn emit_napi(
          publish = false\n\
          \n\
          [lib]\n\
+         name = \"{lib_name}\"\n\
          crate-type = [\"cdylib\"]\n\
          \n\
          [dependencies]\n\
-         {core_name} = {{ path = \"{rel_core}\" }}\n\
+         {component_dependencies}\
          {uniffi_dep}\
          async-trait = \"0.1\"\n\
          napi = {{ version = \"3.8.4\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }}\n\
@@ -372,9 +913,9 @@ fn emit_napi(
          [workspace]\n\
          resolver = \"3\"\n",
         package_name = package_name,
-        core_name = meta.package_name,
-        rel_core = rel_core,
-        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
+        lib_name = lib_name,
+        component_dependencies = component_dependencies,
+        uniffi_dep = render_uniffi_dependency(plan.meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
     );
     fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -390,7 +931,9 @@ fn emit_napi(
          // napi-rs bridge into this crate, so `cargo build` produces the\n\
          // final `.node` cdylib consumed by the generated `backend-napi.ts`.\n\n",
     );
-    for (crate_name, namespace) in crate_names.iter().zip(namespaces) {
+    for component in &plan.components {
+        let crate_name = &component.identity.crate_name;
+        let namespace = &component.identity.namespace;
         let actual_node_rs_path = actual_out_dir
             .join("components")
             .join(namespace)
@@ -407,10 +950,72 @@ fn emit_napi(
             .join(flavor)
             .join(format!("{crate_name}.rs"));
         let rel = relative_path(&logical_src_dir, &rs_path);
-        lib_rs.push_str(&format!("include!(\"{rel}\");\n"));
+        lib_rs.push_str(&component_module_include(crate_name, &rel));
     }
     fs::write(src_dir.join("lib.rs"), lib_rs)?;
     Ok(())
+}
+
+fn render_host_dependencies(plan: &HostCratePlan, crate_dir: &Utf8Path) -> Result<String> {
+    // The root package owns host `--features` selection even if it does not
+    // own a selected component.  Root-as-component is deduplicated by exact
+    // Cargo package ID and lib-target key, so its path dependency appears
+    // once in every generated host manifest.
+    let mut dependencies = vec![(&plan.root_dependency, false)];
+    dependencies.extend(
+        plan.components
+            .iter()
+            .map(|component| (&component.package, true)),
+    );
+    dependencies.sort_by(|(left, _), (right, _)| {
+        (left.dependency_key.as_str(), left.package_id.to_string())
+            .cmp(&(right.dependency_key.as_str(), right.package_id.to_string()))
+    });
+
+    let mut rendered = String::new();
+    let mut rendered_keys = std::collections::BTreeMap::<String, String>::new();
+    for (dependency, disable_default_features) in dependencies {
+        match rendered_keys.entry(dependency.dependency_key.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(dependency.package_id.to_string());
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if *entry.get() == dependency.package_id.to_string() {
+                    // Keep the root package's default features if a root
+                    // component reuses it, and never render a duplicate key.
+                    continue;
+                }
+                bail!(
+                    "host-crate dependency key `{}` maps to both package {} and {}",
+                    dependency.dependency_key,
+                    entry.get(),
+                    dependency.package_id
+                );
+            }
+        }
+        let rel = relative_path(crate_dir, &dependency.package_dir);
+        let default_features = if disable_default_features {
+            ", default-features = false"
+        } else {
+            ""
+        };
+        rendered.push_str(&format!(
+            "{} = {{ package = {}, path = {}{} }}\n",
+            dependency.dependency_key,
+            toml_string_literal(&dependency.package_name),
+            toml_string_literal(rel.as_str()),
+            default_features,
+        ));
+    }
+    if rendered.is_empty() {
+        bail!("composite host plan has no direct dependencies");
+    }
+    Ok(rendered)
+}
+
+fn component_module_include(component_crate_name: &str, relative_bridge_path: &Utf8Path) -> String {
+    let module_name = component_bridge_module_name(component_crate_name);
+    format!("mod {module_name} {{\n    include!(\"{relative_bridge_path}\");\n}}\n")
 }
 
 fn emit_ohos(
@@ -418,21 +1023,20 @@ fn emit_ohos(
     logical_host_dir: &Utf8Path,
     actual_out_dir: &Utf8Path,
     logical_out_dir: &Utf8Path,
-    crate_names: &[String],
-    meta: &CoreCrateMetadata,
+    plan: &HostCratePlan,
     ohos_rs_dir: Option<&Utf8PathBuf>,
-    namespaces: &[String],
 ) -> Result<()> {
     let crate_dir = host_dir.join("ohos");
     let logical_crate_dir = logical_host_dir.join("ohos");
     let src_dir = crate_dir.join("src");
     let logical_src_dir = logical_crate_dir.join("src");
 
-    let rel_core = relative_path(&logical_crate_dir, &meta.crate_dir);
-    let package_name = format!("{}-ohos", meta.package_name);
+    let package_name = plan.ohos_host_package_name();
     let ohos_deps = render_ohos_dependencies(ohos_rs_dir, &logical_crate_dir)?;
-    let package_metadata = render_ohos_package_metadata(meta);
-    let lib_name = ohos_host_library_name(namespaces)?;
+    let package_metadata = render_ohos_package_metadata(&plan.meta);
+    let lib_name = plan.ohos_artifact_stem();
+    let component_dependencies = render_host_dependencies(plan, &logical_crate_dir)?;
+    let host_composite_identity = plan.ohos_composite_identity()?;
 
     let cargo_toml = format!(
         "# AUTOGENERATED by uniffi_bindgen_javascript (host crate: ohos).\n\
@@ -449,7 +1053,7 @@ fn emit_ohos(
          crate-type = [\"cdylib\"]\n\
          \n\
          [dependencies]\n\
-         {core_name} = {{ path = \"{rel_core}\" }}\n\
+         {component_dependencies}\
          {uniffi_dep}\
          async-trait = \"0.1\"\n\
          {ohos_deps}\
@@ -459,17 +1063,16 @@ fn emit_ohos(
         package_name = package_name,
         package_metadata = package_metadata,
         lib_name = lib_name,
-        core_name = meta.package_name,
-        rel_core = rel_core,
-        uniffi_dep = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
+        component_dependencies = component_dependencies,
+        uniffi_dep = render_uniffi_dependency(plan.meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
         ohos_deps = ohos_deps,
     );
     let bundle_text = render_ohos_facade_bundle(
         actual_out_dir,
-        crate_names,
-        namespaces,
+        &plan.components,
         &package_name,
         &lib_name,
+        &host_composite_identity,
     )?;
 
     let build_rs = r#"// AUTOGENERATED by uniffi_bindgen_javascript (host crate: ohos).
@@ -559,14 +1162,16 @@ mod __uniffi_napi_cleanup_hook_key {
 
 "#,
     );
-    for (crate_name, namespace) in crate_names.iter().zip(namespaces) {
+    for component in &plan.components {
+        let crate_name = &component.identity.crate_name;
+        let namespace = &component.identity.namespace;
         let rs_path = logical_out_dir
             .join("components")
             .join(namespace)
             .join("harmony")
             .join(format!("{crate_name}.rs"));
         let rel = relative_path(&logical_src_dir, &rs_path);
-        lib_rs.push_str(&format!("include!(\"{rel}\");\n"));
+        lib_rs.push_str(&component_module_include(crate_name, &rel));
     }
     // No output-tree mutation happens before the facade bundle, contract,
     // sidecar, Rust host source, and every host manifest fragment are ready.
@@ -585,20 +1190,22 @@ fn preflight_ohos_host_emission(
     logical_host_dir: &Utf8Path,
     actual_out_dir: &Utf8Path,
     logical_out_dir: &Utf8Path,
-    crate_names: &[String],
-    meta: &CoreCrateMetadata,
+    plan: &HostCratePlan,
     ohos_rs_dir: Option<&Utf8PathBuf>,
-    namespaces: &[String],
 ) -> Result<()> {
     let logical_crate_dir = logical_host_dir.join("ohos");
-    let package_name = format!("{}-ohos", meta.package_name);
-    let lib_name = ohos_host_library_name(namespaces)?;
+    let package_name = plan.ohos_host_package_name();
+    let lib_name = plan.ohos_artifact_stem();
+    let host_composite_identity = plan.ohos_composite_identity()?;
 
     // These are the only fallible render steps outside the facade bundle.
     // Execute them now, before `emit` creates even the top-level host dir.
     let _ = render_ohos_dependencies(ohos_rs_dir, &logical_crate_dir)?;
-    let _ = render_uniffi_dependency(meta.uniffi_dep.as_ref(), &logical_crate_dir)?;
-    for (crate_name, namespace) in crate_names.iter().zip(namespaces) {
+    let _ = render_uniffi_dependency(plan.meta.uniffi_dep.as_ref(), &logical_crate_dir)?;
+    let _ = render_host_dependencies(plan, &logical_crate_dir)?;
+    for component in &plan.components {
+        let crate_name = &component.identity.crate_name;
+        let namespace = &component.identity.namespace;
         let rs_path = logical_out_dir
             .join("components")
             .join(namespace)
@@ -608,37 +1215,29 @@ fn preflight_ohos_host_emission(
     }
     let _ = render_ohos_facade_bundle(
         actual_out_dir,
-        crate_names,
-        namespaces,
+        &plan.components,
         &package_name,
         &lib_name,
+        &host_composite_identity,
     )?;
     Ok(())
-}
-
-fn ohos_host_library_name(namespaces: &[String]) -> Result<String> {
-    match namespaces {
-        [namespace] => Ok(crate::js_names::ohos_native_library_stem(namespace)),
-        [] => bail!("OHOS host-crate emission requested but no component namespace was generated"),
-        _ => bail!(
-            "OHOS host-crate emission currently supports one component per host crate; got namespaces: {namespaces:?}"
-        ),
-    }
 }
 
 /// Render the complete invocation bundle from exact generated inputs.  This
 /// remains pure so callers can validate it before creating any host tree.
 fn render_ohos_facade_bundle(
     actual_out_dir: &Utf8Path,
-    crate_names: &[String],
-    namespaces: &[String],
+    planned_components: &[PlannedComponentDependency],
     package_name: &str,
     lib_name: &str,
+    host_composite_identity: &str,
 ) -> Result<String> {
     let mut contracts = Vec::new();
     let mut type_sidecars = Vec::new();
     let mut components = Vec::new();
-    for (crate_name, expected_namespace) in crate_names.iter().zip(namespaces) {
+    for planned in planned_components {
+        let crate_name = &planned.identity.crate_name;
+        let expected_namespace = &planned.identity.namespace;
         let contract_file = format!("{crate_name}.ohos-facade.json");
         let contract_path = actual_out_dir
             .join("components")
@@ -655,15 +1254,17 @@ fn render_ohos_facade_bundle(
             crate::flavors::napi::facade_contract_identity(&contract);
         if component != crate_name
             || namespace != expected_namespace
-            || native_export_prefix
-                != uniffi_bindgen::interface::native_export_prefix_for_component(component)
+            || native_export_prefix != planned.identity.native_export_prefix
         {
             bail!(
                 "generated OHOS facade contract {contract_path} does not match its selected component identity"
             );
         }
         let contract_digest = sha256_text(&contract_content);
-        let identity_export = crate::flavors::napi::ohos_bridge_identity_export(&contract_digest);
+        let identity_export = crate::flavors::napi::ohos_bridge_identity_export_for_prefix(
+            &native_export_prefix,
+            &contract_digest,
+        );
         let sidecar_file = format!("{crate_name}.ohos-extra-types.d.ts");
         let sidecar_path = actual_out_dir
             .join("components")
@@ -696,18 +1297,23 @@ fn render_ohos_facade_bundle(
     }
     contracts.sort_by(|left, right| left["file"].as_str().cmp(&right["file"].as_str()));
     type_sidecars.sort_by(|left, right| left["file"].as_str().cmp(&right["file"].as_str()));
-    components.sort_by(|left, right| left["component"].as_str().cmp(&right["component"].as_str()));
-    let host_identity_payload = serde_json::json!({
-        "packageName": package_name,
-        "libTarget": lib_name,
-        "components": components,
+    components.sort_by(|left, right| {
+        (
+            left["component"].as_str(),
+            left["namespace"].as_str(),
+            left["nativeExportPrefix"].as_str(),
+        )
+            .cmp(&(
+                right["component"].as_str(),
+                right["namespace"].as_str(),
+                right["nativeExportPrefix"].as_str(),
+            ))
     });
-    let host_composite_identity = sha256_bytes(&serde_json::to_vec(&host_identity_payload)?);
     let payload = serde_json::json!({
         "packageName": package_name,
         "libTarget": lib_name,
         "hostCompositeIdentity": host_composite_identity,
-        "components": host_identity_payload["components"],
+        "components": components,
         "contracts": contracts,
         "typeSidecars": type_sidecars,
     });
@@ -1040,6 +1646,235 @@ mod tests {
         std::fs::write(crate_dir.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
     }
 
+    fn single_component_plan(
+        meta: &CoreCrateMetadata,
+        crate_name: &str,
+        namespace: &str,
+    ) -> HostCratePlan {
+        let identity = HostComponentIdentity {
+            crate_name: crate_name.to_string(),
+            namespace: namespace.to_string(),
+            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                crate_name,
+            ),
+        };
+        let dependency = PlannedPackageDependency {
+            dependency_key: rust_crate_key(crate_name),
+            package_id: PackageId {
+                repr: format!("fixture {}", meta.package_name),
+            },
+            package_name: meta.package_name.clone(),
+            package_dir: meta.crate_dir.clone(),
+        };
+        HostCratePlan {
+            meta: meta.clone(),
+            root_dependency: dependency.clone(),
+            components: vec![PlannedComponentDependency {
+                package: dependency,
+                identity: identity.clone(),
+            }],
+        }
+    }
+
+    fn fixture_dependency(key: &str, package_name: &str) -> PlannedPackageDependency {
+        PlannedPackageDependency {
+            dependency_key: key.to_string(),
+            package_id: PackageId {
+                repr: format!("fixture {package_name} {key}"),
+            },
+            package_name: package_name.to_string(),
+            package_dir: Utf8PathBuf::from(format!("/fixture/{package_name}")),
+        }
+    }
+
+    fn fixture_component(key: &str, package_name: &str) -> PlannedComponentDependency {
+        PlannedComponentDependency {
+            identity: HostComponentIdentity {
+                crate_name: key.to_string(),
+                namespace: "fixture".to_string(),
+                native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                    key,
+                ),
+            },
+            package: fixture_dependency(key, package_name),
+        }
+    }
+
+    #[test]
+    fn fixed_runtime_dependency_keys_are_scoped_to_requested_host_flavors() {
+        let root = fixture_dependency("root_bridge", "root-package");
+        assert!(validate_fixed_runtime_dependency_keys(
+            &root,
+            &[fixture_component("napi", "component-package")],
+            true,
+            false,
+            false,
+        )
+        .is_ok());
+
+        let napi_error = validate_fixed_runtime_dependency_keys(
+            &root,
+            &[fixture_component("napi_build", "component-package")],
+            false,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{napi_error:#}").contains("napi_build"));
+
+        let ohos_error = validate_fixed_runtime_dependency_keys(
+            &root,
+            &[fixture_component("napi_build_ohos", "component-package")],
+            false,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{ohos_error:#}").contains("napi_build_ohos"));
+
+        let host_target = composite_host_lib_target("root-package");
+        let host_target_error = validate_fixed_runtime_dependency_keys(
+            &root,
+            &[fixture_component(&host_target, "component-package")],
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{host_target_error:#}").contains(&host_target));
+    }
+
+    #[test]
+    fn plan_resolves_feature_gated_aliases_and_reuses_the_root_dependency_once() {
+        let root = test_root("host-plan-alias");
+        let core = root.join("core");
+        let component = root.join("component");
+        write_minimal_lib(&core);
+        write_minimal_lib(&component);
+        std::fs::write(
+            component.join("Cargo.toml"),
+            r#"[package]
+name = "component-package"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "component_bridge"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("Cargo.toml"),
+            r#"[package]
+name = "root-package"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "root_bridge"
+
+[features]
+host-gate = ["dep:component_source_alias"]
+
+[dependencies]
+component_source_alias = { package = "component-package", path = "../component", optional = true }
+"#,
+        )
+        .unwrap();
+        let core = Utf8PathBuf::from_path_buf(core).unwrap();
+        let host_output = Utf8PathBuf::from_path_buf(root.join("host-must-not-exist")).unwrap();
+        let options = HostCrateOptions {
+            manifest_path: core.join("Cargo.toml"),
+            host_crates_dir: host_output.clone(),
+            logical_host_crates_dir: None,
+            logical_out_dir: None,
+            ohos_rs_dir: None,
+        };
+        let identities = vec![
+            HostComponentIdentity {
+                crate_name: "component_bridge".to_string(),
+                namespace: "component".to_string(),
+                native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                    "component_bridge",
+                ),
+            },
+            HostComponentIdentity {
+                crate_name: "root_bridge".to_string(),
+                namespace: "root".to_string(),
+                native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                    "root_bridge",
+                ),
+            },
+        ];
+        let plan = plan(&options, &identities, true, true, true).unwrap();
+        assert!(
+            !host_output.exists(),
+            "read-only host planning must not create the configured host output"
+        );
+        let dependencies = render_host_dependencies(&plan, Utf8Path::new("/fixture/host")).unwrap();
+        let parsed: toml::Value =
+            toml::from_str(&format!("[dependencies]\n{dependencies}")).unwrap();
+        assert_eq!(
+            parsed["dependencies"]["root_bridge"]["package"].as_str(),
+            Some("root-package")
+        );
+        assert!(
+            parsed["dependencies"]["root_bridge"]
+                .get("default-features")
+                .is_none(),
+            "the root feature owner must retain its normal default-feature behavior"
+        );
+        assert_eq!(
+            parsed["dependencies"]["component_bridge"]["package"].as_str(),
+            Some("component-package")
+        );
+        assert_eq!(
+            parsed["dependencies"]["component_bridge"]["default-features"].as_bool(),
+            Some(false)
+        );
+        assert!(!dependencies.contains("component_source_alias"));
+        assert_eq!(dependencies.matches("root_bridge =").count(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn all_javascript_flavors_share_one_logical_composite_identity() {
+        let forward = vec![
+            (
+                "alpha_core".to_string(),
+                "alpha".to_string(),
+                "ffi_alpha_core".to_string(),
+            ),
+            (
+                "beta_core".to_string(),
+                "beta".to_string(),
+                "ffi_beta_core".to_string(),
+            ),
+        ];
+        let mut reverse = forward.clone();
+        reverse.reverse();
+        let package = composite_host_package_name("composite-core");
+        let lib_target = composite_host_lib_target("composite-core");
+        let forward_identity = composite_host_identity(&package, &lib_target, &forward).unwrap();
+        let reverse_identity = composite_host_identity(&package, &lib_target, &reverse).unwrap();
+
+        assert_eq!(forward_identity, reverse_identity);
+        assert_eq!(package, "composite-core-uniffi-js-host");
+        assert_eq!(lib_target, "composite_core_uniffi_js_host");
+        // The digest uses the same tuple even for invocations that never
+        // request Harmony; package manifests must not borrow an OHOS-only
+        // package/lib identity for a NAPI/Wasm-only build.
+        assert_eq!(
+            composite_host_identity(
+                &composite_host_package_name("composite-core"),
+                &composite_host_lib_target("composite-core"),
+                &forward,
+            )
+            .unwrap(),
+            forward_identity
+        );
+    }
+
     #[test]
     fn carries_core_cargo_metadata_into_ohos_host_manifest() {
         let root = test_root("host-meta");
@@ -1110,8 +1945,10 @@ edition = "2021"
         }
         let contract_content =
             std::fs::read_to_string(harmony.join("demo_core.ohos-facade.json")).unwrap();
-        let identity_export =
-            crate::flavors::napi::ohos_bridge_identity_export(&sha256_text(&contract_content));
+        let identity_export = crate::flavors::napi::ohos_bridge_identity_export_for_prefix(
+            "ffi_demo_core",
+            &sha256_text(&contract_content),
+        );
         std::fs::write(
             harmony.join("demo_core.ohos-extra-types.d.ts"),
             format!(
@@ -1161,18 +1998,9 @@ edition.workspace = true
         let out = Utf8PathBuf::from_path_buf(out).unwrap();
         let logical_host = Utf8PathBuf::from_path_buf(root.join("published/host")).unwrap();
         let logical_out = Utf8PathBuf::from_path_buf(root.join("published/generated")).unwrap();
+        let plan = single_component_plan(&metadata, "demo_core", "demo_core");
         std::fs::create_dir_all(&host).unwrap();
-        emit_ohos(
-            &host,
-            &logical_host,
-            &out,
-            &logical_out,
-            &["demo_core".to_string()],
-            &metadata,
-            None,
-            &["demo_core".to_string()],
-        )
-        .unwrap();
+        emit_ohos(&host, &logical_host, &out, &logical_out, &plan, None).unwrap();
         let generated: toml::Value =
             toml::from_str(&std::fs::read_to_string(host.join("ohos/Cargo.toml")).unwrap())
                 .unwrap();
@@ -1202,9 +2030,23 @@ edition.workspace = true
         let bundle: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&bundle_path).unwrap()).unwrap();
         assert_eq!(bundle["hostBundleSchemaVersion"], 3);
-        assert_eq!(bundle["packageName"], "demo-core-ohos");
-        assert_eq!(bundle["libTarget"], "demo_core_ohos");
-        assert_eq!(bundle["hostCompositeIdentity"].as_str().unwrap().len(), 64);
+        assert_eq!(bundle["packageName"], "demo-core-uniffi-js-host");
+        assert_eq!(bundle["libTarget"], "demo_core_uniffi_js_host");
+        let recomputed_identity = composite_host_identity(
+            bundle["packageName"].as_str().unwrap(),
+            bundle["libTarget"].as_str().unwrap(),
+            &[(
+                "demo_core".to_string(),
+                "demo_core".to_string(),
+                "ffi_demo_core".to_string(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            bundle["hostCompositeIdentity"].as_str(),
+            Some(recomputed_identity.as_str()),
+            "OHOS bundle must use the canonical host identity algorithm"
+        );
         assert_eq!(bundle["components"][0]["component"], "demo_core");
         assert_eq!(bundle["components"][0]["namespace"], "demo_core");
         assert_eq!(
@@ -1214,7 +2056,7 @@ edition.workspace = true
         assert!(bundle["components"][0]["identityExport"]
             .as_str()
             .unwrap()
-            .starts_with("uniffiohosbridgeidentity"));
+            .starts_with("ffi_demo_core_uniffiohosbridgeidentity"));
         assert_eq!(bundle["contracts"][0]["file"], "demo_core.ohos-facade.json");
         assert_eq!(
             bundle["typeSidecars"][0]["file"],
@@ -1285,17 +2127,8 @@ edition.workspace = true
             crate_dir: core,
             uniffi_dep: None,
         };
-        let error = emit(
-            &options,
-            &generated,
-            &["demo_core".to_string()],
-            &metadata,
-            true,
-            true,
-            true,
-            &["demo_core".to_string()],
-        )
-        .unwrap_err();
+        let plan = single_component_plan(&metadata, "demo_core", "demo_core");
+        let error = emit(&options, &generated, &plan, true, true, true).unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("type_def:"), "{error}");
         assert!(

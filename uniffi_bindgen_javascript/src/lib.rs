@@ -36,6 +36,7 @@ pub mod flavors;
 pub mod host_crates;
 pub mod js_names;
 pub mod name_map;
+pub mod native_exports;
 
 /// Exact internal ABI spoken by the generated JavaScript runtime and every
 /// generated backend adapter. This is deliberately not a public binding API.
@@ -148,36 +149,51 @@ fn generate_components(
     }
 
     components.sort_by_key(ComponentIdentity::from_component);
+    let want_wasm = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Wasm);
+    // Electron reuses the N-API host crate — no separate Electron crate.
+    let want_napi = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Napi);
+    let want_ohos = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Ohos);
+    // Host planning must happen before the generator creates its first output
+    // directory.  In particular, a plural selection with a missing or
+    // ambiguous direct Cargo dependency must fail without leaving a partial
+    // component tree behind.
+    let host_plan = options
+        .host_crates
+        .as_ref()
+        .map(|host_opts| {
+            let identities = components
+                .iter()
+                .map(|component| host_crates::HostComponentIdentity {
+                    crate_name: component.ci.crate_name().to_string(),
+                    namespace: component.ci.namespace().to_string(),
+                    native_export_prefix: component.ci.native_export_prefix(),
+                })
+                .collect::<Vec<_>>();
+            host_crates::plan(host_opts, &identities, want_wasm, want_napi, want_ohos)
+        })
+        .transpose()?;
     preflight_component_layout(components, options)?;
     fs::create_dir_all(&options.out_dir)?;
 
     api_module::emit_shared_runtime(&options.out_dir)?;
 
-    let mut emitted_crate_names: Vec<String> = Vec::new();
-    let mut emitted_namespaces: Vec<String> = Vec::new();
     for component in &*components {
-        emit_component(component, components, &options)?;
-        emitted_crate_names.push(component.ci.crate_name().to_string());
-        emitted_namespaces.push(component.ci.namespace().to_string());
+        emit_component(component, components, &options, host_plan.as_ref())?;
     }
 
     emit_platform_roots(&options.out_dir, components, &options.flavors)?;
 
     if let Some(host_opts) = &options.host_crates {
-        let meta = host_crates::load_metadata(&host_opts.manifest_path)?;
-        let want_wasm = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Wasm);
-        // electron reuses the napi host crate — no separate electron crate.
-        let want_napi = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Napi);
-        let want_ohos = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Ohos);
+        let plan = host_plan
+            .as_ref()
+            .context("host-crate planning unexpectedly produced no plan")?;
         host_crates::emit(
             host_opts,
             &options.out_dir,
-            &emitted_crate_names,
-            &meta,
+            plan,
             want_wasm,
             want_napi,
             want_ohos,
-            &emitted_namespaces,
         )?;
     }
     Ok(())
@@ -307,19 +323,31 @@ fn preflight_component_layout(
 
     validate_selected_external_type_owners(components)?;
 
-    // 05C owns composite host/artifact identities.  Keep existing single
-    // component host workflows alive, but reject a plural host before source,
-    // host, or artifact output can be created.
-    if options.host_crates.is_some() && components.len() != 1 {
-        let namespaces = components
+    // Harmony source files alone cannot form a plural package: each
+    // component needs the one composite native host that owns the shared
+    // OHOS identity and artifact.  Refuse this incomplete invocation before
+    // `generate_components` creates the output root.  Keep the diagnostic
+    // independent of loader order so callers can treat it as an exact
+    // preflight failure.
+    if options.host_crates.is_none()
+        && components.len() > 1
+        && options
+            .flavors
             .iter()
-            .map(|component| component.ci.namespace())
+            .any(|flavor| matches!(flavor, FlavorTarget::Harmony))
+    {
+        let mut selected = identities.clone();
+        selected.sort();
+        let selected = selected
+            .iter()
+            .map(ComponentIdentity::describe)
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
-            "JavaScript host-crate generation currently supports one component during namespaced-layout stage 05B; selected namespaces: {namespaces}. Multi-component host composition is deferred to stage 05C"
+            "source-only Harmony generation does not support multiple UniFFI components; composite Harmony generation requires HostCrateOptions. Selected components: {selected}"
         );
     }
+
     Ok(())
 }
 
@@ -532,6 +560,7 @@ fn emit_component(
     component: &Component<JsConfig>,
     all_components: &[Component<JsConfig>],
     options: &GenerateJsOptions,
+    host_plan: Option<&host_crates::HostCratePlan>,
 ) -> Result<()> {
     let component_dir = options
         .out_dir
@@ -551,7 +580,15 @@ fn emit_component(
         let dir = component_dir.join(subdir);
         fs::create_dir_all(&dir)?;
         let addon_path = if matches!(target.abi(), AbiFlavor::Napi) {
-            default_addon_path(&dir, options.artifact_dir.as_deref(), subdir, component)?
+            default_addon_path(
+                &dir,
+                options.artifact_dir.as_deref(),
+                subdir,
+                component,
+                host_plan
+                    .map(host_crates::HostCratePlan::napi_artifact_stem)
+                    .as_deref(),
+            )?
         } else {
             None
         };
@@ -561,14 +598,24 @@ fn emit_component(
             component,
             &flavors::FlavorEmitOptions {
                 default_addon_path: addon_path,
+                ohos_native_library_stem: host_plan
+                    .map(host_crates::HostCratePlan::ohos_artifact_stem),
             },
         )?;
         if matches!(target, FlavorTarget::Electron) {
             electron::emit(
                 &dir,
                 component,
-                default_addon_path(&dir, options.artifact_dir.as_deref(), subdir, component)?
-                    .as_deref(),
+                default_addon_path(
+                    &dir,
+                    options.artifact_dir.as_deref(),
+                    subdir,
+                    component,
+                    host_plan
+                        .map(host_crates::HostCratePlan::napi_artifact_stem)
+                        .as_deref(),
+                )?
+                .as_deref(),
             )?;
         }
     }
@@ -703,7 +750,26 @@ fn default_addon_path(
     artifact_dir: Option<&Utf8Path>,
     subdir: &str,
     component: &Component<JsConfig>,
+    composite_artifact_stem: Option<&str>,
 ) -> Result<Option<String>> {
+    if let Some(stem) = composite_artifact_stem {
+        // Composite N-API/Electron hosts publish one canonical addon below
+        // the package-level `node/` directory. All component adapters point
+        // there, including Electron; copying the same binary per namespace
+        // would conceal rather than solve export collisions.
+        let addon_dir = if let Some(artifact_dir) = artifact_dir {
+            artifact_dir.join("node")
+        } else {
+            let out_dir = from_dir
+                .parent()
+                .and_then(Utf8Path::parent)
+                .and_then(Utf8Path::parent)
+                .context("generated component flavor directory has no output-root ancestor")?;
+            out_dir.join("node")
+        };
+        let addon = addon_dir.join(format!("{stem}.node"));
+        return Ok(Some(relative_module_specifier(from_dir, &addon)?));
+    }
     let Some(artifact_dir) = artifact_dir else {
         return Ok(None);
     };
@@ -1589,7 +1655,6 @@ mod output_ownership_tests {
         let mut opts = options(out_dir.clone(), None);
         opts.flavors = vec![
             FlavorTarget::Electron,
-            FlavorTarget::Harmony,
             FlavorTarget::Napi,
             FlavorTarget::Wasm,
         ];
@@ -1602,7 +1667,6 @@ mod output_ownership_tests {
                 format!("components/{namespace}/browser/index.ts"),
                 format!("components/{namespace}/node/index.ts"),
                 format!("components/{namespace}/electron/renderer.ts"),
-                format!("components/{namespace}/harmony/index.ts"),
             ] {
                 assert!(out_dir.join(path).is_file());
             }
@@ -1624,7 +1688,6 @@ mod output_ownership_tests {
             ("browser", "browser/index.ts"),
             ("node", "node/index.ts"),
             ("electron", "electron/renderer.ts"),
-            ("harmony", "harmony/index.ts"),
         ] {
             let source = fs::read_to_string(out_dir.join(root).join("index.ts")).unwrap();
             for namespace in ["alpha", "beta"] {
@@ -1717,7 +1780,6 @@ mod output_ownership_tests {
             FlavorTarget::Wasm,
             FlavorTarget::Napi,
             FlavorTarget::Electron,
-            FlavorTarget::Harmony,
         ];
         let mut reverse_options = forward_options.clone();
         reverse_options.out_dir = reverse_dir.clone();
@@ -2021,7 +2083,7 @@ assert.equal(alphaApi.sameApi(), "alpha-second");
     }
 
     #[test]
-    fn plural_host_generation_is_deferred_before_source_or_host_output_mutation() {
+    fn plural_host_plan_failure_happens_before_source_or_host_output_mutation() {
         let out_dir = test_path("plural-host-source");
         let host_dir = test_path("plural-host-host");
         let mut opts = options(out_dir.clone(), None);
@@ -2035,8 +2097,72 @@ assert.equal(alphaApi.sameApi(), "alpha-second");
         let error = generate_components(&mut components(), &opts)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("deferred to stage 05C"), "{error}");
+        assert!(error.contains("running cargo metadata"), "{error}");
         assert!(!out_dir.exists());
         assert!(!host_dir.exists());
+    }
+
+    #[test]
+    fn plural_harmony_source_only_preflight_is_stable_and_preserves_output() {
+        let missing_forward = test_path("plural-harmony-source-only-forward");
+        let missing_reverse = test_path("plural-harmony-source-only-reverse");
+        let mut forward_options = options(missing_forward.clone(), None);
+        forward_options.flavors = vec![FlavorTarget::Harmony];
+        let mut reverse_options = options(missing_reverse.clone(), None);
+        reverse_options.flavors = vec![FlavorTarget::Harmony];
+
+        let mut forward = components();
+        let forward_error = generate_components(&mut forward, &forward_options)
+            .unwrap_err()
+            .to_string();
+        let mut reverse = components();
+        reverse.reverse();
+        let reverse_error = generate_components(&mut reverse, &reverse_options)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(forward_error, reverse_error);
+        assert!(
+            forward_error.contains(
+                "source-only Harmony generation does not support multiple UniFFI components"
+            ),
+            "{forward_error}"
+        );
+        assert!(forward_error.contains("crate `component_a`, namespace `namespace_a`"));
+        assert!(forward_error.contains("crate `component_b`, namespace `namespace_b`"));
+        assert!(!missing_forward.exists());
+        assert!(!missing_reverse.exists());
+
+        let sentinel_out = test_path("plural-harmony-source-only-sentinel");
+        fs::create_dir_all(sentinel_out.join("nested")).unwrap();
+        fs::write(sentinel_out.join("keep.txt"), "root sentinel").unwrap();
+        fs::write(sentinel_out.join("nested/keep.txt"), "nested sentinel").unwrap();
+        let before = generated_tree_snapshot(&sentinel_out);
+        let mut sentinel_options = options(sentinel_out.clone(), None);
+        sentinel_options.flavors = vec![FlavorTarget::Harmony];
+        let mut selected = components();
+        let sentinel_error = generate_components(&mut selected, &sentinel_options)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(sentinel_error, forward_error);
+        assert_eq!(generated_tree_snapshot(&sentinel_out), before);
+    }
+
+    #[test]
+    fn single_component_harmony_source_only_generation_remains_supported() {
+        let out_dir = test_path("single-harmony-source-only");
+        let mut opts = options(out_dir.clone(), Some("component_a"));
+        opts.flavors = vec![FlavorTarget::Harmony];
+        generate_components(&mut components(), &opts).unwrap();
+
+        assert!(out_dir.join("shared/runtime.ts").is_file());
+        assert!(out_dir
+            .join("components/namespace_a/common/api.ts")
+            .is_file());
+        assert!(out_dir
+            .join("components/namespace_a/harmony/index.ts")
+            .is_file());
+        assert!(out_dir.join("harmony/index.ts").is_file());
+        assert!(!out_dir.join("components/namespace_b").exists());
     }
 }

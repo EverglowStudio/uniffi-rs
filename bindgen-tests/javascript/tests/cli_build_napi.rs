@@ -1,5 +1,9 @@
 //! CLI orchestration smoke test for the JavaScript N-API build path.
 
+mod support;
+
+use support::{CompositeFixture, CANONICAL_COMPONENTS};
+
 use camino::Utf8PathBuf;
 use std::process::Command;
 
@@ -167,8 +171,10 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing generated N-API file: {file}");
     }
-    assert_single_node_addon(out_dir.join("components/cli_napi/node"));
-    assert_single_node_addon(out_dir.join("components/cli_napi/electron"));
+    // A generated package has one composite N-API host.  Component adapters
+    // intentionally share the package-level artifact rather than each
+    // receiving a copy with a namespace-derived filename.
+    assert_single_node_addon(out_dir.join("node"));
     assert!(
         host_dir.join("napi/Cargo.toml").exists(),
         "missing generated napi host crate"
@@ -220,7 +226,7 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
         "generated N-API adapter driver did not print ok"
     );
 
-    let default_addon = single_node_addon(out_dir.join("components/cli_napi/node"));
+    let default_addon = single_node_addon(out_dir.join("node"));
     let override_addon = tmp.path().join("override_cli_napi.node");
     std::fs::copy(&default_addon, &override_addon).unwrap();
     std::fs::remove_file(&default_addon).unwrap();
@@ -242,6 +248,127 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
         String::from_utf8_lossy(&override_run.stdout).contains("ok"),
         "generated N-API env override driver did not print ok"
     );
+}
+
+#[test]
+fn cli_build_napi_orchestrates_two_components_without_feature_flags() {
+    let cargo =
+        which_tool("cargo").expect("two-component CLI N-API orchestration requires cargo on PATH");
+    let root = workspace_root();
+    build_uniffi_bindgen(&root, &cargo);
+    let cli = root.join(if cfg!(windows) {
+        "target/debug/uniffi-bindgen.exe"
+    } else {
+        "target/debug/uniffi-bindgen"
+    });
+    assert!(cli.exists(), "expected built CLI at {cli}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = CompositeFixture::write(tmp.path());
+    fixture.build_cdylib();
+    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let artifact_dir = Utf8PathBuf::from_path_buf(tmp.path().join("artifacts")).unwrap();
+    let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target-napi")).unwrap();
+    let output = Command::new(cli.as_std_path())
+        .current_dir(root.as_std_path())
+        .args([
+            "javascript",
+            "build-napi",
+            "--manifest-path",
+            fixture.manifest_path().as_str(),
+            "--source",
+            fixture.library_path().as_str(),
+            "--out-dir",
+            out_dir.as_str(),
+            "--host-crates-dir",
+            host_dir.as_str(),
+            "--artifact-dir",
+            artifact_dir.as_str(),
+            "--target-dir",
+            target_dir.as_str(),
+        ])
+        .output()
+        .expect("failed to invoke two-component uniffi-bindgen javascript build-napi");
+    assert!(
+        output.status.success(),
+        "two-component javascript build-napi failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let composite_addon = format!(
+        "{}.node",
+        uniffi_bindgen_javascript::host_crates::composite_host_lib_target("composite-core")
+    );
+    let addon = single_node_addon(artifact_dir.join("node"));
+    assert_eq!(
+        addon.file_name().and_then(|name| name.to_str()),
+        Some(composite_addon.as_str()),
+        "both generated namespaces must share the canonical composite addon"
+    );
+    let host_lib = std::fs::read_to_string(host_dir.join("napi/src/lib.rs")).unwrap();
+    assert!(
+        host_dir.join("napi/Cargo.toml").exists(),
+        "two components must produce one N-API host crate"
+    );
+    let expected_addon_path = format!("../../../artifacts/node/{composite_addon}");
+    for component in CANONICAL_COMPONENTS {
+        for flavor in ["node", "electron"] {
+            assert!(
+                out_dir
+                    .join("components")
+                    .join(component.namespace)
+                    .join(flavor)
+                    .join(component.bridge_filename)
+                    .exists(),
+                "missing {flavor} bridge for {}",
+                component.namespace,
+            );
+        }
+        assert!(
+            host_lib.contains(&format!(
+                "components/{}/node/{}",
+                component.namespace, component.bridge_filename
+            )),
+            "one composite N-API host must include {}:\n{host_lib}",
+            component.namespace,
+        );
+        let node_backend = std::fs::read_to_string(
+            out_dir
+                .join("components")
+                .join(component.namespace)
+                .join("node/backend-napi.ts"),
+        )
+        .unwrap();
+        let electron_preload = std::fs::read_to_string(
+            out_dir
+                .join("components")
+                .join(component.namespace)
+                .join("electron/preload.cjs"),
+        )
+        .unwrap();
+        for (surface, source) in [
+            ("Node backend", node_backend),
+            ("Electron preload", electron_preload),
+        ] {
+            assert!(
+                source.contains(&expected_addon_path),
+                "{surface} for {} must use the one canonical composite addon path `{expected_addon_path}`:\n{source}",
+                component.namespace,
+            );
+        }
+    }
+    for platform_entry in ["node/index.ts", "electron/index.ts"] {
+        let source = std::fs::read_to_string(out_dir.join(platform_entry)).unwrap();
+        for component in CANONICAL_COMPONENTS {
+            assert!(
+                source.contains(component.namespace),
+                "{platform_entry} must expose namespace {}:\n{source}",
+                component.namespace,
+            );
+        }
+    }
 }
 
 fn assert_single_node_addon(dir: Utf8PathBuf) {

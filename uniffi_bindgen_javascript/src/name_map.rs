@@ -11,15 +11,14 @@
 //! - constructor:   `{object_snake}_{ctor_snake}` (`counter_new`)
 //! - method:        `{object_snake}_{method_snake}` (`counter_get`)
 //!
-//! But `napi-rs` rewrites every `#[napi] pub fn <snake>` into
-//! `lowerCamelCase` on the JS side (`greetWith`, `counterNew`, …).
-//! Before this module, both `backend-napi.ts` and `electron/preload.cjs`
-//! indexed the addon directly by the low-level key and crashed with
-//! `unknown uniffi method: counter_new` on first call.
+//! A composite host cannot expose napi-rs's default `lowerCamelCase` names:
+//! two selected components may both define `ping`, `Counter`, or stream
+//! support helpers. The Rust bridge sets an explicit `js_name` for every
+//! native export, using its authoritative component prefix.
 //!
 //! Fix: walk the same IR shape `api_module/` walks, emit the exact
-//! low-level keys it emits, and pair each with its `napi-rs` export
-//! name. Both the node backend and the electron preload consume this
+//! low-level keys it emits, and pair each with its exact prefixed native
+//! export name. Both the node backend and the electron preload consume this
 //! map via [`render_name_map_js_literal`], so they can never drift from
 //! `common/api.ts`'s view of the dispatch key.
 //!
@@ -38,9 +37,16 @@ pub use crate::dispatch_key::snake_to_camel;
 /// so the emitted literal is stable across runs.
 pub fn collect(ci: &ComponentInterface) -> Vec<(String, String)> {
     crate::dispatch_key::collect_name_map_pairs(ci)
+        .into_iter()
+        .map(|(key, _legacy_napi_name)| {
+            let native_name = crate::native_exports::native_export_name(ci, &key);
+            (key, native_name)
+        })
+        .collect()
 }
 
-/// Emit the map as a JS object literal (`{ "counter_new": "counterNew", ... }`).
+/// Emit the map as a JS object literal
+/// (`{ "counter_new": "ffi_demo_core_counter_new", ... }`).
 /// Used by both `backend-napi.ts` and `electron/preload.cjs` so they
 /// share exactly one source of truth.
 pub fn render_name_map_js_literal(pairs: &[(String, String)]) -> String {

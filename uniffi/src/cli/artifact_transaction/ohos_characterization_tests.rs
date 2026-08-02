@@ -5285,7 +5285,8 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
     };
     let (mut defs, contracts) = test_harmony_stream_contract();
     let digest = sha256_bytes(b"fixture canonical contract");
-    let sentinel = bridge_identity_export(&digest);
+    let fixture_prefix = uniffi_bindgen::interface::native_export_prefix_for_component("fixture");
+    let sentinel = bridge_identity_export(&fixture_prefix, &digest);
     defs.push(raw_fn(&sentinel, &format!("function {sentinel}(): string")));
     let inventory = FacadeTypeInventory {
         facade_inventory_schema_version: FACADE_INVENTORY_SCHEMA_VERSION,
@@ -5294,9 +5295,7 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
         components: vec![HostFacadeComponentIdentity {
             component: "fixture".into(),
             namespace: "fixture".into(),
-            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
-                "fixture",
-            ),
+            native_export_prefix: fixture_prefix.clone(),
             contract_file: "fixture.ohos-facade.json".into(),
             contract_sha256: digest.clone(),
             identity_export: sentinel.clone(),
@@ -5321,7 +5320,7 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
     assert!(validate_compiled_bridge_identities(&wrong_host, &inventory, &contracts).is_err());
 
     let mut extra = defs.clone();
-    let extra_sentinel = bridge_identity_export(&"0".repeat(64));
+    let extra_sentinel = bridge_identity_export(&fixture_prefix, &"0".repeat(64));
     extra.push(raw_fn(
         &extra_sentinel,
         &format!("function {extra_sentinel}(): string"),
@@ -5338,7 +5337,8 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
     let rehashed_digest = sha256_bytes(b"rehashed fixture canonical contract");
     let mut rehashed = inventory.clone();
     rehashed.components[0].contract_sha256 = rehashed_digest.clone();
-    rehashed.components[0].identity_export = bridge_identity_export(&rehashed_digest);
+    rehashed.components[0].identity_export =
+        bridge_identity_export(&fixture_prefix, &rehashed_digest);
     rehashed.contracts[0].sha256 = rehashed_digest;
     assert!(validate_compiled_bridge_identities(&defs, &rehashed, &contracts).is_err());
 
@@ -5354,7 +5354,9 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
         uniffi_bindgen::interface::native_export_prefix_for_component("fixture_second");
     multi_contracts.push(second_contract);
     let second_digest = sha256_bytes(b"fixture second canonical contract");
-    let second_sentinel = bridge_identity_export(&second_digest);
+    let second_prefix =
+        uniffi_bindgen::interface::native_export_prefix_for_component("fixture_second");
+    let second_sentinel = bridge_identity_export(&second_prefix, &second_digest);
     multi_defs.push(raw_fn(
         &second_sentinel,
         &format!("function {second_sentinel}(): string"),
@@ -5365,9 +5367,7 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
         .push(HostFacadeComponentIdentity {
             component: "fixture_second".into(),
             namespace: "fixture_second".into(),
-            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
-                "fixture_second",
-            ),
+            native_export_prefix: second_prefix,
             contract_file: "fixture_second.ohos-facade.json".into(),
             contract_sha256: second_digest.clone(),
             identity_export: second_sentinel,
@@ -5589,6 +5589,7 @@ fn stream_argument_names_are_mangled_away_from_state_machine_members() {
 #[test]
 fn facade_inventory_ignores_stale_unlisted_contracts() {
     let root = temp_test_dir("uniffi-ohos-facade-inventory");
+    let fixture_prefix = uniffi_bindgen::interface::native_export_prefix_for_component("fixture");
     let (_, contracts) = test_harmony_stream_contract();
     let contract = &contracts[0];
     let mut current = contract.clone();
@@ -5603,11 +5604,10 @@ fn facade_inventory_ignores_stale_unlisted_contracts() {
         serde_json::to_vec(&stale).unwrap(),
     )
     .unwrap();
-    std::fs::write(
-        root.join("fixture.ohos-extra-types.d.ts"),
-        "type_def:{\"kind\":\"fn\",\"name\":\"uniffiohosbridgeidentityfixture\",\"def\":\"function uniffiohosbridgeidentityfixture(): string\",\"typeParameters\":[]}\n",
-    )
-    .unwrap();
+    let sidecar = format!(
+        "type_def:{{\"kind\":\"fn\",\"name\":\"{fixture_prefix}_uniffiohosbridgeidentityfixture\",\"def\":\"function {fixture_prefix}_uniffiohosbridgeidentityfixture(): string\",\"typeParameters\":[]}}\n"
+    );
+    std::fs::write(root.join("fixture.ohos-extra-types.d.ts"), &sidecar).unwrap();
     std::fs::write(
         root.join(FACADE_INVENTORY_FILE),
         serde_json::to_vec(&serde_json::json!({
@@ -5617,15 +5617,15 @@ fn facade_inventory_ignores_stale_unlisted_contracts() {
             "components": [{
                 "component": "fixture",
                 "namespace": "fixture",
-                "nativeExportPrefix": uniffi_bindgen::interface::native_export_prefix_for_component("fixture"),
+                "nativeExportPrefix": fixture_prefix,
                 "contractFile": "current.ohos-facade.json",
                 "contractSha256": sha256_bytes(&current_bytes),
-                "identityExport": bridge_identity_export(&sha256_bytes(&current_bytes)),
+                "identityExport": bridge_identity_export(&fixture_prefix, &sha256_bytes(&current_bytes)),
             }],
             "bundleFingerprint": "0".repeat(64),
             "typeDefinitions": [{
                 "file": "fixture.ohos-extra-types.d.ts",
-                "sha256": sha256_bytes(b"type_def:{\"kind\":\"fn\",\"name\":\"uniffiohosbridgeidentityfixture\",\"def\":\"function uniffiohosbridgeidentityfixture(): string\",\"typeParameters\":[]}\n"),
+                "sha256": sha256_bytes(sidecar.as_bytes()),
             }],
             "contracts": [{
                 "file": "current.ohos-facade.json",
@@ -5654,16 +5654,16 @@ fn test_host_facade_bundle() -> HostFacadeBundle {
     }))
     .unwrap();
     let contract_sha256 = sha256_bytes(contract_content.as_bytes());
-    let identity_export = bridge_identity_export(&contract_sha256);
+    let native_export_prefix =
+        uniffi_bindgen::interface::native_export_prefix_for_component("cache_fixture");
+    let identity_export = bridge_identity_export(&native_export_prefix, &contract_sha256);
     let sidecar_content = format!(
         "type_def:{{\"kind\":\"fn\",\"name\":\"{identity_export}\",\"def\":\"function {identity_export}(): string\",\"typeParameters\":[]}}\n"
     );
     let components = vec![HostFacadeComponentIdentity {
         component: "cache_fixture".into(),
         namespace: "cache_fixture".into(),
-        native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
-            "cache_fixture",
-        ),
+        native_export_prefix,
         contract_file: "cache_fixture.ohos-facade.json".into(),
         contract_sha256: contract_sha256.clone(),
         identity_export,
@@ -5720,6 +5720,135 @@ fn write_required_host_facade_bundle(path: &Utf8Path, bundle: &HostFacadeBundle)
         "typeSidecars": entries(&bundle.type_sidecars),
     });
     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[test]
+fn two_component_prefixed_bundle_loads_and_namespaces_same_short_exports() {
+    // A composite host may contain components that deliberately expose the
+    // same short UniFFI names.  The native sidecar has to use the component
+    // prefix, while the package surface projects those names below the
+    // component namespace instead of merging them into one flat export set.
+    let component = |component: &str, namespace: &str| {
+        let native_export_prefix =
+            uniffi_bindgen::interface::native_export_prefix_for_component(component);
+        let contract_content = serde_json::to_string(&serde_json::json!({
+            "facadeContractSchemaVersion": FACADE_CONTRACT_SCHEMA_VERSION,
+            "component": component,
+            "namespace": namespace,
+            "nativeExportPrefix": native_export_prefix,
+            "outputStreams": [],
+            "inputStreams": [],
+        }))
+        .unwrap();
+        let contract_sha256 = sha256_bytes(contract_content.as_bytes());
+        let identity_export = bridge_identity_export(&native_export_prefix, &contract_sha256);
+        let raw_ping = format!("{native_export_prefix}_ping");
+        let raw_shared = format!("{native_export_prefix}_Shared");
+        let sidecar_content = format!(
+            concat!(
+                "type_def:{{\"kind\":\"interface\",\"name\":\"{raw_shared}\",",
+                "\"def\":\"value: string\",\"typeParameters\":[]}}\n",
+                "type_def:{{\"kind\":\"fn\",\"name\":\"{raw_ping}\",",
+                "\"def\":\"function {raw_ping}(): {raw_shared}\",\"typeParameters\":[]}}\n",
+                "type_def:{{\"kind\":\"fn\",\"name\":\"{identity_export}\",",
+                "\"def\":\"function {identity_export}(): string\",\"typeParameters\":[]}}\n",
+            ),
+            raw_shared = raw_shared,
+            raw_ping = raw_ping,
+            identity_export = identity_export,
+        );
+        (
+            HostFacadeComponentIdentity {
+                component: component.into(),
+                namespace: namespace.into(),
+                native_export_prefix,
+                contract_file: format!("{component}.ohos-facade.json"),
+                contract_sha256: contract_sha256.clone(),
+                identity_export,
+            },
+            HostFacadeBundleEntry {
+                file: format!("{component}.ohos-facade.json"),
+                sha256: contract_sha256,
+                content: contract_content,
+            },
+            HostFacadeBundleEntry {
+                file: format!("{component}.ohos-extra-types.d.ts"),
+                sha256: sha256_bytes(sidecar_content.as_bytes()),
+                content: sidecar_content,
+            },
+        )
+    };
+    // `ffi_a` is a textual prefix of `ffi_a_b`; ownership must come from the
+    // exact component→sidecar binding rather than longest-prefix guessing.
+    let (alpha_identity, alpha_contract, alpha_sidecar) = component("a", "alpha");
+    let (beta_identity, beta_contract, beta_sidecar) = component("a_b", "beta");
+    let components = vec![alpha_identity, beta_identity];
+    let host_identity = serde_json::json!({
+        "packageName": "composite-host",
+        "libTarget": "composite_host",
+        "components": components,
+    });
+    let mut bundle = HostFacadeBundle {
+        host_bundle_schema_version: HOST_BUNDLE_SCHEMA_VERSION,
+        fingerprint: String::new(),
+        package_name: "composite-host".into(),
+        lib_target: "composite_host".into(),
+        host_composite_identity: sha256_bytes(&serde_json::to_vec(&host_identity).unwrap()),
+        components,
+        contracts: vec![alpha_contract, beta_contract],
+        type_sidecars: vec![alpha_sidecar, beta_sidecar],
+        mode: FacadeBundleMode::Required,
+    };
+    bundle.fingerprint = bundle.computed_fingerprint().unwrap();
+
+    let root = temp_test_dir("uniffi-ohos-composite-prefixed-facade");
+    let bundle_path = root.join("composite-host.ohos-facade-bundle.json");
+    write_required_host_facade_bundle(&bundle_path, &bundle);
+    let loaded = load_host_facade_bundle(&FacadeMode::Required(bundle_path)).unwrap();
+    let owned_defs = parse_owned_bundle_type_defs(&loaded, &root).unwrap();
+    let contracts = loaded
+        .contracts
+        .iter()
+        .map(|contract| {
+            parse_harmony_facade_contract(
+                contract.content.as_bytes(),
+                Utf8Path::new(&contract.file),
+            )
+        })
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let exports = FacadeExports::from_owned_type_defs_and_contracts(owned_defs, contracts).unwrap();
+    let index = exports.render_package_index();
+    assert!(
+        index.contains("import * as alpha from \"./src/main/ets/components/alpha\"")
+            && index.contains("import * as beta from \"./src/main/ets/components/beta\"")
+            && index.contains("export {\n  alpha,\n  beta,\n};"),
+        "composite package facade must project short names through component modules:\n{index}"
+    );
+    assert!(!index.contains("ffi_a_ping"), "{index}");
+    assert!(!index.contains("ffi_a_b_ping"), "{index}");
+    let modules = exports.component_modules().unwrap();
+    let alpha = modules
+        .iter()
+        .find(|module| module.namespace == "alpha")
+        .unwrap();
+    let beta = modules
+        .iter()
+        .find(|module| module.namespace == "beta")
+        .unwrap();
+    for module in [alpha, beta] {
+        assert!(
+            module.source.contains("export const ping ="),
+            "{}",
+            module.source
+        );
+        assert!(
+            module.declarations.contains("export type Shared ="),
+            "{}",
+            module.declarations
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -5819,7 +5948,8 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
     });
     let fixture_content = serde_json::to_string(&fixture_contract).unwrap();
     let fixture_digest = sha256_bytes(fixture_content.as_bytes());
-    let fixture_identity_export = bridge_identity_export(&fixture_digest);
+    let fixture_prefix = uniffi_bindgen::interface::native_export_prefix_for_component("fixture");
+    let fixture_identity_export = bridge_identity_export(&fixture_prefix, &fixture_digest);
     fixture_defs.push(TypeDefLine {
         kind: "fn".into(),
         name: fixture_identity_export.clone(),
@@ -5856,7 +5986,9 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
     };
     let owner_content = serde_json::to_string(&owner_contract).unwrap();
     let owner_digest = sha256_bytes(owner_content.as_bytes());
-    let owner_identity_export = bridge_identity_export(&owner_digest);
+    let owner_prefix =
+        uniffi_bindgen::interface::native_export_prefix_for_component("owner_fixture");
+    let owner_identity_export = bridge_identity_export(&owner_prefix, &owner_digest);
     let owner_sidecar = format!(
         "type_def:{{\"kind\":\"fn\",\"name\":\"{owner_identity_export}\",\"def\":\"function {owner_identity_export}(): string\",\"typeParameters\":[]}}\n"
     );

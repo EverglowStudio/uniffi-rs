@@ -65,6 +65,11 @@ fn run_wasm_bindgen_nodejs_in_process(wasm_artifact: &std::path::Path, out_dir: 
     });
 }
 
+fn composite_host_wasm_filename(package_name: &str) -> String {
+    let target = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(package_name);
+    format!("{target}.wasm")
+}
+
 #[test]
 fn runs_generated_wasm_shim_end_to_end() {
     let Some(node) = locate_node_with_strip_types() else {
@@ -1934,7 +1939,7 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
 
     let wasm_file = target_dir
         .join("wasm32-unknown-unknown/debug")
-        .join("input_stream_core_wasm.wasm");
+        .join(composite_host_wasm_filename("input-stream-core"));
     assert!(
         wasm_file.exists(),
         "expected built input stream wasm at {}",
@@ -1951,7 +1956,7 @@ import * as root from "./generated/browser/index.ts";
 const { initBackend, runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } = root.input_stream_core;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/input_stream_core_wasm.js");
+const glue = require("./pkg/input_stream_core_uniffi_js_host.js");
 await initBackend(glue);
 
 function assert(cond: boolean, label: string): void {
@@ -2156,7 +2161,7 @@ fn host_crates_wasm_runs_stream_fixture() {
 
     let wasm_file = target_dir
         .join("wasm32-unknown-unknown/debug")
-        .join("stream_core_wasm.wasm");
+        .join(composite_host_wasm_filename("stream-core"));
     assert!(
         wasm_file.exists(),
         "expected built stream wasm at {}",
@@ -2173,7 +2178,7 @@ import * as root from "./generated/browser/index.ts";
 const { initBackend, countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } = root.stream_core;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/stream_core_wasm.js");
+const glue = require("./pkg/stream_core_uniffi_js_host.js");
 await initBackend(glue);
 
 function assert(cond: boolean, label: string): void {
@@ -2284,6 +2289,131 @@ console.log("ok");
         "wasm stream driver did not print ok"
     );
 }
+
+#[test]
+fn composite_wasm_uses_one_in_process_glue_for_isolated_namespaces_without_cli() {
+    let node = locate_node_with_strip_types().expect(
+        "composite Wasm runtime test requires Node.js 22.6+ with --experimental-strip-types",
+    );
+    let cargo = which_tool("cargo").expect("composite Wasm runtime test requires cargo");
+    let cli_probe = wasm_e2e_command(std::path::Path::new("/bin/sh"))
+        .args(["-c", "command -v wasm-bindgen"])
+        .output()
+        .expect("composite Wasm runtime test must be able to probe its sanitized PATH");
+    assert!(
+        !cli_probe.status.success(),
+        "the composite Wasm test PATH must not expose an external wasm-bindgen CLI: {}",
+        String::from_utf8_lossy(&cli_probe.stdout).trim(),
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = CompositeFixture::write(tmp.path());
+    fixture.build_cdylib();
+    let generated = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
+    let hosts = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    fixture.generate(&generated, Some(hosts.clone()), vec![FlavorTarget::Wasm]);
+
+    let host_target =
+        uniffi_bindgen_javascript::host_crates::composite_host_lib_target("composite-core");
+    let manifest = fixture.host_manifest_path(&hosts, "wasm");
+    let target_dir = tmp.path().join("target-wasm-composite-runtime");
+    let build = wasm_e2e_command(&cargo)
+        .args(["build", "--manifest-path"])
+        .arg(manifest.as_std_path())
+        .args(["--target", "wasm32-unknown-unknown"])
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .output()
+        .expect("failed to invoke cargo for composite Wasm host");
+    assert!(
+        build.status.success(),
+        "composite Wasm host build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let wasm_file = target_dir
+        .join("wasm32-unknown-unknown/debug")
+        .join(format!("{host_target}.wasm"));
+    assert!(
+        wasm_file.exists(),
+        "expected one composite Wasm module at {}",
+        wasm_file.display(),
+    );
+    let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
+    run_wasm_bindgen_nodejs_in_process(&wasm_file, pkg.as_std_path());
+    let glue = pkg.join(format!("{host_target}.js"));
+    assert!(
+        glue.exists(),
+        "in-process wasm-bindgen must produce the one composite glue module at {glue}",
+    );
+    for component in CANONICAL_COMPONENTS {
+        assert!(
+            !pkg.join(format!("{}.js", component.crate_name)).exists(),
+            "component {} must not get a second wasm-bindgen glue module",
+            component.namespace,
+        );
+    }
+
+    let driver = tmp.path().join("composite-wasm-driver.ts");
+    std::fs::write(
+        &driver,
+        format!(
+            r#"
+import {{ createRequire }} from "node:module";
+import * as root from "./generated/browser/index.ts";
+
+const require = createRequire(import.meta.url);
+const glue = require("./pkg/{host_target}.js");
+const {{ alpha, beta }} = root;
+
+function assert(condition: boolean, label: string): void {{
+  if (!condition) throw new Error(`FAIL ${{label}}`);
+}}
+
+// Both component runtimes receive the exact same in-process glue object.
+await alpha.initBackend(glue);
+await beta.initBackend(glue);
+assert(alpha.ping() === "alpha-ping", "alpha ping must stay in alpha namespace");
+assert(beta.ping() === "beta-ping", "beta ping must stay in beta namespace");
+const alphaRecord = alpha.makeRecord();
+const betaRecord = beta.makeRecord();
+assert(alphaRecord.sentinel === "alpha-record", `alpha record=${{JSON.stringify(alphaRecord)}}`);
+assert(betaRecord.sentinel === "beta-record", `beta record=${{JSON.stringify(betaRecord)}}`);
+assert(alpha.echoRecord(alphaRecord).sentinel === "alpha-record", "alpha record round trip");
+assert(beta.echoRecord(betaRecord).sentinel === "beta-record", "beta record round trip");
+
+const alphaObject = alpha.SharedObject.new();
+const betaObject = beta.SharedObject.new();
+assert(alphaObject.sentinel() === "alpha-object", "alpha object must use alpha wasm exports");
+assert(betaObject.sentinel() === "beta-object", "beta object must use beta wasm exports");
+
+const alphaOwned = alpha.makeAlphaOwned();
+const alphaRoundTrip = beta.roundtripAlpha(alphaOwned);
+assert(alphaRoundTrip.sentinel === "alpha-owned", "beta must accept and return alpha-owned external record");
+console.log("ok");
+"#,
+        ),
+    )
+    .unwrap();
+    let output = wasm_e2e_command(&node)
+        .arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg(driver.as_path())
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run composite Wasm Node driver");
+    assert!(
+        output.status.success(),
+        "composite Wasm Node driver failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "composite Wasm Node driver did not print ok",
+    );
+}
+
 pub struct WasmE2eSpec {
     /// Namespace = crate name = wasm module name.
     pub name: &'static str,

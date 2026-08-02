@@ -226,7 +226,51 @@ pub fn render_wasm_rust(ci: &ComponentInterface) -> String {
         }
         writeln!(out).unwrap();
     }
-    out
+    namespace_wasm_exports(out, ci)
+}
+
+/// The generated shim is included in one composite host crate.  wasm-bindgen
+/// therefore sees one flat JavaScript export table even though Rust source is
+/// wrapped in per-component modules.  Attach an explicit JS name to every
+/// exported shim function after generation so support exports (object frees,
+/// callback registration and stream helpers) receive the same component
+/// prefix as ordinary dispatch functions.
+fn namespace_wasm_exports(source: String, ci: &ComponentInterface) -> String {
+    let mut lines = source.lines().map(str::to_string).collect::<Vec<_>>();
+    for index in 0..lines.len() {
+        if lines[index].trim() != "#[wasm_bindgen]" {
+            continue;
+        }
+        let raw_name = lines[index + 1..]
+            .iter()
+            .find_map(|line| wasm_exported_function_name(line))
+            .unwrap_or_else(|| {
+                panic!(
+                    "generated wasm-bindgen attribute at line {} has no following public function",
+                    index + 1
+                )
+            });
+        let indent = lines[index]
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect::<String>();
+        let js_name = crate::native_exports::native_export_name(ci, raw_name);
+        lines[index] = format!(r#"{indent}#[wasm_bindgen(js_name = "{js_name}")]"#);
+    }
+    let mut rendered = lines.join("\n");
+    rendered.push('\n');
+    rendered
+}
+
+fn wasm_exported_function_name(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let line = line.strip_prefix("pub ")?;
+    let line = line.strip_prefix("async ").unwrap_or(line);
+    let line = line.strip_prefix("fn ")?;
+    let end = line
+        .find(|character: char| character == '(' || character.is_whitespace())
+        .unwrap_or(line.len());
+    (!line[..end].is_empty()).then_some(&line[..end])
 }
 
 // ---------------------------------------------------------------------
@@ -309,7 +353,7 @@ fn __uniffi_cb_release(handle: u32) {{
     }});
 }}
 
-fn __uniffi_cb_register(value: JsValue) -> Result<u32, JsError> {{
+pub(crate) fn __uniffi_cb_register(value: JsValue) -> Result<u32, JsError> {{
     __UNIFFI_CB_REGISTER.with(|c| {{
         let b = c.borrow();
         let f = b.as_ref().expect("uniffi: callback register not installed");
@@ -425,12 +469,13 @@ fn rust_ty_for_object(crate_ident: &str, obj: &Object) -> String {
 }
 
 fn rust_ty_for_type(crate_ident: &str, ty: &Type) -> String {
+    let owner = named_type_core_crate(ty, crate_ident);
     match ty {
         Type::Object { name, imp, .. } => match imp {
-            ObjectImpl::Struct => format!("::{crate_ident}::{name}"),
-            _ => format!("dyn ::{crate_ident}::{name}"),
+            ObjectImpl::Struct => format!("::{owner}::{name}"),
+            _ => format!("dyn ::{owner}::{name}"),
         },
-        Type::CallbackInterface { name, .. } => format!("dyn ::{crate_ident}::{name}"),
+        Type::CallbackInterface { name, .. } => format!("dyn ::{owner}::{name}"),
         _ => unreachable!(),
     }
 }
@@ -457,7 +502,7 @@ fn render_object(out: &mut String, crate_ident: &str, obj: &Object) {
     // would otherwise clash with the registry `counter_get` lookup).
     writeln!(
         out,
-        "fn __uniffi_{snake}_insert(obj: Arc<{rust_ty}>) -> u32 {{\n    \
+        "pub(crate) fn __uniffi_{snake}_insert(obj: Arc<{rust_ty}>) -> u32 {{\n    \
          let id = {next}.with(|c| {{ let n = c.get() + 1; c.set(n); n }});\n    \
          {reg}.with(|r| {{ r.borrow_mut().insert(id, obj); }});\n    \
          id\n\
@@ -466,7 +511,7 @@ fn render_object(out: &mut String, crate_ident: &str, obj: &Object) {
     .unwrap();
     writeln!(
         out,
-        "fn __uniffi_{snake}_get(handle: u32) -> Result<Arc<{rust_ty}>, JsError> {{\n    \
+        "pub(crate) fn __uniffi_{snake}_get(handle: u32) -> Result<Arc<{rust_ty}>, JsError> {{\n    \
          {reg}.with(|r| r.borrow().get(&handle).cloned()\n        \
          .ok_or_else(|| JsError::new(&format!(\"invalid handle for `{name}`: {{}}\", handle))))\n\
          }}"
@@ -531,7 +576,7 @@ fn render_constructor(
         "pub {async_kw}fn {fn_name}({params}) -> Result<u32, JsError> {{"
     )
     .unwrap();
-    emit_arg_decoders(out, &arg_info);
+    emit_arg_decoders(out, &arg_info, crate_ident);
     let pass = arg_pass(&arg_info);
     let call = format!("<{rust_ty}>::{}({pass}){call_await}", c.name());
     let obj_expr = if throws {
@@ -595,7 +640,7 @@ fn render_method(out: &mut String, crate_ident: &str, snake: &str, m: &Method) {
     )
     .unwrap();
     writeln!(out, "    let __self = __uniffi_{snake}_get(handle)?;").unwrap();
-    emit_arg_decoders(out, &arg_info);
+    emit_arg_decoders(out, &arg_info, crate_ident);
     let pass = arg_pass(&arg_info);
     let call = format!("__self.{}({pass}){call_await}", m.name());
     let bound = if throws {
@@ -603,7 +648,7 @@ fn render_method(out: &mut String, crate_ident: &str, snake: &str, m: &Method) {
     } else {
         call
     };
-    emit_return(out, &ret_info, &bound);
+    emit_return(out, &ret_info, &bound, crate_ident);
     writeln!(out, "}}").unwrap();
 }
 
@@ -616,7 +661,11 @@ fn render_method(out: &mut String, crate_ident: &str, snake: &str, m: &Method) {
 /// transparently call back into a foreign JS object.
 fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, methods: &[Method]) {
     writeln!(out, "// --- callback wrapper for `{name}` ---").unwrap();
-    writeln!(out, "struct __Js{name} {{ handle: u32 }}").unwrap();
+    writeln!(
+        out,
+        "pub(crate) struct __Js{name} {{ pub(crate) handle: u32 }}"
+    )
+    .unwrap();
     writeln!(out, "impl Drop for __Js{name} {{").unwrap();
     writeln!(
         out,
@@ -691,7 +740,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             match l {
                 Lowering::Native(_) | Lowering::Value { .. } => {
                     let ty = arg.as_type();
-                    let lift = lift_expr_result(n, &ty, 0);
+                    let lift = lift_expr_result(n, &ty, 0, crate_ident);
                     writeln!(
                         out,
                         "        let __lifted_{n} = (|| -> ::std::result::Result<JsValue, JsError> {{ {lift} }})().unwrap_or_else(|e| panic!(\"uniffi wasm callback `{name}.{m_name}` bad argument `{n}`: {{e:?}}\"));"
@@ -723,7 +772,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             )
             .unwrap();
             if let Some(error_ty) = m.throws_type() {
-                let error_lower = lower_expr("__error", error_ty, 0);
+                let error_lower = lower_expr("__error", error_ty, 0, crate_ident);
                 writeln!(
                     out,
                     "        let __ret_obj: ::js_sys::Object = __ret.dyn_into().unwrap_or_else(|_| panic!(\"uniffi wasm callback `{name}.{m_name}` returned a non-object result envelope\"));"
@@ -741,7 +790,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 .unwrap();
                 writeln!(out, "        if __ok {{").unwrap();
                 if let Some(return_type) = m.return_type() {
-                    let value_lower = lower_expr("__value", return_type, 0);
+                    let value_lower = lower_expr("__value", return_type, 0, crate_ident);
                     let value_ty = callback_return_core_ty(return_type, crate_ident);
                     writeln!(
                         out,
@@ -780,7 +829,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                             .return_type()
                             .expect("ret_info Some implies return_type")
                             .clone();
-                        let lower = lower_expr("__ret", &ty, 0);
+                        let lower = lower_expr("__ret", &ty, 0, crate_ident);
                         let return_ty = callback_return_core_ty(&ty, crate_ident);
                         writeln!(
                             out,
@@ -795,7 +844,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
             }
         } else {
             if let Some(error_ty) = m.throws_type() {
-                let error_lower = lower_expr("__error", error_ty, 0);
+                let error_lower = lower_expr("__error", error_ty, 0, crate_ident);
                 writeln!(
                     out,
                     "        let __ret = __uniffi_cb_try_invoke(self.handle, \"{}\", __args).unwrap_or_else(|__err| panic!(\"uniffi wasm callback `{name}.{m_name}` threw unexpected JS error: {{:?}}\", __err));",
@@ -819,7 +868,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                 .unwrap();
                 writeln!(out, "        if __ok {{").unwrap();
                 if let Some(return_type) = m.return_type() {
-                    let value_lower = lower_expr("__value", return_type, 0);
+                    let value_lower = lower_expr("__value", return_type, 0, crate_ident);
                     let value_ty = callback_return_core_ty(return_type, crate_ident);
                     writeln!(
                         out,
@@ -867,7 +916,7 @@ fn render_callback_wrapper(out: &mut String, crate_ident: &str, name: &str, meth
                         .return_type()
                         .expect("ret_info Some implies return_type")
                         .clone();
-                    let lower = lower_expr("__ret", &ty, 0);
+                    let lower = lower_expr("__ret", &ty, 0, crate_ident);
                     let return_ty = callback_return_core_ty(&ty, crate_ident);
                     writeln!(
                         out,
@@ -956,7 +1005,7 @@ fn render_value_method(
 
     writeln!(out, "#[wasm_bindgen]").unwrap();
     writeln!(out, "pub {async_kw}fn {fn_name}({params}) -> {rust_ret} {{").unwrap();
-    emit_arg_decoders(out, &arg_info);
+    emit_arg_decoders(out, &arg_info, crate_ident);
     let pass = m
         .arguments()
         .iter()
@@ -975,7 +1024,7 @@ fn render_value_method(
     } else {
         call
     };
-    emit_return(out, &ret_info, &bound);
+    emit_return(out, &ret_info, &bound, crate_ident);
     writeln!(out, "}}").unwrap();
 }
 
@@ -1030,7 +1079,7 @@ fn render_value_constructor(
 
     writeln!(out, "#[wasm_bindgen]").unwrap();
     writeln!(out, "pub {async_kw}fn {fn_name}({params}) -> {rust_ret} {{").unwrap();
-    emit_arg_decoders(out, &arg_info);
+    emit_arg_decoders(out, &arg_info, crate_ident);
     let pass = c
         .arguments()
         .iter()
@@ -1049,7 +1098,7 @@ fn render_value_constructor(
     } else {
         call
     };
-    emit_return(out, &ret_info, &bound);
+    emit_return(out, &ret_info, &bound, crate_ident);
     writeln!(out, "}}").unwrap();
 }
 
@@ -1098,7 +1147,7 @@ fn render_function(out: &mut String, crate_ident: &str, f: &Function) {
 
     writeln!(out, "#[wasm_bindgen]").unwrap();
     writeln!(out, "pub {async_kw}fn {name}({params}) -> {rust_ret} {{").unwrap();
-    emit_arg_decoders(out, &arg_info);
+    emit_arg_decoders(out, &arg_info, crate_ident);
     let pass = arg_pass(&arg_info);
     let call = format!("::{crate_ident}::{name}({pass}){call_await}");
     let bound = if throws {
@@ -1106,7 +1155,7 @@ fn render_function(out: &mut String, crate_ident: &str, f: &Function) {
     } else {
         call
     };
-    emit_return(out, &ret_info, &bound);
+    emit_return(out, &ret_info, &bound, crate_ident);
     writeln!(out, "}}").unwrap();
 }
 
@@ -1183,7 +1232,7 @@ fn render_stream_function(
     let params = param_list(&arg_info);
     writeln!(out, "#[wasm_bindgen]").unwrap();
     writeln!(out, "pub fn {name}({params}) -> Result<u64, JsError> {{").unwrap();
-    emit_arg_decoders(out, &arg_info);
+    emit_arg_decoders(out, &arg_info, crate_ident);
     let pass = arg_pass(&arg_info);
     writeln!(out, "    let __stream = ::{crate_ident}::{name}({pass});").unwrap();
     writeln!(
@@ -1214,7 +1263,7 @@ fn render_stream_function(
     writeln!(
         out,
         "        Ok(::uniffi::UniFfiStreamStep::Item(value)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"kind\"), &JsValue::from_str(\"item\"));\n            let __value = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"value\"), &__value);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
-        stream_value_lift_expr(&item_info, item_type, "value")
+        stream_value_lift_expr(&item_info, item_type, "value", crate_ident)
     )
     .unwrap();
     writeln!(
@@ -1225,7 +1274,12 @@ fn render_stream_function(
     writeln!(
         out,
         "        Ok(::uniffi::UniFfiStreamStep::Error(error)) => {{\n            let __obj = ::js_sys::Object::new();\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"kind\"), &JsValue::from_str(\"error\"));\n            let __error = {}?;\n            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"error\"), &__error);\n            Ok::<JsValue, JsError>(__obj.into())\n        }}",
-        stream_value_lift_expr(&classify(error_type, crate_ident), error_type, "error")
+        stream_value_lift_expr(
+            &classify(error_type, crate_ident),
+            error_type,
+            "error",
+            crate_ident,
+        )
     )
     .unwrap();
     writeln!(
@@ -1265,10 +1319,22 @@ fn item_info_for_check(info: &Lowering) -> Lowering {
     }
 }
 
-fn stream_value_lift_expr(info: &Lowering, value_type: &Type, value_ident: &str) -> String {
+fn stream_value_lift_expr(
+    info: &Lowering,
+    value_type: &Type,
+    value_ident: &str,
+    current_component_crate: &str,
+) -> String {
     match info {
-        Lowering::Object { snake, .. } => format!(
-            "Ok::<JsValue, JsError>(JsValue::from_f64(__uniffi_{snake}_insert({value_ident}) as f64))"
+        Lowering::Object {
+            snake, module_path, ..
+        } => format!(
+            "Ok::<JsValue, JsError>(JsValue::from_f64({}({value_ident}) as f64))",
+            bridge_helper_path(
+                module_path,
+                &format!("__uniffi_{snake}_insert"),
+                current_component_crate,
+            )
         ),
         Lowering::Callback { .. } => {
             "Err(JsError::new(\"stream items cannot be callback traits\"))".into()
@@ -1276,7 +1342,7 @@ fn stream_value_lift_expr(info: &Lowering, value_type: &Type, value_ident: &str)
         Lowering::Unsupported(reason) => {
             format!("Err(JsError::new(\"unsupported stream item: {reason}\"))")
         }
-        _ => lift_expr_result(value_ident, value_type, 0),
+        _ => lift_expr_result(value_ident, value_type, 0, current_component_crate),
     }
 }
 
@@ -1402,8 +1468,8 @@ fn emit_typed_input_stream_helper(out: &mut String, crate_ident: &str, ty: &Type
     let ops_name = input_stream_ops_name(ty);
     let item_ty = core_ty_for(item_type, crate_ident);
     let error_ty = core_ty_for(error_type, crate_ident);
-    let item_lower = lower_expr("__value", item_type, 0);
-    let error_lower = lower_expr("__error", error_type, 0);
+    let item_lower = lower_expr("__value", item_type, 0, crate_ident);
+    let error_lower = lower_expr("__error", error_type, 0, crate_ident);
 
     writeln!(
         out,
@@ -1663,26 +1729,48 @@ fn param_list(arg_info: &[(String, Lowering)]) -> String {
 /// Emit the per-arg decode statements that turn the wasm-bindgen level
 /// parameter (`JsValue` / `u32` / native) into the biz-call level value
 /// (local variable shadowing the parameter by the same name).
-fn emit_arg_decoders(out: &mut String, arg_info: &[(String, Lowering)]) {
+fn emit_arg_decoders(
+    out: &mut String,
+    arg_info: &[(String, Lowering)],
+    current_component_crate: &str,
+) {
     for (n, l) in arg_info {
         match l {
             Lowering::Native(_) => {}
             Lowering::Value { core_ty, ty } => {
-                let lower = lower_expr(n, ty, 0);
+                let lower = lower_expr(n, ty, 0, current_component_crate);
                 writeln!(out, "    let {n}: {core_ty} = ({lower})?;").unwrap();
             }
-            Lowering::Object { snake, .. } => {
-                writeln!(out, "    let {n} = __uniffi_{snake}_get({n})?;").unwrap();
+            Lowering::Object {
+                snake, module_path, ..
+            } => {
+                let get = bridge_helper_path(
+                    module_path,
+                    &format!("__uniffi_{snake}_get"),
+                    current_component_crate,
+                );
+                writeln!(out, "    let {n} = {get}({n})?;").unwrap();
             }
-            Lowering::Callback { rust_ty, .. } => {
+            Lowering::Callback {
+                rust_ty,
+                module_path,
+                ..
+            } => {
+                let wrapper = bridge_helper_path(
+                    module_path,
+                    &format!(
+                        "__Js{}",
+                        rust_ty
+                            .trim_start_matches("dyn ")
+                            .rsplit("::")
+                            .next()
+                            .unwrap()
+                    ),
+                    current_component_crate,
+                );
                 writeln!(
                     out,
-                    "    let {n}: Arc<{rust_ty}> = Arc::new(__Js{ty_name} {{ handle: {n} }});",
-                    ty_name = rust_ty
-                        .trim_start_matches("dyn ")
-                        .rsplit("::")
-                        .next()
-                        .unwrap()
+                    "    let {n}: Arc<{rust_ty}> = Arc::new({wrapper} {{ handle: {n} }});"
                 )
                 .unwrap();
             }
@@ -1745,7 +1833,12 @@ trait Tap: Sized {
 }
 impl<T> Tap for T {}
 
-fn emit_return(out: &mut String, ret_info: &Option<Lowering>, bound: &str) {
+fn emit_return(
+    out: &mut String,
+    ret_info: &Option<Lowering>,
+    bound: &str,
+    current_component_crate: &str,
+) {
     match ret_info {
         None => {
             writeln!(out, "    {bound};").unwrap();
@@ -1756,21 +1849,24 @@ fn emit_return(out: &mut String, ret_info: &Option<Lowering>, bound: &str) {
         }
         Some(Lowering::Value { ty, .. }) => {
             writeln!(out, "    let __ret_core = {bound};").unwrap();
-            let lift = lift_expr_result("__ret_core", ty, 0);
+            let lift = lift_expr_result("__ret_core", ty, 0, current_component_crate);
             writeln!(out, "    let __ret_js = {lift}?;").unwrap();
             writeln!(out, "    Ok::<JsValue, JsError>(__ret_js)").unwrap();
         }
-        Some(Lowering::Object { snake, .. }) => {
+        Some(Lowering::Object {
+            snake, module_path, ..
+        }) => {
+            let insert = bridge_helper_path(
+                module_path,
+                &format!("__uniffi_{snake}_insert"),
+                current_component_crate,
+            );
             writeln!(
                 out,
                 "    let __obj: Arc<_> = __Coerce({bound}).__into_arc();"
             )
             .unwrap();
-            writeln!(
-                out,
-                "    Ok::<u32, JsError>(__uniffi_{snake}_insert(__obj))"
-            )
-            .unwrap();
+            writeln!(out, "    Ok::<u32, JsError>({insert}(__obj))").unwrap();
         }
         Some(Lowering::Callback { .. }) => {
             writeln!(
@@ -1810,13 +1906,18 @@ enum Lowering {
     },
     /// Opaque object handle: u32 on the boundary, looked up via
     /// `{snake}_get` / `{snake}_insert`.
-    Object { snake: String, rust_ty: String },
+    Object {
+        snake: String,
+        rust_ty: String,
+        module_path: String,
+    },
     /// Foreign trait callback: u32 on the boundary, wrapped in
     /// `Arc::new(__Js{Name}{handle})` on the Rust side.
     Callback {
         #[allow(dead_code)]
         snake: String,
         rust_ty: String,
+        module_path: String,
     },
     /// Foreign input stream marker object from common/runtime.ts.
     InputStream { core_ty: String, ty: Type },
@@ -1871,20 +1972,38 @@ fn classify(ty: &Type, crate_ident: &str) -> Lowering {
         },
         Type::Box { inner_type } => classify(inner_type, crate_ident),
         Type::Set { .. } => Unsupported("Set is not wired into wasm codegen yet".into()),
-        Type::Object { name, imp, .. } => {
+        Type::Object {
+            module_path,
+            name,
+            imp,
+        } => {
             let snake = name.to_snake_case();
             let rust_ty = rust_ty_for_type(crate_ident, ty);
+            let module_path = module_path.clone();
             match imp {
-                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
-                    Callback { snake, rust_ty }
-                }
-                _ => Object { snake, rust_ty },
+                ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => Callback {
+                    snake,
+                    rust_ty,
+                    module_path,
+                },
+                _ => Object {
+                    snake,
+                    rust_ty,
+                    module_path,
+                },
             }
         }
-        Type::CallbackInterface { name, .. } => {
+        Type::CallbackInterface {
+            module_path, name, ..
+        } => {
             let snake = name.to_snake_case();
-            let rust_ty = format!("dyn ::{crate_ident}::{name}");
-            Callback { snake, rust_ty }
+            let owner = core_crate_root(module_path);
+            let rust_ty = format!("dyn ::{owner}::{name}");
+            Callback {
+                snake,
+                rust_ty,
+                module_path: module_path.clone(),
+            }
         }
         Type::Timestamp => Value {
             core_ty: "::std::time::SystemTime".into(),
@@ -2054,7 +2173,7 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     writeln!(
         out,
         "#[allow(non_snake_case, dead_code)]\n\
-         fn __lower_{snake}(__js: JsValue) -> Result<{core}, JsError> {{"
+         pub(crate) fn __lower_{snake}(__js: JsValue) -> Result<{core}, JsError> {{"
     )
     .unwrap();
     writeln!(
@@ -2070,7 +2189,7 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
             "    let {field_ident}: JsValue = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"{key}\")).map_err(|_| JsError::new(\"reflect get `{key}` on `{name}` failed\"))?;"
         )
         .unwrap();
-        let lower = lower_expr(&field_ident, &f.as_type(), 0);
+        let lower = lower_expr(&field_ident, &f.as_type(), 0, crate_ident);
         writeln!(
             out,
             "    let {ident}: {ty} = ({lower})?;",
@@ -2088,7 +2207,7 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     writeln!(
         out,
         "#[allow(non_snake_case, dead_code)]\n\
-         fn __lift_{snake}(__c: {core}) -> Result<JsValue, JsError> {{"
+         pub(crate) fn __lift_{snake}(__c: {core}) -> Result<JsValue, JsError> {{"
     )
     .unwrap();
     writeln!(out, "    let __obj = ::js_sys::Object::new();").unwrap();
@@ -2101,7 +2220,7 @@ fn emit_record_helpers(out: &mut String, r: &Record, crate_ident: &str) {
     .unwrap();
     for f in r.fields() {
         let key = crate::js_names::field_name(f.name());
-        let lift = lift_expr_result(f.name(), &f.as_type(), 0);
+        let lift = lift_expr_result(f.name(), &f.as_type(), 0, crate_ident);
         writeln!(
             out,
             "    let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"{key}\"), &({lift})?);"
@@ -2120,7 +2239,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
     writeln!(
         out,
         "#[allow(non_snake_case, dead_code, unused_variables)]\n\
-         fn __lower_{snake}(__js: JsValue) -> Result<{core}, JsError> {{"
+         pub(crate) fn __lower_{snake}(__js: JsValue) -> Result<{core}, JsError> {{"
     )
     .unwrap();
     if all_unit {
@@ -2179,7 +2298,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
                 "            let {field_ident}: JsValue = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"{key}\")).map_err(|_| JsError::new(\"reflect get `{key}` on `{name}::{vname}` failed\"))?;"
             )
             .unwrap();
-            let lower = lower_expr(&field_ident, &f.as_type(), 0);
+            let lower = lower_expr(&field_ident, &f.as_type(), 0, crate_ident);
             writeln!(
                 out,
                 "            let {bind}: {ty} = ({lower})?;",
@@ -2213,7 +2332,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
     writeln!(
         out,
         "#[allow(non_snake_case, dead_code, unused_variables)]\n\
-         fn __lift_{snake}(__c: {core}) -> Result<JsValue, JsError> {{"
+         pub(crate) fn __lift_{snake}(__c: {core}) -> Result<JsValue, JsError> {{"
     )
     .unwrap();
     writeln!(out, "    match __c {{").unwrap();
@@ -2278,7 +2397,7 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
         .unwrap();
         for (bind, f) in binds.iter().zip(v.fields().iter()) {
             let key = crate::js_names::field_name(bind);
-            let lift = lift_expr_result(bind, &f.as_type(), 0);
+            let lift = lift_expr_result(bind, &f.as_type(), 0, crate_ident);
             writeln!(
                 out,
                 "            let _ = ::js_sys::Reflect::set(&__obj, &JsValue::from_str(\"{key}\"), &({lift})?);"
@@ -2294,9 +2413,52 @@ fn emit_enum_helpers(out: &mut String, e: &Enum, crate_ident: &str) {
     writeln!(out, "    }}\n}}").unwrap();
 }
 
+/// Build the stable private host-module path for a named component owner.
+///
+/// Every generated wasm bridge is included below this exact module in the
+/// composite host.  Always addressing record/enum conversion helpers through
+/// that owner avoids accidental resolution to a same-named helper in the
+/// current component module.
+fn bridge_owner_module_path(module_path: &str) -> String {
+    format!(
+        "crate::{}",
+        crate::host_crates::component_bridge_module_name(module_path)
+    )
+}
+
+/// Resolve a helper that belongs to a component bridge.  The generated source
+/// is included at the crate root for a single component, but is nested below a
+/// stable private module for composite hosts.  Keep local calls short and make
+/// foreign calls explicitly target their owner's module.
+fn bridge_helper_path(module_path: &str, helper: &str, current_component_crate: &str) -> String {
+    if crate::host_crates::component_bridge_module_name(module_path)
+        == crate::host_crates::component_bridge_module_name(current_component_crate)
+    {
+        helper.to_string()
+    } else {
+        format!("{}::{helper}", bridge_owner_module_path(module_path))
+    }
+}
+
+fn bridge_value_helper_path(
+    ty: &Type,
+    helper_prefix: &str,
+    current_component_crate: &str,
+) -> String {
+    let module_path = ty
+        .module_path()
+        .expect("record and enum conversion helpers always have a module path");
+    let name = match ty {
+        Type::Record { name, .. } | Type::Enum { name, .. } => name,
+        _ => unreachable!("only records and enums have generated value helpers"),
+    };
+    let helper = format!("{helper_prefix}{}", name.to_snake_case());
+    bridge_helper_path(module_path, &helper, current_component_crate)
+}
+
 /// Build a Rust expression `Result<CoreTy, JsError>` that lowers the
 /// JS value held in `expr` into the downstream core type for `ty`.
-fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
+fn lower_expr(expr: &str, ty: &Type, depth: usize, current_component_crate: &str) -> String {
     match ty {
         Type::String => format!(
             "{expr}.as_string().ok_or_else(|| JsError::new(\"expected string\"))"
@@ -2321,20 +2483,22 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
         ),
         Type::Timestamp => timestamp_lower(expr),
         Type::Duration => duration_lower(expr),
-        Type::Record { name, .. } | Type::Enum { name, .. } => {
-            let s = name.to_snake_case();
-            format!("__lower_{s}({expr})")
+        Type::Record { .. } | Type::Enum { .. } => {
+            format!(
+                "{}({expr})",
+                bridge_value_helper_path(ty, "__lower_", current_component_crate)
+            )
         }
         Type::Optional { inner_type } => {
             let bind = format!("__inner{depth}");
-            let inner = lower_expr(&bind, inner_type, depth + 1);
+            let inner = lower_expr(&bind, inner_type, depth + 1, current_component_crate);
             format!(
                 "{{ let {bind}: JsValue = {expr}; if {bind}.is_null() || {bind}.is_undefined() {{ Ok::<_, JsError>(None) }} else {{ ({inner}).map(Some) }} }}"
             )
         }
         Type::Sequence { inner_type } => {
             let bind = format!("__item{depth}");
-            let inner = lower_expr(&bind, inner_type, depth + 1);
+            let inner = lower_expr(&bind, inner_type, depth + 1, current_component_crate);
             format!(
                 "{{ let __arr{depth}: ::js_sys::Array = {expr}.dyn_into().map_err(|_| JsError::new(\"expected array\"))?; let mut __out{depth} = ::std::vec::Vec::with_capacity(__arr{depth}.length() as usize); for __i{depth} in 0..__arr{depth}.length() {{ let {bind}: JsValue = __arr{depth}.get(__i{depth}); __out{depth}.push(({inner})?); }} Ok::<_, JsError>(__out{depth}) }}"
             )
@@ -2345,34 +2509,65 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
         } => {
             let key = format!("__key{depth}");
             let value = format!("__value{depth}");
-            let key_lower = lower_expr(&key, key_type, depth + 1);
-            let value_lower = lower_expr(&value, value_type, depth + 1);
+            let key_lower = lower_expr(&key, key_type, depth + 1, current_component_crate);
+            let value_lower = lower_expr(&value, value_type, depth + 1, current_component_crate);
             format!(
                 "{{ let __obj{depth}: ::js_sys::Object = {expr}.dyn_into().map_err(|_| JsError::new(\"expected object for map\"))?; let __keys{depth} = ::js_sys::Object::keys(&__obj{depth}); let mut __out{depth} = ::std::collections::HashMap::new(); for __i{depth} in 0..__keys{depth}.length() {{ let {key}: JsValue = __keys{depth}.get(__i{depth}); let {value}: JsValue = ::js_sys::Reflect::get(&__obj{depth}, &{key}).map_err(|_| JsError::new(\"reflect get map value failed\"))?; __out{depth}.insert(({key_lower})?, ({value_lower})?); }} Ok::<_, JsError>(__out{depth}) }}"
             )
         }
-        Type::Box { inner_type } => lower_expr(expr, inner_type, depth + 1),
+        Type::Box { inner_type } => lower_expr(expr, inner_type, depth + 1, current_component_crate),
         Type::Set { .. } => "Err(JsError::new(\"Set is not wired into wasm lowering yet\"))".into(),
         Type::Stream { .. } => {
             "Err(JsError::new(\"native streams are not wired into wasm lowering yet\"))".into()
         }
         Type::InputStream { .. } => input_stream_lower_expr(expr, ty),
-        Type::Object { name, imp, .. } => match imp {
+        Type::Object {
+            module_path,
+            name,
+            imp,
+        } => match imp {
             ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
                 let snake = name.to_snake_case();
+                let get = bridge_helper_path(
+                    module_path,
+                    &format!("__uniffi_{snake}_get"),
+                    current_component_crate,
+                );
                 format!(
-                    "{{ let __value: JsValue = {expr}; let __handle = if let Some(__handle) = __value.as_f64() {{ __handle }} else {{ let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected object handle or wrapper\"))?; let __uniffi = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffi\")).map_err(|_| JsError::new(\"object wrapper missing __uniffi\"))?; let __uniffi_obj: ::js_sys::Object = __uniffi.dyn_into().map_err(|_| JsError::new(\"object wrapper __uniffi is not an object\"))?; let __raw = ::js_sys::Reflect::get(&__uniffi_obj, &JsValue::from_str(\"raw\")).map_err(|_| JsError::new(\"object wrapper missing raw handle\"))?; __raw.as_f64().ok_or_else(|| JsError::new(\"object wrapper raw handle is not numeric\"))? }}; if !__handle.is_finite() || __handle < 0.0 || __handle.fract() != 0.0 || __handle > u32::MAX as f64 {{ Err(JsError::new(\"invalid object handle\")) }} else {{ __uniffi_{snake}_get(__handle as u32) }} }}"
+                    "{{ let __value: JsValue = {expr}; let __handle = if let Some(__handle) = __value.as_f64() {{ __handle }} else {{ let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected object handle or wrapper\"))?; let __uniffi = ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffi\")).map_err(|_| JsError::new(\"object wrapper missing __uniffi\"))?; let __uniffi_obj: ::js_sys::Object = __uniffi.dyn_into().map_err(|_| JsError::new(\"object wrapper __uniffi is not an object\"))?; let __raw = ::js_sys::Reflect::get(&__uniffi_obj, &JsValue::from_str(\"raw\")).map_err(|_| JsError::new(\"object wrapper missing raw handle\"))?; __raw.as_f64().ok_or_else(|| JsError::new(\"object wrapper raw handle is not numeric\"))? }}; if !__handle.is_finite() || __handle < 0.0 || __handle.fract() != 0.0 || __handle > u32::MAX as f64 {{ Err(JsError::new(\"invalid object handle\")) }} else {{ {get}(__handle as u32) }} }}"
                 )
             }
             ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
+                let register = bridge_helper_path(
+                    module_path,
+                    "__uniffi_cb_register",
+                    current_component_crate,
+                );
                 format!(
-                    "{{ let __value: JsValue = {expr}; let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected callback object\"))?; let __cb = if ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffiCallback\")).map_err(|_| JsError::new(\"failed to inspect callback marker\"))?.as_bool().unwrap_or(false) {{ ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"object\")).map_err(|_| JsError::new(\"callback marker missing object\"))? }} else {{ __obj.into() }}; let __handle = __uniffi_cb_register(__cb)?; Ok::<_, JsError>(Arc::new(__Js{name} {{ handle: __handle }})) }}"
+                    "{{ let __value: JsValue = {expr}; let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected callback object\"))?; let __cb = if ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffiCallback\")).map_err(|_| JsError::new(\"failed to inspect callback marker\"))?.as_bool().unwrap_or(false) {{ ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"object\")).map_err(|_| JsError::new(\"callback marker missing object\"))? }} else {{ __obj.into() }}; let __handle = {register}(__cb)?; Ok::<_, JsError>(Arc::new({wrapper} {{ handle: __handle }})) }}",
+                    wrapper = bridge_helper_path(
+                        module_path,
+                        &format!("__Js{name}"),
+                        current_component_crate,
+                    ),
                 )
             }
         },
-        Type::CallbackInterface { name, .. } => {
+        Type::CallbackInterface {
+            module_path, name, ..
+        } => {
+            let register = bridge_helper_path(
+                module_path,
+                "__uniffi_cb_register",
+                current_component_crate,
+            );
             format!(
-                "{{ let __value: JsValue = {expr}; let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected callback object\"))?; let __cb = if ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffiCallback\")).map_err(|_| JsError::new(\"failed to inspect callback marker\"))?.as_bool().unwrap_or(false) {{ ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"object\")).map_err(|_| JsError::new(\"callback marker missing object\"))? }} else {{ __obj.into() }}; let __handle = __uniffi_cb_register(__cb)?; Ok::<_, JsError>(Arc::new(__Js{name} {{ handle: __handle }})) }}"
+                "{{ let __value: JsValue = {expr}; let __obj: ::js_sys::Object = __value.dyn_into().map_err(|_| JsError::new(\"expected callback object\"))?; let __cb = if ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"__uniffiCallback\")).map_err(|_| JsError::new(\"failed to inspect callback marker\"))?.as_bool().unwrap_or(false) {{ ::js_sys::Reflect::get(&__obj, &JsValue::from_str(\"object\")).map_err(|_| JsError::new(\"callback marker missing object\"))? }} else {{ __obj.into() }}; let __handle = {register}(__cb)?; Ok::<_, JsError>(Arc::new({wrapper} {{ handle: __handle }})) }}",
+                wrapper = bridge_helper_path(
+                    module_path,
+                    &format!("__Js{name}"),
+                    current_component_crate,
+                ),
             )
         }
         Type::Custom {
@@ -2380,12 +2575,9 @@ fn lower_expr(expr: &str, ty: &Type, depth: usize) -> String {
             name,
             builtin,
         } => {
-            let builtin_lower = lower_expr(expr, builtin, depth + 1);
-            let crate_ident = module_path
-                .split("::")
-                .next()
-                .expect("custom type module path should have a crate root");
-            let builtin_ty = core_ty_for(builtin, crate_ident);
+            let builtin_lower = lower_expr(expr, builtin, depth + 1, current_component_crate);
+            let crate_ident = core_crate_root(module_path);
+            let builtin_ty = core_ty_for(builtin, &crate_ident);
             let tag_ty = core_tag_path(module_path);
             let custom_ty = format!("::{crate_ident}::{name}");
             format!(
@@ -2417,7 +2609,7 @@ fn duration_lower(expr: &str) -> String {
 
 /// Build a Rust expression of type `JsValue` that lifts the core value
 /// held in `expr` into a JS value. Infallible.
-fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
+fn lift_expr(expr: &str, ty: &Type, depth: usize, current_component_crate: &str) -> String {
     match ty {
         Type::String => format!("JsValue::from_str(&{expr})"),
         Type::Boolean => format!("JsValue::from_bool({expr})"),
@@ -2435,18 +2627,20 @@ fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
         Type::Bytes => format!("JsValue::from(::js_sys::Uint8Array::from(&{expr}[..]))"),
         Type::Timestamp => timestamp_lift_value(expr),
         Type::Duration => duration_lift_value(expr),
-        Type::Record { name, .. } | Type::Enum { name, .. } => {
-            let s = name.to_snake_case();
-            format!("__lift_{s}({expr})")
+        Type::Record { .. } | Type::Enum { .. } => {
+            format!(
+                "{}({expr})",
+                bridge_value_helper_path(ty, "__lift_", current_component_crate)
+            )
         }
         Type::Optional { inner_type } => {
             let bind = format!("__inner{depth}");
-            let inner = lift_expr(&bind, inner_type, depth + 1);
+            let inner = lift_expr(&bind, inner_type, depth + 1, current_component_crate);
             format!("match {expr} {{ Some({bind}) => {inner}, None => JsValue::NULL }}")
         }
         Type::Sequence { inner_type } => {
             let bind = format!("__item{depth}");
-            let inner = lift_expr(&bind, inner_type, depth + 1);
+            let inner = lift_expr(&bind, inner_type, depth + 1, current_component_crate);
             format!(
                 "{{ let __arr{depth} = ::js_sys::Array::new(); for {bind} in {expr} {{ let _ = __arr{depth}.push(&{inner}); }} JsValue::from(__arr{depth}) }}"
             )
@@ -2457,8 +2651,8 @@ fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
         } => {
             let key = format!("__key{depth}");
             let value = format!("__value{depth}");
-            let key_lift = lift_expr(&key, key_type, depth + 1);
-            let value_lift = lift_expr(&value, value_type, depth + 1);
+            let key_lift = lift_expr(&key, key_type, depth + 1, current_component_crate);
+            let value_lift = lift_expr(&value, value_type, depth + 1, current_component_crate);
             format!(
                 "{{ let __obj{depth} = ::js_sys::Object::new(); for ({key}, {value}) in {expr} {{ let _ = ::js_sys::Reflect::set(&__obj{depth}, &{key_lift}, &{value_lift}); }} JsValue::from(__obj{depth}) }}"
             )
@@ -2469,15 +2663,12 @@ fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
             builtin,
         } => {
             let tag_ty = core_tag_path(module_path);
-            let crate_ident = module_path
-                .split("::")
-                .next()
-                .expect("custom type module path should have a crate root");
+            let crate_ident = core_crate_root(module_path);
             let custom_ty = format!("::{crate_ident}::{name}");
-            let builtin_ty = core_ty_for(builtin, crate_ident);
+            let builtin_ty = core_ty_for(builtin, &crate_ident);
             let lifted = format!(
                 "{{ let __builtin = <{builtin_ty} as ::uniffi::Lift<{tag_ty}>>::try_lift(<{custom_ty} as ::uniffi::Lower<{tag_ty}>>::lower({expr})).expect(\"uniffi wasm custom type lift failed\"); {} }}",
-                lift_expr("__builtin", builtin, depth + 1)
+                lift_expr("__builtin", builtin, depth + 1, current_component_crate)
             );
             lifted
         }
@@ -2489,24 +2680,26 @@ fn lift_expr(expr: &str, ty: &Type, depth: usize) -> String {
 /// the core value held in `expr` into a JS value. This is used at public
 /// return boundaries and for generated record/enum helpers where a
 /// `Date` overflow should surface as a thrown `JsError`.
-fn lift_expr_result(expr: &str, ty: &Type, depth: usize) -> String {
+fn lift_expr_result(expr: &str, ty: &Type, depth: usize, current_component_crate: &str) -> String {
     match ty {
         Type::Timestamp => timestamp_lift_result(expr),
         Type::Duration => duration_lift_result(expr),
-        Type::Record { name, .. } | Type::Enum { name, .. } => {
-            let s = name.to_snake_case();
-            format!("__lift_{s}({expr})")
+        Type::Record { .. } | Type::Enum { .. } => {
+            format!(
+                "{}({expr})",
+                bridge_value_helper_path(ty, "__lift_", current_component_crate)
+            )
         }
         Type::Optional { inner_type } => {
             let bind = format!("__inner{depth}");
-            let inner = lift_expr_result(&bind, inner_type, depth + 1);
+            let inner = lift_expr_result(&bind, inner_type, depth + 1, current_component_crate);
             format!(
                 "match {expr} {{ Some({bind}) => {inner}, None => Ok::<JsValue, JsError>(JsValue::NULL) }}"
             )
         }
         Type::Sequence { inner_type } => {
             let bind = format!("__item{depth}");
-            let inner = lift_expr_result(&bind, inner_type, depth + 1);
+            let inner = lift_expr_result(&bind, inner_type, depth + 1, current_component_crate);
             format!(
                 "{{ let __arr{depth} = ::js_sys::Array::new(); for {bind} in {expr} {{ let _ = __arr{depth}.push(&({inner})?); }} Ok::<JsValue, JsError>(JsValue::from(__arr{depth})) }}"
             )
@@ -2517,8 +2710,9 @@ fn lift_expr_result(expr: &str, ty: &Type, depth: usize) -> String {
         } => {
             let key = format!("__key{depth}");
             let value = format!("__value{depth}");
-            let key_lift = lift_expr_result(&key, key_type, depth + 1);
-            let value_lift = lift_expr_result(&value, value_type, depth + 1);
+            let key_lift = lift_expr_result(&key, key_type, depth + 1, current_component_crate);
+            let value_lift =
+                lift_expr_result(&value, value_type, depth + 1, current_component_crate);
             format!(
                 "{{ let __obj{depth} = ::js_sys::Object::new(); for ({key}, {value}) in {expr} {{ let _ = ::js_sys::Reflect::set(&__obj{depth}, &({key_lift})?, &({value_lift})?); }} Ok::<JsValue, JsError>(JsValue::from(__obj{depth})) }}"
             )
@@ -2528,20 +2722,20 @@ fn lift_expr_result(expr: &str, ty: &Type, depth: usize) -> String {
             name,
             builtin,
         } => {
-            let crate_ident = module_path
-                .split("::")
-                .next()
-                .expect("custom type module path should have a crate root");
-            let builtin_ty = core_ty_for(builtin, crate_ident);
+            let crate_ident = core_crate_root(module_path);
+            let builtin_ty = core_ty_for(builtin, &crate_ident);
             let tag_ty = core_tag_path(module_path);
             let custom_ty = format!("::{crate_ident}::{name}");
             let lowered = format!(
                 "{{ let __builtin = <{builtin_ty} as ::uniffi::Lift<{tag_ty}>>::try_lift(<{custom_ty} as ::uniffi::Lower<{tag_ty}>>::lower({expr})).expect(\"uniffi wasm custom type lift failed\"); {} }}",
-                lift_expr_result("__builtin", builtin, depth + 1)
+                lift_expr_result("__builtin", builtin, depth + 1, current_component_crate)
             );
             lowered
         }
-        _ => format!("Ok::<JsValue, JsError>({})", lift_expr(expr, ty, depth)),
+        _ => format!(
+            "Ok::<JsValue, JsError>({})",
+            lift_expr(expr, ty, depth, current_component_crate)
+        ),
     }
 }
 
@@ -2566,11 +2760,22 @@ fn duration_lift_result(expr: &str) -> String {
 }
 
 fn core_tag_path(module_path: &str) -> String {
-    let crate_ident = module_path
+    let crate_ident = core_crate_root(module_path);
+    format!("::{crate_ident}::UniFfiTag")
+}
+
+fn core_crate_root(module_path: &str) -> String {
+    module_path
         .split("::")
         .next()
-        .expect("custom type module path should have a crate root");
-    format!("::{crate_ident}::UniFfiTag")
+        .expect("named UniFFI type module path should have a crate root")
+        .replace('-', "_")
+}
+
+fn named_type_core_crate(ty: &Type, fallback_crate_ident: &str) -> String {
+    ty.module_path()
+        .map(core_crate_root)
+        .unwrap_or_else(|| fallback_crate_ident.to_string())
 }
 
 /// Downstream core Rust type for a `Type`.
@@ -2595,7 +2800,10 @@ fn core_ty_for(ty: &Type, crate_ident: &str) -> String {
         Type::Bytes => "Vec<u8>".into(),
         Type::Timestamp => "::std::time::SystemTime".into(),
         Type::Duration => "::std::time::Duration".into(),
-        Type::Record { name, .. } | Type::Enum { name, .. } => format!("::{crate_ident}::{name}"),
+        Type::Record { name, .. } | Type::Enum { name, .. } => {
+            let owner = named_type_core_crate(ty, crate_ident);
+            format!("::{owner}::{name}")
+        }
         Type::Optional { inner_type } => {
             format!("Option<{}>", core_ty_for(inner_type, crate_ident))
         }
@@ -2610,7 +2818,10 @@ fn core_ty_for(ty: &Type, crate_ident: &str) -> String {
             core_ty_for(key_type, crate_ident),
             core_ty_for(value_type, crate_ident)
         ),
-        Type::Custom { name, .. } => format!("::{crate_ident}::{name}"),
+        Type::Custom { name, .. } => {
+            let owner = named_type_core_crate(ty, crate_ident);
+            format!("::{owner}::{name}")
+        }
         Type::InputStream {
             item_type,
             error_type,
@@ -2645,6 +2856,7 @@ mod tests {
             &Lowering::Native("String".to_owned()),
             &Type::String,
             "error",
+            "test_component",
         );
         assert!(
             lift.contains("JsValue::from_str(&error)"),
@@ -2653,6 +2865,100 @@ mod tests {
         assert!(
             !lift.contains("&value"),
             "typed stream error lift retained the item binding: {lift}"
+        );
+    }
+
+    #[test]
+    fn recognizes_sync_and_async_wasm_export_functions() {
+        assert_eq!(
+            wasm_exported_function_name("pub fn ping() {}"),
+            Some("ping")
+        );
+        assert_eq!(
+            wasm_exported_function_name("    pub async fn stream_next(handle: u32) {}"),
+            Some("stream_next")
+        );
+        assert_eq!(wasm_exported_function_name("fn private() {}"), None);
+    }
+
+    #[test]
+    fn foreign_named_values_use_the_exact_owner_core_and_bridge_module() {
+        let alpha_record = Type::Record {
+            module_path: "alpha-core::types".into(),
+            name: "AlphaOwned".into(),
+        };
+        let alpha_enum = Type::Enum {
+            module_path: "alpha-core::types".into(),
+            name: "Shared".into(),
+        };
+        let owner = crate::host_crates::component_bridge_module_name("alpha-core::types");
+
+        assert_eq!(
+            core_ty_for(&alpha_record, "beta_core"),
+            "::alpha_core::AlphaOwned"
+        );
+        assert_eq!(
+            core_ty_for(&alpha_enum, "beta_core"),
+            "::alpha_core::Shared"
+        );
+        assert_eq!(
+            lower_expr("value", &alpha_record, 0, "alpha_core"),
+            "__lower_alpha_owned(value)"
+        );
+        for (ty, helper) in [
+            (&alpha_record, "__lower_alpha_owned"),
+            (&alpha_enum, "__lift_shared"),
+        ] {
+            let rendered = if helper.starts_with("__lower") {
+                lower_expr("value", ty, 0, "beta_core")
+            } else {
+                lift_expr_result("value", ty, 0, "beta_core")
+            };
+            assert!(
+                rendered.contains(&format!("crate::{owner}::{helper}")),
+                "foreign value helper must use its exact owner module: {rendered}"
+            );
+        }
+
+        let alpha_object = Type::Object {
+            module_path: "alpha-core::types".into(),
+            name: "SharedObject".into(),
+            imp: ObjectImpl::Struct,
+        };
+        let alpha_callback = Type::CallbackInterface {
+            module_path: "alpha-core::types".into(),
+            name: "SharedCallback".into(),
+        };
+        assert_eq!(
+            rust_ty_for_type("beta_core", &alpha_object),
+            "::alpha_core::SharedObject"
+        );
+        assert_eq!(
+            callback_return_core_ty(&alpha_callback, "beta_core"),
+            "Arc<dyn ::alpha_core::SharedCallback>"
+        );
+        let foreign_object_lower = lower_expr("value", &alpha_object, 0, "beta_core");
+        assert!(
+            foreign_object_lower.contains(&format!("crate::{owner}::__uniffi_shared_object_get")),
+            "foreign object lookup must use its exact owner module: {foreign_object_lower}"
+        );
+        let local_object_lower = lower_expr("value", &alpha_object, 0, "alpha_core");
+        assert!(
+            local_object_lower.contains("__uniffi_shared_object_get(__handle as u32)"),
+            "local object lookup must remain directly usable at the single-component crate root: {local_object_lower}"
+        );
+        assert!(
+            !local_object_lower.contains("crate::__uniffi_component"),
+            "local object lookup must not assume a composite host module: {local_object_lower}"
+        );
+        let foreign_callback_lower = lower_expr("value", &alpha_callback, 0, "beta_core");
+        assert!(
+            foreign_callback_lower.contains(&format!("crate::{owner}::__uniffi_cb_register")),
+            "foreign callback registration must use its exact owner module: {foreign_callback_lower}"
+        );
+        assert!(
+            foreign_callback_lower.contains(&format!("crate::{owner}::__JsSharedCallback")),
+            "foreign callback wrapper must use its exact owner module: {foreign_callback_lower}"
         );
     }
 }

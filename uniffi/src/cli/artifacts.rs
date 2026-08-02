@@ -9,7 +9,7 @@ use super::javascript::{
 };
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::{CargoOpt, MetadataCommand};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +17,11 @@ use std::io::{Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::process::Command;
-use uniffi_bindgen::bindings::{generate, GenerateOptions, TargetLanguage};
+use uniffi_bindgen::{
+    bindings::{generate, GenerateOptions, TargetLanguage},
+    cargo_metadata::CrateConfigSupplier,
+    BindgenLoader, BindgenPaths, CargoMetadataOptions, GlobalConfig,
+};
 use uniffi_bindgen_javascript::{FlavorTarget, HostCrateOptions};
 
 use super::artifact_transaction::*;
@@ -324,7 +328,7 @@ pub(crate) enum ArtifactTargetArg {
     All,
 }
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
 struct ExpandedTargets {
     wasm: bool,
     mini_program: bool,
@@ -338,14 +342,463 @@ struct ExpandedTargets {
 #[derive(Clone, Debug)]
 pub(super) struct ManagedLayout {
     package_dir: Utf8PathBuf,
+    /// Cargo package identity used for the source-mode planner. This is
+    /// intentionally distinct from the root library target: a package may
+    /// export a differently named `[lib]`, while `src:<...>` resolves through
+    /// the package map in `CrateConfigSupplier`.
+    root_source_package: String,
+    /// The root library target remains distinct from the composite host
+    /// target and is the producer-owned Apple xcframework stem.
+    root_lib_target: String,
     source_root: Utf8PathBuf,
     pub(super) artifact_root: Utf8PathBuf,
     host_crates_root: Utf8PathBuf,
     pub(super) manifest_path: Utf8PathBuf,
-    /// Only test-only transaction fixtures may omit this value. Production
-    /// managed layouts always supply it so existing manifests are validated
-    /// as complete generated artifact packages before a transaction starts.
-    namespace: Option<String>,
+    /// `ManagedLayout::apply` seeds this with the root library identity only
+    /// long enough to select `src:<root-package>` for the read-only planner. Every
+    /// managed command promotes the resulting source/library plan before it
+    /// may inspect, adopt, lock, or mutate an existing package.
+    components: Option<Vec<ManagedComponentIdentity>>,
+    /// Only a current source/library plan (or a deliberately test-only
+    /// fixture) may set this true. It is then compared exactly with both
+    /// existing bridges and the existing manifest.
+    components_authoritative: bool,
+    /// The logical host tuple deliberately does not vary by JS flavor.  It
+    /// is needed to recompute the manifest checksum before any managed lock
+    /// or transaction state is created.
+    host_identity: Option<ManagedHostIdentity>,
+    /// Producer-owned route truth for the current invocation.  It is set
+    /// before existing-package preflight so a manifest cannot substitute an
+    /// already-existing same-typed path for a generated route.
+    expected_routes: Option<ManagedArtifactRoutePlan>,
+    /// Inputs needed to reconstruct the producer route plan for an existing
+    /// target set before any managed transaction mutation.
+    route_inputs: Option<ManagedArtifactRouteInputs>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ManagedComponentIdentity {
+    component: String,
+    namespace: String,
+    native_export_prefix: String,
+}
+
+impl ManagedComponentIdentity {
+    fn new(component: impl Into<String>, namespace: impl Into<String>) -> Result<Self> {
+        let component = component.into();
+        let namespace = namespace.into();
+        uniffi_bindgen::interface::validate_harmony_component_identity(&component, &namespace)?;
+        Ok(Self {
+            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
+                &component,
+            ),
+            component,
+            namespace,
+        })
+    }
+
+    fn tuple(&self) -> (String, String, String) {
+        (
+            self.component.clone(),
+            self.namespace.clone(),
+            self.native_export_prefix.clone(),
+        )
+    }
+}
+
+/// Load the current component identities without creating generated output.
+/// Explicit `--source`/`--library-path` inputs are used verbatim; otherwise
+/// the root package is read through `src:<root-package>`. This makes every managed
+/// command authoritative before frontend probing, transaction setup, or
+/// backend Cargo work can adopt an older managed package.
+fn managed_authoritative_input_components(
+    args: &BuildArgs,
+    root_package: &str,
+) -> Result<Vec<ManagedComponentIdentity>> {
+    let source = args
+        .source
+        .as_ref()
+        .or(args.library_path.as_ref())
+        .cloned()
+        // The regular build path has no readable cdylib until after Cargo
+        // runs. Source parsing gives it the same complete component plan up
+        // front, including source dependencies selected by Cargo metadata.
+        .unwrap_or_else(|| Utf8PathBuf::from(format!("src:{root_package}")));
+    let source = source.canonicalize_utf8().unwrap_or(source);
+
+    // Keep this construction deliberately in lockstep with `generate_js`.
+    // In particular, `src:<crate>` sources need the Cargo metadata layer and
+    // a supplied global config can add crate-root layers before metadata is
+    // parsed.  Nothing below creates a generated tree or invokes a build.
+    let mut paths = BindgenPaths::default();
+    let global_config = if let Some(config) = &args.config {
+        let (global_config, crate_roots_layer) = GlobalConfig::from_file(config)?;
+        if let Some(layer) = crate_roots_layer {
+            paths.add_layer(layer);
+        }
+        global_config
+    } else {
+        GlobalConfig::default()
+    };
+    let mut cargo_metadata = MetadataCommand::new();
+    cargo_metadata.manifest_path(args.manifest_path.as_std_path());
+    if args.metadata_no_deps {
+        cargo_metadata.no_deps();
+    }
+    if !args.cargo_features.is_empty() {
+        cargo_metadata.features(CargoOpt::SomeFeatures(args.cargo_features.clone()));
+    }
+    let metadata = cargo_metadata
+        .exec()
+        .with_context(|| format!("running cargo metadata for {}", args.manifest_path))?;
+    paths.add_layer(CrateConfigSupplier::from_cargo_metadata(
+        metadata,
+        CargoMetadataOptions {
+            no_deps: args.metadata_no_deps,
+            features: args.cargo_features.clone(),
+            ..CargoMetadataOptions::default()
+        },
+    ));
+    let loader = BindgenLoader::new(paths, global_config);
+    let metadata = loader.load_metadata(&source)?;
+    if let Some(crate_filter) = &args.crate_name {
+        if !metadata.contains_key(crate_filter) {
+            bail!("No UniFFI metadata found for crate {crate_filter}");
+        }
+    }
+    let mut components = loader.load_cis(&source, metadata)?;
+    if let Some(crate_filter) = &args.crate_name {
+        components.retain(|component| component.crate_name() == crate_filter);
+    }
+    canonical_managed_component_identities(
+        components
+            .iter()
+            .map(|component| {
+                ManagedComponentIdentity::new(component.crate_name(), component.namespace())
+            })
+            .collect::<Result<Vec<_>>>()?,
+    )
+}
+
+fn canonical_managed_component_identities(
+    mut identities: Vec<ManagedComponentIdentity>,
+) -> Result<Vec<ManagedComponentIdentity>> {
+    if identities.is_empty() {
+        bail!("managed artifact component set is empty");
+    }
+    identities.sort();
+    let mut component_names = BTreeSet::new();
+    let mut namespaces = BTreeSet::new();
+    let mut native_export_prefixes = BTreeSet::new();
+    for identity in &identities {
+        if !component_names.insert(identity.component.as_str())
+            || !namespaces.insert(identity.namespace.as_str())
+            || !native_export_prefixes.insert(identity.native_export_prefix.as_str())
+        {
+            bail!("managed artifact component set has duplicate canonical identity fields");
+        }
+    }
+    Ok(identities)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedHostIdentity {
+    package_name: String,
+    lib_target: String,
+}
+
+impl ManagedHostIdentity {
+    fn from_cargo_metadata(meta: &CargoPackageMetadata) -> Self {
+        Self {
+            package_name: uniffi_bindgen_javascript::host_crates::composite_host_package_name(
+                &meta.package_name,
+            ),
+            lib_target: uniffi_bindgen_javascript::host_crates::composite_host_lib_target(
+                &meta.package_name,
+            ),
+        }
+    }
+
+    fn composite_identity(&self, components: &[ManagedComponentIdentity]) -> Result<String> {
+        uniffi_bindgen_javascript::host_crates::composite_host_identity(
+            &self.package_name,
+            &self.lib_target,
+            &components
+                .iter()
+                .map(ManagedComponentIdentity::tuple)
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+/// The complete producer-owned route contract for one managed invocation.
+///
+/// The manifest has to be validated before Cargo, locks, journals, or an
+/// invocation root can exist, so the validator cannot infer a route from the
+/// file that it is validating.  This plan is derived solely from the managed
+/// layout, selected targets, host identity, and already-derived build args;
+/// the renderer consumes the same values below.
+#[derive(Clone, Debug)]
+struct ManagedArtifactRoutePlan {
+    targets: ExpandedTargets,
+    components: serde_json::Value,
+    source: serde_json::Value,
+    entrypoints: serde_json::Value,
+    artifacts: serde_json::Value,
+    host_crates: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedArtifactRouteInputs {
+    ohos_package_name: Option<String>,
+    ohos_no_har: bool,
+    ohos_package_kind: super::ohos::PackageKind,
+    ohos_integrated_hsp: bool,
+    android_aar_out: Option<Utf8PathBuf>,
+}
+
+impl From<&BuildArgs> for ManagedArtifactRouteInputs {
+    fn from(args: &BuildArgs) -> Self {
+        Self {
+            ohos_package_name: args.ohos_package_name.clone(),
+            ohos_no_har: args.ohos_no_har,
+            ohos_package_kind: args.ohos_package_kind,
+            ohos_integrated_hsp: args.ohos_integrated_hsp,
+            android_aar_out: args.android_aar_out.clone(),
+        }
+    }
+}
+
+impl ManagedArtifactRoutePlan {
+    fn validate_manifest_routes(
+        &self,
+        manifest: &serde_json::Value,
+        strict_current_targets: bool,
+    ) -> Result<()> {
+        let mut manifest_targets = BTreeSet::new();
+        for target in manifest
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .context("managed artifact manifest lacks targets while validating routes")?
+        {
+            manifest_targets.insert(
+                target
+                    .as_str()
+                    .context("managed artifact manifest target must be a string")?,
+            );
+        }
+        let active = |target: &str, planned: bool| -> Result<bool> {
+            if !planned {
+                return Ok(false);
+            }
+            let present = manifest_targets.contains(target);
+            if strict_current_targets && !present {
+                bail!(
+                    "managed artifact manifest is missing currently requested `{target}` target while validating producer routes"
+                );
+            }
+            Ok(present)
+        };
+        let wasm = active("wasm", self.targets.wasm)?;
+        let mini_program = active("mini-program", self.targets.mini_program)?;
+        let node = active("node", self.targets.node)?;
+        let electron = active("electron", self.targets.electron)?;
+        let harmony = active("harmony", self.targets.harmony)?;
+        let apple = active("apple", self.targets.apple)?;
+        let android = active("android", self.targets.android)?;
+        let has_js = wasm || mini_program || node || electron || harmony;
+        let has_browser = wasm || mini_program;
+
+        let check = |pointer: &str, expected: &serde_json::Value, label: &str| -> Result<()> {
+            let actual = manifest.pointer(pointer).with_context(|| {
+                format!("managed artifact manifest `{label}` is missing while validating routes")
+            })?;
+            if actual != expected {
+                bail!(
+                    "managed artifact manifest `{label}` route mismatch: expected {expected}, got {actual}"
+                );
+            }
+            Ok(())
+        };
+        let expected_source = self
+            .source
+            .as_object()
+            .context("managed route plan source must be an object")?;
+        check("/source/root", &expected_source["root"], "source.root")?;
+        for (field, present) in [
+            ("shared", has_js),
+            ("browser", has_browser),
+            ("node", node),
+            ("electron", electron),
+            ("harmony", harmony),
+            ("swift", apple),
+            ("kotlin", android),
+        ] {
+            if present {
+                check(
+                    &format!("/source/{field}"),
+                    &expected_source[field],
+                    &format!("source.{field}"),
+                )?;
+            }
+        }
+
+        let expected_components = self
+            .components
+            .as_array()
+            .context("managed route plan components must be an array")?;
+        let actual_components = manifest
+            .get("components")
+            .and_then(serde_json::Value::as_array)
+            .context("managed artifact manifest lacks components while validating routes")?;
+        // The caller owns component-identity compatibility and reports that
+        // separately.  In particular, an Apple-only incremental publication
+        // must be able to inspect a previously generated multi-component JS
+        // package before it adopts the generated identities.  Only compare
+        // component routes when the identities are already the same; never
+        // turn a component-set mismatch into a misleading route error.
+        let components_match = actual_components.len() == expected_components.len()
+            && actual_components
+                .iter()
+                .zip(expected_components)
+                .all(|(actual, expected)| {
+                    ["component", "namespace", "nativeExportPrefix"]
+                        .iter()
+                        .all(|field| actual.get(*field) == expected.get(*field))
+                });
+        if components_match {
+            for (index, expected_component) in expected_components.iter().enumerate() {
+                for field in ["component", "namespace", "nativeExportPrefix"] {
+                    check(
+                        &format!("/components/{index}/{field}"),
+                        &expected_component[field],
+                        &format!("components[{index}].{field}"),
+                    )?;
+                }
+                let expected_component_source = expected_component["source"]
+                    .as_object()
+                    .context("managed route plan component source must be an object")?;
+                for (field, present) in [
+                    ("common", has_js),
+                    ("publicTypes", has_js),
+                    ("browser", has_browser),
+                    ("node", node),
+                    ("electron", electron),
+                    ("harmony", harmony),
+                ] {
+                    if present {
+                        check(
+                            &format!("/components/{index}/source/{field}"),
+                            &expected_component_source[field],
+                            &format!("components[{index}].source.{field}"),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let expected_entrypoints = self
+            .entrypoints
+            .as_object()
+            .context("managed route plan entrypoints must be an object")?;
+        for (field, present) in [
+            ("web", wasm),
+            ("miniProgram", mini_program),
+            ("node", node),
+            ("electron", electron),
+            ("harmony", harmony),
+        ] {
+            if present {
+                check(
+                    &format!("/entrypoints/{field}"),
+                    &expected_entrypoints[field],
+                    &format!("entrypoints.{field}"),
+                )?;
+            }
+        }
+
+        for (field, present) in [
+            ("wasm", wasm),
+            ("miniProgram", mini_program),
+            ("node", node),
+            ("electron", electron),
+            ("apple", apple),
+            ("android", android),
+        ] {
+            if present {
+                check(
+                    &format!("/artifacts/{field}"),
+                    &self.artifacts[field],
+                    &format!("artifacts.{field}"),
+                )?;
+            }
+        }
+        if harmony {
+            let expected = self.artifacts["harmony"]
+                .as_object()
+                .context("managed route plan Harmony artifact must be an object")?;
+            let actual = manifest
+                .pointer("/artifacts/harmony")
+                .and_then(serde_json::Value::as_object)
+                .context("managed artifact manifest Harmony artifact must be an object")?;
+            for (field, expected_value) in expected {
+                if field == "metadata" {
+                    continue;
+                }
+                let actual_value = actual.get(field).with_context(|| {
+                    format!("managed artifact manifest artifacts.harmony.{field} is missing")
+                })?;
+                if actual_value != expected_value {
+                    bail!(
+                        "managed artifact manifest `artifacts.harmony.{field}` route mismatch: expected {expected_value}, got {actual_value}"
+                    );
+                }
+            }
+        }
+
+        let expected_host_crates = self
+            .host_crates
+            .as_object()
+            .context("managed route plan host crates must be an object")?;
+        for (field, present) in [
+            ("wasm", wasm || mini_program),
+            ("napi", node || electron),
+            ("ohos", harmony),
+        ] {
+            if present {
+                check(
+                    &format!("/hostCrates/{field}"),
+                    &expected_host_crates[field],
+                    &format!("hostCrates.{field}"),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn expanded_targets_from_managed_manifest(manifest: &serde_json::Value) -> Result<ExpandedTargets> {
+    let mut targets = ExpandedTargets::default();
+    for target in manifest
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .context("managed artifact manifest lacks targets while planning routes")?
+    {
+        match target
+            .as_str()
+            .context("managed artifact manifest target must be a string while planning routes")?
+        {
+            "wasm" => targets.wasm = true,
+            "mini-program" => targets.mini_program = true,
+            "node" => targets.node = true,
+            "electron" => targets.electron = true,
+            "harmony" => targets.harmony = true,
+            "apple" => targets.apple = true,
+            "android" => targets.android = true,
+            target => bail!("managed artifact manifest has unsupported target `{target}`"),
+        }
+    }
+    Ok(targets)
 }
 
 impl ManagedTransactionLayout for ManagedLayout {
@@ -354,16 +807,43 @@ impl ManagedTransactionLayout for ManagedLayout {
     }
 
     fn preflight_existing_package(&self) -> Result<()> {
-        let Some(fallback_namespace) = self.namespace.as_deref() else {
+        let Some(host_identity) = self.host_identity.as_ref() else {
             return Ok(());
         };
-        // The Cargo lib target and UniFFI namespace are independently named.
-        // When a prior generated JS tree is present, its sole component
-        // directory is the canonical namespace for manifest validation.
-        let namespace = self
-            .generated_component_namespace()?
-            .unwrap_or_else(|| fallback_namespace.to_string());
-        validate_existing_managed_manifest(self, &namespace)?;
+        let Some(existing_components) =
+            read_existing_managed_manifest_components(self, host_identity)?
+        else {
+            return Ok(());
+        };
+        let generated_components = self.generated_component_identities()?;
+        if self.components_authoritative {
+            let planned = self.exact_components()?;
+            if planned != existing_components {
+                bail!(
+                    "managed artifact component set mismatch between authoritative planned metadata and existing manifest: expected {planned:?}, got {existing_components:?}"
+                );
+            }
+            if let Some(generated) = generated_components.as_ref() {
+                if planned != generated {
+                    bail!(
+                        "managed artifact component set mismatch between authoritative planned metadata and generated bridges: expected {planned:?}, got {generated:?}"
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        // `build` always installs a source/library plan before reaching this
+        // point. Keep this branch only for direct test fixtures and legacy
+        // internal callers that construct a layout by hand; it must never be
+        // a production path that adopts an existing package.
+        if let Some(generated) = generated_components {
+            if generated != existing_components {
+                bail!(
+                    "managed artifact component set mismatch between existing manifest and generated bridges: manifest {existing_components:?}, bridges {generated:?}"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -392,7 +872,8 @@ impl<T> ManifestNullable<T> {
 struct ManagedArtifactManifest {
     artifact_manifest_schema_version: u64,
     generator: String,
-    namespace: String,
+    components: Vec<ManagedArtifactManifestComponent>,
+    host_composite_identity: String,
     targets: Vec<String>,
     source: ManagedArtifactManifestSource,
     entrypoints: ManagedArtifactManifestEntrypoints,
@@ -404,13 +885,32 @@ struct ManagedArtifactManifest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ManagedArtifactManifestSource {
     root: String,
-    common: ManifestNullable<String>,
+    shared: ManifestNullable<String>,
     browser: ManifestNullable<String>,
     node: ManifestNullable<String>,
     electron: ManifestNullable<String>,
     harmony: ManifestNullable<String>,
     swift: ManifestNullable<String>,
     kotlin: ManifestNullable<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestComponent {
+    component: String,
+    namespace: String,
+    native_export_prefix: String,
+    source: ManagedArtifactManifestComponentSource,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedArtifactManifestComponentSource {
+    common: ManifestNullable<String>,
+    browser: ManifestNullable<String>,
+    node: ManifestNullable<String>,
+    electron: ManifestNullable<String>,
+    harmony: ManifestNullable<String>,
     public_types: ManifestNullable<String>,
 }
 
@@ -662,7 +1162,7 @@ struct ManagedArtifactManifestHostCrates {
     ohos: ManifestNullable<String>,
 }
 
-const ARTIFACT_MANIFEST_SCHEMA_VERSION: u64 = 3;
+const ARTIFACT_MANIFEST_SCHEMA_VERSION: u64 = 4;
 
 fn artifact_manifest_version_diagnostic(value: &serde_json::Value) -> String {
     match value.get("artifactManifestSchemaVersion") {
@@ -930,9 +1430,58 @@ fn validate_manifest_harmony_artifact_shape(value: &ManagedArtifactManifestHarmo
     validate_manifest_harmony_metadata(&value.metadata, &value.kind, value.integrated)
 }
 
+fn manifest_component_identities(
+    components: &[ManagedArtifactManifestComponent],
+) -> Result<Vec<ManagedComponentIdentity>> {
+    if components.is_empty() {
+        bail!("managed artifact manifest has no components");
+    }
+    let mut identities = Vec::with_capacity(components.len());
+    for component in components {
+        let identity = ManagedComponentIdentity::new(&component.component, &component.namespace)?;
+        if component.native_export_prefix != identity.native_export_prefix {
+            bail!(
+                "managed artifact manifest component `{}` namespace `{}` has an invalid native export prefix `{}`",
+                component.component,
+                component.namespace,
+                component.native_export_prefix
+            );
+        }
+        identities.push(identity);
+    }
+    let canonical = canonical_managed_component_identities(identities.clone())?;
+    if identities != canonical {
+        bail!("managed artifact manifest components are not in canonical order");
+    }
+    Ok(identities)
+}
+
+fn validate_exact_nullable_route(
+    value: &ManifestNullable<String>,
+    expected_present: bool,
+    expected_path: &str,
+    label: &str,
+) -> Result<()> {
+    validate_manifest_nullable_path(value, label)?;
+    match (value, expected_present) {
+        (ManifestNullable::Value(actual), true) if actual == expected_path => Ok(()),
+        (ManifestNullable::Null, false) => Ok(()),
+        (ManifestNullable::Value(actual), true) => bail!(
+            "managed artifact manifest `{label}` route mismatch: expected `{expected_path}`, got `{actual}`"
+        ),
+        (ManifestNullable::Value(actual), false) => bail!(
+            "managed artifact manifest `{label}` must be null, got `{actual}`"
+        ),
+        (ManifestNullable::Null, true) => bail!(
+            "managed artifact manifest `{label}` is missing its required route `{expected_path}`"
+        ),
+    }
+}
+
 fn validate_exact_managed_artifact_manifest(
     manifest: &ManagedArtifactManifest,
-    expected_namespace: &str,
+    expected_components: Option<&[ManagedComponentIdentity]>,
+    host_identity: Option<&ManagedHostIdentity>,
 ) -> Result<()> {
     if manifest.artifact_manifest_schema_version != ARTIFACT_MANIFEST_SCHEMA_VERSION {
         bail!(
@@ -944,22 +1493,40 @@ fn validate_exact_managed_artifact_manifest(
     if manifest.generator != "uniffi-bindgen-javascript" {
         bail!("managed artifact manifest has an unexpected generator");
     }
-    if manifest.namespace != expected_namespace {
-        bail!(
-            "managed artifact manifest namespace mismatch: expected `{expected_namespace}`, got `{}`",
-            manifest.namespace
-        );
+    let component_identities = manifest_component_identities(&manifest.components)?;
+    if let Some(expected_components) = expected_components {
+        if component_identities != expected_components {
+            bail!(
+                "managed artifact manifest component set mismatch: expected {expected_components:?}, got {component_identities:?}"
+            );
+        }
+    }
+    if !manifest
+        .host_composite_identity
+        .chars()
+        .all(|ch| ch.is_ascii_hexdigit())
+        || manifest.host_composite_identity.len() != 64
+    {
+        bail!("managed artifact manifest has an invalid host composite identity");
+    }
+    if let Some(host_identity) = host_identity {
+        let expected = host_identity.composite_identity(&component_identities)?;
+        if manifest.host_composite_identity != expected {
+            bail!(
+                "managed artifact manifest host composite identity mismatch: expected `{expected}`, got `{}`",
+                manifest.host_composite_identity
+            );
+        }
     }
     validate_manifest_relative_path(&manifest.source.root, "source.root")?;
     for (label, value) in [
-        ("source.common", &manifest.source.common),
+        ("source.shared", &manifest.source.shared),
         ("source.browser", &manifest.source.browser),
         ("source.node", &manifest.source.node),
         ("source.electron", &manifest.source.electron),
         ("source.harmony", &manifest.source.harmony),
         ("source.swift", &manifest.source.swift),
         ("source.kotlin", &manifest.source.kotlin),
-        ("source.publicTypes", &manifest.source.public_types),
         ("entrypoints.web", &manifest.entrypoints.web),
         (
             "entrypoints.miniProgram",
@@ -1088,38 +1655,88 @@ fn validate_exact_managed_artifact_manifest(
         }
         Ok(())
     };
-    exact_presence(manifest.source.common.is_value(), has_js, "source.common")?;
-    exact_presence(
-        manifest.source.public_types.is_value(),
+    let has_browser = has("wasm") || has("mini-program");
+    validate_exact_nullable_route(
+        &manifest.source.shared,
         has_js,
-        "source.publicTypes",
+        &format!("{}/shared", manifest.source.root),
+        "source.shared",
     )?;
-    exact_presence(
-        manifest.source.browser.is_value(),
-        has("wasm") || has("mini-program"),
+    validate_exact_nullable_route(
+        &manifest.source.browser,
+        has_browser,
+        &format!("{}/browser", manifest.source.root),
         "source.browser",
     )?;
-    exact_presence(manifest.source.node.is_value(), has("node"), "source.node")?;
-    exact_presence(
-        manifest.source.electron.is_value(),
+    validate_exact_nullable_route(
+        &manifest.source.node,
+        has("node"),
+        &format!("{}/node", manifest.source.root),
+        "source.node",
+    )?;
+    validate_exact_nullable_route(
+        &manifest.source.electron,
         has("electron"),
+        &format!("{}/electron", manifest.source.root),
         "source.electron",
     )?;
-    exact_presence(
-        manifest.source.harmony.is_value(),
+    validate_exact_nullable_route(
+        &manifest.source.harmony,
         has("harmony"),
+        &format!("{}/harmony", manifest.source.root),
         "source.harmony",
     )?;
-    exact_presence(
-        manifest.source.swift.is_value(),
+    validate_exact_nullable_route(
+        &manifest.source.swift,
         has("apple"),
+        &format!("{}/swift", manifest.source.root),
         "source.swift",
     )?;
-    exact_presence(
-        manifest.source.kotlin.is_value(),
+    validate_exact_nullable_route(
+        &manifest.source.kotlin,
         has("android"),
+        &format!("{}/kotlin", manifest.source.root),
         "source.kotlin",
     )?;
+    for (component, identity) in manifest.components.iter().zip(&component_identities) {
+        let component_root = format!("{}/components/{}", manifest.source.root, identity.namespace);
+        validate_exact_nullable_route(
+            &component.source.common,
+            has_js,
+            &format!("{component_root}/common"),
+            &format!("components.{}.source.common", identity.namespace),
+        )?;
+        validate_exact_nullable_route(
+            &component.source.public_types,
+            has_js,
+            &format!("{component_root}/common/public-types.ts"),
+            &format!("components.{}.source.publicTypes", identity.namespace),
+        )?;
+        validate_exact_nullable_route(
+            &component.source.browser,
+            has_browser,
+            &format!("{component_root}/browser"),
+            &format!("components.{}.source.browser", identity.namespace),
+        )?;
+        validate_exact_nullable_route(
+            &component.source.node,
+            has("node"),
+            &format!("{component_root}/node"),
+            &format!("components.{}.source.node", identity.namespace),
+        )?;
+        validate_exact_nullable_route(
+            &component.source.electron,
+            has("electron"),
+            &format!("{component_root}/electron"),
+            &format!("components.{}.source.electron", identity.namespace),
+        )?;
+        validate_exact_nullable_route(
+            &component.source.harmony,
+            has("harmony"),
+            &format!("{component_root}/harmony"),
+            &format!("components.{}.source.harmony", identity.namespace),
+        )?;
+    }
     exact_presence(
         manifest.entrypoints.web.is_value(),
         has("wasm"),
@@ -1198,9 +1815,29 @@ fn validate_exact_managed_artifact_manifest(
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_exact_managed_artifact_manifest(
     bytes: &[u8],
-    expected_namespace: &str,
+    expected_components: Option<&[ManagedComponentIdentity]>,
+    host_identity: Option<&ManagedHostIdentity>,
+    label: &str,
+) -> Result<(ManagedArtifactManifest, serde_json::Value)> {
+    parse_exact_managed_artifact_manifest_with_routes(
+        bytes,
+        expected_components,
+        host_identity,
+        None,
+        false,
+        label,
+    )
+}
+
+fn parse_exact_managed_artifact_manifest_with_routes(
+    bytes: &[u8],
+    expected_components: Option<&[ManagedComponentIdentity]>,
+    host_identity: Option<&ManagedHostIdentity>,
+    route_plan: Option<&ManagedArtifactRoutePlan>,
+    strict_current_targets: bool,
     label: &str,
 ) -> Result<(ManagedArtifactManifest, serde_json::Value)> {
     let raw: serde_json::Value =
@@ -1218,25 +1855,63 @@ fn parse_exact_managed_artifact_manifest(
     }
     let typed: ManagedArtifactManifest =
         serde_json::from_slice(bytes).with_context(|| format!("parsing exact {label}"))?;
-    validate_exact_managed_artifact_manifest(&typed, expected_namespace)?;
+    validate_exact_managed_artifact_manifest(&typed, expected_components, host_identity)?;
+    if let Some(route_plan) = route_plan {
+        route_plan.validate_manifest_routes(&raw, strict_current_targets)?;
+    }
     Ok((typed, raw))
 }
 
-fn validate_existing_managed_manifest(layout: &ManagedLayout, namespace: &str) -> Result<()> {
+fn read_existing_managed_manifest_components(
+    layout: &ManagedLayout,
+    host_identity: &ManagedHostIdentity,
+) -> Result<Option<Vec<ManagedComponentIdentity>>> {
     if !path_entry_exists(&layout.package_dir)? {
-        return Ok(());
+        return Ok(None);
     }
     let bytes = super::artifact_transaction::read_verified_regular_file_bounded(
         &layout.manifest_path,
         16 * 1024 * 1024,
         "existing managed artifact manifest",
     )?;
-    let (_, raw) = parse_exact_managed_artifact_manifest(
+    let (typed, raw) = parse_exact_managed_artifact_manifest_with_routes(
         &bytes,
-        namespace,
+        // Read the actual identities first.  The authoritative/current plan
+        // comparison belongs to `preflight_existing_package`, after parsing,
+        // so incremental direct fixtures retain their established diagnostic.
+        None,
+        Some(host_identity),
+        layout.expected_routes.as_ref(),
+        false,
         "existing managed artifact manifest",
     )?;
+    if let Some(declared_plan) = layout.manifest_declared_route_plan(&raw)? {
+        // The current invocation plan protects requested targets; the
+        // immutable declared-target union protects every target that will be
+        // retained from the existing generation.  Never let a same-typed
+        // historical route become trusted merely because it was not selected
+        // in this invocation.
+        declared_plan.validate_manifest_routes(&raw, true)?;
+    }
     validate_managed_manifest_paths(layout, &raw)?;
+    Ok(Some(manifest_component_identities(&typed.components)?))
+}
+
+#[cfg(test)]
+fn validate_existing_managed_manifest(
+    layout: &ManagedLayout,
+    expected_components: &[ManagedComponentIdentity],
+    host_identity: &ManagedHostIdentity,
+) -> Result<()> {
+    let Some(actual_components) = read_existing_managed_manifest_components(layout, host_identity)?
+    else {
+        return Ok(());
+    };
+    if actual_components != expected_components {
+        bail!(
+            "managed artifact manifest component set mismatch: expected {expected_components:?}, got {actual_components:?}"
+        );
+    }
     Ok(())
 }
 
@@ -1374,22 +2049,385 @@ impl InvocationMirror {
 }
 
 impl ManagedLayout {
-    fn exact_namespace(&self) -> Result<&str> {
-        self.namespace
+    fn exact_components(&self) -> Result<&[ManagedComponentIdentity]> {
+        self.components
             .as_deref()
-            .context("managed artifact layout lacks its exact namespace")
+            .context("managed artifact layout lacks planned component identities")
     }
 
-    /// Resolve the one selected generated component from the namespaced source
-    /// tree. Managed JS builds produce a host-backed single component in 05B;
-    /// accepting zero/multiple/invalid directory entries here would make a
-    /// manifest silently point at the wrong public API.
-    fn generated_component_namespace(&self) -> Result<Option<String>> {
+    /// Build the sole canonical route plan used by both manifest rendering
+    /// and exact manifest validation.  It deliberately derives every path
+    /// from managed layout state and invocation arguments, never from a
+    /// manifest being checked or from a same-typed file found on disk.
+    fn managed_artifact_route_plan(
+        &self,
+        targets: &ExpandedTargets,
+        inputs: &ManagedArtifactRouteInputs,
+        artifact_read_root: Option<&Utf8Path>,
+    ) -> Result<ManagedArtifactRoutePlan> {
+        let components = self.exact_components()?;
+        let host_identity = self
+            .host_identity
+            .as_ref()
+            .context("managed artifact layout lacks its host identity")?;
+        let wasm_stem = &host_identity.lib_target;
+        let harmony_package = inputs
+            .ohos_package_name
+            .clone()
+            .unwrap_or_else(|| format!("{}-ohos", self.root_source_package));
+        let harmony_archive = if targets.harmony
+            && !inputs.ohos_no_har
+            && inputs.ohos_package_kind == super::ohos::PackageKind::Har
+        {
+            Some(harmony_archive_file_name(&harmony_package)?)
+        } else {
+            None
+        };
+        let harmony_hsp = targets.harmony
+            && !inputs.ohos_no_har
+            && inputs.ohos_package_kind == super::ohos::PackageKind::Hsp;
+        let harmony_stem = if harmony_hsp {
+            harmony_archive_stem(&harmony_package)?
+        } else {
+            String::new()
+        };
+        let has_js = self.has_js(targets);
+        let has_browser = targets.wasm || targets.mini_program;
+        let manifest_components = components
+            .iter()
+            .map(|component| -> Result<serde_json::Value> {
+                let component_root = self.component_source_root(component);
+                Ok(serde_json::json!({
+                    "component": component.component,
+                    "namespace": component.namespace,
+                    "nativeExportPrefix": component.native_export_prefix,
+                    "source": {
+                        "common": if has_js { serde_json::Value::String(self.rel(&component_root.join("common"))?) } else { serde_json::Value::Null },
+                        "browser": if has_browser { serde_json::Value::String(self.rel(&component_root.join("browser"))?) } else { serde_json::Value::Null },
+                        "node": if targets.node { serde_json::Value::String(self.rel(&component_root.join("node"))?) } else { serde_json::Value::Null },
+                        "electron": if targets.electron { serde_json::Value::String(self.rel(&component_root.join("electron"))?) } else { serde_json::Value::Null },
+                        "harmony": if targets.harmony { serde_json::Value::String(self.rel(&component_root.join("harmony"))?) } else { serde_json::Value::Null },
+                        "publicTypes": if has_js { serde_json::Value::String(self.rel(&component_root.join("common/public-types.ts"))?) } else { serde_json::Value::Null },
+                    },
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let source = serde_json::json!({
+            "root": self.rel(&self.source_root)?,
+            "shared": if has_js { serde_json::Value::String(self.rel(&self.source_root.join("shared"))?) } else { serde_json::Value::Null },
+            "browser": if has_browser { serde_json::Value::String(self.rel(&self.source_root.join("browser"))?) } else { serde_json::Value::Null },
+            "node": if targets.node { serde_json::Value::String(self.rel(&self.source_root.join("node"))?) } else { serde_json::Value::Null },
+            "electron": if targets.electron { serde_json::Value::String(self.rel(&self.source_root.join("electron"))?) } else { serde_json::Value::Null },
+            "harmony": if targets.harmony { serde_json::Value::String(self.rel(&self.source_root.join("harmony"))?) } else { serde_json::Value::Null },
+            "swift": if targets.apple { serde_json::Value::String(self.rel(&self.source_root.join("swift"))?) } else { serde_json::Value::Null },
+            "kotlin": if targets.android { serde_json::Value::String(self.rel(&self.source_root.join("kotlin"))?) } else { serde_json::Value::Null },
+        });
+        let entrypoints = serde_json::json!({
+            "web": if targets.wasm { serde_json::Value::String("src/index.web.ts".to_string()) } else { serde_json::Value::Null },
+            "miniProgram": if targets.mini_program { serde_json::Value::String("src/index.mini-program.ts".to_string()) } else { serde_json::Value::Null },
+            "node": if targets.node { serde_json::Value::String("src/index.node.ts".to_string()) } else { serde_json::Value::Null },
+            "electron": if targets.electron { serde_json::Value::String("src/index.electron.ts".to_string()) } else { serde_json::Value::Null },
+            "harmony": if targets.harmony {
+                serde_json::Value::String(self.rel(&self.artifact_root.join(if inputs.ohos_no_har { "harmony/dist/Index.ets" } else { "harmony/package/Index.ets" }))?)
+            } else { serde_json::Value::Null },
+        });
+        let artifacts = serde_json::json!({
+            "wasm": if targets.wasm {
+                serde_json::json!({
+                    "glue": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}.js")))?,
+                    "wasm": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}_bg.wasm")))?,
+                    "dts": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}.d.ts")))?,
+                })
+            } else { serde_json::Value::Null },
+            "miniProgram": if targets.mini_program {
+                serde_json::json!({
+                    "glue": self.rel(&self.artifact_root.join(format!("mini-program/{wasm_stem}.js")))?,
+                    "wasm": self.rel(&self.artifact_root.join(format!("mini-program/{wasm_stem}_bg.wasm")))?,
+                    "defaultWasmPath": mini_program_default_wasm_path(wasm_stem),
+                })
+            } else { serde_json::Value::Null },
+            "node": if targets.node {
+                serde_json::json!({
+                    "addon": self.addon_rel_from(artifact_read_root, "node", wasm_stem)?,
+                    "env": "UNIFFI_NAPI_PATH",
+                })
+            } else { serde_json::Value::Null },
+            "electron": if targets.electron {
+                serde_json::json!({
+                    "addon": self.addon_rel_from(artifact_read_root, "node", wasm_stem)?,
+                    "env": "UNIFFI_NAPI_PATH",
+                })
+            } else { serde_json::Value::Null },
+            "harmony": if targets.harmony {
+                serde_json::json!({
+                    "kind": if inputs.ohos_no_har { "dist" } else { inputs.ohos_package_kind.as_str() },
+                    "integrated": harmony_hsp && inputs.ohos_integrated_hsp,
+                    "har": harmony_archive.as_ref().map(|archive| self.rel(&self.artifact_root.join("harmony").join(archive))).transpose()?,
+                    "runtimeHsp": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony").join(format!("{harmony_stem}.hsp")))?) } else { serde_json::Value::Null },
+                    "interfaceHar": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony").join(format!("{harmony_stem}-interface.har")))?) } else { serde_json::Value::Null },
+                    "tgz": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony").join(format!("{harmony_stem}.tgz")))?) } else { serde_json::Value::Null },
+                    "dist": self.rel(&self.artifact_root.join("harmony/dist"))?,
+                    "facade": self.rel(&self.artifact_root.join("harmony/dist/native-facade.ets"))?,
+                    "facadeContract": self.rel(&self.artifact_root.join("harmony/dist/harmony-facade-contract.json"))?,
+                    "packageFacadeContract": if inputs.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/harmony-facade-contract.json"))?) },
+                    "types": self.rel(&self.artifact_root.join("harmony/dist/native-facade.d.ts"))?,
+                    "package": if inputs.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package"))?) },
+                    "moduleProject": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/module-project"))?) } else { serde_json::Value::Null },
+                    "moduleSource": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/module-project/library"))?) } else { serde_json::Value::Null },
+                    "usage": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony").join(format!("{harmony_stem}-HSP_USAGE.md")))?) } else { serde_json::Value::Null },
+                    "packageMetadata": if inputs.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/oh-package.json5"))?) },
+                    "moduleMetadata": if inputs.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/src/main/module.json5"))?) },
+                    "buildProfile": if inputs.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/build-profile.json5"))?) },
+                    "metadata": serde_json::Value::Null,
+                })
+            } else { serde_json::Value::Null },
+            "apple": if targets.apple {
+                serde_json::json!({
+                    "xcframework": self.rel(&self.artifact_root.join("apple").join(format!("{}.xcframework", self.root_lib_target)))?,
+                    "package": self.rel(&self.artifact_root.join("apple"))?,
+                    "product": format!("{}Apple", upper_camel_case_identifier(&self.root_source_package)),
+                })
+            } else { serde_json::Value::Null },
+            "android": if targets.android {
+                serde_json::json!({
+                    "jniLibs": self.rel(&self.artifact_root.join("android/jniLibs"))?,
+                    "aar": inputs.android_aar_out.as_ref().map(|path| self.rel(path)).transpose()?,
+                })
+            } else { serde_json::Value::Null },
+        });
+        let host_crates = serde_json::json!({
+            "wasm": if targets.wasm || targets.mini_program { serde_json::Value::String(self.rel(&self.host_crates_root.join("wasm/Cargo.toml"))?) } else { serde_json::Value::Null },
+            "napi": if targets.node || targets.electron { serde_json::Value::String(self.rel(&self.host_crates_root.join("napi/Cargo.toml"))?) } else { serde_json::Value::Null },
+            "ohos": if targets.harmony { serde_json::Value::String(self.rel(&self.host_crates_root.join("ohos/Cargo.toml"))?) } else { serde_json::Value::Null },
+        });
+        Ok(ManagedArtifactRoutePlan {
+            targets: targets.clone(),
+            components: serde_json::Value::Array(manifest_components),
+            source,
+            entrypoints,
+            artifacts,
+            host_crates,
+        })
+    }
+
+    fn read_historical_harmony_route_metadata(
+        &self,
+        path: &Utf8Path,
+        label: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("reading {label} {path}")),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("historical Harmony {label} must be a regular file: {path}");
+        }
+        Ok(Some(read_generated_json5(path)?))
+    }
+
+    /// Recover the dynamic Harmony route inputs from canonical producer-owned
+    /// package metadata, rather than from the manifest being validated or the
+    /// current invocation's unrelated defaults. This is only used for a
+    /// retained Harmony target that was not requested in the current run.
+    fn historical_harmony_route_inputs(
+        &self,
+        base: &ManagedArtifactRouteInputs,
+    ) -> Result<ManagedArtifactRouteInputs> {
+        let package_root = self.artifact_root.join("harmony/package");
+        let package_path = package_root.join("oh-package.json5");
+        let module_path = package_root.join("src/main/module.json5");
+        let build_profile_path = package_root.join("build-profile.json5");
+        let Some(package) =
+            self.read_historical_harmony_route_metadata(&package_path, "package metadata")?
+        else {
+            for (label, path) in [
+                ("module metadata", &module_path),
+                ("build profile", &build_profile_path),
+            ] {
+                if path_entry_exists(path)? {
+                    bail!(
+                        "historical Harmony route evidence is incomplete: canonical {label} exists without {package_path}"
+                    );
+                }
+            }
+            let mut inputs = base.clone();
+            inputs.ohos_no_har = true;
+            inputs.ohos_package_kind = super::ohos::PackageKind::Har;
+            inputs.ohos_integrated_hsp = false;
+            inputs.ohos_package_name = None;
+            return Ok(inputs);
+        };
+        let module = self
+            .read_historical_harmony_route_metadata(&module_path, "module metadata")?
+            .context("historical Harmony route evidence lacks canonical module metadata")?;
+        let build_profile = self
+            .read_historical_harmony_route_metadata(&build_profile_path, "build profile")?
+            .context("historical Harmony route evidence lacks canonical build profile")?;
+        let package_name = package
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .context("historical Harmony package metadata lacks string `name`")?
+            .to_string();
+        super::ohos::validate_oh_package_name(&package_name)?;
+        let module = module
+            .get("module")
+            .and_then(serde_json::Value::as_object)
+            .context("historical Harmony module metadata lacks object `module`")?;
+        let package_kind = match module.get("type").and_then(serde_json::Value::as_str) {
+            Some("har") => super::ohos::PackageKind::Har,
+            Some("shared") => super::ohos::PackageKind::Hsp,
+            Some(kind) => bail!("historical Harmony module metadata has unsupported type `{kind}`"),
+            None => bail!("historical Harmony module metadata lacks string `module.type`"),
+        };
+        match package_kind {
+            super::ohos::PackageKind::Har => {
+                if package.get("packageType").is_some() {
+                    bail!(
+                        "historical Harmony HAR metadata must not declare `packageType`; refusing to infer routes"
+                    );
+                }
+            }
+            super::ohos::PackageKind::Hsp => {
+                if package
+                    .get("packageType")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("InterfaceHar")
+                {
+                    bail!(
+                        "historical Harmony HSP metadata must declare packageType `InterfaceHar`; refusing to infer routes"
+                    );
+                }
+            }
+        }
+        let integrated_hsp = package_kind == super::ohos::PackageKind::Hsp
+            && build_profile
+                .pointer("/buildOption/arkOptions/integratedHsp")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        let mut inputs = base.clone();
+        inputs.ohos_no_har = false;
+        inputs.ohos_package_kind = package_kind;
+        inputs.ohos_integrated_hsp = integrated_hsp;
+        inputs.ohos_package_name = Some(package_name);
+        Ok(inputs)
+    }
+
+    /// Reconstruct the declared target union from immutable layout state,
+    /// captured inputs, and (only for an unrequested historical Harmony
+    /// target) canonical producer-owned package metadata.  The manifest may
+    /// select which dynamic evidence is needed, but never supplies a route
+    /// value used by the plan.
+    fn manifest_declared_route_inputs(
+        &self,
+        manifest: &serde_json::Value,
+        targets: &ExpandedTargets,
+    ) -> Result<ManagedArtifactRouteInputs> {
+        let base = self.route_inputs.as_ref().context(
+            "managed artifact route inputs are unavailable for declared-target validation; refusing to adopt historical routes",
+        )?;
+        let current = self.expected_routes.as_ref().map(|plan| &plan.targets);
+        let current_harmony = current.is_some_and(|targets| targets.harmony);
+        let current_android = current.is_some_and(|targets| targets.android);
+        let mut inputs = base.clone();
+        if targets.harmony && !current_harmony {
+            inputs = self.historical_harmony_route_inputs(&inputs)?;
+        }
+        if targets.android && !current_android {
+            let aar = manifest
+                .pointer("/artifacts/android/aar")
+                .context("historical Android manifest lacks artifacts.android.aar")?;
+            if aar.is_null() {
+                inputs.android_aar_out = None;
+            } else if inputs.android_aar_out.is_none() {
+                bail!(
+                    "historical Android AAR route cannot be reconstructed; repeat --android-aar-out to retain this managed target"
+                );
+            }
+        }
+        Ok(inputs)
+    }
+
+    /// Reconstruct a historical route plan from immutable layout state and
+    /// captured producer inputs. Dynamic retained targets either use
+    /// independent canonical evidence or fail closed; they never inherit the
+    /// current invocation's default Harmony shape.
+    fn manifest_declared_route_plan(
+        &self,
+        manifest: &serde_json::Value,
+    ) -> Result<Option<ManagedArtifactRoutePlan>> {
+        if self.route_inputs.is_none() {
+            if self.expected_routes.is_some() {
+                bail!(
+                    "managed artifact route inputs are unavailable for declared-target validation; refusing to adopt historical routes"
+                );
+            }
+            return Ok(None);
+        }
+        let targets = expanded_targets_from_managed_manifest(manifest)?;
+        let inputs = self.manifest_declared_route_inputs(manifest, &targets)?;
+        Ok(Some(
+            self.managed_artifact_route_plan(&targets, &inputs, None)?,
+        ))
+    }
+
+    /// Promote the current source/library plan before any mutable managed
+    /// state is created. This selection is authoritative and therefore makes
+    /// an existing v4 manifest an exact compatibility check rather than an
+    /// adoptable source of truth.
+    fn apply_authoritative_input_components(
+        &mut self,
+        args: &BuildArgs,
+        targets: &ExpandedTargets,
+    ) -> Result<()> {
+        let components = managed_authoritative_input_components(args, &self.root_source_package)?;
+        self.components = Some(components);
+        self.components_authoritative = true;
+        let inputs = ManagedArtifactRouteInputs::from(args);
+        self.expected_routes = Some(self.managed_artifact_route_plan(targets, &inputs, None)?);
+        self.route_inputs = Some(inputs);
+        Ok(())
+    }
+
+    /// Direct test fixtures may still ask to promote an exact existing v4
+    /// component set after owner validation. Production `build` has already
+    /// installed an authoritative current plan, so it only revalidates here.
+    fn adopt_owner_verified_existing_components(&mut self) -> Result<()> {
+        let Some(host_identity) = self.host_identity.as_ref() else {
+            return Ok(());
+        };
+        let Some(existing_components) =
+            read_existing_managed_manifest_components(self, host_identity)?
+        else {
+            return Ok(());
+        };
+        let generated_components = self.generated_component_identities()?;
+        if self.components_authoritative {
+            self.preflight_existing_package()?;
+            return Ok(());
+        }
+        if let Some(generated) = generated_components {
+            if generated != existing_components {
+                bail!(
+                    "managed artifact component set mismatch between existing manifest and generated bridges: manifest {existing_components:?}, bridges {generated:?}"
+                );
+            }
+        }
+        self.components = Some(existing_components);
+        self.components_authoritative = true;
+        self.preflight_existing_package()
+    }
+
+    /// Read the generated bridges as an independent check on the selected
+    /// component set.  The namespace directory alone is not an identity: the
+    /// bridge filename carries the Cargo component name, from which the
+    /// authoritative native export prefix is re-derived.
+    fn generated_component_identities(&self) -> Result<Option<Vec<ManagedComponentIdentity>>> {
         let components_dir = self.source_root.join("components");
         if !components_dir.exists() {
             return Ok(None);
         }
-        let mut namespaces = Vec::new();
+        let mut identities = Vec::new();
         for entry in std::fs::read_dir(&components_dir)
             .with_context(|| format!("reading generated component root {components_dir}"))?
         {
@@ -1400,37 +2438,101 @@ impl ManagedLayout {
                     path.display()
                 )
             })?;
-            if !entry
-                .file_type()
-                .with_context(|| format!("reading file type for generated component path {path}"))?
-                .is_dir()
-            {
-                continue;
+            let file_type = entry.file_type().with_context(|| {
+                format!("reading file type for generated component path {path}")
+            })?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                bail!("generated managed component entry must be a real directory: {path}");
             }
             let namespace = path
                 .file_name()
                 .with_context(|| format!("generated component directory has no name: {path}"))?
                 .to_string();
-            namespaces.push(namespace);
+            let mut bridges = BTreeSet::new();
+            for flavor in ["browser", "node", "electron", "harmony"] {
+                let flavor_dir = path.join(flavor);
+                if !flavor_dir.exists() {
+                    continue;
+                }
+                let flavor_metadata =
+                    std::fs::symlink_metadata(&flavor_dir).with_context(|| {
+                        format!("reading generated component flavor directory {flavor_dir}")
+                    })?;
+                if flavor_metadata.file_type().is_symlink() || !flavor_metadata.is_dir() {
+                    bail!(
+                        "generated managed component flavor must be a real directory: {flavor_dir}"
+                    );
+                }
+                let mut flavor_bridges = Vec::new();
+                for file in std::fs::read_dir(&flavor_dir)
+                    .with_context(|| format!("reading generated component flavor {flavor_dir}"))?
+                {
+                    let file = file?;
+                    let file_path = Utf8PathBuf::from_path_buf(file.path()).map_err(|path| {
+                        anyhow::anyhow!(
+                            "generated managed bridge path is not UTF-8 below {flavor_dir}: {}",
+                            path.display()
+                        )
+                    })?;
+                    if file_path.extension() == Some("rs") {
+                        let file_type = file.file_type()?;
+                        if file_type.is_symlink() || !file_type.is_file() {
+                            bail!("generated managed bridge must be a regular file: {file_path}");
+                        }
+                        flavor_bridges.push(
+                            file_path
+                                .file_stem()
+                                .with_context(|| {
+                                    format!("generated managed bridge has no stem: {file_path}")
+                                })?
+                                .to_string(),
+                        );
+                    }
+                }
+                match flavor_bridges.as_slice() {
+                    [] => {}
+                    [bridge] => {
+                        bridges.insert(bridge.clone());
+                    }
+                    _ => bail!(
+                        "generated managed component namespace `{namespace}` flavor `{flavor}` has multiple Rust bridges: {flavor_bridges:?}"
+                    ),
+                }
+            }
+            let component = match bridges.into_iter().collect::<Vec<_>>().as_slice() {
+                [component] => component.clone(),
+                [] => bail!(
+                    "generated managed component namespace `{namespace}` has no Rust bridge in any selected flavor"
+                ),
+                bridges => bail!(
+                    "generated managed component namespace `{namespace}` has inconsistent Rust bridge identities: {bridges:?}"
+                ),
+            };
+            identities.push(ManagedComponentIdentity::new(component, namespace)?);
         }
-        namespaces.sort();
-        match namespaces.as_slice() {
-            [] => Ok(None),
-            [namespace] => Ok(Some(namespace.clone())),
-            _ => bail!(
-                "managed JavaScript source tree has multiple component namespaces below {components_dir}: {namespaces:?}; multi-component artifact composition is deferred to stage 05C"
-            ),
+        if identities.is_empty() {
+            return Ok(None);
         }
+        canonical_managed_component_identities(identities).map(Some)
     }
 
-    fn refresh_generated_component_namespace(&mut self) -> Result<()> {
-        let namespace = self.generated_component_namespace()?.with_context(|| {
+    fn refresh_generated_component_identities(&mut self) -> Result<()> {
+        let components = self.generated_component_identities()?.with_context(|| {
             format!(
-                "generated managed JavaScript source tree has no component namespace below {}",
+                "generated managed JavaScript source tree has no component identities below {}",
                 self.source_root.join("components")
             )
         })?;
-        self.namespace = Some(namespace);
+        if self.components_authoritative {
+            let planned = self.exact_components()?;
+            if planned != components {
+                bail!(
+                    "managed artifact component set mismatch between authoritative planned metadata and generated bridges: expected {planned:?}, got {components:?}"
+                );
+            }
+        }
+        self.components = Some(components);
+        self.components_authoritative = true;
         Ok(())
     }
 
@@ -1441,24 +2543,59 @@ impl ManagedLayout {
                     format!("managed layout path escaped package root: {path}")
                 })?))
         };
+        let route_inputs = self
+            .route_inputs
+            .as_ref()
+            .map(|inputs| -> Result<ManagedArtifactRouteInputs> {
+                let mut inputs = inputs.clone();
+                inputs.android_aar_out =
+                    inputs.android_aar_out.as_deref().map(rebase).transpose()?;
+                Ok(inputs)
+            })
+            .transpose()?;
         Ok(Self {
             package_dir: to.to_path_buf(),
+            root_source_package: self.root_source_package.clone(),
+            root_lib_target: self.root_lib_target.clone(),
             source_root: rebase(&self.source_root)?,
             artifact_root: rebase(&self.artifact_root)?,
             host_crates_root: rebase(&self.host_crates_root)?,
             manifest_path: rebase(&self.manifest_path)?,
-            namespace: self.namespace.clone(),
+            components: self.components.clone(),
+            components_authoritative: self.components_authoritative,
+            host_identity: self.host_identity.clone(),
+            expected_routes: self.expected_routes.clone(),
+            route_inputs,
         })
     }
 
     fn mirrored(&self, mirror: &InvocationMirror) -> Result<Self> {
+        let route_inputs = self
+            .route_inputs
+            .as_ref()
+            .map(|inputs| -> Result<ManagedArtifactRouteInputs> {
+                let mut inputs = inputs.clone();
+                inputs.android_aar_out = inputs
+                    .android_aar_out
+                    .as_deref()
+                    .map(|path| mirror.map(path))
+                    .transpose()?;
+                Ok(inputs)
+            })
+            .transpose()?;
         Ok(Self {
             package_dir: mirror.map(&self.package_dir)?,
+            root_source_package: self.root_source_package.clone(),
+            root_lib_target: self.root_lib_target.clone(),
             source_root: mirror.map(&self.source_root)?,
             artifact_root: mirror.map(&self.artifact_root)?,
             host_crates_root: mirror.map(&self.host_crates_root)?,
             manifest_path: mirror.map(&self.manifest_path)?,
-            namespace: self.namespace.clone(),
+            components: self.components.clone(),
+            components_authoritative: self.components_authoritative,
+            host_identity: self.host_identity.clone(),
+            expected_routes: self.expected_routes.clone(),
+            route_inputs,
         })
     }
 
@@ -1571,22 +2708,49 @@ impl ManagedLayout {
 
         Ok(Some(Self {
             package_dir,
+            root_source_package: meta.package_name.clone(),
+            root_lib_target: meta.lib_target_name.clone(),
             source_root,
             artifact_root,
             host_crates_root,
             manifest_path,
-            namespace: Some(meta.lib_target_name),
+            // This is only a seed for selecting `src:<root-package>` in the
+            // mandatory read-only planner above the transaction boundary.
+            components: Some(vec![ManagedComponentIdentity::new(
+                meta.lib_target_name.clone(),
+                meta.lib_target_name.clone(),
+            )?]),
+            components_authoritative: false,
+            host_identity: Some(ManagedHostIdentity::from_cargo_metadata(&meta)),
+            expected_routes: None,
+            route_inputs: None,
         }))
     }
 
+    #[cfg(test)]
     fn emit(
         &self,
         targets: &ExpandedTargets,
         meta: &CargoPackageMetadata,
         args: &BuildArgs,
     ) -> Result<()> {
+        self.emit_with_artifact_read_root(targets, meta, args, None)
+    }
+
+    /// Production publication has a completed invocation-private artifact
+    /// tree and must prove the composite addon came from its canonical
+    /// private route.  Direct manifest fixtures deliberately have no built
+    /// addon yet, so they retain the pure renderer entry point above.
+    fn emit_with_artifact_read_root(
+        &self,
+        targets: &ExpandedTargets,
+        meta: &CargoPackageMetadata,
+        args: &BuildArgs,
+        artifact_read_root: Option<&Utf8Path>,
+    ) -> Result<()> {
         self.emit_supporting_files(targets, meta, args)?;
-        let manifest = self.render_manifest(targets, meta, args)?;
+        let manifest =
+            self.render_manifest_with_read_roots(targets, meta, args, None, artifact_read_root)?;
         write_file_atomically(&self.manifest_path, manifest.as_bytes())?;
         Ok(())
     }
@@ -1671,11 +2835,10 @@ impl ManagedLayout {
         Ok(())
     }
 
-    fn component_source_root(&self) -> Result<Utf8PathBuf> {
-        Ok(self
-            .source_root
+    fn component_source_root(&self, component: &ManagedComponentIdentity) -> Utf8PathBuf {
+        self.source_root
             .join("components")
-            .join(self.exact_namespace()?))
+            .join(&component.namespace)
     }
 
     fn emit_gitignore(&self) -> Result<()> {
@@ -1751,6 +2914,7 @@ node_modules/\n\
         Ok(())
     }
 
+    #[cfg(test)]
     fn render_manifest(
         &self,
         targets: &ExpandedTargets,
@@ -1760,6 +2924,7 @@ node_modules/\n\
         self.render_manifest_with_harmony_root(targets, meta, args, None)
     }
 
+    #[cfg(test)]
     fn render_manifest_with_harmony_root(
         &self,
         targets: &ExpandedTargets,
@@ -1778,29 +2943,19 @@ node_modules/\n\
         harmony_source_root: Option<&Utf8Path>,
         artifact_read_root: Option<&Utf8Path>,
     ) -> Result<String> {
-        let namespace = self.exact_namespace()?;
-        let wasm_stem = format!("{}_wasm", rust_identifier(&meta.package_name));
-        let node_env = format!("UNIFFI_{}_NAPI_PATH", namespace.to_ascii_uppercase());
+        let route_inputs = ManagedArtifactRouteInputs::from(args);
+        let route_plan =
+            self.managed_artifact_route_plan(targets, &route_inputs, artifact_read_root)?;
+        let components = self.exact_components()?;
+        let host_identity = self
+            .host_identity
+            .as_ref()
+            .context("managed artifact layout lacks its host identity")?;
+        let host_composite_identity = host_identity.composite_identity(components)?;
         let harmony_package = args
             .ohos_package_name
             .clone()
             .unwrap_or_else(|| format!("{}-ohos", meta.package_name));
-        let harmony_archive = if targets.harmony
-            && !args.ohos_no_har
-            && args.ohos_package_kind == super::ohos::PackageKind::Har
-        {
-            Some(harmony_archive_file_name(&harmony_package)?)
-        } else {
-            None
-        };
-        let harmony_hsp = targets.harmony
-            && !args.ohos_no_har
-            && args.ohos_package_kind == super::ohos::PackageKind::Hsp;
-        let harmony_stem = if harmony_hsp {
-            harmony_archive_stem(&harmony_package)?
-        } else {
-            String::new()
-        };
         let default_harmony_source_root = self.artifact_root.join("harmony");
         let harmony_source_root = harmony_source_root.unwrap_or(&default_harmony_source_root);
         let harmony_metadata = if targets.harmony && !args.ohos_no_har {
@@ -1808,108 +2963,40 @@ node_modules/\n\
         } else {
             serde_json::Value::Null
         };
+        // Every route-bearing section is emitted directly from the exact
+        // producer plan shared with preflight and candidate validation. The
+        // staged Harmony metadata is the only dynamic, non-route payload.
+        let mut artifacts = route_plan.artifacts.clone();
+        if let Some(harmony) = artifacts
+            .get_mut("harmony")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            harmony.insert("metadata".to_string(), harmony_metadata);
+        }
         let manifest = serde_json::json!({
             "artifactManifestSchemaVersion": ARTIFACT_MANIFEST_SCHEMA_VERSION,
             "generator": "uniffi-bindgen-javascript",
-            "namespace": namespace,
+            "components": route_plan.components.clone(),
+            "hostCompositeIdentity": host_composite_identity,
             "targets": self.manifest_targets(targets),
-            "source": {
-                "root": self.rel(&self.source_root)?,
-                "common": if self.has_js(targets) { serde_json::Value::String(self.rel(&self.component_source_root()?.join("common"))?) } else { serde_json::Value::Null },
-                "browser": if targets.wasm || targets.mini_program { serde_json::Value::String(self.rel(&self.source_root.join("browser"))?) } else { serde_json::Value::Null },
-                "node": if targets.node { serde_json::Value::String(self.rel(&self.source_root.join("node"))?) } else { serde_json::Value::Null },
-                "electron": if targets.electron { serde_json::Value::String(self.rel(&self.source_root.join("electron"))?) } else { serde_json::Value::Null },
-                "harmony": if targets.harmony { serde_json::Value::String(self.rel(&self.source_root.join("harmony"))?) } else { serde_json::Value::Null },
-                "swift": if targets.apple { serde_json::Value::String(self.rel(&self.source_root.join("swift"))?) } else { serde_json::Value::Null },
-                "kotlin": if targets.android { serde_json::Value::String(self.rel(&self.source_root.join("kotlin"))?) } else { serde_json::Value::Null },
-                "publicTypes": if self.has_js(targets) { serde_json::Value::String(self.rel(&self.component_source_root()?.join("common/public-types.ts"))?) } else { serde_json::Value::Null },
-            },
-            "entrypoints": {
-                "web": if targets.wasm { serde_json::Value::String("src/index.web.ts".to_string()) } else { serde_json::Value::Null },
-                "miniProgram": if targets.mini_program { serde_json::Value::String("src/index.mini-program.ts".to_string()) } else { serde_json::Value::Null },
-                "node": if targets.node { serde_json::Value::String("src/index.node.ts".to_string()) } else { serde_json::Value::Null },
-                "electron": if targets.electron { serde_json::Value::String("src/index.electron.ts".to_string()) } else { serde_json::Value::Null },
-                "harmony": if targets.harmony {
-                    serde_json::Value::String(self.rel(&self.artifact_root.join(if args.ohos_no_har { "harmony/dist/Index.ets" } else { "harmony/package/Index.ets" }))?)
-                } else { serde_json::Value::Null },
-            },
-            "artifacts": {
-                "wasm": if targets.wasm {
-                    serde_json::json!({
-                        "glue": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}.js")))?,
-                        "wasm": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}_bg.wasm")))?,
-                        "dts": self.rel(&self.artifact_root.join(format!("browser/pkg/{wasm_stem}.d.ts")))?,
-                    })
-                } else { serde_json::Value::Null },
-                "miniProgram": if targets.mini_program {
-                    serde_json::json!({
-                        "glue": self.rel(&self.artifact_root.join(format!("mini-program/{wasm_stem}.js")))?,
-                        "wasm": self.rel(&self.artifact_root.join(format!("mini-program/{wasm_stem}_bg.wasm")))?,
-                        "defaultWasmPath": mini_program_default_wasm_path(&wasm_stem),
-                    })
-                } else { serde_json::Value::Null },
-                "node": if targets.node {
-                    serde_json::json!({
-                        "addon": self.addon_rel_from(artifact_read_root, "node", namespace)?,
-                        "env": node_env,
-                    })
-                } else { serde_json::Value::Null },
-                "electron": if targets.electron {
-                    serde_json::json!({
-                        "addon": self.addon_rel_from(artifact_read_root, "electron", namespace)?,
-                        "env": node_env,
-                    })
-                } else { serde_json::Value::Null },
-                "harmony": if targets.harmony {
-                    serde_json::json!({
-                        "kind": if args.ohos_no_har { "dist" } else { args.ohos_package_kind.as_str() },
-                        "integrated": harmony_hsp && args.ohos_integrated_hsp,
-                        "har": harmony_archive.as_ref().map(|archive| self.rel(&self.artifact_root.join("harmony").join(archive))).transpose()?,
-                        "runtimeHsp": if harmony_hsp { serde_json::Value::String(self.rel(args.ohos_runtime_hsp_out.as_ref().context("managed HSP runtime output was not derived")?)?) } else { serde_json::Value::Null },
-                        "interfaceHar": if harmony_hsp { serde_json::Value::String(self.rel(args.ohos_interface_har_out.as_ref().context("managed HSP Interface HAR output was not derived")?)?) } else { serde_json::Value::Null },
-                        "tgz": if harmony_hsp { serde_json::Value::String(self.rel(args.ohos_tgz_out.as_ref().context("managed HSP tgz output was not derived")?)?) } else { serde_json::Value::Null },
-                        "dist": self.rel(&self.artifact_root.join("harmony/dist"))?,
-                        "facade": self.rel(&self.artifact_root.join("harmony/dist/native-facade.ets"))?,
-                        "facadeContract": self.rel(&self.artifact_root.join("harmony/dist/harmony-facade-contract.json"))?,
-                        "packageFacadeContract": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/harmony-facade-contract.json"))?) },
-                        "types": self.rel(&self.artifact_root.join("harmony/dist/native-facade.d.ts"))?,
-                        "package": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package"))?) },
-                        "moduleProject": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/module-project"))?) } else { serde_json::Value::Null },
-                        "moduleSource": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/module-project/library"))?) } else { serde_json::Value::Null },
-                        "usage": if harmony_hsp { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony").join(format!("{harmony_stem}-HSP_USAGE.md")))?) } else { serde_json::Value::Null },
-                        "packageMetadata": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/oh-package.json5"))?) },
-                        "moduleMetadata": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/src/main/module.json5"))?) },
-                        "buildProfile": if args.ohos_no_har { serde_json::Value::Null } else { serde_json::Value::String(self.rel(&self.artifact_root.join("harmony/package/build-profile.json5"))?) },
-                        "metadata": harmony_metadata,
-                    })
-                } else { serde_json::Value::Null },
-                "apple": if targets.apple {
-                    serde_json::json!({
-                        "xcframework": self.rel(args.apple_xcframework_out.as_ref().expect("managed apple path derived"))?,
-                        "package": self.rel(&self.artifact_root.join("apple"))?,
-                        "product": apple_package_product_name(meta),
-                    })
-                } else { serde_json::Value::Null },
-                "android": if targets.android {
-                    serde_json::json!({
-                        "jniLibs": self.rel(args.android_jni_libs_out.as_ref().expect("managed android path derived"))?,
-                        "aar": args.android_aar_out.as_ref().map(|p| self.rel(p)).transpose()?,
-                    })
-                } else { serde_json::Value::Null },
-            },
-            "hostCrates": {
-                "wasm": if targets.wasm || targets.mini_program { serde_json::Value::String(self.rel(&self.host_crates_root.join("wasm/Cargo.toml"))?) } else { serde_json::Value::Null },
-                "napi": if targets.node || targets.electron { serde_json::Value::String(self.rel(&self.host_crates_root.join("napi/Cargo.toml"))?) } else { serde_json::Value::Null },
-                "ohos": if targets.harmony { serde_json::Value::String(self.rel(&self.host_crates_root.join("ohos/Cargo.toml"))?) } else { serde_json::Value::Null },
-            },
+            "source": route_plan.source.clone(),
+            "entrypoints": route_plan.entrypoints.clone(),
+            "artifacts": artifacts,
+            "hostCrates": route_plan.host_crates.clone(),
         });
         let manifest = self.merge_existing_manifest(manifest)?;
         let bytes = serde_json::to_vec(&manifest)?;
-        parse_exact_managed_artifact_manifest(
+        let (_, parsed_manifest) = parse_exact_managed_artifact_manifest_with_routes(
             &bytes,
-            self.exact_namespace()?,
+            Some(self.exact_components()?),
+            self.host_identity.as_ref(),
+            Some(&route_plan),
+            true,
             "managed artifact manifest candidate",
         )?;
+        if let Some(merged_plan) = self.manifest_declared_route_plan(&parsed_manifest)? {
+            merged_plan.validate_manifest_routes(&parsed_manifest, true)?;
+        }
         let text = serde_json::to_string_pretty(&manifest)?;
         Ok(format!("{text}\n"))
     }
@@ -2034,11 +3121,17 @@ node_modules/\n\
 
         let existing_text = std::fs::read_to_string(&self.manifest_path)
             .with_context(|| format!("reading managed artifact manifest {}", self.manifest_path))?;
-        let (_, existing) = parse_exact_managed_artifact_manifest(
+        let (_, existing) = parse_exact_managed_artifact_manifest_with_routes(
             existing_text.as_bytes(),
-            self.exact_namespace()?,
+            None,
+            None,
+            self.expected_routes.as_ref(),
+            false,
             "existing managed artifact manifest",
         )?;
+        if let Some(declared_plan) = self.manifest_declared_route_plan(&existing)? {
+            declared_plan.validate_manifest_routes(&existing, true)?;
+        }
 
         let current_targets = manifest
             .get("targets")
@@ -2052,6 +3145,7 @@ node_modules/\n\
         for key in ["source", "entrypoints", "artifacts", "hostCrates"] {
             merge_manifest_object_section(&mut manifest, &existing, key, &current_targets);
         }
+        merge_manifest_components(&mut manifest, &existing, &current_targets)?;
         Ok(manifest)
     }
 
@@ -2099,34 +3193,45 @@ node_modules/\n\
         &self,
         artifact_read_root: Option<&Utf8Path>,
         subdir: &str,
-        fallback_stem: &str,
+        composite_stem: &str,
     ) -> Result<String> {
         let public_dir = self.artifact_root.join(subdir);
-        let read_dir = artifact_read_root
-            .unwrap_or(&self.artifact_root)
-            .join(subdir);
-        if read_dir.exists() {
-            let mut nodes = Vec::new();
-            for entry in
-                std::fs::read_dir(&read_dir).with_context(|| format!("reading {read_dir}"))?
-            {
-                let entry = entry?;
-                let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|p| {
-                    anyhow::anyhow!("managed addon artifact path is not utf8: {}", p.display())
-                })?;
-                if path.extension() == Some("node") {
-                    nodes.push(path);
-                }
-            }
-            nodes.sort();
-            if let [path] = nodes.as_slice() {
-                let name = path
-                    .file_name()
-                    .context("managed addon candidate has no file name")?;
-                return self.rel(&public_dir.join(name));
+        let canonical = public_dir.join(format!("{composite_stem}.node"));
+        let Some(artifact_read_root) = artifact_read_root else {
+            return self.rel(&canonical);
+        };
+        let read_dir = artifact_read_root.join(subdir);
+        let expected_candidate = read_dir.join(format!("{composite_stem}.node"));
+        let metadata = std::fs::symlink_metadata(&expected_candidate).with_context(|| {
+            format!(
+                "managed composite addon candidate is missing at the canonical private route {expected_candidate}"
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "managed composite addon candidate must be a regular file at {expected_candidate}"
+            );
+        }
+        let mut nodes = Vec::new();
+        for entry in std::fs::read_dir(&read_dir).with_context(|| format!("reading {read_dir}"))? {
+            let entry = entry?;
+            let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+                anyhow::anyhow!(
+                    "managed addon artifact path is not utf8: {}",
+                    path.display()
+                )
+            })?;
+            if path.extension() == Some("node") {
+                nodes.push(path);
             }
         }
-        self.rel(&public_dir.join(format!("{fallback_stem}.node")))
+        nodes.sort();
+        if nodes != vec![expected_candidate.clone()] {
+            bail!(
+                "managed composite addon candidate set must contain exactly `{expected_candidate}`, got {nodes:?}"
+            );
+        }
+        self.rel(&canonical)
     }
 }
 
@@ -2300,6 +3405,68 @@ fn merge_manifest_object_section(
     }
 }
 
+fn merge_manifest_components(
+    manifest: &mut serde_json::Value,
+    existing: &serde_json::Value,
+    current_targets: &BTreeSet<String>,
+) -> Result<()> {
+    let current = manifest
+        .get_mut("components")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("managed manifest candidate lacks components array")?;
+    let previous = existing
+        .get("components")
+        .and_then(serde_json::Value::as_array)
+        .context("existing managed manifest lacks components array")?;
+    if current.len() != previous.len() {
+        bail!("managed artifact manifest component set changed during incremental merge");
+    }
+    let current_has_js = current_targets.iter().any(|target| {
+        matches!(
+            target.as_str(),
+            "wasm" | "mini-program" | "node" | "electron" | "harmony"
+        )
+    });
+    for (current_component, previous_component) in current.iter_mut().zip(previous) {
+        for field in ["component", "namespace", "nativeExportPrefix"] {
+            if current_component.get(field) != previous_component.get(field) {
+                bail!("managed artifact manifest component set changed during incremental merge");
+            }
+        }
+        let current_source = current_component
+            .get_mut("source")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("managed manifest candidate component lacks source object")?;
+        let previous_source = previous_component
+            .get("source")
+            .and_then(serde_json::Value::as_object)
+            .context("existing managed manifest component lacks source object")?;
+        for (field, previous_value) in previous_source {
+            let generated_this_run = match field.as_str() {
+                "common" | "publicTypes" => current_has_js,
+                "browser" => {
+                    current_targets.contains("wasm") || current_targets.contains("mini-program")
+                }
+                "node" => current_targets.contains("node"),
+                "electron" => current_targets.contains("electron"),
+                "harmony" => current_targets.contains("harmony"),
+                _ => {
+                    bail!("existing managed manifest component source has unknown route `{field}`")
+                }
+            };
+            if generated_this_run
+                || current_source
+                    .get(field)
+                    .is_some_and(|value| !value.is_null())
+            {
+                continue;
+            }
+            current_source.insert(field.clone(), previous_value.clone());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn run(args: ArtifactsArgs) -> Result<()> {
     match args.command {
         ArtifactsCommands::Build(args) => build(args),
@@ -2310,7 +3477,8 @@ fn ensure_explicit_generated_hsp_outputs(
     args: &mut BuildArgs,
 ) -> Result<super::artifact_transaction::HspOutputPaths> {
     let meta = cargo_package_metadata(&args.manifest_path)?;
-    let generated_host_package = format!("{}-ohos", meta.package_name);
+    let generated_host_package =
+        uniffi_bindgen_javascript::host_crates::composite_host_package_name(&meta.package_name);
     let host_root = resolve_cwd_path(&args.host_crates_dir())?;
     let dist = args
         .ohos_dist_dir
@@ -2746,7 +3914,8 @@ fn rebase_private_javascript_host_crates(
     )
     .context("rebasing invocation-private JavaScript host manifests to public paths")?;
     if targets.mini_program {
-        let wasm_stem = format!("{}_wasm", rust_identifier(&meta.package_name));
+        let wasm_stem =
+            uniffi_bindgen_javascript::host_crates::composite_host_lib_target(&meta.package_name);
         rebase_mini_program_auto_entrypoint(
             &private.out_dir()?,
             &canonicalize_invocation_output(&public.out_dir()?)?,
@@ -2821,7 +3990,9 @@ fn build_multi_target_hsp(
         }
         if targets.mini_program {
             let meta = cargo_package_metadata(&private_args.manifest_path)?;
-            let wasm_stem = format!("{}_wasm", rust_identifier(&meta.package_name));
+            let wasm_stem = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(
+                &meta.package_name,
+            );
             emit_mini_program_wasm_runtime(
                 &private_args.out_dir()?,
                 &private_args.wasm_bindgen_out_dir()?,
@@ -2969,11 +4140,17 @@ fn validate_managed_manifest_candidate(layout: &ManagedLayout, cargo_bin: &str) 
         16 * 1024 * 1024,
         "managed artifact manifest candidate",
     )?;
-    let (_, manifest) = parse_exact_managed_artifact_manifest(
+    let (_, manifest) = parse_exact_managed_artifact_manifest_with_routes(
         &bytes,
-        layout.exact_namespace()?,
+        Some(layout.exact_components()?),
+        layout.host_identity.as_ref(),
+        layout.expected_routes.as_ref(),
+        true,
         "managed artifact manifest candidate",
     )?;
+    if let Some(merged_plan) = layout.manifest_declared_route_plan(&manifest)? {
+        merged_plan.validate_manifest_routes(&manifest, true)?;
+    }
     let host_crates = validate_managed_manifest_paths(layout, &manifest)?;
     for manifest_path in host_crates.into_iter().flatten() {
         let output = Command::new(cargo_bin)
@@ -3041,7 +4218,7 @@ fn validate_managed_manifest_paths(
     };
     for pointer in [
         "/source/root",
-        "/source/common",
+        "/source/shared",
         "/source/browser",
         "/source/node",
         "/source/electron",
@@ -3058,8 +4235,17 @@ fn validate_managed_manifest_paths(
     ] {
         validate_path(pointer, true)?;
     }
+    let components = manifest
+        .get("components")
+        .and_then(serde_json::Value::as_array)
+        .context("managed manifest lacks components array while validating paths")?;
+    for (index, _) in components.iter().enumerate() {
+        for suffix in ["common", "browser", "node", "electron", "harmony"] {
+            validate_path(&format!("/components/{index}/source/{suffix}"), true)?;
+        }
+        validate_path(&format!("/components/{index}/source/publicTypes"), false)?;
+    }
     for pointer in [
-        "/source/publicTypes",
         "/entrypoints/web",
         "/entrypoints/miniProgram",
         "/entrypoints/node",
@@ -3113,7 +4299,8 @@ fn build_private_target_set(args: &BuildArgs, targets: &ExpandedTargets) -> Resu
     }
     if targets.mini_program {
         let meta = cargo_package_metadata(&args.manifest_path)?;
-        let wasm_stem = format!("{}_wasm", rust_identifier(&meta.package_name));
+        let wasm_stem =
+            uniffi_bindgen_javascript::host_crates::composite_host_lib_target(&meta.package_name);
         emit_mini_program_wasm_runtime(
             &args.out_dir()?,
             &args.wasm_bindgen_out_dir()?,
@@ -3140,8 +4327,13 @@ fn build_private_target_set(args: &BuildArgs, targets: &ExpandedTargets) -> Resu
 fn build_managed_package(
     public_args: BuildArgs,
     targets: ExpandedTargets,
-    layout: ManagedLayout,
+    mut layout: ManagedLayout,
 ) -> Result<()> {
+    // `build` installs the authoritative source/library plan before this
+    // function is reached. The owner check is still repeated under the output
+    // lock by `ManagedPackageTransaction::begin` before mutable state exists.
+    preflight_managed_package(&layout)?;
+    layout.adopt_owner_verified_existing_components()?;
     let mut transaction = ManagedPackageTransaction::begin(&layout)?;
     let mut private_layout = layout.rebased(&layout.package_dir, transaction.candidate_root())?;
     let prepared = (|| -> Result<ManagedPackageOwner> {
@@ -3150,17 +4342,27 @@ fn build_managed_package(
         build_private_target_set(&private_args, &targets)?;
         rebase_private_javascript_host_crates(&public_args, &private_args, &targets)?;
         if private_layout.has_js(&targets) {
-            private_layout.refresh_generated_component_namespace()?;
-        } else if let Some(namespace) = private_layout.generated_component_namespace()? {
-            // Incremental managed builds may add a non-JS target to an
-            // existing package. Preserve the already-published UniFFI
-            // namespace rather than reverting its manifest to the Cargo lib
-            // target name.
-            private_layout.namespace = Some(namespace);
+            private_layout.refresh_generated_component_identities()?;
+        } else if let Some(components) = private_layout.generated_component_identities()? {
+            if private_layout.components_authoritative
+                && private_layout.exact_components()? != components
+            {
+                bail!(
+                    "managed artifact component set mismatch between authoritative planned metadata and generated bridges: expected {:?}, got {components:?}",
+                    private_layout.exact_components()?
+                );
+            }
+            private_layout.components = Some(components);
+            private_layout.components_authoritative = true;
         }
         let meta = cargo_package_metadata(&public_args.manifest_path)?;
         private_layout
-            .emit(&targets, &meta, &private_args)
+            .emit_with_artifact_read_root(
+                &targets,
+                &meta,
+                &private_args,
+                Some(&private_layout.artifact_root),
+            )
             .context("emitting complete private managed package manifest")?;
         validate_managed_manifest_candidate(&private_layout, &public_args.cargo_bin)?;
         transaction.prepare_owner()
@@ -3189,6 +4391,11 @@ fn build(mut args: BuildArgs) -> Result<()> {
     } else {
         None
     };
+    if let Some(layout) = managed_layout.as_mut() {
+        layout
+            .apply_authoritative_input_components(&args, &targets)
+            .context("planning managed component identities from the current source/library")?;
+    }
     if targets.harmony {
         if let Some(layout) = managed_layout.as_ref() {
             preflight_managed_package(layout).context(
@@ -3220,6 +4427,11 @@ fn build(mut args: BuildArgs) -> Result<()> {
     }
     if managed_layout.is_none() {
         managed_layout = ManagedLayout::apply(&mut args, &targets)?;
+        if let Some(layout) = managed_layout.as_mut() {
+            layout
+                .apply_authoritative_input_components(&args, &targets)
+                .context("planning managed component identities from the current source/library")?;
+        }
     }
     if let Some(layout) = managed_layout {
         return build_managed_package(args, targets, layout);
@@ -3245,7 +4457,9 @@ fn build(mut args: BuildArgs) -> Result<()> {
         }
         if targets.mini_program {
             let meta = cargo_package_metadata(&args.manifest_path)?;
-            let wasm_stem = format!("{}_wasm", rust_identifier(&meta.package_name));
+            let wasm_stem = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(
+                &meta.package_name,
+            );
             emit_mini_program_wasm_runtime(
                 &args.out_dir()?,
                 &args.wasm_bindgen_out_dir()?,
@@ -4436,10 +5650,6 @@ fn host_cdylib_filename(lib_target_name: &str) -> String {
     } else {
         format!("lib{lib_target_name}.so")
     }
-}
-
-fn rust_identifier(package_name: &str) -> String {
-    package_name.replace('-', "_")
 }
 
 fn xcodebuild_create_xcframework_args(
