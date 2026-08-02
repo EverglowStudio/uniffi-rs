@@ -3974,7 +3974,10 @@ fn public_direct_and_managed_node_hsp_invocations_are_atomic() {
     let mut direct_success = hsp_direct_multi_target_command(&direct);
     let output = direct_success.output().unwrap();
     assert_success(output, &direct_success);
-    let direct_node = direct_public.join("artifacts/node/uniffi_ohos_public_core.node");
+    let direct_host_lib_target = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(
+        "uniffi-ohos-public-core",
+    );
+    let direct_node = direct_public.join(format!("artifacts/node/{direct_host_lib_target}.node"));
     let direct_tgz = direct_public.join("artifacts/ohos/uniffi-ohos-public-core.tgz");
     assert!(
         direct_node.is_file(),

@@ -6210,9 +6210,20 @@ fn two_component_prefixed_bundle_loads_and_namespaces_same_short_exports() {
         .iter()
         .find(|module| module.namespace == "beta")
         .unwrap();
-    for module in [alpha, beta] {
+    for (module, native_export_prefix) in [
+        (
+            alpha,
+            uniffi_bindgen::interface::native_export_prefix_for_component("a"),
+        ),
+        (
+            beta,
+            uniffi_bindgen::interface::native_export_prefix_for_component("a_b"),
+        ),
+    ] {
         assert!(
-            module.source.contains("export const ping ="),
+            module.source.contains(&format!(
+                "export const ping: () => Shared = {native_export_prefix}_ping;"
+            )),
             "{}",
             module.source
         );
@@ -6273,9 +6284,83 @@ fn required_bundle_semantic_preflight_rejects_generated_name_collision_without_c
     let output_before = regular_file_snapshot(&output);
 
     let mut bundle = test_host_facade_bundle();
-    bundle.type_sidecars[0].content.push_str(
-        "type_def:{\"kind\":\"interface\",\"name\":\"__uniffiFacadeContractDigest\",\"def\":\"value: number\",\"typeParameters\":[]}\n",
+    let component = &bundle.components[0];
+    let raw = uniffi_bindgen_javascript::flavors::napi::ohos_raw_output_stream_names_for_prefix(
+        &component.native_export_prefix,
+        "count",
     );
+    // Raw sidecar names remain component-owned.  The collision is in the
+    // generated facade namespace: a contract-generated pull class cannot
+    // reuse the contract digest's private helper name.
+    let contract = HarmonyFacadeContract {
+        facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
+        component: component.component.clone(),
+        namespace: component.namespace.clone(),
+        native_export_prefix: component.native_export_prefix.clone(),
+        output_streams: vec![HarmonyOutputStreamContract {
+            function: raw.function.clone(),
+            next_function: raw.next_function.clone(),
+            cancel_function: raw.cancel_function.clone(),
+            stream_factory: "countStream".into(),
+            pull_class: "__uniffiFacadeContractDigest".into(),
+            step_type: raw.step_type.clone(),
+            item_type: HarmonyTypeDescriptor::Number,
+            error_type: HarmonyTypeDescriptor::String,
+            arguments: Vec::new(),
+        }],
+        input_streams: Vec::new(),
+    };
+    let contract_content = serde_json::to_string(&contract).unwrap();
+    let contract_sha256 = sha256_bytes(contract_content.as_bytes());
+    let identity_export = bridge_identity_export(&component.native_export_prefix, &contract_sha256);
+    let type_def = |kind: &str, name: &str, definition: String| {
+        format!(
+            "type_def:{}\n",
+            serde_json::to_string(&serde_json::json!({
+                "kind": kind,
+                "name": name,
+                "def": definition,
+                "typeParameters": [],
+            }))
+            .unwrap()
+        )
+    };
+    let sidecar = [
+        type_def(
+            "fn",
+            &raw.function,
+            format!("function {}(): bigint", raw.function),
+        ),
+        type_def(
+            "fn",
+            &raw.next_function,
+            format!(
+                "function {}(handle: bigint): Promise<{}>",
+                raw.next_function, raw.step_type
+            ),
+        ),
+        type_def(
+            "fn",
+            &raw.cancel_function,
+            format!("function {}(handle: bigint): void", raw.cancel_function),
+        ),
+        type_def(
+            "interface",
+            &raw.step_type,
+            "kind: string\nvalue?: number\nerror?: string".into(),
+        ),
+        type_def(
+            "fn",
+            &identity_export,
+            format!("function {identity_export}(): string"),
+        ),
+    ]
+    .concat();
+    bundle.components[0].contract_sha256 = contract_sha256.clone();
+    bundle.components[0].identity_export = identity_export;
+    bundle.contracts[0].sha256 = contract_sha256;
+    bundle.contracts[0].content = contract_content;
+    bundle.type_sidecars[0].content = sidecar;
     bundle.type_sidecars[0].sha256 = sha256_bytes(bundle.type_sidecars[0].content.as_bytes());
     bundle.fingerprint = bundle.computed_fingerprint().unwrap();
     let bundle_path = root.join("bundle.json");
@@ -6285,7 +6370,8 @@ fn required_bundle_semantic_preflight_rejects_generated_name_collision_without_c
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("private helper") && error.contains("collision"),
+        error.contains("generated stream value name collision")
+            && error.contains("__uniffiFacadeContractDigest"),
         "{error}"
     );
     assert_eq!(regular_file_snapshot(&target), target_before);
@@ -6305,8 +6391,16 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
     let target_before = regular_file_snapshot(&target);
     let output_before = regular_file_snapshot(&output);
 
-    let (mut fixture_defs, mut fixture_contracts) = test_harmony_stream_contract();
-    let mut fixture_contract = fixture_contracts.remove(0);
+    let mut fixture_contract = test_harmony_stream_contract_for_schema();
+    let fixture_prefix = uniffi_bindgen::interface::native_export_prefix_for_component("fixture");
+    let owner_prefix =
+        uniffi_bindgen::interface::native_export_prefix_for_component("owner_fixture");
+    let owner_raw_shared = uniffi_bindgen_javascript::native_exports::native_export_name_for_prefix(
+        &owner_prefix,
+        "Shared",
+    );
+    fixture_contract.output_streams.truncate(1);
+    fixture_contract.input_streams.clear();
     fixture_contract.output_streams[0].item_type = HarmonyTypeDescriptor::Named {
         owner: HarmonyNamedTypeOwner {
             component: "owner_fixture".into(),
@@ -6314,22 +6408,48 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
         },
         name: "Shared".into(),
     };
-    fixture_defs.push(TypeDefLine {
-        kind: "interface".into(),
-        name: "Shared".into(),
-        def: "value: number".into(),
-        type_parameters: Vec::new(),
-    });
     let fixture_content = serde_json::to_string(&fixture_contract).unwrap();
     let fixture_digest = sha256_bytes(fixture_content.as_bytes());
-    let fixture_prefix = uniffi_bindgen::interface::native_export_prefix_for_component("fixture");
     let fixture_identity_export = bridge_identity_export(&fixture_prefix, &fixture_digest);
-    fixture_defs.push(TypeDefLine {
-        kind: "fn".into(),
-        name: fixture_identity_export.clone(),
-        def: format!("function {fixture_identity_export}(): string"),
+    let [count] = fixture_contract.output_streams.as_slice() else {
+        panic!("fixture contract must contain one output stream");
+    };
+    let def = |kind: &str, name: &str, body: String| TypeDefLine {
+        kind: kind.into(),
+        name: name.into(),
+        def: body,
         type_parameters: Vec::new(),
-    });
+    };
+    let fixture_defs = vec![
+        def(
+            "fn",
+            &count.function,
+            format!("function {}(count: number): bigint", count.function),
+        ),
+        def(
+            "fn",
+            &count.next_function,
+            format!(
+                "function {}(handle: bigint): Promise<{}>",
+                count.next_function, count.step_type
+            ),
+        ),
+        def(
+            "fn",
+            &count.cancel_function,
+            format!("function {}(handle: bigint): void", count.cancel_function),
+        ),
+        def(
+            "interface",
+            &count.step_type,
+            format!("kind: string\nvalue?: {owner_raw_shared}\nerror?: string"),
+        ),
+        def(
+            "fn",
+            &fixture_identity_export,
+            format!("function {fixture_identity_export}(): string"),
+        ),
+    ];
     let sidecar = |defs: &[TypeDefLine]| {
         defs.iter()
             .map(|def| {
@@ -6352,27 +6472,33 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
         facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
         component: "owner_fixture".into(),
         namespace: "owner_fixture".into(),
-        native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
-            "owner_fixture",
-        ),
+        native_export_prefix: owner_prefix.clone(),
         output_streams: Vec::new(),
         input_streams: Vec::new(),
     };
     let owner_content = serde_json::to_string(&owner_contract).unwrap();
     let owner_digest = sha256_bytes(owner_content.as_bytes());
-    let owner_prefix =
-        uniffi_bindgen::interface::native_export_prefix_for_component("owner_fixture");
     let owner_identity_export = bridge_identity_export(&owner_prefix, &owner_digest);
-    let owner_sidecar = format!(
-        "type_def:{{\"kind\":\"fn\",\"name\":\"{owner_identity_export}\",\"def\":\"function {owner_identity_export}(): string\",\"typeParameters\":[]}}\n"
-    );
+    let owner_sidecar = sidecar(&[
+        def(
+            "interface",
+            &uniffi_bindgen_javascript::native_exports::native_export_name_for_prefix(
+                &owner_prefix,
+                "Other",
+            ),
+            "value: number".into(),
+        ),
+        def(
+            "fn",
+            &owner_identity_export,
+            format!("function {owner_identity_export}(): string"),
+        ),
+    ]);
     let components = vec![
         HostFacadeComponentIdentity {
             component: "fixture".into(),
             namespace: "fixture".into(),
-            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
-                "fixture",
-            ),
+            native_export_prefix: fixture_prefix,
             contract_file: "fixture.ohos-facade.json".into(),
             contract_sha256: fixture_digest.clone(),
             identity_export: fixture_identity_export,
@@ -6380,9 +6506,7 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
         HostFacadeComponentIdentity {
             component: "owner_fixture".into(),
             namespace: "owner_fixture".into(),
-            native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
-                "owner_fixture",
-            ),
+            native_export_prefix: owner_prefix,
             contract_file: "owner_fixture.ohos-facade.json".into(),
             contract_sha256: owner_digest.clone(),
             identity_export: owner_identity_export,
@@ -6433,7 +6557,8 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("not declared by owner component `owner_fixture`"),
+        error.contains("not declared as raw `ffi_owner_fixture_Shared`")
+            && error.contains("by owner component `owner_fixture`"),
         "{error}"
     );
     assert_eq!(regular_file_snapshot(&target), target_before);
