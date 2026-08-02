@@ -73,18 +73,26 @@ namespace async_callback_return {
         },
     )
     .expect("N-API/Electron should accept async callback-return callbacks");
-    let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
+    let api =
+        std::fs::read_to_string(out_dir.join("components/async_callback_return/common/api.ts"))
+            .unwrap();
     assert!(
         api.contains("callbackReturnMethods: { \"makeLogger\": true }"),
         "callback-return metadata should be emitted:\n{api}"
     );
-    let napi_rs = std::fs::read_to_string(out_dir.join("node/async_callback_return.rs")).unwrap();
+    let napi_rs = std::fs::read_to_string(
+        out_dir.join("components/async_callback_return/node/async_callback_return.rs"),
+    )
+    .unwrap();
     assert!(
         napi_rs.contains("UniffiCallbackHandle")
             && napi_rs.contains("__uniffi_from_callback_registry"),
         "napi bridge should emit callback-return registry support:\n{napi_rs}"
     );
-    let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    let backend = std::fs::read_to_string(
+        out_dir.join("components/async_callback_return/node/backend-napi.ts"),
+    )
+    .unwrap();
     assert!(
         backend.contains("__uniffiStoreCallbackReturn")
             && backend.contains("__uniffiCallbackDispatcher"),
@@ -155,7 +163,7 @@ crate-type = ["rlib"]
     )
     .expect("generator should succeed for blockers fixture");
 
-    let api = std::fs::read_to_string(gen_dir.join("common/api.ts")).unwrap();
+    let api = std::fs::read_to_string(gen_dir.join("components/blockers/common/api.ts")).unwrap();
 
     // 1. Explicit imports for every type the signatures actually touch.
     for (name, from_file) in [
@@ -199,7 +207,8 @@ crate-type = ["rlib"]
         "common/api.ts should import toI64 for nested i64 fields in record args:\n{import_block}\n\n{api}"
     );
 
-    let records = std::fs::read_to_string(gen_dir.join("common/records.ts")).unwrap();
+    let records =
+        std::fs::read_to_string(gen_dir.join("components/blockers/common/records.ts")).unwrap();
     let records_runtime_imports: String = records
         .lines()
         .filter(|l| l.starts_with("import ") && l.contains("./runtime.ts"))
@@ -235,7 +244,8 @@ crate-type = ["rlib"]
 
     // 5. `common/objects.ts` must not carry a dangling runtime import
     //    when there are no non-callback-trait objects at all.
-    let objects = std::fs::read_to_string(gen_dir.join("common/objects.ts")).unwrap();
+    let objects =
+        std::fs::read_to_string(gen_dir.join("components/blockers/common/objects.ts")).unwrap();
     assert!(
         !objects.contains("import") || !objects.contains("runtime.ts"),
         "common/objects.ts has unused runtime import (no objects in this fixture):\n{objects}"
@@ -262,7 +272,7 @@ crate-type = ["rlib"]
     "types": [],
     "lib": ["es2022", "dom"]
   },
-  "include": ["common/*.ts"]
+  "include": ["components/blockers/common/*.ts"]
 }
 "#,
         )
@@ -310,7 +320,7 @@ fn custom_types_wasm_static_contract() {
     .expect("custom wasm generation should succeed");
 
     std::fs::write(
-        gen_dir.join("common/email.ts"),
+        gen_dir.join("components/custom_js_core/common/email.ts"),
         r#"
 export type EmailAddress = { value: string };
 export function emailAddressFromString(value: string): EmailAddress {
@@ -323,7 +333,8 @@ export function emailAddressToString(value: EmailAddress): string {
     )
     .unwrap();
 
-    let api = std::fs::read_to_string(gen_dir.join("common/api.ts")).unwrap();
+    let api =
+        std::fs::read_to_string(gen_dir.join("components/custom_js_core/common/api.ts")).unwrap();
     assert!(
         api.contains("export type { Email } from \"./custom-types.ts\";"),
         "api.ts should re-export the configured custom type alias:\n{api}"
@@ -337,13 +348,17 @@ export function emailAddressToString(value: EmailAddress): string {
         "api.ts should surface the UDL custom type name, not the underlying type name:\n{api}"
     );
 
-    let public_types = std::fs::read_to_string(gen_dir.join("common/public-types.ts")).unwrap();
+    let public_types =
+        std::fs::read_to_string(gen_dir.join("components/custom_js_core/common/public-types.ts"))
+            .unwrap();
     assert!(
         public_types.contains("export type { Email } from \"./custom-types.ts\";"),
         "public-types.ts should re-export the configured custom type alias:\n{public_types}"
     );
 
-    let custom_types = std::fs::read_to_string(gen_dir.join("common/custom-types.ts")).unwrap();
+    let custom_types =
+        std::fs::read_to_string(gen_dir.join("components/custom_js_core/common/custom-types.ts"))
+            .unwrap();
     for needle in [
         "type { EmailAddress } from \"./email.ts\"",
         "emailAddressFromString",
@@ -358,18 +373,20 @@ export function emailAddressToString(value: EmailAddress): string {
         );
     }
 
-    let records = std::fs::read_to_string(gen_dir.join("common/records.ts")).unwrap();
+    let records =
+        std::fs::read_to_string(gen_dir.join("components/custom_js_core/common/records.ts"))
+            .unwrap();
     assert!(
         records.contains("import type { Email } from \"./custom-types.ts\";"),
         "records.ts should import configured custom types when used in records:\n{records}"
     );
 
-    let wasm_rs_path = std::fs::read_dir(gen_dir.join("browser"))
+    let wasm_rs_path = std::fs::read_dir(gen_dir.join("components/custom_js_core/browser"))
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
-        .expect("a .rs wasm shim should exist under browser/");
+        .expect("a .rs wasm shim should exist under the custom_js_core browser component");
     let wasm_rs = std::fs::read_to_string(&wasm_rs_path).unwrap();
     assert!(
         !wasm_rs.contains("serde::") && !wasm_rs.contains("serde_wasm_bindgen"),
@@ -455,7 +472,8 @@ crate-type = ["rlib"]
         ("run_job", "runJob"),
     ];
 
-    let backend_napi = std::fs::read_to_string(gen_dir.join("node/backend-napi.ts")).unwrap();
+    let backend_napi =
+        std::fs::read_to_string(gen_dir.join("components/mapping/node/backend-napi.ts")).unwrap();
     assert!(
         backend_napi.contains("__uniffiNameMap"),
         "node/backend-napi.ts must carry the generator-emitted name map"
@@ -473,7 +491,8 @@ crate-type = ["rlib"]
         "node/backend-napi.ts must handle wasm-style object_free keys as documented no-ops:\n{backend_napi}"
     );
 
-    let preload = std::fs::read_to_string(gen_dir.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(gen_dir.join("components/mapping/electron/preload.cjs")).unwrap();
     assert!(
         preload.contains("__uniffiNameMap"),
         "electron/preload.cjs must carry the same name map"
@@ -492,7 +511,8 @@ crate-type = ["rlib"]
         "electron/preload.cjs must dispatch through resolveMethod()"
     );
 
-    let renderer = std::fs::read_to_string(gen_dir.join("electron/renderer.ts")).unwrap();
+    let renderer =
+        std::fs::read_to_string(gen_dir.join("components/mapping/electron/renderer.ts")).unwrap();
     assert!(
         renderer.contains("dropSync(handle: unknown)")
             && renderer.contains("kind: \"drop\"")
@@ -554,7 +574,8 @@ crate-type = ["rlib"]
     )
     .expect("generator should succeed for compat fixture");
 
-    let backend_napi = std::fs::read_to_string(gen_dir.join("node/backend-napi.ts")).unwrap();
+    let backend_napi =
+        std::fs::read_to_string(gen_dir.join("components/compat/node/backend-napi.ts")).unwrap();
     for needle in [
         "__uniffiInt64ArgKinds",
         "__uniffiInt64ReturnKinds",
@@ -567,7 +588,8 @@ crate-type = ["rlib"]
         );
     }
 
-    let preload = std::fs::read_to_string(gen_dir.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(gen_dir.join("components/compat/electron/preload.cjs")).unwrap();
     for needle in [
         "__uniffiInt64ArgKinds",
         "__uniffiInt64ReturnKinds",
@@ -631,7 +653,7 @@ class FakeFinalizationRegistry {
 (globalThis as { FinalizationRegistry?: unknown }).FinalizationRegistry = FakeFinalizationRegistry;
 
 const { __installBackend, createUniFfiStream, UniffiError } =
-  await import("./common/runtime.ts");
+  await import("./components/arithmetic/common/runtime.ts");
 
 function assert(condition: boolean, label: string): void {
   if (!condition) throw new Error("FAIL " + label);
@@ -879,7 +901,9 @@ fn napi_electron_translate_enum_tag_to_type() {
     let out_dir = Utf8PathBuf::from_path_buf(out.path().to_path_buf()).unwrap();
     generate_arithmetic(&out_dir);
 
-    let backend_napi = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    let backend_napi =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/node/backend-napi.ts"))
+            .unwrap();
     for needle in [
         "__uniffiLowerShape",
         "__uniffiLiftShape",
@@ -896,7 +920,9 @@ fn napi_electron_translate_enum_tag_to_type() {
         "backend-napi.ts must reference both `tag` and `type`"
     );
 
-    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/electron/preload.cjs"))
+            .unwrap();
     for needle in [
         "__uniffiLowerShape",
         "__uniffiLiftShape",
@@ -926,9 +952,8 @@ fn napi_electron_translate_enum_tag_to_type() {
         r#"
 const fs = require("node:fs");
 const path = require("node:path");
-const src = fs.readFileSync(path.resolve(__dirname, "electron/preload.cjs"), "utf8");
-// Extract just the helper block — stops at the contextBridge line
-// so we do not pull in `electron` at require time.
+const src = fs.readFileSync(path.resolve(__dirname, "components/arithmetic/electron/preload.cjs"), "utf8");
+// Extract just the helper block without loading the generated addon bridge.
 const start = src.indexOf("function __uniffiIsPlainObject");
 const end = src.indexOf("// -------------------------------------------------------------------", start);
 if (start < 0 || end < 0) {
@@ -1013,10 +1038,10 @@ fn js_async_iterable_runtime_stub_contract() {
     };
     let tmp = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-    let common = root.join("common");
-    std::fs::create_dir_all(&common).unwrap();
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
     std::fs::write(
-        common.join("runtime.ts"),
+        shared.join("runtime.ts"),
         include_str!("../../../uniffi_runtime_javascript/typescript/src/runtime.ts"),
     )
     .unwrap();
@@ -1043,7 +1068,8 @@ class Finalizers {
   }
 }
 (globalThis as { FinalizationRegistry?: unknown }).FinalizationRegistry = Finalizers;
-const { __installBackend, createUniFfiStream, UniffiError } = await import("./common/runtime.ts");
+const { createComponentRuntime, createUniFfiStream, UniffiError } = await import("./shared/runtime.ts");
+const { __installBackend } = createComponentRuntime("runtime-stub-contract");
 function assert(ok: boolean, label: string): void { if (!ok) throw new Error("FAIL " + label); }
 function name(error: unknown): string { return error instanceof UniffiError ? error.errorName : ""; }
 async function flush(): Promise<void> { await Promise.resolve(); await new Promise<void>((resolve) => setTimeout(resolve, 0)); }
@@ -1238,7 +1264,8 @@ fn js_async_iterable_stream_stub_contract() {
         ],
     );
 
-    let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
+    let api =
+        std::fs::read_to_string(out_dir.join("components/stream_core/common/api.ts")).unwrap();
     for needle in [
         "createUniFfiStream<StreamEvent, unknown>",
         "start: () => __call<any>(\"count_events\"",
@@ -1321,7 +1348,7 @@ fn js_async_iterable_stream_stub_contract() {
     "types": [],
     "lib": ["es2022", "dom"]
   },
-  "include": ["common/*.ts"]
+  "include": ["components/stream_core/common/*.ts"]
 }
 "#
             } else {
@@ -1338,7 +1365,7 @@ fn js_async_iterable_stream_stub_contract() {
     "types": [],
     "lib": ["es2022", "dom"]
   },
-  "include": ["common/*.ts"]
+  "include": ["components/stream_core/common/*.ts"]
 }
 "#
             },
@@ -1375,7 +1402,9 @@ fn js_async_iterable_stream_stub_contract() {
     } else {
         eprintln!("note: tsc not available, skipping strict output-stream typecheck");
     }
-    let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    let backend =
+        std::fs::read_to_string(out_dir.join("components/stream_core/node/backend-napi.ts"))
+            .unwrap();
     assert!(
         backend.contains("\"count_events_stream_next\": \"countEventsStreamNext\"")
             && backend.contains("\"count_events_stream_cancel\": \"countEventsStreamCancel\"")
@@ -1383,20 +1412,26 @@ fn js_async_iterable_stream_stub_contract() {
             && backend.contains("__uniffiNormalizeStreamStep"),
         "napi backend name map should include stream next/cancel:\n{backend}"
     );
-    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(out_dir.join("components/stream_core/electron/preload.cjs"))
+            .unwrap();
     assert!(
         preload.contains("__uniffiNormalizeStreamStep")
             && preload.contains("__uniffiLiftResult")
             && preload.contains("method.endsWith(\"_stream_next\")"),
         "electron preload must normalize N-API stream output to tagged ABI-v2 steps:\n{preload}"
     );
-    let renderer = std::fs::read_to_string(out_dir.join("electron/renderer.ts")).unwrap();
+    let renderer =
+        std::fs::read_to_string(out_dir.join("components/stream_core/electron/renderer.ts"))
+            .unwrap();
     assert!(
         renderer.contains("\"count_events_stream_next\"")
             && !renderer.contains("\"count_events_stream_cancel\""),
         "electron renderer should dispatch next asynchronously and leave cancel sync:\n{renderer}"
     );
-    let wasm_rs = std::fs::read_to_string(out_dir.join("browser/stream_core.rs")).unwrap();
+    let wasm_rs =
+        std::fs::read_to_string(out_dir.join("components/stream_core/browser/stream_core.rs"))
+            .unwrap();
     assert!(
         wasm_rs.contains("RustStreamRegistry")
             && wasm_rs.contains("pub async fn count_events_stream_next")
@@ -1407,7 +1442,9 @@ fn js_async_iterable_stream_stub_contract() {
             && wasm_rs.contains("JsValue::from_str(\"error\")"),
         "wasm shim should emit stream start/next/cancel:\n{wasm_rs}"
     );
-    let napi_rs = std::fs::read_to_string(out_dir.join("node/stream_core.rs")).unwrap();
+    let napi_rs =
+        std::fs::read_to_string(out_dir.join("components/stream_core/node/stream_core.rs"))
+            .unwrap();
     assert!(
         napi_rs.contains("RustStreamRegistry")
             && napi_rs.contains("pub async fn count_events_stream_next")
@@ -1422,8 +1459,8 @@ fn js_async_iterable_stream_stub_contract() {
     std::fs::write(
         out_dir.join("driver.ts"),
         r#"
-import { __installBackend, UniffiError } from "./common/runtime.ts";
-import { countEvents, emptyOptionalEvents, errorAfterOne, optionalEvents, singleOptionalEvent } from "./common/api.ts";
+import { __installBackend, UniffiError } from "./components/stream_core/common/runtime.ts";
+import { countEvents, emptyOptionalEvents, errorAfterOne, optionalEvents, singleOptionalEvent } from "./components/stream_core/common/api.ts";
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -1685,7 +1722,8 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
     generate_stream_tree(&fixture, &out_dir, None, vec![FlavorTarget::Harmony]);
 
     let contract: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(out_dir.join("harmony/stream_core.ohos-facade.json")).unwrap(),
+        &std::fs::read(out_dir.join("components/stream_core/harmony/stream_core.ohos-facade.json"))
+            .unwrap(),
     )
     .unwrap();
     assert_eq!(contract["facadeContractSchemaVersion"], 4);
@@ -1746,8 +1784,10 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         "UniffiOptionalEventsStreamNext"
     );
 
-    let extra_types =
-        std::fs::read_to_string(out_dir.join("harmony/stream_core.ohos-extra-types.d.ts")).unwrap();
+    let extra_types = std::fs::read_to_string(
+        out_dir.join("components/stream_core/harmony/stream_core.ohos-extra-types.d.ts"),
+    )
+    .unwrap();
     let optional_step = extra_types
         .lines()
         .map(|line| {
@@ -1766,13 +1806,20 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         "kind: string\nvalue?: number | undefined | null\nerror?: StreamError"
     );
 
-    let index = std::fs::read_to_string(out_dir.join("harmony/index.ts")).unwrap();
+    let root_index = std::fs::read_to_string(out_dir.join("harmony/index.ts")).unwrap();
+    assert!(
+        root_index.contains("stream_core") && !root_index.contains("export * from"),
+        "harmony root should expose only the stream_core namespace:\n{root_index}"
+    );
+    let index =
+        std::fs::read_to_string(out_dir.join("components/stream_core/harmony/index.ts")).unwrap();
     assert!(
         index.contains("export * from \"./stream.ts\";"),
-        "harmony index should re-export stream fallback helpers:\n{index}"
+        "component harmony index should re-export stream fallback helpers:\n{index}"
     );
 
-    let stream = std::fs::read_to_string(out_dir.join("harmony/stream.ts")).unwrap();
+    let stream =
+        std::fs::read_to_string(out_dir.join("components/stream_core/harmony/stream.ts")).unwrap();
     for needle in [
         "import type { UniFfiStream } from \"../common/runtime.ts\";",
         "export function countEventsStream(count: number): UniFfiStream<StreamEvent>",
@@ -1808,10 +1855,10 @@ fn input_stream_runtime_helper_contract() {
     };
     let tmp = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-    let common = root.join("common");
-    std::fs::create_dir_all(&common).unwrap();
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
     std::fs::write(
-        common.join("runtime.ts"),
+        shared.join("runtime.ts"),
         include_str!("../../../uniffi_runtime_javascript/typescript/src/runtime.ts"),
     )
     .unwrap();
@@ -1823,7 +1870,7 @@ import {
   createUniffiInputStream,
   nextUniffiInputStream,
   UniffiError,
-} from "./common/runtime.ts";
+} from "./shared/runtime.ts";
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -1973,7 +2020,10 @@ fn input_stream_bidi_static_generation_contract() {
     );
 
     let contract: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(out_dir.join("harmony/input_stream_core.ohos-facade.json")).unwrap(),
+        &std::fs::read(
+            out_dir.join("components/input_stream_core/harmony/input_stream_core.ohos-facade.json"),
+        )
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(contract["facadeContractSchemaVersion"], 4);
@@ -1999,9 +2049,11 @@ fn input_stream_bidi_static_generation_contract() {
         contract["outputStreams"][0]["stepType"],
         "UniffiRunningSumStreamNext"
     );
-    let extra_types =
-        std::fs::read_to_string(out_dir.join("harmony/input_stream_core.ohos-extra-types.d.ts"))
-            .unwrap();
+    let extra_types = std::fs::read_to_string(
+        out_dir
+            .join("components/input_stream_core/harmony/input_stream_core.ohos-extra-types.d.ts"),
+    )
+    .unwrap();
     let input_stream_def = extra_types
         .lines()
         .map(|line| {
@@ -2020,7 +2072,8 @@ fn input_stream_bidi_static_generation_contract() {
         .unwrap()
         .contains("next(error: Error | null, handle: number): Promise<T>"));
 
-    let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
+    let api = std::fs::read_to_string(out_dir.join("components/input_stream_core/common/api.ts"))
+        .unwrap();
     for needle in [
         "createUniffiInputStream",
         "export async function sumInputEvents(events: AsyncIterable<CounterEvent>): Promise<bigint>",
@@ -2041,7 +2094,9 @@ fn input_stream_bidi_static_generation_contract() {
         );
     }
 
-    let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    let backend =
+        std::fs::read_to_string(out_dir.join("components/input_stream_core/node/backend-napi.ts"))
+            .unwrap();
     assert!(
         backend.contains("__uniffiInputStream")
             && backend.contains(
@@ -2049,14 +2104,19 @@ fn input_stream_bidi_static_generation_contract() {
             ),
         "napi backend should coerce input stream markers:\n{backend}"
     );
-    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(out_dir.join("components/input_stream_core/electron/preload.cjs"))
+            .unwrap();
     assert!(
         preload.contains("__uniffiInputStream")
             && preload
                 .contains("return { handle: arg.handle, next: arg.next, cancel: arg.cancel };"),
         "electron preload should forward input stream markers:\n{preload}"
     );
-    let napi_rs = std::fs::read_to_string(out_dir.join("node/input_stream_core.rs")).unwrap();
+    let napi_rs = std::fs::read_to_string(
+        out_dir.join("components/input_stream_core/node/input_stream_core.rs"),
+    )
+    .unwrap();
     let compact_napi_rs = napi_rs.split_whitespace().collect::<String>();
     assert!(
         compact_napi_rs.contains(
@@ -2082,7 +2142,10 @@ fn input_stream_bidi_static_generation_contract() {
         napi_rs.contains(&format!("UniffiInputStream{input_suffix}Ops")),
         "napi bridge must use the canonical contract suffix `{input_suffix}`:\n{napi_rs}"
     );
-    let wasm_rs = std::fs::read_to_string(out_dir.join("browser/input_stream_core.rs")).unwrap();
+    let wasm_rs = std::fs::read_to_string(
+        out_dir.join("components/input_stream_core/browser/input_stream_core.rs"),
+    )
+    .unwrap();
     for needle in [
         "__UniffiInputStreamCounterEventStreamErrorOps",
         "impl ::uniffi::ForeignInputStreamOps",
@@ -2240,7 +2303,9 @@ fn napi_callback_args_are_lifted_with_js_stub() {
     std::fs::create_dir_all(&out_dir).unwrap();
     generate_callback_shape_tree(&out_dir);
 
-    let backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    let backend =
+        std::fs::read_to_string(out_dir.join("components/callback_shape/node/backend-napi.ts"))
+            .unwrap();
     for needle in [
         "args.slice(2).map(__uniffiLiftShape)",
         "const liftedArgs = callArgs.map(__uniffiLiftShape);",
@@ -2270,7 +2335,8 @@ module.exports = {
 import assert from "node:assert/strict";
 
 process.env.UNIFFI_CALLBACK_SHAPE_NAPI_PATH = new URL("./stub-addon.cjs", import.meta.url).pathname;
-const api = await import("./node/index.ts");
+const root = await import("./node/index.ts");
+const api = root.callback_shape;
 
 const events: unknown[] = [];
 api.emitEvent({
@@ -2317,7 +2383,9 @@ fn electron_preload_callback_args_are_lifted_with_js_stub() {
     std::fs::create_dir_all(&out_dir).unwrap();
     generate_callback_shape_tree(&out_dir);
 
-    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(out_dir.join("components/callback_shape/electron/preload.cjs"))
+            .unwrap();
     for needle in [
         "UNIFFI_CALLBACK_SHAPE_NAPI_PATH",
         "UNIFFI_NAPI_PATH",
@@ -2366,7 +2434,8 @@ process.env.UNIFFI_CALLBACK_SHAPE_NAPI_PATH = new URL("./stub-addon.cjs", import
 (globalThis as { window?: unknown }).window = globalThis;
 const require = createRequire(import.meta.url);
 require("./electron/preload.cjs");
-const api = await import("./electron/renderer.ts");
+const root = await import("./electron/index.ts");
+const api = root.callback_shape;
 
 const events: unknown[] = [];
 api.emitEvent({
@@ -2411,7 +2480,9 @@ fn electron_wrap_result_does_not_wrap_arrays_or_plain_values() {
     let out_dir = Utf8PathBuf::from_path_buf(out.path().to_path_buf()).unwrap();
     generate_arithmetic(&out_dir);
 
-    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/electron/preload.cjs"))
+            .unwrap();
     // The bad heuristic must be gone.
     assert!(
         !preload.contains(r#"value.constructor.name !== "Object""#),
@@ -2444,7 +2515,7 @@ fn electron_wrap_result_does_not_wrap_arrays_or_plain_values() {
 const fs = require("node:fs");
 const path = require("node:path");
 const src = fs.readFileSync(
-    path.resolve(__dirname, "electron/preload.cjs"),
+    path.resolve(__dirname, "components/arithmetic/electron/preload.cjs"),
     "utf8",
 );
 const helperStart = src.indexOf("function __uniffiIsHostPlainObject");
@@ -2581,19 +2652,23 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
     .expect("generator should emit both node and harmony flavors");
 
     for name in [
-        "common/public-types.ts",
-        "node/backend-napi.ts",
-        "node/arithmetical.rs",
-        "harmony/backend-ohos.ts",
+        "shared/runtime.ts",
         "harmony/index.ts",
-        "harmony/arithmetical.ohos-extra-types.d.ts",
-        "harmony/arithmetical.rs",
+        "components/arithmetic/common/public-types.ts",
+        "components/arithmetic/node/backend-napi.ts",
+        "components/arithmetic/node/arithmetical.rs",
+        "components/arithmetic/harmony/index.ts",
+        "components/arithmetic/harmony/backend-ohos.ts",
+        "components/arithmetic/harmony/arithmetical.ohos-extra-types.d.ts",
+        "components/arithmetic/harmony/arithmetical.rs",
     ] {
         let p = out_dir.join(name);
         assert!(p.exists(), "expected output file missing: {p}");
     }
 
-    let node_rs = std::fs::read_to_string(out_dir.join("node/arithmetical.rs")).unwrap();
+    let node_rs =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/node/arithmetical.rs"))
+            .unwrap();
     assert!(
         !node_rs.contains("use napi::bindgen_prelude::*;")
             && node_rs.contains("use napi_derive::napi;")
@@ -2605,7 +2680,9 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
         "node bridge must not use ohos-rs imports:\n{node_rs}"
     );
 
-    let ohos_rs = std::fs::read_to_string(out_dir.join("harmony/arithmetical.rs")).unwrap();
+    let ohos_rs =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/harmony/arithmetical.rs"))
+            .unwrap();
     assert!(
         ohos_rs.contains("extern crate napi_ohos as napi;")
             && ohos_rs.contains("use napi_derive_ohos::napi;")
@@ -2617,7 +2694,9 @@ fn emits_harmony_flavor_with_ohos_napi_surface() {
         "harmony bridge must not import the ordinary napi-rs derive crate:\n{ohos_rs}"
     );
 
-    let backend = std::fs::read_to_string(out_dir.join("harmony/backend-ohos.ts")).unwrap();
+    let backend =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/harmony/backend-ohos.ts"))
+            .unwrap();
     assert!(
         !contains_dynamic_type_word(&backend),
         "harmony backend must not emit ArkTS-hostile dynamic type words `any`/`unknown`:\n{backend}"
@@ -2650,7 +2729,9 @@ fn custom_types_emit_public_contract() {
     let tmp = tempfile::tempdir().unwrap();
     let (generated, _manifest) = generate_custom_napi_tree(tmp.path());
 
-    let custom_types = std::fs::read_to_string(generated.join("common/custom-types.ts")).unwrap();
+    let custom_types =
+        std::fs::read_to_string(generated.join("components/custom_js_core/common/custom-types.ts"))
+            .unwrap();
     assert!(
         custom_types.contains("import type { EmailAddress } from \"./email.ts\";"),
         "custom-types.ts should emit configured type import:\n{custom_types}"
@@ -2671,7 +2752,8 @@ fn custom_types_emit_public_contract() {
         "custom-types.ts should emit lower/lift helpers:\n{custom_types}"
     );
 
-    let api = std::fs::read_to_string(generated.join("common/api.ts")).unwrap();
+    let api =
+        std::fs::read_to_string(generated.join("components/custom_js_core/common/api.ts")).unwrap();
     assert!(
         !api.contains("unknown /* custom:"),
         "common/api.ts must not leave custom types as unknown:\n{api}"
@@ -2684,7 +2766,9 @@ fn custom_types_emit_public_contract() {
         api.contains("import { __uniffiLiftCustomEmail, __uniffiLowerCustomEmail } from \"./custom-types.ts\";"),
         "common/api.ts should import the custom-type helpers:\n{api}"
     );
-    let public_types = std::fs::read_to_string(generated.join("common/public-types.ts")).unwrap();
+    let public_types =
+        std::fs::read_to_string(generated.join("components/custom_js_core/common/public-types.ts"))
+            .unwrap();
     assert!(
         public_types.contains("export type { Email } from \"./custom-types.ts\";"),
         "public-types.ts should re-export Email:\n{public_types}"
@@ -2705,7 +2789,7 @@ fn runtime_numeric_lossless_or_reject() {
     generate_arithmetic(&out_dir);
 
     let driver = r#"
-import { toI64, toU64, UniffiError } from "./common/runtime.ts";
+import { toI64, toU64, UniffiError } from "./shared/runtime.ts";
 
 function expectBigint(label, fn_) {
     const result = fn_();

@@ -48,8 +48,9 @@ fn emits_host_crate_tree_when_opted_in() {
 
     let wasm_lib = std::fs::read_to_string(host_dir.join("wasm/src/lib.rs")).unwrap();
     assert!(
-        wasm_lib.contains("include!(") && wasm_lib.contains("browser/arithmetical.rs"),
-        "wasm lib.rs must include the generated browser/<crate>.rs, got:\n{wasm_lib}"
+        wasm_lib.contains("include!(")
+            && wasm_lib.contains("components/arithmetic/browser/arithmetical.rs"),
+        "wasm lib.rs must include the generated component browser bridge, got:\n{wasm_lib}"
     );
 
     let napi_toml = std::fs::read_to_string(host_dir.join("napi/Cargo.toml")).unwrap();
@@ -67,8 +68,9 @@ fn emits_host_crate_tree_when_opted_in() {
 
     let napi_lib = std::fs::read_to_string(host_dir.join("napi/src/lib.rs")).unwrap();
     assert!(
-        napi_lib.contains("include!(") && napi_lib.contains("node/arithmetical.rs"),
-        "napi lib.rs must include the generated node/<crate>.rs, got:\n{napi_lib}"
+        napi_lib.contains("include!(")
+            && napi_lib.contains("components/arithmetic/node/arithmetical.rs"),
+        "napi lib.rs must include the generated component node bridge, got:\n{napi_lib}"
     );
 
     let build_rs = std::fs::read_to_string(host_dir.join("napi/build.rs")).unwrap();
@@ -176,8 +178,9 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
         .any(|entry| entry["file"] == "arithmetical.ohos-extra-types.d.ts"));
     let lib_rs = std::fs::read_to_string(host_dir.join("ohos/src/lib.rs")).unwrap();
     assert!(
-        lib_rs.contains("include!(") && lib_rs.contains("harmony/arithmetical.rs"),
-        "OHOS lib.rs must include generated harmony bridge:\n{lib_rs}"
+        lib_rs.contains("include!(")
+            && lib_rs.contains("components/arithmetic/harmony/arithmetical.rs"),
+        "OHOS lib.rs must include generated component harmony bridge:\n{lib_rs}"
     );
 }
 
@@ -214,8 +217,8 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
     let (out_dir, host_dir) = generate_float32_record_hosts(tmp.path());
 
     for bridge in [
-        out_dir.join("node/float32_record_core.rs"),
-        out_dir.join("harmony/float32_record_core.rs"),
+        out_dir.join("components/float32_record_core/node/float32_record_core.rs"),
+        out_dir.join("components/float32_record_core/harmony/float32_record_core.rs"),
     ] {
         let source = std::fs::read_to_string(&bridge).unwrap();
         assert!(
@@ -421,8 +424,11 @@ fn host_crates_napi_compiles_temporal_fixture() {
     let host_dir = generate_temporal_napi_host(tmp.path());
 
     let bridge = std::fs::read_to_string(
-        Utf8PathBuf::from_path_buf(tmp.path().join("generated/node/napi_temporal_core.rs"))
-            .unwrap(),
+        Utf8PathBuf::from_path_buf(
+            tmp.path()
+                .join("generated/components/napi_temporal_core/node/napi_temporal_core.rs"),
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(
@@ -451,8 +457,11 @@ fn host_crates_napi_compiles_temporal_fixture() {
         );
     }
 
-    let electron_preload =
-        std::fs::read_to_string(tmp.path().join("generated/electron/preload.cjs")).unwrap();
+    let electron_preload = std::fs::read_to_string(
+        tmp.path()
+            .join("generated/components/napi_temporal_core/electron/preload.cjs"),
+    )
+    .unwrap();
     assert!(
         !electron_preload.contains("unsupported"),
         "electron preload should remain on the supported temporal path:\n{electron_preload}"
@@ -467,7 +476,11 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
     // Sanity check: the generated bridge actually uses the newer
     // napi-rs surface whose compatibility is the point of this test.
     let bridge = std::fs::read_to_string(
-        Utf8PathBuf::from_path_buf(tmp.path().join("generated/node/napi_compat.rs")).unwrap(),
+        Utf8PathBuf::from_path_buf(
+            tmp.path()
+                .join("generated/components/napi_compat/node/napi_compat.rs"),
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(

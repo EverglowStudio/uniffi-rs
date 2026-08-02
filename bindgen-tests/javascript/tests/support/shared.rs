@@ -1137,7 +1137,7 @@ pub fn generate_custom_napi_tree(root: &std::path::Path) -> (Utf8PathBuf, Utf8Pa
     )
     .expect("custom napi generator run should succeed");
     std::fs::write(
-        out_dir.join("common/email.ts"),
+        out_dir.join("components/custom_js_core/common/email.ts"),
         r#"
 export type EmailAddress = { value: string };
 export function emailAddressFromString(value: string): EmailAddress {
@@ -1193,7 +1193,9 @@ resolver = "3"
         "extern crate napi_build;\nfn main() { napi_build::setup(); }\n",
     )
     .unwrap();
-    let bridge = std::fs::read_to_string(generated.join("node/custom_js_core.rs")).unwrap();
+    let bridge =
+        std::fs::read_to_string(generated.join("components/custom_js_core/node/custom_js_core.rs"))
+            .unwrap();
     std::fs::write(shim.join("src/lib.rs"), bridge).unwrap();
 
     let target_dir = root.join("cargo-target-custom-napi");
@@ -1218,7 +1220,7 @@ resolver = "3"
         "expected built cdylib at {}",
         dylib.display()
     );
-    let addon = generated.join("node/custom_js_core.node");
+    let addon = generated.join("components/custom_js_core/node/custom_js_core.node");
     std::fs::copy(&dylib, &addon).unwrap();
     addon
 }

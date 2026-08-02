@@ -36,30 +36,37 @@ fn emits_real_tree_for_all_flavors() {
     generate_arithmetic(&out_dir);
 
     for name in [
-        "common/api.ts",
-        "common/records.ts",
-        "common/enums.ts",
-        "common/errors.ts",
-        "common/objects.ts",
-        "common/callbacks.ts",
-        "common/runtime.ts",
+        "shared/runtime.ts",
         "browser/index.ts",
-        "browser/backend-wasm.ts",
+        "components/arithmetic/common/api.ts",
+        "components/arithmetic/common/records.ts",
+        "components/arithmetic/common/enums.ts",
+        "components/arithmetic/common/errors.ts",
+        "components/arithmetic/common/objects.ts",
+        "components/arithmetic/common/callbacks.ts",
+        "components/arithmetic/common/runtime.ts",
+        "components/arithmetic/browser/index.ts",
+        "components/arithmetic/browser/backend-wasm.ts",
         "node/index.ts",
-        "node/backend-napi.ts",
+        "components/arithmetic/node/index.ts",
+        "components/arithmetic/node/backend-napi.ts",
         "electron/index.ts",
-        "electron/backend-napi.ts",
         "electron/preload.cjs",
-        "electron/renderer.ts",
+        "components/arithmetic/electron/index.ts",
+        "components/arithmetic/electron/backend-napi.ts",
+        "components/arithmetic/electron/preload.cjs",
+        "components/arithmetic/electron/renderer.ts",
         "harmony/index.ts",
-        "harmony/arithmetical.ohos-facade.json",
+        "components/arithmetic/harmony/index.ts",
+        "components/arithmetic/harmony/arithmetical.ohos-facade.json",
     ] {
         let p = out_dir.join(name);
         assert!(p.exists(), "expected output file missing: {p}");
     }
 
     let harmony_contract: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(out_dir.join("harmony/arithmetical.ohos-facade.json")).unwrap(),
+        &std::fs::read(out_dir.join("components/arithmetic/harmony/arithmetical.ohos-facade.json"))
+            .unwrap(),
     )
     .unwrap();
     assert_eq!(harmony_contract["facadeContractSchemaVersion"], 4);
@@ -76,7 +83,7 @@ fn emits_real_tree_for_all_flavors() {
         .unwrap()
         .is_empty());
 
-    let api = std::fs::read_to_string(out_dir.join("common/api.ts")).unwrap();
+    let api = std::fs::read_to_string(out_dir.join("components/arithmetic/common/api.ts")).unwrap();
     assert!(
         api.contains("export function add("),
         "common/api.ts should expose `add`, got:\n{api}"
@@ -87,8 +94,8 @@ fn emits_real_tree_for_all_flavors() {
         "common/api.ts should NOT wrap u64 returns via fromU64 (bigint contract), got:\n{api}"
     );
     // public-types.ts must exist and re-export key types.
-    let pt_path = out_dir.join("common/public-types.ts");
-    assert!(pt_path.exists(), "expected common/public-types.ts");
+    let pt_path = out_dir.join("components/arithmetic/common/public-types.ts");
+    assert!(pt_path.exists(), "expected component public-types.ts");
     let pt = std::fs::read_to_string(&pt_path).unwrap();
     assert!(
         pt.contains("ArithmeticError"),
@@ -139,7 +146,9 @@ fn emits_real_tree_for_all_flavors() {
 
     // The raw napi addon surface is bigint-native, so node/electron
     // adapters must not carry the old safe-integer compatibility layer.
-    let napi_backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    let napi_backend =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/node/backend-napi.ts"))
+            .unwrap();
     assert!(
         !napi_backend.contains("__uniffiInt64ArgKinds")
             && !napi_backend.contains("__uniffiInt64ReturnKinds")
@@ -147,7 +156,9 @@ fn emits_real_tree_for_all_flavors() {
             && !napi_backend.contains("__uniffiLiftInt64FromNapi"),
         "node/backend-napi.ts must not carry the old int64 compat layer"
     );
-    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/electron/preload.cjs"))
+            .unwrap();
     assert!(
         !preload.contains("__uniffiInt64ArgKinds")
             && !preload.contains("__uniffiInt64ReturnKinds")
@@ -156,13 +167,14 @@ fn emits_real_tree_for_all_flavors() {
         "electron/preload.cjs must not carry the old int64 compat layer"
     );
 
-    let errors = std::fs::read_to_string(out_dir.join("common/errors.ts")).unwrap();
+    let errors =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/common/errors.ts")).unwrap();
     assert!(
         errors.contains("ArithmeticError"),
         "common/errors.ts should contain ArithmeticError subclass"
     );
 
-    let runtime = std::fs::read_to_string(out_dir.join("common/runtime.ts")).unwrap();
+    let runtime = std::fs::read_to_string(out_dir.join("shared/runtime.ts")).unwrap();
     assert!(runtime.contains("const JS_RUNTIME_ABI_VERSION = 2"));
     assert!(runtime.contains("__uniffiJsRuntimeAbiVersion"));
     assert!(runtime.contains("jsRuntimeAbiVersion"));
@@ -170,25 +182,38 @@ fn emits_real_tree_for_all_flavors() {
     assert!(runtime.contains("class UniffiObjectHandle"));
     assert!(runtime.contains("function toU64"));
 
-    // Both node and browser entries must auto-install the backend.
-    let node_index = std::fs::read_to_string(out_dir.join("node/index.ts")).unwrap();
+    // Platform roots are namespace-only; each component entry auto-installs
+    // its own backend.
+    let node_root = std::fs::read_to_string(out_dir.join("node/index.ts")).unwrap();
+    assert!(
+        node_root.contains("arithmetic") && !node_root.contains("__installBackend(backend)"),
+        "node root must expose only the arithmetic namespace, got:\n{node_root}"
+    );
+    let node_index =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/node/index.ts")).unwrap();
     assert!(
         node_index.contains("__installBackend(backend)"),
-        "node/index.ts must auto-install backend, got:\n{node_index}"
+        "component node entry must auto-install backend, got:\n{node_index}"
     );
-    let browser_index = std::fs::read_to_string(out_dir.join("browser/index.ts")).unwrap();
+    let browser_root = std::fs::read_to_string(out_dir.join("browser/index.ts")).unwrap();
+    assert!(
+        browser_root.contains("arithmetic") && !browser_root.contains("__installBackend(backend)"),
+        "browser root must expose only the arithmetic namespace, got:\n{browser_root}"
+    );
+    let browser_index =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/browser/index.ts")).unwrap();
     assert!(
         browser_index.contains("__installBackend(backend)"),
-        "browser/index.ts must auto-install backend, got:\n{browser_index}"
+        "component browser entry must auto-install backend, got:\n{browser_index}"
     );
 
     // Locate the per-crate napi bridge file.
-    let rust_path = std::fs::read_dir(out_dir.join("node"))
+    let rust_path = std::fs::read_dir(out_dir.join("components/arithmetic/node"))
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
-        .expect("a .rs bridge file should exist under node/");
+        .expect("a .rs bridge file should exist under the arithmetic node component");
     let rust_bridge = std::fs::read_to_string(&rust_path).unwrap();
     assert!(
         rust_bridge.contains("#[napi]"),
@@ -201,12 +226,12 @@ fn emits_real_tree_for_all_flavors() {
 
     // The wasm Rust shim must exist, must use #[wasm_bindgen], and must
     // actually wrap at least one of the arithmetic free functions.
-    let wasm_rs_path = std::fs::read_dir(out_dir.join("browser"))
+    let wasm_rs_path = std::fs::read_dir(out_dir.join("components/arithmetic/browser"))
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
-        .expect("a .rs wasm shim should exist under browser/");
+        .expect("a .rs wasm shim should exist under the arithmetic browser component");
     let wasm_rs = std::fs::read_to_string(&wasm_rs_path).unwrap();
     assert!(
         wasm_rs.contains("#[wasm_bindgen]"),
@@ -217,7 +242,9 @@ fn emits_real_tree_for_all_flavors() {
         "browser/*.rs should wrap `add`"
     );
 
-    let backend_wasm = std::fs::read_to_string(out_dir.join("browser/backend-wasm.ts")).unwrap();
+    let backend_wasm =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/browser/backend-wasm.ts"))
+            .unwrap();
     assert!(
         backend_wasm.contains("adaptWasmBindgenGlue"),
         "backend-wasm.ts must expose Path A adapter, got:\n{backend_wasm}"
@@ -235,9 +262,31 @@ fn emits_real_tree_for_all_flavors() {
         "browser/index.ts must expose async initBackend"
     );
 
-    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
-    assert!(preload.contains("contextBridge.exposeInMainWorld(\"__uniffi__\""));
-    assert!(preload.contains(".node\""));
+    let root_preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    assert!(
+        root_preload.contains("contextBridge.exposeInMainWorld(\"__uniffi__\"")
+            && root_preload.contains("components")
+            && root_preload.contains("../components/arithmetic/electron/preload.cjs"),
+        "root Electron preload must publish the namespaced component bridge once:\n{root_preload}"
+    );
+
+    let electron_root = std::fs::read_to_string(out_dir.join("electron/index.ts")).unwrap();
+    assert!(
+        electron_root.contains("export * as arithmetic")
+            && electron_root.contains("main: () => import")
+            && electron_root.contains("preload: new URL(\"./preload.cjs\", import.meta.url)"),
+        "Electron root must expose the renderer API and a namespace-keyed root preload entrypoint:\n{electron_root}"
+    );
+
+    let preload =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/electron/preload.cjs"))
+            .unwrap();
+    assert!(
+        preload.contains(".node\"")
+            && preload.contains("module.exports = Object.freeze")
+            && !preload.contains("contextBridge.exposeInMainWorld"),
+        "component Electron preload must be a bridge module, not publish a global:\n{preload}"
+    );
     // Preload must split sync and async — sync Rust exports break React
     // render if the preload async-wraps them.
     assert!(
@@ -255,7 +304,9 @@ fn emits_real_tree_for_all_flavors() {
         "electron preload must unwrap callback-trait markers in resolveArg"
     );
 
-    let renderer = std::fs::read_to_string(out_dir.join("electron/renderer.ts")).unwrap();
+    let renderer =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/electron/renderer.ts"))
+            .unwrap();
     assert!(renderer.contains("__installBackend"));
     assert!(renderer.contains("new Proxy"));
     // Renderer must preserve sync semantics: there must be a sync
@@ -278,7 +329,9 @@ fn emits_real_tree_for_all_flavors() {
 
     // napi backend adapter must also unwrap the callback marker so the
     // Logger-style fixture works end-to-end through the napi addon.
-    let backend_napi = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    let backend_napi =
+        std::fs::read_to_string(out_dir.join("components/arithmetic/node/backend-napi.ts"))
+            .unwrap();
     assert!(
         backend_napi.contains("__uniffiCallback"),
         "napi backend adapter must unwrap callback-trait markers \
@@ -299,14 +352,15 @@ fn runs_common_api_under_node() {
     let out_dir = Utf8PathBuf::from_path_buf(out.path().to_path_buf()).unwrap();
     generate_arithmetic(&out_dir);
 
-    // Harness: install a pure-JS stub backend, call through common/api.ts.
+    // Harness: install a pure-JS stub backend, call through the arithmetic
+    // component API.
     let harness = r#"
 import {
     __installBackend,
     UniffiError,
-} from "./common/runtime.ts";
-import { add, sub, div, equal } from "./common/api.ts";
-import { ArithmeticError } from "./common/errors.ts";
+} from "./components/arithmetic/common/runtime.ts";
+import { add, sub, div, equal } from "./components/arithmetic/common/api.ts";
+import { ArithmeticError } from "./components/arithmetic/common/errors.ts";
 
 __installBackend({
     __uniffiJsRuntimeAbiVersion: 2,

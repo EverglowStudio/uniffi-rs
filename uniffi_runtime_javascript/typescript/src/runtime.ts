@@ -1,11 +1,12 @@
 // Shared TypeScript runtime for uniffi_bindgen_javascript.
 //
-// This file is copied verbatim into `common/runtime.ts` by the generator
+// This file is copied verbatim into `shared/runtime.ts` by the generator
 // (via `include_str!`), so it must not depend on anything outside itself.
-// It owns: the stable `UniffiError` class, the backend install hook, the
-// sync/async call wrappers, a handle registry with a FinalizationRegistry
-// safety net, minimal numeric normalisation, and the callback registry
-// used to forward `Logger`-style foreign traits into the native backend.
+// It owns: the stable `UniffiError` class, namespace-scoped backend install
+// hooks and sync/async call wrappers, a handle registry with a
+// FinalizationRegistry safety net, minimal numeric normalisation, and the
+// callback registry used to forward `Logger`-style foreign traits into the
+// native backend.
 //
 // This is deliberately private to the generated runtime.  Flavor adapters
 // may be distributed independently from the high-level API, so installation
@@ -84,65 +85,86 @@ function wrapError(raw: unknown): UniffiError {
 }
 
 // ---------------------------------------------------------------------------
-// Backend install hook
+// Namespace-scoped backend install hook
 // ---------------------------------------------------------------------------
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type UniffiBackend = any;
 
-let __uniffiBackend: UniffiBackend = null;
+type UniffiComponentRuntime = {
+    __installBackend(backend: UniffiBackend): void;
+    __call<T>(fn: string, ...args: unknown[]): T;
+    __callAsync<T>(fn: string, ...args: unknown[]): Promise<T>;
+};
 
-export function __installBackend(backend: UniffiBackend): void {
-    let actualVersion: unknown;
-    try {
-        actualVersion =
-            backend !== null && backend !== undefined
-                ? backend.__uniffiJsRuntimeAbiVersion
-                : undefined;
-    } catch {
-        actualVersion = undefined;
-    }
-    if (actualVersion !== JS_RUNTIME_ABI_VERSION) {
-        throw new UniffiError({
-            errorName: "UniffiAbiMismatch",
-            data: {
-                jsRuntimeAbiVersion: {
-                    expected: JS_RUNTIME_ABI_VERSION,
-                    got: actualVersion,
+// One physical runtime module deliberately owns all slots.  A generated
+// component wrapper binds exactly one namespace to one slot, so importing a
+// second component can never replace the backend used by the first.
+const BACKENDS_BY_NAMESPACE = new Map<string, UniffiBackend>();
+
+/**
+ * Build the tiny runtime surface re-exported from one generated component's
+ * `common/runtime.ts`. The namespace is generator-validated before it is
+ * embedded here and is part of every missing-backend/ABI diagnostic.
+ */
+export function createComponentRuntime(namespace: string): UniffiComponentRuntime {
+    const install = (backend: UniffiBackend): void => {
+        let actualVersion: unknown;
+        try {
+            actualVersion =
+                backend !== null && backend !== undefined
+                    ? backend.__uniffiJsRuntimeAbiVersion
+                    : undefined;
+        } catch {
+            actualVersion = undefined;
+        }
+        if (actualVersion !== JS_RUNTIME_ABI_VERSION) {
+            throw new UniffiError({
+                errorName: "UniffiAbiMismatch",
+                data: {
+                    namespace,
+                    jsRuntimeAbiVersion: {
+                        expected: JS_RUNTIME_ABI_VERSION,
+                        got: actualVersion,
+                    },
                 },
-            },
-            message: `incompatible UniFFI JavaScript backend jsRuntimeAbiVersion: expected ${JS_RUNTIME_ABI_VERSION}, got ${String(actualVersion)}`,
-        });
-    }
-    __uniffiBackend = backend;
-}
+                message: `incompatible UniFFI JavaScript backend for namespace ${namespace}: expected jsRuntimeAbiVersion ${JS_RUNTIME_ABI_VERSION}, got ${String(actualVersion)}`,
+            });
+        }
+        BACKENDS_BY_NAMESPACE.set(namespace, backend);
+    };
 
-function requireBackend(fn: string): UniffiBackend {
-    if (!__uniffiBackend) {
-        throw new UniffiError({
-            errorName: "UniffiBackendMissing",
-            message: `backend not installed before calling ${fn}`,
-        });
-    }
-    return __uniffiBackend;
-}
+    const requireBackend = (fn: string): UniffiBackend => {
+        const backend = BACKENDS_BY_NAMESPACE.get(namespace);
+        if (!backend) {
+            throw new UniffiError({
+                errorName: "UniffiBackendMissing",
+                data: { namespace },
+                message: `backend for namespace ${namespace} not installed before calling ${fn}`,
+            });
+        }
+        return backend;
+    };
 
-export function __call<T>(fn: string, ...args: unknown[]): T {
-    const backend = requireBackend(fn);
-    try {
-        return backend[fn](...args) as T;
-    } catch (raw) {
-        throw wrapError(raw);
-    }
-}
-
-export async function __callAsync<T>(fn: string, ...args: unknown[]): Promise<T> {
-    const backend = requireBackend(fn);
-    try {
-        return (await backend[fn](...args)) as T;
-    } catch (raw) {
-        throw wrapError(raw);
-    }
+    return {
+        __installBackend: install,
+        __call<T>(fn: string, ...args: unknown[]): T {
+            const backend = requireBackend(fn);
+            try {
+                return backend[fn](...args) as T;
+            } catch (raw) {
+                throw wrapError(raw);
+            }
+        },
+        async __callAsync<T>(fn: string, ...args: unknown[]): Promise<T> {
+            const backend = requireBackend(fn);
+            try {
+                return (await backend[fn](...args)) as T;
+            } catch (raw) {
+                throw wrapError(raw);
+            }
+        },
+    };
 }
 
 // ---------------------------------------------------------------------------

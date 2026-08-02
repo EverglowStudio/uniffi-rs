@@ -291,15 +291,20 @@ fn cli_build_orchestrates_wasm_and_napi() {
     }
 
     for path in [
-        "common/api.ts",
+        "shared/runtime.ts",
         "browser/index.ts",
         "browser/index.web.ts",
-        "browser/backend-wasm.ts",
+        "components/cli_build/common/api.ts",
+        "components/cli_build/browser/index.ts",
+        "components/cli_build/browser/backend-wasm.ts",
         "node/index.ts",
-        "node/backend-napi.ts",
+        "components/cli_build/node/index.ts",
+        "components/cli_build/node/backend-napi.ts",
         "electron/index.ts",
         "electron/preload.cjs",
-        "electron/renderer.ts",
+        "components/cli_build/electron/index.ts",
+        "components/cli_build/electron/preload.cjs",
+        "components/cli_build/electron/renderer.ts",
     ] {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing generated JavaScript file: {file}");
@@ -310,8 +315,8 @@ fn cli_build_orchestrates_wasm_and_napi() {
         pkg_dir.exists(),
         "missing wasm-bindgen output dir: {pkg_dir}"
     );
-    assert_single_node_addon(out_dir.join("node"));
-    assert_single_node_addon(out_dir.join("electron"));
+    assert_single_node_addon(out_dir.join("components/cli_build/node"));
+    assert_single_node_addon(out_dir.join("components/cli_build/electron"));
 }
 
 #[test]
@@ -378,7 +383,10 @@ fn cli_build_runs_value_type_methods() {
         );
     }
 
-    let records = std::fs::read_to_string(out_dir.join("common/records.ts")).unwrap();
+    let records = std::fs::read_to_string(
+        out_dir.join("components/value_type_method_fixture/common/records.ts"),
+    )
+    .unwrap();
     assert!(
         records.contains("export const Point = Object.freeze")
             && records.contains("new(x: number, y: number): Point")
@@ -386,7 +394,10 @@ fn cli_build_runs_value_type_methods() {
             && records.contains("scale(self_: Point"),
         "records.ts should expose static value constructors and methods:\n{records}"
     );
-    let enums = std::fs::read_to_string(out_dir.join("common/enums.ts")).unwrap();
+    let enums = std::fs::read_to_string(
+        out_dir.join("components/value_type_method_fixture/common/enums.ts"),
+    )
+    .unwrap();
     assert!(
         enums.contains("south(): Direction")
             && enums.contains("opposite(self_: Direction")
@@ -400,7 +411,8 @@ fn cli_build_runs_value_type_methods() {
     std::fs::write(
         &driver,
         r#"
-import { Direction, Point, Shape } from "./generated/node/index.ts";
+import * as root from "./generated/node/index.ts";
+const { Direction, Point, Shape } = root.value_type_method_fixture;
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(label);
@@ -508,16 +520,21 @@ fn cli_build_orchestrates_full_javascript_tree() {
     }
 
     for path in [
-        "common/api.ts",
-        "common/public-types.ts",
+        "shared/runtime.ts",
         "browser/index.ts",
-        "browser/backend-wasm.ts",
+        "components/cli_wasm/common/api.ts",
+        "components/cli_wasm/common/public-types.ts",
+        "components/cli_wasm/browser/index.ts",
+        "components/cli_wasm/browser/backend-wasm.ts",
         "node/index.ts",
-        "node/backend-napi.ts",
+        "components/cli_wasm/node/index.ts",
+        "components/cli_wasm/node/backend-napi.ts",
         "electron/index.ts",
-        "electron/backend-napi.ts",
         "electron/preload.cjs",
-        "electron/renderer.ts",
+        "components/cli_wasm/electron/index.ts",
+        "components/cli_wasm/electron/backend-napi.ts",
+        "components/cli_wasm/electron/preload.cjs",
+        "components/cli_wasm/electron/renderer.ts",
     ] {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing combined build artifact: {file}");
@@ -526,11 +543,15 @@ fn cli_build_orchestrates_full_javascript_tree() {
     assert!(host_dir.join("wasm/Cargo.toml").exists());
     assert!(host_dir.join("napi/Cargo.toml").exists());
     assert!(
-        !out_dir.join("node/cli_wasm.node").exists(),
+        !out_dir
+            .join("components/cli_wasm/node/cli_wasm.node")
+            .exists(),
         "--artifact-dir should keep node addon out of the generated source tree"
     );
     assert!(
-        !out_dir.join("electron/cli_wasm.node").exists(),
+        !out_dir
+            .join("components/cli_wasm/electron/cli_wasm.node")
+            .exists(),
         "--artifact-dir should keep electron addon out of the generated source tree"
     );
     assert!(
@@ -567,18 +588,20 @@ fn cli_build_orchestrates_full_javascript_tree() {
         "combined build should leave wasm-bindgen TypeScript declarations in browser/pkg: {pkg_entries:?}"
     );
 
-    let preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    let preload =
+        std::fs::read_to_string(out_dir.join("components/cli_wasm/electron/preload.cjs")).unwrap();
     assert!(
         preload.contains("dispatchSync") && preload.contains("dispatchAsync"),
         "combined build electron preload should expose sync and async dispatch:\n{preload}"
     );
     assert!(
-        preload.contains("../artifacts/electron/cli_wasm.node"),
+        preload.contains("../../../artifacts/electron/cli_wasm.node"),
         "preload should load the addon from --artifact-dir:\n{preload}"
     );
-    let node_backend = std::fs::read_to_string(out_dir.join("node/backend-napi.ts")).unwrap();
+    let node_backend =
+        std::fs::read_to_string(out_dir.join("components/cli_wasm/node/backend-napi.ts")).unwrap();
     assert!(
-        node_backend.contains("../artifacts/node/cli_wasm.node"),
+        node_backend.contains("../../../artifacts/node/cli_wasm.node"),
         "node backend should load the addon from --artifact-dir:\n{node_backend}"
     );
 
@@ -637,7 +660,8 @@ async function expectThrown(label: string, call: () => unknown): Promise<void> {
 }
 
 const glue = require("__WASM_PKG__/__WASM_GLUE__");
-const browser = await import("./browser/index.ts");
+const browserRoot = await import("./browser/index.ts");
+const browser = browserRoot.cli_wasm;
 await browser.initBackend(glue);
 assertEq(browser.add(2n, 3n), 5n, "browser.add");
 assertEq(browser.slowAdd(20n, 22n), 42n, "browser.slowAdd name mapping");
@@ -651,7 +675,8 @@ assertEq(browserEvent.y, 4, "browser.makeEvent y");
 assertEq(browser.describeEvent({ tag: "Moved", x: 5, y: 6 }), "moved:5,6", "browser.describeEvent");
 await expectThrown("browser.sub underflow", () => browser.sub(1n, 2n));
 
-const nodeApi = await import("./node/index.ts");
+const nodeRoot = await import("./node/index.ts");
+const nodeApi = nodeRoot.cli_wasm;
 assertEq(nodeApi.add(4n, 6n), 10n, "node.add");
 assertEq(nodeApi.slowAdd(20n, 22n), 42n, "node.slowAdd name mapping");
 assertEq(await nodeApi.asyncAdd(30n, 12n), 42n, "node.asyncAdd");
@@ -666,7 +691,8 @@ await expectThrown("node.sub underflow", () => nodeApi.sub(1n, 2n));
 
 (globalThis as { window?: unknown }).window = globalThis;
 require("./electron/preload.cjs");
-const electronApi = await import("./electron/renderer.ts");
+const electronRoot = await import("./electron/index.ts");
+const electronApi = electronRoot.cli_wasm;
 assertEq(electronApi.add(10n, 11n), 21n, "electron.add");
 assertEq(electronApi.slowAdd(20n, 22n), 42n, "electron.slowAdd name mapping");
 assertEq(await electronApi.asyncAdd(30n, 12n), 42n, "electron.asyncAdd");
@@ -772,7 +798,10 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "src/index.web.ts",
         "src/index.mini-program.ts",
         "src/index.node.ts",
-        "src/ffi/common/public-types.ts",
+        "src/ffi/shared/runtime.ts",
+        "src/ffi/components/cli_wasm/common/public-types.ts",
+        "src/ffi/components/cli_wasm/browser/index.ts",
+        "src/ffi/components/cli_wasm/node/index.ts",
         "src/ffi/browser/index.web.ts",
         "src/ffi/browser/index.mini-program.ts",
         "src/ffi/node/index.ts",
@@ -796,8 +825,8 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "managed web entry must re-export generated browser auto entry:\n{web_entry}"
     );
     assert!(
-        web_entry.contains("export type * from \"./ffi/common/public-types.ts\";"),
-        "managed web entry must re-export public types:\n{web_entry}"
+        !web_entry.contains("public-types.ts"),
+        "managed web entry must preserve the namespace-only public surface:\n{web_entry}"
     );
     assert!(
         !web_entry.contains(package_dir.as_str()) && !web_entry.contains("artifacts/"),
@@ -811,8 +840,8 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "managed Mini Program entry must re-export generated Mini Program entry:\n{mini_entry}"
     );
     assert!(
-        mini_entry.contains("export type * from \"./ffi/common/public-types.ts\";"),
-        "managed Mini Program entry must re-export public types:\n{mini_entry}"
+        !mini_entry.contains("public-types.ts"),
+        "managed Mini Program entry must preserve the namespace-only public surface:\n{mini_entry}"
     );
 
     let mini_runtime =
@@ -863,8 +892,8 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         "managed node entry must re-export generated node entry:\n{node_entry}"
     );
     assert!(
-        node_entry.contains("export type * from \"./ffi/common/public-types.ts\";"),
-        "managed node entry must re-export public types:\n{node_entry}"
+        !node_entry.contains("public-types.ts"),
+        "managed node entry must preserve the namespace-only public surface:\n{node_entry}"
     );
 
     let gitignore = std::fs::read_to_string(package_dir.join(".gitignore")).unwrap();
@@ -888,7 +917,14 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         serde_json::json!(["wasm", "mini-program", "node"])
     );
     assert_eq!(manifest_json["source"]["root"], "src/ffi");
-    assert_eq!(manifest_json["source"]["common"], "src/ffi/common");
+    assert_eq!(
+        manifest_json["source"]["common"],
+        "src/ffi/components/cli_wasm/common"
+    );
+    assert_eq!(
+        manifest_json["source"]["publicTypes"],
+        "src/ffi/components/cli_wasm/common/public-types.ts"
+    );
     assert_eq!(manifest_json["entrypoints"]["web"], "src/index.web.ts");
     assert_eq!(
         manifest_json["entrypoints"]["miniProgram"],
@@ -947,13 +983,14 @@ const calls: string[] = [];
     },
 };
 
-const mini = await import("./src/index.mini-program.ts");
-await mini.init("/assets/cli_wasm_fixture_wasm_bg.wasm");
+const miniRoot = await import("./src/index.mini-program.ts");
+const mini = miniRoot.cli_wasm;
+await miniRoot.init("/assets/cli_wasm_fixture_wasm_bg.wasm");
 assertEq(calls[0], "/assets/cli_wasm_fixture_wasm_bg.wasm", "WXWebAssembly path");
 assertEq(mini.add(2n, 3n), 5n, "mini.add");
 assertEq(mini.slowAdd(20n, 22n), 42n, "mini.slowAdd");
 assertEq(await mini.asyncAdd(30n, 12n), 42n, "mini.asyncAdd");
-await mini.init("/assets/ignored.wasm");
+await miniRoot.init("/assets/ignored.wasm");
 assertEq(calls.length, 1, "mini init idempotent");
 console.log("mini-program managed runtime ok");
 "#;
@@ -1003,8 +1040,10 @@ function run(label: string, fn: (a: bigint, b: bigint) => bigint): { elapsed: nu
     return { elapsed: performance.now() - started, acc };
 }
 
-const managed = await import("./src/index.node.ts");
-const direct = await import("./src/ffi/node/index.ts");
+const managedRoot = await import("./src/index.node.ts");
+const directRoot = await import("./src/ffi/node/index.ts");
+const managed = managedRoot.cli_wasm;
+const direct = directRoot.cli_wasm;
 assertEq(managed.add(2n, 3n), 5n, "managed.add");
 assertEq(direct.add(2n, 3n), 5n, "direct.add");
 
