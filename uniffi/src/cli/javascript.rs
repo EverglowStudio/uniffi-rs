@@ -2300,8 +2300,8 @@ fn cargo_package_matches_selector(package: &Package, selector: &str) -> bool {
 mod tests {
     use super::{
         emit_browser_auto_entrypoint, host_dependency_cargo_feature_args,
-        rebase_mini_program_auto_entrypoint, BuildWasmArgs, WasmBindgenTargetArg,
-        WasmTargetIsolationGuard,
+        patch_mini_program_web_runtime, rebase_mini_program_auto_entrypoint, BuildWasmArgs,
+        WasmBindgenTargetArg, WasmTargetIsolationGuard,
     };
     #[cfg(windows)]
     use super::{wasm_preflight_nofollow, windows_wasm_semantic_path_key};
@@ -2328,6 +2328,33 @@ mod tests {
             crate_name: None,
             metadata_no_deps: false,
         }
+    }
+
+    #[test]
+    fn mini_program_web_runtime_patch_removes_free_fetch_and_constructor_lookups() {
+        let source = r#"
+const ret = getObject(arg0).fetch(getObject(arg1));
+const ret = fetch(getObject(arg0));
+result = getObject(arg0) instanceof Response;
+const ret = new Headers();
+const ret = new Request(getStringFromWasm0(arg0, arg1), getObject(arg2));
+if (typeof Response === 'function' && module instanceof Response) {
+}
+"#;
+
+        let patched = patch_mini_program_web_runtime(source);
+
+        assert!(patched.contains("export function setMiniProgramWebRuntime(runtime)"));
+        assert!(patched.contains("__uniffiMiniProgramFetch(getObject(arg1))"));
+        assert!(patched.contains("__uniffiMiniProgramFetch(getObject(arg0))"));
+        assert!(patched.contains("instanceof __uniffiMiniProgramResponse"));
+        assert!(patched.contains("new __uniffiMiniProgramHeaders()"));
+        assert!(patched.contains("new __uniffiMiniProgramRequest("));
+        assert!(!patched.contains("getObject(arg0).fetch("));
+        assert!(!patched.contains("const ret = fetch("));
+        assert!(!patched.contains("instanceof Response"));
+        assert!(!patched.contains("new Headers()"));
+        assert!(!patched.contains("new Request("));
     }
 
     #[test]
@@ -3166,7 +3193,60 @@ fn patch_mini_program_wasm_bindgen_glue(source: &str, wasm_bindgen_stem: &str) -
         "const ret = typeof window === 'undefined' ? null : window;",
         "const ret = null;",
     );
+    let patched = patch_mini_program_web_runtime(&patched);
     Ok(patch_mini_program_text_encoding(&patched))
+}
+
+fn patch_mini_program_web_runtime(source: &str) -> String {
+    let patched = source
+        .replace(
+            "const ret = getObject(arg0).fetch(getObject(arg1));",
+            "const ret = __uniffiMiniProgramFetch(getObject(arg1));",
+        )
+        .replace(
+            "const ret = fetch(getObject(arg0));",
+            "const ret = __uniffiMiniProgramFetch(getObject(arg0));",
+        )
+        .replace(
+            "result = getObject(arg0) instanceof Response;",
+            "result = getObject(arg0) instanceof __uniffiMiniProgramResponse;",
+        )
+        .replace(
+            "const ret = new Headers();",
+            "const ret = new __uniffiMiniProgramHeaders();",
+        )
+        .replace(
+            "const ret = new Request(getStringFromWasm0(arg0, arg1), getObject(arg2));",
+            "const ret = new __uniffiMiniProgramRequest(getStringFromWasm0(arg0, arg1), getObject(arg2));",
+        )
+        .replace(
+            "if (typeof Response === 'function' && module instanceof Response) {",
+            "if (typeof __uniffiMiniProgramResponse === 'function' && module instanceof __uniffiMiniProgramResponse) {",
+        );
+    format!("{}\n{}", mini_program_web_runtime_prelude(), patched)
+}
+
+fn mini_program_web_runtime_prelude() -> &'static str {
+    r#"let __uniffiMiniProgramFetch = typeof fetch === "function" ? fetch : undefined;
+let __uniffiMiniProgramHeaders = typeof Headers === "function" ? Headers : undefined;
+let __uniffiMiniProgramRequest = typeof Request === "function" ? Request : undefined;
+let __uniffiMiniProgramResponse = typeof Response === "function" ? Response : undefined;
+
+export function setMiniProgramWebRuntime(runtime) {
+    if (runtime === null || typeof runtime !== "object") {
+        throw new TypeError("Mini Program web runtime must be an object");
+    }
+    if (typeof runtime.fetch !== "function"
+        || typeof runtime.Headers !== "function"
+        || typeof runtime.Request !== "function"
+        || typeof runtime.Response !== "function") {
+        throw new TypeError("Mini Program web runtime requires fetch, Headers, Request, and Response");
+    }
+    __uniffiMiniProgramFetch = runtime.fetch;
+    __uniffiMiniProgramHeaders = runtime.Headers;
+    __uniffiMiniProgramRequest = runtime.Request;
+    __uniffiMiniProgramResponse = runtime.Response;
+}"#
 }
 
 fn patch_mini_program_text_encoding(source: &str) -> String {
@@ -3391,6 +3471,13 @@ declare const WXWebAssembly:
 
 export const DEFAULT_WASM_PATH = "{default_wasm_path}";
 
+export type MiniProgramWebRuntime = {{
+    fetch: unknown;
+    Headers: unknown;
+    Request: unknown;
+    Response: unknown;
+}};
+
 let readyPromise: Promise<void> | null = null;
 
 function assertWXWebAssembly(): void {{
@@ -3405,6 +3492,13 @@ export function init(wasmPath: string = DEFAULT_WASM_PATH): Promise<void> {{
 
 export function initWithPath(wasmPath: string): Promise<void> {{
     return init(wasmPath);
+}}
+
+export function setMiniProgramWebRuntime(runtime: MiniProgramWebRuntime): void {{
+    const runtimeGlue = glue as typeof glue & {{
+        setMiniProgramWebRuntime(value: MiniProgramWebRuntime): void;
+    }};
+    runtimeGlue.setMiniProgramWebRuntime(runtime);
 }}
 
 export function initWithGlue(

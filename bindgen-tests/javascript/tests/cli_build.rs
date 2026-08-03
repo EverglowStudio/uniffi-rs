@@ -936,6 +936,10 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         mini_runtime.contains("WXWebAssembly.instantiate"),
         "Mini Program entry should validate WXWebAssembly.instantiate:\n{mini_runtime}"
     );
+    assert!(
+        mini_runtime.contains("setMiniProgramWebRuntime"),
+        "Mini Program entry should expose the generated glue runtime setter:\n{mini_runtime}"
+    );
 
     let mini_glue = std::fs::read_to_string(package_dir.join(mini_glue_path)).unwrap();
     for forbidden in ["fetch(", "import.meta.url", "?url", "window", "document"] {
@@ -954,6 +958,10 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
             && !mini_glue.contains("new TextDecoder(")
             && !mini_glue.contains("new TextEncoder("),
         "patched Mini Program glue must not require TextDecoder/TextEncoder globals at module evaluation:\n{mini_glue}"
+    );
+    assert!(
+        mini_glue.contains("export function setMiniProgramWebRuntime(runtime)"),
+        "patched Mini Program glue must own injectable web runtime slots:\n{mini_glue}"
     );
 
     let node_entry = std::fs::read_to_string(package_dir.join("src/index.node.ts")).unwrap();
@@ -1074,6 +1082,12 @@ const calls: string[] = [];
 
 const miniRoot = await import("./src/index.mini-program.ts");
 const mini = miniRoot.cli_wasm;
+miniRoot.setMiniProgramWebRuntime({
+    fetch: async () => { throw new Error("unused fixture fetch"); },
+    Headers: class {},
+    Request: class {},
+    Response: class {},
+});
 let defaultCalls = 0;
 // Keep the real named wasm-bindgen exports, but make `default` explicitly
 // read-only. The generated Mini Program coordinator must shadow it on a
