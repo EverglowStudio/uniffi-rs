@@ -4497,6 +4497,16 @@ fn build(mut args: BuildArgs) -> Result<()> {
     if targets.mini_program && args.wasm_bindgen_target != WasmBindgenTargetArg::Web {
         bail!("--target mini-program requires --wasm-bindgen-target web");
     }
+    // Managed target generation is intentionally fail-closed once its durable
+    // transaction starts: partial tool output is not adopted after an error
+    // merely so it can be deleted.  Reject deterministic Android toolchain
+    // configuration errors before any journal, candidate, or build root can
+    // exist. `build_android` repeats these checks at the point of use so this
+    // early validation does not weaken the normal TOCTOU boundary.
+    if args.managed_layout && targets.android {
+        preflight_android_toolchain(&args)
+            .context("preflighting Android toolchain before target generation")?;
+    }
 
     // Managed HSP derives its public layout without touching the filesystem so
     // existing ownership, residue, and manifest evidence can fail closed
@@ -4718,6 +4728,21 @@ fn build_android(args: &BuildArgs) -> Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+fn preflight_android_toolchain(args: &BuildArgs) -> Result<()> {
+    let ndk_home = resolve_android_ndk_home(args)?;
+    let prebuilt = android_llvm_prebuilt_dir(&ndk_home)?;
+    for abi in android_abis(args)? {
+        let clang = android_clang_path(&prebuilt, &abi, args.android_api);
+        if !clang.exists() {
+            bail!(
+                "Android NDK clang not found at {}. Check --android-ndk-home/ANDROID_NDK_HOME and --android-api",
+                clang
+            );
+        }
+    }
     Ok(())
 }
 
