@@ -173,7 +173,7 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
         &std::fs::read(host_dir.join("ohos/uniffi-ohos-facade-bundle.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(bundle["hostBundleSchemaVersion"], 3);
+    assert_eq!(bundle["hostBundleSchemaVersion"], 4);
     assert_eq!(bundle["components"][0]["namespace"], "arithmetic");
     assert_eq!(
         bundle["components"][0]["nativeExportPrefix"],
@@ -702,7 +702,7 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
         &std::fs::read(forward_hosts.join("ohos/uniffi-ohos-facade-bundle.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(bundle["hostBundleSchemaVersion"], 3);
+    assert_eq!(bundle["hostBundleSchemaVersion"], 4);
     assert_eq!(bundle["packageName"], host_package);
     assert_eq!(bundle["libTarget"], host_target);
     assert_eq!(bundle["components"].as_array().map(Vec::len), Some(2));
@@ -725,11 +725,20 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
                     .as_str()
                     .unwrap()
                     .to_string(),
+                component["interfaceAbiDigest"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
             )
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        identity_components,
+        identity_components
+            .iter()
+            .map(|(component, namespace, prefix, _)| {
+                (component.clone(), namespace.clone(), prefix.clone())
+            })
+            .collect::<Vec<_>>(),
         vec![
             (
                 "alpha_core".to_string(),
@@ -744,6 +753,12 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
         ],
         "bundle components must preserve stable crate/namespace/native-prefix ownership",
     );
+    assert!(identity_components.iter().all(|(_, _, _, digest)| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }));
     assert_eq!(
         bundle["hostCompositeIdentity"],
         uniffi_bindgen_javascript::host_crates::composite_host_identity(

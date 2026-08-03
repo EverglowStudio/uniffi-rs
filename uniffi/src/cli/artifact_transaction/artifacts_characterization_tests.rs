@@ -2338,6 +2338,7 @@ fn exact_node_managed_manifest_for_components(
             "component": component.component,
             "namespace": component.namespace,
             "nativeExportPrefix": component.native_export_prefix,
+            "interfaceAbiDigest": component.interface_abi_digest,
             "source": {
                 "common": format!("src/ffi/components/{}/common", component.namespace),
                 "browser": null,
@@ -2595,6 +2596,7 @@ fn current_harmony_managed_manifest(shape: CurrentHarmonyManifestShape) -> serde
             "component": component.component,
             "namespace": component.namespace,
             "nativeExportPrefix": component.native_export_prefix,
+            "interfaceAbiDigest": component.interface_abi_digest,
             "source": {
                 "common": "src/ffi/components/uni_core/common",
                 "browser": null,
@@ -3272,6 +3274,16 @@ fn managed_manifest_v4_preflight_rejects_legacy_and_tampering_without_side_effec
     let mut unknown = current.clone();
     unknown["components"][0]["unexpected"] = serde_json::json!(true);
 
+    let mut missing_interface_abi = current.clone();
+    missing_interface_abi["components"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("interfaceAbiDigest");
+
+    let mut noncanonical_interface_abi = current.clone();
+    noncanonical_interface_abi["components"][0]["interfaceAbiDigest"] =
+        serde_json::json!("A".repeat(64));
+
     let mut duplicate = current.clone();
     duplicate["components"]
         .as_array_mut()
@@ -3311,6 +3323,16 @@ fn managed_manifest_v4_preflight_rejects_legacy_and_tampering_without_side_effec
             "unknown component field",
             unknown,
             "unknown field `unexpected`",
+        ),
+        (
+            "missing component interface ABI digest",
+            missing_interface_abi,
+            "missing field `interfaceAbiDigest`",
+        ),
+        (
+            "noncanonical component interface ABI digest",
+            noncanonical_interface_abi,
+            "canonical lowercase SHA-256 digest",
         ),
         (
             "duplicate component identity",
@@ -3543,6 +3565,121 @@ fn managed_manifest_v4_incremental_subset_rejects_retained_route_swaps_without_m
     );
 
     let sidecar = managed_owner_path(&layout.package_dir);
+    std::fs::remove_dir_all(root).ok();
+    let _ = std::fs::remove_file(sidecar);
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_manifest_v4_abi_change_requires_complete_existing_target_union() {
+    let root = unique_tmp_dir("managed-manifest-v4-interface-abi-union");
+    let v1 =
+        ManagedComponentIdentity::with_interface_abi_digest("fixture", "fixture", "1".repeat(64))
+            .unwrap();
+    let v2 =
+        ManagedComponentIdentity::with_interface_abi_digest("fixture", "fixture", "2".repeat(64))
+            .unwrap();
+    let mut historical_layout = write_exact_node_managed_fixture_for_components(
+        &root,
+        "fixture",
+        std::slice::from_ref(&v1),
+    );
+    let mut args = empty_build_args();
+    args.manifest_path = write_test_manifest(&root.join("core"));
+    args.managed_layout = true;
+    args.package_dir = Some(historical_layout.package_dir.clone());
+    args.out_dir = None;
+    args.target = vec![ArtifactTargetArg::Node, ArtifactTargetArg::Electron];
+    let historical_targets = expand_targets(&args.target).unwrap();
+    let route_inputs = ManagedArtifactRouteInputs::from(&args);
+    historical_layout.expected_routes = Some(
+        historical_layout
+            .managed_artifact_route_plan(&historical_targets, &route_inputs, None)
+            .unwrap(),
+    );
+    historical_layout.route_inputs = Some(route_inputs.clone());
+    let meta = cargo_package_metadata(&args.manifest_path).unwrap();
+    let historical_manifest: serde_json::Value = serde_json::from_str(
+        &historical_layout
+            .render_manifest(&historical_targets, &meta, &args)
+            .unwrap(),
+    )
+    .unwrap();
+    publish_exact_all_target_managed_fixture(&historical_layout, &historical_manifest);
+
+    let node_targets = ExpandedTargets {
+        node: true,
+        ..Default::default()
+    };
+    let mut changed_partial = historical_layout.clone();
+    changed_partial.components = Some(vec![v2.clone()]);
+    changed_partial.expected_routes = Some(
+        changed_partial
+            .managed_artifact_route_plan(&node_targets, &route_inputs, None)
+            .unwrap(),
+    );
+    changed_partial.route_inputs = Some(route_inputs.clone());
+    assert_managed_preflight_rejects_without_mutation(
+        &changed_partial,
+        &root,
+        "interface ABI digest changed",
+    );
+
+    let mut same_api_partial = historical_layout.clone();
+    same_api_partial.expected_routes = Some(
+        same_api_partial
+            .managed_artifact_route_plan(&node_targets, &route_inputs, None)
+            .unwrap(),
+    );
+    same_api_partial.route_inputs = Some(route_inputs.clone());
+    same_api_partial
+        .preflight_existing_package()
+        .expect("same-ABI partial update should retain sibling targets");
+    let same_api_merged: serde_json::Value = serde_json::from_str(
+        &same_api_partial
+            .render_manifest(&node_targets, &meta, &args)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        same_api_merged["targets"],
+        serde_json::json!(["node", "electron"])
+    );
+    assert_eq!(
+        same_api_merged["artifacts"]["electron"],
+        historical_manifest["artifacts"]["electron"]
+    );
+
+    let mut changed_full = changed_partial;
+    changed_full.expected_routes = Some(
+        changed_full
+            .managed_artifact_route_plan(&historical_targets, &route_inputs, None)
+            .unwrap(),
+    );
+    changed_full
+        .preflight_existing_package()
+        .expect("an ABI change may replace the complete existing target union");
+    let changed_manifest: serde_json::Value = serde_json::from_str(
+        &changed_full
+            .render_manifest(&historical_targets, &meta, &args)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        changed_manifest["components"][0]["interfaceAbiDigest"],
+        "2".repeat(64)
+    );
+    assert_ne!(
+        changed_manifest["hostCompositeIdentity"],
+        historical_manifest["hostCompositeIdentity"]
+    );
+
+    validate_managed_owner(
+        &historical_layout.package_dir,
+        &parse_managed_owner(&historical_layout.package_dir).unwrap(),
+    )
+    .unwrap();
+    let sidecar = managed_owner_path(&historical_layout.package_dir);
     std::fs::remove_dir_all(root).ok();
     let _ = std::fs::remove_file(sidecar);
 }
@@ -3806,6 +3943,41 @@ fn managed_manifest_v4_harmony_kind_transitions_validate_historical_routes_befor
 #[cfg(unix)]
 const MANAGED_CURRENT_SOURCE_PREFLIGHT_CHILD_ROOT: &str =
     "UNIFFI_MANAGED_CURRENT_SOURCE_PREFLIGHT_CHILD_ROOT";
+
+#[test]
+fn managed_source_interface_abi_digest_ignores_bodies_and_tracks_api_shape() {
+    let root = unique_tmp_dir("managed-source-interface-abi-digest");
+    let manifest_path = write_test_source_manifest(&root.join("core"));
+    let source_path = manifest_path.parent().unwrap().join("src/lib.rs");
+    let mut args = empty_build_args();
+    args.manifest_path = manifest_path;
+    args.cargo_features = vec!["planned".into()];
+
+    let initial = managed_authoritative_input_components(&args, "uni-core").unwrap();
+    assert_eq!(initial.len(), 1);
+    let initial_digest = initial[0].interface_abi_digest.clone();
+
+    let source = std::fs::read_to_string(&source_path).unwrap();
+    let same_api = source.replace(
+        "current_component() -> u32 { 1 }",
+        "current_component() -> u32 { 2 }",
+    );
+    assert_ne!(same_api, source);
+    std::fs::write(&source_path, &same_api).unwrap();
+    let body_only = managed_authoritative_input_components(&args, "uni-core").unwrap();
+    assert_eq!(body_only[0].interface_abi_digest, initial_digest);
+
+    let changed_api = same_api.replace(
+        "current_component() -> u32 { 2 }",
+        "current_component() -> u64 { 2 }",
+    );
+    assert_ne!(changed_api, same_api);
+    std::fs::write(&source_path, changed_api).unwrap();
+    let changed = managed_authoritative_input_components(&args, "uni-core").unwrap();
+    assert_ne!(changed[0].interface_abi_digest, initial_digest);
+
+    std::fs::remove_dir_all(root).ok();
+}
 
 #[cfg(unix)]
 fn run_managed_current_source_plan_preflight_test(root: &Utf8Path) {
@@ -4175,6 +4347,13 @@ fn run_managed_hsp_top_level_preflight_test(root: &Utf8Path) {
     // Exercise `build`, the `artifacts build` command handler, rather than
     // calling `build_managed_package` directly.
     let manifest_path = write_test_source_manifest(&root.join("core"));
+    let mut planner_args = empty_build_args();
+    planner_args.manifest_path = manifest_path.clone();
+    planner_args.cargo_features = vec!["planned".into()];
+    let current_components =
+        managed_authoritative_input_components(&planner_args, "uni-core").unwrap();
+    assert_eq!(current_components.len(), 1);
+    let current_component = &current_components[0];
     let scratch = root.join("hsp-preflight-scratch");
     assert!(scratch.is_dir(), "child HSP scratch directory is missing");
 
@@ -4242,15 +4421,14 @@ fn run_managed_hsp_top_level_preflight_test(root: &Utf8Path) {
     ];
     for (label, expected_error, mutate) in manifest_cases {
         let case = root.join(label);
-        let component = ManagedComponentIdentity::new("uni_core", "uni_core").unwrap();
         let layout = write_exact_node_managed_fixture_for_components(
             &case,
             "uni-core",
-            std::slice::from_ref(&component),
+            std::slice::from_ref(current_component),
         );
         let mut manifest = exact_node_managed_manifest_for_components(
             "uni-core",
-            std::slice::from_ref(&component),
+            std::slice::from_ref(current_component),
         );
         mutate(&mut manifest);
         rewrite_exact_node_managed_manifest(&layout, &manifest);
@@ -4296,11 +4474,10 @@ fn run_managed_hsp_top_level_preflight_test(root: &Utf8Path) {
     );
 
     let current_case = root.join("current-exact");
-    let component = ManagedComponentIdentity::new("uni_core", "uni_core").unwrap();
     let current = write_exact_node_managed_fixture_for_components(
         &current_case,
         "uni-core",
-        std::slice::from_ref(&component),
+        std::slice::from_ref(current_component),
     );
     let tools = managed_hsp_frontend_test_tools(&current_case);
     assert_managed_hsp_top_level_reaches_frontend_tools(
@@ -6796,11 +6973,11 @@ fn managed_layout_emits_entries_and_relative_manifest() {
     assert_eq!(manifest["artifactManifestSchemaVersion"], 4);
     assert!(manifest.get("schemaVersion").is_none());
     assert!(manifest.get("namespace").is_none());
-    let component = ManagedComponentIdentity::new("uni_core", "uni_core").unwrap();
+    let components = layout.exact_components().unwrap();
     assert_eq!(
         manifest["hostCompositeIdentity"],
         test_managed_host_identity("uni-core")
-            .composite_identity(std::slice::from_ref(&component))
+            .composite_identity(components)
             .unwrap()
     );
     assert_eq!(manifest["components"].as_array().map(Vec::len), Some(1));
@@ -6809,6 +6986,10 @@ fn managed_layout_emits_entries_and_relative_manifest() {
     assert_eq!(
         manifest["components"][0]["nativeExportPrefix"],
         "ffi_uni_core"
+    );
+    assert_eq!(
+        manifest["components"][0]["interfaceAbiDigest"],
+        components[0].interface_abi_digest
     );
     assert_eq!(
         manifest["targets"],

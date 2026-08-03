@@ -68,6 +68,8 @@ pub enum BuiltinItem {
     HashSet,
     Option,
     Result,
+    UniFfiStream,
+    UniFfiInputStream,
     Arc,
     Box,
     From,
@@ -87,6 +89,8 @@ impl BuiltinItem {
                 | Self::Arc
                 | Self::Box
                 | Self::Result
+                | Self::UniFfiStream
+                | Self::UniFfiInputStream
         )
     }
 }
