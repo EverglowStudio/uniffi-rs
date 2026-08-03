@@ -137,8 +137,6 @@ pub fn ohos_raw_output_stream_names_for_prefix(
 ) -> OhosRawOutputStreamNames {
     let next_key = crate::dispatch_key::stream_next_key(function_short_name);
     let cancel_key = crate::dispatch_key::stream_cancel_key(function_short_name);
-    let next_short_name = crate::js_names::function_name(&next_key);
-    let cancel_short_name = crate::js_names::function_name(&cancel_key);
     let step_short_name = format!(
         "Uniffi{}StreamNext",
         function_short_name.to_upper_camel_case()
@@ -150,11 +148,11 @@ pub fn ohos_raw_output_stream_names_for_prefix(
         ),
         next_function: crate::native_exports::native_export_name_for_prefix(
             native_export_prefix,
-            &next_short_name,
+            &next_key,
         ),
         cancel_function: crate::native_exports::native_export_name_for_prefix(
             native_export_prefix,
-            &cancel_short_name,
+            &cancel_key,
         ),
         step_type: crate::native_exports::native_export_name_for_prefix(
             native_export_prefix,
@@ -779,21 +777,13 @@ fn render_ohos_extra_types(
         for constructor in record.constructors() {
             let constructor_name = ohos_raw_export_name(
                 ci,
-                &crate::js_names::function_name(&crate::dispatch_key::constructor_key(
-                    record.name(),
-                    constructor,
-                )),
+                &crate::dispatch_key::constructor_key(record.name(), constructor),
             );
             definitions.insert_callable(ci, &constructor_name, constructor, None)?;
         }
         for method in record.methods() {
-            let method_name = ohos_raw_export_name(
-                ci,
-                &crate::js_names::function_name(&crate::dispatch_key::method_key(
-                    record.name(),
-                    method,
-                )),
-            );
+            let method_name =
+                ohos_raw_export_name(ci, &crate::dispatch_key::method_key(record.name(), method));
             definitions.insert_callable(
                 ci,
                 &method_name,
@@ -846,21 +836,13 @@ fn render_ohos_extra_types(
         for constructor in enum_.constructors() {
             let constructor_name = ohos_raw_export_name(
                 ci,
-                &crate::js_names::function_name(&crate::dispatch_key::constructor_key(
-                    enum_.name(),
-                    constructor,
-                )),
+                &crate::dispatch_key::constructor_key(enum_.name(), constructor),
             );
             definitions.insert_callable(ci, &constructor_name, constructor, None)?;
         }
         for method in enum_.methods() {
-            let method_name = ohos_raw_export_name(
-                ci,
-                &crate::js_names::function_name(&crate::dispatch_key::method_key(
-                    enum_.name(),
-                    method,
-                )),
-            );
+            let method_name =
+                ohos_raw_export_name(ci, &crate::dispatch_key::method_key(enum_.name(), method));
             definitions.insert_callable(
                 ci,
                 &method_name,
@@ -878,20 +860,13 @@ fn render_ohos_extra_types(
                 for constructor in object.constructors() {
                     let constructor_name = ohos_raw_export_name(
                         ci,
-                        &crate::js_names::function_name(&crate::dispatch_key::constructor_key(
-                            object.name(),
-                            constructor,
-                        )),
+                        &crate::dispatch_key::constructor_key(object.name(), constructor),
                     );
                     definitions.insert_callable(ci, &constructor_name, constructor, None)?;
                 }
                 for method in object.methods() {
-                    let method_name = ohos_raw_export_name(
-                        ci,
-                        &crate::js_names::function_name(&crate::dispatch_key::object_method_key(
-                            method,
-                        )),
-                    );
+                    let method_name =
+                        ohos_raw_export_name(ci, &crate::dispatch_key::object_method_key(method));
                     definitions.insert_callable(
                         ci,
                         &method_name,
@@ -953,7 +928,7 @@ fn render_ohos_extra_types(
             ..
         }) = function.return_type()
         {
-            let function_short_name = crate::js_names::function_name(function.name());
+            let function_short_name = crate::dispatch_key::free_function_key(function.name());
             let raw_names = ohos_raw_output_stream_names_for_prefix(
                 &ci.native_export_prefix(),
                 &function_short_name,
@@ -996,7 +971,7 @@ fn render_ohos_extra_types(
             )?;
         } else {
             let function_name =
-                ohos_raw_export_name(ci, &crate::js_names::function_name(function.name()));
+                ohos_raw_export_name(ci, &crate::dispatch_key::free_function_key(function.name()));
             definitions.insert_callable(ci, &function_name, function, None)?;
         }
     }
@@ -1495,8 +1470,9 @@ fn render_ohos_facade_contract(ci: &uniffi_bindgen::ComponentInterface) -> Resul
             continue;
         };
         let function_name = crate::js_names::function_name(function.name());
+        let raw_function_name = crate::dispatch_key::free_function_key(function.name());
         let raw_names =
-            ohos_raw_output_stream_names_for_prefix(&ci.native_export_prefix(), &function_name);
+            ohos_raw_output_stream_names_for_prefix(&ci.native_export_prefix(), &raw_function_name);
         let class_prefix = function_name.to_upper_camel_case();
         let arguments = function
             .arguments()
@@ -2310,6 +2286,64 @@ mod ohos_facade_type_tests {
         assert_eq!(
             ohos_napi_ts_type(&optional_record).unwrap(),
             "StreamItem | undefined | null"
+        );
+    }
+
+    #[test]
+    fn ohos_raw_callable_metadata_matches_namespaced_napi_exports() {
+        let mut metadata = group("facade_graph");
+        metadata.add_item(
+            function(
+                "add_ticket_points",
+                vec![
+                    FnParamMetadata::simple("base_points", Type::Int32),
+                    FnParamMetadata::simple("escalation_points", Type::Int32),
+                ],
+                Some(Type::Int32),
+            )
+            .into(),
+        );
+        metadata.add_item(
+            function(
+                "support_update_steps",
+                Vec::new(),
+                Some(output_stream(Type::UInt32, Type::String)),
+            )
+            .into(),
+        );
+        let ci = ComponentInterface::from_metadata(metadata).unwrap();
+        let contract_json = render_ohos_facade_contract(&ci).unwrap();
+        let contract = parse_ohos_facade_contract(&contract_json).unwrap();
+        let digest = sha256_text(&contract_json);
+        let identity_export = ohos_bridge_identity_export(&ci, &digest);
+        let sidecar = render_ohos_extra_types(&ci, &identity_export).unwrap();
+        let prefix = ci.native_export_prefix();
+        let output = contract.output_streams.first().unwrap();
+
+        for expected in [
+            format!("{prefix}_add_ticket_points"),
+            format!("{prefix}_support_update_steps"),
+            format!("{prefix}_support_update_steps_stream_next"),
+            format!("{prefix}_support_update_steps_stream_cancel"),
+        ] {
+            assert!(
+                sidecar.contains(&format!(r#""name":"{expected}""#)),
+                "canonical OHOS sidecar is missing raw N-API export `{expected}`:\n{sidecar}"
+            );
+        }
+        assert_eq!(output.function, format!("{prefix}_support_update_steps"));
+        assert_eq!(
+            output.next_function,
+            format!("{prefix}_support_update_steps_stream_next")
+        );
+        assert_eq!(
+            output.cancel_function,
+            format!("{prefix}_support_update_steps_stream_cancel")
+        );
+        assert!(!sidecar.contains("addTicketPoints"), "{sidecar}");
+        assert!(
+            !sidecar.contains("supportUpdateStepsStreamNext"),
+            "{sidecar}"
         );
     }
 
