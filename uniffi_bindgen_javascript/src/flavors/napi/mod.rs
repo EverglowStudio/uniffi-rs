@@ -14,7 +14,7 @@
 use anyhow::{bail, Context, Result};
 use camino::Utf8Path;
 use fs_err as fs;
-use heck::ToUpperCamelCase;
+use heck::{ToSnakeCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uniffi_bindgen::interface::{AsType, Callable, Method, Type};
@@ -135,16 +135,14 @@ pub fn ohos_raw_output_stream_names_for_prefix(
     native_export_prefix: &str,
     function_short_name: &str,
 ) -> OhosRawOutputStreamNames {
-    let next_key = crate::dispatch_key::stream_next_key(function_short_name);
-    let cancel_key = crate::dispatch_key::stream_cancel_key(function_short_name);
-    let step_short_name = format!(
-        "Uniffi{}StreamNext",
-        function_short_name.to_upper_camel_case()
-    );
+    let function_key = function_short_name.to_snake_case();
+    let next_key = crate::dispatch_key::stream_next_key(&function_key);
+    let cancel_key = crate::dispatch_key::stream_cancel_key(&function_key);
+    let step_short_name = format!("Uniffi{}StreamNext", function_key.to_upper_camel_case());
     OhosRawOutputStreamNames {
         function: crate::native_exports::native_export_name_for_prefix(
             native_export_prefix,
-            function_short_name,
+            &function_key,
         ),
         next_function: crate::native_exports::native_export_name_for_prefix(
             native_export_prefix,
@@ -2344,6 +2342,29 @@ mod ohos_facade_type_tests {
         assert!(
             !sidecar.contains("supportUpdateStepsStreamNext"),
             "{sidecar}"
+        );
+    }
+
+    #[test]
+    fn ohos_raw_output_stream_names_normalize_public_and_dispatch_names() {
+        let prefix = "ffi_uni_core";
+        let public_names = ohos_raw_output_stream_names_for_prefix(prefix, "supportUpdateSteps");
+        let dispatch_names =
+            ohos_raw_output_stream_names_for_prefix(prefix, "support_update_steps");
+
+        assert_eq!(public_names, dispatch_names);
+        assert_eq!(public_names.function, "ffi_uni_core_support_update_steps");
+        assert_eq!(
+            public_names.next_function,
+            "ffi_uni_core_support_update_steps_stream_next"
+        );
+        assert_eq!(
+            public_names.cancel_function,
+            "ffi_uni_core_support_update_steps_stream_cancel"
+        );
+        assert_eq!(
+            public_names.step_type,
+            "ffi_uni_core_UniffiSupportUpdateStepsStreamNext"
         );
     }
 
