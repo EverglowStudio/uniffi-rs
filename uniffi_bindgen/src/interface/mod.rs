@@ -244,6 +244,99 @@ pub struct ComponentInterface {
     pub skip_checksum_checks: bool,
 }
 
+fn canonical_abi_module_path(module_path: &mut String) {
+    if let Some(crate_name) = module_path.split("::").next() {
+        module_path.truncate(crate_name.len());
+    }
+}
+
+fn canonicalize_abi_type(type_: &mut Type) {
+    match type_ {
+        Type::Object { module_path, .. }
+        | Type::Record { module_path, .. }
+        | Type::Enum { module_path, .. }
+        | Type::CallbackInterface { module_path, .. } => {
+            canonical_abi_module_path(module_path);
+        }
+        Type::Box { inner_type }
+        | Type::Optional { inner_type }
+        | Type::Sequence { inner_type }
+        | Type::Set { inner_type } => canonicalize_abi_type(inner_type),
+        Type::Map {
+            key_type,
+            value_type,
+        } => {
+            canonicalize_abi_type(key_type);
+            canonicalize_abi_type(value_type);
+        }
+        Type::Stream {
+            item_type,
+            error_type,
+            ..
+        }
+        | Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => {
+            canonicalize_abi_type(item_type);
+            canonicalize_abi_type(error_type);
+        }
+        Type::Custom {
+            module_path,
+            builtin,
+            ..
+        } => {
+            canonical_abi_module_path(module_path);
+            canonicalize_abi_type(builtin);
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize_abi_argument(argument: &mut Argument) {
+    canonicalize_abi_type(&mut argument.type_);
+}
+
+fn canonicalize_abi_method(method: &mut Method) {
+    canonicalize_abi_type(&mut method.self_type);
+    method
+        .arguments
+        .iter_mut()
+        .for_each(canonicalize_abi_argument);
+    method
+        .return_type
+        .iter_mut()
+        .for_each(canonicalize_abi_type);
+    method.throws.iter_mut().for_each(canonicalize_abi_type);
+}
+
+fn canonicalize_abi_constructor(constructor: &mut Constructor) {
+    canonical_abi_module_path(&mut constructor.object_module_path);
+    constructor
+        .arguments
+        .iter_mut()
+        .for_each(canonicalize_abi_argument);
+    constructor
+        .throws
+        .iter_mut()
+        .for_each(canonicalize_abi_type);
+    canonicalize_abi_type(&mut constructor.self_type);
+}
+
+fn canonicalize_abi_uniffi_trait(uniffi_trait: &mut UniffiTrait) {
+    match uniffi_trait {
+        UniffiTrait::Debug { fmt }
+        | UniffiTrait::Display { fmt }
+        | UniffiTrait::Hash { hash: fmt }
+        | UniffiTrait::Ord { cmp: fmt } => canonicalize_abi_method(fmt),
+        UniffiTrait::Eq { eq, ne } => {
+            canonicalize_abi_method(eq);
+            canonicalize_abi_method(ne);
+        }
+    }
+}
+
 impl ComponentInterface {
     pub fn new(crate_name: &str) -> Self {
         assert!(!crate_name.is_empty());
@@ -367,6 +460,95 @@ impl ComponentInterface {
     /// Get the definitions for every custom type in the interface.
     pub fn custom_type_definitions(&self) -> &[CustomType] {
         &self.custom_types
+    }
+
+    /// Clone this interface into the canonical representation used for a
+    /// cross-loader ABI digest.
+    ///
+    /// Rust source parsing sees re-exported public types at the component
+    /// crate root, while compiled metadata retains their defining submodule.
+    /// Internal Rust submodules are not visible in foreign bindings or the C
+    /// ABI, so reduce every named type/definition path to its owning crate.
+    /// All callable/type fields remain otherwise intact, including ordering,
+    /// async/throws state, streams, custom types, callbacks and object methods.
+    pub fn canonicalized_for_abi_digest(&self) -> Self {
+        let mut canonical = self.clone();
+
+        for enum_ in &mut canonical.enums {
+            canonical_abi_module_path(&mut enum_.module_path);
+            enum_.discr_type.iter_mut().for_each(canonicalize_abi_type);
+            for variant in &mut enum_.variants {
+                variant
+                    .fields
+                    .iter_mut()
+                    .for_each(|field| canonicalize_abi_type(&mut field.type_));
+            }
+            enum_
+                .constructors
+                .iter_mut()
+                .for_each(canonicalize_abi_constructor);
+            enum_.methods.iter_mut().for_each(canonicalize_abi_method);
+            enum_
+                .uniffi_traits
+                .iter_mut()
+                .for_each(canonicalize_abi_uniffi_trait);
+        }
+        for record in &mut canonical.records {
+            canonical_abi_module_path(&mut record.module_path);
+            record
+                .fields
+                .iter_mut()
+                .for_each(|field| canonicalize_abi_type(&mut field.type_));
+            record
+                .constructors
+                .iter_mut()
+                .for_each(canonicalize_abi_constructor);
+            record.methods.iter_mut().for_each(canonicalize_abi_method);
+            record
+                .uniffi_traits
+                .iter_mut()
+                .for_each(canonicalize_abi_uniffi_trait);
+        }
+        for function in &mut canonical.functions {
+            canonical_abi_module_path(&mut function.module_path);
+            function
+                .arguments
+                .iter_mut()
+                .for_each(canonicalize_abi_argument);
+            function
+                .return_type
+                .iter_mut()
+                .for_each(canonicalize_abi_type);
+            function.throws.iter_mut().for_each(canonicalize_abi_type);
+        }
+        for object in &mut canonical.objects {
+            canonical_abi_module_path(&mut object.module_path);
+            object
+                .constructors
+                .iter_mut()
+                .for_each(canonicalize_abi_constructor);
+            object.methods.iter_mut().for_each(canonicalize_abi_method);
+            object
+                .uniffi_traits
+                .iter_mut()
+                .for_each(canonicalize_abi_uniffi_trait);
+            for trait_impl in &mut object.trait_impls {
+                canonicalize_abi_type(&mut trait_impl.ty);
+                canonicalize_abi_type(&mut trait_impl.trait_ty);
+            }
+        }
+        for callback in &mut canonical.callback_interfaces {
+            canonical_abi_module_path(&mut callback.module_path);
+            callback
+                .methods
+                .iter_mut()
+                .for_each(canonicalize_abi_method);
+        }
+        for custom in &mut canonical.custom_types {
+            canonical_abi_module_path(&mut custom.module_path);
+            canonicalize_abi_type(&mut custom.builtin);
+        }
+        canonical
     }
 
     /// Get the definitions for every Function in the interface.
