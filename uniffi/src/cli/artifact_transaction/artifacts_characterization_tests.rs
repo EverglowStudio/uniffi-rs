@@ -1526,6 +1526,76 @@ fn empty_build_args() -> BuildArgs {
     }
 }
 
+#[test]
+fn managed_android_llvm_preflight_fails_before_transaction_state() {
+    let root = unique_tmp_dir("managed-android-llvm-preflight");
+    let package_dir = root.join("published/uni-core-ffi");
+    let ndk_home = root.join("android-ndk");
+    std::fs::create_dir_all(&ndk_home).unwrap();
+
+    let mut args = empty_build_args();
+    args.target = vec![ArtifactTargetArg::Android];
+    args.managed_layout = true;
+    args.package_dir = Some(package_dir.clone());
+    args.android_ndk_home = Some(ndk_home);
+
+    let error = build(args).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("preflighting Android toolchain before target generation"),
+        "{error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("Android NDK LLVM prebuilt directory not found"),
+        "{error:#}"
+    );
+    assert!(!package_dir.exists());
+    assert!(!root.join("published").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn managed_android_clang_preflight_fails_before_transaction_state() {
+    let root = unique_tmp_dir("managed-android-toolchain-preflight");
+    let package_dir = root.join("published/uni-core-ffi");
+    let ndk_home = root.join("android-ndk");
+    let host = if cfg!(target_os = "macos") {
+        "darwin-x86_64"
+    } else if cfg!(target_os = "linux") {
+        "linux-x86_64"
+    } else if cfg!(target_os = "windows") {
+        "windows-x86_64"
+    } else {
+        return;
+    };
+    std::fs::create_dir_all(ndk_home.join("toolchains/llvm/prebuilt").join(host)).unwrap();
+
+    let mut args = empty_build_args();
+    args.target = vec![ArtifactTargetArg::Android];
+    args.managed_layout = true;
+    args.package_dir = Some(package_dir.clone());
+    args.android_ndk_home = Some(ndk_home);
+    args.android_abi = vec!["arm64-v8a".into()];
+
+    let error = build(args).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("preflighting Android toolchain before target generation"),
+        "{error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("Android NDK clang not found"),
+        "{error:#}"
+    );
+    assert!(!package_dir.exists());
+    assert!(!root.join("published").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn test_cargo_metadata(target_directory: Utf8PathBuf) -> CargoPackageMetadata {
     CargoPackageMetadata {
         target_directory,
