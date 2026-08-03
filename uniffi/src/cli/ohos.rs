@@ -7194,10 +7194,15 @@ impl OwnedFacadeTypeDefs {
                         def.name
                     );
                 }
+                let short = if def.kind == "fn" {
+                    uniffi_bindgen_javascript::dispatch_key::snake_to_camel(short)
+                } else {
+                    short.to_string()
+                };
                 Ok(FacadePublicBinding {
                     projection: self.projection.clone(),
                     raw: def.clone(),
-                    short: short.to_string(),
+                    short,
                 })
             })
             .collect()

@@ -216,7 +216,7 @@ fn single_owned_component_projects_public_bindings_through_its_namespace() {
         identity_export: bridge_identity_export(&native_export_prefix, &"a".repeat(64)),
     };
     let raw_payload = format!("{native_export_prefix}_Payload");
-    let raw_ping = format!("{native_export_prefix}_ping");
+    let raw_add_ticket_points = format!("{native_export_prefix}_add_ticket_points");
     let raw_worker = format!("{native_export_prefix}_Worker");
     let owned = OwnedFacadeTypeDefs::new(
         &identity,
@@ -225,8 +225,8 @@ fn single_owned_component_projects_public_bindings_through_its_namespace() {
             def("struct", &raw_worker, "constructor();"),
             def(
                 "fn",
-                &raw_ping,
-                &format!("function {raw_ping}(): {raw_payload}"),
+                &raw_add_ticket_points,
+                &format!("function {raw_add_ticket_points}(): {raw_payload}"),
             ),
         ],
     )
@@ -244,10 +244,10 @@ fn single_owned_component_projects_public_bindings_through_its_namespace() {
     assert_component_stream_declarations_are_arkts_safe(&exports, module);
 
     assert!(
-        module
-            .source
-            .contains(&format!("export const ping: () => Payload = {raw_ping};")),
-        "ordinary callable aliases must also carry an explicit public type:\n{}",
+        module.source.contains(&format!(
+            "export const addTicketPoints: () => Payload = {raw_add_ticket_points};"
+        )),
+        "raw snake_case callable aliases must use explicit lowerCamelCase public names:\n{}",
         module.source
     );
 
@@ -258,15 +258,15 @@ fn single_owned_component_projects_public_bindings_through_its_namespace() {
         );
         assert!(surface.contains("export {\n  fixture,\n};"), "{surface}");
         assert!(
-            !surface.contains(&raw_ping) && !surface.contains(&raw_payload),
+            !surface.contains(&raw_add_ticket_points) && !surface.contains(&raw_payload),
             "single-component package root must not leak flat raw bindings:\n{surface}"
         );
     }
     for surface in [&module.source, &module.declarations] {
-        assert!(surface.contains(&raw_ping), "{surface}");
+        assert!(surface.contains(&raw_add_ticket_points), "{surface}");
         assert!(surface.contains(&raw_payload), "{surface}");
         assert!(surface.contains(&raw_worker), "{surface}");
-        assert!(surface.contains("ping"), "{surface}");
+        assert!(surface.contains("addTicketPoints"), "{surface}");
         assert!(surface.contains("Payload"), "{surface}");
         assert!(surface.contains("Worker"), "{surface}");
     }
