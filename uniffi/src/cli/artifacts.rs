@@ -346,6 +346,18 @@ struct ExpandedTargets {
     android: bool,
 }
 
+impl ExpandedTargets {
+    fn contains(&self, other: &Self) -> bool {
+        (!other.wasm || self.wasm)
+            && (!other.mini_program || self.mini_program)
+            && (!other.node || self.node)
+            && (!other.electron || self.electron)
+            && (!other.harmony || self.harmony)
+            && (!other.apple || self.apple)
+            && (!other.android || self.android)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ManagedLayout {
     package_dir: Utf8PathBuf,
@@ -388,28 +400,62 @@ struct ManagedComponentIdentity {
     component: String,
     namespace: String,
     native_export_prefix: String,
+    interface_abi_digest: String,
+}
+
+fn validate_sha256_digest(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("managed artifact {label} must be a canonical lowercase SHA-256 digest");
+    }
+    Ok(())
 }
 
 impl ManagedComponentIdentity {
-    fn new(component: impl Into<String>, namespace: impl Into<String>) -> Result<Self> {
+    fn with_interface_abi_digest(
+        component: impl Into<String>,
+        namespace: impl Into<String>,
+        interface_abi_digest: impl Into<String>,
+    ) -> Result<Self> {
         let component = component.into();
         let namespace = namespace.into();
+        let interface_abi_digest = interface_abi_digest.into();
         uniffi_bindgen::interface::validate_harmony_component_identity(&component, &namespace)?;
+        validate_sha256_digest(&interface_abi_digest, "component interface ABI digest")?;
         Ok(Self {
             native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
                 &component,
             ),
             component,
             namespace,
+            interface_abi_digest,
         })
     }
 
-    fn tuple(&self) -> (String, String, String) {
+    #[cfg(test)]
+    fn new(component: impl Into<String>, namespace: impl Into<String>) -> Result<Self> {
+        let component = component.into();
+        let namespace = namespace.into();
+        let digest = sha256_bytes(format!("fixture-interface:{component}:{namespace}").as_bytes());
+        Self::with_interface_abi_digest(component, namespace, digest)
+    }
+
+    fn tuple(&self) -> (String, String, String, String) {
         (
             self.component.clone(),
             self.namespace.clone(),
             self.native_export_prefix.clone(),
+            self.interface_abi_digest.clone(),
         )
+    }
+
+    fn same_component_key(&self, other: &Self) -> bool {
+        self.component == other.component
+            && self.namespace == other.namespace
+            && self.native_export_prefix == other.native_export_prefix
     }
 }
 
@@ -466,36 +512,6 @@ fn managed_authoritative_input_components(
             ..CargoMetadataOptions::default()
         },
     ));
-    if let Some(source_crate) = source.as_str().strip_prefix("src:") {
-        // Source parsing is the generator's eventual metadata authority, but
-        // it is deliberately not part of this identity-only managed preflight.
-        // In particular, the planner must reject an existing-package mismatch
-        // before invoking a backend or parsing API details that are irrelevant
-        // to component identity. Keep the selected crate set and its name
-        // normalization in lockstep with `BindgenLoader::load_metadata`:
-        // `uniffi_parse_rs::Ir::add_crate_root` converts `-` to `_`.
-        let mut crate_names = paths
-            .get_source_crates(source_crate)
-            .context("Failed to find Rust crates, was the `cargo_metadata` feature enabled?")?
-            .into_iter()
-            .map(|source| source.name.replace('-', "_"))
-            .collect::<Vec<_>>();
-        if let Some(crate_filter) = &args.crate_name {
-            if !crate_names
-                .iter()
-                .any(|crate_name| crate_name == crate_filter)
-            {
-                bail!("No UniFFI metadata found for crate {crate_filter}");
-            }
-            crate_names.retain(|crate_name| crate_name == crate_filter);
-        }
-        return canonical_managed_component_identities(
-            crate_names
-                .into_iter()
-                .map(|crate_name| ManagedComponentIdentity::new(&crate_name, &crate_name))
-                .collect::<Result<Vec<_>>>()?,
-        );
-    }
     let loader = BindgenLoader::new(paths, global_config);
     let metadata = loader.load_metadata(&source)?;
     if let Some(crate_filter) = &args.crate_name {
@@ -511,7 +527,13 @@ fn managed_authoritative_input_components(
         components
             .iter()
             .map(|component| {
-                ManagedComponentIdentity::new(component.crate_name(), component.namespace())
+                ManagedComponentIdentity::with_interface_abi_digest(
+                    component.crate_name(),
+                    component.namespace(),
+                    uniffi_bindgen_javascript::host_crates::component_interface_abi_digest(
+                        component,
+                    ),
+                )
             })
             .collect::<Result<Vec<_>>>()?,
     )
@@ -536,6 +558,17 @@ fn canonical_managed_component_identities(
         }
     }
     Ok(identities)
+}
+
+fn same_managed_component_keys(
+    left: &[ManagedComponentIdentity],
+    right: &[ManagedComponentIdentity],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.same_component_key(right))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -847,19 +880,29 @@ impl ManagedTransactionLayout for ManagedLayout {
         let Some(host_identity) = self.host_identity.as_ref() else {
             return Ok(());
         };
-        let Some(existing_components) =
-            read_existing_managed_manifest_components(self, host_identity)?
-        else {
+        let Some(existing) = read_existing_managed_manifest_components(self, host_identity)? else {
             return Ok(());
         };
-        let generated_components = self.generated_component_identities()?;
+        let existing_components = &existing.components;
         if self.components_authoritative {
             let planned = self.exact_components()?;
-            if planned != existing_components {
+            if !same_managed_component_keys(planned, existing_components) {
                 bail!(
                     "managed artifact component set mismatch between authoritative planned metadata and existing manifest: expected {planned:?}, got {existing_components:?}"
                 );
             }
+            if planned != existing_components {
+                let requested = self.expected_routes.as_ref().context(
+                    "managed artifact interface ABI changed without an authoritative target plan",
+                )?;
+                if !requested.targets.contains(&existing.targets) {
+                    bail!(
+                        "managed artifact component interface ABI digest changed; refusing a partial target update that could mix new common bindings with retained sibling backends/native artifacts. Rebuild the complete existing target union (or use --target all)"
+                    );
+                }
+            }
+            let generated_components =
+                self.generated_component_identities_with_fallback(Some(existing_components))?;
             if let Some(generated) = generated_components.as_ref() {
                 if planned != generated {
                     bail!(
@@ -874,8 +917,10 @@ impl ManagedTransactionLayout for ManagedLayout {
         // point. Keep this branch only for direct test fixtures and legacy
         // internal callers that construct a layout by hand; it must never be
         // a production path that adopts an existing package.
+        let generated_components =
+            self.generated_component_identities_with_fallback(Some(existing_components))?;
         if let Some(generated) = generated_components {
-            if generated != existing_components {
+            if !same_managed_component_keys(&generated, existing_components) {
                 bail!(
                     "managed artifact component set mismatch between existing manifest and generated bridges: manifest {existing_components:?}, bridges {generated:?}"
                 );
@@ -937,6 +982,7 @@ struct ManagedArtifactManifestComponent {
     component: String,
     namespace: String,
     native_export_prefix: String,
+    interface_abi_digest: String,
     source: ManagedArtifactManifestComponentSource,
 }
 
@@ -1475,7 +1521,11 @@ fn manifest_component_identities(
     }
     let mut identities = Vec::with_capacity(components.len());
     for component in components {
-        let identity = ManagedComponentIdentity::new(&component.component, &component.namespace)?;
+        let identity = ManagedComponentIdentity::with_interface_abi_digest(
+            &component.component,
+            &component.namespace,
+            &component.interface_abi_digest,
+        )?;
         if component.native_export_prefix != identity.native_export_prefix {
             bail!(
                 "managed artifact manifest component `{}` namespace `{}` has an invalid native export prefix `{}`",
@@ -1538,14 +1588,7 @@ fn validate_exact_managed_artifact_manifest(
             );
         }
     }
-    if !manifest
-        .host_composite_identity
-        .chars()
-        .all(|ch| ch.is_ascii_hexdigit())
-        || manifest.host_composite_identity.len() != 64
-    {
-        bail!("managed artifact manifest has an invalid host composite identity");
-    }
+    validate_sha256_digest(&manifest.host_composite_identity, "host composite identity")?;
     if let Some(host_identity) = host_identity {
         let expected = host_identity.composite_identity(&component_identities)?;
         if manifest.host_composite_identity != expected {
@@ -1899,10 +1942,15 @@ fn parse_exact_managed_artifact_manifest_with_routes(
     Ok((typed, raw))
 }
 
+struct ExistingManagedManifestIdentity {
+    components: Vec<ManagedComponentIdentity>,
+    targets: ExpandedTargets,
+}
+
 fn read_existing_managed_manifest_components(
     layout: &ManagedLayout,
     host_identity: &ManagedHostIdentity,
-) -> Result<Option<Vec<ManagedComponentIdentity>>> {
+) -> Result<Option<ExistingManagedManifestIdentity>> {
     if !path_entry_exists(&layout.package_dir)? {
         return Ok(None);
     }
@@ -1935,7 +1983,10 @@ fn read_existing_managed_manifest_components(
         declared_plan.validate_manifest_routes(&raw, true)?;
     }
     validate_managed_manifest_paths(layout, &raw)?;
-    Ok(Some(manifest_component_identities(&typed.components)?))
+    Ok(Some(ExistingManagedManifestIdentity {
+        components: manifest_component_identities(&typed.components)?,
+        targets: expanded_targets_from_managed_manifest(&raw)?,
+    }))
 }
 
 #[cfg(test)]
@@ -1944,13 +1995,13 @@ fn validate_existing_managed_manifest(
     expected_components: &[ManagedComponentIdentity],
     host_identity: &ManagedHostIdentity,
 ) -> Result<()> {
-    let Some(actual_components) = read_existing_managed_manifest_components(layout, host_identity)?
-    else {
+    let Some(actual) = read_existing_managed_manifest_components(layout, host_identity)? else {
         return Ok(());
     };
-    if actual_components != expected_components {
+    if actual.components != expected_components {
         bail!(
-            "managed artifact manifest component set mismatch: expected {expected_components:?}, got {actual_components:?}"
+            "managed artifact manifest component set mismatch: expected {expected_components:?}, got {:?}",
+            actual.components
         );
     }
     Ok(())
@@ -2219,6 +2270,7 @@ impl ManagedLayout {
                     "component": component.component,
                     "namespace": component.namespace,
                     "nativeExportPrefix": component.native_export_prefix,
+                    "interfaceAbiDigest": component.interface_abi_digest,
                     "source": {
                         "common": if has_js { serde_json::Value::String(self.rel(&component_root.join("common"))?) } else { serde_json::Value::Null },
                         "browser": if has_browser { serde_json::Value::String(self.rel(&component_root.join("browser"))?) } else { serde_json::Value::Null },
@@ -2534,18 +2586,18 @@ impl ManagedLayout {
         let Some(host_identity) = self.host_identity.as_ref() else {
             return Ok(());
         };
-        let Some(existing_components) =
-            read_existing_managed_manifest_components(self, host_identity)?
-        else {
+        let Some(existing) = read_existing_managed_manifest_components(self, host_identity)? else {
             return Ok(());
         };
-        let generated_components = self.generated_component_identities()?;
+        let existing_components = existing.components;
+        let generated_components =
+            self.generated_component_identities_with_fallback(Some(&existing_components))?;
         if self.components_authoritative {
             self.preflight_existing_package()?;
             return Ok(());
         }
         if let Some(generated) = generated_components {
-            if generated != existing_components {
+            if !same_managed_component_keys(&generated, &existing_components) {
                 bail!(
                     "managed artifact component set mismatch between existing manifest and generated bridges: manifest {existing_components:?}, bridges {generated:?}"
                 );
@@ -2561,6 +2613,13 @@ impl ManagedLayout {
     /// bridge filename carries the Cargo component name, from which the
     /// authoritative native export prefix is re-derived.
     fn generated_component_identities(&self) -> Result<Option<Vec<ManagedComponentIdentity>>> {
+        self.generated_component_identities_with_fallback(None)
+    }
+
+    fn generated_component_identities_with_fallback(
+        &self,
+        fallback_components: Option<&[ManagedComponentIdentity]>,
+    ) -> Result<Option<Vec<ManagedComponentIdentity>>> {
         let components_dir = self.source_root.join("components");
         if !components_dir.exists() {
             return Ok(None);
@@ -2646,7 +2705,31 @@ impl ManagedLayout {
                     "generated managed component namespace `{namespace}` has inconsistent Rust bridge identities: {bridges:?}"
                 ),
             };
-            identities.push(ManagedComponentIdentity::new(component, namespace)?);
+            let planned = self
+                .components
+                .as_ref()
+                .and_then(|components| {
+                    components.iter().find(|identity| {
+                        identity.component == component && identity.namespace == namespace
+                    })
+                })
+                .or_else(|| {
+                    fallback_components.and_then(|components| {
+                        components.iter().find(|identity| {
+                            identity.component == component && identity.namespace == namespace
+                        })
+                    })
+                })
+                .with_context(|| {
+                    format!(
+                        "generated managed component `{component}` namespace `{namespace}` is absent from the authoritative interface ABI plan and validated existing manifest"
+                    )
+                })?;
+            identities.push(ManagedComponentIdentity::with_interface_abi_digest(
+                component,
+                namespace,
+                &planned.interface_abi_digest,
+            )?);
         }
         if identities.is_empty() {
             return Ok(None);
@@ -2655,12 +2738,22 @@ impl ManagedLayout {
     }
 
     fn refresh_generated_component_identities(&mut self) -> Result<()> {
-        let components = self.generated_component_identities()?.with_context(|| {
-            format!(
-                "generated managed JavaScript source tree has no component identities below {}",
-                self.source_root.join("components")
-            )
-        })?;
+        let fallback_components = if self.components_authoritative {
+            None
+        } else if let Some(host_identity) = self.host_identity.as_ref() {
+            read_existing_managed_manifest_components(self, host_identity)?
+                .map(|existing| existing.components)
+        } else {
+            None
+        };
+        let components = self
+            .generated_component_identities_with_fallback(fallback_components.as_deref())?
+            .with_context(|| {
+                format!(
+                    "generated managed JavaScript source tree has no component identities below {}",
+                    self.source_root.join("components")
+                )
+            })?;
         if self.components_authoritative {
             let planned = self.exact_components()?;
             if planned != components {
@@ -2854,9 +2947,16 @@ impl ManagedLayout {
             manifest_path,
             // This is only a seed for selecting `src:<root-package>` in the
             // mandatory read-only planner above the transaction boundary.
-            components: Some(vec![ManagedComponentIdentity::new(
+            components: Some(vec![ManagedComponentIdentity::with_interface_abi_digest(
                 meta.lib_target_name.clone(),
                 meta.lib_target_name.clone(),
+                sha256_bytes(
+                    format!(
+                        "uniffi-managed-component-plan-seed:{}:{}",
+                        meta.lib_target_name, meta.lib_target_name
+                    )
+                    .as_bytes(),
+                ),
             )?]),
             components_authoritative: false,
             host_identity: Some(ManagedHostIdentity::from_cargo_metadata(&meta)),

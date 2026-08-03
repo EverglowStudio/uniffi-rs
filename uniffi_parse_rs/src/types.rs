@@ -86,6 +86,8 @@ pub enum Type {
     HashMap(Box<Type>, Box<Type>),
     HashSet(Box<Type>),
     Result(Box<Type>, Box<Type>),
+    Stream(Box<Type>, Box<Type>),
+    InputStream(Box<Type>, Box<Type>),
     // Custom type on the scaffolding side
     Custom {
         module_path: String,
@@ -145,6 +147,16 @@ impl Type {
             }),
             Type::HashSet(key) => Ok(uniffi_meta::Type::Set {
                 inner_type: Box::new((*key).try_into_uniffi_meta(source, span, self_ty)?),
+            }),
+            Type::Stream(item, error) => Ok(uniffi_meta::Type::Stream {
+                item_type: Box::new((*item).try_into_uniffi_meta(source, span, self_ty)?),
+                error_type: Box::new((*error).try_into_uniffi_meta(source, span, self_ty)?),
+                is_send: true,
+            }),
+            Type::InputStream(item, error) => Ok(uniffi_meta::Type::InputStream {
+                item_type: Box::new((*item).try_into_uniffi_meta(source, span, self_ty)?),
+                error_type: Box::new((*error).try_into_uniffi_meta(source, span, self_ty)?),
+                is_send: true,
             }),
             Type::Object { module_path, name } => Ok(uniffi_meta::Type::Object {
                 module_path,
@@ -472,6 +484,14 @@ impl<'ir> RPath<'ir> {
                             BuiltinItem::Result => {
                                 let (ok, err) = generics.resolve2(ir, cache, self)?;
                                 Type::Result(Box::new(ok), Box::new(err))
+                            }
+                            BuiltinItem::UniFfiStream => {
+                                let (item, error) = generics.resolve2(ir, cache, self)?;
+                                Type::Stream(Box::new(item), Box::new(error))
+                            }
+                            BuiltinItem::UniFfiInputStream => {
+                                let (item, error) = generics.resolve2(ir, cache, self)?;
+                                Type::InputStream(Box::new(item), Box::new(error))
                             }
                             _ => return Err(Error::new(self.file_id(), ty.span(), InvalidType)),
                         })
@@ -1087,6 +1107,38 @@ pub mod tests {
                     name: "TestError".into(),
                 }),
             ))
+        );
+        let error = uniffi_meta::Type::Enum {
+            module_path: "types".into(),
+            name: "TestError".into(),
+        };
+        assert_eq!(
+            run_resolve_uniffi_meta_type(
+                &ir,
+                &mut cache,
+                "types",
+                "uniffi::UniFfiStream<u32, TestError>",
+                None,
+            ),
+            Ok(uniffi_meta::Type::Stream {
+                item_type: Box::new(uniffi_meta::Type::UInt32),
+                error_type: Box::new(error.clone()),
+                is_send: true,
+            })
+        );
+        assert_eq!(
+            run_resolve_uniffi_meta_type(
+                &ir,
+                &mut cache,
+                "types",
+                "UniFfiInputStream<String, TestError>",
+                None,
+            ),
+            Ok(uniffi_meta::Type::InputStream {
+                item_type: Box::new(uniffi_meta::Type::String),
+                error_type: Box::new(error),
+                is_send: true,
+            })
         );
         assert_eq!(
             run_resolve_type(

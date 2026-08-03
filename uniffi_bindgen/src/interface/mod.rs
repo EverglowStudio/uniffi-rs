@@ -364,6 +364,11 @@ impl ComponentInterface {
         self.custom_types.iter().find(|c| c.name == name)
     }
 
+    /// Get the definitions for every custom type in the interface.
+    pub fn custom_type_definitions(&self) -> &[CustomType] {
+        &self.custom_types
+    }
+
     /// Get the definitions for every Function in the interface.
     pub fn function_definitions(&self) -> &[Function] {
         &self.functions

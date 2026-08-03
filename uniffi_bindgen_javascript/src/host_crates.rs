@@ -24,8 +24,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{CargoOpt, DependencyKind, MetadataCommand, Package, PackageId, TargetKind};
 use fs_err as fs;
 use sha2::{Digest, Sha256};
+use std::hash::Hasher;
+use uniffi_meta::Checksum;
 
-const HOST_BUNDLE_SCHEMA_VERSION: u32 = 3;
+const HOST_BUNDLE_SCHEMA_VERSION: u32 = 4;
 
 /// Canonical identity of one selected JavaScript component before Cargo
 /// dependency planning.  The generator supplies these in stable order, but
@@ -37,13 +39,14 @@ pub(crate) struct HostComponentIdentity {
     pub(crate) crate_name: String,
     pub(crate) namespace: String,
     pub(crate) native_export_prefix: String,
+    pub(crate) interface_abi_digest: String,
 }
 
 impl HostComponentIdentity {
     pub(crate) fn describe(&self) -> String {
         format!(
-            "component `{}` (namespace `{}`, native export prefix `{}`)",
-            self.crate_name, self.namespace, self.native_export_prefix
+            "component `{}` (namespace `{}`, native export prefix `{}`, interface ABI `{}`)",
+            self.crate_name, self.namespace, self.native_export_prefix, self.interface_abi_digest
         )
     }
 }
@@ -109,6 +112,7 @@ impl HostCratePlan {
                         component.identity.crate_name.clone(),
                         component.identity.namespace.clone(),
                         component.identity.native_export_prefix.clone(),
+                        component.identity.interface_abi_digest.clone(),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -252,7 +256,7 @@ pub(crate) fn plan(
     canonical_identities.sort();
     if canonical_identities != identities {
         bail!(
-            "host-crate component identities must be supplied in canonical (crate, namespace, native prefix) order"
+            "host-crate component identities must be supplied in canonical (crate, namespace, native prefix, interface ABI digest) order"
         );
     }
     for identity in identities {
@@ -261,6 +265,7 @@ pub(crate) fn plan(
         if identity.crate_name.is_empty()
             || identity.namespace.is_empty()
             || identity.native_export_prefix != expected
+            || !is_sha256(&identity.interface_abi_digest)
         {
             bail!(
                 "host-crate component identity is invalid for {}",
@@ -657,38 +662,44 @@ pub fn composite_host_lib_target(package_name: &str) -> String {
 }
 
 /// Canonical composite-host identity shared by generated host bundles and
-/// artifact manifests.  It deliberately excludes generated contract text:
-/// contract/sidecar integrity belongs to the OHOS bundle fingerprint, while
-/// this digest means exactly "this host target contains this component set".
+/// artifact manifests. Generated contract/sidecar bytes remain bound by the
+/// OHOS bundle fingerprint, while this identity binds the selected component
+/// set to each component's canonical interface ABI digest.
 ///
 /// Callers may supply identities in loader order; the serialized payload is
-/// always sorted by the complete `(component, namespace, nativeExportPrefix)`
-/// tuple so equivalent selections have one stable identity.
+/// always sorted by the complete
+/// `(component, namespace, nativeExportPrefix, interfaceAbiDigest)` tuple so
+/// equivalent selections have one stable identity.
 pub fn composite_host_identity(
     package_name: &str,
     lib_target: &str,
-    components: &[(String, String, String)],
+    components: &[(String, String, String, String)],
 ) -> Result<String> {
     let mut components = components
         .iter()
-        .map(|(component, namespace, native_export_prefix)| {
-            serde_json::json!({
-                "component": component,
-                "namespace": namespace,
-                "nativeExportPrefix": native_export_prefix,
-            })
-        })
+        .map(
+            |(component, namespace, native_export_prefix, interface_abi_digest)| {
+                serde_json::json!({
+                    "component": component,
+                    "namespace": namespace,
+                    "nativeExportPrefix": native_export_prefix,
+                    "interfaceAbiDigest": interface_abi_digest,
+                })
+            },
+        )
         .collect::<Vec<_>>();
     components.sort_by(|left, right| {
         (
             left["component"].as_str(),
             left["namespace"].as_str(),
             left["nativeExportPrefix"].as_str(),
+            left["interfaceAbiDigest"].as_str(),
         )
             .cmp(&(
                 right["component"].as_str(),
                 right["namespace"].as_str(),
                 right["nativeExportPrefix"].as_str(),
+                right["interfaceAbiDigest"].as_str(),
             ))
     });
     let payload = serde_json::json!({
@@ -697,6 +708,152 @@ pub fn composite_host_identity(
         "components": components,
     });
     Ok(sha256_bytes(&serde_json::to_vec(&payload)?))
+}
+
+#[derive(Default)]
+struct InterfaceAbiHasher(Sha256);
+
+impl Hasher for InterfaceAbiHasher {
+    fn finish(&self) -> u64 {
+        0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write(&(value as u64).to_le_bytes());
+    }
+
+    fn write_i8(&mut self, value: i8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i16(&mut self, value: i16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i128(&mut self, value: i128) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.write(&(value as i64).to_le_bytes());
+    }
+}
+
+fn checksum_named_definitions<T: Checksum>(
+    state: &mut InterfaceAbiHasher,
+    kind: &str,
+    mut definitions: Vec<(&str, &T)>,
+) {
+    definitions.sort_by(|left, right| left.0.cmp(right.0));
+    kind.checksum(state);
+    state.write_u64(definitions.len() as u64);
+    for (name, definition) in definitions {
+        name.checksum(state);
+        definition.checksum(state);
+    }
+}
+
+/// Stable SHA-256 digest of one component's public interface and native ABI.
+///
+/// UniFFI's `Checksum` implementations intentionally omit docstrings and
+/// derived FFI caches while retaining callable/type shape. Sorting top-level
+/// definitions makes the digest independent of metadata discovery order;
+/// record fields, enum variants, callable parameters and methods retain their
+/// ABI-significant order inside each definition.
+pub fn component_interface_abi_digest(ci: &uniffi_bindgen::ComponentInterface) -> String {
+    let mut state = InterfaceAbiHasher::default();
+    "uniffi-component-interface-abi-v1".checksum(&mut state);
+    state.write_u32(ci.uniffi_contract_version());
+    ci.crate_name().checksum(&mut state);
+    ci.namespace().checksum(&mut state);
+    checksum_named_definitions(
+        &mut state,
+        "enum",
+        ci.enum_definitions()
+            .iter()
+            .map(|definition| (definition.name(), definition))
+            .collect(),
+    );
+    checksum_named_definitions(
+        &mut state,
+        "record",
+        ci.record_definitions()
+            .iter()
+            .map(|definition| (definition.name(), definition))
+            .collect(),
+    );
+    checksum_named_definitions(
+        &mut state,
+        "function",
+        ci.function_definitions()
+            .iter()
+            .map(|definition| (definition.name(), definition))
+            .collect(),
+    );
+    checksum_named_definitions(
+        &mut state,
+        "object",
+        ci.object_definitions()
+            .iter()
+            .map(|definition| (definition.name(), definition))
+            .collect(),
+    );
+    checksum_named_definitions(
+        &mut state,
+        "callbackInterface",
+        ci.callback_interface_definitions()
+            .iter()
+            .map(|definition| (definition.name(), definition))
+            .collect(),
+    );
+    checksum_named_definitions(
+        &mut state,
+        "customType",
+        ci.custom_type_definitions()
+            .iter()
+            .map(|definition| (definition.name.as_str(), definition))
+            .collect(),
+    );
+    format!("{:x}", state.0.finalize())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Emit selected `<host_crates_dir>/{wasm,napi,ohos}/*` composite hosts.
@@ -1287,6 +1444,7 @@ fn render_ohos_facade_bundle(
             "component": component,
             "namespace": namespace,
             "nativeExportPrefix": native_export_prefix,
+            "interfaceAbiDigest": planned.identity.interface_abi_digest,
             "contractFile": contract_file,
             "contractSha256": contract_digest,
             "identityExport": identity_export,
@@ -1632,6 +1790,10 @@ fn render_uniffi_dependency(
 mod tests {
     use super::*;
 
+    fn fixture_abi_digest(label: &str) -> String {
+        sha256_bytes(format!("fixture-interface-abi:{label}").as_bytes())
+    }
+
     fn test_root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "uniffi-js-{label}-{}-{}",
@@ -1659,6 +1821,7 @@ mod tests {
             native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
                 crate_name,
             ),
+            interface_abi_digest: fixture_abi_digest(crate_name),
         };
         let dependency = PlannedPackageDependency {
             dependency_key: rust_crate_key(crate_name),
@@ -1697,6 +1860,7 @@ mod tests {
                 native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
                     key,
                 ),
+                interface_abi_digest: fixture_abi_digest(key),
             },
             package: fixture_dependency(key, package_name),
         }
@@ -1799,6 +1963,7 @@ component_source_alias = { package = "component-package", path = "../component",
                 native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
                     "component_bridge",
                 ),
+                interface_abi_digest: fixture_abi_digest("component_bridge"),
             },
             HostComponentIdentity {
                 crate_name: "root_bridge".to_string(),
@@ -1806,6 +1971,7 @@ component_source_alias = { package = "component-package", path = "../component",
                 native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
                     "root_bridge",
                 ),
+                interface_abi_digest: fixture_abi_digest("root_bridge"),
             },
         ];
         let plan = plan(&options, &identities, true, true, true).unwrap();
@@ -1846,11 +2012,13 @@ component_source_alias = { package = "component-package", path = "../component",
                 "alpha_core".to_string(),
                 "alpha".to_string(),
                 "ffi_alpha_core".to_string(),
+                fixture_abi_digest("alpha_core"),
             ),
             (
                 "beta_core".to_string(),
                 "beta".to_string(),
                 "ffi_beta_core".to_string(),
+                fixture_abi_digest("beta_core"),
             ),
         ];
         let mut reverse = forward.clone();
@@ -1861,6 +2029,13 @@ component_source_alias = { package = "component-package", path = "../component",
         let reverse_identity = composite_host_identity(&package, &lib_target, &reverse).unwrap();
 
         assert_eq!(forward_identity, reverse_identity);
+        let mut changed_abi = forward.clone();
+        changed_abi[0].3 = fixture_abi_digest("alpha_core-v2");
+        assert_ne!(
+            composite_host_identity(&package, &lib_target, &changed_abi).unwrap(),
+            forward_identity,
+            "the composite host identity must bind every component ABI digest",
+        );
         assert_eq!(package, "composite-core-uniffi-js-host");
         assert_eq!(lib_target, "composite_core_uniffi_js_host");
         // The digest uses the same tuple even for invocations that never
@@ -1875,6 +2050,45 @@ component_source_alias = { package = "component-package", path = "../component",
             .unwrap(),
             forward_identity
         );
+    }
+
+    #[test]
+    fn interface_abi_digest_is_order_stable_and_shape_sensitive() {
+        let forward = uniffi_bindgen::ComponentInterface::from_webidl(
+            r#"
+                namespace digest_fixture {
+                    u32 beta();
+                    string alpha(string value);
+                };
+            "#,
+            "digest_fixture",
+        )
+        .unwrap();
+        let reverse = uniffi_bindgen::ComponentInterface::from_webidl(
+            r#"
+                namespace digest_fixture {
+                    string alpha(string value);
+                    u32 beta();
+                };
+            "#,
+            "digest_fixture",
+        )
+        .unwrap();
+        let changed = uniffi_bindgen::ComponentInterface::from_webidl(
+            r#"
+                namespace digest_fixture {
+                    string alpha(string value);
+                    u64 beta();
+                };
+            "#,
+            "digest_fixture",
+        )
+        .unwrap();
+
+        let digest = component_interface_abi_digest(&forward);
+        assert_eq!(digest, component_interface_abi_digest(&reverse));
+        assert_ne!(digest, component_interface_abi_digest(&changed));
+        assert!(is_sha256(&digest));
     }
 
     #[test]
@@ -2031,7 +2245,7 @@ edition.workspace = true
         let bundle_path = host.join("ohos/uniffi-ohos-facade-bundle.json");
         let bundle: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&bundle_path).unwrap()).unwrap();
-        assert_eq!(bundle["hostBundleSchemaVersion"], 3);
+        assert_eq!(bundle["hostBundleSchemaVersion"], 4);
         assert_eq!(bundle["packageName"], "demo-core-uniffi-js-host");
         assert_eq!(bundle["libTarget"], "demo_core_uniffi_js_host");
         let recomputed_identity = composite_host_identity(
@@ -2041,6 +2255,10 @@ edition.workspace = true
                 "demo_core".to_string(),
                 "demo_core".to_string(),
                 "ffi_demo_core".to_string(),
+                bundle["components"][0]["interfaceAbiDigest"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
             )],
         )
         .unwrap();

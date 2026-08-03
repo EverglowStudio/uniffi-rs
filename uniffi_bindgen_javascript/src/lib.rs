@@ -168,6 +168,9 @@ fn generate_components(
                     crate_name: component.ci.crate_name().to_string(),
                     namespace: component.ci.namespace().to_string(),
                     native_export_prefix: component.ci.native_export_prefix(),
+                    interface_abi_digest: host_crates::component_interface_abi_digest(
+                        &component.ci,
+                    ),
                 })
                 .collect::<Vec<_>>();
             host_crates::plan(host_opts, &identities, want_wasm, want_napi, want_ohos)

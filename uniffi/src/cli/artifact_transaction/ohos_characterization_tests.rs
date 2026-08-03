@@ -3079,7 +3079,7 @@ fn write_fake_dist(root: &Utf8Path, lib_target_name: &str) -> Utf8PathBuf {
         .unwrap();
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"hspFacadeAggregateSchemaVersion\":1,\"components\":[],\"componentIdentities\":[],\"hostCompositeIdentity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"hspFacadeAggregateSchemaVersion\":2,\"components\":[],\"componentIdentities\":[],\"hostCompositeIdentity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outputStreams\":[],\"inputStreams\":[]}",
     )
     .unwrap();
     std::fs::write(dist.join("arm64-v8a").join(native), "fake").unwrap();
@@ -3106,7 +3106,7 @@ fn write_invocation_dist(dist: &Utf8Path, arches: &[&str], with_native: bool) ->
         )?;
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"hspFacadeAggregateSchemaVersion\":1,\"components\":[],\"componentIdentities\":[],\"hostCompositeIdentity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"hspFacadeAggregateSchemaVersion\":2,\"components\":[],\"componentIdentities\":[],\"hostCompositeIdentity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outputStreams\":[],\"inputStreams\":[]}",
     )?;
     if with_native {
         for arch in arches {
@@ -5367,6 +5367,7 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
             component: "fixture".into(),
             namespace: "fixture".into(),
             native_export_prefix: fixture_prefix.clone(),
+            interface_abi_digest: sha256_bytes(b"fixture interface ABI"),
             contract_file: "fixture.ohos-facade.json".into(),
             contract_sha256: digest.clone(),
             identity_export: sentinel.clone(),
@@ -5439,6 +5440,7 @@ fn compiled_bridge_identity_binds_exact_component_contract_coverage() {
             component: "fixture_second".into(),
             namespace: "fixture_second".into(),
             native_export_prefix: second_prefix,
+            interface_abi_digest: sha256_bytes(b"fixture second interface ABI"),
             contract_file: "fixture_second.ohos-facade.json".into(),
             contract_sha256: second_digest.clone(),
             identity_export: second_sentinel,
@@ -5689,6 +5691,7 @@ fn facade_inventory_ignores_stale_unlisted_contracts() {
                 "component": "fixture",
                 "namespace": "fixture",
                 "nativeExportPrefix": fixture_prefix,
+                "interfaceAbiDigest": sha256_bytes(b"fixture interface ABI"),
                 "contractFile": "current.ohos-facade.json",
                 "contractSha256": sha256_bytes(&current_bytes),
                 "identityExport": bridge_identity_export(&fixture_prefix, &sha256_bytes(&current_bytes)),
@@ -5735,6 +5738,7 @@ fn test_host_facade_bundle() -> HostFacadeBundle {
         component: "cache_fixture".into(),
         namespace: "cache_fixture".into(),
         native_export_prefix,
+        interface_abi_digest: sha256_bytes(b"cache fixture interface ABI"),
         contract_file: "cache_fixture.ohos-facade.json".into(),
         contract_sha256: contract_sha256.clone(),
         identity_export,
@@ -5781,6 +5785,7 @@ fn test_host_composite_identity(
                     component.component.clone(),
                     component.namespace.clone(),
                     component.native_export_prefix.clone(),
+                    component.interface_abi_digest.clone(),
                 )
             })
             .collect::<Vec<_>>(),
@@ -5863,6 +5868,7 @@ fn test_input_stream_host_facade_bundle() -> HostFacadeBundle {
         component: component.into(),
         namespace: namespace.into(),
         native_export_prefix,
+        interface_abi_digest: sha256_bytes(b"input fixture interface ABI"),
         contract_file: format!("{component}.ohos-facade.json"),
         contract_sha256: contract_sha256.clone(),
         identity_export,
@@ -6137,6 +6143,7 @@ fn two_component_prefixed_bundle_loads_and_namespaces_same_short_exports() {
                 component: component.into(),
                 namespace: namespace.into(),
                 native_export_prefix,
+                interface_abi_digest: sha256_bytes(format!("{component} interface ABI").as_bytes()),
                 contract_file: format!("{component}.ohos-facade.json"),
                 contract_sha256: contract_sha256.clone(),
                 identity_export,
@@ -6499,6 +6506,7 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
             component: "fixture".into(),
             namespace: "fixture".into(),
             native_export_prefix: fixture_prefix,
+            interface_abi_digest: sha256_bytes(b"fixture interface ABI"),
             contract_file: "fixture.ohos-facade.json".into(),
             contract_sha256: fixture_digest.clone(),
             identity_export: fixture_identity_export,
@@ -6507,6 +6515,7 @@ fn required_bundle_preflight_rejects_named_owner_type_from_another_sidecar_witho
             component: "owner_fixture".into(),
             namespace: "owner_fixture".into(),
             native_export_prefix: owner_prefix,
+            interface_abi_digest: sha256_bytes(b"owner fixture interface ABI"),
             contract_file: "owner_fixture.ohos-facade.json".into(),
             contract_sha256: owner_digest.clone(),
             identity_export: owner_identity_export,
@@ -6597,7 +6606,7 @@ fn host_bundle_version_checksum_and_identity_rejections_do_not_mutate_cache_or_o
     reject(
         "v2",
         serde_json::to_vec(&version_two).unwrap(),
-        "expected 3",
+        "expected 4",
     );
 
     let mut generic_schema: Value =
@@ -6606,11 +6615,11 @@ fn host_bundle_version_checksum_and_identity_rejections_do_not_mutate_cache_or_o
         .as_object_mut()
         .unwrap()
         .remove("hostBundleSchemaVersion");
-    generic_schema["schemaVersion"] = Value::from(3);
+    generic_schema["schemaVersion"] = Value::from(4);
     reject(
         "generic schemaVersion",
         serde_json::to_vec(&generic_schema).unwrap(),
-        "expected 3, got missing",
+        "expected 4, got missing",
     );
 
     let mut unknown_schema: Value =
@@ -6619,7 +6628,7 @@ fn host_bundle_version_checksum_and_identity_rejections_do_not_mutate_cache_or_o
     reject(
         "unknown schema",
         serde_json::to_vec(&unknown_schema).unwrap(),
-        "expected 3, got 99",
+        "expected 4, got 99",
     );
 
     let mut checksum_mismatch = valid.clone();
@@ -9359,7 +9368,7 @@ fn generates_har_with_package_root_and_no_absolute_paths() {
         .unwrap();
     std::fs::write(
         dist.join("harmony-facade-contract.json"),
-        "{\"hspFacadeAggregateSchemaVersion\":1,\"components\":[],\"componentIdentities\":[],\"hostCompositeIdentity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outputStreams\":[],\"inputStreams\":[]}",
+        "{\"hspFacadeAggregateSchemaVersion\":2,\"components\":[],\"componentIdentities\":[],\"hostCompositeIdentity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outputStreams\":[],\"inputStreams\":[]}",
     )
     .unwrap();
     std::fs::write(dist.join("arm64-v8a/libdemo_ohos.so"), "fake").unwrap();

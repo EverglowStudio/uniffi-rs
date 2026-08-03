@@ -138,6 +138,8 @@ impl<'ir> RPath<'ir> {
                     BuiltinItem::HashSet => path.push_str("HashSet"),
                     BuiltinItem::Option => path.push_str("Option"),
                     BuiltinItem::Result => path.push_str("Result"),
+                    BuiltinItem::UniFfiStream => path.push_str("UniFfiStream"),
+                    BuiltinItem::UniFfiInputStream => path.push_str("UniFfiInputStream"),
                     BuiltinItem::UniffiMacro(name) | BuiltinItem::UniffiDerive(name) => {
                         path.push_str(name)
                     }
@@ -714,6 +716,10 @@ fn get_builtin_item(path: &Path) -> Option<&'static Item> {
         "Box" | "std::boxed::Box" => Some(&Item::Builtin(BuiltinItem::Box)),
         "Vec" | "std::vec::Vec" => Some(&Item::Builtin(BuiltinItem::Vec)),
         "Result" | "std::result::Result" => Some(&Item::Builtin(BuiltinItem::Result)),
+        "UniFfiStream" | "uniffi::UniFfiStream" => Some(&Item::Builtin(BuiltinItem::UniFfiStream)),
+        "UniFfiInputStream" | "uniffi::UniFfiInputStream" => {
+            Some(&Item::Builtin(BuiltinItem::UniFfiInputStream))
+        }
         "String" | "std::string::String" => Some(&Item::Builtin(BuiltinItem::String)),
         "str" | "std::primitive::str" => Some(&Item::Builtin(BuiltinItem::Str)),
         "From" | "std::convert::From" => Some(&Item::Builtin(BuiltinItem::From)),
