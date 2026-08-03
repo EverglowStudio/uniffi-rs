@@ -2020,18 +2020,95 @@ fn managed_private_args(
 
 fn clear_managed_selected_roots(
     transaction: &mut ManagedPackageTransaction,
+    layout: &ManagedLayout,
     targets: &ExpandedTargets,
 ) -> Result<()> {
-    let mut paths = Vec::new();
+    let mut paths = Vec::<String>::new();
+    let has_browser = targets.wasm || targets.mini_program;
+    let has_napi = targets.node || targets.electron;
+    let has_js = has_browser || has_napi || targets.harmony;
+
+    // A managed candidate is seeded byte-for-byte from the previous owned
+    // generation.  Remove every selected generator-owned route through the
+    // transaction snapshot before invoking a generator: overwriting a seeded
+    // path would retain stale files, and creation-time guards (notably the
+    // Mini Program snippets copier) must never treat an old pathname as one
+    // created by the current invocation.  Shared/common routes are rebuilt by
+    // every JavaScript flavor, while unselected flavor routes remain seeded.
+    if has_js {
+        paths.push("src/ffi/shared".into());
+        for component in layout.exact_components()? {
+            let root = format!("src/ffi/components/{}", component.namespace);
+            paths.push(format!("{root}/common"));
+            if has_browser {
+                paths.push(format!("{root}/browser"));
+            }
+            if targets.node {
+                paths.push(format!("{root}/node"));
+            }
+            if targets.electron {
+                paths.push(format!("{root}/electron"));
+            }
+            if targets.harmony {
+                paths.push(format!("{root}/harmony"));
+            }
+        }
+    }
+    if has_browser {
+        // The browser namespace root is shared by Web and Mini Program.
+        // build_wasm always regenerates index.ts and index.web.ts, including
+        // for a Mini-Program-only request, while the Mini entry is selected
+        // independently and must survive an unselected Web-only refresh.
+        paths.extend([
+            "src/ffi/browser/index.ts".into(),
+            "src/ffi/browser/index.web.ts".into(),
+            "artifacts/browser".into(),
+            "artifacts/rust/wasm".into(),
+        ]);
+    }
+    if targets.wasm {
+        paths.push("src/index.web.ts".into());
+    }
+    if targets.mini_program {
+        paths.extend([
+            "src/ffi/browser/index.mini-program.ts".into(),
+            "src/index.mini-program.ts".into(),
+            "artifacts/mini-program".into(),
+        ]);
+    }
+    if has_napi {
+        // Node and Electron intentionally share one composite N-API host and
+        // one addon publication route.
+        paths.extend(["artifacts/node".into(), "artifacts/rust/napi".into()]);
+    }
+    if targets.node {
+        paths.extend(["src/ffi/node".into(), "src/index.node.ts".into()]);
+    }
+    if targets.electron {
+        paths.extend(["src/ffi/electron".into(), "src/index.electron.ts".into()]);
+    }
     if targets.harmony {
-        paths.push("artifacts/harmony");
+        paths.extend([
+            "src/ffi/harmony".into(),
+            "artifacts/harmony".into(),
+            "artifacts/rust/ohos".into(),
+        ]);
     }
     if targets.apple {
-        paths.extend(["artifacts/apple", "src/ffi/swift", "src/ffi/apple"]);
+        paths.extend([
+            "artifacts/apple".into(),
+            "src/ffi/swift".into(),
+            "src/ffi/apple".into(),
+        ]);
     }
     if targets.android {
-        paths.extend(["artifacts/android", "src/ffi/kotlin", "src/ffi/android"]);
+        paths.extend([
+            "artifacts/android".into(),
+            "src/ffi/kotlin".into(),
+            "src/ffi/android".into(),
+        ]);
     }
+    let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
     transaction.clear_seeded_paths(&paths)
 }
 
@@ -4454,7 +4531,7 @@ fn build_managed_package(
     let mut transaction = ManagedPackageTransaction::begin(&layout)?;
     let mut private_layout = layout.rebased(&layout.package_dir, transaction.candidate_root())?;
     let prepared = (|| -> Result<ManagedPackageOwner> {
-        clear_managed_selected_roots(&mut transaction, &targets)?;
+        clear_managed_selected_roots(&mut transaction, &layout, &targets)?;
         let private_args = managed_private_args(&transaction, &layout, &public_args)?;
         build_private_target_set(&private_args, &targets)?;
         rebase_private_javascript_host_crates(&public_args, &private_args, &targets)?;
