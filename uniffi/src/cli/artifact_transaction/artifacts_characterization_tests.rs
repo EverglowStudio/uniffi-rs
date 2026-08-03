@@ -4440,6 +4440,178 @@ fn managed_package_root_transaction_preserves_carried_files_and_fail_closes_owne
 }
 
 #[test]
+fn managed_selected_javascript_routes_leave_exact_abort_inventory_and_unselected_siblings() {
+    let root = unique_tmp_dir("managed-selected-javascript-routes");
+    let package = fresh_managed_package_root(&root);
+    let component = ManagedComponentIdentity::new("fixture", "fixture").unwrap();
+    let layout = ManagedLayout {
+        package_dir: package.clone(),
+        root_source_package: "fixture".into(),
+        root_lib_target: "fixture".into(),
+        source_root: package.join("src/ffi"),
+        artifact_root: package.join("artifacts"),
+        host_crates_root: package.join("artifacts/rust"),
+        manifest_path: package.join("artifact-manifest.json"),
+        components: Some(vec![component]),
+        components_authoritative: true,
+        host_identity: None,
+        expected_routes: None,
+        route_inputs: None,
+    };
+    let selected = [
+        "src/ffi/shared/runtime.ts",
+        "src/ffi/components/fixture/common/api.ts",
+        "src/ffi/components/fixture/browser/backend-wasm.ts",
+        "src/ffi/components/fixture/node/backend-napi.ts",
+        "src/ffi/components/fixture/electron/backend-napi.ts",
+        "src/ffi/components/fixture/harmony/backend-ohos.ts",
+        "src/ffi/browser/index.ts",
+        "src/ffi/browser/index.web.ts",
+        "src/ffi/browser/index.mini-program.ts",
+        "src/ffi/node/index.ts",
+        "src/ffi/electron/index.ts",
+        "src/ffi/harmony/index.ts",
+        "src/index.web.ts",
+        "src/index.mini-program.ts",
+        "src/index.node.ts",
+        "src/index.electron.ts",
+        "artifacts/browser/pkg/snippets/fixture/inline0.js",
+        "artifacts/mini-program/snippets/fixture/inline0.js",
+        "artifacts/node/fixture.node",
+        "artifacts/rust/wasm/Cargo.toml",
+        "artifacts/rust/napi/Cargo.toml",
+        "artifacts/rust/ohos/Cargo.toml",
+        "artifacts/harmony/dist/Index.ets",
+    ];
+    let unselected = [
+        "src/ffi/swift/fixture.swift",
+        "src/ffi/kotlin/uniffi/fixture/fixture.kt",
+        "artifacts/apple/fixture.xcframework/Info.plist",
+        "artifacts/android/jniLibs/arm64-v8a/libfixture.so",
+        "artifacts/operator-note.txt",
+        "src/support/email.ts",
+        "package.json",
+    ];
+
+    let mut initial = ManagedPackageTransaction::begin(&layout).unwrap();
+    for relative in selected.iter().chain(&unselected) {
+        let path = initial.candidate_root().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("owned fixture {relative}\n")).unwrap();
+    }
+    std::fs::write(
+        initial.candidate_root().join("artifact-manifest.json"),
+        "{}\n",
+    )
+    .unwrap();
+    let owner = initial.prepare_owner().unwrap();
+    initial.commit(owner).unwrap();
+    let public_before = regular_file_snapshot(&package);
+
+    // Web and Mini Program share their component/browser host, but the Mini
+    // coordinator and copied runtime are independently selected routes.  A
+    // Web-only refresh must therefore rebuild the shared Web routes without
+    // discarding the retained Mini generation (or any N-API/Harmony sibling).
+    let web_selected = [
+        "src/ffi/shared/runtime.ts",
+        "src/ffi/components/fixture/common/api.ts",
+        "src/ffi/components/fixture/browser/backend-wasm.ts",
+        "src/ffi/browser/index.ts",
+        "src/ffi/browser/index.web.ts",
+        "src/index.web.ts",
+        "artifacts/browser/pkg/snippets/fixture/inline0.js",
+        "artifacts/rust/wasm/Cargo.toml",
+    ];
+    let web_unselected = [
+        "src/ffi/browser/index.mini-program.ts",
+        "src/index.mini-program.ts",
+        "artifacts/mini-program/snippets/fixture/inline0.js",
+        "src/ffi/components/fixture/node/backend-napi.ts",
+        "src/ffi/components/fixture/electron/backend-napi.ts",
+        "src/ffi/components/fixture/harmony/backend-ohos.ts",
+        "artifacts/node/fixture.node",
+        "artifacts/rust/napi/Cargo.toml",
+        "artifacts/rust/ohos/Cargo.toml",
+        "artifacts/harmony/dist/Index.ets",
+    ];
+    let mut web_refresh = ManagedPackageTransaction::begin(&layout).unwrap();
+    let web_candidate = web_refresh.candidate_root().to_path_buf();
+    let web_build = web_refresh.build_root().to_path_buf();
+    let mut web_targets = ExpandedTargets::default();
+    web_targets.wasm = true;
+    clear_managed_selected_roots(&mut web_refresh, &layout, &web_targets).unwrap();
+    for relative in web_selected {
+        assert!(
+            !web_candidate.join(relative).exists(),
+            "selected Web route survived exact seed removal: {relative}"
+        );
+    }
+    for relative in web_unselected {
+        assert_eq!(
+            std::fs::read(web_candidate.join(relative)).unwrap(),
+            format!("owned fixture {relative}\n").as_bytes(),
+            "unselected JavaScript sibling changed during Web refresh: {relative}"
+        );
+    }
+    let error = web_refresh.abort(anyhow::anyhow!(
+        "intentional stop after exact Web-route removal"
+    ));
+    assert!(
+        format!("{error:#}").contains("intentional stop after exact Web-route removal"),
+        "Web-only abort unexpectedly failed its identity cleanup: {error:#}"
+    );
+    assert_eq!(regular_file_snapshot(&package), public_before);
+    assert!(!web_candidate.exists());
+    assert!(!web_build.exists());
+    assert!(managed_record_paths(&root, &managed_package_digest(&package)).is_empty());
+
+    let mut refresh = ManagedPackageTransaction::begin(&layout).unwrap();
+    let candidate = refresh.candidate_root().to_path_buf();
+    let build = refresh.build_root().to_path_buf();
+    let mut targets = ExpandedTargets::default();
+    targets.wasm = true;
+    targets.mini_program = true;
+    targets.node = true;
+    targets.electron = true;
+    targets.harmony = true;
+    clear_managed_selected_roots(&mut refresh, &layout, &targets).unwrap();
+
+    for relative in selected {
+        assert!(
+            !candidate.join(relative).exists(),
+            "selected generator route survived exact seed removal: {relative}"
+        );
+    }
+    for relative in unselected {
+        assert_eq!(
+            std::fs::read(candidate.join(relative)).unwrap(),
+            format!("owned fixture {relative}\n").as_bytes(),
+            "unselected sibling changed during selected seed removal: {relative}"
+        );
+    }
+
+    let error = refresh.abort(anyhow::anyhow!(
+        "intentional stop after exact selected-route removal"
+    ));
+    assert!(
+        format!("{error:#}").contains("intentional stop after exact selected-route removal"),
+        "exact abort unexpectedly failed its identity cleanup: {error:#}"
+    );
+    assert_eq!(regular_file_snapshot(&package), public_before);
+    assert!(
+        !candidate.exists(),
+        "exact abort retained candidate {candidate}"
+    );
+    assert!(!build.exists(), "exact abort retained build root {build}");
+    assert!(
+        managed_record_paths(&root, &managed_package_digest(&package)).is_empty(),
+        "exact abort retained managed transaction records"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn managed_seed_registration_never_adopts_inserted_or_replaced_objects() {
     let root = unique_tmp_dir("managed-exact-seed-races");
     let source = root.join("source");
@@ -6930,7 +7102,7 @@ fn managed_dual_component_incremental_apple_merge_has_one_owner_and_manifest_com
 
     let meta = test_cargo_metadata(core.join("target"));
     let mut transaction = ManagedPackageTransaction::begin(&apple_layout).unwrap();
-    clear_managed_selected_roots(&mut transaction, &targets).unwrap();
+    clear_managed_selected_roots(&mut transaction, &apple_layout, &targets).unwrap();
     let private_args = managed_private_args(&transaction, &apple_layout, &args).unwrap();
     let mut private_layout = apple_layout
         .rebased(&apple_layout.package_dir, transaction.candidate_root())

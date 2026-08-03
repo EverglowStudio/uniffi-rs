@@ -802,33 +802,35 @@ fn cli_managed_layout_emits_package_entries_manifest_and_bench_smoke() {
         Utf8PathBuf::from_path_buf(tmp.path().join("managed-cargo-target-napi")).unwrap();
     let (manifest, source) = shared::write_cli_wasm_fixture(tmp.path());
 
-    let output = Command::new(cli.as_std_path())
-        .current_dir(&root)
-        .arg("artifacts")
-        .arg("build")
-        .arg("--manifest-path")
-        .arg(manifest.as_str())
-        .arg("--source")
-        .arg(source.as_str())
-        .arg("--target")
-        .arg("wasm")
-        .arg("--target")
-        .arg("mini-program")
-        .arg("--target")
-        .arg("node")
-        .arg("--managed-layout")
-        .arg("--package-dir")
-        .arg(package_dir.as_str())
-        .arg("--napi-target-dir")
-        .arg(target_dir.as_str())
-        .output()
-        .expect("failed to invoke uniffi-bindgen artifacts build --managed-layout");
-    if !output.status.success() {
-        panic!(
-            "managed artifacts build failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    for attempt in 1..=2 {
+        let output = Command::new(cli.as_std_path())
+            .current_dir(&root)
+            .arg("artifacts")
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(manifest.as_str())
+            .arg("--source")
+            .arg(source.as_str())
+            .arg("--target")
+            .arg("wasm")
+            .arg("--target")
+            .arg("mini-program")
+            .arg("--target")
+            .arg("node")
+            .arg("--managed-layout")
+            .arg("--package-dir")
+            .arg(package_dir.as_str())
+            .arg("--napi-target-dir")
+            .arg(target_dir.as_str())
+            .output()
+            .expect("failed to invoke uniffi-bindgen artifacts build --managed-layout");
+        if !output.status.success() {
+            panic!(
+                "managed artifacts build attempt {attempt} failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     let manifest_path = package_dir.join("artifact-manifest.json");
