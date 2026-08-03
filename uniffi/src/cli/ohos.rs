@@ -11654,7 +11654,7 @@ fn pretty_type_def(def: &TypeDefLine) -> String {
                 out.push_str(&rendered);
             } else {
                 out.push_str(&format!(
-                    "export type {}{} = \n{}",
+                    "export type {}{} =\n{}",
                     def.name,
                     render_type_parameters(&def.type_parameters),
                     definition

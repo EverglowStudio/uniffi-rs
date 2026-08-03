@@ -4518,6 +4518,7 @@ fn ohos_type_renderer_rewrites_only_buffer_type_tokens() {
     ));
     assert!(rendered.contains("export type napi_ohos_bridge = 'Buffer' | 'BufferPool';"));
     assert!(rendered.contains("payload: ArrayBuffer"));
+    assert!(rendered.lines().all(|line| line.trim_end() == line));
 }
 
 #[test]
