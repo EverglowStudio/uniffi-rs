@@ -793,6 +793,7 @@ fn checksum_named_definitions<T: Checksum>(
 /// record fields, enum variants, callable parameters and methods retain their
 /// ABI-significant order inside each definition.
 pub fn component_interface_abi_digest(ci: &uniffi_bindgen::ComponentInterface) -> String {
+    let ci = ci.canonicalized_for_abi_digest();
     let mut state = InterfaceAbiHasher::default();
     "uniffi-component-interface-abi-v1".checksum(&mut state);
     state.write_u32(ci.uniffi_contract_version());
@@ -1789,6 +1790,91 @@ fn render_uniffi_dependency(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uniffi_bindgen::cargo_metadata::CrateConfigSupplier;
+    use uniffi_bindgen::{
+        BindgenLoader, BindgenPaths, CargoMetadataOptions, ComponentInterface, GlobalConfig,
+    };
+
+    const CROSS_LOADER_FIXTURE_SOURCE: &str = r#"
+mod api {
+    use std::sync::Arc;
+
+    #[derive(Clone, Debug, uniffi::Record)]
+    pub struct Payload {
+        pub value: u64,
+    }
+
+    #[derive(Clone, Debug, uniffi::Error)]
+    pub enum ApiError {
+        Failed,
+    }
+
+    impl std::fmt::Display for ApiError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "failed")
+        }
+    }
+
+    impl std::error::Error for ApiError {}
+
+    #[derive(Clone, Debug, uniffi::Error)]
+    pub enum AlternateError {
+        Failed,
+    }
+
+    impl std::fmt::Display for AlternateError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "alternate failure")
+        }
+    }
+
+    impl std::error::Error for AlternateError {}
+
+    #[derive(Clone, Debug)]
+    pub struct EventId(pub u64);
+    uniffi::custom_newtype!(EventId, u64);
+
+    #[uniffi::export(callback_interface)]
+    pub trait Listener: Send + Sync {
+        async fn on_event(&self, event: Payload) -> Result<EventId, ApiError>;
+    }
+
+    #[derive(uniffi::Object)]
+    pub struct Service;
+
+    #[uniffi::export]
+    impl Service {
+        #[uniffi::constructor]
+        pub fn new(_seed: EventId) -> Arc<Self> {
+            Arc::new(Self)
+        }
+
+        pub async fn fetch(&self, request: Payload) -> Result<Payload, ApiError> {
+            Ok(request)
+        }
+    }
+
+    #[uniffi::export]
+    pub fn produce_events(
+        _seed: EventId,
+    ) -> uniffi::UniFfiStream<Payload, ApiError> {
+        unimplemented!()
+    }
+
+    #[uniffi::export]
+    pub async fn consume_events(
+        events: uniffi::UniFfiInputStream<Payload, ApiError>,
+    ) -> Result<EventId, ApiError> {
+        drop(events);
+        Err(ApiError::Failed)
+    }
+}
+
+pub use api::{
+    consume_events, produce_events, AlternateError, ApiError, EventId, Listener, Payload, Service,
+};
+uniffi::setup_scaffolding!();
+"#;
 
     fn fixture_abi_digest(label: &str) -> String {
         sha256_bytes(format!("fixture-interface-abi:{label}").as_bytes())
@@ -1808,6 +1894,82 @@ mod tests {
     fn write_minimal_lib(crate_dir: &std::path::Path) {
         std::fs::create_dir_all(crate_dir.join("src")).unwrap();
         std::fs::write(crate_dir.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    }
+
+    fn cross_loader_fixture_manifest(root: &std::path::Path) -> Utf8PathBuf {
+        let crate_dir = root.join("abi-loader-fixture");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let uniffi_dir = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("uniffi");
+        let uniffi_dir = serde_json::to_string(uniffi_dir.as_str()).unwrap();
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                r#"[package]
+name = "abi-loader-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+async-trait = "0.1"
+uniffi = {{ path = {uniffi_dir}, default-features = false, features = ["macro-scaffolding"] }}
+"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), CROSS_LOADER_FIXTURE_SOURCE).unwrap();
+        Utf8PathBuf::from_path_buf(crate_dir.join("Cargo.toml")).unwrap()
+    }
+
+    fn load_cross_loader_fixture(manifest: &Utf8Path, source: &Utf8Path) -> ComponentInterface {
+        let mut metadata_command = MetadataCommand::new();
+        metadata_command.manifest_path(manifest.as_std_path());
+        let metadata = metadata_command.exec().unwrap();
+        let mut paths = BindgenPaths::default();
+        paths.add_layer(CrateConfigSupplier::from_cargo_metadata(
+            metadata,
+            CargoMetadataOptions::default(),
+        ));
+        let loader = BindgenLoader::new(paths, GlobalConfig::default());
+        let metadata = loader.load_metadata(source).unwrap();
+        loader
+            .load_cis(source, metadata)
+            .unwrap()
+            .into_iter()
+            .find(|ci| ci.crate_name() == "abi_loader_fixture")
+            .unwrap()
+    }
+
+    fn source_fixture_digest(manifest: &Utf8Path, source: &str) -> String {
+        std::fs::write(manifest.parent().unwrap().join("src/lib.rs"), source).unwrap();
+        component_interface_abi_digest(&load_cross_loader_fixture(
+            manifest,
+            Utf8Path::new("src:abi-loader-fixture"),
+        ))
+    }
+
+    fn assert_source_mutation_changes(
+        manifest: &Utf8Path,
+        baseline_digest: &str,
+        before: &str,
+        after: &str,
+        dimension: &str,
+    ) {
+        assert!(
+            CROSS_LOADER_FIXTURE_SOURCE.contains(before),
+            "missing fixture source marker for {dimension}",
+        );
+        let changed = CROSS_LOADER_FIXTURE_SOURCE.replacen(before, after, 1);
+        assert_ne!(
+            source_fixture_digest(manifest, &changed),
+            baseline_digest,
+            "{dimension} must contribute to the interface ABI digest",
+        );
     }
 
     fn single_component_plan(
@@ -2089,6 +2251,121 @@ component_source_alias = { package = "component-package", path = "../component",
         assert_eq!(digest, component_interface_abi_digest(&reverse));
         assert_ne!(digest, component_interface_abi_digest(&changed));
         assert!(is_sha256(&digest));
+    }
+
+    #[test]
+    fn interface_abi_digest_matches_source_and_compiled_metadata_without_losing_shape() {
+        let root = test_root("interface-abi-cross-loader");
+        let manifest = cross_loader_fixture_manifest(&root);
+        let crate_dir = manifest.parent().unwrap();
+        let target_dir = Utf8PathBuf::from_path_buf(root.join("target")).unwrap();
+        let build = std::process::Command::new("cargo")
+            .args(["build", "--manifest-path"])
+            .arg(manifest.as_std_path())
+            .env("CARGO_TARGET_DIR", target_dir.as_std_path())
+            .env_remove("RUSTFLAGS")
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "cross-loader fixture build failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+        );
+        let library = target_dir.join("debug").join(format!(
+            "{}abi_loader_fixture.{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_EXTENSION,
+        ));
+        assert!(library.is_file(), "fixture cdylib missing at {library}");
+
+        let source = load_cross_loader_fixture(&manifest, Utf8Path::new("src:abi-loader-fixture"));
+        let compiled = load_cross_loader_fixture(&manifest, &library);
+        let source_digest = component_interface_abi_digest(&source);
+        assert_eq!(
+            source_digest,
+            component_interface_abi_digest(&compiled),
+            "source parsing and compiled metadata must describe one canonical ABI",
+        );
+
+        let producer = source.get_function_definition("produce_events").unwrap();
+        assert!(matches!(
+            producer.return_type(),
+            Some(uniffi_bindgen::interface::Type::Stream { .. })
+        ));
+        let consumer = source.get_function_definition("consume_events").unwrap();
+        assert!(consumer.is_async() && consumer.throws());
+        assert!(consumer.arguments().iter().any(|argument| matches!(
+            uniffi_bindgen::interface::AsType::as_type(*argument),
+            uniffi_bindgen::interface::Type::InputStream { .. }
+        )));
+        assert!(source.get_custom_type_definition("EventId").is_some());
+        let callback = source
+            .get_callback_interface_definition("Listener")
+            .unwrap();
+        let callback_method = callback.methods()[0];
+        assert!(callback_method.is_async() && callback_method.throws());
+        let object = source.get_object_definition("Service").unwrap();
+        let object_method = object
+            .methods()
+            .into_iter()
+            .find(|method| method.name() == "fetch")
+            .unwrap();
+        assert!(object_method.is_async() && object_method.throws());
+
+        for (before, after, dimension) in [
+            (
+                "uniffi::UniFfiStream<Payload, ApiError>",
+                "uniffi::UniFfiStream<u64, ApiError>",
+                "output stream item type",
+            ),
+            (
+                "uniffi::UniFfiInputStream<Payload, ApiError>",
+                "uniffi::UniFfiInputStream<Payload, AlternateError>",
+                "input stream error type",
+            ),
+            (
+                "pub struct EventId(pub u64);\n    uniffi::custom_newtype!(EventId, u64);",
+                "pub struct EventId(pub u32);\n    uniffi::custom_newtype!(EventId, u32);",
+                "custom type builtin",
+            ),
+            (
+                "pub async fn fetch(&self, request: Payload)",
+                "pub fn fetch(&self, request: Payload)",
+                "object method async state",
+            ),
+            (
+                "pub async fn fetch(&self, request: Payload) -> Result<Payload, ApiError> {\n            Ok(request)\n        }",
+                "pub async fn fetch(&self, request: Payload) -> Payload {\n            request\n        }",
+                "object method throws state",
+            ),
+            (
+                "async fn on_event(&self, event: Payload)",
+                "fn on_event(&self, event: Payload)",
+                "callback method async state",
+            ),
+            (
+                "async fn on_event(&self, event: Payload) -> Result<EventId, ApiError>;",
+                "async fn on_event(&self, event: Payload) -> EventId;",
+                "callback method throws state",
+            ),
+            (
+                "async fn on_event(&self, event: Payload)",
+                "async fn on_event(&self, event: u64)",
+                "callback method argument type",
+            ),
+        ] {
+            assert_source_mutation_changes(
+                &manifest,
+                &source_digest,
+                before,
+                after,
+                dimension,
+            );
+        }
+
+        std::fs::write(crate_dir.join("src/lib.rs"), CROSS_LOADER_FIXTURE_SOURCE).unwrap();
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
