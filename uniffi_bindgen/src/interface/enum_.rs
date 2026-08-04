@@ -190,7 +190,7 @@ pub struct Enum {
     pub(super) constructors: Vec<Constructor>,
     pub(super) methods: Vec<Method>,
     // The "uniffi trait" methods - eg, `Eq`, `Display` etc.
-    pub(super) uniffi_traits: Vec<UniffiTrait>,
+    uniffi_traits: Vec<UniffiTrait>,
     #[checksum_ignore]
     pub(super) docstring: Option<String>,
 }

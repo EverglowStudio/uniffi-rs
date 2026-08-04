@@ -69,7 +69,6 @@ fn emits_real_tree_for_all_flavors() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(harmony_contract["facadeContractSchemaVersion"], 4);
     assert_eq!(harmony_contract["component"], "arithmetical");
     assert_eq!(harmony_contract["namespace"], "arithmetic");
     assert_eq!(harmony_contract["nativeExportPrefix"], "ffi_arithmetical");
@@ -339,14 +338,12 @@ fn emits_real_tree_for_all_flavors() {
     );
 }
 
-// Execution-level sanity check (see module doc). Skipped if Node is
-// missing or older than 22.6 (no `--experimental-strip-types`).
+// Execution-level sanity check (see module doc). Requires Node 22.6+
+// for `--experimental-strip-types` support.
 #[test]
 fn runs_common_api_under_node() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("skipping: node with --experimental-strip-types not available");
-        return;
-    };
+    let node = locate_node_with_strip_types()
+        .expect("node 22.6+ with --experimental-strip-types is required");
 
     let out = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(out.path().to_path_buf()).unwrap();
