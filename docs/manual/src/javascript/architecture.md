@@ -71,16 +71,21 @@ single-component output may load its local addon fallback.
 ## Managed artifacts
 
 `uniffi-bindgen artifacts build --managed-layout --package-dir <dir>` derives
-the source and artifact roots, platform namespace facades, and an exact-v4
-`artifact-manifest.json`. The manifest records canonical ordered `components`
-and `hostCompositeIdentity` alongside every generated source root, platform
-entrypoint, host crate, and artifact route. It is an internal build document,
-not a public runtime API.
+one dedicated package root. Every public source tree, native host, platform
+wrapper, and required metadata file is below that root and is consumed through
+fixed paths. The complete directory is the smallest supported consumption
+unit; files from separate generator runs must not be mixed.
 
-Readers and writers require manifest v4 exactly. They do not use an old schema,
-legacy adoption, compatibility alias, or dual-read behavior. A managed
-HAR↔HSP transition validates both the published generation's exact historical
-route evidence and the new generation's current plan.
+Generation starts from an empty sibling temporary directory. A successful
+build replaces the whole public root. A failed build leaves the published root
+unchanged. The fixed `.uniffi-managed-owner` file only identifies a directory
+as tool-owned; it has no version, generation, hash, PID, or artifact inventory.
+A non-empty root without that marker is rejected. Concurrent writers and
+hard-power-loss recovery are not supported: rerun generation after an
+interruption. When the format changes, delete the root and generate it again.
+
+Version resolution, lockfiles, archive-level checksums, and package caching
+belong to a future dependency CLI and are intentionally not implemented here.
 
 ## Harmony / OpenHarmony
 
@@ -97,9 +102,11 @@ The package has separate implementation and public declaration layers:
 - `Index.ets` and `Index.d.ets` define the public namespace surface; component
   `.ets` and `.d.ets` facade modules are staged below `src/main/ets/components`.
 
-The facade contract is exact v4 and the host bundle is exact v3. HSP additionally
-uses its separate exact-v1 aggregate facade contract with the canonical
-component and stream inventory. The generated host enables upstream
+The per-component facade contract and host bundle contain only the functional
+component, namespace, native-prefix, type, and stream data used by the Harmony
+facade renderer. No HSP aggregate metadata is published. These functional
+inputs contain no numeric format version, ABI digest, composite identity, or
+per-file hash. The generated host enables upstream
 `napi-derive-ohos`'s `type-def` feature only as a
 compile-only compatibility feature; the checked UniFFI sidecar is the canonical
 raw type source.
@@ -107,9 +114,8 @@ raw type source.
 HAR is the default package kind and HSP is explicit. Their public namespace
 surface is the same. The HSP release tgz contains the runtime HSP and Interface
 HAR; the runtime owns native libraries and the Interface HAR excludes them.
-The Interface HAR deletes its package-root `harmony-facade-contract.json` and
-retains only the internal native dependency copy at
-`src/main/cpp/types/lib<host-stem>/harmony-facade-contract.json`.
+The Interface HAR contains the public namespace declarations and native module
+declarations, but no facade-contract metadata copy.
 
 Core package/HAP evidence is validated before any optional CodeLinter probe. A
 standalone executable may come from `CODELINTER`, a conventional tool
@@ -117,23 +123,13 @@ directory, or `PATH`; a DevEco plugin JavaScript file is not an executable
 substitute. If none is available, UniFFI records only CodeLinter availability:
 it does not invalidate the core package/HAP evidence or the generated contract.
 
-The exact current versions are JavaScript runtime backend ABI v2, Harmony
-facade contract v4, JavaScript host bundle v3, managed artifact manifest v4,
-and HSP facade aggregate contract v1.
-
 ## Artifact publication
 
-The standalone `cli::artifact_transaction` module owns managed and OHOS
-publication. `ohos.rs` and `artifacts.rs` call its stable crate-private API;
-they do not maintain independent transaction state. Destination locks, private
-candidates, durable owner and journal records, pre-commit rollback, and
-recovery protect an interrupted generation. Ambiguous or unverifiable state
-fails closed.
-
-This does not promise instantaneous global atomic visibility across unrelated
-filesystems. A later invocation either restores a complete old generation or
-finishes cleanup for a committed new one according to the exact owner and
-journal evidence.
+Managed publication uses the sibling staging directory described above and a
+single directory replacement. Concurrent writers and crash recovery are not
+supported; rerun generation after an interruption. Direct non-managed
+platform commands remain ordinary build commands and do not define the managed
+package contract.
 
 ## Why there is no JavaScript IR yet
 

@@ -368,7 +368,6 @@ Managed mode derives these paths from `--package-dir`:
 - generated source: `src/ffi`
 - build artifacts: `artifacts`
 - generated host crates: `artifacts/rust`
-- manifest: `artifact-manifest.json`
 - web entrypoint: `src/index.web.ts` when `--target wasm` is requested
 - Mini Program entrypoint: `src/index.mini-program.ts`
 - node entrypoint: `src/index.node.ts` when `--target node` is requested
@@ -404,105 +403,36 @@ import * as bindings from "./src/index.node.ts";
 console.log(bindings.myCore.welcomeAgent("Ada"));
 ```
 
-Managed mode emits deterministic, exact-v4 `artifact-manifest.json` metadata
-for build tools. The manifest is not a public runtime API. Its full route
-inventory is required, and its identity starts with a canonical ordered
-component set and one composite host identity. This structurally complete Node
-example shows every required v4 field; inapplicable routes are explicit `null`:
+Managed mode does not emit an artifact manifest. The target set, package name,
+and fixed directory conventions determine every source, host, entrypoint, and
+platform package path. The selected N-API, wasm, and OHOS hosts are
+package-level composite artifacts, and all component source roots remain
+namespaced.
 
-```json
-{
-  "artifactManifestSchemaVersion": 4,
-  "generator": "uniffi-bindgen-javascript",
-  "components": [
-    {
-      "component": "my_core",
-      "namespace": "myCore",
-      "nativeExportPrefix": "ffi_my_core",
-      "source": {
-        "common": "src/ffi/components/myCore/common",
-        "browser": null,
-        "node": "src/ffi/components/myCore/node",
-        "electron": null,
-        "harmony": null,
-        "publicTypes": "src/ffi/components/myCore/common/public-types.ts"
-      }
-    }
-  ],
-  "hostCompositeIdentity": "0000000000000000000000000000000000000000000000000000000000000000",
-  "targets": ["node"],
-  "source": {
-    "root": "src/ffi",
-    "shared": "src/ffi/shared",
-    "browser": null,
-    "node": "src/ffi/node",
-    "electron": null,
-    "harmony": null,
-    "swift": null,
-    "kotlin": null
-  },
-  "entrypoints": {
-    "web": null,
-    "miniProgram": null,
-    "node": "src/index.node.ts",
-    "electron": null,
-    "harmony": null
-  },
-  "artifacts": {
-    "wasm": null,
-    "miniProgram": null,
-    "node": {
-      "addon": "artifacts/node/my_core_uniffi_js_host.node",
-      "env": "UNIFFI_NAPI_PATH"
-    },
-    "electron": null,
-    "harmony": null,
-    "apple": null,
-    "android": null
-  },
-  "hostCrates": {
-    "wasm": null,
-    "napi": "artifacts/rust/napi/Cargo.toml",
-    "ohos": null
-  }
-}
-```
+The whole managed root is one atomic generated package and the smallest
+supported consumption unit. Do not combine source, native libraries, host
+crates, facade files, or sidecars from different runs. When the generated
+format changes, delete the managed root and generate it again. Managed mode
+does not generate `package.json` exports or npm publishing metadata.
 
-`component` is the canonical Rust crate identity: a Cargo package named
-`my-core` therefore appears here as `my_core`. Its public `namespace` remains
-the separately normalized `myCore` value.
+A future dependency CLI will provide version resolution, lockfiles, one
+archive-level checksum per resolved package, and package caching. Those
+features are outside UniFFI managed generation and are not implemented here.
 
-The selected N-API, wasm, and OHOS hosts are composite package-level artifacts,
-and all component source roots remain namespaced. Harmony records the exact HAR
-or HSP package kind, archive routes, facade contract, package/module/profile
-metadata, and host identity.
+### Managed publication boundary
 
-Readers and writers accept only exact v4. They do not dual-read old schemas,
-adopt a legacy manifest, or invent compatibility aliases. A managed HAR↔HSP
-transition is valid only after the existing generation proves its exact
-historical routes and the current invocation proves its current route plan.
-Managed mode does not generate `package.json` exports or npm publishing
-metadata.
+Managed generation creates an empty temporary directory beside the public
+root, performs all generation, compilation, and packaging there, then replaces
+the public directory after success. An ordinary build failure therefore leaves
+the published directory unchanged.
 
-### Managed artifact transaction boundary
-
-Exact-v4 publication uses the standalone `artifact_transaction` module shared
-by the managed artifact CLI and the OHOS packager. A committed owner sidecar
-binds the public package identity and inventory. Destination locks, durable
-journal/record files, private candidates, and pre-commit backups let the next
-UniFFI invocation recover an interrupted cross-path generation before it makes
-new writes; ambiguous or invalid state fails closed. Platform builders call
-this stable API and do not add their own states or recovery paths.
-
-Cooperating UniFFI invocations are serialized, and recovery preserves the
-current all-participant transaction semantics. This is not a promise of
-instantaneous global atomic visibility between unrelated destination paths: a
-hard process termination can leave them briefly mixed. On the next invocation,
-recovery restores the complete old generation if the interruption happened
-before the final owner commit; if it happened after that commit, recovery
-completes cleanup and preserves the committed new generation. Unverifiable
-identity or state fails closed. The owner and journal checks do not authorize
-deleting, adopting, or recovering unrelated or unowned filesystem content.
+The only persistent publication metadata is
+`.uniffi-managed-owner`, whose fixed content says that UniFFI owns the
+directory. It contains no format version, generation number, PID, hashes, or
+inventory. A non-empty directory without this marker is never overwritten.
+Concurrent writers, durable crash recovery, and hard-power-loss preservation
+of the previous package are not supported; rerun generation after an
+interruption.
 
 ## Electron preload ↔ renderer message shape
 
@@ -746,11 +676,11 @@ Package metadata flags are `--package-name`, `--module-name`,
 `--target-sdk-version` defaults to the resolved compile SDK and is written into
 the generated Hvigor build profile. Package selection and build controls include
 `--package/-p`, `--cargo-feature`, `--arch`, `--cargo-bin`, `--target-dir`,
-`--static`, `--skip-libs`, `--dts-cache`, `--skip-check`, `--zigbuild`,
+`--static`, `--skip-libs`, `--skip-check`, `--zigbuild`,
 `--bisheng`, `--skip-napi-check`, `--soname`, `--release`, and trailing Cargo
 arguments after `--`. Existing host workspaces can be selected with
 `--ohos-host-manifest-path`; `--raw-only-facade` is the explicit opt-out for a
-custom host that does not carry the generated facade contract.
+custom host that does not carry the generated facade inputs.
 
 Package-kind and output flags are `--package-type har|hsp`,
 `--integrated-hsp`, `--hsp-bundle-name`, `--har-out`, `--runtime-hsp-out`,
@@ -794,16 +724,13 @@ metadata:
 package/
   Index.ets
   Index.d.ets
-  harmony-facade-contract.json  # staging contract; omitted from the HSP Interface HAR
   oh-package.json5
   build-profile.json5
   src/main/module.json5
   src/main/ets/native-facade.ets
   src/main/ets/components/<namespace>.ets
   src/main/ets/components/<namespace>.d.ets
-  src/main/ets/harmonyFacadeContract.ets  # HSP
   src/main/cpp/types/lib<host-stem>/index.d.ts
-  src/main/cpp/types/lib<host-stem>/harmony-facade-contract.json  # internal HSP copy
   src/main/cpp/types/lib<host-stem>/oh-package.json5
   libs/<abi>/*.so
 ```
@@ -826,18 +753,9 @@ declare `packageType: InterfaceHar`. `module.json5` uses `type: har` for HAR and
 the staged public component `.ets` and `.d.ets` facade modules implement and
 declare the public Pull surface.
 
-For HSP publication, the Interface HAR deletes the package-root
-`harmony-facade-contract.json`. It retains exactly one internal native
-dependency copy at
-`src/main/cpp/types/lib<host-stem>/harmony-facade-contract.json` for native
-dependency validation; that file is not part of the public package root.
-
-For an HSP, `harmony-facade-contract.json` is the package aggregate contract
-with exact `hspFacadeAggregateSchemaVersion: 1`. It records the composite host
-identity, canonical component identities, components, and the output/input
-stream inventories. This v1 aggregate is distinct from each component's v4
-facade contract; readers reject a different aggregate schema rather than
-adopting a legacy contract.
+The generated ArkTS source and declarations fully materialize the namespace and
+stream surface before packaging. HAR and HSP therefore publish no aggregate
+facade metadata file.
 
 ### Published HAR and HSP artifacts
 
@@ -853,9 +771,7 @@ reported runtime HSP and Interface HAR are extracted byte-for-byte from that
 same tgz. The runtime HSP owns the selected ABI `.so` files. Because
 `excludeSoFromInterfaceHar` is enabled, the Interface HAR contains no target
 native library, and a consuming HAP must not duplicate those libraries. The
-Interface HAR preserves the same explicit public values and types as HAR, but
-deletes the package-root `harmony-facade-contract.json` and retains only its
-internal native dependency copy.
+Interface HAR preserves the same explicit public values and types as HAR.
 
 Consumers declare the generated tgz with the exact OHPM package name as the
 dependency key. They must not depend on the extracted runtime `.hsp` or
@@ -873,22 +789,11 @@ substitute. If none is available, UniFFI records only CodeLinter availability:
 it does not discard the core evidence or invalidate the generated package
 contract.
 
-## Versioning
+## Internal runtime handshake
 
-The exact current versions are:
-
-| Boundary | Version |
-| --- | --- |
-| Harmony facade contract | v4 |
-| JavaScript host bundle | v3 |
-| JavaScript runtime backend ABI | v2 |
-| Managed artifact manifest | v4 |
-| HSP facade aggregate contract | v1 |
-
-`JS_RUNTIME_ABI_VERSION` is internal and is checked fail-fast by generated
-backends. It is not an exported application constant. Exact schema readers and
-writers reject a different version rather than selecting a legacy migration
-path.
+`JS_RUNTIME_ABI_VERSION` is an internal runtime handshake checked fail-fast by
+generated backends. It is not an artifact schema, a package identity, or an
+exported application constant.
 
 ## Open items
 
