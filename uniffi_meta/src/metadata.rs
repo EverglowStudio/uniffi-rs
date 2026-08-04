@@ -24,6 +24,10 @@ pub mod codes {
     pub const TRAIT_INTERFACE: u8 = 12;
     pub const OBJECT_TRAIT_IMPL: u8 = 14;
     pub const CUSTOM_TYPE: u8 = 15;
+    // A callback lifetime/threading/reentrancy contract for one operation value path.
+    // This is deliberately a standalone metadata item so the existing operation metadata
+    // remains usable by non-JavaScript bindings.
+    pub const CALLBACK_USE_SITE: u8 = 16;
 
     // Type codes
     pub const TYPE_U8: u8 = 0;

@@ -5,13 +5,13 @@
 
 use uniffi_js_abi::{
     assign_component_ids, assign_operation_ids, assign_type_ids, ArgumentDefinition, AsyncKind,
-    ComponentDefinition, ComponentKey, EnumVariant, FieldDefinition, NamedTypeKind,
-    OperationDefinition, OperationKind, OperationOwner, OperationSignature, OperationSourceKey,
-    Ownership, ScalarType, TypeDefinition, TypeSourceKey, ValueType,
+    Capability, CapabilitySet, ComponentDefinition, ComponentKey, EnumVariant, FieldDefinition,
+    NamedTypeKind, OperationDefinition, OperationKind, OperationOwner, OperationSignature,
+    OperationSourceKey, Ownership, ScalarType, TypeDefinition, TypeSourceKey, ValueType,
 };
 use uniffi_js_engine_schema::{
-    BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention,
-    CallbackThreading, CallbackUseSite, Capability, CapabilitySet, EngineCapabilities, EngineKind,
+    assign_stream_use_site_ids, BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy,
+    CallbackRetention, CallbackThreading, CallbackUseSite, EngineCapabilities, EngineKind,
     PlannedOperation, StreamContract, StreamUseSite, ValuePath,
 };
 
@@ -94,7 +94,14 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
             },
         )
         .unwrap(),
-        TypeDefinition::new(object_key.clone(), "CorpusObject", NamedTypeKind::Object).unwrap(),
+        TypeDefinition::new(
+            object_key.clone(),
+            "CorpusObject",
+            NamedTypeKind::Object {
+                kind: uniffi_js_abi::ObjectKind::Struct,
+            },
+        )
+        .unwrap(),
         TypeDefinition::new(
             callback_key.clone(),
             "CorpusCallback",
@@ -325,6 +332,12 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
         Capability::OutputStream,
     ]);
 
+    let mut streams = vec![
+        StreamUseSite::new(run_async, ValuePath::argument(1), StreamContract::input()),
+        StreamUseSite::new(events, ValuePath::return_value(), StreamContract::output()),
+    ];
+    assign_stream_use_site_ids(&mut streams);
+
     BridgePlan::build(BridgePlanInput {
         components,
         types,
@@ -339,18 +352,7 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
                 reentrancy: CallbackReentrancy::Allowed,
             },
         }],
-        streams: vec![
-            StreamUseSite {
-                operation_id: run_async,
-                path: ValuePath::argument(1),
-                contract: StreamContract::input(),
-            },
-            StreamUseSite {
-                operation_id: events,
-                path: ValuePath::return_value(),
-                contract: StreamContract::output(),
-            },
-        ],
+        streams,
         targets: [
             EngineKind::Napi,
             EngineKind::WasmBindgen,

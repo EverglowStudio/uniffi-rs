@@ -3,8 +3,11 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use super::APIConverter;
-use crate::attributes::InterfaceAttributes;
-use crate::{converters::convert_docstring, InterfaceCollector};
+use crate::attributes::{ConstructorAttributes, InterfaceAttributes, MethodAttributes};
+use crate::{
+    converters::callables::callback_use_site_metadata, converters::convert_docstring,
+    InterfaceCollector,
+};
 use anyhow::{bail, Result};
 use std::collections::HashSet;
 use uniffi_meta::{
@@ -41,6 +44,21 @@ impl APIConverter<ObjectMetadata> for weedle::InterfaceDefinition<'_> {
                         bail!("Duplicate interface member name: \"{}\"", cons.name)
                     }
                     cons.self_name = object_name.to_string();
+                    let attributes = match &t.attributes {
+                        Some(attributes) => ConstructorAttributes::try_from(attributes)?,
+                        None => Default::default(),
+                    };
+                    for contract in callback_use_site_metadata(
+                        ci,
+                        uniffi_meta::CallbackOperationKind::Constructor,
+                        Some(object_name),
+                        &cons.name,
+                        &t.args.body.list,
+                        None,
+                        attributes.callback_contracts(),
+                    )? {
+                        ci.items.insert(contract.into());
+                    }
                     cons.self_type = Some(Type::Object {
                         module_path: ci.module_path(),
                         name: object_name.to_string(),
@@ -55,6 +73,18 @@ impl APIConverter<ObjectMetadata> for weedle::InterfaceDefinition<'_> {
                     }
                     // a little smelly that we need to fixup `self_name` here, but it is what it is...
                     method.self_name = object_name.to_string();
+                    let attributes = MethodAttributes::try_from(t.attributes.as_ref())?;
+                    for contract in callback_use_site_metadata(
+                        ci,
+                        uniffi_meta::CallbackOperationKind::Method,
+                        Some(object_name),
+                        &method.name,
+                        &t.args.body.list,
+                        method.return_type.as_ref(),
+                        attributes.callback_contracts(),
+                    )? {
+                        ci.items.insert(contract.into());
+                    }
                     ci.items.insert(method.into());
                 }
                 _ => bail!("no support for interface member type {:?} yet", member),

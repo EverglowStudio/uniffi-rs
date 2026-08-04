@@ -33,6 +33,7 @@ pub mod dispatch_key;
 pub mod electron;
 pub mod enum_shape;
 pub mod flavors;
+pub mod frontend;
 pub mod host_crates;
 pub mod js_names;
 pub mod name_map;

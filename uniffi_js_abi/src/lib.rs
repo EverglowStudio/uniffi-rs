@@ -10,7 +10,7 @@
 //! equivalent input regardless of discovery order, but are intentionally not
 //! persisted artifact identities.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -40,6 +40,81 @@ macro_rules! dense_id {
 dense_id!(ComponentId);
 dense_id!(TypeId);
 dense_id!(OperationId);
+dense_id!(StreamUseSiteId);
+
+/// Engine capabilities required by the canonical JavaScript API contract.
+///
+/// This belongs to the leaf ABI crate so public IR consumers do not need to
+/// depend on the schema validator or the bindgen frontend.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Capability {
+    Primitive,
+    String,
+    Bytes,
+    BigInt,
+    Optional,
+    Sequence,
+    Map,
+    Set,
+    Record,
+    Enum,
+    DeclaredError,
+    ObjectLease,
+    SyncCall,
+    AsyncCall,
+    Callback,
+    RetainedCallback,
+    AsyncCallback,
+    FallibleCallback,
+    CallbackReentrancy,
+    CrossThreadAsyncCallback,
+    InputStream,
+    OutputStream,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CapabilitySet(BTreeSet<Capability>);
+
+impl CapabilitySet {
+    pub fn new(capabilities: impl IntoIterator<Item = Capability>) -> Self {
+        Self(capabilities.into_iter().collect())
+    }
+
+    pub fn insert(&mut self, capability: Capability) -> bool {
+        self.0.insert(capability)
+    }
+
+    pub fn contains(&self, capability: Capability) -> bool {
+        self.0.contains(&capability)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
+        self.0.iter().copied()
+    }
+
+    pub fn is_superset(&self, other: &Self) -> bool {
+        self.0.is_superset(&other.0)
+    }
+
+    pub fn extend(&mut self, other: impl IntoIterator<Item = Capability>) {
+        self.0.extend(other);
+    }
+}
+
+impl FromIterator<Capability> for CapabilitySet {
+    fn from_iter<T: IntoIterator<Item = Capability>>(iter: T) -> Self {
+        Self::new(iter)
+    }
+}
+
+impl IntoIterator for CapabilitySet {
+    type Item = Capability;
+    type IntoIter = std::collections::btree_set::IntoIter<Capability>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PublicTarget {
@@ -138,6 +213,7 @@ impl fmt::Display for TypeSourceKey {
 pub enum OperationOwner {
     Namespace,
     Object(TypeSourceKey),
+    Value(TypeSourceKey),
     Callback(TypeSourceKey),
 }
 
@@ -146,6 +222,7 @@ impl fmt::Display for OperationOwner {
         match self {
             Self::Namespace => formatter.write_str("namespace"),
             Self::Object(key) => write!(formatter, "object:{key}"),
+            Self::Value(key) => write!(formatter, "value:{key}"),
             Self::Callback(key) => write!(formatter, "callback:{key}"),
         }
     }
@@ -265,6 +342,12 @@ impl ScalarType {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ValueType {
     Scalar(ScalarType),
+    /// A UniFFI timestamp.  The public JavaScript representation is chosen by
+    /// the facade policy, while the engine plan keeps the value semantic.
+    Timestamp,
+    /// A UniFFI duration.  This is deliberately distinct from a numeric
+    /// scalar so printers can apply the one canonical duration policy.
+    Duration,
     Named(TypeSourceKey),
     Optional(Box<ValueType>),
     Sequence(Box<ValueType>),
@@ -324,7 +407,7 @@ impl ValueType {
                 key.visit(visitor);
                 value.visit(visitor);
             }
-            Self::Scalar(_) | Self::Named(_) => {}
+            Self::Scalar(_) | Self::Timestamp | Self::Duration | Self::Named(_) => {}
         }
     }
 }
@@ -393,12 +476,35 @@ impl EnumVariant {
     }
 }
 
+/// Object implementation kind needed by callback-capable trait surfaces.
+/// This is semantic contract data, not a Rust path or private symbol.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ObjectKind {
+    Struct,
+    TraitRustOnly,
+    TraitBoth,
+    TraitForeignOnly,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum NamedTypeKind {
-    Record { fields: Vec<FieldDefinition> },
-    Enum { variants: Vec<EnumVariant> },
-    Error { variants: Vec<EnumVariant> },
-    Object,
+    Record {
+        fields: Vec<FieldDefinition>,
+    },
+    Enum {
+        variants: Vec<EnumVariant>,
+    },
+    Error {
+        variants: Vec<EnumVariant>,
+    },
+    /// A custom type keeps its public name while exposing the builtin value
+    /// used by the native conversion recipe.
+    Custom {
+        builtin: ValueType,
+    },
+    Object {
+        kind: ObjectKind,
+    },
     Callback,
 }
 
@@ -446,6 +552,7 @@ pub struct ArgumentDefinition {
     pub public_name: String,
     pub ty: ValueType,
     pub ownership: Ownership,
+    pub default: Option<DefaultValue>,
 }
 
 impl ArgumentDefinition {
@@ -458,8 +565,133 @@ impl ArgumentDefinition {
             public_name: checked_name("operation argument", public_name.into())?,
             ty,
             ownership,
+            default: None,
         })
     }
+
+    pub fn with_default(mut self, default: DefaultValue) -> Self {
+        self.default = Some(default);
+        self
+    }
+}
+
+/// A target-neutral operation/field default. The frontend lowers the source
+/// literal once; consumers use this owned value instead of looking back at CI.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DefaultValue {
+    Unspecified,
+    Boolean(bool),
+    String(String),
+    Integer { value: i128, unsigned: bool },
+    Float(String),
+    Enum(String),
+    EmptySequence,
+    EmptyMap,
+    EmptySet,
+    None,
+    Some(Box<Self>),
+}
+
+/// Resolved JavaScript policy configuration.  This is deliberately an ABI
+/// value: it carries no parser or renderer implementation details.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedJsConfig {
+    pub custom_types: BTreeMap<TypeSourceKey, JsCustomTypeConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsCustomTypeConfig {
+    pub public_type_name: String,
+    pub imports: Vec<String>,
+    pub into_custom: String,
+    pub from_custom: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsComponent {
+    pub id: ComponentId,
+    pub source_key: ComponentKey,
+    pub public_namespace: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsField {
+    pub public_name: String,
+    pub ty: ValueType,
+    pub default: Option<DefaultValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsVariant {
+    pub public_name: String,
+    pub fields: Vec<JsField>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JsTypeKind {
+    Record {
+        fields: Vec<JsField>,
+    },
+    Enum {
+        variants: Vec<JsVariant>,
+    },
+    Error {
+        variants: Vec<JsVariant>,
+    },
+    Custom {
+        builtin: ValueType,
+        config: JsCustomTypeConfig,
+    },
+    Object {
+        kind: ObjectKind,
+    },
+    Callback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsType {
+    pub id: TypeId,
+    pub source_key: TypeSourceKey,
+    pub public_name: String,
+    pub kind: JsTypeKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsArgument {
+    pub public_name: String,
+    pub ty: ValueType,
+    pub default: Option<DefaultValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsReceiver {
+    pub object_type: TypeId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsOperation {
+    pub id: OperationId,
+    pub source_key: OperationSourceKey,
+    pub component_id: ComponentId,
+    pub public_name: String,
+    pub debug_name: String,
+    pub kind: OperationKind,
+    pub arguments: Vec<JsArgument>,
+    pub return_type: Option<ValueType>,
+    pub async_kind: AsyncKind,
+    pub throws: Option<TypeSourceKey>,
+    pub receiver: Option<JsReceiver>,
+    pub callback_method_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsApiIr {
+    pub target_universe: Vec<PublicTarget>,
+    pub resolved_config: ResolvedJsConfig,
+    pub components: Vec<JsComponent>,
+    pub types: Vec<JsType>,
+    pub operations: Vec<JsOperation>,
+    pub required_capabilities: CapabilitySet,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -483,6 +715,13 @@ pub struct OperationDefinition {
     pub debug_name: String,
     pub private_symbol: String,
     pub signature: OperationSignature,
+    pub receiver: Option<ReceiverDefinition>,
+    pub callback_method_id: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ReceiverDefinition {
+    pub ownership: Ownership,
 }
 
 impl OperationDefinition {
@@ -499,7 +738,19 @@ impl OperationDefinition {
             debug_name: checked_name("operation debug name", debug_name.into())?,
             private_symbol: checked_name("private operation symbol", private_symbol.into())?,
             signature,
+            receiver: None,
+            callback_method_id: None,
         })
+    }
+
+    pub fn with_receiver(mut self, receiver: ReceiverDefinition) -> Self {
+        self.receiver = Some(receiver);
+        self
+    }
+
+    pub fn with_callback_method_id(mut self, method_id: u32) -> Self {
+        self.callback_method_id = Some(method_id);
+        self
     }
 }
 
@@ -853,7 +1104,14 @@ mod tests {
                 },
             )
             .unwrap(),
-            TypeDefinition::new(service, "Service", NamedTypeKind::Object).unwrap(),
+            TypeDefinition::new(
+                service,
+                "Service",
+                NamedTypeKind::Object {
+                    kind: ObjectKind::Struct,
+                },
+            )
+            .unwrap(),
         ])
         .unwrap();
 

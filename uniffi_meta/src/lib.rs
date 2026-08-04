@@ -429,6 +429,165 @@ pub struct CallbackInterfaceMetadata {
     pub docstring: Option<String>,
 }
 
+/// The operation kind used to identify a callback argument/return use-site.
+///
+/// Callback contracts are emitted as independent metadata items rather than being folded into
+/// the existing function/method metadata. This keeps the representation available to every
+/// language while allowing JavaScript to opt into the stronger use-site contract.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Checksum)]
+pub enum CallbackOperationKind {
+    Function = 0,
+    Constructor = 1,
+    Method = 2,
+    /// A method on a callback interface/foreign trait. This is distinct from an object method.
+    CallbackMethod = 3,
+}
+
+impl CallbackOperationKind {
+    pub fn from_u8(value: u8) -> anyhow::Result<Self> {
+        Ok(match value {
+            0 => Self::Function,
+            1 => Self::Constructor,
+            2 => Self::Method,
+            3 => Self::CallbackMethod,
+            other => anyhow::bail!("invalid callback operation kind {other}"),
+        })
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Checksum)]
+pub enum CallbackRetention {
+    Scoped = 0,
+    Retained = 1,
+}
+
+impl CallbackRetention {
+    pub fn from_u8(value: u8) -> anyhow::Result<Self> {
+        Ok(match value {
+            0 => Self::Scoped,
+            1 => Self::Retained,
+            other => anyhow::bail!("invalid callback retention {other}"),
+        })
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Checksum)]
+pub enum CallbackThreading {
+    CallingThread = 0,
+    MayCrossThread = 1,
+}
+
+impl CallbackThreading {
+    pub fn from_u8(value: u8) -> anyhow::Result<Self> {
+        Ok(match value {
+            0 => Self::CallingThread,
+            1 => Self::MayCrossThread,
+            other => anyhow::bail!("invalid callback threading {other}"),
+        })
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Checksum)]
+pub enum CallbackReentrancy {
+    Forbidden = 0,
+    Allowed = 1,
+}
+
+impl CallbackReentrancy {
+    pub fn from_u8(value: u8) -> anyhow::Result<Self> {
+        Ok(match value {
+            0 => Self::Forbidden,
+            1 => Self::Allowed,
+            other => anyhow::bail!("invalid callback reentrancy {other}"),
+        })
+    }
+}
+
+/// The three properties that are not recoverable from a callback method signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Checksum)]
+pub struct CallbackContract {
+    pub retention: CallbackRetention,
+    pub threading: CallbackThreading,
+    pub reentrancy: CallbackReentrancy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CallbackValuePathSegment {
+    Argument(u32),
+    Return,
+    /// Source/component field name. Language-specific public renames are applied later.
+    Field(String),
+    /// Source/component variant name. Language-specific public renames are applied later.
+    Variant(String),
+    SequenceItem,
+    SetItem,
+    MapKey,
+    MapValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct CallbackValuePath(pub Vec<CallbackValuePathSegment>);
+
+impl CallbackValuePath {
+    pub fn argument(index: u32) -> Self {
+        Self(vec![CallbackValuePathSegment::Argument(index)])
+    }
+
+    pub fn return_value() -> Self {
+        Self(vec![CallbackValuePathSegment::Return])
+    }
+
+    pub fn then(mut self, segment: CallbackValuePathSegment) -> Self {
+        self.0.push(segment);
+        self
+    }
+
+    pub fn segments(&self) -> &[CallbackValuePathSegment] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CallbackValuePath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, segment) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(".")?;
+            }
+            match segment {
+                CallbackValuePathSegment::Argument(index) => {
+                    write!(formatter, "argument[{index}]")?
+                }
+                CallbackValuePathSegment::Return => formatter.write_str("return")?,
+                CallbackValuePathSegment::Field(name) => write!(formatter, "field[{name}]")?,
+                CallbackValuePathSegment::Variant(name) => write!(formatter, "variant[{name}]")?,
+                CallbackValuePathSegment::SequenceItem => formatter.write_str("item")?,
+                CallbackValuePathSegment::SetItem => formatter.write_str("set-item")?,
+                CallbackValuePathSegment::MapKey => formatter.write_str("key")?,
+                CallbackValuePathSegment::MapValue => formatter.write_str("value")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A callback contract tied to one operation and one canonical value path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CallbackUseSiteMetadata {
+    pub module_path: String,
+    pub operation_kind: CallbackOperationKind,
+    /// The containing object/trait for methods and constructors. Functions use `None`.
+    pub owner: Option<String>,
+    pub operation_name: String,
+    /// The callback type is intentionally resolved by the language frontend from this path;
+    /// it is not persisted in metadata and therefore cannot become a second identity/schema.
+    pub path: CallbackValuePath,
+    pub contract: CallbackContract,
+}
+
 impl ObjectMetadata {
     /// FFI symbol name for the `clone` function for this object.
     ///
@@ -585,6 +744,7 @@ pub enum Metadata {
     Func(FnMetadata),
     Object(ObjectMetadata),
     CallbackInterface(CallbackInterfaceMetadata),
+    CallbackUseSite(CallbackUseSiteMetadata),
     Record(RecordMetadata),
     Enum(EnumMetadata),
     Constructor(ConstructorMetadata),
@@ -612,6 +772,7 @@ impl Metadata {
             Metadata::Enum(meta) => &meta.module_path,
             Metadata::Object(meta) => &meta.module_path,
             Metadata::CallbackInterface(meta) => &meta.module_path,
+            Metadata::CallbackUseSite(meta) => &meta.module_path,
             Metadata::TraitMethod(meta) => &meta.module_path,
             Metadata::CustomType(meta) => &meta.module_path,
             Metadata::UniffiTrait(meta) => meta.module_path(),
@@ -674,6 +835,12 @@ impl From<ObjectMetadata> for Metadata {
 impl From<CallbackInterfaceMetadata> for Metadata {
     fn from(v: CallbackInterfaceMetadata) -> Self {
         Self::CallbackInterface(v)
+    }
+}
+
+impl From<CallbackUseSiteMetadata> for Metadata {
+    fn from(v: CallbackUseSiteMetadata) -> Self {
+        Self::CallbackUseSite(v)
     }
 }
 

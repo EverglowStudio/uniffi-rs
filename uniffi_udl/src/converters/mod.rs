@@ -2,7 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use crate::{attributes::DictionaryAttributes, literal::convert_default_value, InterfaceCollector};
+use crate::{
+    attributes::{DictionaryAttributes, MethodAttributes},
+    literal::convert_default_value,
+    InterfaceCollector,
+};
 use anyhow::{bail, Result};
 
 use uniffi_meta::{
@@ -14,6 +18,8 @@ use uniffi_meta::{
 mod callables;
 mod enum_;
 mod interface;
+
+use callables::callback_use_site_metadata;
 
 /// Trait to help convert WedIDL syntax nodes into `InterfaceCollector` objects.
 ///
@@ -167,6 +173,18 @@ impl APIConverter<CallbackInterfaceMetadata> for weedle::CallbackInterfaceDefini
                     // But currently they are passed as a concrete type with no associated types.
                     method.trait_name = object_name.to_string();
                     method.index = index as u32;
+                    let attributes = MethodAttributes::try_from(t.attributes.as_ref())?;
+                    for contract in callback_use_site_metadata(
+                        ci,
+                        uniffi_meta::CallbackOperationKind::CallbackMethod,
+                        Some(object_name),
+                        &method.name,
+                        &t.args.body.list,
+                        method.return_type.as_ref(),
+                        attributes.callback_contracts(),
+                    )? {
+                        ci.items.insert(contract.into());
+                    }
                     ci.items.insert(method.into());
                 }
                 _ => bail!(
@@ -333,5 +351,130 @@ mod test {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn callback_contracts_use_one_metadata_representation_and_keep_method_owners() {
+        const UDL: &str = r#"
+            namespace test {
+                Logger make_logger();
+                [CallbackContract="return,scoped,calling_thread,forbidden"] Logger make_logger_checked();
+                [CallbackContract="argument[0].field[callback],retained,calling_thread,allowed"] void consume_wrapper(Wrapper value);
+                void consume_arg([CallbackContract="retained,calling_thread,forbidden"] Logger callback);
+            };
+            callback interface Logger { void log(); };
+            callback interface Relay {
+                [CallbackContract="argument[0],retained,may_cross_thread,allowed"] void invoke(Logger callback);
+            };
+            dictionary Wrapper { Logger callback; };
+            interface First {
+                [CallbackContract="argument[0],retained,calling_thread,forbidden"] constructor(Logger callback);
+                [CallbackContract="argument[0],retained,calling_thread,forbidden"] void notify(Logger cb);
+            };
+            interface Second {
+                [CallbackContract="argument[0],retained,calling_thread,allowed"] void notify(Logger cb);
+            };
+        "#;
+        let ci = InterfaceCollector::from_webidl(UDL, "crate-name").unwrap();
+        let contracts: Vec<_> = ci
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Metadata::CallbackUseSite(contract) => Some(contract),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contracts.len(), 7);
+        assert!(contracts
+            .iter()
+            .all(|contract| contract.module_path == "crate-name"));
+        assert!(contracts.iter().any(|contract| {
+            contract.owner.as_deref() == Some("First")
+                && contract.operation_name == "notify"
+                && contract.contract.reentrancy == uniffi_meta::CallbackReentrancy::Forbidden
+        }));
+        assert!(contracts.iter().any(|contract| {
+            contract.owner.as_deref() == Some("First")
+                && contract.operation_kind == uniffi_meta::CallbackOperationKind::Constructor
+                && contract.operation_name == "new"
+                && contract.path == uniffi_meta::CallbackValuePath::argument(0)
+        }));
+        assert!(contracts.iter().any(|contract| {
+            contract.owner.as_deref() == Some("Second")
+                && contract.operation_name == "notify"
+                && contract.contract.reentrancy == uniffi_meta::CallbackReentrancy::Allowed
+        }));
+        assert!(contracts.iter().any(|contract| {
+            contract.owner.as_deref() == Some("Relay")
+                && contract.operation_kind == uniffi_meta::CallbackOperationKind::CallbackMethod
+                && contract.operation_name == "invoke"
+                && contract.path == uniffi_meta::CallbackValuePath::argument(0)
+        }));
+        assert!(contracts.iter().any(|contract| {
+            contract.owner.is_none()
+                && contract.operation_name == "make_logger_checked"
+                && contract.path == uniffi_meta::CallbackValuePath::return_value()
+        }));
+        assert!(contracts.iter().any(|contract| {
+            contract.owner.is_none()
+                && contract.operation_name == "consume_wrapper"
+                && contract.path
+                    == uniffi_meta::CallbackValuePath(vec![
+                        uniffi_meta::CallbackValuePathSegment::Argument(0),
+                        uniffi_meta::CallbackValuePathSegment::Field("callback".into()),
+                    ])
+        }));
+        assert!(contracts.iter().any(|contract| {
+            contract.owner.is_none()
+                && contract.operation_name == "consume_arg"
+                && contract.path == uniffi_meta::CallbackValuePath::argument(0)
+        }));
+    }
+
+    #[test]
+    fn callback_contracts_reject_duplicate_and_invalid_specs() {
+        let duplicate = r#"
+            namespace test {
+                [CallbackContract="argument[0],retained,calling_thread,forbidden"]
+                void consume([CallbackContract="retained,calling_thread,forbidden"] Logger callback);
+            };
+            callback interface Logger { void log(); };
+        "#;
+        let error = InterfaceCollector::from_webidl(duplicate, "crate-name").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("duplicate CallbackContract path"));
+
+        let invalid_path = r#"
+            namespace test {
+                [CallbackContract="argument[bad],retained,calling_thread,forbidden"]
+                void consume(Logger callback);
+            };
+            callback interface Logger { void log(); };
+        "#;
+        let error = InterfaceCollector::from_webidl(invalid_path, "crate-name").unwrap_err();
+        assert!(error.to_string().contains("invalid callback argument path"));
+
+        let invalid_index = r#"
+            namespace test {
+                [CallbackContract="argument[1],retained,calling_thread,forbidden"]
+                void consume(Logger callback);
+            };
+            callback interface Logger { void log(); };
+        "#;
+        let error = InterfaceCollector::from_webidl(invalid_index, "crate-name").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("callback contract argument index 1 is out of range"));
+
+        let invalid_value = r#"
+            namespace test {
+                [CallbackContract="argument[0],retained,wrong_thread,forbidden"]
+                void consume(Logger callback);
+            };
+            callback interface Logger { void log(); };
+        "#;
+        let error = InterfaceCollector::from_webidl(invalid_value, "crate-name").unwrap_err();
+        assert!(error.to_string().contains("invalid callback threading"));
     }
 }
