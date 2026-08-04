@@ -154,32 +154,24 @@ OHOS host builds use a package-level composite host/artifact rather than copied
 per-component native binaries. Cross-component types reference their owning
 component.
 
-The current exact versions are:
+Managed output is one indivisible package directory. Source, composite hosts,
+platform wrappers, and the stream/type metadata consumed by those wrappers are
+created in the same staging build and published together. Consumers use the
+fixed paths inside that root; there is no artifact manifest or cross-file
+identity graph.
 
-| Boundary | Version |
-| --- | --- |
-| Harmony facade contract | v4 |
-| JavaScript host bundle | v3 |
-| JavaScript runtime backend ABI | v2 |
-| Managed artifact manifest | v4 |
-| HSP facade aggregate contract | v1 |
-
-Managed artifact manifest v4 has canonical ordered `components` and
-`hostCompositeIdentity` fields. Generation, reads, and transition validation
-require that exact schema; they do not adopt legacy manifests, dual-read old
-schemas, or provide compatibility aliases.
+Files from different generator runs must not be combined. When the generated
+format changes, delete the package root and generate it again. A future
+dependency CLI will own version selection, lockfiles, archive-level checksums,
+and package caching; UniFFI does not implement those concerns here.
 
 HAR is the default package kind. HSP is an explicit package kind, and the two
-publish the same public namespace surface. A managed HAR↔HSP transition is
-allowed only when the existing generation proves its exact historical routes
-and the new invocation proves its current route plan. This is transaction
-validation, not a compatibility layer. Core package/HAP validation is separate
-from the availability of a standalone CodeLinter executable.
+publish the same public namespace surface. Core package/HAP validation is
+separate from the availability of a standalone CodeLinter executable.
 
-When HSP is selected, `harmony-facade-contract.json` carries the separate,
-exact `hspFacadeAggregateSchemaVersion: 1` aggregate. It records the composite
-host identity and canonical component and stream inventories; it is not a
-legacy-reader bridge for the per-component v4 facade contract.
+No HSP aggregate metadata file is published. The namespace and stream surfaces
+are already materialized in the generated ArkTS source and declarations before
+Hvigor packages them.
 
 ## wasm-bindgen
 
