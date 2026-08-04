@@ -82,6 +82,9 @@ use super::{AsType, ObjectImpl, Type, TypeIterator};
 #[derive(Debug, Clone, Checksum)]
 pub struct Object {
     pub(super) name: String,
+    /// Original Rust type name when a foreign-facing rename was applied.
+    #[checksum_ignore]
+    pub(super) orig_name: String,
     /// How this object is implemented in Rust
     pub(super) imp: ObjectImpl,
     pub(super) module_path: String,
@@ -128,7 +131,7 @@ impl Object {
     /// Includes `r#`, traits get a leading `dyn`. If we ever supported associated types, then
     /// this would also include them.
     pub fn rust_name(&self) -> String {
-        self.imp.rust_name_for(&self.name)
+        self.imp.rust_name_for(&self.orig_name)
     }
 
     pub fn imp(&self) -> &ObjectImpl {
@@ -331,9 +334,12 @@ impl From<uniffi_meta::ObjectMetadata> for Object {
     fn from(meta: uniffi_meta::ObjectMetadata) -> Self {
         let ffi_clone_name = meta.clone_ffi_symbol_name();
         let ffi_free_name = meta.free_ffi_symbol_name();
+        let name = meta.name;
+        let orig_name = meta.orig_name.unwrap_or_else(|| name.clone());
         Object {
             module_path: meta.module_path,
-            name: meta.name,
+            name,
+            orig_name,
             imp: meta.imp,
             remote: meta.remote,
             constructors: Default::default(),
@@ -361,6 +367,9 @@ impl From<uniffi_meta::ObjectMetadata> for Object {
 #[derive(Debug, Clone, Checksum)]
 pub struct Constructor {
     pub(super) name: String,
+    /// Original Rust constructor item name when a foreign-facing rename was applied.
+    #[checksum_ignore]
+    pub(super) orig_name: String,
     pub(super) object_name: String,
     pub(super) object_module_path: String,
     pub(super) is_async: bool,
@@ -387,6 +396,10 @@ pub struct Constructor {
 impl Constructor {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn rust_name(&self) -> &str {
+        &self.orig_name
     }
 
     pub fn rename(&mut self, new_name: String) {
@@ -456,6 +469,8 @@ impl From<uniffi_meta::ConstructorMetadata> for Constructor {
     fn from(meta: uniffi_meta::ConstructorMetadata) -> Self {
         let ffi_name = meta.ffi_symbol_name();
         let checksum_fn_name = meta.checksum_symbol_name();
+        let name = meta.name;
+        let orig_name = meta.orig_name.unwrap_or_else(|| name.clone());
         let module_path = meta.module_path.clone();
         let self_name = meta.self_name.clone();
         let arguments = meta.inputs.into_iter().map(Into::into).collect();
@@ -471,7 +486,8 @@ impl From<uniffi_meta::ConstructorMetadata> for Constructor {
             imp: ObjectImpl::Struct,
         });
         Self {
-            name: meta.name,
+            name,
+            orig_name,
             object_name: meta.self_name,
             is_async: meta.is_async,
             object_module_path: meta.module_path,
@@ -493,6 +509,9 @@ impl From<uniffi_meta::ConstructorMetadata> for Constructor {
 #[derive(Debug, Clone, Checksum)]
 pub struct Method {
     pub(super) name: String,
+    /// Original Rust method item name when a foreign-facing rename was applied.
+    #[checksum_ignore]
+    pub(super) orig_name: String,
     pub(super) is_async: bool,
     // Ignore `self_type` for the checksum, we never compare the method checksums for methods from
     // different objects.
@@ -521,6 +540,10 @@ pub struct Method {
 impl Method {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn rust_name(&self) -> &str {
+        &self.orig_name
     }
 
     pub fn rename(&mut self, new_name: String) {
@@ -608,6 +631,8 @@ impl Method {
     pub fn from_metadata(meta: uniffi_meta::MethodMetadata, receiver: Type) -> Self {
         let ffi_name = meta.ffi_symbol_name();
         let checksum_fn_name = meta.checksum_symbol_name();
+        let name = meta.name;
+        let orig_name = meta.orig_name.unwrap_or_else(|| name.clone());
         let arguments = meta.inputs.into_iter().map(Into::into).collect();
 
         let ffi_func = FfiFunction {
@@ -617,7 +642,8 @@ impl Method {
         };
 
         Self {
-            name: meta.name,
+            name,
+            orig_name,
             self_type: receiver,
             is_async: meta.is_async,
             arguments,
@@ -749,6 +775,14 @@ impl Callable for Constructor {
         self.docstring()
     }
 
+    fn rust_name(&self) -> &str {
+        self.rust_name()
+    }
+
+    fn module_path(&self) -> Option<&str> {
+        Some(&self.object_module_path)
+    }
+
     fn is_async(&self) -> bool {
         self.is_async
     }
@@ -773,6 +807,14 @@ impl Callable for Method {
 
     fn docstring(&self) -> Option<&str> {
         self.docstring()
+    }
+
+    fn rust_name(&self) -> &str {
+        self.rust_name()
+    }
+
+    fn module_path(&self) -> Option<&str> {
+        self.self_type.module_path()
     }
 
     fn is_async(&self) -> bool {

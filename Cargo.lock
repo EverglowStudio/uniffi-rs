@@ -2810,6 +2810,8 @@ dependencies = [
  "syn",
  "toml 1.1.0+spec-1.1.0",
  "uniffi_bindgen",
+ "uniffi_js_abi",
+ "uniffi_js_engine_schema",
  "uniffi_meta",
 ]
 

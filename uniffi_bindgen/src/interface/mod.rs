@@ -81,9 +81,9 @@ pub use ffi::{
 };
 pub use uniffi_meta::Radix;
 use uniffi_meta::{
-    ConstructorMetadata, DefaultValueMetadata, LiteralMetadata, MethodMetadata, NamespaceMetadata,
-    ObjectMetadata, ObjectTraitImplMetadata, TraitMethodMetadata, UniffiTraitMetadata,
-    UNIFFI_CONTRACT_VERSION,
+    CallbackUseSiteMetadata, ConstructorMetadata, DefaultValueMetadata, LiteralMetadata,
+    MethodMetadata, NamespaceMetadata, ObjectMetadata, ObjectTraitImplMetadata,
+    TraitMethodMetadata, UniffiTraitMetadata, UNIFFI_CONTRACT_VERSION,
 };
 pub type Literal = LiteralMetadata;
 pub type DefaultValue = DefaultValueMetadata;
@@ -228,6 +228,10 @@ pub struct ComponentInterface {
     objects: Vec<Object>,
     custom_types: Vec<CustomType>,
     pub(crate) callback_interfaces: Vec<CallbackInterface>,
+    /// Explicit callback lifetime/threading/reentrancy contracts keyed by operation and value path.
+    /// Missing entries are intentionally preserved as missing; JavaScript normalization is the
+    /// layer that requires a contract for every callback use-site.
+    pub(crate) callback_use_sites: Vec<CallbackUseSiteMetadata>,
     // Type names which were seen used as an error.
     errors: HashSet<String>,
     // Type names which participate in a recursive type cycle.
@@ -457,6 +461,15 @@ impl ComponentInterface {
     pub fn get_callback_interface_definition(&self, name: &str) -> Option<&CallbackInterface> {
         // TODO: probably we could store these internally in a HashMap to make this easier?
         self.callback_interfaces.iter().find(|o| o.name == name)
+    }
+
+    /// Return callback use-site metadata supplied by proc-macro or UDL input.
+    pub fn callback_use_sites(&self) -> &[CallbackUseSiteMetadata] {
+        &self.callback_use_sites
+    }
+
+    pub(crate) fn add_callback_use_site_metadata(&mut self, metadata: CallbackUseSiteMetadata) {
+        self.callback_use_sites.push(metadata);
     }
 
     /// Get the definitions for every Callback Interface type in the interface.
@@ -2078,6 +2091,7 @@ new definition: Enum {
 
         let ob = Object {
             name: "ob".to_string(),
+            orig_name: "ob".to_string(),
             module_path: "mp".to_string(),
             imp: ObjectImpl::Struct,
             remote: false,

@@ -11,9 +11,137 @@ use crate::InterfaceCollector;
 use anyhow::{bail, Result};
 
 use uniffi_meta::{
+    CallbackContract, CallbackOperationKind, CallbackReentrancy, CallbackRetention,
+    CallbackThreading, CallbackUseSiteMetadata, CallbackValuePath, CallbackValuePathSegment,
     ConstructorMetadata, DefaultValueMetadata, FieldMetadata, FnMetadata, FnParamMetadata,
     MethodMetadata, TraitMethodMetadata,
 };
+
+pub(crate) fn callback_use_site_metadata<'a>(
+    ci: &InterfaceCollector,
+    operation_kind: CallbackOperationKind,
+    owner: Option<&str>,
+    operation_name: &str,
+    args: &[weedle::argument::Argument<'_>],
+    _return_type: Option<&uniffi_meta::Type>,
+    operation_contracts: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<CallbackUseSiteMetadata>> {
+    let mut specs = Vec::new();
+    let mut seen_paths = std::collections::BTreeSet::new();
+    for (index, argument) in args.iter().enumerate() {
+        let weedle::argument::Argument::Single(argument) = argument else {
+            continue;
+        };
+        let attrs = ArgumentAttributes::try_from(argument.attributes.as_ref())?;
+        if let Some(spec) = attrs.callback_contract() {
+            specs.push((format!("argument[{index}]"), spec.to_owned()));
+        }
+    }
+    specs.extend(
+        operation_contracts
+            .into_iter()
+            .map(|spec| (String::new(), spec.to_owned())),
+    );
+
+    specs
+        .into_iter()
+        .map(|(default_path, spec)| {
+            let parts: Vec<_> = spec.split(',').map(str::trim).collect();
+            let (path, values) = match parts.as_slice() {
+                [retention, threading, reentrancy] => {
+                    (default_path, [*retention, *threading, *reentrancy])
+                }
+                [path, retention, threading, reentrancy] => (
+                    (*path).to_owned(),
+                    [*retention, *threading, *reentrancy],
+                ),
+                _ => bail!(
+                    "CallbackContract must be `retention,threading,reentrancy` on an argument or `path,retention,threading,reentrancy` on an operation"
+                ),
+            };
+            let path = parse_callback_path(&path)?;
+            match path.segments().first() {
+                Some(CallbackValuePathSegment::Argument(index)) if (*index as usize) < args.len() => {}
+                Some(CallbackValuePathSegment::Argument(index)) => {
+                    bail!("callback contract argument index {index} is out of range")
+                }
+                Some(CallbackValuePathSegment::Return) => {}
+                _ => bail!(
+                    "callback contract path must start with `argument[index]` or `return`"
+                ),
+            }
+            let path_key = path.to_string();
+            if !seen_paths.insert(path_key.clone()) {
+                bail!("duplicate CallbackContract path `{path_key}`");
+            }
+            let retention = match values[0] {
+                "scoped" => CallbackRetention::Scoped,
+                "retained" => CallbackRetention::Retained,
+                other => bail!("invalid callback retention `{other}`"),
+            };
+            let threading = match values[1] {
+                "calling_thread" => CallbackThreading::CallingThread,
+                "may_cross_thread" => CallbackThreading::MayCrossThread,
+                other => bail!("invalid callback threading `{other}`"),
+            };
+            let reentrancy = match values[2] {
+                "forbidden" => CallbackReentrancy::Forbidden,
+                "allowed" => CallbackReentrancy::Allowed,
+                other => bail!("invalid callback reentrancy `{other}`"),
+            };
+            Ok(CallbackUseSiteMetadata {
+                module_path: ci.module_path(),
+                operation_kind,
+                owner: owner.map(str::to_owned),
+                operation_name: operation_name.to_owned(),
+                path,
+                contract: CallbackContract {
+                    retention,
+                    threading,
+                    reentrancy,
+                },
+            })
+        })
+        .collect()
+}
+
+fn parse_callback_path(path: &str) -> Result<CallbackValuePath> {
+    let mut segments = Vec::new();
+    for segment in path.split('.') {
+        if segment == "return" {
+            segments.push(CallbackValuePathSegment::Return);
+        } else if let Some(value) = segment
+            .strip_prefix("argument[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            segments.push(CallbackValuePathSegment::Argument(value.parse().map_err(
+                |_| anyhow::anyhow!("invalid callback argument path `{segment}`"),
+            )?));
+        } else if let Some(value) = segment
+            .strip_prefix("field[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            segments.push(CallbackValuePathSegment::Field(value.to_owned()));
+        } else if let Some(value) = segment
+            .strip_prefix("variant[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            segments.push(CallbackValuePathSegment::Variant(value.to_owned()));
+        } else {
+            segments.push(match segment {
+                "item" => CallbackValuePathSegment::SequenceItem,
+                "set-item" => CallbackValuePathSegment::SetItem,
+                "key" => CallbackValuePathSegment::MapKey,
+                "value" => CallbackValuePathSegment::MapValue,
+                _ => bail!("invalid callback value path segment `{segment}`"),
+            });
+        }
+    }
+    if segments.is_empty() {
+        bail!("callback contract path is empty");
+    }
+    Ok(CallbackValuePath(segments))
+}
 
 impl APIConverter<FieldMetadata> for weedle::argument::Argument<'_> {
     fn convert(&self, ci: &mut InterfaceCollector) -> Result<FieldMetadata> {
@@ -97,7 +225,7 @@ impl APIConverter<FnMetadata> for weedle::namespace::OperationNamespaceMember<'_
                 None => bail!("unknown type for error: {name}"),
             },
         };
-        Ok(FnMetadata {
+        let metadata = FnMetadata {
             module_path: ci.module_path(),
             name,
             orig_name: None,
@@ -107,7 +235,19 @@ impl APIConverter<FnMetadata> for weedle::namespace::OperationNamespaceMember<'_
             throws,
             docstring: self.docstring.as_ref().map(|v| convert_docstring(&v.0)),
             checksum: None,
-        })
+        };
+        for contract in callback_use_site_metadata(
+            ci,
+            CallbackOperationKind::Function,
+            None,
+            &metadata.name,
+            &self.args.body.list,
+            metadata.return_type.as_ref(),
+            attrs.callback_contracts(),
+        )? {
+            ci.items.insert(contract.into());
+        }
+        Ok(metadata)
     }
 }
 
@@ -120,7 +260,7 @@ impl APIConverter<ConstructorMetadata> for weedle::interface::ConstructorInterfa
         let throws = attributes
             .get_throws_err()
             .map(|name| ci.get_type(name).expect("invalid throws type"));
-        Ok(ConstructorMetadata {
+        let metadata = ConstructorMetadata {
             module_path: ci.module_path(),
             name: String::from(attributes.get_name().unwrap_or("new")),
             orig_name: None,
@@ -133,7 +273,8 @@ impl APIConverter<ConstructorMetadata> for weedle::interface::ConstructorInterfa
             throws,
             checksum: None,
             docstring: self.docstring.as_ref().map(|v| convert_docstring(&v.0)),
-        })
+        };
+        Ok(metadata)
     }
 }
 
@@ -158,7 +299,7 @@ impl APIConverter<MethodMetadata> for weedle::interface::OperationInterfaceMembe
         };
 
         let takes_self_by_arc = attributes.get_self_by_arc();
-        Ok(MethodMetadata {
+        let metadata = MethodMetadata {
             module_path: ci.module_path(),
             // We don't know the name of the containing `Object` at this point, fill it in later.
             self_name: Default::default(),
@@ -180,7 +321,8 @@ impl APIConverter<MethodMetadata> for weedle::interface::OperationInterfaceMembe
             takes_self_by_arc,
             checksum: None,
             docstring: self.docstring.as_ref().map(|v| convert_docstring(&v.0)),
-        })
+        };
+        Ok(metadata)
     }
 }
 
@@ -205,7 +347,7 @@ impl APIConverter<TraitMethodMetadata> for weedle::interface::OperationInterface
         };
 
         let takes_self_by_arc = attributes.get_self_by_arc();
-        Ok(TraitMethodMetadata {
+        let metadata = TraitMethodMetadata {
             module_path: ci.module_path(),
             trait_name: Default::default(), // we'll fill these in later.
             index: Default::default(),
@@ -227,6 +369,7 @@ impl APIConverter<TraitMethodMetadata> for weedle::interface::OperationInterface
             takes_self_by_arc,
             checksum: None,
             docstring: self.docstring.as_ref().map(|v| convert_docstring(&v.0)),
-        })
+        };
+        Ok(metadata)
     }
 }

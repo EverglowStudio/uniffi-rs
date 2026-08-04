@@ -48,6 +48,9 @@ use super::{AsType, ComponentInterface, DefaultValue, Type, TypeIterator};
 #[derive(Debug, Clone, Checksum)]
 pub struct Function {
     pub(super) name: String,
+    /// Original Rust item name when a foreign-facing rename was applied.
+    #[checksum_ignore]
+    pub(super) orig_name: String,
     pub(super) module_path: String,
     pub(super) is_async: bool,
     pub(super) arguments: Vec<Argument>,
@@ -72,6 +75,10 @@ pub struct Function {
 impl Function {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn rust_name(&self) -> &str {
+        &self.orig_name
     }
 
     // Note: Don't recalculate the checksum. In order to have consistent checksums,
@@ -173,6 +180,8 @@ impl From<uniffi_meta::FnMetadata> for Function {
     fn from(meta: uniffi_meta::FnMetadata) -> Self {
         let ffi_name = meta.ffi_symbol_name();
         let checksum_fn_name = meta.checksum_symbol_name();
+        let name = meta.name;
+        let orig_name = meta.orig_name.unwrap_or_else(|| name.clone());
         let is_async = meta.is_async;
         let return_type = meta.return_type;
         let arguments = meta.inputs.into_iter().map(Into::into).collect();
@@ -184,7 +193,8 @@ impl From<uniffi_meta::FnMetadata> for Function {
         };
 
         Self {
-            name: meta.name,
+            name,
+            orig_name,
             module_path: meta.module_path,
             is_async,
             arguments,
@@ -282,6 +292,16 @@ pub trait Callable {
     fn throws_type(&self) -> Option<&Type>;
     fn is_async(&self) -> bool;
     fn docstring(&self) -> Option<&str>;
+
+    /// Original Rust source item name, before a foreign-facing rename.
+    fn rust_name(&self) -> &str;
+
+    /// Module path containing the source Rust callable.  Bindgen frontends
+    /// that need a structured core-item path may use this without deriving a
+    /// path from the generated FFI symbol.
+    fn module_path(&self) -> Option<&str> {
+        None
+    }
 
     fn self_type(&self) -> Option<Type> {
         None
@@ -414,6 +434,14 @@ impl Callable for Function {
         self.docstring()
     }
 
+    fn module_path(&self) -> Option<&str> {
+        Some(&self.module_path)
+    }
+
+    fn rust_name(&self) -> &str {
+        self.rust_name()
+    }
+
     fn is_async(&self) -> bool {
         self.is_async
     }
@@ -443,6 +471,14 @@ impl<T: Callable> Callable for &T {
 
     fn docstring(&self) -> Option<&str> {
         (*self).docstring()
+    }
+
+    fn module_path(&self) -> Option<&str> {
+        (*self).module_path()
+    }
+
+    fn rust_name(&self) -> &str {
+        (*self).rust_name()
     }
 
     fn ffi_func(&self) -> &FfiFunction {
@@ -554,6 +590,7 @@ mod test {
     fn test_iter_types() {
         let f = Function {
             name: "fn".to_string(),
+            orig_name: "fn".to_string(),
             module_path: "fn".to_string(),
             is_async: false,
             arguments: vec![Argument {

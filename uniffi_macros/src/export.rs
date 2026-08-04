@@ -20,7 +20,7 @@ use self::{
     },
 };
 use crate::util::{create_metadata_items, ident_to_string, mod_path};
-pub use attributes::{AsyncRuntime, DefaultMap, ExportFnArgs};
+pub(crate) use attributes::{AsyncRuntime, CallbackContractArg, DefaultMap, ExportFnArgs};
 pub use callback_interface::ffi_converter_callback_interface_impl;
 pub use trait_interface::alter_trait;
 

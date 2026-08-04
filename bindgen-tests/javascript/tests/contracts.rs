@@ -10,10 +10,10 @@ use support::*;
 
 #[test]
 fn engine_neutral_contract_corpus_is_deterministic() {
+    use uniffi_js_abi::Capability;
     use uniffi_js_abi::{
         InputPresence, PresenceError, PublicSourceFamily, PublicTarget, ScalarType, ValueType,
     };
-    use uniffi_js_engine_schema::Capability;
 
     let forward = unified_contract_corpus(false);
     let reverse = unified_contract_corpus(true);
@@ -52,8 +52,8 @@ fn engine_neutral_contract_corpus_is_deterministic() {
 
 #[test]
 fn callback_methods_keep_independent_async_and_error_signatures() {
+    use uniffi_js_abi::Capability;
     use uniffi_js_abi::{AsyncKind, OperationOwner};
-    use uniffi_js_engine_schema::Capability;
 
     let plan = unified_contract_corpus(false);
     let callback_methods: Vec<_> = plan

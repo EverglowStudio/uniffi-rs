@@ -60,6 +60,7 @@ impl<'a> MetadataReader<'a> {
                 obj.into()
             }
             codes::CALLBACK_INTERFACE => self.read_callback_interface()?.into(),
+            codes::CALLBACK_USE_SITE => self.read_callback_use_site()?.into(),
             codes::TRAIT_METHOD => self.read_trait_method()?.into(),
             codes::UNIFFI_TRAIT => self.read_uniffi_trait()?.into(),
             codes::OBJECT_TRAIT_IMPL => self.read_object_trait_impl()?.into(),
@@ -453,6 +454,41 @@ impl<'a> MetadataReader<'a> {
         })
     }
 
+    fn read_callback_use_site(&mut self) -> Result<CallbackUseSiteMetadata> {
+        let module_path = self.read_string()?;
+        let operation_kind = CallbackOperationKind::from_u8(self.read_u8()?)?;
+        let owner = self.read_optional_string()?;
+        let operation_name = self.read_string()?;
+        let path_len = self.read_u8()? as usize;
+        let mut segments = Vec::with_capacity(path_len);
+        for _ in 0..path_len {
+            segments.push(match self.read_u8()? {
+                0 => CallbackValuePathSegment::Argument(self.read_u32()?),
+                1 => CallbackValuePathSegment::Return,
+                2 => CallbackValuePathSegment::Field(self.read_string()?),
+                3 => CallbackValuePathSegment::Variant(self.read_string()?),
+                4 => CallbackValuePathSegment::SequenceItem,
+                5 => CallbackValuePathSegment::SetItem,
+                6 => CallbackValuePathSegment::MapKey,
+                7 => CallbackValuePathSegment::MapValue,
+                other => bail!("invalid callback value path segment {other}"),
+            });
+        }
+        let contract = CallbackContract {
+            retention: CallbackRetention::from_u8(self.read_u8()?)?,
+            threading: CallbackThreading::from_u8(self.read_u8()?)?,
+            reentrancy: CallbackReentrancy::from_u8(self.read_u8()?)?,
+        };
+        Ok(CallbackUseSiteMetadata {
+            module_path,
+            operation_kind,
+            owner,
+            operation_name,
+            path: CallbackValuePath(segments),
+            contract,
+        })
+    }
+
     fn read_trait_method(&mut self) -> Result<TraitMethodMetadata> {
         let module_path = self.read_string()?;
         let trait_name = self.read_string()?;
@@ -713,6 +749,53 @@ mod tests {
                 error_type: Box::new(Type::String),
                 is_send: true,
             }
+        );
+    }
+
+    #[test]
+    fn reads_callback_use_site_metadata_with_nested_path() {
+        fn push_string(bytes: &mut Vec<u8>, value: &str) {
+            bytes.push(value.len() as u8);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+
+        let mut bytes = vec![codes::CALLBACK_USE_SITE];
+        push_string(&mut bytes, "crate::module");
+        bytes.push(2); // method
+        bytes.push(1);
+        push_string(&mut bytes, "Thing");
+        push_string(&mut bytes, "notify");
+        bytes.push(4); // argument[0].field[observer].variant[Ready].item
+        bytes.push(0);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.push(2);
+        push_string(&mut bytes, "observer");
+        bytes.push(3);
+        push_string(&mut bytes, "Ready");
+        bytes.push(4);
+        bytes.push(1); // retained
+        bytes.push(0); // calling thread
+        bytes.push(1); // reentrancy allowed
+
+        assert_eq!(
+            read_metadata(&bytes).unwrap(),
+            Metadata::CallbackUseSite(CallbackUseSiteMetadata {
+                module_path: "crate::module".into(),
+                operation_kind: CallbackOperationKind::Method,
+                owner: Some("Thing".into()),
+                operation_name: "notify".into(),
+                path: CallbackValuePath(vec![
+                    CallbackValuePathSegment::Argument(0),
+                    CallbackValuePathSegment::Field("observer".into()),
+                    CallbackValuePathSegment::Variant("Ready".into()),
+                    CallbackValuePathSegment::SequenceItem,
+                ]),
+                contract: CallbackContract {
+                    retention: CallbackRetention::Retained,
+                    threading: CallbackThreading::CallingThread,
+                    reentrancy: CallbackReentrancy::Allowed,
+                },
+            })
         );
     }
 }

@@ -42,6 +42,7 @@ pub(super) enum Attribute {
     WithForeign,
     Async,
     NonExhaustive,
+    CallbackContract(String),
 }
 
 impl Attribute {
@@ -79,6 +80,9 @@ impl TryFrom<&weedle::attribute::ExtendedAttribute<'_>> for Attribute {
                 match identity.lhs_identifier.0 {
                     "Name" => Ok(Attribute::Name(name_from_id_or_string(&identity.rhs))),
                     "Throws" => Ok(Attribute::Throws(name_from_id_or_string(&identity.rhs))),
+                    "CallbackContract" => Ok(Attribute::CallbackContract(name_from_id_or_string(
+                        &identity.rhs,
+                    ))),
                     "Self" => Ok(Attribute::SelfType(SelfType::try_from(&identity.rhs)?)),
                     "External" => Ok(Attribute::External {
                         crate_name: name_from_id_or_string(&identity.rhs),
@@ -277,6 +281,13 @@ impl FunctionAttributes {
     pub(super) fn is_async(&self) -> bool {
         self.0.iter().any(|attr| matches!(attr, Attribute::Async))
     }
+
+    pub(super) fn callback_contracts(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(|attr| match attr {
+            Attribute::CallbackContract(value) => Some(value.as_str()),
+            _ => None,
+        })
+    }
 }
 
 impl FromIterator<Attribute> for FunctionAttributes {
@@ -291,7 +302,7 @@ impl TryFrom<&weedle::attribute::ExtendedAttributeList<'_>> for FunctionAttribut
         weedle_attributes: &weedle::attribute::ExtendedAttributeList<'_>,
     ) -> Result<Self, Self::Error> {
         let attrs = parse_attributes(weedle_attributes, |attr| match attr {
-            Attribute::Throws(_) | Attribute::Async => Ok(()),
+            Attribute::Throws(_) | Attribute::Async | Attribute::CallbackContract(_) => Ok(()),
             _ => bail!(format!("{attr:?} not supported for functions")),
         })?;
         Ok(Self(attrs))
@@ -321,6 +332,13 @@ impl ArgumentAttributes {
     pub fn by_ref(&self) -> bool {
         self.0.iter().any(|attr| matches!(attr, Attribute::ByRef))
     }
+
+    pub fn callback_contract(&self) -> Option<&str> {
+        self.0.iter().find_map(|attr| match attr {
+            Attribute::CallbackContract(value) => Some(value.as_str()),
+            _ => None,
+        })
+    }
 }
 
 impl TryFrom<&weedle::attribute::ExtendedAttributeList<'_>> for ArgumentAttributes {
@@ -329,7 +347,7 @@ impl TryFrom<&weedle::attribute::ExtendedAttributeList<'_>> for ArgumentAttribut
         weedle_attributes: &weedle::attribute::ExtendedAttributeList<'_>,
     ) -> Result<Self, Self::Error> {
         let attrs = parse_attributes(weedle_attributes, |attr| match attr {
-            Attribute::ByRef => Ok(()),
+            Attribute::ByRef | Attribute::CallbackContract(_) => Ok(()),
             _ => bail!(format!("{attr:?} not supported for arguments")),
         })?;
         Ok(Self(attrs))
@@ -465,6 +483,13 @@ impl ConstructorAttributes {
     pub(super) fn is_async(&self) -> bool {
         self.0.iter().any(|attr| matches!(attr, Attribute::Async))
     }
+
+    pub(super) fn callback_contracts(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(|attr| match attr {
+            Attribute::CallbackContract(value) => Some(value.as_str()),
+            _ => None,
+        })
+    }
 }
 
 impl TryFrom<&weedle::attribute::ExtendedAttributeList<'_>> for ConstructorAttributes {
@@ -475,7 +500,7 @@ impl TryFrom<&weedle::attribute::ExtendedAttributeList<'_>> for ConstructorAttri
         let attrs = parse_attributes(weedle_attributes, |attr| match attr {
             Attribute::Throws(_) => Ok(()),
             Attribute::Name(_) => Ok(()),
-            Attribute::Async => Ok(()),
+            Attribute::Async | Attribute::CallbackContract(_) => Ok(()),
             _ => bail!(format!("{attr:?} not supported for constructors")),
         })?;
         Ok(Self(attrs))
@@ -508,6 +533,13 @@ impl MethodAttributes {
             .iter()
             .any(|attr| matches!(attr, Attribute::SelfType(SelfType::ByArc)))
     }
+
+    pub(super) fn callback_contracts(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(|attr| match attr {
+            Attribute::CallbackContract(value) => Some(value.as_str()),
+            _ => None,
+        })
+    }
 }
 
 impl FromIterator<Attribute> for MethodAttributes {
@@ -522,7 +554,10 @@ impl TryFrom<&weedle::attribute::ExtendedAttributeList<'_>> for MethodAttributes
         weedle_attributes: &weedle::attribute::ExtendedAttributeList<'_>,
     ) -> Result<Self, Self::Error> {
         let attrs = parse_attributes(weedle_attributes, |attr| match attr {
-            Attribute::SelfType(_) | Attribute::Throws(_) | Attribute::Async => Ok(()),
+            Attribute::SelfType(_)
+            | Attribute::Throws(_)
+            | Attribute::Async
+            | Attribute::CallbackContract(_) => Ok(()),
             _ => bail!(format!("{attr:?} not supported for methods")),
         })?;
         Ok(Self(attrs))

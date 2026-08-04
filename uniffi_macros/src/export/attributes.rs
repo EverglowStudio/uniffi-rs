@@ -117,6 +117,61 @@ pub struct ExportFnArgs {
     pub(crate) async_runtime: Option<AsyncRuntime>,
     pub(crate) name: Option<String>,
     pub(crate) defaults: DefaultMap,
+    pub(crate) callback_contracts: Vec<CallbackContractArg>,
+}
+
+/// One explicit callback argument/return use-site contract. The path is kept as text until the
+/// function signature is lowered, where it is parsed into canonical metadata path segments.
+#[derive(Clone, Debug)]
+pub(crate) struct CallbackContractArg {
+    pub(crate) path: String,
+    pub(crate) retention: String,
+    pub(crate) threading: String,
+    pub(crate) reentrancy: String,
+}
+
+impl Parse for CallbackContractArg {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let mut path = None;
+        let mut retention = None;
+        let mut threading = None;
+        let mut reentrancy = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            let _: Token![=] = input.parse()?;
+            let value = if input.peek(LitStr) {
+                input.parse::<LitStr>()?.value()
+            } else {
+                input.parse::<Ident>()?.to_string()
+            };
+            match key.to_string().as_str() {
+                "path" => path = Some(value),
+                "retention" => retention = Some(value),
+                "threading" => threading = Some(value),
+                "reentrancy" => reentrancy = Some(value),
+                _ => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "unknown callback contract field",
+                    ))
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            } else if !input.is_empty() {
+                return Err(input.error("expected `,` between callback contract fields"));
+            }
+        }
+        Ok(Self {
+            path: path.ok_or_else(|| input.error("callback contract requires `path`"))?,
+            retention: retention
+                .ok_or_else(|| input.error("callback contract requires `retention`"))?,
+            threading: threading
+                .ok_or_else(|| input.error("callback contract requires `threading`"))?,
+            reentrancy: reentrancy
+                .ok_or_else(|| input.error("callback contract requires `reentrancy`"))?,
+        })
+    }
 }
 
 impl Parse for ExportFnArgs {
@@ -148,6 +203,14 @@ impl UniffiAttributeArgs for ExportFnArgs {
                 defaults: DefaultMap::parse(input)?,
                 ..Self::default()
             })
+        } else if lookahead.peek(kw::callback) {
+            let _: kw::callback = input.parse()?;
+            let content;
+            parenthesized!(content in input);
+            Ok(Self {
+                callback_contracts: vec![content.parse()?],
+                ..Self::default()
+            })
         } else {
             Err(syn::Error::new(
                 input.span(),
@@ -161,6 +224,11 @@ impl UniffiAttributeArgs for ExportFnArgs {
             async_runtime: either_attribute_arg(self.async_runtime, other.async_runtime)?,
             name: either_attribute_arg(self.name, other.name)?,
             defaults: self.defaults.merge(other.defaults),
+            callback_contracts: self
+                .callback_contracts
+                .into_iter()
+                .chain(other.callback_contracts)
+                .collect(),
         })
     }
 }

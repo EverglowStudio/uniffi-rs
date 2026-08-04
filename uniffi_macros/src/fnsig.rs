@@ -4,7 +4,7 @@
 
 use crate::{
     default::{default_value_metadata_calls, DefaultValue},
-    export::{AsyncRuntime, DefaultMap, ExportFnArgs},
+    export::{AsyncRuntime, CallbackContractArg, DefaultMap, ExportFnArgs},
     ffiops,
     util::{
         create_metadata_items, ident_to_string, mod_path, orig_name_metadata,
@@ -49,6 +49,7 @@ pub(crate) struct FnSignature {
     // In general, it's not reliable because it fails for type aliases.
     pub looks_like_result: bool,
     pub docstring: String,
+    pub callback_contracts: Vec<CallbackContractArg>,
 }
 
 impl FnSignature {
@@ -186,6 +187,8 @@ impl FnSignature {
             ));
         }
 
+        let callback_contracts = export_fn_args.callback_contracts.clone();
+
         Ok(Self {
             kind,
             span,
@@ -203,6 +206,7 @@ impl FnSignature {
             stream_return,
             looks_like_result,
             docstring,
+            callback_contracts,
         })
     }
 
@@ -464,48 +468,174 @@ impl FnSignature {
 
     pub(crate) fn metadata_items(&self) -> syn::Result<TokenStream> {
         let Self { name, .. } = &self;
-        match &self.kind {
-            FnKind::Function => Ok(create_metadata_items(
+        let operation_item = match &self.kind {
+            FnKind::Function => create_metadata_items(
                 "func",
                 name,
                 self.metadata_expr()?,
                 Some(self.checksum_symbol_name()),
-            )),
+            ),
 
             FnKind::Method {
                 foreign_self_ident, ..
             } => {
                 let object_name = ident_to_string(foreign_self_ident);
-                Ok(create_metadata_items(
+                create_metadata_items(
                     "method",
                     &format!("{object_name}_{name}"),
                     self.metadata_expr()?,
                     Some(self.checksum_symbol_name()),
-                ))
+                )
             }
 
             FnKind::TraitMethod { self_ident, .. } => {
                 let object_name = ident_to_string(self_ident);
-                Ok(create_metadata_items(
+                create_metadata_items(
                     "method",
                     &format!("{object_name}_{name}"),
                     self.metadata_expr()?,
                     Some(self.checksum_symbol_name()),
-                ))
+                )
             }
 
             FnKind::Constructor {
                 foreign_self_ident, ..
             } => {
                 let object_name = ident_to_string(foreign_self_ident);
-                Ok(create_metadata_items(
+                create_metadata_items(
                     "constructor",
                     &format!("{object_name}_{name}"),
                     self.metadata_expr()?,
                     Some(self.checksum_symbol_name()),
-                ))
+                )
             }
-        }
+        };
+        let callback_items = self.callback_metadata_items()?;
+        Ok(quote! {
+            #operation_item
+            #(#callback_items)*
+        })
+    }
+
+    fn callback_metadata_items(&self) -> syn::Result<Vec<TokenStream>> {
+        let mut seen_paths = std::collections::BTreeSet::new();
+        let (operation_kind, owner) = match &self.kind {
+            FnKind::Function => (0u8, None),
+            FnKind::Constructor {
+                foreign_self_ident, ..
+            } => (1u8, Some(ident_to_string(foreign_self_ident))),
+            FnKind::Method {
+                foreign_self_ident, ..
+            } => (2u8, Some(ident_to_string(foreign_self_ident))),
+            FnKind::TraitMethod { self_ident, .. } => (3u8, Some(ident_to_string(self_ident))),
+        };
+        let owner_metadata = match owner {
+            Some(owner) => quote! { .concat_bool(true).concat_str(#owner) },
+            None => quote! { .concat_bool(false) },
+        };
+        let operation_name = &self.name;
+        let item_prefix = match &self.kind {
+            FnKind::Function => self.name.clone(),
+            FnKind::Constructor {
+                foreign_self_ident, ..
+            }
+            | FnKind::Method {
+                foreign_self_ident, ..
+            } => format!("{}_{}", ident_to_string(foreign_self_ident), self.name),
+            FnKind::TraitMethod { self_ident, .. } => {
+                format!("{}_{}", ident_to_string(self_ident), self.name)
+            }
+        };
+
+        self.callback_contracts
+            .iter()
+            .enumerate()
+            .map(|(contract_index, contract)| {
+                let segments = parse_callback_path(&contract.path)?;
+                if !seen_paths.insert(contract.path.clone()) {
+                    return Err(syn::Error::new(
+                        self.span,
+                        format!("duplicate callback contract path `{}`", contract.path),
+                    ));
+                }
+                match segments.first() {
+                    Some(CallbackPathSegment::Argument(index))
+                        if (*index as usize) < self.args.len() => {}
+                    Some(CallbackPathSegment::Return) => {}
+                    Some(CallbackPathSegment::Argument(index)) => {
+                        return Err(syn::Error::new(
+                            self.span,
+                            format!("callback contract argument index {index} is out of range"),
+                        ));
+                    }
+                    _ => {
+                        return Err(syn::Error::new(
+                            self.span,
+                            "callback contract path must start with `argument[index]` or `return`",
+                        ));
+                    }
+                }
+                let path_len = try_metadata_value_from_usize(
+                    segments.len(),
+                    "callback contract paths are limited to 255 segments",
+                )?;
+                let segment_metadata = segments.iter().map(|segment| match segment {
+                    CallbackPathSegment::Argument(index) => {
+                        quote! { .concat_value(0).concat_u32(#index) }
+                    }
+                    CallbackPathSegment::Return => quote! { .concat_value(1) },
+                    CallbackPathSegment::Field(name) => {
+                        quote! { .concat_value(2).concat_str(#name) }
+                    }
+                    CallbackPathSegment::Variant(name) => {
+                        quote! { .concat_value(3).concat_str(#name) }
+                    }
+                    CallbackPathSegment::SequenceItem => quote! { .concat_value(4) },
+                    CallbackPathSegment::SetItem => quote! { .concat_value(5) },
+                    CallbackPathSegment::MapKey => quote! { .concat_value(6) },
+                    CallbackPathSegment::MapValue => quote! { .concat_value(7) },
+                });
+                let retention = callback_contract_value(
+                    &contract.retention,
+                    &["scoped", "retained"],
+                    self.span,
+                    "retention",
+                )?;
+                let threading = callback_contract_value(
+                    &contract.threading,
+                    &["calling_thread", "may_cross_thread"],
+                    self.span,
+                    "threading",
+                )?;
+                let reentrancy = callback_contract_value(
+                    &contract.reentrancy,
+                    &["forbidden", "allowed"],
+                    self.span,
+                    "reentrancy",
+                )?;
+                let metadata = quote! {
+                    ::uniffi::MetadataBuffer::from_code(
+                        ::uniffi::metadata::codes::CALLBACK_USE_SITE
+                    )
+                    .concat_str(module_path!())
+                    .concat_value(#operation_kind)
+                    #owner_metadata
+                    .concat_str(#operation_name)
+                    .concat_value(#path_len)
+                    #(#segment_metadata)*
+                    .concat_value(#retention)
+                    .concat_value(#threading)
+                    .concat_value(#reentrancy)
+                };
+                let item_name = format!("{item_prefix}_callback_{contract_index}");
+                Ok(create_metadata_items(
+                    "callback_use_site",
+                    &item_name,
+                    metadata,
+                    None,
+                ))
+            })
+            .collect()
     }
 
     pub(crate) fn checksum_symbol_name(&self) -> String {
@@ -531,6 +661,100 @@ impl FnSignature {
             }
         }
     }
+}
+
+#[derive(Debug)]
+enum CallbackPathSegment {
+    Argument(u32),
+    Return,
+    Field(String),
+    Variant(String),
+    SequenceItem,
+    SetItem,
+    MapKey,
+    MapValue,
+}
+
+fn parse_callback_path(path: &str) -> syn::Result<Vec<CallbackPathSegment>> {
+    if path.is_empty() {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "callback contract path is empty",
+        ));
+    }
+    path.split('.')
+        .map(|segment| {
+            if segment == "return" {
+                return Ok(CallbackPathSegment::Return);
+            }
+            let parse_named = |prefix: &str| -> syn::Result<String> {
+                let Some(value) = segment
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.strip_suffix(']'))
+                else {
+                    return Err(syn::Error::new(
+                        Span::call_site(),
+                        format!("invalid callback contract path segment `{segment}`"),
+                    ));
+                };
+                if value.is_empty() {
+                    return Err(syn::Error::new(
+                        Span::call_site(),
+                        "callback contract path segment must not be empty",
+                    ));
+                }
+                Ok(value.to_owned())
+            };
+            if let Some(rest) = segment.strip_prefix("argument[") {
+                let value = rest.strip_suffix(']').ok_or_else(|| {
+                    syn::Error::new(
+                        Span::call_site(),
+                        format!("invalid callback argument path `{segment}`"),
+                    )
+                })?;
+                return value
+                    .parse::<u32>()
+                    .map(CallbackPathSegment::Argument)
+                    .map_err(|_| {
+                        syn::Error::new(
+                            Span::call_site(),
+                            format!("invalid callback argument index `{value}`"),
+                        )
+                    });
+            }
+            if segment.starts_with("field[") {
+                return parse_named("field[").map(CallbackPathSegment::Field);
+            }
+            if segment.starts_with("variant[") {
+                return parse_named("variant[").map(CallbackPathSegment::Variant);
+            }
+            Ok(match segment {
+                "item" => CallbackPathSegment::SequenceItem,
+                "set-item" => CallbackPathSegment::SetItem,
+                "key" => CallbackPathSegment::MapKey,
+                "value" => CallbackPathSegment::MapValue,
+                _ => {
+                    return Err(syn::Error::new(
+                        Span::call_site(),
+                        format!("invalid callback contract path segment `{segment}`"),
+                    ))
+                }
+            })
+        })
+        .collect()
+}
+
+fn callback_contract_value(
+    value: &str,
+    allowed: &[&str],
+    span: Span,
+    field: &str,
+) -> syn::Result<u8> {
+    allowed
+        .iter()
+        .position(|candidate| *candidate == value)
+        .map(|index| index as u8)
+        .ok_or_else(|| syn::Error::new(span, format!("invalid callback {field} `{value}`")))
 }
 
 #[derive(Debug, Clone)]
@@ -1194,6 +1418,59 @@ mod tests {
         assert!(err
             .to_string()
             .contains("only supported for top-level functions"));
+    }
+
+    #[test]
+    fn callback_contract_rejects_duplicate_paths_and_invalid_values() {
+        // `create_metadata_items` normally runs in the proc-macro expansion environment where
+        // Cargo provides this variable; supply the same value for this direct unit test.
+        unsafe { std::env::set_var("CARGO_CRATE_NAME", "uniffi_macros_test") };
+        let args: ExportFnArgs = syn::parse_str(
+            "callback(path = \"argument[0]\", retention = retained, threading = calling_thread, reentrancy = forbidden), callback(path = \"argument[0]\", retention = scoped, threading = calling_thread, reentrancy = allowed)",
+        )
+        .unwrap();
+        let sig = FnSignature::new(
+            FnKind::Function,
+            parse_quote! { fn run(callback: Box<dyn Callback>) },
+            args,
+            String::new(),
+        )
+        .unwrap();
+        assert!(sig
+            .metadata_items()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate callback contract path"));
+
+        let args: ExportFnArgs = syn::parse_str(
+            "callback(path = \"argument[0].unknown\", retention = retained, threading = calling_thread, reentrancy = forbidden)",
+        )
+        .unwrap();
+        let sig = FnSignature::new(
+            FnKind::Function,
+            parse_quote! { fn run(callback: Box<dyn Callback>) },
+            args,
+            String::new(),
+        )
+        .unwrap();
+        assert!(sig.metadata_items().is_err());
+
+        let args: ExportFnArgs = syn::parse_str(
+            "callback(path = \"argument[0]\", retention = unknown, threading = calling_thread, reentrancy = forbidden)",
+        )
+        .unwrap();
+        let sig = FnSignature::new(
+            FnKind::Function,
+            parse_quote! { fn run(callback: Box<dyn Callback>) },
+            args,
+            String::new(),
+        )
+        .unwrap();
+        assert!(sig
+            .metadata_items()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid callback retention"));
     }
 }
 

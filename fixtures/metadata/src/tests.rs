@@ -116,6 +116,18 @@ pub trait Logger {
     fn log(&self, message: String);
 }
 
+#[uniffi::export(
+    callback(
+        path = "argument[0]",
+        retention = retained,
+        threading = calling_thread,
+        reentrancy = forbidden
+    )
+)]
+pub fn use_logger(logger: Box<dyn Logger>) {
+    logger.log("metadata contract".to_owned());
+}
+
 #[derive(uniffi::Object)]
 pub struct RealLogger {}
 
@@ -1132,6 +1144,21 @@ mod test_function_metadata {
                     UNIFFI_META_CONST_UNIFFI_FIXTURE_METADATA_METHOD_LOGGER_LOG.checksum(),
                 ),
                 docstring: None,
+            },
+        );
+        check_metadata(
+            &UNIFFI_META_UNIFFI_FIXTURE_METADATA_CALLBACK_USE_SITE_USE_LOGGER_CALLBACK_0,
+            CallbackUseSiteMetadata {
+                module_path: "uniffi_fixture_metadata::tests".into(),
+                operation_kind: CallbackOperationKind::Function,
+                owner: None,
+                operation_name: "use_logger".into(),
+                path: CallbackValuePath::argument(0),
+                contract: CallbackContract {
+                    retention: CallbackRetention::Retained,
+                    threading: CallbackThreading::CallingThread,
+                    reentrancy: CallbackReentrancy::Forbidden,
+                },
             },
         );
     }

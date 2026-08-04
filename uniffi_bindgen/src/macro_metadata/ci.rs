@@ -106,6 +106,9 @@ fn add_item_to_ci(iface: &mut ComponentInterface, item: Metadata) -> anyhow::Res
         Metadata::CallbackInterface(meta) => {
             iface.add_callback_interface_definition(CallbackInterface::try_from(meta)?)?;
         }
+        Metadata::CallbackUseSite(meta) => {
+            iface.add_callback_use_site_metadata(meta);
+        }
         Metadata::TraitMethod(meta) => {
             iface.add_trait_method_meta(meta)?;
         }

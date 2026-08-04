@@ -14,9 +14,10 @@ use std::error::Error;
 use std::fmt;
 
 use uniffi_js_abi::{
-    AsyncKind, ComponentId, ComponentKey, IdentifiedComponent, IdentifiedOperation, IdentifiedType,
-    NamedTypeKind, OperationId, OperationKind, OperationOwner, ScalarType, TypeId, TypeSourceKey,
-    ValueType,
+    AsyncKind, Capability, CapabilitySet, ComponentId, ComponentKey, IdentifiedComponent,
+    IdentifiedOperation, IdentifiedType, NamedTypeKind, ObjectKind, OperationId, OperationKind,
+    OperationOwner, OperationSourceKey, Ownership, ScalarType, StreamUseSiteId, TypeId,
+    TypeSourceKey, ValueType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -24,76 +25,6 @@ pub enum EngineKind {
     Napi,
     WasmBindgen,
     OhosNapi,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum Capability {
-    Primitive,
-    String,
-    Bytes,
-    BigInt,
-    Optional,
-    Sequence,
-    Map,
-    Set,
-    Record,
-    Enum,
-    DeclaredError,
-    ObjectLease,
-    SyncCall,
-    AsyncCall,
-    Callback,
-    RetainedCallback,
-    AsyncCallback,
-    FallibleCallback,
-    CallbackReentrancy,
-    CrossThreadAsyncCallback,
-    InputStream,
-    OutputStream,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CapabilitySet(BTreeSet<Capability>);
-
-impl CapabilitySet {
-    pub fn new(capabilities: impl IntoIterator<Item = Capability>) -> Self {
-        Self(capabilities.into_iter().collect())
-    }
-
-    pub fn insert(&mut self, capability: Capability) -> bool {
-        self.0.insert(capability)
-    }
-
-    pub fn contains(&self, capability: Capability) -> bool {
-        self.0.contains(&capability)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
-        self.0.iter().copied()
-    }
-
-    pub fn is_superset(&self, other: &Self) -> bool {
-        self.0.is_superset(&other.0)
-    }
-
-    pub fn extend(&mut self, other: impl IntoIterator<Item = Capability>) {
-        self.0.extend(other);
-    }
-}
-
-impl FromIterator<Capability> for CapabilitySet {
-    fn from_iter<T: IntoIterator<Item = Capability>>(iter: T) -> Self {
-        Self::new(iter)
-    }
-}
-
-impl IntoIterator for CapabilitySet {
-    type Item = Capability;
-    type IntoIter = std::collections::btree_set::IntoIter<Capability>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -263,9 +194,248 @@ impl StreamContract {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamUseSite {
+    pub id: StreamUseSiteId,
     pub operation_id: OperationId,
     pub path: ValuePath,
     pub contract: StreamContract,
+}
+
+impl StreamUseSite {
+    pub fn new(operation_id: OperationId, path: ValuePath, contract: StreamContract) -> Self {
+        Self {
+            id: StreamUseSiteId::new(0),
+            operation_id,
+            path,
+            contract,
+        }
+    }
+}
+
+/// Rust-side bridge plan owned by the engine-neutral schema crate.  It is
+/// produced by the bindgen frontend but contains no parser, renderer, or IO
+/// types, so engine adapters can consume it without depending on bindgen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustPath {
+    pub segments: Vec<String>,
+}
+
+impl RustPath {
+    pub fn new(segments: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            segments: segments.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn from_module_path(module_path: &str, item: &str) -> Self {
+        let mut segments = module_path
+            .split("::")
+            .filter(|segment| !segment.is_empty())
+            .enumerate()
+            .map(|(index, segment)| {
+                if index == 0 {
+                    segment.replace('-', "_")
+                } else {
+                    segment.to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        if !item.is_empty() {
+            segments.push(item.to_owned());
+        }
+        Self { segments }
+    }
+
+    pub fn from_relative_path(crate_name: &str, relative_path: &str) -> Self {
+        let mut segments = vec![crate_name.replace('-', "_")];
+        segments.extend(
+            relative_path
+                .split("::")
+                .filter(|segment| !segment.is_empty())
+                .map(ToOwned::to_owned),
+        );
+        Self { segments }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RustType {
+    Unit,
+    Scalar(ScalarType),
+    Timestamp,
+    Duration,
+    Path(RustPath),
+    Option(Box<Self>),
+    Sequence(Box<Self>),
+    Map(Box<Self>, Box<Self>),
+    Set(Box<Self>),
+    Stream(Box<Self>),
+    InputStream(Box<Self>),
+    Custom(Box<Self>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustCarrier {
+    Primitive,
+    BigInt,
+    Bytes,
+    Timestamp,
+    Duration,
+    LocalAdapter,
+    OpaqueHandle,
+    CallbackProxy,
+    InputStream,
+    OutputStream,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RustCallTarget {
+    FreeFunction {
+        module: RustPath,
+        /// The source Rust item name.  This is deliberately not the private
+        /// generated FFI export name; the latter lives on
+        /// [`RustOperationPlan::private_ffi_symbol`].
+        item: String,
+    },
+    Constructor {
+        object: RustPath,
+        object_kind: RustObjectKind,
+        /// The source Rust constructor item name.
+        item: String,
+    },
+    Method {
+        object: RustPath,
+        object_kind: RustObjectKind,
+        callback_method_id: Option<u32>,
+        /// The source Rust method item name.
+        item: String,
+    },
+    CallbackMethod {
+        callback: RustPath,
+        callback_type: TypeId,
+        method_id: u32,
+        /// The source Rust callback method item name.
+        item: String,
+    },
+    /// A canonical stream operation slot.  Stream lifecycle operations are
+    /// synthesized from a value path rather than pretending that they are
+    /// user-declared Rust functions.
+    StreamHook {
+        parent: OperationId,
+        hook: RustResourceHook,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustObjectKind {
+    Struct,
+    TraitRustOnly,
+    TraitBoth,
+    TraitForeignOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConversionRecipe {
+    Identity,
+    Timestamp,
+    Duration,
+    BigInt,
+    Bytes,
+    Optional(Box<Self>),
+    Sequence(Box<Self>),
+    Map(Box<Self>, Box<Self>),
+    Set(Box<Self>),
+    Record(TypeId),
+    Enum(TypeId),
+    Error(TypeId),
+    Object(TypeId),
+    Custom(TypeId, Box<Self>),
+    Callback(TypeId),
+    InputStream(Box<Self>),
+    OutputStream(Box<Self>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustArgumentBinding {
+    pub public_name: String,
+    pub rust_name: String,
+    pub rust_type: RustType,
+    pub carrier: RustCarrier,
+    pub ownership: Ownership,
+    pub conversion: ConversionRecipe,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustReceiverBinding {
+    pub rust_type: RustType,
+    pub carrier: RustCarrier,
+    pub ownership: Ownership,
+    pub conversion: ConversionRecipe,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustReturnBinding {
+    pub rust_type: RustType,
+    pub carrier: RustCarrier,
+    pub ownership: Ownership,
+    pub conversion: ConversionRecipe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RustResourceHook {
+    None,
+    AcquireObject,
+    ReleaseObject,
+    StartInputStream,
+    PullInputStream,
+    CancelInputStream,
+    CloseInputStream,
+    StartOutputStream,
+    PullOutputStream,
+    CancelOutputStream,
+    CloseOutputStream,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustStreamResourceGroup {
+    pub id: StreamUseSiteId,
+    pub path: ValuePath,
+    pub direction: StreamDirection,
+    pub hooks: Vec<RustResourceHook>,
+    /// Operation IDs for the canonical stream slots in this resource group.
+    /// Close is a resource hook only and therefore has no operation slot.
+    pub slot_operation_ids: BTreeMap<OperationKind, OperationId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustOperationPlan {
+    pub operation_id: OperationId,
+    pub source_key: OperationSourceKey,
+    pub component_id: ComponentId,
+    pub owner: OperationOwner,
+    pub kind: OperationKind,
+    pub callback_method_id: Option<u32>,
+    /// Private generated FFI export used by the backend trampoline.  It is
+    /// kept separate from [`RustCallTarget`] so an FFI symbol can never be
+    /// mistaken for a Rust core item path.
+    pub private_ffi_symbol: Option<String>,
+    pub call_target: RustCallTarget,
+    pub receiver: Option<RustReceiverBinding>,
+    pub arguments: Vec<RustArgumentBinding>,
+    pub return_value: Option<RustReturnBinding>,
+    pub throws: Option<TypeId>,
+    pub resource_hooks: Vec<RustResourceHook>,
+    pub stream_resources: Vec<RustStreamResourceGroup>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustBridgePlan {
+    pub engines: BTreeMap<EngineKind, EngineRustBridgePlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineRustBridgePlan {
+    pub engine: EngineKind,
+    pub operations: Vec<RustOperationPlan>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -351,6 +521,11 @@ impl BridgePlan {
                 .map(|value| value.operation.id.index()),
             &mut errors,
         );
+        validate_unique_ids(
+            "stream use-site",
+            input.streams.iter().map(|value| value.id.index()),
+            &mut errors,
+        );
 
         input.components.sort_by_key(|value| value.id);
         input.types.sort_by_key(|value| value.id);
@@ -379,6 +554,11 @@ impl BridgePlan {
                 .operations
                 .iter()
                 .map(|value| value.operation.id.index()),
+            &mut errors,
+        );
+        validate_dense_ids(
+            "stream use-site",
+            input.streams.iter().map(|value| value.id.index()),
             &mut errors,
         );
 
@@ -700,7 +880,7 @@ fn validate_type_member_names(ty: &IdentifiedType, errors: &mut Vec<ValidationEr
                 );
             }
         }
-        NamedTypeKind::Object | NamedTypeKind::Callback => {}
+        NamedTypeKind::Custom { .. } | NamedTypeKind::Object { .. } | NamedTypeKind::Callback => {}
     }
 }
 
@@ -729,6 +909,7 @@ fn validate_operation_owner(
     let (owner_key, expected_kind) = match source.owner() {
         OperationOwner::Namespace => return,
         OperationOwner::Object(key) => (key, "object"),
+        OperationOwner::Value(key) => (key, "value"),
         OperationOwner::Callback(key) => (key, "callback"),
     };
 
@@ -748,7 +929,18 @@ fn validate_operation_owner(
         Some(owner) => {
             let matches = matches!(
                 (&owner.definition.kind, expected_kind),
-                (NamedTypeKind::Object, "object") | (NamedTypeKind::Callback, "callback")
+                (NamedTypeKind::Object { .. }, "object")
+                    | (NamedTypeKind::Callback, "callback")
+                    | (
+                        NamedTypeKind::Object {
+                            kind: ObjectKind::TraitBoth | ObjectKind::TraitForeignOnly,
+                        },
+                        "callback",
+                    )
+                    | (NamedTypeKind::Record { .. }, "value")
+                    | (NamedTypeKind::Enum { .. }, "value")
+                    | (NamedTypeKind::Error { .. }, "value")
+                    | (NamedTypeKind::Custom { .. }, "value")
             );
             if !matches {
                 errors.push(ValidationError::OperationOwnerKindMismatch {
@@ -767,7 +959,8 @@ fn named_type_kind_name(kind: &NamedTypeKind) -> &'static str {
         NamedTypeKind::Record { .. } => "record",
         NamedTypeKind::Enum { .. } => "enum",
         NamedTypeKind::Error { .. } => "error",
-        NamedTypeKind::Object => "object",
+        NamedTypeKind::Custom { .. } => "custom",
+        NamedTypeKind::Object { .. } => "object",
         NamedTypeKind::Callback => "callback",
     }
 }
@@ -818,6 +1011,191 @@ fn enumerate_expected_use_sites(
     (callbacks, streams)
 }
 
+/// Enumerate every stream value path in a batch of operations using the same
+/// named-type walker as bridge validation.  Frontends only project source
+/// metadata paths to public names; they must not reimplement this traversal.
+pub fn enumerate_stream_use_sites(
+    operations: &[IdentifiedOperation],
+    types: &[IdentifiedType],
+) -> Result<Vec<StreamUseSite>, ValidationReport> {
+    let types_by_key = types
+        .iter()
+        .map(|ty| (ty.definition.source_key.clone(), ty))
+        .collect::<BTreeMap<_, _>>();
+    let planned = operations
+        .iter()
+        .cloned()
+        .map(PlannedOperation::new)
+        .collect::<Vec<_>>();
+    let mut errors = Vec::new();
+    let (_, streams) = enumerate_expected_use_sites(&planned, &types_by_key, &mut errors);
+    if !errors.is_empty() {
+        errors.sort_by_key(ToString::to_string);
+        errors.dedup();
+        return Err(ValidationReport { errors });
+    }
+    let mut sites = streams
+        .into_iter()
+        .map(|((operation_id, path), expected)| {
+            StreamUseSite::new(
+                operation_id,
+                path,
+                StreamContract {
+                    direction: expected.direction,
+                    ..match expected.direction {
+                        StreamDirection::Input => StreamContract::input(),
+                        StreamDirection::Output => StreamContract::output(),
+                    }
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    assign_stream_use_site_ids(&mut sites);
+    Ok(sites)
+}
+
+/// Assign dense IDs after canonical operation/path ordering.  The IDs are
+/// build-local references for resource plans, not persisted identities.
+pub fn assign_stream_use_site_ids(sites: &mut [StreamUseSite]) {
+    sites.sort_by_key(|site| (site.operation_id, site.path.clone()));
+    for (index, site) in sites.iter_mut().enumerate() {
+        site.id = StreamUseSiteId::new(index as u32);
+    }
+}
+
+/// Resolve the callback type at a canonical operation value path.
+///
+/// This is shared by metadata adapters and the final [`BridgePlan`] validator
+/// so no consumer can grow a second named-type/path walker.  `None` means the
+/// path is invalid or points at a non-callback value.
+pub fn callback_type_for_path(
+    operation: &IdentifiedOperation,
+    path: &ValuePath,
+    types: &[IdentifiedType],
+) -> Option<TypeId> {
+    let types_by_key = types
+        .iter()
+        .map(|ty| (ty.definition.source_key.clone(), ty))
+        .collect::<BTreeMap<_, _>>();
+    let mut segments = path.segments().iter();
+    let first = segments.next()?;
+    let value = match first {
+        ValuePathSegment::Argument(index) => operation
+            .definition
+            .signature
+            .arguments
+            .get(*index as usize)
+            .map(|argument| &argument.ty),
+        ValuePathSegment::Return => operation.definition.signature.return_type.as_ref(),
+        _ => None,
+    }?;
+    let remaining = segments.collect::<Vec<_>>();
+    resolve_callback_value_path(value, &remaining, &types_by_key, &mut BTreeSet::new())
+}
+
+fn resolve_callback_value_path(
+    value: &ValueType,
+    segments: &[&ValuePathSegment],
+    types: &BTreeMap<TypeSourceKey, &IdentifiedType>,
+    visiting: &mut BTreeSet<TypeSourceKey>,
+) -> Option<TypeId> {
+    if segments.is_empty() {
+        let ValueType::Named(key) = value else {
+            return None;
+        };
+        let ty = types.get(key)?;
+        return matches!(
+            ty.definition.kind,
+            NamedTypeKind::Callback
+                | NamedTypeKind::Object {
+                    kind: ObjectKind::TraitBoth | ObjectKind::TraitForeignOnly,
+                }
+        )
+        .then_some(ty.id);
+    }
+    match value {
+        ValueType::Optional(inner) => resolve_callback_value_path(inner, segments, types, visiting),
+        ValueType::Sequence(inner) => match segments.first()? {
+            ValuePathSegment::SequenceItem => {
+                resolve_callback_value_path(inner, &segments[1..], types, visiting)
+            }
+            _ => None,
+        },
+        ValueType::Set(inner) => match segments.first()? {
+            ValuePathSegment::SetItem => {
+                resolve_callback_value_path(inner, &segments[1..], types, visiting)
+            }
+            _ => None,
+        },
+        ValueType::Map(key, value) => match segments.first()? {
+            ValuePathSegment::MapKey => {
+                resolve_callback_value_path(key, &segments[1..], types, visiting)
+            }
+            ValuePathSegment::MapValue => {
+                resolve_callback_value_path(value, &segments[1..], types, visiting)
+            }
+            _ => None,
+        },
+        ValueType::InputStream(inner) | ValueType::OutputStream(inner) => {
+            match segments.first()? {
+                ValuePathSegment::SequenceItem => {
+                    resolve_callback_value_path(inner, &segments[1..], types, visiting)
+                }
+                _ => None,
+            }
+        }
+        ValueType::Named(key) => {
+            if !visiting.insert(key.clone()) {
+                return None;
+            }
+            let result = match segments.first()? {
+                ValuePathSegment::Field(name) => match &types.get(key)?.definition.kind {
+                    NamedTypeKind::Record { fields } => fields
+                        .iter()
+                        .find(|field| field.public_name == *name)
+                        .and_then(|field| {
+                            resolve_callback_value_path(&field.ty, &segments[1..], types, visiting)
+                        }),
+                    NamedTypeKind::Custom { builtin } => {
+                        resolve_callback_value_path(builtin, segments, types, visiting)
+                    }
+                    _ => None,
+                },
+                ValuePathSegment::Variant(variant_name) => match &types.get(key)?.definition.kind {
+                    NamedTypeKind::Enum { variants } | NamedTypeKind::Error { variants } => {
+                        variants
+                            .iter()
+                            .find(|variant| variant.public_name == *variant_name)
+                            .and_then(|variant| {
+                                let ValuePathSegment::Field(field_name) = *segments.get(1)? else {
+                                    return None;
+                                };
+                                let field = variant
+                                    .fields
+                                    .iter()
+                                    .find(|field| field.public_name == *field_name)?;
+                                resolve_callback_value_path(
+                                    &field.ty,
+                                    &segments[2..],
+                                    types,
+                                    visiting,
+                                )
+                            })
+                    }
+                    NamedTypeKind::Custom { builtin } => {
+                        resolve_callback_value_path(builtin, segments, types, visiting)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            visiting.remove(key);
+            result
+        }
+        ValueType::Scalar(_) | ValueType::Timestamp | ValueType::Duration => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enumerate_value_use_sites(
     operation_id: OperationId,
@@ -830,7 +1208,7 @@ fn enumerate_value_use_sites(
     errors: &mut Vec<ValidationError>,
 ) {
     match value {
-        ValueType::Scalar(_) => {}
+        ValueType::Scalar(_) | ValueType::Timestamp | ValueType::Duration => {}
         ValueType::Named(key) => {
             let Some(ty) = types.get(key) else {
                 errors.push(ValidationError::UnknownNamedType { key: key.clone() });
@@ -845,7 +1223,17 @@ fn enumerate_value_use_sites(
                         },
                     );
                 }
-                NamedTypeKind::Object => {}
+                NamedTypeKind::Object {
+                    kind: ObjectKind::TraitBoth | ObjectKind::TraitForeignOnly,
+                } => {
+                    callbacks.insert(
+                        (operation_id, path),
+                        ExpectedCallbackUseSite {
+                            callback_type: ty.id,
+                        },
+                    );
+                }
+                NamedTypeKind::Object { .. } => {}
                 NamedTypeKind::Record { fields } => {
                     if !visiting.insert(key.clone()) {
                         return;
@@ -889,6 +1277,18 @@ fn enumerate_value_use_sites(
                         }
                     }
                     visiting.remove(key);
+                }
+                NamedTypeKind::Custom { builtin } => {
+                    enumerate_value_use_sites(
+                        operation_id,
+                        builtin,
+                        path,
+                        types,
+                        visiting,
+                        callbacks,
+                        streams,
+                        errors,
+                    );
                 }
             }
         }
@@ -987,8 +1387,7 @@ fn validate_callback_use_sites(
             });
         }
         match types_by_id.get(&callback.callback_type) {
-            Some(callback_type)
-                if matches!(callback_type.definition.kind, NamedTypeKind::Callback) => {}
+            Some(callback_type) if is_callback_capable_type(&callback_type.definition.kind) => {}
             Some(_) => errors.push(ValidationError::NotACallbackType {
                 type_id: callback.callback_type,
                 use_site: callback.path.to_string(),
@@ -1061,7 +1460,11 @@ fn validate_callback_method_contract(
     if !types_by_key.contains_key(callback_key) {
         return;
     }
-    let methods: Vec<_> = callback_methods(callback_key, operations);
+    let methods: Vec<_> = callback_methods(
+        callback_key,
+        &callback_definition.definition.kind,
+        operations,
+    );
     if methods.is_empty() {
         errors.push(ValidationError::CallbackTypeHasNoMethods {
             callback_type,
@@ -1083,17 +1486,40 @@ fn validate_callback_method_contract(
 
 fn callback_methods<'a>(
     callback_key: &TypeSourceKey,
+    callback_kind: &NamedTypeKind,
     operations: &'a [PlannedOperation],
 ) -> Vec<&'a PlannedOperation> {
     operations
         .iter()
-        .filter(|planned| {
-            matches!(
-                planned.operation.definition.source_key.owner(),
-                OperationOwner::Callback(owner) if owner == callback_key
-            ) && planned.operation.definition.source_key.kind() == OperationKind::CallbackMethod
+        .filter(|planned| match callback_kind {
+            NamedTypeKind::Callback => {
+                matches!(
+                    planned.operation.definition.source_key.owner(),
+                    OperationOwner::Callback(owner) if owner == callback_key
+                ) && planned.operation.definition.source_key.kind() == OperationKind::CallbackMethod
+            }
+            NamedTypeKind::Object {
+                kind: ObjectKind::TraitBoth | ObjectKind::TraitForeignOnly,
+            } => {
+                matches!(
+                    planned.operation.definition.source_key.owner(),
+                    OperationOwner::Callback(owner) if owner == callback_key
+                ) && planned.operation.definition.source_key.kind() == OperationKind::CallbackMethod
+                    && planned.operation.definition.callback_method_id.is_some()
+            }
+            _ => false,
         })
         .collect()
+}
+
+fn is_callback_capable_type(kind: &NamedTypeKind) -> bool {
+    matches!(
+        kind,
+        NamedTypeKind::Callback
+            | NamedTypeKind::Object {
+                kind: ObjectKind::TraitBoth | ObjectKind::TraitForeignOnly,
+            }
+    )
 }
 
 fn validate_stream_use_sites(
@@ -1190,7 +1616,11 @@ fn callback_method_capabilities(
     if !types_by_key.contains_key(callback_key) {
         return capabilities;
     }
-    let methods = callback_methods(callback_key, operations);
+    let methods = callback_methods(
+        callback_key,
+        &callback_definition.definition.kind,
+        operations,
+    );
     if methods
         .iter()
         .any(|method| method.operation.definition.signature.async_kind == AsyncKind::Async)
@@ -1265,8 +1695,14 @@ fn infer_named_capabilities(
                 }
             }
         }
-        NamedTypeKind::Object => {
+        NamedTypeKind::Custom { builtin } => {
+            infer_value_capabilities(builtin, types, visiting, required, errors);
+        }
+        NamedTypeKind::Object { kind } => {
             required.insert(Capability::ObjectLease);
+            if matches!(kind, ObjectKind::TraitBoth | ObjectKind::TraitForeignOnly) {
+                required.insert(Capability::Callback);
+            }
         }
         NamedTypeKind::Callback => {
             required.insert(Capability::Callback);
@@ -1291,6 +1727,9 @@ fn infer_value_capabilities(
                 ScalarType::I64 | ScalarType::U64 => Capability::BigInt,
                 _ => return,
             });
+        }
+        ValueType::Timestamp | ValueType::Duration => {
+            required.insert(Capability::Primitive);
         }
         ValueType::Named(key) => {
             infer_named_capabilities(key, types, visiting, required, errors);
@@ -2058,7 +2497,14 @@ mod tests {
                 },
             )
             .unwrap(),
-            TypeDefinition::new(object_key.clone(), "Service", NamedTypeKind::Object).unwrap(),
+            TypeDefinition::new(
+                object_key.clone(),
+                "Service",
+                NamedTypeKind::Object {
+                    kind: ObjectKind::Struct,
+                },
+            )
+            .unwrap(),
             TypeDefinition::new(callback_key.clone(), "Observer", NamedTypeKind::Callback).unwrap(),
         ])
         .unwrap();
@@ -2227,6 +2673,15 @@ mod tests {
             .find(|operation| operation.definition.public_name == "events")
             .unwrap()
             .id;
+        let mut streams = vec![
+            StreamUseSite::new(
+                observe,
+                ValuePath::argument(0).then(ValuePathSegment::Field("input".to_owned())),
+                StreamContract::input(),
+            ),
+            StreamUseSite::new(events, ValuePath::return_value(), StreamContract::output()),
+        ];
+        assign_stream_use_site_ids(&mut streams);
         BridgePlanInput {
             components,
             types,
@@ -2241,18 +2696,7 @@ mod tests {
                     reentrancy: CallbackReentrancy::Allowed,
                 },
             }],
-            streams: vec![
-                StreamUseSite {
-                    operation_id: observe,
-                    path: ValuePath::argument(0).then(ValuePathSegment::Field("input".to_owned())),
-                    contract: StreamContract::input(),
-                },
-                StreamUseSite {
-                    operation_id: events,
-                    path: ValuePath::return_value(),
-                    contract: StreamContract::output(),
-                },
-            ],
+            streams,
             targets: [
                 EngineKind::Napi,
                 EngineKind::WasmBindgen,
@@ -2468,7 +2912,7 @@ mod tests {
         let mut foreign_type = foreign
             .types
             .iter()
-            .find(|ty| matches!(ty.definition.kind, NamedTypeKind::Object))
+            .find(|ty| matches!(ty.definition.kind, NamedTypeKind::Object { .. }))
             .unwrap()
             .clone();
         foreign_type.id = TypeId::new(foreign.types.len() as u32);
@@ -2589,7 +3033,7 @@ mod tests {
         wrong_type.callbacks[0].callback_type = wrong_type
             .types
             .iter()
-            .find(|ty| matches!(ty.definition.kind, NamedTypeKind::Object))
+            .find(|ty| matches!(ty.definition.kind, NamedTypeKind::Object { .. }))
             .unwrap()
             .id;
         let report = BridgePlan::build(wrong_type).unwrap_err();
@@ -2640,8 +3084,12 @@ mod tests {
     #[test]
     fn stream_contract_path_and_direction_must_match_the_signature() {
         let mut wrong_path = corpus_input();
-        wrong_path.streams[0].path =
-            ValuePath::argument(0).then(ValuePathSegment::Field("missing".to_owned()));
+        wrong_path
+            .streams
+            .iter_mut()
+            .find(|stream| stream.contract.direction == StreamDirection::Input)
+            .expect("corpus contains an input stream")
+            .path = ValuePath::argument(0).then(ValuePathSegment::Field("missing".to_owned()));
         let report = BridgePlan::build(wrong_path).unwrap_err();
         assert!(report
             .contains(|error| matches!(error, ValidationError::UnexpectedStreamContract { .. })));
@@ -2650,7 +3098,12 @@ mod tests {
         );
 
         let mut wrong_direction = corpus_input();
-        wrong_direction.streams[0].contract = StreamContract::output();
+        wrong_direction
+            .streams
+            .iter_mut()
+            .find(|stream| stream.contract.direction == StreamDirection::Input)
+            .expect("corpus contains an input stream")
+            .contract = StreamContract::output();
         let report = BridgePlan::build(wrong_direction).unwrap_err();
         assert!(report.contains(|error| matches!(
             error,

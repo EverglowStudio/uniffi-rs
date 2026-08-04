@@ -127,6 +127,10 @@ impl UniffiMetaConverter {
                     .or_default()
                     .insert_unique(cbi.name.clone(), cbi)?;
             }
+            // Callback use-site contracts are consumed by the JavaScript frontend. The generic
+            // initial IR intentionally does not reinterpret them, so other language backends
+            // retain their existing behavior.
+            uniffi_meta::Metadata::CallbackUseSite(_) => (),
             uniffi_meta::Metadata::CustomType(custom) => {
                 // No `update_orig_names` call, since custom types don't support renaming yet
                 let by_crate = self
