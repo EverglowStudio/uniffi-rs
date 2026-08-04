@@ -8,6 +8,48 @@ mod shared;
 use shared::*;
 use support::*;
 
+#[test]
+fn engine_neutral_contract_corpus_is_deterministic() {
+    use uniffi_js_abi::{
+        InputPresence, PresenceError, PublicSourceFamily, PublicTarget, ScalarType, ValueType,
+    };
+    use uniffi_js_engine_schema::Capability;
+
+    let forward = unified_contract_corpus(false);
+    let reverse = unified_contract_corpus(true);
+    assert_eq!(forward, reverse, "source discovery order changed the plan");
+    assert_eq!(forward.targets().len(), 3);
+    assert!(forward
+        .operations()
+        .iter()
+        .any(|operation| operation.required_capabilities.contains(Capability::BigInt)));
+    assert!(forward
+        .operations()
+        .iter()
+        .any(|operation| operation.required_capabilities.contains(Capability::Map)));
+    assert!(forward
+        .operations()
+        .iter()
+        .any(|operation| operation.required_capabilities.contains(Capability::Set)));
+
+    let optional = ValueType::optional(ValueType::Scalar(ScalarType::String));
+    assert_eq!(optional.validate_presence(InputPresence::Null), Ok(()));
+    assert_eq!(
+        optional.validate_presence(InputPresence::Undefined),
+        Err(PresenceError::Undefined)
+    );
+
+    let node = PublicTarget::NodeNapi.output_layout();
+    let web = PublicTarget::BrowserWasm.output_layout();
+    let ohos = PublicTarget::OhosNapi.output_layout();
+    assert_eq!(node, web, "Node and Web must share physical public source");
+    assert_eq!(node.implementation_suffix, ".js");
+    assert_eq!(node.declaration_suffix, ".d.ts");
+    assert_eq!(ohos.implementation_suffix, ".ets");
+    assert_eq!(ohos.declaration_suffix, ".d.ets");
+    assert_eq!(ohos.source_family, PublicSourceFamily::ArkTs);
+}
+
 fn contains_dynamic_type_word(source: &str) -> bool {
     source
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))

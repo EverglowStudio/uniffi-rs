@@ -1,0 +1,10 @@
+[package]
+name = "uniffi_js_engine_schema"
+version = "0.32.0"
+description = "Engine-neutral UniFFI JavaScript bridge planning contract"
+license = "MPL-2.0"
+edition = "2021"
+keywords = ["ffi", "bindgen", "javascript"]
+
+[dependencies]
+uniffi_js_abi = { path = "../uniffi_js_abi", version = "=0.32.0" }

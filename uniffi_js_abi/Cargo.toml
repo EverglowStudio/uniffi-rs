@@ -1,0 +1,7 @@
+[package]
+name = "uniffi_js_abi"
+version = "0.32.0"
+description = "Engine-neutral JavaScript API contract for UniFFI"
+license = "MPL-2.0"
+edition = "2021"
+keywords = ["ffi", "bindgen", "javascript"]
