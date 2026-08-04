@@ -35,7 +35,7 @@ use super::ir::{
     JsVariant, LayoutPlan, NormalizedPackage, ResolvedJsConfig, RustArgumentBinding,
     RustBridgePlan, RustCallTarget, RustCarrier, RustObjectKind, RustOperationPlan, RustPath,
     RustReceiverBinding, RustResourceHook, RustReturnBinding, RustStreamResourceGroup, RustType,
-    UNIFIED_TARGET_UNIVERSE,
+    RustValueBinding, UNIFIED_TARGET_UNIVERSE,
 };
 use crate::{CustomTypeConfig, JsConfig};
 
@@ -247,6 +247,11 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
     )?;
     let stream_use_sites = enumerate_stream_use_sites(&identified_operations, &identified_types)
         .map_err(|report| FrontendError::Contract(report.to_string()))?;
+    validate_executable_stream_use_sites(
+        &identified_operations,
+        &operation_extras,
+        &stream_use_sites,
+    )?;
 
     let bridge_input = build_bridge_input(
         &identified_components,
@@ -298,6 +303,7 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
         &operation_extras,
         bridge.callbacks(),
         &stream_use_sites,
+        &crate_owners,
         &build_targets,
     )?;
     let engines = build_targets
@@ -336,6 +342,73 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
         host,
         engines,
     })
+}
+
+fn validate_executable_stream_use_sites(
+    operations: &[IdentifiedOperation],
+    operation_extras: &BTreeMap<OperationSourceKey, OperationExtra>,
+    streams: &[StreamUseSite],
+) -> Result<(), FrontendError> {
+    for stream in streams {
+        let operation = operations
+            .iter()
+            .find(|operation| operation.id == stream.operation_id)
+            .ok_or_else(|| {
+                FrontendError::Contract(format!(
+                    "unsupported stream use-site operation=<unknown:{}> path={} reason=unknown operation",
+                    stream.operation_id.index(),
+                    stream.path
+                ))
+            })?;
+        let metadata = operation_extras
+            .get(&operation.definition.source_key)
+            .and_then(|extra| extra.stream_metadata.get(&stream.path));
+        let Some(metadata) = metadata else {
+            return Err(FrontendError::Contract(format!(
+                "unsupported stream use-site operation={} path={} reason=nested stream values are not executable by the JavaScript frontend",
+                operation.definition.source_key, stream.path
+            )));
+        };
+        if !matches!(
+            operation.definition.source_key.owner(),
+            OperationOwner::Namespace
+        ) {
+            return Err(FrontendError::Contract(format!(
+                "unsupported stream use-site operation={} path={} reason=methods and callback operations cannot expose stream slots",
+                operation.definition.source_key, stream.path
+            )));
+        }
+        match metadata.direction {
+            StreamDirection::Input
+                if matches!(stream.path.segments(), [ValuePathSegment::Argument(_)]) => {}
+            StreamDirection::Output
+                if matches!(stream.path.segments(), [ValuePathSegment::Return])
+                    && operation.definition.source_key.kind()
+                        == OperationKind::OutputStreamStart
+                    && operation.definition.signature.async_kind == AsyncKind::Sync
+                    && operation.definition.signature.throws.is_none() => {}
+            StreamDirection::Input => {
+                return Err(FrontendError::Contract(format!(
+                    "unsupported stream use-site operation={} path={} reason=input streams are executable only as direct namespace arguments",
+                    operation.definition.source_key, stream.path
+                )));
+            }
+            StreamDirection::Output => {
+                let reason = if operation.definition.signature.throws.is_some() {
+                    "output stream source errors must be carried by StreamStep, not operation throws"
+                } else if operation.definition.signature.async_kind == AsyncKind::Async {
+                    "async output stream sources are not executable by the JavaScript frontend"
+                } else {
+                    "output streams are executable only as direct synchronous namespace returns"
+                };
+                return Err(FrontendError::Contract(format!(
+                    "unsupported stream use-site operation={} path={} reason={reason}",
+                    operation.definition.source_key, stream.path
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -621,6 +694,15 @@ struct OperationExtra {
     argument_rust_names: Vec<String>,
     argument_ownership: Vec<Ownership>,
     receiver_ownership: Option<Ownership>,
+    stream_metadata: BTreeMap<ValuePath, SourceStreamMetadata>,
+}
+
+#[derive(Clone)]
+struct SourceStreamMetadata {
+    direction: StreamDirection,
+    item_type: Type,
+    error_type: Type,
+    is_send: bool,
 }
 
 fn collect_operation_definitions(
@@ -646,11 +728,16 @@ fn collect_operation_definitions(
             owner_key_for_module(&component.ci, component.ci.crate_name(), crate_owners)?;
         let module_path = RustPath::from_module_path(component.ci.crate_name(), "");
         for function in component.ci.function_definitions() {
+            let kind = if matches!(function.return_type(), Some(Type::Stream { .. })) {
+                OperationKind::OutputStreamStart
+            } else {
+                OperationKind::Function
+            };
             push(operation_definition(
                 &component.ci,
                 &component_key,
                 OperationOwner::Namespace,
-                OperationKind::Function,
+                kind,
                 function.name(),
                 function,
                 None,
@@ -980,8 +1067,67 @@ fn operation_definition(
             argument_rust_names,
             argument_ownership,
             receiver_ownership,
+            stream_metadata: direct_stream_metadata(callable),
         },
     ))
+}
+
+fn direct_stream_metadata(callable: &dyn Callable) -> BTreeMap<ValuePath, SourceStreamMetadata> {
+    let mut metadata = BTreeMap::new();
+    for (index, argument) in callable.arguments().into_iter().enumerate() {
+        let stream = match argument.as_type() {
+            Type::InputStream {
+                item_type,
+                error_type,
+                is_send,
+            } => Some(SourceStreamMetadata {
+                direction: StreamDirection::Input,
+                item_type: (*item_type).clone(),
+                error_type: (*error_type).clone(),
+                is_send,
+            }),
+            Type::Stream {
+                item_type,
+                error_type,
+                is_send,
+            } => Some(SourceStreamMetadata {
+                direction: StreamDirection::Output,
+                item_type: (*item_type).clone(),
+                error_type: (*error_type).clone(),
+                is_send,
+            }),
+            _ => None,
+        };
+        if let Some(stream) = stream {
+            metadata.insert(ValuePath::argument(index as u32), stream);
+        }
+    }
+    if let Some(stream) = callable.return_type().and_then(|ty| match ty {
+        Type::Stream {
+            item_type,
+            error_type,
+            is_send,
+        } => Some(SourceStreamMetadata {
+            direction: StreamDirection::Output,
+            item_type: (**item_type).clone(),
+            error_type: (**error_type).clone(),
+            is_send: *is_send,
+        }),
+        Type::InputStream {
+            item_type,
+            error_type,
+            is_send,
+        } => Some(SourceStreamMetadata {
+            direction: StreamDirection::Input,
+            item_type: (**item_type).clone(),
+            error_type: (**error_type).clone(),
+            is_send: *is_send,
+        }),
+        _ => None,
+    }) {
+        metadata.insert(ValuePath::return_value(), stream);
+    }
+    metadata
 }
 
 fn collect_callback_metadata(
@@ -999,7 +1145,9 @@ fn collect_callback_metadata(
                 .get(&crate_root(&metadata.module_path))
                 .cloned()
                 .ok_or_else(|| FrontendError::InvalidMetadata(metadata.module_path.clone()))?;
-            for (kind, owner) in metadata_operation_owners(metadata, &component_key, type_extras)? {
+            for (kind, owner) in
+                metadata_operation_owners(metadata, &component_key, type_extras, js_operations)?
+            {
                 let source_key = OperationSourceKey::new(
                     component_key.clone(),
                     owner,
@@ -1069,10 +1217,23 @@ fn metadata_operation_owners(
     metadata: &CallbackUseSiteMetadata,
     component_key: &ComponentKey,
     type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+    js_operations: &[JsOperation],
 ) -> Result<Vec<(OperationKind, OperationOwner)>, FrontendError> {
     Ok(match metadata.operation_kind {
         CallbackOperationKind::Function => {
-            vec![(OperationKind::Function, OperationOwner::Namespace)]
+            let kind = js_operations
+                .iter()
+                .find(|operation| {
+                    operation.source_key.component() == component_key
+                        && operation.source_key.owner() == &OperationOwner::Namespace
+                        && operation.source_key.name() == metadata.operation_name
+                })
+                .filter(|operation| {
+                    matches!(&operation.return_type, Some(ValueType::OutputStream(_)))
+                })
+                .map(|_| OperationKind::OutputStreamStart)
+                .unwrap_or(OperationKind::Function);
+            vec![(kind, OperationOwner::Namespace)]
         }
         CallbackOperationKind::Constructor | CallbackOperationKind::Method => {
             let owner_name = metadata.owner.as_deref().ok_or_else(|| {
@@ -1347,6 +1508,7 @@ fn build_rust_bridge_plan(
     operation_extras: &BTreeMap<OperationSourceKey, OperationExtra>,
     callbacks: &[CallbackUseSite],
     streams: &[StreamUseSite],
+    crate_owners: &BTreeMap<String, ComponentKey>,
     build_targets: &[PublicTarget],
 ) -> Result<RustBridgePlan, FrontendError> {
     let mut operations = Vec::with_capacity(api.operations.len());
@@ -1468,6 +1630,28 @@ fn build_rust_bridge_plan(
             .iter()
             .filter(|stream| stream.operation_id == operation.id)
         {
+            let source_stream = extra.stream_metadata.get(&stream.path).ok_or_else(|| {
+                FrontendError::Contract(format!(
+                    "missing source stream metadata for operation={} path={}",
+                    operation.source_key, stream.path
+                ))
+            })?;
+            let item = rust_value_binding_for_source_type(
+                &source_stream.item_type,
+                api,
+                type_ids,
+                type_extras,
+                crate_owners,
+                callback_role,
+            )?;
+            let error = rust_value_binding_for_source_type(
+                &source_stream.error_type,
+                api,
+                type_ids,
+                type_extras,
+                crate_owners,
+                callback_role,
+            )?;
             let hooks = match stream.contract.direction {
                 StreamDirection::Input => vec![
                     RustResourceHook::StartInputStream,
@@ -1498,10 +1682,6 @@ fn build_rust_bridge_plan(
                 .collect::<Vec<_>>(),
                 StreamDirection::Output => [
                     (
-                        OperationKind::OutputStreamStart,
-                        RustResourceHook::StartOutputStream,
-                    ),
-                    (
                         OperationKind::OutputStreamNext,
                         RustResourceHook::PullOutputStream,
                     ),
@@ -1514,6 +1694,9 @@ fn build_rust_bridge_plan(
                 .collect::<Vec<_>>(),
             };
             let mut slot_operation_ids = BTreeMap::new();
+            if stream.contract.direction == StreamDirection::Output {
+                slot_operation_ids.insert(OperationKind::OutputStreamStart, operation.id);
+            }
             for (kind, hook) in slot_kinds {
                 let operation_id = uniffi_js_abi::OperationId::new(next_synthetic_id);
                 next_synthetic_id = next_synthetic_id.saturating_add(1);
@@ -1537,15 +1720,24 @@ fn build_rust_bridge_plan(
                     component_id: operation.component_id,
                     owner: operation.source_key.owner().clone(),
                     kind,
+                    async_kind: AsyncKind::Async,
                     callback_method_id: None,
                     private_ffi_symbol: None,
                     call_target: RustCallTarget::StreamHook {
                         parent: operation.id,
+                        use_site_id: stream.id,
                         hook,
                     },
-                    receiver: None,
+                    receiver: Some(stream_handle_binding(stream.contract.direction)),
                     arguments: Vec::new(),
-                    return_value: None,
+                    return_value: if matches!(
+                        kind,
+                        OperationKind::InputStreamCancel | OperationKind::OutputStreamCancel
+                    ) {
+                        None
+                    } else {
+                        Some(stream_step_return_binding(&item, &error))
+                    },
                     throws: None,
                     resource_hooks: vec![hook],
                     stream_resources: Vec::new(),
@@ -1555,6 +1747,9 @@ fn build_rust_bridge_plan(
                 id: stream.id,
                 path: stream.path.clone(),
                 direction: stream.contract.direction,
+                item,
+                error,
+                is_send: source_stream.is_send,
                 hooks,
                 slot_operation_ids,
             });
@@ -1562,10 +1757,13 @@ fn build_rust_bridge_plan(
         resource_hooks.sort();
         resource_hooks.dedup();
         let call_target = match (operation.source_key.owner(), operation.kind) {
-            (OperationOwner::Namespace, OperationKind::Function) => RustCallTarget::FreeFunction {
-                module: extra.module_path.clone(),
-                item: extra.item_name.clone(),
-            },
+            (OperationOwner::Namespace, OperationKind::Function)
+            | (OperationOwner::Namespace, OperationKind::OutputStreamStart) => {
+                RustCallTarget::FreeFunction {
+                    module: extra.module_path.clone(),
+                    item: extra.item_name.clone(),
+                }
+            }
             (OperationOwner::Object(_), OperationKind::Constructor)
             | (OperationOwner::Value(_), OperationKind::Constructor) => {
                 RustCallTarget::Constructor {
@@ -1613,6 +1811,7 @@ fn build_rust_bridge_plan(
             component_id: operation.component_id,
             owner: operation.source_key.owner().clone(),
             kind: operation.kind,
+            async_kind: operation.async_kind,
             callback_method_id: operation.callback_method_id,
             private_ffi_symbol: extra.private_ffi_symbol.clone(),
             call_target,
@@ -1649,6 +1848,63 @@ fn build_rust_bridge_plan(
         })
         .collect();
     Ok(RustBridgePlan { engines })
+}
+
+fn rust_value_binding_for_source_type(
+    source_type: &Type,
+    api: &JsApiIr,
+    type_ids: &BTreeMap<TypeSourceKey, uniffi_js_abi::TypeId>,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+    crate_owners: &BTreeMap<String, ComponentKey>,
+    callback_role: bool,
+) -> Result<RustValueBinding, FrontendError> {
+    let value_type = convert_type(source_type, crate_owners)?;
+    let (rust_type, carrier, conversion) =
+        rust_binding_for_type(&value_type, api, type_ids, type_extras, callback_role)?;
+    Ok(RustValueBinding {
+        rust_type,
+        carrier,
+        conversion,
+    })
+}
+
+fn stream_handle_binding(direction: StreamDirection) -> RustReceiverBinding {
+    let (rust_type, carrier, conversion) = match direction {
+        StreamDirection::Input => (
+            RustType::Path(RustPath::new(["uniffi", "Handle"])),
+            RustCarrier::InputStream,
+            ConversionRecipe::Identity,
+        ),
+        StreamDirection::Output => (
+            RustType::Path(RustPath::new(["uniffi", "Handle"])),
+            RustCarrier::OutputStream,
+            ConversionRecipe::Identity,
+        ),
+    };
+    RustReceiverBinding {
+        rust_type,
+        carrier,
+        ownership: Ownership::Borrowed,
+        conversion,
+    }
+}
+
+fn stream_step_return_binding(
+    item: &RustValueBinding,
+    error: &RustValueBinding,
+) -> RustReturnBinding {
+    RustReturnBinding {
+        rust_type: RustType::StreamStep {
+            item: Box::new(item.rust_type.clone()),
+            error: Box::new(error.rust_type.clone()),
+        },
+        carrier: RustCarrier::StreamStep,
+        ownership: Ownership::Owned,
+        conversion: ConversionRecipe::StreamStep {
+            item: Box::new(item.conversion.clone()),
+            error: Box::new(error.conversion.clone()),
+        },
+    }
 }
 
 fn rust_binding_for_type(
@@ -1995,6 +2251,7 @@ fn enum_module_path(enum_: &Enum) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uniffi_js_abi::ScalarType;
 
     fn component(crate_name: &str, namespace: &str, body: &str) -> Component<JsConfig> {
         Component {
@@ -2585,7 +2842,7 @@ mod tests {
                 return_type: Some(uniffi_meta::Type::Stream {
                     item_type: Box::new(uniffi_meta::Type::UInt32),
                     error_type: Box::new(uniffi_meta::Type::String),
-                    is_send: true,
+                    is_send: false,
                 }),
                 throws: None,
                 checksum: None,
@@ -2601,14 +2858,13 @@ mod tests {
         assert_eq!(package.api.operations.len(), 1);
         assert_eq!(package.bridge.streams().len(), 1);
         let rust_operations = &package.rust.engines[&EngineKind::WasmBindgen].operations;
-        assert_eq!(rust_operations.len(), 4);
+        assert_eq!(rust_operations.len(), 3);
         assert_eq!(
             rust_operations
                 .iter()
                 .map(|operation| operation.kind)
                 .collect::<Vec<_>>(),
             vec![
-                OperationKind::Function,
                 OperationKind::OutputStreamStart,
                 OperationKind::OutputStreamNext,
                 OperationKind::OutputStreamCancel,
@@ -2622,16 +2878,304 @@ mod tests {
                 .values()
                 .map(|id| id.index())
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![0, 1, 2]
         );
+        assert_eq!(group.item.rust_type, RustType::Scalar(ScalarType::U32));
+        assert_eq!(group.error.rust_type, RustType::Scalar(ScalarType::String));
+        assert!(!group.is_send);
+        assert!(matches!(
+            rust_operations[0].call_target,
+            RustCallTarget::FreeFunction { .. }
+        ));
+        assert!(!rust_operations.iter().any(|operation| matches!(
+            operation.call_target,
+            RustCallTarget::StreamHook {
+                hook: RustResourceHook::StartOutputStream,
+                ..
+            }
+        )));
         assert_eq!(
             package.engines[0]
                 .operation_ids
                 .iter()
                 .map(|id| id.index())
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3]
+            vec![0, 1, 2]
         );
+    }
+
+    #[test]
+    fn output_stream_source_throws_are_rejected_before_bridge_plan() {
+        let mut group = uniffi_meta::MetadataGroup {
+            namespace: uniffi_meta::NamespaceMetadata {
+                crate_name: "stream_throws_crate".to_owned(),
+                name: "stream_throws".to_owned(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            uniffi_meta::EnumMetadata {
+                module_path: "stream_throws_crate".to_owned(),
+                name: "StreamError".to_owned(),
+                orig_name: None,
+                rust_path: None,
+                shape: uniffi_meta::EnumShape::Error { flat: false },
+                remote: false,
+                variants: vec![uniffi_meta::VariantMetadata {
+                    name: "Failed".to_owned(),
+                    orig_name: None,
+                    discr: None,
+                    fields: vec![],
+                    docstring: None,
+                }],
+                discr_type: None,
+                non_exhaustive: false,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            uniffi_meta::FnMetadata {
+                module_path: "stream_throws_crate".to_owned(),
+                name: "events".to_owned(),
+                orig_name: None,
+                is_async: false,
+                inputs: vec![],
+                return_type: Some(uniffi_meta::Type::Stream {
+                    item_type: Box::new(uniffi_meta::Type::UInt32),
+                    error_type: Box::new(uniffi_meta::Type::String),
+                    is_send: false,
+                }),
+                throws: Some(uniffi_meta::Type::Enum {
+                    module_path: "stream_throws_crate".to_owned(),
+                    name: "StreamError".to_owned(),
+                }),
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        let component = Component {
+            ci: ComponentInterface::from_metadata(group).unwrap(),
+            config: JsConfig::default(),
+        };
+        let error = normalize(BindingInput::new(&[component])).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("stream_throws::namespace::OutputStreamStart::events"));
+        assert!(message.contains("path=return"));
+        assert!(message.contains("StreamStep"));
+    }
+
+    #[test]
+    fn direct_input_stream_gets_typed_async_slots() {
+        let mut group = uniffi_meta::MetadataGroup {
+            namespace: uniffi_meta::NamespaceMetadata {
+                crate_name: "input_stream_slots_crate".to_owned(),
+                name: "input_stream_slots".to_owned(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            uniffi_meta::FnMetadata {
+                module_path: "input_stream_slots_crate".to_owned(),
+                name: "consume".to_owned(),
+                orig_name: None,
+                is_async: false,
+                inputs: vec![uniffi_meta::FnParamMetadata::simple(
+                    "source",
+                    uniffi_meta::Type::InputStream {
+                        item_type: Box::new(uniffi_meta::Type::UInt32),
+                        error_type: Box::new(uniffi_meta::Type::String),
+                        is_send: false,
+                    },
+                )],
+                return_type: None,
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        let component = Component {
+            ci: ComponentInterface::from_metadata(group).unwrap(),
+            config: JsConfig::default(),
+        };
+        let package = normalize(BindingInput::new(&[component])).unwrap();
+        let operations = &package.rust.engines[&EngineKind::Napi].operations;
+        assert_eq!(operations.len(), 3);
+        let source = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::Function)
+            .unwrap();
+        assert_eq!(source.stream_resources.len(), 1);
+        let resource = &source.stream_resources[0];
+        assert_eq!(resource.direction, StreamDirection::Input);
+        assert_eq!(resource.item.rust_type, RustType::Scalar(ScalarType::U32));
+        assert_eq!(
+            resource.error.rust_type,
+            RustType::Scalar(ScalarType::String)
+        );
+        assert!(!resource.is_send);
+        assert_eq!(resource.slot_operation_ids.len(), 2);
+        assert!(resource.hooks.contains(&RustResourceHook::StartInputStream));
+        assert!(resource.hooks.contains(&RustResourceHook::CloseInputStream));
+        let pull = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::InputStreamPull)
+            .unwrap();
+        assert_eq!(pull.async_kind, AsyncKind::Async);
+        assert_eq!(
+            pull.receiver.as_ref().unwrap().ownership,
+            Ownership::Borrowed
+        );
+        assert!(matches!(
+            pull.return_value.as_ref().unwrap().rust_type,
+            RustType::StreamStep { .. }
+        ));
+        assert!(matches!(
+            pull.call_target,
+            RustCallTarget::StreamHook {
+                hook: RustResourceHook::PullInputStream,
+                use_site_id: _,
+                ..
+            }
+        ));
+        let cancel = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::InputStreamCancel)
+            .unwrap();
+        assert_eq!(cancel.async_kind, AsyncKind::Async);
+        assert!(cancel.return_value.is_none());
+    }
+
+    #[test]
+    fn direct_input_and_bidi_streams_get_typed_async_slots() {
+        let stream = |item, error, is_send| uniffi_meta::Type::InputStream {
+            item_type: Box::new(item),
+            error_type: Box::new(error),
+            is_send,
+        };
+        let output = |item, error, is_send| uniffi_meta::Type::Stream {
+            item_type: Box::new(item),
+            error_type: Box::new(error),
+            is_send,
+        };
+        let mut group = uniffi_meta::MetadataGroup {
+            namespace: uniffi_meta::NamespaceMetadata {
+                crate_name: "bidi_streams_crate".to_owned(),
+                name: "bidi_streams".to_owned(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            uniffi_meta::FnMetadata {
+                module_path: "bidi_streams_crate".to_owned(),
+                name: "consume".to_owned(),
+                orig_name: None,
+                is_async: false,
+                inputs: vec![uniffi_meta::FnParamMetadata::simple(
+                    "source",
+                    stream(uniffi_meta::Type::UInt32, uniffi_meta::Type::String, false),
+                )],
+                return_type: None,
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            uniffi_meta::FnMetadata {
+                module_path: "bidi_streams_crate".to_owned(),
+                name: "events".to_owned(),
+                orig_name: None,
+                is_async: false,
+                inputs: vec![uniffi_meta::FnParamMetadata::simple(
+                    "source",
+                    stream(uniffi_meta::Type::UInt32, uniffi_meta::Type::String, false),
+                )],
+                return_type: Some(output(
+                    uniffi_meta::Type::String,
+                    uniffi_meta::Type::UInt32,
+                    false,
+                )),
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        let component = Component {
+            ci: ComponentInterface::from_metadata(group).unwrap(),
+            config: JsConfig::default(),
+        };
+        let package = normalize(BindingInput::new(&[component])).unwrap();
+        let operations = &package.rust.engines[&EngineKind::Napi].operations;
+        assert_eq!(operations.len(), 8);
+        let events = operations
+            .iter()
+            .find(|operation| operation.source_key.name() == "events")
+            .unwrap();
+        assert_eq!(events.kind, OperationKind::OutputStreamStart);
+        let resources = &events.stream_resources;
+        assert_eq!(resources.len(), 2);
+        let input = resources
+            .iter()
+            .find(|resource| resource.direction == StreamDirection::Input)
+            .unwrap();
+        let output = resources
+            .iter()
+            .find(|resource| resource.direction == StreamDirection::Output)
+            .unwrap();
+        assert_eq!(input.slot_operation_ids.len(), 2);
+        assert_eq!(output.slot_operation_ids.len(), 3);
+        assert_eq!(
+            output.slot_operation_ids[&OperationKind::OutputStreamStart],
+            events.operation_id
+        );
+        assert!(!input.is_send && !output.is_send);
+        let input_pull = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::InputStreamPull)
+            .unwrap();
+        assert_eq!(input_pull.async_kind, AsyncKind::Async);
+        assert_eq!(
+            input_pull.receiver.as_ref().unwrap().ownership,
+            Ownership::Borrowed
+        );
+        assert!(matches!(
+            input_pull.return_value.as_ref().unwrap().rust_type,
+            RustType::StreamStep { .. }
+        ));
+        assert!(matches!(
+            input_pull.call_target,
+            RustCallTarget::StreamHook {
+                hook: RustResourceHook::PullInputStream,
+                use_site_id: _,
+                ..
+            }
+        ));
+        let input_cancel = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::InputStreamCancel)
+            .unwrap();
+        assert!(input_cancel.return_value.is_none());
+        let output_next = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::OutputStreamNext)
+            .unwrap();
+        assert!(matches!(
+            output_next.return_value.as_ref().unwrap().rust_type,
+            RustType::StreamStep { .. }
+        ));
+        let output_cancel = operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::OutputStreamCancel)
+            .unwrap();
+        assert!(output_cancel.return_value.is_none());
     }
 
     #[test]
@@ -2698,51 +3242,10 @@ mod tests {
             ci: ComponentInterface::from_metadata(group).unwrap(),
             config: JsConfig::default(),
         };
-        let package = normalize(BindingInput::new(&[component])).unwrap();
-        assert_eq!(package.bridge.streams().len(), 2);
-        let consume = package
-            .rust
-            .engines
-            .get(&EngineKind::Napi)
-            .unwrap()
-            .operations
-            .iter()
-            .find(|operation| operation.kind == OperationKind::Function)
-            .unwrap();
-        assert_eq!(consume.stream_resources.len(), 2);
-        for resource in &consume.stream_resources {
-            assert!(
-                resource.hooks.contains(&RustResourceHook::StartInputStream)
-                    || resource
-                        .hooks
-                        .contains(&RustResourceHook::StartOutputStream)
-            );
-            assert!(
-                resource.hooks.contains(&RustResourceHook::PullInputStream)
-                    || resource.hooks.contains(&RustResourceHook::PullOutputStream)
-            );
-            assert!(
-                resource
-                    .hooks
-                    .contains(&RustResourceHook::CancelInputStream)
-                    || resource
-                        .hooks
-                        .contains(&RustResourceHook::CancelOutputStream)
-            );
-            assert!(
-                resource.hooks.contains(&RustResourceHook::CloseInputStream)
-                    || resource
-                        .hooks
-                        .contains(&RustResourceHook::CloseOutputStream)
-            );
-            assert!(!resource.slot_operation_ids.is_empty());
-        }
-        let ids = consume
-            .stream_resources
-            .iter()
-            .flat_map(|resource| resource.slot_operation_ids.values())
-            .map(|id| id.index())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+        let error = normalize(BindingInput::new(&[component])).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("nested_streams::namespace::Function::consume"));
+        assert!(message.contains("argument[0].field[streams].key"));
+        assert!(message.contains("nested stream values"));
     }
 }

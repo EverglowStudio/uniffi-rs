@@ -270,6 +270,7 @@ pub enum RustType {
     Set(Box<Self>),
     Stream(Box<Self>),
     InputStream(Box<Self>),
+    StreamStep { item: Box<Self>, error: Box<Self> },
     Custom(Box<Self>),
 }
 
@@ -285,6 +286,7 @@ pub enum RustCarrier {
     CallbackProxy,
     InputStream,
     OutputStream,
+    StreamStep,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -321,6 +323,7 @@ pub enum RustCallTarget {
     /// user-declared Rust functions.
     StreamHook {
         parent: OperationId,
+        use_site_id: StreamUseSiteId,
         hook: RustResourceHook,
     },
 }
@@ -352,6 +355,17 @@ pub enum ConversionRecipe {
     Callback(TypeId),
     InputStream(Box<Self>),
     OutputStream(Box<Self>),
+    StreamStep { item: Box<Self>, error: Box<Self> },
+}
+
+/// Rust-side value conversion metadata without an ownership policy.  Stream
+/// item/error payloads are values produced by a pull hook, so they must not
+/// inherit an argument/receiver ownership declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustValueBinding {
+    pub rust_type: RustType,
+    pub carrier: RustCarrier,
+    pub conversion: ConversionRecipe,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -400,6 +414,9 @@ pub struct RustStreamResourceGroup {
     pub id: StreamUseSiteId,
     pub path: ValuePath,
     pub direction: StreamDirection,
+    pub item: RustValueBinding,
+    pub error: RustValueBinding,
+    pub is_send: bool,
     pub hooks: Vec<RustResourceHook>,
     /// Operation IDs for the canonical stream slots in this resource group.
     /// Close is a resource hook only and therefore has no operation slot.
@@ -413,6 +430,7 @@ pub struct RustOperationPlan {
     pub component_id: ComponentId,
     pub owner: OperationOwner,
     pub kind: OperationKind,
+    pub async_kind: AsyncKind,
     pub callback_method_id: Option<u32>,
     /// Private generated FFI export used by the backend trampoline.  It is
     /// kept separate from [`RustCallTarget`] so an FFI symbol can never be
