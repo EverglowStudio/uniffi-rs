@@ -10,10 +10,9 @@ use uniffi_js_abi::{
     Ownership, ScalarType, TypeDefinition, TypeSourceKey, ValueType,
 };
 use uniffi_js_engine_schema::{
-    BridgePlan, BridgePlanInput, CallbackCallStyle, CallbackContract, CallbackErrorStyle,
-    CallbackReentrancy, CallbackRetention, CallbackThreading, CallbackUseSite, Capability,
-    CapabilitySet, EngineCapabilities, EngineKind, PlannedOperation, StreamContract, StreamUseSite,
-    ValuePath,
+    BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention,
+    CallbackThreading, CallbackUseSite, Capability, CapabilitySet, EngineCapabilities, EngineKind,
+    PlannedOperation, StreamContract, StreamUseSite, ValuePath,
 };
 
 pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
@@ -173,7 +172,55 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
         OperationDefinition::new(
             OperationSourceKey::new(
                 component_key.clone(),
-                OperationOwner::Callback(callback_key),
+                OperationOwner::Callback(callback_key.clone()),
+                OperationKind::CallbackMethod,
+                "on_ready",
+            )
+            .unwrap(),
+            "onReady",
+            "unified_contract_corpus.CorpusCallback.onReady",
+            "__uniffi_unified_contract_corpus_callback_on_ready",
+            OperationSignature {
+                arguments: vec![ArgumentDefinition::new(
+                    "event",
+                    ValueType::Named(enum_key.clone()),
+                    Ownership::Borrowed,
+                )
+                .unwrap()],
+                return_type: None,
+                async_kind: AsyncKind::Sync,
+                throws: None,
+            },
+        )
+        .unwrap(),
+        OperationDefinition::new(
+            OperationSourceKey::new(
+                component_key.clone(),
+                OperationOwner::Callback(callback_key.clone()),
+                OperationKind::CallbackMethod,
+                "on_ready_checked",
+            )
+            .unwrap(),
+            "onReadyChecked",
+            "unified_contract_corpus.CorpusCallback.onReadyChecked",
+            "__uniffi_unified_contract_corpus_callback_on_ready_checked",
+            OperationSignature {
+                arguments: vec![ArgumentDefinition::new(
+                    "event",
+                    ValueType::Named(enum_key.clone()),
+                    Ownership::Borrowed,
+                )
+                .unwrap()],
+                return_type: None,
+                async_kind: AsyncKind::Sync,
+                throws: Some(error_key.clone()),
+            },
+        )
+        .unwrap(),
+        OperationDefinition::new(
+            OperationSourceKey::new(
+                component_key.clone(),
+                OperationOwner::Callback(callback_key.clone()),
                 OperationKind::CallbackMethod,
                 "on_event",
             )
@@ -181,6 +228,30 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
             "onEvent",
             "unified_contract_corpus.CorpusCallback.onEvent",
             "__uniffi_unified_contract_corpus_callback_on_event",
+            OperationSignature {
+                arguments: vec![ArgumentDefinition::new(
+                    "event",
+                    ValueType::Named(enum_key.clone()),
+                    Ownership::Borrowed,
+                )
+                .unwrap()],
+                return_type: None,
+                async_kind: AsyncKind::Async,
+                throws: None,
+            },
+        )
+        .unwrap(),
+        OperationDefinition::new(
+            OperationSourceKey::new(
+                component_key.clone(),
+                OperationOwner::Callback(callback_key),
+                OperationKind::CallbackMethod,
+                "on_event_checked",
+            )
+            .unwrap(),
+            "onEventChecked",
+            "unified_contract_corpus.CorpusCallback.onEventChecked",
+            "__uniffi_unified_contract_corpus_callback_on_event_checked",
             OperationSignature {
                 arguments: vec![ArgumentDefinition::new(
                     "event",
@@ -264,9 +335,7 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
             path: ValuePath::argument(0),
             contract: CallbackContract {
                 retention: CallbackRetention::Retained,
-                threading: CallbackThreading::MayCrossThread,
-                call_style: CallbackCallStyle::Async,
-                error_style: CallbackErrorStyle::Fallible,
+                threading: CallbackThreading::CallingThread,
                 reentrancy: CallbackReentrancy::Allowed,
             },
         }],
