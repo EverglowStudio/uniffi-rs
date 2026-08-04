@@ -10,6 +10,8 @@ members = [
   "uniffi_meta",
   "uniffi_parse_rs",
   "uniffi_pipeline",
+  "uniffi_js_abi",
+  "uniffi_js_engine_schema",
   "uniffi_bindgen_javascript",
   "uniffi_runtime_javascript",
   "uniffi_testing",

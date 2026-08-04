@@ -2198,6 +2198,8 @@ dependencies = [
  "tempfile",
  "uniffi_bindgen",
  "uniffi_bindgen_javascript",
+ "uniffi_js_abi",
+ "uniffi_js_engine_schema",
  "wasm-bindgen-cli-support",
 ]
 
@@ -2842,6 +2844,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "uniffi_js_abi"
+version = "0.32.0"
+
+[[package]]
+name = "uniffi_js_engine_schema"
+version = "0.32.0"
+dependencies = [
+ "uniffi_js_abi",
 ]
 
 [[package]]
