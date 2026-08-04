@@ -295,6 +295,76 @@ fn managed_layout_derives_paths_without_creating_the_public_root() {
 }
 
 #[test]
+fn managed_android_aar_override_is_rebased_below_the_private_stage() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = Utf8Path::from_path(temp.path()).unwrap();
+    let manifest = write_test_manifest(&parent.join("crate"));
+    let package = parent.join("package");
+    let public_aar = package.join("custom/android/uni-core.aar");
+    let mut args = empty_build_args();
+    args.manifest_path = manifest;
+    args.out_dir = None;
+    args.managed_layout = true;
+    args.package_dir = Some(package.clone());
+    args.target = vec![ArtifactTargetArg::Android];
+    args.android_aar_out = Some(public_aar.clone());
+    let targets = expand_targets(&args.target).unwrap();
+
+    let layout = ManagedLayout::apply(&mut args, &targets).unwrap().unwrap();
+    assert_eq!(args.android_aar_out.as_deref(), Some(public_aar.as_path()));
+    let stage = ManagedPackageStage::begin(&package).unwrap();
+    let private = managed_private_args(&stage, &layout, &args, &targets).unwrap();
+    assert_eq!(
+        private.android_aar_out.as_deref(),
+        Some(stage.root().join("custom/android/uni-core.aar").as_path())
+    );
+    drop(stage);
+    assert!(!package.exists());
+    assert_no_staging_residue(parent, "package");
+}
+
+#[test]
+fn managed_android_aar_escape_fails_before_staging_and_preserves_external_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = Utf8Path::from_path(temp.path()).unwrap();
+    let manifest = write_test_manifest(&parent.join("crate"));
+    let package = parent.join("package");
+    publish_fixture(&package, "generation.txt", b"old generation\n");
+
+    for (label, override_path) in [
+        ("dotdot", package.join("../outside-dotdot.aar")),
+        ("absolute", parent.join("outside-absolute.aar")),
+    ] {
+        let outside = parent.join(format!("outside-{label}.aar"));
+        std::fs::write(&outside, format!("{label} sentinel\n")).unwrap();
+        let before = std::fs::read(&outside).unwrap();
+        let mut args = empty_build_args();
+        args.manifest_path = manifest.clone();
+        args.out_dir = None;
+        args.managed_layout = true;
+        args.package_dir = Some(package.clone());
+        args.target = vec![ArtifactTargetArg::Android];
+        args.android_aar_out = Some(override_path);
+
+        let error = build(args).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("managed Android AAR output"),
+            "unexpected {label} escape error: {error:#}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), before);
+        assert_eq!(
+            std::fs::read(package.join("generation.txt")).unwrap(),
+            b"old generation\n"
+        );
+        assert_eq!(
+            std::fs::read(package.join(MANAGED_PACKAGE_MARKER_NAME)).unwrap(),
+            MANAGED_PACKAGE_MARKER_CONTENT
+        );
+        assert_no_staging_residue(parent, "package");
+    }
+}
+
+#[test]
 fn expands_all_js_targets() {
     assert_eq!(
         expand_targets(&[ArtifactTargetArg::AllJs]).unwrap(),

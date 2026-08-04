@@ -339,6 +339,35 @@ pub(super) struct ManagedLayout {
     host_crates_root: Utf8PathBuf,
 }
 
+fn normalize_managed_public_output(
+    package_dir: &Utf8Path,
+    output: &Utf8Path,
+    label: &str,
+) -> Result<Utf8PathBuf> {
+    if output
+        .components()
+        .any(|component| matches!(component.as_str(), "." | ".."))
+    {
+        bail!("managed {label} must not contain `.` or `..` path components: {output}");
+    }
+
+    let package_dir = resolve_cwd_path(package_dir)?;
+    let output = resolve_cwd_path(output)?;
+    let resolved_package = canonicalize_invocation_output(&package_dir)?;
+    let resolved_output = canonicalize_invocation_output(&output)?;
+    let relative = resolved_output
+        .strip_prefix(&resolved_package)
+        .with_context(|| {
+            format!("managed {label} must remain inside package root {package_dir}: {output}")
+        })?;
+    if relative.as_str().is_empty() {
+        bail!("managed {label} must name an output below package root {package_dir}");
+    }
+    // Carry only the resolved, package-relative suffix into managed staging;
+    // never rebase the caller's original path spelling.
+    Ok(package_dir.join(relative))
+}
+
 impl ManagedLayout {
     fn apply(args: &mut BuildArgs, targets: &ExpandedTargets) -> Result<Option<Self>> {
         if !args.managed_layout {
@@ -399,6 +428,13 @@ impl ManagedLayout {
                 .as_deref()
                 .unwrap_or_else(|| Utf8Path::new(".")),
         )?;
+        if let Some(android_aar_out) = args.android_aar_out.take() {
+            args.android_aar_out = Some(normalize_managed_public_output(
+                &package_dir,
+                &android_aar_out,
+                "Android AAR output",
+            )?);
+        }
         let meta = cargo_package_metadata(&args.manifest_path)?;
         let source_root = package_dir.join("src/ffi");
         let artifact_root = package_dir.join("artifacts");
@@ -1283,15 +1319,15 @@ fn build(mut args: BuildArgs) -> Result<()> {
     if targets.mini_program && args.wasm_bindgen_target != WasmBindgenTargetArg::Web {
         bail!("--target mini-program requires --wasm-bindgen-target web");
     }
+    let managed_layout = ManagedLayout::apply(&mut args, &targets)?;
     // Reject deterministic Android toolchain errors before creating the
-    // sibling managed staging directory. `build_android` repeats the checks
-    // at the point of use.
+    // sibling managed staging directory. Managed output containment is
+    // validated by `ManagedLayout::apply` before this toolchain probe.
+    // `build_android` repeats the checks at the point of use.
     if args.managed_layout && targets.android {
         preflight_android_toolchain(&args)
             .context("preflighting Android toolchain before target generation")?;
     }
-
-    let managed_layout = ManagedLayout::apply(&mut args, &targets)?;
     if targets.harmony {
         super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
             package_kind: args.ohos_package_kind,
