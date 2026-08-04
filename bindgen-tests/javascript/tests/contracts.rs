@@ -50,6 +50,53 @@ fn engine_neutral_contract_corpus_is_deterministic() {
     assert_eq!(ohos.source_family, PublicSourceFamily::ArkTs);
 }
 
+#[test]
+fn callback_methods_keep_independent_async_and_error_signatures() {
+    use uniffi_js_abi::{AsyncKind, OperationOwner};
+    use uniffi_js_engine_schema::Capability;
+
+    let plan = unified_contract_corpus(false);
+    let callback_methods: Vec<_> = plan
+        .operations()
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.operation.definition.source_key.owner(),
+                OperationOwner::Callback(_)
+            )
+        })
+        .collect();
+    assert_eq!(callback_methods.len(), 4);
+    assert!(callback_methods.iter().any(|method| {
+        method.operation.definition.signature.async_kind == AsyncKind::Sync
+            && method.operation.definition.signature.throws.is_none()
+    }));
+    assert!(callback_methods.iter().any(|method| {
+        method.operation.definition.signature.async_kind == AsyncKind::Sync
+            && method.operation.definition.signature.throws.is_some()
+    }));
+    assert!(callback_methods.iter().any(|method| {
+        method.operation.definition.signature.async_kind == AsyncKind::Async
+            && method.operation.definition.signature.throws.is_none()
+    }));
+    assert!(callback_methods.iter().any(|method| {
+        method.operation.definition.signature.async_kind == AsyncKind::Async
+            && method.operation.definition.signature.throws.is_some()
+    }));
+
+    let run_async = plan
+        .operations()
+        .iter()
+        .find(|operation| operation.operation.definition.public_name == "runAsync")
+        .unwrap();
+    assert!(run_async
+        .required_capabilities
+        .contains(Capability::AsyncCallback));
+    assert!(run_async
+        .required_capabilities
+        .contains(Capability::FallibleCallback));
+}
+
 fn contains_dynamic_type_word(source: &str) -> bool {
     source
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))

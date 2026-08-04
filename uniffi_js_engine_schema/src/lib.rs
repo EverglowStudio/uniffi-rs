@@ -124,18 +124,6 @@ pub enum CallbackThreading {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum CallbackCallStyle {
-    Sync,
-    Async,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum CallbackErrorStyle {
-    Infallible,
-    Fallible,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CallbackReentrancy {
     Forbidden,
     Allowed,
@@ -146,8 +134,6 @@ pub enum CallbackReentrancy {
 pub struct CallbackContract {
     pub retention: CallbackRetention,
     pub threading: CallbackThreading,
-    pub call_style: CallbackCallStyle,
-    pub error_style: CallbackErrorStyle,
     pub reentrancy: CallbackReentrancy,
 }
 
@@ -157,32 +143,10 @@ impl CallbackContract {
         if self.retention == CallbackRetention::Retained {
             capabilities.insert(Capability::RetainedCallback);
         }
-        if self.call_style == CallbackCallStyle::Async {
-            capabilities.insert(Capability::AsyncCallback);
-        }
-        if self.error_style == CallbackErrorStyle::Fallible {
-            capabilities.insert(Capability::FallibleCallback);
-        }
         if self.reentrancy == CallbackReentrancy::Allowed {
             capabilities.insert(Capability::CallbackReentrancy);
         }
-        if self.threading == CallbackThreading::MayCrossThread
-            && self.call_style == CallbackCallStyle::Async
-        {
-            capabilities.insert(Capability::CrossThreadAsyncCallback);
-        }
         capabilities
-    }
-
-    fn validate(self, use_site: &ValuePath) -> Option<ValidationError> {
-        if self.threading == CallbackThreading::MayCrossThread
-            && self.call_style == CallbackCallStyle::Sync
-        {
-            return Some(ValidationError::CrossThreadSyncCallback {
-                use_site: use_site.to_string(),
-            });
-        }
-        None
     }
 }
 
@@ -474,7 +438,12 @@ impl BridgePlan {
             &mut errors,
         );
 
-        let callbacks_by_operation = group_callback_capabilities(&input.callbacks);
+        let callbacks_by_operation = group_callback_capabilities(
+            &input.callbacks,
+            &types_by_id,
+            &types_by_key,
+            &input.operations,
+        );
         let streams_by_operation = group_stream_capabilities(&input.streams);
         let mut operations = Vec::with_capacity(input.operations.len());
         for planned in input.operations {
@@ -1029,10 +998,6 @@ fn validate_callback_use_sites(
                 type_id: callback.callback_type,
             }),
         }
-        if let Some(error) = callback.contract.validate(&callback.path) {
-            errors.push(error);
-        }
-
         let Some(expected_site) = expected.get(&key) else {
             errors.push(ValidationError::UnexpectedCallbackContract {
                 operation_id: callback.operation_id,
@@ -1096,15 +1061,7 @@ fn validate_callback_method_contract(
     if !types_by_key.contains_key(callback_key) {
         return;
     }
-    let methods: Vec<_> = operations
-        .iter()
-        .filter(|planned| {
-            matches!(
-                planned.operation.definition.source_key.owner(),
-                OperationOwner::Callback(owner) if owner == callback_key
-            ) && planned.operation.definition.source_key.kind() == OperationKind::CallbackMethod
-        })
-        .collect();
+    let methods: Vec<_> = callback_methods(callback_key, operations);
     if methods.is_empty() {
         errors.push(ValidationError::CallbackTypeHasNoMethods {
             callback_type,
@@ -1113,34 +1070,30 @@ fn validate_callback_method_contract(
         return;
     }
 
-    for method in methods {
-        let signature = &method.operation.definition.signature;
-        let actual_call_style = match signature.async_kind {
-            AsyncKind::Sync => CallbackCallStyle::Sync,
-            AsyncKind::Async => CallbackCallStyle::Async,
-        };
-        if callback.contract.call_style != actual_call_style {
-            errors.push(ValidationError::CallbackCallStyleMismatch {
-                use_site: callback.path.to_string(),
-                callback_method: method.operation.id,
-                contract: callback.contract.call_style,
-                signature: actual_call_style,
-            });
-        }
-        let actual_error_style = if signature.throws.is_some() {
-            CallbackErrorStyle::Fallible
-        } else {
-            CallbackErrorStyle::Infallible
-        };
-        if callback.contract.error_style != actual_error_style {
-            errors.push(ValidationError::CallbackErrorStyleMismatch {
-                use_site: callback.path.to_string(),
-                callback_method: method.operation.id,
-                contract: callback.contract.error_style,
-                signature: actual_error_style,
-            });
-        }
+    if callback.contract.threading == CallbackThreading::MayCrossThread
+        && methods
+            .iter()
+            .any(|method| method.operation.definition.signature.async_kind == AsyncKind::Sync)
+    {
+        errors.push(ValidationError::CrossThreadSyncCallback {
+            use_site: callback.path.to_string(),
+        });
     }
+}
+
+fn callback_methods<'a>(
+    callback_key: &TypeSourceKey,
+    operations: &'a [PlannedOperation],
+) -> Vec<&'a PlannedOperation> {
+    operations
+        .iter()
+        .filter(|planned| {
+            matches!(
+                planned.operation.definition.source_key.owner(),
+                OperationOwner::Callback(owner) if owner == callback_key
+            ) && planned.operation.definition.source_key.kind() == OperationKind::CallbackMethod
+        })
+        .collect()
 }
 
 fn validate_stream_use_sites(
@@ -1204,15 +1157,61 @@ fn validate_stream_use_sites(
 
 fn group_callback_capabilities(
     callbacks: &[CallbackUseSite],
+    types_by_id: &BTreeMap<TypeId, &IdentifiedType>,
+    types_by_key: &BTreeMap<TypeSourceKey, &IdentifiedType>,
+    operations: &[PlannedOperation],
 ) -> BTreeMap<OperationId, CapabilitySet> {
     let mut grouped = BTreeMap::<OperationId, CapabilitySet>::new();
     for callback in callbacks {
         grouped
             .entry(callback.operation_id)
             .or_default()
-            .extend(callback.contract.required_capabilities());
+            .extend(callback_method_capabilities(
+                callback,
+                types_by_id,
+                types_by_key,
+                operations,
+            ));
     }
     grouped
+}
+
+fn callback_method_capabilities(
+    callback: &CallbackUseSite,
+    types_by_id: &BTreeMap<TypeId, &IdentifiedType>,
+    types_by_key: &BTreeMap<TypeSourceKey, &IdentifiedType>,
+    operations: &[PlannedOperation],
+) -> CapabilitySet {
+    let mut capabilities = callback.contract.required_capabilities();
+    let Some(callback_definition) = types_by_id.get(&callback.callback_type) else {
+        return capabilities;
+    };
+    let callback_key = &callback_definition.definition.source_key;
+    if !types_by_key.contains_key(callback_key) {
+        return capabilities;
+    }
+    let methods = callback_methods(callback_key, operations);
+    if methods
+        .iter()
+        .any(|method| method.operation.definition.signature.async_kind == AsyncKind::Async)
+    {
+        capabilities.insert(Capability::AsyncCallback);
+    }
+    if methods
+        .iter()
+        .any(|method| method.operation.definition.signature.throws.is_some())
+    {
+        capabilities.insert(Capability::FallibleCallback);
+    }
+    if callback.contract.threading == CallbackThreading::MayCrossThread
+        && !methods.is_empty()
+        && methods
+            .iter()
+            .all(|method| method.operation.definition.signature.async_kind == AsyncKind::Async)
+    {
+        capabilities.insert(Capability::CrossThreadAsyncCallback);
+    }
+    capabilities
 }
 
 fn group_stream_capabilities(streams: &[StreamUseSite]) -> BTreeMap<OperationId, CapabilitySet> {
@@ -1418,18 +1417,6 @@ pub enum ValidationError {
         callback_type: TypeId,
         use_site: String,
     },
-    CallbackCallStyleMismatch {
-        use_site: String,
-        callback_method: OperationId,
-        contract: CallbackCallStyle,
-        signature: CallbackCallStyle,
-    },
-    CallbackErrorStyleMismatch {
-        use_site: String,
-        callback_method: OperationId,
-        contract: CallbackErrorStyle,
-        signature: CallbackErrorStyle,
-    },
     NonCanonicalStreamContract {
         use_site: String,
     },
@@ -1580,24 +1567,6 @@ impl fmt::Display for ValidationError {
             } => write!(
                 formatter,
                 "callback type {callback_type} at {use_site} has no callback-method operations"
-            ),
-            Self::CallbackCallStyleMismatch {
-                use_site,
-                callback_method,
-                contract,
-                signature,
-            } => write!(
-                formatter,
-                "callback contract at {use_site} declares {contract:?} calls, but callback method {callback_method} is {signature:?}"
-            ),
-            Self::CallbackErrorStyleMismatch {
-                use_site,
-                callback_method,
-                contract,
-                signature,
-            } => write!(
-                formatter,
-                "callback contract at {use_site} declares {contract:?} errors, but callback method {callback_method} is {signature:?}"
             ),
             Self::NonCanonicalStreamContract { use_site } => write!(
                 formatter,
@@ -2136,6 +2105,54 @@ mod tests {
                     component_key.clone(),
                     OperationOwner::Callback(callback_key.clone()),
                     uniffi_js_abi::OperationKind::CallbackMethod,
+                    "on_ready",
+                )
+                .unwrap(),
+                "onReady",
+                "contract_corpus.Observer.onReady",
+                "__uniffi_contract_corpus_observer_on_ready",
+                OperationSignature {
+                    arguments: vec![ArgumentDefinition::new(
+                        "event",
+                        ValueType::Named(event_key.clone()),
+                        Ownership::Borrowed,
+                    )
+                    .unwrap()],
+                    return_type: None,
+                    async_kind: AsyncKind::Sync,
+                    throws: None,
+                },
+            )
+            .unwrap(),
+            OperationDefinition::new(
+                OperationSourceKey::new(
+                    component_key.clone(),
+                    OperationOwner::Callback(callback_key.clone()),
+                    uniffi_js_abi::OperationKind::CallbackMethod,
+                    "on_ready_checked",
+                )
+                .unwrap(),
+                "onReadyChecked",
+                "contract_corpus.Observer.onReadyChecked",
+                "__uniffi_contract_corpus_observer_on_ready_checked",
+                OperationSignature {
+                    arguments: vec![ArgumentDefinition::new(
+                        "event",
+                        ValueType::Named(event_key.clone()),
+                        Ownership::Borrowed,
+                    )
+                    .unwrap()],
+                    return_type: None,
+                    async_kind: AsyncKind::Sync,
+                    throws: Some(error_key.clone()),
+                },
+            )
+            .unwrap(),
+            OperationDefinition::new(
+                OperationSourceKey::new(
+                    component_key.clone(),
+                    OperationOwner::Callback(callback_key.clone()),
+                    uniffi_js_abi::OperationKind::CallbackMethod,
                     "on_event",
                 )
                 .unwrap(),
@@ -2151,7 +2168,31 @@ mod tests {
                     .unwrap()],
                     return_type: None,
                     async_kind: AsyncKind::Async,
-                    throws: Some(error_key),
+                    throws: None,
+                },
+            )
+            .unwrap(),
+            OperationDefinition::new(
+                OperationSourceKey::new(
+                    component_key.clone(),
+                    OperationOwner::Callback(callback_key.clone()),
+                    uniffi_js_abi::OperationKind::CallbackMethod,
+                    "on_event_checked",
+                )
+                .unwrap(),
+                "onEventChecked",
+                "contract_corpus.Observer.onEventChecked",
+                "__uniffi_contract_corpus_observer_on_event_checked",
+                OperationSignature {
+                    arguments: vec![ArgumentDefinition::new(
+                        "event",
+                        ValueType::Named(event_key.clone()),
+                        Ownership::Borrowed,
+                    )
+                    .unwrap()],
+                    return_type: None,
+                    async_kind: AsyncKind::Async,
+                    throws: Some(error_key.clone()),
                 },
             )
             .unwrap(),
@@ -2196,9 +2237,7 @@ mod tests {
                 path: ValuePath::argument(1),
                 contract: CallbackContract {
                     retention: CallbackRetention::Retained,
-                    threading: CallbackThreading::MayCrossThread,
-                    call_style: CallbackCallStyle::Async,
-                    error_style: CallbackErrorStyle::Fallible,
+                    threading: CallbackThreading::CallingThread,
                     reentrancy: CallbackReentrancy::Allowed,
                 },
             }],
@@ -2249,11 +2288,24 @@ mod tests {
             Capability::ObjectLease,
             Capability::AsyncCall,
             Capability::RetainedCallback,
-            Capability::CrossThreadAsyncCallback,
+            Capability::AsyncCallback,
+            Capability::FallibleCallback,
             Capability::InputStream,
         ] {
             assert!(observe.required_capabilities.contains(capability));
         }
+        assert_eq!(
+            plan.operations()
+                .iter()
+                .filter(|operation| {
+                    matches!(
+                        operation.operation.definition.source_key.owner(),
+                        OperationOwner::Callback(_)
+                    )
+                })
+                .count(),
+            4
+        );
     }
 
     #[test]
@@ -2435,10 +2487,33 @@ mod tests {
     #[test]
     fn cross_thread_sync_callback_is_rejected() {
         let mut input = corpus_input();
-        input.callbacks[0].contract.call_style = CallbackCallStyle::Sync;
+        input.callbacks[0].contract.threading = CallbackThreading::MayCrossThread;
         let report = BridgePlan::build(input).unwrap_err();
         assert!(report
             .contains(|error| matches!(error, ValidationError::CrossThreadSyncCallback { .. })));
+    }
+
+    #[test]
+    fn cross_thread_async_callback_capability_comes_from_async_methods() {
+        let mut input = corpus_input();
+        input.callbacks[0].contract.threading = CallbackThreading::MayCrossThread;
+        for planned in &mut input.operations {
+            if matches!(
+                planned.operation.definition.source_key.owner(),
+                OperationOwner::Callback(_)
+            ) {
+                planned.operation.definition.signature.async_kind = AsyncKind::Async;
+            }
+        }
+        let plan = BridgePlan::build(input).unwrap();
+        let observe = plan
+            .operations()
+            .iter()
+            .find(|operation| operation.operation.definition.public_name == "observe")
+            .unwrap();
+        assert!(observe
+            .required_capabilities
+            .contains(Capability::CrossThreadAsyncCallback));
     }
 
     #[test]
@@ -2524,44 +2599,19 @@ mod tests {
     }
 
     #[test]
-    fn callback_contract_call_and_error_styles_match_callback_methods() {
-        let mut wrong_call = corpus_input();
-        wrong_call
-            .operations
-            .iter_mut()
-            .find(|planned| {
-                matches!(
-                    planned.operation.definition.source_key.owner(),
-                    OperationOwner::Callback(_)
-                )
-            })
-            .unwrap()
-            .operation
-            .definition
-            .signature
-            .async_kind = AsyncKind::Sync;
-        let report = BridgePlan::build(wrong_call).unwrap_err();
-        assert!(report
-            .contains(|error| matches!(error, ValidationError::CallbackCallStyleMismatch { .. })));
-
-        let mut wrong_error = corpus_input();
-        wrong_error
-            .operations
-            .iter_mut()
-            .find(|planned| {
-                matches!(
-                    planned.operation.definition.source_key.owner(),
-                    OperationOwner::Callback(_)
-                )
-            })
-            .unwrap()
-            .operation
-            .definition
-            .signature
-            .throws = None;
-        let report = BridgePlan::build(wrong_error).unwrap_err();
-        assert!(report
-            .contains(|error| matches!(error, ValidationError::CallbackErrorStyleMismatch { .. })));
+    fn mixed_callback_methods_derive_capabilities_from_each_signature() {
+        let plan = BridgePlan::build(corpus_input()).unwrap();
+        let observe = plan
+            .operations()
+            .iter()
+            .find(|operation| operation.operation.definition.public_name == "observe")
+            .unwrap();
+        assert!(observe
+            .required_capabilities
+            .contains(Capability::AsyncCallback));
+        assert!(observe
+            .required_capabilities
+            .contains(Capability::FallibleCallback));
     }
 
     #[test]
