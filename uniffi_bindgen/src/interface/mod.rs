@@ -91,10 +91,8 @@ pub type DefaultValue = DefaultValueMetadata;
 /// Return the stable prefix used by UniFFI's native C ABI exports for a
 /// component.
 ///
-/// Artifact schemas must not invent a second notion of component identity
-/// from an output filename.  Keep the prefix alongside the interface model so
-/// contract producers, host bundles, and consumers all derive it from the
-/// same native-symbol rule.
+/// Generated source, host crates, and platform wrappers all derive this value
+/// from the same native-symbol rule instead of guessing it from a filename.
 pub fn native_export_prefix_for_component(component: &str) -> String {
     // Cargo package spellings may use `-`, while the Rust/C symbol spelling
     // is an identifier.  This is the same normalization already used by the
@@ -191,10 +189,10 @@ fn validate_harmony_identifier(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate the identity fields carried through the checksummed Harmony
-/// facade contracts and host bundle.  Components are allowed to retain a
-/// Cargo-style dash, but their native ABI spelling is normalized to `_`.
-pub fn validate_harmony_component_identity(component: &str, namespace: &str) -> Result<()> {
+/// Validate the component and namespace spellings used by generated Harmony
+/// paths, modules, and native symbols. Components may retain a Cargo-style
+/// dash, while their native ABI spelling is normalized to `_`.
+pub fn validate_harmony_component_names(component: &str, namespace: &str) -> Result<()> {
     if component.is_empty()
         || component.len() > 256
         || namespace.is_empty()
@@ -204,10 +202,10 @@ pub fn validate_harmony_component_identity(component: &str, namespace: &str) -> 
         || component.contains("..")
         || component.contains(['/', '\\'])
     {
-        bail!("invalid Harmony component identity `{component}`");
+        bail!("invalid Harmony component name `{component}`");
     }
-    validate_harmony_identifier(&component.replace('-', "_"), "component identity")?;
-    validate_harmony_identifier(namespace, "namespace identity")?;
+    validate_harmony_identifier(&component.replace('-', "_"), "component name")?;
+    validate_harmony_identifier(namespace, "component namespace")?;
     validate_harmony_identifier(
         &native_export_prefix_for_component(component),
         "native export prefix",
@@ -242,99 +240,6 @@ pub struct ComponentInterface {
     all_component_interfaces: Vec<ComponentInterface>,
     // Should we skip checksum checks, for example because we were loaded from `uniffi_parse_rs`?
     pub skip_checksum_checks: bool,
-}
-
-fn canonical_abi_module_path(module_path: &mut String) {
-    if let Some(crate_name) = module_path.split("::").next() {
-        module_path.truncate(crate_name.len());
-    }
-}
-
-fn canonicalize_abi_type(type_: &mut Type) {
-    match type_ {
-        Type::Object { module_path, .. }
-        | Type::Record { module_path, .. }
-        | Type::Enum { module_path, .. }
-        | Type::CallbackInterface { module_path, .. } => {
-            canonical_abi_module_path(module_path);
-        }
-        Type::Box { inner_type }
-        | Type::Optional { inner_type }
-        | Type::Sequence { inner_type }
-        | Type::Set { inner_type } => canonicalize_abi_type(inner_type),
-        Type::Map {
-            key_type,
-            value_type,
-        } => {
-            canonicalize_abi_type(key_type);
-            canonicalize_abi_type(value_type);
-        }
-        Type::Stream {
-            item_type,
-            error_type,
-            ..
-        }
-        | Type::InputStream {
-            item_type,
-            error_type,
-            ..
-        } => {
-            canonicalize_abi_type(item_type);
-            canonicalize_abi_type(error_type);
-        }
-        Type::Custom {
-            module_path,
-            builtin,
-            ..
-        } => {
-            canonical_abi_module_path(module_path);
-            canonicalize_abi_type(builtin);
-        }
-        _ => {}
-    }
-}
-
-fn canonicalize_abi_argument(argument: &mut Argument) {
-    canonicalize_abi_type(&mut argument.type_);
-}
-
-fn canonicalize_abi_method(method: &mut Method) {
-    canonicalize_abi_type(&mut method.self_type);
-    method
-        .arguments
-        .iter_mut()
-        .for_each(canonicalize_abi_argument);
-    method
-        .return_type
-        .iter_mut()
-        .for_each(canonicalize_abi_type);
-    method.throws.iter_mut().for_each(canonicalize_abi_type);
-}
-
-fn canonicalize_abi_constructor(constructor: &mut Constructor) {
-    canonical_abi_module_path(&mut constructor.object_module_path);
-    constructor
-        .arguments
-        .iter_mut()
-        .for_each(canonicalize_abi_argument);
-    constructor
-        .throws
-        .iter_mut()
-        .for_each(canonicalize_abi_type);
-    canonicalize_abi_type(&mut constructor.self_type);
-}
-
-fn canonicalize_abi_uniffi_trait(uniffi_trait: &mut UniffiTrait) {
-    match uniffi_trait {
-        UniffiTrait::Debug { fmt }
-        | UniffiTrait::Display { fmt }
-        | UniffiTrait::Hash { hash: fmt }
-        | UniffiTrait::Ord { cmp: fmt } => canonicalize_abi_method(fmt),
-        UniffiTrait::Eq { eq, ne } => {
-            canonicalize_abi_method(eq);
-            canonicalize_abi_method(ne);
-        }
-    }
 }
 
 impl ComponentInterface {
@@ -460,95 +365,6 @@ impl ComponentInterface {
     /// Get the definitions for every custom type in the interface.
     pub fn custom_type_definitions(&self) -> &[CustomType] {
         &self.custom_types
-    }
-
-    /// Clone this interface into the canonical representation used for a
-    /// cross-loader ABI digest.
-    ///
-    /// Rust source parsing sees re-exported public types at the component
-    /// crate root, while compiled metadata retains their defining submodule.
-    /// Internal Rust submodules are not visible in foreign bindings or the C
-    /// ABI, so reduce every named type/definition path to its owning crate.
-    /// All callable/type fields remain otherwise intact, including ordering,
-    /// async/throws state, streams, custom types, callbacks and object methods.
-    pub fn canonicalized_for_abi_digest(&self) -> Self {
-        let mut canonical = self.clone();
-
-        for enum_ in &mut canonical.enums {
-            canonical_abi_module_path(&mut enum_.module_path);
-            enum_.discr_type.iter_mut().for_each(canonicalize_abi_type);
-            for variant in &mut enum_.variants {
-                variant
-                    .fields
-                    .iter_mut()
-                    .for_each(|field| canonicalize_abi_type(&mut field.type_));
-            }
-            enum_
-                .constructors
-                .iter_mut()
-                .for_each(canonicalize_abi_constructor);
-            enum_.methods.iter_mut().for_each(canonicalize_abi_method);
-            enum_
-                .uniffi_traits
-                .iter_mut()
-                .for_each(canonicalize_abi_uniffi_trait);
-        }
-        for record in &mut canonical.records {
-            canonical_abi_module_path(&mut record.module_path);
-            record
-                .fields
-                .iter_mut()
-                .for_each(|field| canonicalize_abi_type(&mut field.type_));
-            record
-                .constructors
-                .iter_mut()
-                .for_each(canonicalize_abi_constructor);
-            record.methods.iter_mut().for_each(canonicalize_abi_method);
-            record
-                .uniffi_traits
-                .iter_mut()
-                .for_each(canonicalize_abi_uniffi_trait);
-        }
-        for function in &mut canonical.functions {
-            canonical_abi_module_path(&mut function.module_path);
-            function
-                .arguments
-                .iter_mut()
-                .for_each(canonicalize_abi_argument);
-            function
-                .return_type
-                .iter_mut()
-                .for_each(canonicalize_abi_type);
-            function.throws.iter_mut().for_each(canonicalize_abi_type);
-        }
-        for object in &mut canonical.objects {
-            canonical_abi_module_path(&mut object.module_path);
-            object
-                .constructors
-                .iter_mut()
-                .for_each(canonicalize_abi_constructor);
-            object.methods.iter_mut().for_each(canonicalize_abi_method);
-            object
-                .uniffi_traits
-                .iter_mut()
-                .for_each(canonicalize_abi_uniffi_trait);
-            for trait_impl in &mut object.trait_impls {
-                canonicalize_abi_type(&mut trait_impl.ty);
-                canonicalize_abi_type(&mut trait_impl.trait_ty);
-            }
-        }
-        for callback in &mut canonical.callback_interfaces {
-            canonical_abi_module_path(&mut callback.module_path);
-            callback
-                .methods
-                .iter_mut()
-                .for_each(canonicalize_abi_method);
-        }
-        for custom in &mut canonical.custom_types {
-            canonical_abi_module_path(&mut custom.module_path);
-            canonicalize_abi_type(&mut custom.builtin);
-        }
-        canonical
     }
 
     /// Get the definitions for every Function in the interface.
@@ -1898,9 +1714,9 @@ mod test {
     // with specific member types, in the sub-modules defining those member types.
 
     #[test]
-    fn harmony_component_identity_uses_the_real_native_ffi_prefix() {
-        validate_harmony_component_identity("demo_core", "demoNamespace").unwrap();
-        validate_harmony_component_identity("demo-core", "demoNamespace").unwrap();
+    fn harmony_component_names_use_the_real_native_ffi_prefix() {
+        validate_harmony_component_names("demo_core", "demoNamespace").unwrap();
+        validate_harmony_component_names("demo-core", "demoNamespace").unwrap();
         assert_eq!(
             native_export_prefix_for_component("demo-core"),
             "ffi_demo_core"
@@ -1927,8 +1743,8 @@ mod test {
             ("valid", ""),
         ] {
             assert!(
-                validate_harmony_component_identity(component, namespace).is_err(),
-                "invalid Harmony identity `{component}/{namespace}` unexpectedly passed"
+                validate_harmony_component_names(component, namespace).is_err(),
+                "invalid Harmony component names `{component}/{namespace}` unexpectedly passed"
             );
         }
     }

@@ -6,499 +6,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use flate2::read::GzDecoder;
-use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TestOwnedEntry {
-    relative: PathBuf,
-    kind: &'static str,
-    device: u64,
-    inode: u64,
-    links: u64,
-    len: u64,
-    sha256: Option<String>,
-    link_target: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TestOwnedFile {
-    path: PathBuf,
-    device: u64,
-    inode: u64,
-    links: u64,
-    len: u64,
-    sha256: String,
-    bytes: Vec<u8>,
-}
-
-fn test_owned_file(path: &Path) -> TestOwnedFile {
-    let before = std::fs::symlink_metadata(path).unwrap();
-    assert!(
-        before.is_file() && !before.file_type().is_symlink(),
-        "test-only cleanup refuses a non-regular file: {}",
-        path.display()
-    );
-    let bytes = std::fs::read(path).unwrap();
-    let after = std::fs::symlink_metadata(path).unwrap();
-    assert_eq!(
-        (before.dev(), before.ino(), before.len()),
-        (after.dev(), after.ino(), after.len()),
-        "test-only file changed while its cleanup witness was captured: {}",
-        path.display()
-    );
-    TestOwnedFile {
-        path: path.to_path_buf(),
-        device: before.dev(),
-        inode: before.ino(),
-        links: before.nlink(),
-        len: before.len(),
-        sha256: sha256(&bytes),
-        bytes,
-    }
-}
-
-fn test_remove_identity_bound_file(expected: &TestOwnedFile) {
-    let metadata = std::fs::symlink_metadata(&expected.path).unwrap();
-    assert!(metadata.is_file() && !metadata.file_type().is_symlink());
-    assert_eq!(
-        (metadata.dev(), metadata.ino(), metadata.len()),
-        (expected.device, expected.inode, expected.len),
-        "test-only file identity changed before removal: {}",
-        expected.path.display()
-    );
-    assert_eq!(std::fs::read(&expected.path).unwrap(), expected.bytes);
-    assert_eq!(test_file_sha256(&expected.path), expected.sha256);
-    std::fs::remove_file(&expected.path).unwrap();
-}
-
-fn test_file_sha256(path: &Path) -> String {
-    let mut file = std::fs::File::open(path).unwrap();
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).unwrap();
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    format!("{:x}", digest.finalize())
-}
-
-fn test_owned_tree_inventory_with_file_hashes(
-    root: &Path,
-    hash_files: bool,
-) -> Vec<TestOwnedEntry> {
-    fn visit(root: &Path, current: &Path, hash_files: bool, entries: &mut Vec<TestOwnedEntry>) {
-        let mut children = std::fs::read_dir(current)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        children.sort_by_key(|entry| entry.file_name());
-        for child in children {
-            let path = child.path();
-            let metadata = std::fs::symlink_metadata(&path).unwrap();
-            let relative = path.strip_prefix(root).unwrap().to_path_buf();
-            let (kind, sha256, link_target) = if metadata.file_type().is_symlink() {
-                ("symlink", None, Some(std::fs::read_link(&path).unwrap()))
-            } else if metadata.is_dir() {
-                ("directory", None, None)
-            } else if metadata.is_file() {
-                ("file", hash_files.then(|| test_file_sha256(&path)), None)
-            } else {
-                panic!(
-                    "test-only cleanup refuses special object {}",
-                    path.display()
-                );
-            };
-            entries.push(TestOwnedEntry {
-                relative,
-                kind,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                links: metadata.nlink(),
-                len: metadata.len(),
-                sha256,
-                link_target,
-            });
-            if metadata.is_dir() {
-                visit(root, &path, hash_files, entries);
-            }
-        }
-    }
-
-    let root_metadata = std::fs::symlink_metadata(root).unwrap();
-    assert!(root_metadata.is_dir() && !root_metadata.file_type().is_symlink());
-    let mut entries = vec![TestOwnedEntry {
-        relative: PathBuf::new(),
-        kind: "directory",
-        device: root_metadata.dev(),
-        inode: root_metadata.ino(),
-        links: root_metadata.nlink(),
-        len: root_metadata.len(),
-        sha256: None,
-        link_target: None,
-    }];
-    visit(root, root, hash_files, &mut entries);
-    entries
-}
-
-fn test_owned_tree_inventory(root: &Path) -> Vec<TestOwnedEntry> {
-    test_owned_tree_inventory_with_file_hashes(root, true)
-}
-
-fn assert_test_owned_tree_matches(root: &Path, expected: &[TestOwnedEntry]) {
-    let actual = test_owned_tree_inventory(root);
-    assert_eq!(actual.len(), expected.len());
-    for (actual, expected) in actual.iter().zip(expected) {
-        assert_eq!(
-            (
-                &actual.relative,
-                actual.kind,
-                actual.device,
-                actual.inode,
-                actual.len,
-                &actual.sha256,
-                &actual.link_target,
-            ),
-            (
-                &expected.relative,
-                expected.kind,
-                expected.device,
-                expected.inode,
-                expected.len,
-                &expected.sha256,
-                &expected.link_target,
-            ),
-            "test-only cleanup inventory changed before removal under {}",
-            root.display()
-        );
-    }
-}
-
-fn test_remove_identity_bound_tree(root: &Path, expected: &[TestOwnedEntry]) {
-    // Removing one name of a hard-linked file legitimately changes the
-    // remaining names' link count and ctime.  Bind cleanup to the stable
-    // object identity, kind, length, digest and link target instead.
-    assert_test_owned_tree_matches(root, expected);
-    let mut payload = expected.iter().skip(1).cloned().collect::<Vec<_>>();
-    payload.sort_by(|left, right| {
-        let left_depth = left.relative.components().count();
-        let right_depth = right.relative.components().count();
-        right_depth
-            .cmp(&left_depth)
-            .then_with(|| right.relative.cmp(&left.relative))
-    });
-    for entry in payload {
-        let path = root.join(&entry.relative);
-        let metadata = std::fs::symlink_metadata(&path).unwrap();
-        assert_eq!(
-            (metadata.dev(), metadata.ino()),
-            (entry.device, entry.inode)
-        );
-        match entry.kind {
-            "file" => {
-                assert_eq!(metadata.len(), entry.len);
-                if let Some(expected) = &entry.sha256 {
-                    assert_eq!(&test_file_sha256(&path), expected);
-                }
-                std::fs::remove_file(path).unwrap();
-            }
-            "symlink" => {
-                assert_eq!(std::fs::read_link(&path).ok(), entry.link_target);
-                std::fs::remove_file(path).unwrap();
-            }
-            "directory" => {
-                assert!(std::fs::read_dir(&path).unwrap().next().is_none());
-                std::fs::remove_dir(path).unwrap();
-            }
-            other => panic!("unsupported test-owned entry kind {other}"),
-        }
-    }
-    let root_metadata = std::fs::symlink_metadata(root).unwrap();
-    let expected_root = &expected[0];
-    assert_eq!(
-        (root_metadata.dev(), root_metadata.ino()),
-        (expected_root.device, expected_root.inode)
-    );
-    assert!(std::fs::read_dir(root).unwrap().next().is_none());
-    std::fs::remove_dir(root).unwrap();
-}
-
-fn test_pid_from_generation(value: &str) -> u32 {
-    value
-        .split('-')
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap_or_else(|_| panic!("generation is not PID-bound: {value}"))
-}
-
-fn assert_test_producer_exited(pid: u32) {
-    let result = unsafe { libc::kill(pid as i32, 0) };
-    assert_eq!(result, -1, "test producer PID {pid} is still running");
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH),
-        "cannot prove test producer PID {pid} exited"
-    );
-}
-
-fn encoded_invocation_mirror_path(invocation_root: &Path, public: &Path) -> PathBuf {
-    let public = std::fs::canonicalize(public).unwrap_or_else(|_| public.to_path_buf());
-    let mut mapped = invocation_root.join("mirror");
-    for component in public.components() {
-        let Component::Normal(value) = component else {
-            continue;
-        };
-        let value = value.to_str().unwrap();
-        let encoded = value
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        mapped.push(format!("c{}-{encoded}", value.len()));
-    }
-    mapped
-}
-
-fn invocation_roots_in_log(log: &str, prefix: &str) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let needle = format!("/{prefix}");
-    let mut offset = 0usize;
-    while let Some(found) = log[offset..].find(&needle) {
-        let component_start = offset + found;
-        let token_start = log[..component_start]
-            .rfind(|ch: char| {
-                ch.is_whitespace() || matches!(ch, ';' | ',' | ':' | '(' | '[' | '"' | '\'' | '=')
-            })
-            .map(|start| start + 1)
-            .unwrap_or_default();
-        let tail = &log[component_start..];
-        // Logs usually mention a file below the invocation root rather than
-        // the root alone.  Stop at the first path separator after the
-        // PID-bound root component so cleanup cannot accidentally select an
-        // arbitrary descendant (or skip the still-live root because that
-        // descendant was already removed).
-        let component_end = 1 + prefix.len();
-        let end = tail[component_end..]
-            .find(|ch: char| {
-                ch == '/'
-                    || ch.is_whitespace()
-                    || matches!(ch, ';' | ',' | ':' | ')' | ']' | '"' | '\'')
-            })
-            .map(|end| component_end + end)
-            .unwrap_or(tail.len());
-        let root_end = component_start + end;
-        let path = PathBuf::from(&log[token_start..root_end]);
-        assert!(
-            path.is_absolute(),
-            "logged invocation root is not absolute: {}",
-            path.display()
-        );
-        if !roots.contains(&path) {
-            roots.push(path);
-        }
-        offset = root_end;
-    }
-    roots
-}
-
-fn cleanup_preserved_artifact_invocation_roots(log: &str, expected_public: &Path) {
-    let roots = invocation_roots_in_log(log, "uniffi-artifacts-invocation-");
-    assert!(
-        !roots.is_empty(),
-        "failure did not disclose its preserved artifact invocation root:\n{log}"
-    );
-    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-    let expected_public =
-        std::fs::canonicalize(expected_public).unwrap_or_else(|_| expected_public.to_path_buf());
-    let mut cleaned = 0usize;
-    for root in roots {
-        if !root.exists() {
-            continue;
-        }
-        let canonical = std::fs::canonicalize(&root).unwrap();
-        assert_eq!(canonical.parent(), Some(temp.as_path()));
-        let name = canonical.file_name().unwrap().to_string_lossy();
-        let pid = name
-            .strip_prefix("uniffi-artifacts-invocation-")
-            .and_then(|rest| rest.split('-').next())
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
-        assert_test_producer_exited(pid);
-        assert!(canonical.join("mirror").is_dir() && canonical.join("build").is_dir());
-        let mapped = encoded_invocation_mirror_path(&canonical, &expected_public);
-        assert!(
-            mapped.exists(),
-            "preserved invocation root is not bound to expected public root {}: {}",
-            expected_public.display(),
-            canonical.display()
-        );
-        let inventory = test_owned_tree_inventory(&canonical);
-        test_remove_identity_bound_tree(&canonical, &inventory);
-        cleaned += 1;
-    }
-    assert!(cleaned > 0, "no disclosed invocation root required cleanup");
-}
-
-fn assert_test_owner_identity(value: &serde_json::Value, entry: &TestOwnedEntry) {
-    assert_eq!(value["platform"], "unix");
-    assert_eq!(value["object"], format!("{}:{}", entry.device, entry.inode));
-    assert_eq!(value["kind"], entry.kind);
-    assert_eq!(
-        value["links"].as_u64(),
-        Some(if entry.kind == "directory" {
-            0
-        } else {
-            entry.links
-        })
-    );
-}
-
-fn assert_direct_owner_entry_matches_output(
-    owner_entry: &serde_json::Value,
-) -> DirectOutputCleanup {
-    let path = PathBuf::from(owner_entry["path"].as_str().unwrap());
-    match owner_entry["kind"].as_str().unwrap() {
-        "file" => {
-            let witness = test_owned_file(&path);
-            let root = TestOwnedEntry {
-                relative: PathBuf::new(),
-                kind: "file",
-                device: witness.device,
-                inode: witness.inode,
-                links: witness.links,
-                len: witness.len,
-                sha256: Some(witness.sha256.clone()),
-                link_target: None,
-            };
-            assert_test_owner_identity(&owner_entry["identity"], &root);
-            assert_eq!(owner_entry["len"].as_u64(), Some(witness.len));
-            assert_eq!(owner_entry["sha256"], witness.sha256);
-            assert!(owner_entry["inventory"].as_array().unwrap().is_empty());
-            DirectOutputCleanup::File(witness)
-        }
-        "directory" => {
-            let inventory = test_owned_tree_inventory(&path);
-            assert_test_owner_identity(&owner_entry["identity"], &inventory[0]);
-            let expected = owner_entry["inventory"].as_array().unwrap();
-            assert_eq!(expected.len(), inventory.len() - 1);
-            for (expected, actual) in expected.iter().zip(inventory.iter().skip(1)) {
-                assert_eq!(
-                    expected["path"].as_str(),
-                    actual.relative.to_str(),
-                    "direct owner inventory path mismatch for {}",
-                    path.display()
-                );
-                assert_eq!(expected["kind"], actual.kind);
-                assert_test_owner_identity(&expected["identity"], actual);
-                assert_eq!(expected["sha256"].as_str(), actual.sha256.as_deref());
-                let expected_link = expected
-                    .get("link_target")
-                    .or_else(|| expected.get("linkTarget"))
-                    .and_then(serde_json::Value::as_str);
-                assert_eq!(
-                    expected_link,
-                    actual.link_target.as_deref().and_then(Path::to_str)
-                );
-            }
-            DirectOutputCleanup::Directory { path, inventory }
-        }
-        kind => panic!("unsupported direct owner entry kind {kind}"),
-    }
-}
-
-enum DirectOutputCleanup {
-    File(TestOwnedFile),
-    Directory {
-        path: PathBuf,
-        inventory: Vec<TestOwnedEntry>,
-    },
-}
-
-/// Successful public CLI tests must remove the sealed publication before its
-/// stable owner.  The final whole-test-root removal is also inventory-bound,
-/// so `TempDir::drop` is only a no-op fallback and never the acceptance proof.
-fn cleanup_committed_direct_outputs_then_owners_and_test_root(test_root: &Path) {
-    let test_root = std::fs::canonicalize(test_root).unwrap_or_else(|_| test_root.to_path_buf());
-    let control = std::env::temp_dir().join("uniffi-artifacts-control-v1");
-    let mut owners = std::fs::read_dir(&control)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            name.starts_with("owner-") && name.ends_with(".json")
-        })
-        .filter_map(|entry| {
-            let path = entry.path();
-            let bytes = std::fs::read(&path).ok()?;
-            let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            let entries = value["entries"].as_array()?;
-            (!entries.is_empty()
-                && entries.iter().all(|entry| {
-                    entry["path"]
-                        .as_str()
-                        .is_some_and(|path| Path::new(path).starts_with(&test_root))
-                }))
-            .then_some((path, bytes, value))
-        })
-        .collect::<Vec<_>>();
-    owners.sort_by(|left, right| left.0.cmp(&right.0));
-    assert!(
-        !owners.is_empty(),
-        "public success test produced no stable direct owner under {}",
-        test_root.display()
-    );
-    for (path, bytes, value) in owners {
-        assert_eq!(value["owner"], "uniffi-artifacts-invocation");
-        assert_eq!(value["state"], "committed");
-        let generation = value["generation"].as_str().unwrap();
-        assert_test_producer_exited(test_pid_from_generation(generation));
-        let owner_witness = test_owned_file(&path);
-        assert_eq!(owner_witness.bytes, bytes);
-
-        // Capture and validate every output before deleting any of them.  A
-        // single identity/inventory mismatch therefore preserves the entire
-        // output/owner generation for diagnosis.
-        let outputs = value["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(assert_direct_owner_entry_matches_output)
-            .collect::<Vec<_>>();
-        for output in &outputs {
-            match output {
-                DirectOutputCleanup::File(witness) => test_remove_identity_bound_file(witness),
-                DirectOutputCleanup::Directory { path, inventory } => {
-                    test_remove_identity_bound_tree(path, inventory)
-                }
-            }
-        }
-        for entry in value["entries"].as_array().unwrap() {
-            assert!(
-                !Path::new(entry["path"].as_str().unwrap()).exists(),
-                "direct output survived exact cleanup"
-            );
-        }
-        test_remove_identity_bound_file(&owner_witness);
-    }
-    assert!(
-        find_generation_owner(&test_root).is_none(),
-        "test-only owner cleanup left a stable direct owner under {}",
-        test_root.display()
-    );
-    let root_inventory = test_owned_tree_inventory(&test_root);
-    test_remove_identity_bound_tree(&test_root, &root_inventory);
-}
+const MANAGED_OWNER_CONTENT: &[u8] = b"uniffi-managed-package\n";
+const FIXTURE_COMPONENT: &str = "uniffi_ohos_public_core";
+const HARMONY_PACKAGE_NAME: &str = "@uniffi/ohos-public-core";
+const HARMONY_ARCHIVE_STEM: &str = "uniffi-ohos-public-core";
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -519,7 +36,7 @@ fn ohos_ndk() -> PathBuf {
                 PathBuf::from("/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony");
             path.exists().then_some(path)
         })
-        .expect("set OHOS_NDK_HOME to run the ignored public OHOS CLI tests")
+        .expect("set OHOS_NDK_HOME to run the public OHOS CLI tests")
 }
 
 fn deveco_sdk_home() -> PathBuf {
@@ -529,7 +46,7 @@ fn deveco_sdk_home() -> PathBuf {
             let path = PathBuf::from("/Applications/DevEco-Studio.app/Contents/sdk");
             path.exists().then_some(path)
         })
-        .expect("set DEVECO_SDK_HOME to run the ignored public HSP CLI test")
+        .expect("set DEVECO_SDK_HOME to run the public HSP CLI test")
 }
 
 fn ohpm_bin() -> PathBuf {
@@ -601,377 +118,37 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
     out
 }
 
-/// Direct control records now live in the stable system control root, outside
-/// every published tree.  Keep this named view at call sites to make the
-/// payload-vs-control distinction explicit.
-fn snapshot_without_direct_audit(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
-    snapshot(root)
-}
-
-fn managed_owner_path(package_root: &Path) -> PathBuf {
-    let canonical = std::fs::canonicalize(package_root).unwrap();
-    let digest = sha256(canonical.to_string_lossy().as_bytes());
-    canonical
-        .parent()
-        .unwrap()
-        .join(format!(".uniffi-managed-package-owner-{digest}.json"))
-}
-
-fn test_owned_file_bounded(path: &Path, maximum_bytes: u64) -> TestOwnedFile {
-    let metadata = std::fs::symlink_metadata(path).unwrap();
-    assert!(
-        metadata.len() <= maximum_bytes,
-        "test-only cleanup record exceeds its bound: {} > {} at {}",
-        metadata.len(),
-        maximum_bytes,
-        path.display()
-    );
-    test_owned_file(path)
-}
-
-fn test_managed_generation_pid(generation: &str) -> u32 {
-    let mut fields = generation.split('-');
-    let pid = fields.next().unwrap();
-    let timestamp = fields.next().unwrap();
-    let nonce = fields.next().unwrap();
-    assert!(fields.next().is_none());
-    assert!(!timestamp.is_empty() && timestamp.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert!(!nonce.is_empty() && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    u32::from_str_radix(pid, 16)
-        .unwrap_or_else(|_| panic!("managed generation is not PID-bound: {generation}"))
-}
-
-fn assert_test_file_identity(value: &serde_json::Value, file: &TestOwnedFile) {
-    assert_eq!(value["platform"], "unix");
-    assert_eq!(value["object"], format!("{}:{}", file.device, file.inode));
-    assert_eq!(value["kind"], "file");
-    assert_eq!(value["links"].as_u64(), Some(file.links));
-}
-
-fn test_safe_managed_residue_name(name: &str, digest: &str, generation: &str) {
-    let mut components = Path::new(name).components();
-    assert!(matches!(components.next(), Some(Component::Normal(_))));
-    assert!(components.next().is_none());
-    assert!(name.contains(digest) && name.contains(generation));
-}
-
-/// A managed failure intentionally retains its immutable audit chain.  Public
-/// tests consume that evidence immediately after the fail-closed assertion:
-/// journal identities select the public/candidate/build roots, every selected
-/// tree is fully inventoried, producer PIDs must be exited, and outputs are
-/// removed before owner/journal records.  No path is adopted from a random
-/// TempDir basename.
-fn cleanup_managed_failure_from_exact_journals(package_root: &Path) {
-    let package_root = std::fs::canonicalize(package_root).unwrap();
-    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-    assert!(package_root.starts_with(&temp));
-    let parent = package_root.parent().unwrap();
-    let digest = sha256(package_root.to_string_lossy().as_bytes());
-    let journal_prefix = format!(".uniffi-managed-package-transaction-{digest}-");
-    let mut journals = std::fs::read_dir(parent)
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
-        .into_iter()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            (name.starts_with(&journal_prefix) && name.ends_with(".json")).then(|| {
-                let witness = test_owned_file_bounded(&entry.path(), 1024 * 1024);
-                let value: serde_json::Value = serde_json::from_slice(&witness.bytes).unwrap();
-                (value, witness)
-            })
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        !journals.is_empty(),
-        "managed failure left no exact journal chain for {}",
-        package_root.display()
-    );
-    journals.sort_by(|left, right| {
-        left.0["generation"]
-            .as_str()
-            .cmp(&right.0["generation"].as_str())
-            .then_with(|| {
-                left.0["sequence"]
-                    .as_u64()
-                    .cmp(&right.0["sequence"].as_u64())
-            })
-    });
-
-    let generations = journals
-        .iter()
-        .map(|(journal, _)| journal["generation"].as_str().unwrap().to_string())
-        .collect::<BTreeSet<_>>();
+fn assert_managed_package_root(package: &Path) {
     assert_eq!(
-        generations.len(),
-        1,
-        "one public failure case produced multiple managed generations"
+        std::fs::read(package.join(".uniffi-managed-owner")).unwrap(),
+        MANAGED_OWNER_CONTENT
     );
-    let generation = generations.iter().next().unwrap();
-    let producer_pid = test_managed_generation_pid(generation);
-    assert_test_producer_exited(producer_pid);
+    assert!(!package.join("artifact-manifest.json").exists());
+    assert!(!package.join("target").exists());
+}
 
-    let mut previous: Option<&TestOwnedFile> = None;
-    let mut planned_directories = BTreeMap::<PathBuf, Vec<serde_json::Value>>::new();
-    let mut snapshot_files = BTreeMap::<PathBuf, TestOwnedFile>::new();
-    let mut planned_paths = BTreeSet::<PathBuf>::new();
-    for (index, (journal, witness)) in journals.iter().enumerate() {
-        assert_eq!(journal["owner"], "uniffi-managed-package-transaction");
-        assert_eq!(journal["schemaVersion"], 2);
-        assert_eq!(journal["packageIdentity"], digest);
-        assert_eq!(journal["generation"], generation.as_str());
-        assert_eq!(journal["sequence"].as_u64(), Some(index as u64));
-        assert_eq!(journal["publicRoot"].as_str(), package_root.to_str(),);
-        let state = journal["state"].as_str().unwrap();
-        assert!(
-            !state.is_empty()
-                && state
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        );
-        let expected_name = format!("{journal_prefix}{generation}-{index:020}-{state}.json");
-        assert_eq!(
-            witness.path.file_name().unwrap().to_str(),
-            Some(expected_name.as_str())
-        );
-        assert_eq!(witness.links, 1);
-        if let Some(previous) = previous {
-            assert_eq!(
-                journal["previousRecordName"].as_str(),
-                previous.path.file_name().unwrap().to_str()
-            );
-            assert_test_file_identity(&journal["previousRecordIdentity"], previous);
-            assert_eq!(journal["previousRecordDigest"], previous.sha256);
-        } else {
-            assert!(journal["previousRecordName"].is_null());
-            assert!(journal["previousRecordIdentity"].is_null());
-            assert!(journal["previousRecordDigest"].is_null());
-        }
-        previous = Some(witness);
-        planned_paths.insert(witness.path.clone());
-
-        for field in ["candidateName", "buildName", "backupName", "failedName"] {
-            test_safe_managed_residue_name(journal[field].as_str().unwrap(), &digest, generation);
-        }
-        if !journal["previousRootIdentity"].is_null() {
-            planned_directories
-                .entry(package_root.clone())
-                .or_default()
-                .push(journal["previousRootIdentity"].clone());
-        }
-        if !journal["publishedRootIdentity"].is_null() {
-            planned_directories
-                .entry(package_root.clone())
-                .or_default()
-                .push(journal["publishedRootIdentity"].clone());
-        }
-        let mut add_directory = |name_field: &str, identity_field: &str| {
-            let identity = &journal[identity_field];
-            if identity.is_null() {
-                return;
-            }
-            let path = parent.join(journal[name_field].as_str().unwrap());
-            planned_paths.insert(path.clone());
-            planned_directories
-                .entry(path)
-                .or_default()
-                .push(identity.clone());
-        };
-        add_directory("candidateName", "candidateRootIdentity");
-        add_directory("buildName", "buildRootIdentity");
-        add_directory("backupName", "previousRootIdentity");
-        add_directory("backupName", "backupRootIdentity");
-        add_directory("failedName", "candidateRootIdentity");
-
-        if let Some(snapshot_name) = journal["cleanupSnapshotName"].as_str() {
-            test_safe_managed_residue_name(snapshot_name, &digest, generation);
-            let path = parent.join(snapshot_name);
-            planned_paths.insert(path.clone());
-            if path.exists()
-                && journal["cleanupSnapshotIdentity"].is_object()
-                && journal["cleanupSnapshotDigest"].is_string()
-                && journal["cleanupSnapshotLen"].is_u64()
-                && !snapshot_files.contains_key(&path)
-            {
-                let snapshot = test_owned_file_bounded(&path, 1024 * 1024 * 1024);
-                assert_test_file_identity(&journal["cleanupSnapshotIdentity"], &snapshot);
-                assert_eq!(journal["cleanupSnapshotDigest"], snapshot.sha256);
-                assert_eq!(journal["cleanupSnapshotLen"].as_u64(), Some(snapshot.len));
-                snapshot_files.insert(path, snapshot);
-            }
-        }
-    }
-
-    // Seal all journal-selected roots before deleting any output.
-    let mut directories = Vec::<(PathBuf, Vec<TestOwnedEntry>)>::new();
-    for (path, identities) in &planned_directories {
-        if !path.exists() {
-            continue;
-        }
-        let inventory = test_owned_tree_inventory(path);
-        assert!(
-            identities.iter().any(|identity| {
-                let actual = &inventory[0];
-                identity["platform"] == "unix"
-                    && identity["object"] == format!("{}:{}", actual.device, actual.inode)
-                    && identity["kind"] == "directory"
-            }),
-            "managed cleanup root identity is not journal-bound: {}",
-            path.display()
-        );
-        directories.push((path.clone(), inventory));
-    }
-    assert!(
-        directories.iter().any(|(path, _)| path == &package_root),
-        "managed failure public root lacks an immutable journal identity"
+fn assert_no_managed_staging(package: &Path) {
+    let parent = package.parent().unwrap();
+    let prefix = format!(
+        ".{}.staging-",
+        package.file_name().unwrap().to_string_lossy()
     );
-
-    let final_owner_path = managed_owner_path(&package_root);
-    let final_owner = final_owner_path
-        .exists()
-        .then(|| test_owned_file_bounded(&final_owner_path, 16 * 1024 * 1024));
-    if let Some(owner) = &final_owner {
-        let value: serde_json::Value = serde_json::from_slice(&owner.bytes).unwrap();
-        assert_eq!(value["owner"], "uniffi-managed-package");
-        assert_eq!(value["schemaVersion"], 3);
-        assert_eq!(value["state"], "committed");
-        assert_test_producer_exited(test_managed_generation_pid(
-            value["generation"].as_str().unwrap(),
-        ));
-        let public_inventory = directories
-            .iter()
-            .find(|(path, _)| path == &package_root)
-            .unwrap();
-        assert_test_owner_identity(&value["rootIdentity"], &public_inventory.1[0]);
-        assert!(value["entries"].as_array().unwrap().iter().all(|entry| {
-            entry["path"]
-                .as_str()
-                .is_some_and(|path| Path::new(path).starts_with(&package_root))
-        }));
-        planned_paths.insert(final_owner_path.clone());
-    }
-
-    let owner_candidate_path = parent.join(format!(
-        ".{}.next-{generation}",
-        final_owner_path.file_name().unwrap().to_string_lossy()
-    ));
-    let owner_candidate = owner_candidate_path
-        .exists()
-        .then(|| test_owned_file_bounded(&owner_candidate_path, 16 * 1024 * 1024));
-    if let Some(candidate) = &owner_candidate {
-        let value: serde_json::Value = serde_json::from_slice(&candidate.bytes).unwrap();
-        assert_eq!(value["owner"], "uniffi-managed-package");
-        assert_eq!(value["generation"], generation.as_str());
-        planned_paths.insert(owner_candidate_path.clone());
-    }
-
-    let residue_prefix = format!(".uniffi-managed-package-{digest}-");
-    for entry in std::fs::read_dir(parent).unwrap().filter_map(Result::ok) {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let path = entry.path();
-        if (name.starts_with(&residue_prefix)
-            || name.starts_with(&journal_prefix)
-            || path == final_owner_path
-            || path == owner_candidate_path)
-            && !planned_paths.contains(&path)
-        {
-            panic!(
-                "managed failure cleanup found unplanned residue: {}",
-                path.display()
-            );
-        }
-    }
-
-    // outputs -> snapshots -> owner/candidate -> immutable journal chain
-    for (path, inventory) in &directories {
-        test_remove_identity_bound_tree(path, inventory);
-    }
-    for snapshot in snapshot_files.values() {
-        test_remove_identity_bound_file(snapshot);
-    }
-    if let Some(candidate) = &owner_candidate {
-        test_remove_identity_bound_file(candidate);
-    }
-    if let Some(owner) = &final_owner {
-        test_remove_identity_bound_file(owner);
-    }
-    for (_, journal) in journals.iter().rev() {
-        test_remove_identity_bound_file(journal);
-    }
-
-    assert!(!package_root.exists());
-    assert!(!final_owner_path.exists() && !owner_candidate_path.exists());
-    assert!(std::fs::read_dir(parent)
+    let residue = std::fs::read_dir(parent)
         .unwrap()
         .filter_map(Result::ok)
-        .all(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            !name.starts_with(&residue_prefix) && !name.starts_with(&journal_prefix)
-        }));
-}
-
-fn direct_control_records_for(root: &Path) -> Vec<PathBuf> {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let needle = canonical.to_string_lossy();
-    let control = std::env::temp_dir().join("uniffi-artifacts-control-v1");
-    let mut found = std::fs::read_dir(control)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            (name.starts_with("anchor-")
-                || name.starts_with(".uniffi-artifacts-record-")
-                || (name.starts_with(".owner-") && name.contains(".json.next-")))
-            .then(|| entry.path())
-        })
-        .filter(|path| {
-            std::fs::read_to_string(path).is_ok_and(|record| record.contains(needle.as_ref()))
-        })
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&prefix))
         .collect::<Vec<_>>();
-    found.sort();
-    found
+    assert!(
+        residue.is_empty(),
+        "managed staging residue remains: {residue:?}"
+    );
 }
 
-fn restore_snapshot(root: &Path, files: &BTreeMap<PathBuf, SnapshotEntry>) {
-    std::fs::create_dir(root).unwrap();
-    for (relative, entry) in files {
-        let path = root.join(relative);
-        match entry {
-            SnapshotEntry::Directory => std::fs::create_dir_all(path).unwrap(),
-            SnapshotEntry::File(bytes) => {
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, bytes).unwrap();
-            }
-            SnapshotEntry::Symlink(target) => {
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::os::unix::fs::symlink(target, path).unwrap();
-            }
-        }
-    }
-}
-
-fn rebind_unix_owned_tree_marker(root: &Path, marker_name: &str) {
-    let marker_path = root.join(marker_name);
-    let mut marker: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
-    let identity = |path: &Path, directory: bool| {
-        let metadata = std::fs::symlink_metadata(path).unwrap();
-        serde_json::json!({
-            "platform": "unix",
-            "object": format!("{}:{}", metadata.dev(), metadata.ino()),
-            "kind": if directory { "directory" } else { "file" },
-            "links": if directory { 0 } else { metadata.nlink() },
-        })
-    };
-    marker["rootIdentity"] = identity(root, true);
-    for entry in marker["entries"].as_array_mut().unwrap() {
-        let relative = entry["path"].as_str().unwrap();
-        let directory = entry["kind"] == "directory";
-        entry["identity"] = identity(&root.join(relative), directory);
-    }
-    std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+fn managed_harmony_artifact(package: &Path, suffix: &str) -> PathBuf {
+    package
+        .join("artifacts/harmony")
+        .join(format!("{HARMONY_ARCHIVE_STEM}{suffix}"))
 }
 
 fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
@@ -994,6 +171,10 @@ fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 fn managed_command(root: &Path, arch: &str) -> Command {
+    managed_command_with_ndk(root, arch, &ohos_ndk())
+}
+
+fn managed_command_with_ndk(root: &Path, arch: &str, ndk: &Path) -> Command {
     let package = root.join("package");
     let mut command = Command::new(env!("CARGO_BIN_EXE_uniffi-bindgen"));
     command
@@ -1011,7 +192,7 @@ fn managed_command(root: &Path, arch: &str) -> Command {
         ])
         .arg(root.join("ohos-target"))
         .args(["--ohos-skip-check", "--ohos-skip-napi-check", "--no-format"])
-        .env("OHOS_NDK_HOME", ohos_ndk())
+        .env("OHOS_NDK_HOME", ndk)
         .env("CARGO_TARGET_DIR", root.join("core-target"));
     command
 }
@@ -1166,7 +347,6 @@ fn static_stream_host_command(
     static_manifest: &Path,
     dist: &Path,
     target_dir: &Path,
-    dts_cache: bool,
 ) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_uniffi-bindgen"));
     command
@@ -1198,9 +378,6 @@ fn static_stream_host_command(
             "RUSTC_WORKSPACE_WRAPPER",
             root.join("static-rustc-workspace-wrapper"),
         );
-    if dts_cache {
-        command.arg("--dts-cache");
-    }
     command.arg("--").arg("-v");
     command
 }
@@ -1209,7 +386,6 @@ fn stream_api_snapshot(dist: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut snapshot = [
         "Index.ets",
         "Index.d.ets",
-        "harmony-facade-contract.json",
         "native-facade.d.ts",
         "native-facade.ets",
     ]
@@ -1238,6 +414,23 @@ fn stream_api_snapshot(dist: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 fn hsp_managed_command(root: &Path) -> Command {
     hsp_managed_command_with_hvigor(root, &hvigorw_bin())
+}
+
+fn hsp_managed_wasm_command(root: &Path, cargo: &Path, label: &str) -> Command {
+    let mut command = hsp_managed_command(root);
+    command
+        .args([
+            "--target",
+            "wasm",
+            "--ohos-target-sdk-version",
+            "6.0.0(20)",
+            "--cargo-feature",
+            "wasm-streams",
+            "--cargo-bin",
+        ])
+        .arg(cargo)
+        .env("UNIFFI_TEST_WASM_ENTRY", label);
+    command
 }
 
 fn hsp_managed_command_with_hvigor(root: &Path, hvigorw: &Path) -> Command {
@@ -1325,46 +518,28 @@ fn har_managed_command(root: &Path) -> Command {
     command
 }
 
-fn assert_published_wasm_stream_consumer(
-    root: &Path,
-    package_root: &Path,
-    manifest: &serde_json::Value,
-) {
-    let components = manifest["components"]
-        .as_array()
-        .expect("published wasm manifest components must be an array");
-    let [component] = components.as_slice() else {
-        panic!("published wasm fixture must declare exactly one component: {components:?}");
-    };
-    let namespace = component["namespace"]
-        .as_str()
-        .expect("published wasm component must declare its namespace");
-    assert!(manifest["targets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|value| value == "wasm"));
-    for field in ["glue", "wasm", "dts"] {
-        let path = package_root.join(manifest["artifacts"]["wasm"][field].as_str().unwrap());
+fn assert_published_wasm_stream_consumer(root: &Path, package_root: &Path) {
+    let artifact_root = package_root.join("artifacts/browser/pkg");
+    let published_glue = artifact_root.join("uniffi_ohos_public_core_uniffi_js_host.js");
+    let published_wasm = artifact_root.join("uniffi_ohos_public_core_uniffi_js_host_bg.wasm");
+    let declarations = artifact_root.join("uniffi_ohos_public_core_uniffi_js_host.d.ts");
+    let host_manifest = package_root.join("artifacts/rust/wasm/Cargo.toml");
+    for (label, path) in [
+        ("glue", published_glue.as_path()),
+        ("wasm", published_wasm.as_path()),
+        ("declarations", declarations.as_path()),
+        ("host manifest", host_manifest.as_path()),
+    ] {
         assert!(
             path.is_file(),
-            "published wasm {field} is missing: {}",
+            "published managed wasm {label} is missing: {}",
             path.display()
         );
     }
-    let published_glue = package_root.join(manifest["artifacts"]["wasm"]["glue"].as_str().unwrap());
-    let published_wasm = package_root.join(manifest["artifacts"]["wasm"]["wasm"].as_str().unwrap());
     assert!(std::fs::read(&published_wasm)
         .unwrap()
         .starts_with(b"\0asm"));
-    let host_manifest = package_root.join(manifest["hostCrates"]["wasm"].as_str().unwrap());
-    assert!(host_manifest.is_file());
     assert!(!package_root.join("artifacts/rust/wasm/target").exists());
-    let host_text = std::fs::read_to_string(&host_manifest).unwrap();
-    assert!(
-        !host_text.contains(".uniffi-managed-package-next-"),
-        "published wasm host retained a private managed-root path:\n{host_text}"
-    );
 
     let mut metadata = Command::new("cargo");
     metadata
@@ -1385,15 +560,15 @@ fn assert_published_wasm_stream_consumer(
         r#"
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { __UNIFFI_NAMESPACE__ } from "./package/src/ffi/browser/index.ts";
+import { uniffi_ohos_public_core } from "./package/src/ffi/browser/index.ts";
 
 const glue = await import(pathToFileURL(process.env.UNIFFI_TEST_PUBLISHED_WASM_GLUE!).href);
 const bytes = await readFile(process.env.UNIFFI_TEST_PUBLISHED_WASM_BYTES!);
 await glue.default(bytes);
-await __UNIFFI_NAMESPACE__.initBackend(glue);
+await uniffi_ohos_public_core.initBackend(glue);
 
 const values: number[] = [];
-for await (const event of __UNIFFI_NAMESPACE__.countEvents(3)) values.push(event.value);
+for await (const event of uniffi_ohos_public_core.countEvents(3)) values.push(event.value);
 if (values.join(",") !== "0,1,2") throw new Error(`countEvents: ${values}`);
 
 async function* events(): AsyncIterable<{ value: number }> {
@@ -1401,11 +576,10 @@ async function* events(): AsyncIterable<{ value: number }> {
   yield { value: 2 };
   yield { value: 3 };
 }
-const sum = await __UNIFFI_NAMESPACE__.sumEvents(events());
+const sum = await uniffi_ohos_public_core.sumEvents(events());
 if (sum !== 6) throw new Error(`sumEvents: ${sum}`);
 console.log("published managed wasm stream smoke ok");
-"#
-        .replace("__UNIFFI_NAMESPACE__", namespace),
+"#,
     )
     .unwrap();
     let mut node = Command::new("node");
@@ -1419,7 +593,6 @@ console.log("published managed wasm stream smoke ok");
     assert_success(output, &node);
     assert!(stdout.contains("published managed wasm stream smoke ok"));
 }
-
 fn assert_direct_web_wasm_consumer(root: &Path, public: &Path, label: &str) {
     let entry = public.join("generated/browser/index.ts");
     let host_manifest = public.join("host/wasm/Cargo.toml");
@@ -1427,9 +600,9 @@ fn assert_direct_web_wasm_consumer(root: &Path, public: &Path, label: &str) {
     for path in [
         &entry,
         &host_manifest,
-        &pkg.join("uniffi_ohos_public_core_wasm.js"),
-        &pkg.join("uniffi_ohos_public_core_wasm_bg.wasm"),
-        &pkg.join("uniffi_ohos_public_core_wasm.d.ts"),
+        &pkg.join("uniffi_ohos_public_core_uniffi_js_host.js"),
+        &pkg.join("uniffi_ohos_public_core_uniffi_js_host_bg.wasm"),
+        &pkg.join("uniffi_ohos_public_core_uniffi_js_host.d.ts"),
     ] {
         assert!(
             path.is_file(),
@@ -1437,8 +610,8 @@ fn assert_direct_web_wasm_consumer(root: &Path, public: &Path, label: &str) {
             path.display()
         );
     }
-    let published_glue = pkg.join("uniffi_ohos_public_core_wasm.js");
-    let published_wasm = pkg.join("uniffi_ohos_public_core_wasm_bg.wasm");
+    let published_glue = pkg.join("uniffi_ohos_public_core_uniffi_js_host.js");
+    let published_wasm = pkg.join("uniffi_ohos_public_core_uniffi_js_host_bg.wasm");
     assert!(std::fs::read(&published_wasm)
         .unwrap()
         .starts_with(b"\0asm"));
@@ -1504,12 +677,12 @@ console.log("direct wasm stream smoke ok");
 fn assert_direct_mini_program_consumer(root: &Path, public: &Path) {
     let entry = public.join("generated/browser/index.mini-program.ts");
     let artifact = public.join("artifacts/mini-program");
-    let glue = artifact.join("uniffi_ohos_public_core_wasm.js");
-    let wasm = artifact.join("uniffi_ohos_public_core_wasm_bg.wasm");
+    let glue = artifact.join("uniffi_ohos_public_core_uniffi_js_host.js");
+    let wasm = artifact.join("uniffi_ohos_public_core_uniffi_js_host_bg.wasm");
     assert!(entry.is_file() && glue.is_file() && wasm.is_file());
     let entry_text = std::fs::read_to_string(&entry).unwrap();
     assert!(entry_text.contains("WXWebAssembly.instantiate"));
-    assert!(entry_text.contains("/assets/uniffi_ohos_public_core_wasm_bg.wasm"));
+    assert!(entry_text.contains("/assets/uniffi_ohos_public_core_uniffi_js_host_bg.wasm"));
 
     let driver = root.join("fresh-mini-program-driver.ts");
     std::fs::write(
@@ -1519,7 +692,7 @@ import { readFile } from "node:fs/promises";
 const wasmBytes = await readFile(process.env.UNIFFI_TEST_MINI_WASM!);
 (globalThis as any).WXWebAssembly = {
   async instantiate(path: string, imports: WebAssembly.Imports) {
-    if (path !== "/assets/uniffi_ohos_public_core_wasm_bg.wasm") {
+    if (path !== "/assets/uniffi_ohos_public_core_uniffi_js_host_bg.wasm") {
       throw new Error(`unexpected Mini Program wasm path: ${path}`);
     }
     return WebAssembly.instantiate(wasmBytes, imports);
@@ -1528,7 +701,7 @@ const wasmBytes = await readFile(process.env.UNIFFI_TEST_MINI_WASM!);
 const root = await import(process.env.UNIFFI_TEST_MINI_ENTRY!);
 const api = root.uniffi_ohos_public_core;
 if (!api) throw new Error("missing uniffi_ohos_public_core namespace export");
-await api.init();
+await root.init();
 const values: number[] = [];
 for await (const event of api.countEvents(3)) values.push(event.value);
 if (values.join(",") !== "0,1,2") throw new Error(`Mini Program stream: ${values}`);
@@ -1599,17 +772,15 @@ console.log("published node bidirectional stream smoke ok");
     assert_success(output, &node);
     assert!(stdout.contains("published node bidirectional stream smoke ok"));
     eprintln!(
-        "published {label} Node consumer: addon={} sha256={} entry={}",
+        "published {label} Node consumer: addon={} entry={}",
         addon.display(),
-        sha256(&std::fs::read(addon).unwrap()),
         entry.display()
     );
 }
 
-fn assert_published_apple_consumer(package_root: &Path, manifest: &serde_json::Value) {
-    let apple = &manifest["artifacts"]["apple"];
-    let xcframework = package_root.join(apple["xcframework"].as_str().unwrap());
-    let package = package_root.join(apple["package"].as_str().unwrap());
+fn assert_published_apple_consumer(package_root: &Path) {
+    let package = package_root.join("artifacts/apple");
+    let xcframework = package.join("uniffi_ohos_public_core.xcframework");
     assert!(xcframework.join("Info.plist").is_file());
     assert!(package.join("Package.swift").is_file());
     let mut plist = Command::new("plutil");
@@ -1775,12 +946,8 @@ print("published XCFramework Swift smoke ok")
     );
 }
 
-fn assert_published_android_consumer(package_root: &Path, manifest: &serde_json::Value) {
-    let jni = package_root.join(
-        manifest["artifacts"]["android"]["jniLibs"]
-            .as_str()
-            .unwrap(),
-    );
+fn assert_published_android_consumer(package_root: &Path) {
+    let jni = package_root.join("artifacts/android/jniLibs");
     let library = jni.join("arm64-v8a/libuniffi_ohos_public_core.so");
     assert!(
         library.is_file(),
@@ -1948,9 +1115,8 @@ dependencies {{
         classes.keys().collect::<Vec<_>>()
     );
     eprintln!(
-        "fresh Android Gradle consumer AAR={} sha256={} packaged_jni={}",
+        "fresh Android Gradle consumer AAR={} packaged_jni={}",
         aar.display(),
-        sha256(&std::fs::read(&aar).unwrap()),
         library.display()
     );
 }
@@ -2189,65 +1355,6 @@ fn mixed_standalone_wasm_command(
     command
 }
 
-fn find_legacy_generation_owner(root: &Path) -> Option<PathBuf> {
-    let mut entries = std::fs::read_dir(root)
-        .ok()?
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        if entry.file_type().ok()?.is_dir() {
-            if let Some(found) = find_legacy_generation_owner(&path) {
-                return Some(found);
-            }
-        } else if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".uniffi-artifacts-generation-")
-        {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn find_generation_owner(root: &Path) -> Option<PathBuf> {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let control = std::env::temp_dir().join("uniffi-artifacts-control-v1");
-    let mut owners = std::fs::read_dir(control)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            name.starts_with("owner-") && name.ends_with(".json")
-        })
-        .filter_map(|entry| {
-            let path = entry.path();
-            let value: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-            (value["owner"] == "uniffi-artifacts-invocation"
-                && value["state"] == "committed"
-                && value["entries"].as_array().is_some_and(|entries| {
-                    entries.iter().any(|entry| {
-                        entry["path"]
-                            .as_str()
-                            .is_some_and(|path| Path::new(path).starts_with(&canonical))
-                    })
-                }))
-            .then_some(path)
-        })
-        .collect::<Vec<_>>();
-    owners.sort();
-    owners.pop().or_else(|| find_legacy_generation_owner(root))
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 fn assert_safe_archive_path(path: &Path) {
     assert!(
         !path.as_os_str().is_empty()
@@ -2308,307 +1415,6 @@ fn zip_files(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     files
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct HarmonyPublicSurface {
-    declarations: String,
-    component_declarations: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct HarmonyContractCallable {
-    function_statement: String,
-    const_statement: String,
-}
-
-fn compact_harmony_declaration(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect()
-}
-
-fn facade_contract_descriptor_public_type(
-    descriptor: &serde_json::Value,
-    current_component: &str,
-) -> Result<String, String> {
-    let kind = descriptor
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("facade type descriptor lacks string kind: {descriptor}"))?;
-    match kind {
-        "number" => Ok("number".to_string()),
-        "bigint" => Ok("bigint".to_string()),
-        "boolean" => Ok("boolean".to_string()),
-        "string" => Ok("string".to_string()),
-        "arrayBuffer" => Ok("ArrayBuffer".to_string()),
-        "named" => {
-            let owner = descriptor
-                .get("owner")
-                .and_then(serde_json::Value::as_object)
-                .ok_or_else(|| format!("named facade descriptor lacks owner: {descriptor}"))?;
-            let owner_component = owner
-                .get("component")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    format!("named facade descriptor owner lacks component: {descriptor}")
-                })?;
-            let owner_namespace = owner
-                .get("namespace")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    format!("named facade descriptor owner lacks namespace: {descriptor}")
-                })?;
-            let name = descriptor
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("named facade descriptor lacks name: {descriptor}"))?;
-            Ok(if owner_component == current_component {
-                name.to_string()
-            } else {
-                format!("{owner_namespace}.{name}")
-            })
-        }
-        "optional" => Ok(format!(
-            "{}|undefined|null",
-            facade_contract_descriptor_public_type(
-                descriptor.get("inner").ok_or_else(|| format!(
-                    "optional facade descriptor lacks inner: {descriptor}"
-                ))?,
-                current_component,
-            )?
-        )),
-        "sequence" => Ok(format!(
-            "Array<{}>",
-            facade_contract_descriptor_public_type(
-                descriptor.get("inner").ok_or_else(|| format!(
-                    "sequence facade descriptor lacks inner: {descriptor}"
-                ))?,
-                current_component,
-            )?
-        )),
-        "set" => Ok(format!(
-            "Set<{}>",
-            facade_contract_descriptor_public_type(
-                descriptor
-                    .get("inner")
-                    .ok_or_else(|| format!("set facade descriptor lacks inner: {descriptor}"))?,
-                current_component,
-            )?
-        )),
-        "inputSource" => descriptor
-            .get("suffix")
-            .and_then(serde_json::Value::as_str)
-            .map(|suffix| format!("{suffix}InputSource"))
-            .ok_or_else(|| format!("input-source facade descriptor lacks suffix: {descriptor}")),
-        other => Err(format!("unsupported facade type descriptor kind `{other}`")),
-    }
-}
-
-fn facade_contract_callable_declarations(
-    facade_contract: &serde_json::Value,
-) -> Result<BTreeMap<String, HarmonyContractCallable>, String> {
-    let identity = facade_contract
-        .get("componentIdentities")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|identities| identities.first())
-        .ok_or_else(|| "facade contract lacks its component identity".to_string())?;
-    let current_component = identity
-        .get("component")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "facade contract component identity lacks component".to_string())?;
-    let mut declarations = BTreeMap::new();
-    let mut insert = |name: String, function_statement: String, const_statement: String| {
-        if declarations
-            .insert(
-                name.clone(),
-                HarmonyContractCallable {
-                    function_statement,
-                    const_statement,
-                },
-            )
-            .is_some()
-        {
-            Err(format!("facade contract has duplicate callable `{name}`"))
-        } else {
-            Ok(())
-        }
-    };
-    for output in facade_contract
-        .get("outputStreams")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "facade contract lacks outputStreams".to_string())?
-    {
-        let name = output
-            .get("streamFactory")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("facade output stream lacks streamFactory: {output}"))?;
-        let arguments = output
-            .get("arguments")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| format!("facade output stream lacks arguments: {output}"))?
-            .iter()
-            .map(|argument| {
-                let name = argument
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| format!("facade output argument lacks name: {argument}"))?;
-                let ty = facade_contract_descriptor_public_type(
-                    argument
-                        .get("type")
-                        .ok_or_else(|| format!("facade output argument lacks type: {argument}"))?,
-                    current_component,
-                )?;
-                Ok(format!("{name}:{ty}"))
-            })
-            .collect::<Result<Vec<_>, String>>()?
-            .join(",");
-        let item_type = facade_contract_descriptor_public_type(
-            output
-                .get("itemType")
-                .ok_or_else(|| format!("facade output stream lacks itemType: {output}"))?,
-            current_component,
-        )?;
-        let return_type = format!("UniFfiStream<{item_type}>");
-        insert(
-            name.to_string(),
-            format!("exportdeclarefunction{name}({arguments}):{return_type};"),
-            format!("exportdeclareconst{name}:({arguments})=>{return_type};"),
-        )?;
-    }
-    for input in facade_contract
-        .get("inputStreams")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "facade contract lacks inputStreams".to_string())?
-    {
-        let name = input
-            .get("factory")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("facade input stream lacks factory: {input}"))?;
-        let channel = input
-            .get("channelClass")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("facade input stream lacks channelClass: {input}"))?;
-        insert(
-            name.to_string(),
-            format!("exportdeclarefunction{name}():{channel};"),
-            format!("exportdeclareconst{name}:()=>{channel};"),
-        )?;
-    }
-    if declarations.is_empty() {
-        return Err("facade contract has no callable factories".to_string());
-    }
-    Ok(declarations)
-}
-
-/// Strip precisely the known contract factories from one generated component
-/// declaration. Hvigor turns only these implementation callables from
-/// `declare function` into `declare const: (...) => ...` while archiving a
-/// default HAR. Everything else remains in the canonical comparison below.
-fn project_contract_callables_from_component_declaration(
-    source: &str,
-    expected: &BTreeMap<String, HarmonyContractCallable>,
-) -> Result<String, String> {
-    let uncommented = source
-        .lines()
-        .filter(|line| {
-            let line = line.trim_start();
-            !line.starts_with("//") && !line.starts_with("/*") && !line.starts_with('*')
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut seen = BTreeMap::new();
-    let mut retained = Vec::new();
-    for statement in uncommented.split_inclusive(';') {
-        let compact = compact_harmony_declaration(statement);
-        if compact.is_empty() {
-            continue;
-        }
-        let matches = expected
-            .iter()
-            .filter(|(_, declaration)| {
-                compact == declaration.function_statement || compact == declaration.const_statement
-            })
-            .map(|(name, _)| name)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [] => retained.push(compact),
-            [name] => {
-                let count = seen.entry((*name).clone()).or_insert(0usize);
-                *count += 1;
-                if *count != 1 {
-                    return Err(format!("contract callable `{name}` appears more than once"));
-                }
-            }
-            names => return Err(format!("ambiguous contract callable statement: {names:?}")),
-        }
-    }
-    for name in expected.keys() {
-        if seen.get(name) != Some(&1) {
-            return Err(format!(
-                "contract callable `{name}` is missing or has a changed signature"
-            ));
-        }
-    }
-    let mut exports = Vec::new();
-    for statement in retained {
-        if statement.starts_with("import") {
-            // Declaration emitters may elide implementation-only imports;
-            // local class imports are independently checked below.
-            continue;
-        }
-        if !statement.starts_with("export") {
-            return Err(format!("unexpected declaration statement `{statement}`"));
-        }
-        exports.push(statement);
-    }
-    exports.sort();
-    Ok(exports.join(";"))
-}
-
-#[test]
-fn harmony_contract_callable_projection_equates_function_and_const_forms() {
-    let expected = BTreeMap::from([(
-        "eventsStream".to_string(),
-        HarmonyContractCallable {
-            function_statement:
-                "exportdeclarefunctioneventsStream(event:EventId):UniFfiStream<EventId>;"
-                    .to_string(),
-            const_statement:
-                "exportdeclareconsteventsStream:(event:EventId)=>UniFfiStream<EventId>;".to_string(),
-        },
-    )]);
-    let function = "import { raw } from \"../native-facade\"; export declare function eventsStream(event: EventId): UniFfiStream<EventId>; export type EventId = RawEventId;";
-    let constant = "export type EventId = RawEventId; import { raw as hidden } from \"../native-facade\"; export declare const eventsStream: (event: EventId) => UniFfiStream<EventId>;";
-    assert_eq!(
-        project_contract_callables_from_component_declaration(function, &expected).unwrap(),
-        project_contract_callables_from_component_declaration(constant, &expected).unwrap(),
-    );
-}
-
-#[test]
-fn harmony_contract_callable_projection_rejects_signature_drift() {
-    let expected = BTreeMap::from([(
-        "eventsStream".to_string(),
-        HarmonyContractCallable {
-            function_statement:
-                "exportdeclarefunctioneventsStream(event:EventId):UniFfiStream<EventId>;"
-                    .to_string(),
-            const_statement:
-                "exportdeclareconsteventsStream:(event:EventId)=>UniFfiStream<EventId>;".to_string(),
-        },
-    )]);
-    let wrong_parameter =
-        "export declare const eventsStream: (other: EventId) => UniFfiStream<EventId>;";
-    let wrong_return =
-        "export declare function eventsStream(event: EventId): UniFfiStream<string>;";
-    assert!(
-        project_contract_callables_from_component_declaration(wrong_parameter, &expected).is_err()
-    );
-    assert!(
-        project_contract_callables_from_component_declaration(wrong_return, &expected).is_err()
-    );
-}
-
 fn archive_utf8(files: &BTreeMap<String, Vec<u8>>, path: &str, label: &str) -> String {
     let bytes = files
         .get(path)
@@ -2619,15 +1425,8 @@ fn archive_utf8(files: &BTreeMap<String, Vec<u8>>, path: &str, label: &str) -> S
 fn assert_namespaced_harmony_public_surface(
     files: &BTreeMap<String, Vec<u8>>,
     namespace: &str,
-    facade_contract: &serde_json::Value,
     label: &str,
-) -> HarmonyPublicSurface {
-    // Interface HARs intentionally carry declarations rather than the
-    // implementation `.ets` modules. Hvigor canonicalizes the finite set of
-    // contract stream/input factories from `declare function` to callable
-    // `declare const` in a default HAR; compare that exact contract projection
-    // semantically and retain a canonical exact comparison for everything
-    // else.
+) {
     let index = files
         .contains_key("package/Index.ets")
         .then(|| archive_utf8(files, "package/Index.ets", label));
@@ -2636,27 +1435,28 @@ fn assert_namespaced_harmony_public_surface(
     let component_declaration_path = format!("package/src/main/ets/components/{namespace}.d.ets");
     assert!(
         !files.contains_key(&format!("package/src/main/ets/components/{namespace}.d.ts")),
-        "{label} must not contain a legacy component .d.ts compatibility declaration"
+        "{label} must not contain a legacy component .d.ts declaration"
     );
-    let mut component_sources = BTreeMap::from([(
-        component_declaration_path.clone(),
-        archive_utf8(files, &component_declaration_path, label),
-    )]);
-    let component_declarations = component_sources
-        .get(&component_declaration_path)
-        .expect("component declaration was inserted");
+
+    let component_declarations = archive_utf8(files, &component_declaration_path, label);
+    let component_source = files
+        .contains_key(&component_source_path)
+        .then(|| archive_utf8(files, &component_source_path, label));
+    let component_text = component_source
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(component_declarations.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !component_declarations.contains("typeof "),
-        "{label} component declaration must not use ArkTS-incompatible type queries:\n{component_declarations}"
+        !component_text.contains("typeof "),
+        "{label} component surface contains an ArkTS-incompatible type query:\n{component_text}"
     );
-    if files.contains_key(&component_source_path) {
-        let source = archive_utf8(files, &component_source_path, label);
-        component_sources.insert(component_source_path.clone(), source);
-    }
+
     let root_import =
         format!("import * as {namespace} from \"./src/main/ets/components/{namespace}\";");
-    let root_export = format!("export {{\n  {namespace},\n}};");
-    let normalize_active_root = |source: &str| {
+    let root_export = format!("export {{ {namespace} }};");
+    let normalize_root = |source: &str| {
         source
             .lines()
             .map(str::trim)
@@ -2670,45 +1470,33 @@ fn assert_namespaced_harmony_public_surface(
             .filter(|character| !character.is_whitespace())
             .collect::<String>()
     };
-    let expected_root = normalize_active_root(&format!("{root_import}\n{root_export}"));
-    let mut roots = vec![&declarations];
+    let expected_root = normalize_root(&format!("{root_import}\n{root_export}"));
+    assert_eq!(
+        normalize_root(&declarations),
+        expected_root,
+        "{label} declaration root must expose exactly the generated namespace:\n{declarations}"
+    );
     if let Some(index) = &index {
-        roots.push(index);
-    }
-    for root in roots {
-        assert!(
-            !root.contains("native-facade"),
-            "{label} root directly exposes the native facade:\n{root}"
-        );
         assert_eq!(
-            normalize_active_root(root),
+            normalize_root(index),
             expected_root,
-            "{label} root must contain exactly one namespace import/export and no compatibility surface:\n{root}"
+            "{label} implementation root must expose exactly the generated namespace:\n{index}"
         );
-        for flat_public in [
-            "add",
-            "CounterEvent",
-            "CounterObject",
-            "CounterObserver",
-            "CounterSignal",
-            "StreamError",
-            "UniFfiStream",
-            "UniFfiStreamResult",
-            "UniFfiStreamFailure",
-            "countEventsStream",
+        assert!(!index.contains("export *"));
+    }
+    for root in std::iter::once(&declarations).chain(index.iter()) {
+        for forbidden in [
+            "native-facade",
+            "countEventsStreamNext",
+            "UniffiInputStream",
         ] {
             assert!(
-                !root.contains(flat_public),
-                "{label} root leaked flat public binding `{flat_public}`:\n{root}"
+                !root.contains(forbidden),
+                "{label} root leaked flat/raw binding {forbidden}:\n{root}"
             );
         }
     }
 
-    let component_text = component_sources
-        .values()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join("\n");
     for public_symbol in [
         "add",
         "CounterEvent",
@@ -2719,192 +1507,51 @@ fn assert_namespaced_harmony_public_surface(
         "UniFfiStream",
         "UniFfiStreamResult",
         "UniFfiStreamFailure",
+        "UniFfiInputFailure",
+        "UniffiInputStream",
         "countEventsStream",
+        "echoEventsStream",
     ] {
         assert!(
             component_text.contains(public_symbol),
-            "{label} namespace `{namespace}` misses public/Pull binding `{public_symbol}`:\n{component_text}"
+            "{label} namespace {namespace} misses {public_symbol}:\n{component_text}"
         );
     }
-    for legacy_event_facade in ["CountEventsEventsStream", "countEventsEvents"] {
+    for forbidden in [
+        "CountEventsEventsStream",
+        "countEventsEvents",
+        "export interface UniffiInputStream<T>",
+        "countEventsStreamNext(",
+        "countEventsStreamCancel(",
+    ] {
         assert!(
-            !component_text.contains(legacy_event_facade),
-            "{label} namespace `{namespace}` leaked removed Event facade `{legacy_event_facade}`:\n{component_text}"
+            !component_text.contains(forbidden),
+            "{label} namespace {namespace} leaked removed/raw binding {forbidden}:\n{component_text}"
         );
-    }
-    assert!(
-        !component_text.contains("typeof "),
-        "{label} namespace `{namespace}` contains an ArkTS-incompatible type query:\n{component_text}"
-    );
-    let has_local_class_import = |source: &str, internal: &str, public: &str| {
-        let expected_binding = if internal == public {
-            internal.to_string()
-        } else {
-            format!("{internal}as{public}")
-        };
-        source.split(';').any(|statement| {
-            let compact = statement
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect::<String>();
-            compact
-                .strip_prefix("import{")
-                .and_then(|bindings| bindings.strip_suffix("}from\"../native-facade\""))
-                .is_some_and(|bindings| {
-                    bindings
-                        .split(',')
-                        .any(|binding| binding == expected_binding)
-                })
-        })
-    };
-    let outputs = facade_contract["outputStreams"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{label} facade contract lacks outputStreams"));
-    assert!(
-        !outputs.is_empty(),
-        "{label} fixture unexpectedly has no output stream"
-    );
-    let mut class_reexports = BTreeMap::from([(
-        "UniFfiStreamFailure".to_string(),
-        "UniFfiStreamFailure".to_string(),
-    )]);
-    for output in outputs {
-        let class = output["pullClass"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{label} output stream has no pullClass"))
-            .to_string();
-        class_reexports.insert(class.clone(), class);
-    }
-    let inputs = facade_contract["inputStreams"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{label} facade contract lacks inputStreams"));
-    let contract_callables =
-        facade_contract_callable_declarations(facade_contract).unwrap_or_else(|error| {
-            panic!("{label} facade contract callable projection failed: {error}")
-        });
-    assert_eq!(
-        contract_callables.len(),
-        outputs.len() + inputs.len(),
-        "{label} facade contract has non-unique output/input factory names"
-    );
-    if !inputs.is_empty() {
-        class_reexports.insert(
-            "UniFfiInputFailure".to_string(),
-            "UniFfiInputFailure".to_string(),
-        );
-        let native_export_prefix = facade_contract["componentIdentities"]
-            .as_array()
-            .and_then(|identities| identities.first())
-            .and_then(|identity| identity["nativeExportPrefix"].as_str())
-            .unwrap_or_else(|| {
-                panic!("{label} facade contract lacks its component nativeExportPrefix")
-            });
-        let raw_input_stream = format!("{native_export_prefix}_UniffiInputStream");
-        for source in component_sources.values() {
-            assert!(
-                source.contains(&format!(
-                    "export type UniffiInputStream<T> = {raw_input_stream}<T>;"
-                )),
-                "{label} namespace `{namespace}` did not preserve its exact prefixed raw input generic:\n{source}"
-            );
-            assert!(
-                !source.contains("export interface UniffiInputStream<T>"),
-                "{label} namespace `{namespace}` reintroduced a compatibility raw input interface:\n{source}"
-            );
-        }
-    }
-    for input in inputs {
-        for field in ["writerClass", "sourceClass", "channelClass"] {
-            let class = input[field]
-                .as_str()
-                .unwrap_or_else(|| panic!("{label} input stream has no {field}"))
-                .to_string();
-            class_reexports.insert(class.clone(), class);
-        }
-    }
-    let native_export_prefix = facade_contract["componentIdentities"]
-        .as_array()
-        .and_then(|identities| identities.first())
-        .and_then(|identity| identity["nativeExportPrefix"].as_str())
-        .unwrap_or_else(|| {
-            panic!("{label} facade contract lacks its component nativeExportPrefix")
-        });
-    class_reexports.insert(
-        "CounterObject".to_string(),
-        format!("{native_export_prefix}_CounterObject"),
-    );
-    for (class, internal) in class_reexports {
-        let component_declaration = component_sources
-            .get(&component_declaration_path)
-            .expect("required component declaration is present");
-        let export = format!("export {{ {class} }};");
-        assert!(
-            has_local_class_import(component_declaration, &internal, &class)
-                && component_declaration.matches(&export).count() == 1,
-            "{label} namespace `{namespace}` declaration must create and export a local ArkTS class binding for `{class}`:\n{component_declaration}"
-        );
-        if let Some(component_source) = component_sources.get(&component_source_path) {
-            assert!(
-                has_local_class_import(component_source, &internal, &class)
-                    && component_source.matches(&export).count() == 1,
-                "{label} namespace `{namespace}` source must create and export a local ArkTS class binding for `{class}`:\n{component_source}"
-            );
-        }
-        let direct_reexport =
-            format!("export {{ {internal} as {class} }} from \"../native-facade\";");
-        for source in component_sources.values() {
-            assert!(
-                !source.contains(&format!("export const {class} ="))
-                    && !source.contains(&format!("export type {class} ="))
-                    && !source.contains(&direct_reexport),
-                "{label} namespace `{namespace}` modeled class `{class}` as an invalid const/type alias:\n{source}"
-            );
-        }
-    }
-    for output in outputs {
-        for field in ["function", "nextFunction", "cancelFunction", "stepType"] {
-            let raw = output[field]
-                .as_str()
-                .unwrap_or_else(|| panic!("{label} output stream has no {field}"));
-            assert!(
-                !component_text.contains(raw),
-                "{label} namespace `{namespace}` leaked raw output `{raw}`:\n{component_text}"
-            );
-        }
-        for field in ["streamFactory", "pullClass"] {
-            let public = output[field]
-                .as_str()
-                .unwrap_or_else(|| panic!("{label} output stream has no {field}"));
-            assert!(
-                component_text.contains(public),
-                "{label} namespace `{namespace}` misses Pull facade `{public}`:\n{component_text}"
-            );
-        }
     }
 
-    let component_declarations = component_sources
-        .remove(&format!(
-            "package/src/main/ets/components/{namespace}.d.ets"
-        ))
-        .expect("required component declaration is present");
-    let component_declarations = project_contract_callables_from_component_declaration(
-        &component_declarations,
-        &contract_callables,
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "{label} namespace `{namespace}` contract callable declaration projection failed: {error}"
-        )
-    });
-    HarmonyPublicSurface {
-        declarations: normalize_active_root(&declarations),
-        component_declarations: BTreeMap::from([(
-            component_declaration_path,
-            component_declarations,
-        )]),
+    let raw_input_stream = format!(
+        "{}_UniffiInputStream",
+        uniffi_bindgen::interface::native_export_prefix_for_component(namespace)
+    );
+    assert!(
+        component_text.contains(&format!(
+            "export type UniffiInputStream<T> = {raw_input_stream}<T>;"
+        )),
+        "{label} namespace {namespace} lost its typed input-stream facade:\n{component_text}"
+    );
+    for class in ["CounterObject", "UniFfiStreamFailure", "UniFfiInputFailure"] {
+        assert!(
+            component_declarations.contains(&format!("export {{ {class} }};")),
+            "{label} declaration does not re-export class {class}:\n{component_declarations}"
+        );
+        assert!(
+            !component_text.contains(&format!("export const {class} ="))
+                && !component_text.contains(&format!("export type {class} =")),
+            "{label} modeled class {class} as a const/type alias:\n{component_text}"
+        );
     }
 }
-
 fn write_consumer_file(root: &Path, relative: &str, contents: impl AsRef<[u8]>) {
     let path = root.join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3166,15 +1813,11 @@ struct Index {{
 }
 
 fn remove_consumer_state(path: &Path) {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if metadata.is_dir() {
-        let inventory = test_owned_tree_inventory(path);
-        test_remove_identity_bound_tree(path, &inventory);
-    } else {
-        let witness = test_owned_file(path);
-        test_remove_identity_bound_file(&witness);
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path).unwrap(),
+        Ok(_) => std::fs::remove_file(path).unwrap(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("cannot inspect consumer state {}: {error}", path.display()),
     }
 }
 
@@ -3300,6 +1943,65 @@ fn artifacts_hsp_target_sdk_order_is_validated_before_output_generation() {
     }
 }
 
+#[test]
+fn managed_layout_refuses_unowned_root_and_failure_does_not_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let fake_ndk = root.join("fake-ndk");
+    std::fs::create_dir(&fake_ndk).unwrap();
+    let failing_cargo = root.join("failing-cargo");
+    let backend_log = root.join("backend-ran");
+    write_executable(
+        &failing_cargo,
+        &format!(
+            "#!/bin/sh\nprintf 'backend ran\\n' >> '{}'\necho 'intentional managed backend failure' >&2\nexit 91\n",
+            backend_log.display()
+        ),
+    );
+
+    let unowned = root.join("unowned/package");
+    std::fs::create_dir_all(&unowned).unwrap();
+    std::fs::write(unowned.join("user.txt"), b"keep\n").unwrap();
+    let before = snapshot(&unowned);
+    let mut command = managed_command_with_ndk(&root.join("unowned"), "x64", &fake_ndk);
+    command.args(["--cargo-bin"]).arg(&failing_cargo);
+    let output = command.output().unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "unowned managed root was replaced"
+    );
+    assert!(log.contains("lacks ownership marker"), "{log}");
+    assert_eq!(snapshot(&unowned), before);
+    assert!(
+        !backend_log.exists(),
+        "backend ran before ownership preflight"
+    );
+    assert_no_managed_staging(&unowned);
+
+    let fresh_root = root.join("fresh-failure");
+    let fresh_package = fresh_root.join("package");
+    let mut command = managed_command_with_ndk(&fresh_root, "x64", &fake_ndk);
+    command.args(["--cargo-bin"]).arg(&failing_cargo);
+    let output = command.output().unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "injected managed failure passed");
+    assert!(log.contains("intentional managed backend failure"), "{log}");
+    assert!(
+        !fresh_package.exists(),
+        "failed fresh build published a package"
+    );
+    assert_no_managed_staging(&fresh_package);
+}
+
 fn is_standalone_executable(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
@@ -3394,7 +2096,6 @@ fn run_codelinter(codelinter: &Path, project: &Path, label: &str) {
 }
 
 #[test]
-#[ignore = "requires a standalone CodeLinter CLI; set CODELINTER to its executable path"]
 fn public_hsp_codelinter_boundary_requires_a_standalone_cli() {
     let codelinter =
         standalone_codelinter_bin().unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
@@ -3427,90 +2128,58 @@ fn normalize_integrated_metadata(
 }
 
 #[test]
-#[ignore = "requires DevEco 6.0.2, Hvigor, ohpm, an OHOS Rust target, and the OHOS NDK"]
 fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let (cargo_wrapper, cargo_log) = write_cargo_target_logger(root);
-    let mut build_hsp = hsp_managed_command(root);
-    build_hsp
-        .args([
-            "--target",
-            "wasm",
-            "--ohos-target-sdk-version",
-            "6.0.0(20)",
-            "--cargo-feature",
-            "wasm-streams",
-            "--cargo-bin",
-        ])
-        .arg(&cargo_wrapper)
-        .env("UNIFFI_TEST_WASM_ENTRY", "managed-hsp-web");
+
+    let mut build_hsp = hsp_managed_wasm_command(root, &cargo_wrapper, "managed-hsp-web-fresh");
     let output = build_hsp.output().unwrap();
     assert_success(output, &build_hsp);
 
     let package_root = root.join("package");
-    assert_wasm_target_log(&cargo_log, "managed-hsp-web", &[&package_root]);
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(package_root.join("artifact-manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(manifest["artifactManifestSchemaVersion"], 4);
-    assert!(manifest.get("schemaVersion").is_none());
-    assert_eq!(manifest["targets"], serde_json::json!(["wasm", "harmony"]));
-    assert_eq!(manifest["source"]["root"], "src/ffi");
-    assert_eq!(manifest["source"]["shared"], "src/ffi/shared");
-    assert_eq!(manifest["source"]["browser"], "src/ffi/browser");
-    assert_eq!(manifest["source"]["harmony"], "src/ffi/harmony");
-    let components = manifest["components"]
-        .as_array()
-        .expect("managed artifact manifest components must be an array");
-    let [component] = components.as_slice() else {
-        panic!("public HSP fixture must have exactly one component: {components:?}");
-    };
-    assert_eq!(component["component"], "uniffi_ohos_public_core");
-    assert_eq!(component["namespace"], "uniffi_ohos_public_core");
-    assert_eq!(
-        component["nativeExportPrefix"],
-        "ffi_uniffi_ohos_public_core"
+    assert_managed_package_root(&package_root);
+    assert_no_managed_staging(&package_root);
+    assert_wasm_target_log(&cargo_log, "managed-hsp-web-fresh", &[&package_root]);
+    assert_published_wasm_stream_consumer(root, &package_root);
+    std::fs::write(package_root.join("stale-from-first-generation"), b"stale\n").unwrap();
+
+    let mut repeat = hsp_managed_wasm_command(root, &cargo_wrapper, "managed-hsp-web-repeat");
+    let output = repeat.output().unwrap();
+    assert_success(output, &repeat);
+    assert_managed_package_root(&package_root);
+    assert_no_managed_staging(&package_root);
+    assert!(
+        !package_root.join("stale-from-first-generation").exists(),
+        "repeat managed build did not replace the complete package"
     );
-    let namespace = component["namespace"].as_str().unwrap();
-    assert_eq!(
-        component["source"]["common"],
-        "src/ffi/components/uniffi_ohos_public_core/common"
-    );
-    assert_eq!(
-        component["source"]["browser"],
-        "src/ffi/components/uniffi_ohos_public_core/browser"
-    );
-    assert_eq!(
-        component["source"]["harmony"],
-        "src/ffi/components/uniffi_ohos_public_core/harmony"
-    );
-    assert_eq!(
-        component["source"]["publicTypes"],
-        "src/ffi/components/uniffi_ohos_public_core/common/public-types.ts"
-    );
-    assert_eq!(manifest["entrypoints"]["web"], "src/index.web.ts");
-    assert_eq!(
-        manifest["entrypoints"]["harmony"],
-        "artifacts/harmony/package/Index.ets"
-    );
-    let harmony = &manifest["artifacts"]["harmony"];
-    assert_published_wasm_stream_consumer(root, &package_root, &manifest);
-    assert_eq!(harmony["kind"], "hsp");
-    assert_eq!(harmony["integrated"], true);
-    assert!(harmony["har"].is_null());
-    let package_name = harmony["metadata"]["package"]["name"].as_str().unwrap();
-    assert_eq!(package_name, "@uniffi/ohos-public-core");
-    let artifact = |field: &str| package_root.join(harmony[field].as_str().unwrap());
-    let tgz = artifact("tgz");
-    let runtime_hsp = artifact("runtimeHsp");
-    let interface_har = artifact("interfaceHar");
-    let module_project = artifact("moduleProject");
+    assert_wasm_target_log(&cargo_log, "managed-hsp-web-repeat", &[&package_root]);
+    assert_published_wasm_stream_consumer(root, &package_root);
+
+    let namespace = FIXTURE_COMPONENT;
+    let package_name = HARMONY_PACKAGE_NAME;
+    let tgz = managed_harmony_artifact(&package_root, ".tgz");
+    let runtime_hsp = managed_harmony_artifact(&package_root, ".hsp");
+    let interface_har = managed_harmony_artifact(&package_root, "-interface.har");
+    let module_project = package_root.join("artifacts/harmony/module-project");
+    let harmony_entry = package_root.join("artifacts/harmony/package/Index.ets");
+    for (label, path) in [
+        ("release tgz", tgz.as_path()),
+        ("runtime HSP", runtime_hsp.as_path()),
+        ("Interface HAR", interface_har.as_path()),
+        ("Harmony package entry", harmony_entry.as_path()),
+    ] {
+        assert!(
+            path.is_file(),
+            "managed {label} is missing: {}",
+            path.display()
+        );
+    }
+    assert!(module_project.is_dir());
+
     let tgz_bytes = std::fs::read(&tgz).unwrap();
     let runtime_bytes = std::fs::read(&runtime_hsp).unwrap();
     let interface_bytes = std::fs::read(&interface_har).unwrap();
-
     let members = targz_files(&tgz_bytes, false);
     assert_eq!(
         members.len(),
@@ -3529,8 +2198,6 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
     assert!(!interface_member_name.contains('/'));
     assert_eq!(runtime_member.as_slice(), runtime_bytes);
     assert_eq!(interface_member.as_slice(), interface_bytes);
-    assert_eq!(sha256(runtime_member), sha256(&runtime_bytes));
-    assert_eq!(sha256(interface_member), sha256(&interface_bytes));
 
     let mut prepublish = Command::new(ohpm_bin());
     prepublish
@@ -3538,18 +2205,18 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         .args(["prepublish"])
         .arg(&tgz)
         .env("DEVECO_SDK_HOME", deveco_sdk_home());
-    let before_prepublish = sha256(&std::fs::read(&tgz).unwrap());
+    let before_prepublish = std::fs::read(&tgz).unwrap();
     let output = prepublish.output().unwrap();
     assert_success(output, &prepublish);
-    assert_eq!(sha256(&std::fs::read(&tgz).unwrap()), before_prepublish);
+    assert_eq!(std::fs::read(&tgz).unwrap(), before_prepublish);
 
     let runtime_files = zip_files(&runtime_bytes);
-    let facade_contract = std::fs::read(artifact("facadeContract")).unwrap();
-    let facade_contract_sha256 = sha256(&facade_contract);
-    let facade_contract_json: serde_json::Value = serde_json::from_slice(&facade_contract).unwrap();
-    assert!(runtime_files["ets/modules.abc"]
-        .windows(facade_contract_sha256.len())
-        .any(|window| window == facade_contract_sha256.as_bytes()));
+    assert!(
+        runtime_files
+            .keys()
+            .all(|path| !path.ends_with("harmony-facade-contract.json")),
+        "runtime HSP retained a removed facade metadata file"
+    );
     let runtime_module: serde_json::Value =
         serde_json::from_slice(runtime_files.get("module.json").unwrap()).unwrap();
     assert_eq!(runtime_module["app"]["bundleName"], "");
@@ -3576,31 +2243,17 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
 
     let interface_files = targz_files(&interface_bytes, true);
     assert!(interface_files.keys().all(|name| !name.ends_with(".so")));
-    assert!(!interface_files.contains_key("package/harmony-facade-contract.json"));
-    let internal_contracts = interface_files
-        .iter()
-        .filter(|(path, _)| {
-            path.starts_with("package/src/main/cpp/types/")
-                && path.ends_with("/harmony-facade-contract.json")
-        })
-        .collect::<Vec<_>>();
-    let [(_, internal_contract)] = internal_contracts.as_slice() else {
-        panic!(
-            "Interface HAR must retain exactly one internal native facade contract, found {}",
-            internal_contracts.len()
-        );
-    };
-    assert_eq!(internal_contract.as_slice(), facade_contract.as_slice());
+    assert!(
+        interface_files
+            .keys()
+            .all(|path| !path.ends_with("harmony-facade-contract.json")),
+        "Interface HAR retained a removed facade metadata file"
+    );
     let interface_package: serde_json::Value =
         serde_json::from_slice(interface_files.get("package/oh-package.json5").unwrap()).unwrap();
     assert_eq!(interface_package["packageType"], "InterfaceHar");
     assert_eq!(interface_package["name"], package_name);
-    let hsp_public_surface = assert_namespaced_harmony_public_surface(
-        &interface_files,
-        namespace,
-        &facade_contract_json,
-        "HSP Interface HAR",
-    );
+    assert_namespaced_harmony_public_surface(&interface_files, namespace, "HSP Interface HAR");
 
     let consumer = root.join("fresh-consumer");
     write_integrated_hsp_consumer(&consumer, package_name, namespace, &tgz, &deveco_sdk_home());
@@ -3681,12 +2334,10 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         "generated HSP declarations regressed to ArkTS-incompatible typeof queries:\n{build_log}"
     );
     assert_success(output, &assemble_hap);
-    let codelinter = standalone_codelinter_bin();
-    let module_lint_copy = codelinter.as_ref().ok().map(|_| {
-        let copy = root.join("module-project-lint-copy");
-        copy_tree(&module_project, &copy);
-        copy
-    });
+    let codelinter =
+        standalone_codelinter_bin().unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
+    let module_lint_copy = root.join("module-project-lint-copy");
+    copy_tree(&module_project, &module_lint_copy);
 
     let hap =
         unique_file_with_extension(&consumer.join("entry/build/default/outputs/default"), "hap");
@@ -3771,109 +2422,43 @@ fn public_integrated_hsp_builds_and_is_consumed_by_a_fresh_release_hap() {
         3,
         "processed HSP must own the target, bridge, and libc++ SOs"
     );
-    assert!(processed_files["ets/modules.abc"]
-        .windows(facade_contract_sha256.len())
-        .any(|window| window == facade_contract_sha256.as_bytes()));
-    assert_eq!(
-        processed_files
-            .iter()
-            .filter(|(path, _)| path.ends_with(".so"))
-            .map(|(path, bytes)| (path, sha256(bytes)))
-            .collect::<BTreeMap<_, _>>(),
-        runtime_files
-            .iter()
-            .filter(|(path, _)| path.ends_with(".so"))
-            .map(|(path, bytes)| (path, sha256(bytes)))
-            .collect::<BTreeMap<_, _>>(),
-        "processed HSP SO inventory/hash is not byte-bound to the raw HSP"
-    );
 
-    // Exercise the production managed package-root transaction in both
-    // directions. Every Harmony-only update must preserve the previously
-    // published Web source, host and artifacts while removing stale Harmony
-    // state from the other package kinds.
-    let mut har = har_managed_command(root);
-    let output = har.output().unwrap();
-    assert_success(output, &har);
-    let read_manifest = || -> serde_json::Value {
-        serde_json::from_slice(&std::fs::read(package_root.join("artifact-manifest.json")).unwrap())
-            .unwrap()
-    };
-    let manifest = read_manifest();
-    assert_eq!(manifest["artifacts"]["harmony"]["kind"], "har");
-    assert!(manifest["artifacts"]["harmony"]["har"].is_string());
-    assert!(manifest["artifacts"]["harmony"]["runtimeHsp"].is_null());
-    let harmony_root = package_root.join("artifacts/harmony");
-    assert!(!harmony_root.join("module-project").exists());
-    assert!(std::fs::read_dir(&harmony_root).unwrap().all(|entry| {
-        let path = entry.unwrap().path();
-        !matches!(
-            path.extension().and_then(|value| value.to_str()),
-            Some("hsp" | "tgz")
-        )
-    }));
-    assert_published_wasm_stream_consumer(root, &package_root, &manifest);
-    let har = package_root.join(
-        manifest["artifacts"]["harmony"]["har"]
-            .as_str()
-            .expect("default HAR manifest route must be a string"),
-    );
+    // A Harmony-only managed invocation is a complete new package, not an
+    // incremental merge with the previous HSP+Web generation.
+    let mut har_build = har_managed_command(root);
+    let output = har_build.output().unwrap();
+    assert_success(output, &har_build);
+    assert_managed_package_root(&package_root);
+    assert_no_managed_staging(&package_root);
+    assert!(!package_root.join("src/ffi/browser").exists());
+    assert!(!managed_harmony_artifact(&package_root, ".hsp").exists());
+    assert!(!managed_harmony_artifact(&package_root, ".tgz").exists());
+    assert!(!package_root
+        .join("artifacts/harmony/module-project")
+        .exists());
+
+    let har = managed_harmony_artifact(&package_root, ".har");
+    assert!(har.is_file(), "managed HAR is missing: {}", har.display());
     let har_files = targz_files(&std::fs::read(&har).unwrap(), true);
-    let har_public_surface = assert_namespaced_harmony_public_surface(
-        &har_files,
-        namespace,
-        &facade_contract_json,
-        "default HAR",
+    assert!(
+        har_files
+            .keys()
+            .all(|path| !path.ends_with("harmony-facade-contract.json")),
+        "default HAR retained a removed facade metadata file"
     );
-    assert_eq!(
-        har_public_surface, hsp_public_surface,
-        "default HAR and HSP Interface HAR must expose the identical namespace-only public surface"
-    );
-
-    let mut dist = managed_command(root, "aarch");
-    let output = dist.output().unwrap();
-    assert_success(output, &dist);
-    let manifest = read_manifest();
-    assert_eq!(manifest["artifacts"]["harmony"]["kind"], "dist");
-    assert!(manifest["artifacts"]["harmony"]["har"].is_null());
-    assert!(manifest["artifacts"]["harmony"]["package"].is_null());
-    assert!(!package_root.join("artifacts/harmony/package").exists());
-
-    let mut hsp_again = hsp_managed_command(root);
-    let output = hsp_again.output().unwrap();
-    assert_success(output, &hsp_again);
-    assert_eq!(read_manifest()["artifacts"]["harmony"]["kind"], "hsp");
-
-    let mut dist_again = managed_command(root, "aarch");
-    let output = dist_again.output().unwrap();
-    assert_success(output, &dist_again);
-    assert_eq!(read_manifest()["artifacts"]["harmony"]["kind"], "dist");
-
-    let mut har_again = har_managed_command(root);
-    let output = har_again.output().unwrap();
-    assert_success(output, &har_again);
-    let final_manifest = read_manifest();
-    assert_eq!(final_manifest["artifacts"]["harmony"]["kind"], "har");
-    assert_published_wasm_stream_consumer(root, &package_root, &final_manifest);
+    assert_namespaced_harmony_public_surface(&har_files, namespace, "default HAR");
 
     eprintln!(
-        "integrated HSP+Web evidence: tgz={} sha256={} runtime={} sha256={} interface={} sha256={} hap={} sha256={} processed_hsp={} sha256={}",
+        "integrated HSP+Web evidence: tgz={} runtime={} interface={} hap={} processed_hsp={} har={}",
         tgz.display(),
-        sha256(&tgz_bytes),
         runtime_hsp.display(),
-        sha256(&runtime_bytes),
         interface_har.display(),
-        sha256(&interface_bytes),
         hap.display(),
-        sha256(&std::fs::read(&hap).unwrap()),
         processed_hsp.display(),
-        sha256(&processed_bytes),
+        har.display(),
     );
-
-    // Run the intentionally unsealable external-tool failure last.  Its
-    // private build tree and append-only record chain must be preserved for
-    // audit, so a subsequent invocation on this package is expected to fail
-    // closed rather than silently recapturing and deleting the residue.
+    // A failed staged HSP build must leave the published HAR byte-for-byte
+    // unchanged and must not prevent an ordinary retry.
     let committed_package = snapshot(&package_root);
     let oversized_tgz = root.join("oversized-hvigor-output.tgz");
     std::fs::File::create(&oversized_tgz)
@@ -3923,311 +2508,126 @@ exit 0
     assert_eq!(
         snapshot(&package_root),
         committed_package,
-        "oversized Hvigor output changed the committed managed generation"
+        "oversized Hvigor output changed the published managed package"
     );
-    let mut blocked = har_managed_command(root);
-    let output = blocked.output().unwrap();
-    let blocked_log = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !output.status.success(),
-        "managed audit residue was bypassed"
-    );
-    assert!(
-        blocked_log.contains("previous managed package transaction")
-            && blocked_log.contains("preserving"),
-        "next managed invocation did not fail closed on retained evidence:\n{blocked_log}"
-    );
-    cleanup_managed_failure_from_exact_journals(&package_root);
+    assert_no_managed_staging(&package_root);
+    let mut retry = har_managed_command(root);
+    let output = retry.output().unwrap();
+    assert_success(output, &retry);
+    assert_managed_package_root(&package_root);
+    assert!(managed_harmony_artifact(&package_root, ".har").is_file());
+    assert_no_managed_staging(&package_root);
 
-    match (codelinter, module_lint_copy) {
-        (Ok(codelinter), Some(module_lint_copy)) => {
-            run_codelinter(&codelinter, &consumer, "fresh integrated HSP consumer");
-            run_codelinter(
-                &codelinter,
-                &module_lint_copy,
-                "generated HSP module project",
-            );
-        }
-        (Err(diagnostic), None) => eprintln!(
-            "CodeLinter availability boundary after completed HSP/HAP core evidence: {diagnostic}"
-        ),
-        (Ok(_), None) | (Err(_), Some(_)) => {
-            panic!("CodeLinter availability state and copied lint project diverged")
-        }
-    }
+    run_codelinter(&codelinter, &consumer, "fresh integrated HSP consumer");
+    run_codelinter(
+        &codelinter,
+        &module_lint_copy,
+        "generated HSP module project",
+    );
 }
 
 #[test]
-#[ignore = "requires DevEco 6.0.2, Hvigor, ohpm, an OHOS Rust target, and the OHOS NDK"]
-fn public_direct_and_managed_node_hsp_invocations_are_atomic() {
+fn public_direct_and_managed_node_hsp_publish_fixed_artifacts() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    let failing_cargo = root.join("fail-napi-cargo");
-    write_target_failing_cargo(&failing_cargo);
+    let host_lib_target = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(
+        "uniffi-ohos-public-core",
+    );
 
     let direct = root.join("direct");
     let direct_public = direct.join("public");
     let mut direct_success = hsp_direct_multi_target_command(&direct);
     let output = direct_success.output().unwrap();
     assert_success(output, &direct_success);
-    let direct_host_lib_target = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(
-        "uniffi-ohos-public-core",
-    );
-    let direct_node = direct_public.join(format!("artifacts/node/{direct_host_lib_target}.node"));
+    let direct_node = direct_public.join(format!("artifacts/node/{host_lib_target}.node"));
     let direct_tgz = direct_public.join("artifacts/ohos/uniffi-ohos-public-core.tgz");
-    assert!(
-        direct_node.is_file(),
-        "direct Node participant was not published"
-    );
-    assert!(
-        direct_tgz.is_file(),
-        "direct HSP participant was not published"
-    );
-    let mut direct_metadata = Command::new("cargo");
-    direct_metadata
-        .args([
-            "metadata",
-            "--no-deps",
-            "--format-version",
-            "1",
-            "--manifest-path",
-        ])
-        .arg(direct_public.join("host/napi/Cargo.toml"));
-    let output = direct_metadata.output().unwrap();
-    assert_success(output, &direct_metadata);
+    assert!(direct_tgz.is_file(), "direct HSP tgz was not published");
     assert_published_node_stream_consumer(
         &direct,
         &direct_public.join("generated/node/index.ts"),
         &direct_node,
         "direct",
     );
-    let direct_committed = snapshot_without_direct_audit(&direct_public);
-    let direct_owner = find_generation_owner(&direct)
-        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
-        .expect("direct multi-target success has no committed owner");
-
-    let mut direct_failure = hsp_direct_multi_target_command(&direct);
-    direct_failure
-        .args(["--cargo-bin"])
-        .arg(&failing_cargo)
-        .env("UNIFFI_TEST_FAIL_TARGET", "napi");
-    let output = direct_failure.output().unwrap();
-    let direct_failure_log = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!output.status.success(), "injected direct failure passed");
-    assert!(
-        direct_failure_log.contains("prepublish @uniffi/ohos-public-core 1.0.0 succeed"),
-        "direct invocation did not finish the HSP candidate before Node failed:\n{direct_failure_log}"
-    );
-    assert!(
-        direct_failure_log.contains("intentional napi participant failure"),
-        "direct invocation did not reach the injected Node failure:\n{direct_failure_log}"
-    );
-    assert_eq!(
-        snapshot_without_direct_audit(&direct_public),
-        direct_committed,
-        "direct HSP success followed by Node failure changed the committed invocation"
-    );
-    assert_eq!(
-        std::fs::read(&direct_owner.0).unwrap(),
-        direct_owner.1,
-        "failed direct invocation replaced the committed owner"
-    );
-    assert!(
-        direct_control_records_for(&direct).is_empty(),
-        "controlled prepublication failure retained direct anchors/records"
-    );
-    cleanup_preserved_artifact_invocation_roots(&direct_failure_log, &direct_public);
-    let mut direct_retry = hsp_direct_multi_target_command(&direct);
-    let output = direct_retry.output().unwrap();
-    assert_success(output, &direct_retry);
-    assert!(
-        direct_control_records_for(&direct).is_empty(),
-        "successful retry left non-terminal direct controls"
-    );
 
     let managed = root.join("managed");
-    let managed_package = managed.join("package");
-    let mut managed_success = hsp_managed_command(&managed);
-    managed_success
-        .args(["--target", "node", "--napi-target-dir"])
-        .arg(managed.join("napi-target"));
-    let output = managed_success.output().unwrap();
-    assert_success(output, &managed_success);
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(managed_package.join("artifact-manifest.json")).unwrap(),
-    )
-    .unwrap();
-    let managed_node = managed_package.join(
-        manifest["artifacts"]["node"]["addon"]
-            .as_str()
-            .expect("managed Node addon path"),
-    );
-    let managed_tgz = managed_package.join(
-        manifest["artifacts"]["harmony"]["tgz"]
-            .as_str()
-            .expect("managed HSP tgz path"),
-    );
-    assert!(
-        managed_node.is_file(),
-        "managed Node addon is missing at {}",
-        managed_node.display()
-    );
-    assert!(
-        managed_tgz.is_file(),
-        "managed HSP tgz is missing at {}; committed package tree: {:#?}",
-        managed_tgz.display(),
-        snapshot(&managed_package).keys().collect::<Vec<_>>()
-    );
-    let mut managed_metadata = Command::new("cargo");
-    managed_metadata
-        .args([
-            "metadata",
-            "--no-deps",
-            "--format-version",
-            "1",
-            "--manifest-path",
-        ])
-        .arg(managed_package.join("artifacts/rust/napi/Cargo.toml"));
-    let output = managed_metadata.output().unwrap();
-    assert_success(output, &managed_metadata);
+    let package = managed.join("package");
+    let managed_command = || {
+        let mut command = hsp_managed_command(&managed);
+        command
+            .args(["--target", "node", "--napi-target-dir"])
+            .arg(managed.join("napi-target"));
+        command
+    };
+
+    let mut fresh = managed_command();
+    let output = fresh.output().unwrap();
+    assert_success(output, &fresh);
+    assert_managed_package_root(&package);
+    assert_no_managed_staging(&package);
+    let managed_node = package.join(format!("artifacts/node/{host_lib_target}.node"));
+    let managed_tgz = managed_harmony_artifact(&package, ".tgz");
+    assert!(managed_tgz.is_file(), "managed HSP tgz was not published");
     assert_published_node_stream_consumer(
         &managed,
-        &managed_package.join(
-            manifest["entrypoints"]["node"]
-                .as_str()
-                .expect("managed Node entrypoint"),
-        ),
+        &package.join("src/index.node.ts"),
         &managed_node,
-        "managed",
-    );
-    let managed_owner = managed_owner_path(&managed_package);
-    let initial_managed_owner: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&managed_owner).unwrap()).unwrap();
-    let mut harmony_only = hsp_managed_command(&managed);
-    let output = harmony_only.output().unwrap();
-    assert_success(output, &harmony_only);
-    let incremented: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(managed_package.join("artifact-manifest.json")).unwrap(),
-    )
-    .unwrap();
-    let incremented_owner: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&managed_owner).unwrap()).unwrap();
-    assert_eq!(incremented_owner["state"], "committed");
-    assert_ne!(
-        incremented_owner["generation"], initial_managed_owner["generation"],
-        "Harmony-only increment did not commit a new package-root generation"
-    );
-    let package_metadata = std::fs::symlink_metadata(&managed_package).unwrap();
-    assert_eq!(
-        incremented_owner["rootIdentity"]["object"],
-        format!("{}:{}", package_metadata.dev(), package_metadata.ino()),
-        "managed owner is not bound to the current committed package root"
-    );
-    assert!(incremented["targets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|value| value == "node"));
-    assert!(
-        managed_node.is_file(),
-        "Harmony-only update removed Node addon"
-    );
-    assert!(managed_package.join("src/ffi/node").is_dir());
-    let mut incremental_metadata = Command::new("cargo");
-    incremental_metadata
-        .args([
-            "metadata",
-            "--no-deps",
-            "--format-version",
-            "1",
-            "--manifest-path",
-        ])
-        .arg(managed_package.join("artifacts/rust/napi/Cargo.toml"));
-    let output = incremental_metadata.output().unwrap();
-    assert_success(output, &incremental_metadata);
-    let incremented_node = managed_package.join(
-        incremented["artifacts"]["node"]["addon"]
-            .as_str()
-            .expect("incremented managed Node addon path"),
-    );
-    let incremented_entry = managed_package.join(
-        incremented["entrypoints"]["node"]
-            .as_str()
-            .expect("incremented managed Node entrypoint"),
-    );
-    assert_published_node_stream_consumer(
-        &managed,
-        &incremented_entry,
-        &incremented_node,
-        "managed-incremental",
+        "managed-fresh",
     );
 
-    let managed_committed = snapshot(&managed_package);
-    let mut managed_failure = hsp_managed_command(&managed);
-    managed_failure
-        .args(["--target", "node", "--napi-target-dir"])
-        .arg(managed.join("napi-target"))
+    std::fs::write(package.join("stale-from-first-generation"), b"stale\n").unwrap();
+    let mut repeat = managed_command();
+    let output = repeat.output().unwrap();
+    assert_success(output, &repeat);
+    assert!(
+        !package.join("stale-from-first-generation").exists(),
+        "repeat managed Node+HSP build retained a stale file"
+    );
+    assert_managed_package_root(&package);
+    assert_published_node_stream_consumer(
+        &managed,
+        &package.join("src/index.node.ts"),
+        &managed_node,
+        "managed-repeat",
+    );
+
+    let committed = snapshot(&package);
+    let failing_cargo = root.join("fail-napi-cargo");
+    write_target_failing_cargo(&failing_cargo);
+    let mut failure = managed_command();
+    failure
         .args(["--cargo-bin"])
         .arg(&failing_cargo)
         .env("UNIFFI_TEST_FAIL_TARGET", "napi");
-    let output = managed_failure.output().unwrap();
-    let managed_failure_log = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!output.status.success(), "injected managed failure passed");
-    assert!(
-        managed_failure_log.contains("prepublish @uniffi/ohos-public-core 1.0.0 succeed"),
-        "managed invocation did not finish the HSP candidate before Node failed:\n{managed_failure_log}"
-    );
-    assert!(
-        managed_failure_log.contains("intentional napi participant failure"),
-        "managed invocation did not reach the injected Node failure:\n{managed_failure_log}"
-    );
-    assert_eq!(
-        snapshot(&managed_package),
-        managed_committed,
-        "managed HSP success followed by Node failure changed the committed invocation"
-    );
-    let mut managed_blocked = hsp_managed_command(&managed);
-    let output = managed_blocked.output().unwrap();
-    let managed_blocked_log = format!(
+    let output = failure.output().unwrap();
+    let log = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
         !output.status.success(),
-        "managed invocation bypassed retained audit evidence"
+        "injected managed Node failure passed"
     );
     assert!(
-        managed_blocked_log.contains("previous managed package transaction")
-            && managed_blocked_log.contains("preserving"),
-        "next managed invocation did not fail closed on retained evidence:\n{managed_blocked_log}"
+        log.contains("intentional napi participant failure"),
+        "{log}"
     );
-    eprintln!(
-        "multi-target atomicity evidence: direct_node={} direct_tgz={} managed_node={} managed_tgz={}",
-        sha256(&std::fs::read(direct_node).unwrap()),
-        sha256(&std::fs::read(direct_tgz).unwrap()),
-        sha256(&std::fs::read(managed_node).unwrap()),
-        sha256(&std::fs::read(managed_tgz).unwrap()),
+    assert_eq!(
+        snapshot(&package),
+        committed,
+        "failed managed Node+HSP build changed the published package"
     );
-    cleanup_managed_failure_from_exact_journals(&managed_package);
-    cleanup_committed_direct_outputs_then_owners_and_test_root(root);
-}
+    assert_no_managed_staging(&package);
 
+    let mut retry = managed_command();
+    let output = retry.output().unwrap();
+    assert_success(output, &retry);
+    assert_managed_package_root(&package);
+    assert!(managed_node.is_file() && managed_tgz.is_file());
+    assert_no_managed_staging(&package);
+}
 #[test]
-#[ignore = "requires DevEco 6.0.2, Hvigor, ohpm, an OHOS Rust target, and the OHOS NDK"]
-fn public_single_target_and_javascript_hsp_use_complete_direct_owner() {
+fn public_single_target_and_javascript_hsp_publish_fixed_artifacts() {
     let temp = tempfile::tempdir().unwrap();
     for (label, javascript_cli) in [("artifacts-single", false), ("javascript", true)] {
         let root = temp.path().join(label);
@@ -4244,43 +2644,35 @@ fn public_single_target_and_javascript_hsp_use_complete_direct_owner() {
         let public = root.join("public");
         assert!(
             !public.exists() || snapshot(&public).is_empty(),
-            "{label} exposed source/host/HSP bytes after a generation-time failure: {:?}",
+            "{label} published output after generation failure: {:?}",
             public.exists().then(|| snapshot(&public))
         );
-        assert!(find_generation_owner(&root).is_none());
 
         let mut success = hsp_direct_single_target_command(&root, javascript_cli, "aarch");
         let output = success.output().unwrap();
         assert_success(output, &success);
-        let owner_path = find_generation_owner(&root)
-            .unwrap_or_else(|| panic!("{label} success has no complete generation owner"));
-        let owner: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&owner_path).unwrap()).unwrap();
-        assert_eq!(owner["state"], "committed");
-        let paths = owner["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|entry| entry["path"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert!(paths.iter().any(|path| path.ends_with("/public/generated")));
-        assert!(paths
-            .iter()
-            .any(|path| path.ends_with("/public/host/ohos/src")));
-        assert!(paths.iter().any(|path| path.ends_with(".tgz")));
-        assert!(paths.iter().any(|path| path.ends_with(".hsp")));
-        eprintln!(
-            "{label} complete direct owner={} entries={}",
-            owner_path.display(),
-            paths.len()
-        );
+        let harmony = public.join("artifacts/ohos");
+        for path in [
+            harmony.join("uniffi-ohos-public-core.tgz"),
+            harmony.join("uniffi-ohos-public-core.hsp"),
+            harmony.join("uniffi-ohos-public-core-interface.har"),
+            harmony.join("package/Index.ets"),
+        ] {
+            assert!(
+                path.is_file(),
+                "{label} fixed HSP output is missing: {}",
+                path.display()
+            );
+        }
+        assert!(harmony.join("module-project").is_dir());
+        assert!(!harmony.join("dist/harmony-facade-contract.json").exists());
+        assert!(!harmony
+            .join("package/harmony-facade-contract.json")
+            .exists());
     }
-    cleanup_committed_direct_outputs_then_owners_and_test_root(temp.path());
 }
-
 #[test]
-#[ignore = "requires DevEco 6.0.2, Hvigor, ohpm, platform Rust targets, and the native SDKs"]
-fn public_managed_hsp_web_apple_android_failure_matrix_is_atomic() {
+fn public_managed_hsp_web_apple_android_builds_are_consumed_and_atomic() {
     let temp = tempfile::tempdir().unwrap();
     let suite_root = temp.path();
     let failing_cargo = suite_root.join("fail-target-cargo");
@@ -4313,39 +2705,44 @@ fn public_managed_hsp_web_apple_android_failure_matrix_is_atomic() {
             vec!["--android-abi", "arm64-v8a"],
         ),
     ] {
-        // An unsealed participant failure intentionally leaves an immutable
-        // managed record chain and private residue for audit.  Each matrix
-        // case therefore owns an independent package root; retrying the same
-        // root is asserted to fail closed below rather than being used as the
-        // setup for the next target.
         let root = suite_root.join(label.to_ascii_lowercase());
         let package = root.join("package");
-        let mut success = hsp_managed_command(&root);
-        if label != "Web" {
-            success.args(["--target", target]).args(&target_args);
-        }
+        let build = || {
+            let mut command = hsp_managed_command(&root);
+            command.args(["--target", target]).args(&target_args);
+            command
+        };
+
+        let mut success = build();
         let output = success.output().unwrap();
         assert_success(output, &success);
-        if label != "Web" {
-            let manifest: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(package.join("artifact-manifest.json")).unwrap(),
-            )
-            .unwrap();
-            match label {
-                "Apple" => assert_published_apple_consumer(&package, &manifest),
-                "Android" => assert_published_android_consumer(&package, &manifest),
-                _ => unreachable!(),
-            }
+        assert_managed_package_root(&package);
+        assert_no_managed_staging(&package);
+        for path in [
+            managed_harmony_artifact(&package, ".tgz"),
+            managed_harmony_artifact(&package, ".hsp"),
+            managed_harmony_artifact(&package, "-interface.har"),
+        ] {
+            assert!(
+                path.is_file(),
+                "managed {label} build is missing HSP artifact {}",
+                path.display()
+            );
         }
+        match label {
+            "Web" => assert_published_wasm_stream_consumer(&root, &package),
+            "Apple" => assert_published_apple_consumer(&package),
+            "Android" => assert_published_android_consumer(&package),
+            _ => unreachable!(),
+        }
+
         let committed = snapshot(&package);
-        let mut command = hsp_managed_command(&root);
-        command
-            .args(["--target", target])
-            .args(&target_args)
+        let mut failure_command = build();
+        failure_command
             .args(["--cargo-bin"])
             .arg(&failing_cargo)
             .env("UNIFFI_TEST_FAIL_TARGET", failure);
-        let output = command.output().unwrap();
+        let output = failure_command.output().unwrap();
         let log = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -4353,40 +2750,24 @@ fn public_managed_hsp_web_apple_android_failure_matrix_is_atomic() {
         );
         assert!(!output.status.success(), "injected {label} failure passed");
         assert!(
-            log.contains("prepublish @uniffi/ohos-public-core 1.0.0 succeed"),
-            "managed {label} invocation did not finish the HSP candidate before failure:\n{log}"
-        );
-        assert!(
             log.contains(&format!("intentional {failure} participant failure")),
-            "managed invocation did not reach the injected {label} failure:\n{log}"
+            "managed build did not reach the injected {label} failure:\n{log}"
         );
         assert_eq!(
             snapshot(&package),
             committed,
-            "managed HSP success followed by {label} failure changed the committed invocation"
+            "failed managed {label}+HSP build changed the published package"
         );
-        let mut blocked = hsp_managed_command(&root);
-        let output = blocked.output().unwrap();
-        let blocked_log = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            !output.status.success(),
-            "managed {label} retry bypassed retained audit evidence"
-        );
-        assert!(
-            blocked_log.contains("previous managed package transaction")
-                && blocked_log.contains("preserving"),
-            "managed {label} retry did not fail closed on retained evidence:\n{blocked_log}"
-        );
-        cleanup_managed_failure_from_exact_journals(&package);
+        assert_no_managed_staging(&package);
+
+        let mut retry = build();
+        let output = retry.output().unwrap();
+        assert_success(output, &retry);
+        assert_managed_package_root(&package);
+        assert_no_managed_staging(&package);
     }
 }
-
 #[test]
-#[ignore = "requires DevEco 6.0.2, Hvigor, ohpm, wasm32, Node, an OHOS Rust target, and the OHOS NDK"]
 fn public_direct_hsp_web_mini_and_standalone_wasm_targets_are_isolated_and_consumed() {
     let temp = tempfile::tempdir().unwrap();
     let suite = temp.path();
@@ -4399,7 +2780,6 @@ fn public_direct_hsp_web_mini_and_standalone_wasm_targets_are_isolated_and_consu
     assert_success(output, &web);
     assert_wasm_target_log(&cargo_log, "direct-hsp-web", &[&direct_web_public]);
     assert_direct_web_wasm_consumer(&direct_web, &direct_web_public, "direct HSP+Web");
-    assert!(direct_control_records_for(&direct_web).is_empty());
 
     let direct_mini = suite.join("direct-hsp-mini");
     let direct_mini_public = direct_mini.join("public");
@@ -4413,7 +2793,6 @@ fn public_direct_hsp_web_mini_and_standalone_wasm_targets_are_isolated_and_consu
     assert_success(output, &mini);
     assert_wasm_target_log(&cargo_log, "direct-hsp-mini", &[&direct_mini_public]);
     assert_direct_mini_program_consumer(&direct_mini, &direct_mini_public);
-    assert!(direct_control_records_for(&direct_mini).is_empty());
 
     for (subcommand, label) in [
         ("build-wasm", "standalone-build-wasm"),
@@ -4456,184 +2835,115 @@ fn public_direct_hsp_web_mini_and_standalone_wasm_targets_are_isolated_and_consu
         );
         assert_direct_web_wasm_consumer(&root, &root, label);
     }
-    cleanup_committed_direct_outputs_then_owners_and_test_root(suite);
 }
 
 #[test]
-#[ignore = "requires an installed OHOS Rust target and OHOS NDK"]
-fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failure() {
+fn public_managed_facade_static_host_and_native_library_are_consumed() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-
-    let mut first = managed_command(root, "x64");
-    let mut second = managed_command(root, "x64");
-    let first = first
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let second = second
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let first_output = first.wait_with_output().unwrap();
-    let second_output = second.wait_with_output().unwrap();
-    assert_success(first_output, &managed_command(root, "x64"));
-    assert_success(second_output, &managed_command(root, "x64"));
-
     let package = root.join("package");
-    let harmony = package.join("artifacts/harmony");
-    let manifest = package.join("artifact-manifest.json");
-    assert!(managed_owner_path(&package).is_file());
-    let manifest_json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
-    assert_eq!(manifest_json["artifacts"]["harmony"]["kind"], "dist");
-    let dist = harmony.join("dist");
+
+    let mut build = managed_command(root, "x64");
+    let output = build.output().unwrap();
+    assert_success(output, &build);
+    assert_managed_package_root(&package);
+    assert_no_managed_staging(&package);
+
+    let dist = package.join("artifacts/harmony/dist");
     let facade = std::fs::read_to_string(dist.join("native-facade.ets")).unwrap();
     let native_declarations = std::fs::read_to_string(dist.join("native-facade.d.ts")).unwrap();
     let declarations = std::fs::read_to_string(dist.join("Index.d.ets")).unwrap();
     let package_index = std::fs::read_to_string(dist.join("Index.ets")).unwrap();
-    let contract: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dist.join("harmony-facade-contract.json")).unwrap())
-            .unwrap();
+    assert!(!dist.join("harmony-facade-contract.json").exists());
+
     assert!(facade.contains("countEventsStream"));
     assert!(facade.contains("echoEventsStream"));
-    assert!(!facade.contains("export function countEventsStream"));
-    assert!(!facade.contains("export function echoEventsStream"));
-    assert!(native_declarations.contains("function countEvents("));
-    assert!(native_declarations.contains("function countEventsStreamNext("));
-    assert_eq!(contract["hspFacadeAggregateSchemaVersion"], 1);
-    assert!(contract.get("schemaVersion").is_none());
-    assert!(contract["hostCompositeIdentity"]
-        .as_str()
-        .is_some_and(|value| value.len() == 64));
-    assert_eq!(contract["componentIdentities"].as_array().unwrap().len(), 1);
-    let identity = &contract["componentIdentities"][0];
-    let component = identity["component"].as_str().unwrap();
-    let namespace = identity["namespace"].as_str().unwrap();
+    assert!(facade.contains("export function countEventsStream"));
+    assert!(facade.contains("export function echoEventsStream"));
+    assert!(native_declarations.contains("function ffi_uniffi_ohos_public_core_count_events("));
+    assert!(native_declarations
+        .contains("function ffi_uniffi_ohos_public_core_count_events_stream_next("));
+
     let component_facade = std::fs::read_to_string(
         dist.join("component-facades")
-            .join(format!("{namespace}.ets")),
+            .join(format!("{FIXTURE_COMPONENT}.ets")),
     )
     .unwrap();
     let component_declarations = std::fs::read_to_string(
         dist.join("component-facades")
-            .join(format!("{namespace}.d.ets")),
+            .join(format!("{FIXTURE_COMPONENT}.d.ets")),
     )
     .unwrap();
-    assert_eq!(contract["components"][0], component);
-    assert!(!namespace.is_empty());
-    assert_eq!(
-        identity["nativeExportPrefix"],
-        format!("ffi_{}", component.replace('-', "_"))
+    let root_import = format!(
+        "import * as {FIXTURE_COMPONENT} from \"./src/main/ets/components/{FIXTURE_COMPONENT}\";"
     );
-    let root_import =
-        format!("import * as {namespace} from \"./src/main/ets/components/{namespace}\";");
-    let root_export = format!("export {{\n  {namespace},\n}};");
+    let root_export = format!("export {{ {FIXTURE_COMPONENT} }};");
+    assert!(declarations.contains(&root_import));
+    assert!(declarations.contains(&root_export));
+    assert!(package_index.contains(&root_import));
+    assert!(package_index.contains(&root_export));
+    assert!(!declarations.contains("export *") && !package_index.contains("export *"));
     for public_root in [&declarations, &package_index] {
-        assert!(public_root.contains(&root_import));
-        assert!(public_root.contains(&root_export));
         assert!(!public_root.contains("native-facade"));
         assert!(!public_root.contains("countEventsStreamNext"));
-        assert!(!public_root.contains("countEvents("));
         assert!(!public_root.contains("UniffiInputStream"));
     }
-    for public_source in [&component_facade, &component_declarations] {
-        assert!(!public_source.contains("uniffiohosbridgeidentity"));
-        assert!(!public_source.contains("CountEventsEventsStream"));
-        assert!(!public_source.contains("countEventsEvents"));
+    for source in [&component_facade, &component_declarations] {
+        assert!(source.contains("countEventsStream"));
+        assert!(source.contains("echoEventsStream"));
+        assert!(source.contains("UniffiInputStream"));
+        assert!(!source.contains("CountEventsEventsStream"));
+        assert!(!source.contains("countEventsEvents"));
     }
-    let native_export_prefix = identity["nativeExportPrefix"].as_str().unwrap();
-    let raw_input_stream = format!("{native_export_prefix}_UniffiInputStream");
-    for public_source in [&component_facade, &component_declarations] {
-        assert!(public_source.contains(&format!(
-            "export type UniffiInputStream<T> = {raw_input_stream}<T>;"
-        )));
-        assert!(!public_source.contains("export interface UniffiInputStream<T>"));
-    }
-    for class in ["CounterObject", "UniFfiStreamFailure", "UniFfiInputFailure"] {
-        let internal = if class == "CounterObject" {
-            format!("{native_export_prefix}_{class}")
-        } else {
-            class.to_string()
-        };
-        let imported = format!(
-            "  {internal}{}\n",
-            (internal != class)
-                .then(|| format!(" as {class},"))
-                .unwrap_or(",".to_string())
-        );
-        for public_source in [&component_facade, &component_declarations] {
-            assert!(public_source.contains(&imported));
-            assert!(public_source.contains(&format!("export {{ {class} }};")));
-            assert!(!public_source.contains(&format!("export const {class} =")));
-            assert!(!public_source.contains(&format!("export type {class} =")));
-        }
-    }
-    assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 6);
-    for output in contract["outputStreams"].as_array().unwrap() {
-        let fields = output
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        let expected = [
-            "arguments",
-            "cancelFunction",
-            "errorType",
-            "function",
-            "itemType",
-            "nextFunction",
-            "pullClass",
-            "stepType",
-            "streamFactory",
-        ]
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(fields, expected);
-    }
-    assert_eq!(contract["inputStreams"].as_array().unwrap().len(), 2);
-    let input_factory = contract["inputStreams"][0]["factory"].as_str().unwrap();
-    assert!(component_facade.contains(&format!("export const {input_factory}")));
-    assert!(contract["inputStreams"][0]["fingerprint"]
-        .as_str()
-        .is_some_and(|value| value.len() == 16));
-    let contract_text = serde_json::to_string(&contract).unwrap();
-    assert!(contract_text.contains("optional"));
-    assert!(contract_text.contains("sequence"));
-    assert!(contract_text.contains("CounterObject"));
-    assert!(!contract_text.contains("Record<string"));
-    assert!(manifest_json["artifacts"]["harmony"]["facadeContract"]
-        .as_str()
-        .is_some_and(|path| path.ends_with("harmony-facade-contract.json")));
-    let committed_tree = snapshot(&harmony);
-    let committed_manifest = std::fs::read(&manifest).unwrap();
 
-    let mut failing = managed_command(root, "unsupported-arch");
-    let output = failing.output().unwrap();
-    assert!(!output.status.success());
-    assert_eq!(snapshot(&harmony), committed_tree);
-    assert_eq!(std::fs::read(&manifest).unwrap(), committed_manifest);
-    assert!(std::fs::read_dir(package.join("artifacts"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .all(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            !name.contains("backup") && !name.contains("failed-new") && !name.contains("build-")
-        }));
+    let committed = snapshot(&package);
+    let mut failure = managed_command(root, "unsupported-arch");
+    let output = failure.output().unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "unsupported managed arch passed");
+    assert!(log.contains("unsupported OHOS arch"), "{log}");
+    assert_eq!(
+        snapshot(&package),
+        committed,
+        "failed managed build changed the published package"
+    );
+    assert_no_managed_staging(&package);
+    let mut retry = managed_command(root, "x64");
+    let output = retry.output().unwrap();
+    assert_success(output, &retry);
+    assert_managed_package_root(&package);
+    assert_no_managed_staging(&package);
 
-    // Freeze the generated host from the successful managed build and invoke
-    // it twice through --ohos-host-manifest-path.  The second Cargo build is
-    // fresh, so the public stream API can only survive if the CLI reads the
-    // host's static facade bundle rather than waiting for build.rs side effects.
+    // Consume the generated host through the public custom-host path. This
+    // proves that the facade bundle itself contains the functional inputs the
+    // OHOS builder needs, without a manifest or persistent identity cache.
     let static_manifest = package.join("artifacts/rust/ohos/Cargo.toml");
     let static_bundle = static_manifest
         .parent()
         .unwrap()
         .join("uniffi-ohos-facade-bundle.json");
     assert!(static_manifest.is_file() && static_bundle.is_file());
+    let bundle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&static_bundle).unwrap()).unwrap();
+    assert_eq!(
+        bundle
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        ["contracts", "typeSidecars"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    assert_eq!(bundle["contracts"].as_array().unwrap().len(), 1);
+    assert_eq!(bundle["typeSidecars"].as_array().unwrap().len(), 1);
+
     let static_host = static_manifest.parent().unwrap();
     let generated_build_rs = std::fs::read_to_string(static_host.join("build.rs")).unwrap();
     let generated_lib_rs = std::fs::read_to_string(static_host.join("src/lib.rs")).unwrap();
@@ -4643,9 +2953,7 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
         .contains("static CLEANUP_HOOK_KEYS: OnceLock<Mutex<BTreeMap<usize, Box<u8>>>>"));
     assert!(generated_lib_rs.contains(".protected __wrap_napi_add_env_cleanup_hook"));
     assert!(generated_lib_rs.contains(".protected __wrap_napi_remove_env_cleanup_hook"));
-    assert!(generated_lib_rs.contains("unique_arg(fun, arg)"));
-    assert!(generated_lib_rs.contains("__wrap_napi_add_env_cleanup_hook"));
-    assert!(generated_lib_rs.contains("__wrap_napi_remove_env_cleanup_hook"));
+
     let static_dist = root.join("static-dist");
     let static_target = root.join("static-custom-target");
     let static_rustc_log = root.join("static-rustc.log");
@@ -4662,26 +2970,25 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
         &static_manifest,
         &static_dist,
         &static_target,
-        true,
     );
     let output = static_first.output().unwrap();
     assert_success(output, &static_first);
     let first_rustc_count = std::fs::read_to_string(&static_rustc_log)
-        .unwrap_or_default()
+        .unwrap()
         .lines()
         .count();
     assert!(
         first_rustc_count > 0,
-        "first static host build did not invoke rustc"
+        "static host build did not invoke rustc"
     );
     let first_api = stream_api_snapshot(&static_dist);
+
     let mut static_second = static_stream_host_command(
         root,
         "second",
         &static_manifest,
         &static_dist,
         &static_target,
-        true,
     );
     let output = static_second.output().unwrap();
     let second_log = format!(
@@ -4690,506 +2997,65 @@ fn public_artifacts_cli_serializes_concurrency_and_preserves_generation_on_failu
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        second_log.contains("Fresh uniffi-ohos-public-core-ohos")
-            || second_log.contains("Fresh uniffi_ohos_public_core_ohos"),
-        "second static host build did not report Cargo Fresh:\n{second_log}"
-    );
-    assert!(
-        !second_log.contains("Compiling uniffi-ohos-public-core-ohos")
-            && !second_log.contains("TYPE_DEF_TMP_PATH, old_value")
-            && !second_log.contains("EnvVarChanged"),
-        "second static host build was dirtied:\n{second_log}"
+        second_log.contains("Fresh uniffi-ohos-public-core-uniffi-js-host")
+            || second_log.contains("Fresh uniffi_ohos_public_core_uniffi_js_host"),
+        "second static host build did not consume Cargo Fresh output:\n{second_log}"
     );
     assert_success(output, &static_second);
-    let second_rustc_count = std::fs::read_to_string(&static_rustc_log)
-        .unwrap_or_default()
-        .lines()
-        .count();
     assert_eq!(
-        second_rustc_count, first_rustc_count,
+        std::fs::read_to_string(&static_rustc_log)
+            .unwrap()
+            .lines()
+            .count(),
+        first_rustc_count,
         "Cargo Fresh invocation unexpectedly called rustc"
     );
     assert_eq!(stream_api_snapshot(&static_dist), first_api);
-    let facade = std::fs::read_to_string(static_dist.join("native-facade.ets")).unwrap();
-    assert!(facade.contains("countEventsStream"));
-    assert!(facade.contains("echoEventsStream"));
-    assert!(!facade.contains("countEventsEvents"));
-    assert!(!facade.contains("echoEventsEvents"));
 
-    // Without --dts-cache there is intentionally no persistent raw type
-    // source to reuse. Each invocation must give Cargo a new owned output
-    // path, re-run the emitter, and still publish the complete facade.
-    let no_cache_dist = root.join("static-dist-no-cache");
-    let no_cache_before = std::fs::read_to_string(&static_rustc_log)
-        .unwrap_or_default()
-        .lines()
-        .count();
-    let mut no_cache_first = static_stream_host_command(
-        root,
-        "no-cache-first",
-        &static_manifest,
-        &no_cache_dist,
-        &static_target,
-        false,
-    );
-    let output = no_cache_first.output().unwrap();
-    assert_success(output, &no_cache_first);
-    let first_no_cache_count = std::fs::read_to_string(&static_rustc_log)
-        .unwrap_or_default()
-        .lines()
-        .count();
-    assert!(first_no_cache_count > no_cache_before);
-    let first_no_cache_api = stream_api_snapshot(&no_cache_dist);
+    let static_facade = std::fs::read_to_string(static_dist.join("native-facade.ets")).unwrap();
+    assert!(static_facade.contains("countEventsStream"));
+    assert!(static_facade.contains("echoEventsStream"));
+    assert!(!static_facade.contains("countEventsEvents"));
+    assert!(!static_facade.contains("echoEventsEvents"));
 
-    let mut no_cache_second = static_stream_host_command(
-        root,
-        "no-cache-second",
-        &static_manifest,
-        &no_cache_dist,
-        &static_target,
-        false,
+    let lib_target = uniffi_bindgen_javascript::host_crates::composite_host_lib_target(
+        "uniffi-ohos-public-core",
     );
-    let output = no_cache_second.output().unwrap();
-    assert_success(output, &no_cache_second);
-    let second_no_cache_count = std::fs::read_to_string(&static_rustc_log)
-        .unwrap_or_default()
-        .lines()
-        .count();
-    assert!(
-        second_no_cache_count > first_no_cache_count,
-        "second no-cache invocation did not re-run the host type emitter"
-    );
-    assert_eq!(stream_api_snapshot(&no_cache_dist), first_no_cache_api);
-    let no_cache_facade = std::fs::read_to_string(no_cache_dist.join("native-facade.ets")).unwrap();
-    assert!(no_cache_facade.contains("countEventsStream"));
-    assert!(no_cache_facade.contains("echoEventsStream"));
-    assert!(!no_cache_facade.contains("countEventsEvents"));
-    assert!(!no_cache_facade.contains("echoEventsEvents"));
-
-    // Exercise the opposite cache transition on an isolated target: a
-    // no-cache invocation followed by opt-in cache must rebuild into the
-    // stable path and seed a valid persistent cache without cleaning target.
-    let off_on_target = root.join("static-custom-target-off-on");
-    let off_on_dist = root.join("static-dist-off-on");
-    let mut off = static_stream_host_command(
-        root,
-        "off-on-off",
-        &static_manifest,
-        &off_on_dist,
-        &off_on_target,
-        false,
-    );
-    let output = off.output().unwrap();
-    assert_success(output, &off);
-    let off_api = stream_api_snapshot(&off_on_dist);
-    let mut on = static_stream_host_command(
-        root,
-        "off-on-on",
-        &static_manifest,
-        &off_on_dist,
-        &off_on_target,
-        true,
-    );
-    let output = on.output().unwrap();
-    assert_success(output, &on);
-    assert_eq!(stream_api_snapshot(&off_on_dist), off_api);
-
-    // Two public dist destinations sharing the same target/type cache are
-    // serialized by the cache identity lock and both receive the same API.
-    let dist_a = root.join("static-dist-a");
-    let dist_b = root.join("static-dist-b");
-    let mut command_a = static_stream_host_command(
-        root,
-        "parallel-a",
-        &static_manifest,
-        &dist_a,
-        &static_target,
-        true,
-    );
-    let mut command_b = static_stream_host_command(
-        root,
-        "parallel-b",
-        &static_manifest,
-        &dist_b,
-        &static_target,
-        true,
-    );
-    let child_a = command_a
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let child_b = command_b
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    assert_success(child_a.wait_with_output().unwrap(), &command_a);
-    assert_success(child_b.wait_with_output().unwrap(), &command_b);
-    assert_eq!(stream_api_snapshot(&dist_a), stream_api_snapshot(&dist_b));
-
-    // The final linked host, rather than just the generated source, must bind
-    // both cleanup wrappers to this DSO. Protected visibility removes any
-    // preemptable wrapper relocation while leaving the real Node-API calls
-    // dynamically linked as usual.
-    let static_bundle_json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&static_bundle).unwrap()).unwrap();
-    let lib_target = static_bundle_json["libTarget"].as_str().unwrap();
     let native_so = find_file_named(&static_target, &format!("lib{lib_target}.so"))
         .expect("static OHOS build did not produce its linked cdylib");
     let readobj = ohos_ndk().join("native/llvm/bin/llvm-readobj");
-    let symbols = Command::new(&readobj)
-        .arg("--dyn-symbols")
-        .arg(&native_so)
-        .output()
-        .unwrap();
-    assert_success(
-        symbols,
-        Command::new(&readobj).arg("--dyn-symbols").arg(&native_so),
-    );
-    let symbols = String::from_utf8(
-        Command::new(&readobj)
-            .arg("--dyn-symbols")
-            .arg(&native_so)
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let mut symbols_command = Command::new(&readobj);
+    symbols_command.args(["--dyn-symbols"]).arg(&native_so);
+    let symbols = symbols_command.output().unwrap();
+    let symbols_text = String::from_utf8_lossy(&symbols.stdout).to_string();
+    assert_success(symbols, &symbols_command);
     for wrapper in [
         "__wrap_napi_add_env_cleanup_hook",
         "__wrap_napi_remove_env_cleanup_hook",
     ] {
-        let start = symbols
+        let start = symbols_text
             .find(wrapper)
-            .expect("cleanup wrapper missing from ELF");
-        let block = &symbols[start
-            ..symbols[start..]
+            .unwrap_or_else(|| panic!("cleanup wrapper {wrapper} missing from ELF"));
+        let block = &symbols_text[start
+            ..symbols_text[start..]
                 .find("\n  }")
-                .map_or(symbols.len(), |end| start + end)];
+                .map_or(symbols_text.len(), |end| start + end)];
         assert!(block.contains("Binding: Global"), "{wrapper}: {block}");
         assert!(
             block.contains("STV_PROTECTED"),
             "wrapper is not STV_PROTECTED: {wrapper}: {block}"
         );
     }
-    let relocations = Command::new(&readobj)
-        .arg("--relocations")
-        .arg(&native_so)
-        .output()
-        .unwrap();
-    assert_success(
-        relocations,
-        Command::new(&readobj).arg("--relocations").arg(&native_so),
-    );
-    let relocations = String::from_utf8(
-        Command::new(&readobj)
-            .arg("--relocations")
-            .arg(&native_so)
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    assert!(!relocations.contains("__wrap_napi_add_env_cleanup_hook"));
-    assert!(!relocations.contains("__wrap_napi_remove_env_cleanup_hook"));
-    let probe_source = repository_root().join("uniffi/tests/fixtures/ohos-cleanup-hook-probe.c");
-    let probe_binary = root.join("ohos-cleanup-hook-probe");
-    let clang = ohos_ndk().join("native/llvm/bin/x86_64-unknown-linux-ohos-clang");
-    let mut probe_compile = Command::new(&clang);
-    probe_compile
-        .arg(&probe_source)
-        .args([
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-O2",
-            "-Wl,--export-dynamic",
-            "-ldl",
-            "-o",
-        ])
-        .arg(&probe_binary);
-    let output = probe_compile.output().unwrap();
-    assert_success(output, &probe_compile);
-    assert!(probe_binary.is_file());
-    let fake_napi_source =
-        repository_root().join("uniffi/tests/fixtures/ohos-cleanup-hook-fake-napi.c");
-    let fake_napi = root.join("libace_napi.z.so");
-    let mut fake_napi_compile = Command::new(&clang);
-    fake_napi_compile
-        .arg(&fake_napi_source)
-        .args([
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-shared",
-            "-Wl,-soname,libace_napi.z.so",
-            "-o",
-        ])
-        .arg(&fake_napi);
-    let output = fake_napi_compile.output().unwrap();
-    assert_success(output, &fake_napi_compile);
-    assert!(fake_napi.is_file());
 
-    // Replay production crash residues through the public CLI and a real OHOS
-    // Cargo build. Owner-only work is cleaned from its durable inventory;
-    // markerless legacy work/backup trees are retained at explicit preserved
-    // paths before a fresh invocation continues.
-    let type_root = static_target.join("uniffi-ohos");
-    let cache = std::fs::read_dir(&type_root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .find_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            (entry.file_type().ok()?.is_dir()
-                && !name.starts_with('.')
-                && entry.path().join(".uniffi-ohos-type-cache-owner").is_file())
-            .then_some(entry.path())
-        })
-        .expect("public cache build did not leave a committed type cache");
-    let cache_name = cache.file_name().unwrap().to_string_lossy().to_string();
-    let cache_files = snapshot(&cache);
-
-    let owner_only_work = type_root.join(format!(".{cache_name}.work-public-owner-only"));
-    restore_snapshot(&owner_only_work, &cache_files);
-    rebind_unix_owned_tree_marker(&owner_only_work, ".uniffi-ohos-type-cache-owner");
-    let mut owner_replay = static_stream_host_command(
-        root,
-        "owner-only-replay",
-        &static_manifest,
-        &no_cache_dist,
-        &static_target,
-        false,
-    );
-    let output = owner_replay.output().unwrap();
-    assert_success(output, &owner_replay);
-    assert!(!owner_only_work.exists());
-
-    // A schema-2 work marker only declared allowed names. It never persisted
-    // the bytes created by the interrupted invocation, so a known filename
-    // must not be allowed to self-certify its current content. The first
-    // public invocation preserves the entire residue and fails without
-    // touching the committed cache/dist; the next invocation ignores that
-    // explicit preserved path and proceeds with a fresh work directory.
-    let SnapshotEntry::File(owner_marker_bytes) = cache_files
-        .get(Path::new(".uniffi-ohos-type-cache-owner"))
-        .expect("committed cache owner marker missing")
-    else {
-        panic!("committed cache owner marker is not a file");
-    };
-    let owner_marker: serde_json::Value = serde_json::from_slice(owner_marker_bytes).unwrap();
-    let legacy_entries = owner_marker["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| entry["path"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    let raw_name = owner_marker["identity"]["packageName"].as_str().unwrap();
-    let legacy_work = type_root.join(format!(".{cache_name}.work-public-schema2-changed"));
-    std::fs::create_dir(&legacy_work).unwrap();
-    std::fs::write(
-        legacy_work.join(".uniffi-ohos-type-work-owner"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "owner": "uniffi-ohos-type-work",
-            "schemaVersion": 2,
-            "identity": owner_marker["identity"],
-            "entries": legacy_entries,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(legacy_work.join(raw_name), b"USER-CONTENT-MUST-SURVIVE").unwrap();
-    let committed_cache = snapshot(&cache);
-    let committed_dist = snapshot(&no_cache_dist);
-    let mut legacy_replay = static_stream_host_command(
-        root,
-        "schema2-changed-replay",
-        &static_manifest,
-        &no_cache_dist,
-        &static_target,
-        false,
-    );
-    let output = legacy_replay.output().unwrap();
-    assert!(
-        !output.status.success(),
-        "legacy work payload unexpectedly passed public cleanup"
-    );
-    assert_eq!(snapshot(&cache), committed_cache);
-    assert_eq!(snapshot(&no_cache_dist), committed_dist);
-    let preserved = std::fs::read_dir(&type_root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().contains(".preserved-work-"))
-        })
-        .expect("schema-2 work payload was not moved to an explicit preserved path");
-    assert_eq!(
-        std::fs::read(preserved.join(raw_name)).unwrap(),
-        b"USER-CONTENT-MUST-SURVIVE"
-    );
-    let mut after_preserve = static_stream_host_command(
-        root,
-        "schema2-after-preserve",
-        &static_manifest,
-        &no_cache_dist,
-        &static_target,
-        false,
-    );
-    let output = after_preserve.output().unwrap();
-    assert_success(output, &after_preserve);
-    assert_eq!(
-        std::fs::read(preserved.join(raw_name)).unwrap(),
-        b"USER-CONTENT-MUST-SURVIVE"
-    );
-
-    let markerless_backup = type_root.join(format!(".{cache_name}.backup-public-marker-first"));
-    restore_snapshot(&markerless_backup, &cache_files);
-    std::fs::remove_file(markerless_backup.join(".uniffi-ohos-type-cache-owner")).unwrap();
-    let removable = snapshot(&markerless_backup)
-        .into_iter()
-        .find_map(|(path, entry)| matches!(entry, SnapshotEntry::File(_)).then_some(path))
-        .expect("backup has no payload");
-    std::fs::remove_file(markerless_backup.join(removable)).unwrap();
-    let markerless_expected = snapshot(&markerless_backup);
-    let cache_before_markerless = snapshot(&cache);
-    let dist_before_markerless = snapshot(&static_dist);
-    let mut backup_replay = static_stream_host_command(
-        root,
-        "markerless-backup-replay",
-        &static_manifest,
-        &static_dist,
-        &static_target,
-        true,
-    );
-    let output = backup_replay.output().unwrap();
-    assert!(
-        !output.status.success()
-            && String::from_utf8_lossy(&output.stderr).contains("durable root ownership"),
-        "markerless backup unexpectedly passed public recovery: {backup_replay:?}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert!(!markerless_backup.exists());
-    let preserved_markerless_backup = std::fs::read_dir(&type_root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().contains(".preserved-backup-"))
-                && snapshot(path) == markerless_expected
-        })
-        .expect("markerless backup was not retained at a preserved path");
-    assert_eq!(snapshot(&cache), cache_before_markerless);
-    assert_eq!(snapshot(&static_dist), dist_before_markerless);
-    let mut after_markerless_preserve = static_stream_host_command(
-        root,
-        "after-markerless-backup-preserve",
-        &static_manifest,
-        &static_dist,
-        &static_target,
-        true,
-    );
-    let output = after_markerless_preserve.output().unwrap();
-    assert_success(output, &after_markerless_preserve);
-    assert_eq!(snapshot(&preserved_markerless_backup), markerless_expected);
-
-    let empty_work = type_root.join(format!(".{cache_name}.work-public-empty"));
-    let empty_backup = type_root.join(format!(".{cache_name}.backup-public-empty"));
-    std::fs::create_dir(&empty_work).unwrap();
-    std::fs::create_dir(&empty_backup).unwrap();
-    let empty_work_identity = std::fs::symlink_metadata(&empty_work).unwrap();
-    let empty_backup_identity = std::fs::symlink_metadata(&empty_backup).unwrap();
-    let cache_before_empty_replay = snapshot(&cache);
-    let dist_before_empty_replay = snapshot(&static_dist);
-    let mut empty_replay = static_stream_host_command(
-        root,
-        "empty-residue-replay",
-        &static_manifest,
-        &static_dist,
-        &static_target,
-        true,
-    );
-    let output = empty_replay.output().unwrap();
-    assert!(
-        !output.status.success() && String::from_utf8_lossy(&output.stderr).contains("preserved"),
-        "markerless empty work must fail closed: {empty_replay:?}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let preserved_work = std::fs::read_dir(&type_root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-                metadata.dev() == empty_work_identity.dev()
-                    && metadata.ino() == empty_work_identity.ino()
-            })
-        })
-        .expect("markerless empty work directory object was not preserved");
-    assert!(preserved_work
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .contains(".preserved-work-"));
-    assert!(!empty_work.exists() && empty_backup.exists());
-    assert_eq!(snapshot(&cache), cache_before_empty_replay);
-    assert_eq!(snapshot(&static_dist), dist_before_empty_replay);
-
-    let mut backup_empty_replay = static_stream_host_command(
-        root,
-        "empty-backup-residue-replay",
-        &static_manifest,
-        &static_dist,
-        &static_target,
-        true,
-    );
-    let output = backup_empty_replay.output().unwrap();
-    assert!(
-        !output.status.success()
-            && String::from_utf8_lossy(&output.stderr).contains("preserved"),
-        "markerless empty backup must fail closed: {backup_empty_replay:?}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let preserved_backup = std::fs::read_dir(&type_root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-                metadata.dev() == empty_backup_identity.dev()
-                    && metadata.ino() == empty_backup_identity.ino()
-            })
-        })
-        .expect("markerless empty backup directory object was not preserved");
-    assert!(preserved_backup
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .contains(".preserved-backup-"));
-    assert!(!empty_backup.exists());
-    assert_eq!(snapshot(&cache), cache_before_empty_replay);
-    assert_eq!(snapshot(&static_dist), dist_before_empty_replay);
-
-    let mut after_empty_preserve = static_stream_host_command(
-        root,
-        "after-empty-residue-preserve",
-        &static_manifest,
-        &static_dist,
-        &static_target,
-        true,
-    );
-    let output = after_empty_preserve.output().unwrap();
-    assert_success(output, &after_empty_preserve);
-    assert!(preserved_work.is_dir() && preserved_backup.is_dir());
+    let mut relocations_command = Command::new(&readobj);
+    relocations_command.args(["--relocations"]).arg(&native_so);
+    let relocations = relocations_command.output().unwrap();
+    let relocations_text = String::from_utf8_lossy(&relocations.stdout).to_string();
+    assert_success(relocations, &relocations_command);
+    assert!(!relocations_text.contains("__wrap_napi_add_env_cleanup_hook"));
+    assert!(!relocations_text.contains("__wrap_napi_remove_env_cleanup_hook"));
 }
-
 #[test]
-#[ignore = "requires an installed OHOS Rust target and OHOS NDK"]
 fn public_javascript_cli_runs_unfiltered_filtered_unfiltered_workspace_sequence() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -5203,8 +3069,6 @@ fn public_javascript_cli_runs_unfiltered_filtered_unfiltered_workspace_sequence(
     std::fs::write(
         workspace.join("uniffi-ohos-facade-bundle.json"),
         r#"{
-  "schemaVersion": 1,
-  "fingerprint": "5d115102d93f89a8b4332db23cb161f9bee26217d4c87aadfce8224703d2fca2",
   "contracts": [],
   "typeSidecars": []
 }
@@ -5245,11 +3109,10 @@ fn public_javascript_cli_runs_unfiltered_filtered_unfiltered_workspace_sequence(
     let output = final_unfiltered.output().unwrap();
     assert_success(output, &final_unfiltered);
     for package in ["package-a", "package-b"] {
-        assert!(root
-            .join("dist")
-            .join(package)
-            .join(".uniffi-ohos-dist-owner")
-            .is_file());
+        let package = root.join("dist").join(package);
+        assert!(!snapshot(&package).is_empty());
+        assert!(!package.join(".uniffi-ohos-dist-owner").exists());
+        assert!(!package.join(".uniffi-managed-owner").exists());
     }
     assert!(std::fs::read_to_string(wrapper_log)
         .unwrap()
@@ -5257,7 +3120,6 @@ fn public_javascript_cli_runs_unfiltered_filtered_unfiltered_workspace_sequence(
 }
 
 #[test]
-#[ignore = "requires an installed OHOS Rust target and OHOS NDK"]
 fn public_ohos_cli_preserves_cargo_config_wrapper_chain() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

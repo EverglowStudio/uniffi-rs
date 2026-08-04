@@ -173,20 +173,19 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
         &std::fs::read(host_dir.join("ohos/uniffi-ohos-facade-bundle.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(bundle["hostBundleSchemaVersion"], 4);
-    assert_eq!(bundle["components"][0]["namespace"], "arithmetic");
+    assert_eq!(bundle.as_object().unwrap().len(), 2);
+    assert_eq!(bundle["contracts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(bundle["typeSidecars"].as_array().map(Vec::len), Some(1));
     assert_eq!(
-        bundle["components"][0]["nativeExportPrefix"],
-        "ffi_arithmetical"
+        bundle["contracts"][0]["file"],
+        "arithmetical.ohos-facade.json"
     );
-    assert!(bundle["fingerprint"]
-        .as_str()
-        .is_some_and(|value| value.len() == 64));
-    assert!(bundle["typeSidecars"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|entry| entry["file"] == "arithmetical.ohos-extra-types.d.ts"));
+    assert_eq!(bundle["contracts"][0].as_object().unwrap().len(), 2);
+    assert_eq!(
+        bundle["typeSidecars"][0]["file"],
+        "arithmetical.ohos-extra-types.d.ts"
+    );
+    assert_eq!(bundle["typeSidecars"][0].as_object().unwrap().len(), 2);
     let lib_rs = std::fs::read_to_string(host_dir.join("ohos/src/lib.rs")).unwrap();
     assert!(
         lib_rs.contains("include!(")
@@ -702,110 +701,39 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
         &std::fs::read(forward_hosts.join("ohos/uniffi-ohos-facade-bundle.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(bundle["hostBundleSchemaVersion"], 4);
-    assert_eq!(bundle["packageName"], host_package);
-    assert_eq!(bundle["libTarget"], host_target);
-    assert_eq!(bundle["components"].as_array().map(Vec::len), Some(2));
+    assert_eq!(bundle.as_object().unwrap().len(), 2);
     assert_eq!(bundle["contracts"].as_array().map(Vec::len), Some(2));
     assert_eq!(bundle["typeSidecars"].as_array().map(Vec::len), Some(2));
-    assert_eq!(
-        bundle["fingerprint"].as_str().map(str::len),
-        Some(64),
-        "OHOS bundle fingerprint must be an exact SHA-256",
-    );
-
-    let components = bundle["components"].as_array().unwrap();
-    let identity_components = components
-        .iter()
-        .map(|component| {
-            (
-                component["component"].as_str().unwrap().to_string(),
-                component["namespace"].as_str().unwrap().to_string(),
-                component["nativeExportPrefix"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-                component["interfaceAbiDigest"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        identity_components
-            .iter()
-            .map(|(component, namespace, prefix, _)| {
-                (component.clone(), namespace.clone(), prefix.clone())
-            })
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                "alpha_core".to_string(),
-                "alpha".to_string(),
-                "ffi_alpha_core".to_string()
-            ),
-            (
-                "beta_core".to_string(),
-                "beta".to_string(),
-                "ffi_beta_core".to_string()
-            ),
-        ],
-        "bundle components must preserve stable crate/namespace/native-prefix ownership",
-    );
-    assert!(identity_components.iter().all(|(_, _, _, digest)| {
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }));
-    assert_eq!(
-        bundle["hostCompositeIdentity"],
-        uniffi_bindgen_javascript::host_crates::composite_host_identity(
-            host_package,
-            host_target,
-            &identity_components,
-        )
-        .unwrap(),
-        "bundle identity must be recomputable from its exact component tuple",
-    );
-
-    for component in components {
-        let namespace = component["namespace"].as_str().unwrap();
-        let crate_name = component["component"].as_str().unwrap();
-        let contract_file = component["contractFile"].as_str().unwrap();
-        let identity_export = component["identityExport"].as_str().unwrap();
-        assert_eq!(component["contractSha256"].as_str().map(str::len), Some(64));
-        assert!(
-            std::fs::read_to_string(
-                forward_out
-                    .join("components")
-                    .join(namespace)
-                    .join("harmony")
-                    .join(contract_file),
-            )
-            .unwrap()
-            .contains(crate_name),
-            "each bundle contract must be the exact generated component contract"
+    for (index, component) in CANONICAL_COMPONENTS.into_iter().enumerate() {
+        let contract_entry = &bundle["contracts"][index];
+        let sidecar_entry = &bundle["typeSidecars"][index];
+        assert_eq!(contract_entry.as_object().unwrap().len(), 2);
+        assert_eq!(sidecar_entry.as_object().unwrap().len(), 2);
+        assert_eq!(
+            contract_entry["file"],
+            format!("{}.ohos-facade.json", component.crate_name)
         );
-        let sidecar = forward_out
+        assert_eq!(
+            sidecar_entry["file"],
+            format!("{}.ohos-extra-types.d.ts", component.crate_name)
+        );
+        let contract_path = forward_out
             .join("components")
-            .join(namespace)
+            .join(component.namespace)
             .join("harmony")
-            .join(format!("{crate_name}.ohos-extra-types.d.ts"));
-        let bridge = forward.generated_bridge_path(
-            &forward_out,
-            component_for_namespace(namespace),
-            "harmony",
+            .join(contract_entry["file"].as_str().unwrap());
+        let sidecar_path = forward_out
+            .join("components")
+            .join(component.namespace)
+            .join("harmony")
+            .join(sidecar_entry["file"].as_str().unwrap());
+        assert_eq!(
+            contract_entry["content"],
+            std::fs::read_to_string(contract_path).unwrap()
         );
-        assert!(
-            std::fs::read_to_string(&sidecar)
-                .unwrap()
-                .contains(identity_export)
-                && std::fs::read_to_string(&bridge)
-                    .unwrap()
-                    .contains(identity_export),
-            "OHOS sidecar and bridge must carry the same component identity export",
+        assert_eq!(
+            sidecar_entry["content"],
+            std::fs::read_to_string(sidecar_path).unwrap()
         );
     }
 
@@ -861,13 +789,6 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
         String::from_utf8_lossy(&ohos.stdout),
         String::from_utf8_lossy(&ohos.stderr),
     );
-}
-
-fn component_for_namespace(namespace: &str) -> CompositeComponent {
-    CANONICAL_COMPONENTS
-        .into_iter()
-        .find(|component| component.namespace == namespace)
-        .unwrap_or_else(|| panic!("unexpected composite namespace `{namespace}`"))
 }
 
 fn regular_tree_snapshot(

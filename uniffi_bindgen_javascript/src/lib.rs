@@ -149,7 +149,7 @@ fn generate_components(
         c.ci.derive_ffi_funcs()?;
     }
 
-    components.sort_by_key(ComponentIdentity::from_component);
+    components.sort_by_key(ComponentNames::from_component);
     let want_wasm = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Wasm);
     // Electron reuses the N-API host crate — no separate Electron crate.
     let want_napi = options.flavors.iter().any(|f| f.abi() == AbiFlavor::Napi);
@@ -162,18 +162,21 @@ fn generate_components(
         .host_crates
         .as_ref()
         .map(|host_opts| {
-            let identities = components
+            let selected_components = components
                 .iter()
-                .map(|component| host_crates::HostComponentIdentity {
+                .map(|component| host_crates::SelectedHostComponent {
                     crate_name: component.ci.crate_name().to_string(),
                     namespace: component.ci.namespace().to_string(),
                     native_export_prefix: component.ci.native_export_prefix(),
-                    interface_abi_digest: host_crates::component_interface_abi_digest(
-                        &component.ci,
-                    ),
                 })
                 .collect::<Vec<_>>();
-            host_crates::plan(host_opts, &identities, want_wasm, want_napi, want_ohos)
+            host_crates::plan(
+                host_opts,
+                &selected_components,
+                want_wasm,
+                want_napi,
+                want_ohos,
+            )
         })
         .transpose()?;
     preflight_component_layout(components, options)?;
@@ -206,12 +209,12 @@ fn generate_components(
 /// A stable component description suitable for deterministic preflight
 /// diagnostics. Deliberately excludes source paths and loader ordering.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ComponentIdentity {
+struct ComponentNames {
     crate_name: String,
     namespace: String,
 }
 
-impl ComponentIdentity {
+impl ComponentNames {
     fn from_component(component: &Component<JsConfig>) -> Self {
         Self {
             crate_name: component.ci.crate_name().to_string(),
@@ -227,7 +230,7 @@ impl ComponentIdentity {
     }
 }
 
-/// Validate every component identity and every selected cross-component owner
+/// Validate every component name and every selected cross-component owner
 /// before generation creates the output root.  The namespaced tree gives each
 /// component disjoint paths, but unsafe or duplicate namespace identifiers
 /// would still make a root export ambiguous or unsafe.
@@ -235,17 +238,17 @@ fn preflight_component_layout(
     components: &[Component<JsConfig>],
     options: &GenerateJsOptions,
 ) -> Result<()> {
-    let identities = components
+    let component_names = components
         .iter()
-        .map(ComponentIdentity::from_component)
+        .map(ComponentNames::from_component)
         .collect::<Vec<_>>();
 
-    let mut namespace_owners = BTreeMap::<String, Vec<ComponentIdentity>>::new();
-    for identity in &identities {
+    let mut namespace_owners = BTreeMap::<String, Vec<ComponentNames>>::new();
+    for names in &component_names {
         namespace_owners
-            .entry(identity.namespace.clone())
+            .entry(names.namespace.clone())
             .or_default()
-            .push(identity.clone());
+            .push(names.clone());
     }
     let duplicate_namespaces = namespace_owners
         .into_iter()
@@ -262,7 +265,7 @@ fn preflight_component_layout(
         for (namespace, owners) in duplicate_namespaces {
             let owners = owners
                 .iter()
-                .map(ComponentIdentity::describe)
+                .map(ComponentNames::describe)
                 .collect::<Vec<_>>()
                 .join(", ");
             message.push_str(&format!("- namespace `{namespace}`: {owners}\n"));
@@ -270,9 +273,9 @@ fn preflight_component_layout(
         diagnostics.push(message);
     }
 
-    let mut unsafe_namespaces = identities
+    let mut unsafe_namespaces = component_names
         .iter()
-        .filter(|identity| !is_safe_component_namespace(&identity.namespace))
+        .filter(|names| !is_safe_component_namespace(&names.namespace))
         .cloned()
         .collect::<Vec<_>>();
     unsafe_namespaces.sort();
@@ -280,8 +283,8 @@ fn preflight_component_layout(
         let mut message = String::from(
             "unsafe UniFFI component namespace(s); namespaces must be one safe TypeScript identifier path segment:\n",
         );
-        for identity in unsafe_namespaces {
-            message.push_str(&format!("- {}\n", identity.describe()));
+        for names in unsafe_namespaces {
+            message.push_str(&format!("- {}\n", names.describe()));
         }
         diagnostics.push(message);
     }
@@ -291,12 +294,12 @@ fn preflight_component_layout(
     // owner lookup inherently ambiguous, even when their output namespaces
     // are distinct.  Reject it before attempting any owner resolution rather
     // than letting a later `.find()` silently choose the first component.
-    let mut crate_root_owners = BTreeMap::<String, Vec<ComponentIdentity>>::new();
-    for identity in &identities {
+    let mut crate_root_owners = BTreeMap::<String, Vec<ComponentNames>>::new();
+    for names in &component_names {
         crate_root_owners
-            .entry(crate_root(&identity.crate_name))
+            .entry(crate_root(&names.crate_name))
             .or_default()
-            .push(identity.clone());
+            .push(names.clone());
     }
     let duplicate_crate_roots = crate_root_owners
         .into_iter()
@@ -313,7 +316,7 @@ fn preflight_component_layout(
         for (root, owners) in duplicate_crate_roots {
             let owners = owners
                 .iter()
-                .map(ComponentIdentity::describe)
+                .map(ComponentNames::describe)
                 .collect::<Vec<_>>()
                 .join(", ");
             message.push_str(&format!("- normalized crate root `{root}`: {owners}\n"));
@@ -329,7 +332,7 @@ fn preflight_component_layout(
 
     // Harmony source files alone cannot form a plural package: each
     // component needs the one composite native host that owns the shared
-    // OHOS identity and artifact.  Refuse this incomplete invocation before
+    // OHOS module and artifact. Refuse this incomplete invocation before
     // `generate_components` creates the output root.  Keep the diagnostic
     // independent of loader order so callers can treat it as an exact
     // preflight failure.
@@ -340,11 +343,11 @@ fn preflight_component_layout(
             .iter()
             .any(|flavor| matches!(flavor, FlavorTarget::Harmony))
     {
-        let mut selected = identities.clone();
+        let mut selected = component_names.clone();
         selected.sort();
         let selected = selected
             .iter()
-            .map(ComponentIdentity::describe)
+            .map(ComponentNames::describe)
             .collect::<Vec<_>>()
             .join(", ");
         bail!(

@@ -476,10 +476,6 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long = "skip-libs")]
     pub(crate) skip_libs: bool,
 
-    /// Reuse the generated OHOS type definition cache.
-    #[clap(long = "dts-cache")]
-    pub(crate) dts_cache: bool,
-
     /// Skip napi-ohos version checks.
     #[clap(long = "skip-check")]
     pub(crate) skip_check: bool,
@@ -527,10 +523,6 @@ pub(crate) struct BuildOhosArgs {
     /// Additional cargo args passed to the OHOS host cargo build after `--`.
     #[clap(last = true)]
     pub(crate) cargo_args: Vec<String>,
-
-    /// The caller already holds the managed Harmony output lock.
-    #[clap(skip)]
-    pub(crate) output_lock_held: bool,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -637,50 +629,40 @@ fn build(args: BuildArgs) -> Result<()> {
 }
 
 pub(crate) fn build_wasm(mut args: BuildWasmArgs) -> Result<()> {
-    if args.core_target_dir.is_some() && args.target_dir.is_some() {
-        let guard = WasmTargetIsolationGuard::prepare(&args)?;
-        let result = build_wasm_inner(args, Some(&guard));
-        guard.finish(result)?;
-        return Ok(());
-    }
-    let mut invocation = super::artifact_transaction::IdentityBoundInvocationRoot::create(
-        "uniffi-javascript-wasm-invocation",
-    )
-    .context("creating standalone JavaScript wasm build roots")?;
-    let build_root = invocation.build_root().join("wasm");
+    let workspace = (args.core_target_dir.is_none() || args.target_dir.is_none())
+        .then(|| {
+            super::artifact_staging::TemporaryWorkspace::create("uniffi-javascript-wasm-invocation")
+        })
+        .transpose()
+        .context("creating standalone JavaScript wasm build roots")?;
+    let build_root = workspace
+        .as_ref()
+        .map(|workspace| workspace.build_root().join("wasm"));
     if args.core_target_dir.is_none() {
-        args.core_target_dir = Some(build_root.join("core"));
+        args.core_target_dir = Some(
+            build_root
+                .as_ref()
+                .expect("missing wasm target has a temporary workspace")
+                .join("core"),
+        );
     }
     if args.target_dir.is_none() {
-        args.target_dir = Some(build_root.join("host"));
+        args.target_dir = Some(
+            build_root
+                .as_ref()
+                .expect("missing wasm target has a temporary workspace")
+                .join("host"),
+        );
     }
-    let guard = WasmTargetIsolationGuard::prepare(&args)?;
-    let result = guard.finish(build_wasm_inner(args, Some(&guard)));
-    if result.is_ok() {
-        invocation.seal()?;
-    }
-    invocation.finish(result, "standalone JavaScript wasm")
+    preflight_wasm_build_paths(&args)?;
+    let result = build_wasm_inner(args);
+    drop(workspace);
+    result
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct WasmGuardedDirectory {
-    path: Utf8PathBuf,
-    identity: super::artifact_transaction::PersistentFsIdentity,
-    /// Cargo is expected to mutate the target root itself.  Its stable parent
-    /// token detects a root A->B->A rename, while ancestors that Cargo must not
-    /// touch retain their own mutation epoch as well.
-    mutation: Option<String>,
-}
-
-struct WasmTargetIsolationGuard {
-    directories: Vec<WasmGuardedDirectory>,
-}
-
-fn wasm_guard_identity(
-    path: &Utf8Path,
-) -> Result<super::artifact_transaction::PersistentFsIdentity> {
+fn validate_real_wasm_directory(path: &Utf8Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("reading guarded wasm target directory {path}"))?;
+        .with_context(|| format!("reading wasm target directory {path}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!("wasm target path component must be a real directory: {path}");
     }
@@ -692,7 +674,7 @@ fn wasm_guard_identity(
             bail!("wasm target path component must not be a reparse point: {path}");
         }
     }
-    super::artifact_transaction::persistent_fs_identity(path, true)
+    Ok(())
 }
 
 fn wasm_absolute_lexical_path(path: &Utf8Path) -> Result<Utf8PathBuf> {
@@ -858,7 +840,7 @@ fn wasm_paths_alias_or_overlap(left: &Utf8Path, right: &Utf8Path) -> Result<bool
 fn validate_existing_wasm_directory_endpoint(path: &Utf8Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {
-            wasm_guard_identity(path)?;
+            validate_real_wasm_directory(path)?;
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -874,216 +856,65 @@ fn materialize_wasm_directories(paths: &[Utf8PathBuf]) -> Result<()> {
         validate_existing_wasm_directory_endpoint(path)?;
     }
 
-    let mut created = Vec::<WasmGuardedDirectory>::new();
-    let result = (|| -> Result<()> {
-        for path in paths {
-            let mut missing = Vec::new();
-            let mut current = path.as_path();
-            loop {
-                match std::fs::symlink_metadata(current) {
-                    Ok(_) => {
-                        wasm_guard_identity(current)?;
-                        break;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        missing.push(current.to_path_buf());
-                        current = current.parent().with_context(|| {
-                            format!("wasm directory has no existing ancestor: {path}")
-                        })?;
-                    }
-                    Err(error) => {
-                        return Err(error)
-                            .with_context(|| format!("reading wasm directory {current}"));
-                    }
-                }
-            }
-            for directory in missing.into_iter().rev() {
-                match std::fs::create_dir(&directory) {
-                    Ok(()) => created.push(WasmGuardedDirectory {
-                        identity: wasm_guard_identity(&directory)?,
-                        path: directory,
-                        mutation: None,
-                    }),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        wasm_guard_identity(&directory)?;
-                    }
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("creating guarded wasm directory {directory}")
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let mut cleanup_errors = Vec::new();
-        for directory in created.iter().rev() {
-            let cleanup = (|| -> Result<()> {
-                if wasm_guard_identity(&directory.path)? != directory.identity {
-                    bail!(
-                        "created wasm directory was replaced; preserving {}",
-                        directory.path
-                    );
-                }
-                if std::fs::read_dir(&directory.path)?.next().is_some() {
-                    bail!(
-                        "created wasm directory is no longer empty; preserving {}",
-                        directory.path
-                    );
-                }
-                std::fs::remove_dir(&directory.path)
-                    .with_context(|| format!("removing created wasm directory {}", directory.path))
-            })();
-            if let Err(cleanup) = cleanup {
-                cleanup_errors.push(format!("{cleanup:#}"));
-            }
-        }
-        if cleanup_errors.is_empty() {
-            return Err(error);
-        }
-        bail!(
-            "guarded wasm directory setup failed: {error:#}; identity-bound cleanup also failed: {}",
-            cleanup_errors.join("; ")
-        );
+    for path in paths {
+        std::fs::create_dir_all(path).with_context(|| format!("creating wasm directory {path}"))?;
+        validate_real_wasm_directory(path)?;
     }
     Ok(())
 }
 
-impl WasmTargetIsolationGuard {
-    fn prepare(args: &BuildWasmArgs) -> Result<Self> {
-        let core = wasm_preflight_nofollow(
-            args.core_target_dir
-                .as_deref()
-                .context("wasm core target directory was not resolved")?,
-        )?;
-        let host = wasm_preflight_nofollow(
-            args.target_dir
-                .as_deref()
-                .context("wasm host target directory was not resolved")?,
-        )?;
-        let mut published = vec![
-            wasm_preflight_nofollow(&args.out_dir)?,
-            wasm_preflight_nofollow(&args.host_crates_dir)?,
-        ];
-        for path in [
-            args.artifact_dir.as_deref(),
-            args.wasm_bindgen_out_dir.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            published.push(wasm_preflight_nofollow(path)?);
-        }
-        if wasm_paths_alias_or_overlap(&core, &host)? {
-            bail!(
+fn preflight_wasm_build_paths(args: &BuildWasmArgs) -> Result<()> {
+    let core = wasm_preflight_nofollow(
+        args.core_target_dir
+            .as_deref()
+            .context("wasm core target directory was not resolved")?,
+    )?;
+    let host = wasm_preflight_nofollow(
+        args.target_dir
+            .as_deref()
+            .context("wasm host target directory was not resolved")?,
+    )?;
+    let mut published = vec![
+        wasm_preflight_nofollow(&args.out_dir)?,
+        wasm_preflight_nofollow(&args.host_crates_dir)?,
+    ];
+    for path in [
+        args.artifact_dir.as_deref(),
+        args.wasm_bindgen_out_dir.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        published.push(wasm_preflight_nofollow(path)?);
+    }
+    if wasm_paths_alias_or_overlap(&core, &host)? {
+        bail!(
                 "wasm isolated paths alias or overlap: core Cargo target `{core}` vs host Cargo target `{host}`"
             );
-        }
-        for output in &published {
-            for (label, target) in [
-                ("core Cargo target", core.as_path()),
-                ("host Cargo target", host.as_path()),
-            ] {
-                if wasm_paths_alias_or_overlap(target, output)? {
-                    bail!(
+    }
+    for output in &published {
+        for (label, target) in [
+            ("core Cargo target", core.as_path()),
+            ("host Cargo target", host.as_path()),
+        ] {
+            if wasm_paths_alias_or_overlap(target, output)? {
+                bail!(
                         "wasm isolated paths alias or overlap: {label} `{target}` vs generated/published output `{output}`"
                     );
-                }
             }
-        }
-        // Materialize every legal publication root before capturing the
-        // explicit target's parent mutation epoch.  Mixed explicit/default
-        // layouts commonly place `explicit-core`, `generated`, `host`, and
-        // `artifacts` as siblings.  Creating those expected sibling roots
-        // after the guard is armed would be indistinguishable from a target
-        // root rename in the shared parent and would reject a normal build.
-        // Writes below the pre-created roots do not mutate that shared parent,
-        // while target A->B->A still does.
-        let materialized = published
-            .iter()
-            .cloned()
-            .chain([core.clone(), host.clone()])
-            .collect::<Vec<_>>();
-        materialize_wasm_directories(&materialized)?;
-        let mut directories = Vec::new();
-        for target in [&core, &host] {
-            let mutation_parent = target
-                .parent()
-                .context("guarded wasm Cargo target has no parent")?
-                .to_path_buf();
-            let mut current = Some(target.as_path());
-            while let Some(path) = current {
-                if path.exists() {
-                    let guarded = WasmGuardedDirectory {
-                        path: path.to_path_buf(),
-                        identity: wasm_guard_identity(path)?,
-                        // Only the immediate parent is the rename authority
-                        // for this target root. Guarding global ancestors such
-                        // as /tmp would turn unrelated concurrent builds into
-                        // false positives.
-                        mutation: (path == mutation_parent)
-                            .then(|| {
-                                super::artifact_transaction::directory_mutation_token_for_owner(
-                                    path,
-                                )
-                            })
-                            .transpose()?,
-                    };
-                    if !directories
-                        .iter()
-                        .any(|value: &WasmGuardedDirectory| value.path == path)
-                    {
-                        directories.push(guarded);
-                    }
-                }
-                current = path.parent();
-            }
-        }
-        let guard = Self { directories };
-        guard.validate()?;
-        Ok(guard)
-    }
-
-    fn validate(&self) -> Result<()> {
-        for guarded in &self.directories {
-            if wasm_guard_identity(&guarded.path)? != guarded.identity {
-                bail!(
-                    "wasm target directory/ancestor identity changed while Cargo was running: {}",
-                    guarded.path
-                );
-            }
-            if let Some(expected) = &guarded.mutation {
-                let actual =
-                    super::artifact_transaction::directory_mutation_token_for_owner(&guarded.path)?;
-                if &actual != expected {
-                    bail!(
-                        "wasm target ancestor mutation epoch changed while Cargo was running: {}",
-                        guarded.path
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn finish<T>(&self, result: Result<T>) -> Result<T> {
-        match (result, self.validate()) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(identity)) => Err(identity),
-            (Err(error), Err(identity)) => Err(anyhow::anyhow!(
-                "standalone wasm build failed: {error:#}; explicit target identity validation also failed: {identity:#}"
-            )),
         }
     }
+    // Preflight every endpoint before creating any missing directory.
+    let materialized = published
+        .iter()
+        .cloned()
+        .chain([core.clone(), host.clone()])
+        .collect::<Vec<_>>();
+    materialize_wasm_directories(&materialized)?;
+    Ok(())
 }
 
-fn build_wasm_inner(
-    args: BuildWasmArgs,
-    target_guard: Option<&WasmTargetIsolationGuard>,
-) -> Result<()> {
+fn build_wasm_inner(args: BuildWasmArgs) -> Result<()> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let core_meta = cargo_package_metadata(&manifest_path)?;
 
@@ -1133,10 +964,6 @@ fn build_wasm_inner(
         "cargo",
         "install Rust's cargo toolchain or pass --cargo-bin <path>",
     )?;
-    if let Some(guard) = target_guard {
-        guard.validate()?;
-    }
-
     let generation_source = if let Some(source) = &args.source {
         canonicalize_or_keep(source)
     } else {
@@ -1226,10 +1053,6 @@ fn build_wasm_inner(
         "cargo",
         "install Rust's wasm32-unknown-unknown target with `rustup target add wasm32-unknown-unknown`",
     )?;
-    if let Some(guard) = target_guard {
-        guard.validate()?;
-    }
-
     let wasm_meta = cargo_package_metadata(&wasm_manifest)?;
     let wasm_artifact = if let Some(target_dir) = &target_dir {
         wasm_meta.wasm_artifact_path_in(target_dir, args.release)
@@ -1453,7 +1276,7 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
 }
 
 pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
-    if args.package_kind == super::ohos::PackageKind::Hsp && !args.output_lock_held {
+    if args.package_kind == super::ohos::PackageKind::Hsp {
         return build_direct_ohos_hsp(args);
     }
     if let Some(prepared) = build_ohos_internal(args, false)? {
@@ -1462,10 +1285,8 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     Ok(())
 }
 
-/// Build every direct JavaScript HSP generation in a private source/host
-/// mirror, then publish the generic and HSP participants under one complete
-/// owner.  In particular, an OHOS Cargo/arch failure can never expose freshly
-/// generated common/Harmony sources without the matching HSP generation.
+/// Build every direct JavaScript HSP output in a private source/host mirror,
+/// then replace the completed public outputs from ordinary sibling staging.
 fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
     super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
         package_kind: public.package_kind,
@@ -1501,7 +1322,7 @@ fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
         cwd.join(&public.host_crates_dir)
     };
     let public_ohos = public_host.join("ohos");
-    let mut specifications = vec![super::artifact_transaction::InvocationOutputSpec {
+    let mut specifications = vec![super::artifact_staging::InvocationOutputSpec {
         label: "generated JavaScript source root".into(),
         path: public_out,
         is_directory: true,
@@ -1517,149 +1338,62 @@ fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
         ),
         ("OHOS host source", "src", true),
     ] {
-        specifications.push(super::artifact_transaction::InvocationOutputSpec {
+        specifications.push(super::artifact_staging::InvocationOutputSpec {
             label: label.into(),
             path: public_ohos.join(relative),
             is_directory,
         });
     }
-    let mut plan = super::artifact_transaction::GenericPublicationPlan::new(
-        specifications,
-        &outputs,
-        super::ohos::publication_hooks(),
-    )
-    .context("planning complete direct JavaScript HSP publication")?;
-    // Declared before both staged participants so locks outlive every rollback
-    // and identity-bound cleanup guard.
-    let _union_locks = plan
-        .take_output_locks()
-        .context("direct JavaScript HSP coordinator lost its union lock")?;
-    let mut invocation = super::artifact_transaction::IdentityBoundInvocationRoot::create(
-        "uniffi-javascript-hsp-invocation",
-    )
-    .context("creating private JavaScript HSP invocation")?;
-    let result = (|| -> Result<()> {
-        let mirror = invocation.mirror_root().to_path_buf();
-        let build_root = invocation.build_root().to_path_buf();
-        let private_out = mirror.join("generated");
-        let private_host = mirror.join("host");
-        let private_ohos = private_host.join("ohos");
-        let mut private = public.clone();
-        private.out_dir = private_out.clone();
-        private.host_crates_dir = private_host;
-        private.logical_host_crates_dir = Some(public_host.clone());
-        private.target_dir = Some(build_root.join("ohos"));
-        private.output_lock_held = true;
+    let invocation =
+        super::artifact_staging::TemporaryWorkspace::create("uniffi-javascript-hsp-invocation")
+            .context("creating private JavaScript HSP invocation")?;
+    let mirror = invocation.mirror_root().to_path_buf();
+    let build_root = invocation.build_root().to_path_buf();
+    let private_out = mirror.join("generated");
+    let private_host = mirror.join("host");
+    let private_ohos = private_host.join("ohos");
+    let mut private = public.clone();
+    private.out_dir = private_out.clone();
+    private.host_crates_dir = private_host;
+    private.logical_host_crates_dir = Some(public_host.clone());
+    private.target_dir = Some(build_root.join("ohos"));
 
-        let mut sources = vec![private_out];
-        for relative in [
-            "Cargo.toml",
-            "Cargo.lock",
-            "build.rs",
-            "uniffi-ohos-facade-bundle.json",
-            "src",
-        ] {
-            sources.push(private_ohos.join(relative));
-        }
-        let prepared = build_ohos_internal(private, true)?
-            .context("private JavaScript HSP build did not return a deferred generation")?;
-        if prepared.output_paths() != outputs {
-            bail!("direct JavaScript HSP output plan changed during private generation");
-        }
-        // No later step may write the private source/build tree. Seal it before
-        // staging reads any source so cleanup rejects replacement or ABA.
-        invocation.seal()?;
-        let mut hsp_publication = plan.stage_hsp(prepared)?;
-        let mut generic_publication = plan.stage(&sources)?;
-        if let Err(error) =
-            generic_publication.register_complete_candidates(&hsp_publication.next_entries())
-        {
-            let hsp_candidates = if generic_publication.requires_control_preservation() {
-                Err(anyhow::anyhow!(
-                    "HSP candidates are preserved because candidate-record durability is uncertain"
-                ))
-            } else {
-                hsp_publication.cleanup_unpublished_candidates()
-            };
-            let controls = generic_publication.rollback();
-            return match (hsp_candidates, controls) {
-                (Ok(()), Ok(())) => {
-                    Err(error).context("registering complete direct JavaScript candidates")
-                }
-                (hsp, controls) => Err(anyhow::anyhow!(
-                    "registering complete direct JavaScript candidates failed: {error:#}; HSP candidate cleanup={hsp:?}; generic/control cleanup={controls:?}"
-                )),
-            };
-        }
-        if let Err(error) = generic_publication.publish_hsp(&mut hsp_publication) {
-            let controls = generic_publication.rollback();
-            return match controls {
-                Ok(()) => Err(error),
-                Err(controls) => Err(anyhow::anyhow!(
-                    "publishing direct JavaScript HSP participant failed: {error:#}; control cleanup also failed: {controls:#}"
-                )),
-            };
-        }
-        if let Err(error) = generic_publication.publish() {
-            let hsp_recovery = if generic_publication.complete_owner_recovery_finished() {
-                hsp_publication.mark_recovered_by_complete_owner();
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!(
-                    "complete-owner durable recovery did not finish; HSP state is preserved"
-                ))
-            };
-            let controls = generic_publication.abort_controls_after_rollback();
-            return match (hsp_recovery, controls) {
-                (Ok(()), Ok(())) => {
-                    Err(error).context("publishing direct JavaScript HSP sources")
-                }
-                (recovery, controls) => Err(anyhow::anyhow!(
-                    "direct JavaScript HSP source publication failed: {error:#}; HSP complete-owner recovery={recovery:?}; control cleanup={controls:?}"
-                )),
-            };
-        }
-        match generic_publication.commit_record(&hsp_publication.next_entries()) {
-            Err(error) => {
-                let generic_rollback = generic_publication.rollback_outputs_only();
-                let hsp_recovery = if generic_rollback.is_ok()
-                    && generic_publication.complete_owner_recovery_finished()
-                {
-                    hsp_publication.mark_recovered_by_complete_owner();
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!(
-                        "complete-owner durable recovery did not finish; HSP state is preserved"
-                    ))
-                };
-                let controls = generic_publication.abort_controls_after_rollback();
-                match (generic_rollback, hsp_recovery, controls) {
-                    (Ok(()), Ok(()), Ok(())) => Err(error),
-                    (generic, hsp, controls) => Err(anyhow::anyhow!(
-                        "direct JavaScript final owner failed before commit: {error:#}; complete-owner recovery={generic:?}; HSP recovery state={hsp:?}; control cleanup={controls:?}"
-                    )),
-                }
-            }
-            Ok(super::artifact_transaction::DirectCommitOutcome::Verified) => {
-                generic_publication.finalize_hsp(hsp_publication)?;
-                generic_publication.finalize()
-            }
-            Ok(super::artifact_transaction::DirectCommitOutcome::CommittedNeedsAudit(error)) => {
-                hsp_publication.preserve_previous_backups();
-                let _ = hsp_publication.finalize();
-                let _ = generic_publication.finalize();
-                Err(error)
-            }
-        }
-    })();
-    // Keep the complete union lock alive through explicit identity-bound
-    // cleanup, including ordinary generation/publication failures.
-    invocation.finish(result, "JavaScript HSP")
+    let mut sources = vec![private_out];
+    for relative in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "uniffi-ohos-facade-bundle.json",
+        "src",
+    ] {
+        sources.push(private_ohos.join(relative));
+    }
+    let prepared = build_ohos_internal(private, true)?
+        .context("private JavaScript HSP build did not return a deferred generation")?;
+    if prepared.output_paths() != outputs {
+        bail!("direct JavaScript HSP output plan changed during private generation");
+    }
+    let staged_sources = sources
+        .iter()
+        .zip(&specifications)
+        .map(|(source, destination)| {
+            (
+                source.as_path(),
+                destination.path.as_path(),
+                destination.is_directory,
+            )
+        })
+        .collect::<Vec<_>>();
+    super::artifact_staging::publish_simple_output_set(staged_sources)
+        .context("publishing ordinary staged JavaScript outputs")?;
+    prepared
+        .commit()
+        .context("publishing ordinary staged Harmony HSP outputs")
 }
 
 fn planned_direct_ohos_hsp_outputs(
     args: &BuildOhosArgs,
-) -> Result<Vec<super::artifact_transaction::HspOutputPaths>> {
+) -> Result<Vec<super::artifact_staging::HspOutputPaths>> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let cwd = Utf8PathBuf::from_path_buf(std::env::current_dir()?)
         .map_err(|path| anyhow::anyhow!("cwd is not utf8: {}", path.display()))?;
@@ -1742,14 +1476,12 @@ fn planned_direct_ohos_hsp_outputs(
             cargo_args,
             copy_static: args.copy_static,
             skip_libs: args.skip_libs,
-            dts_cache: args.dts_cache,
             skip_check: args.skip_check,
             zigbuild: args.zigbuild,
             bisheng: args.bisheng,
             package: args.package.clone(),
             skip_napi_check: args.skip_napi_check,
             soname: args.soname.clone(),
-            output_lock_held: true,
             frontend_hsp_preflight_done: true,
         });
     }
@@ -1772,7 +1504,7 @@ fn planned_direct_ohos_hsp_outputs(
 
 pub(crate) fn build_ohos_deferred(
     args: BuildOhosArgs,
-) -> Result<super::artifact_transaction::PreparedHspInvocation> {
+) -> Result<super::artifact_staging::PreparedHspInvocation> {
     build_ohos_internal(args, true)?
         .context("deferred JavaScript OHOS build did not produce an HSP invocation")
 }
@@ -1780,7 +1512,7 @@ pub(crate) fn build_ohos_deferred(
 fn build_ohos_internal(
     args: BuildOhosArgs,
     defer_hsp_publication: bool,
-) -> Result<Option<super::artifact_transaction::PreparedHspInvocation>> {
+) -> Result<Option<super::artifact_staging::PreparedHspInvocation>> {
     super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
         package_kind: args.package_kind,
         integrated_hsp: args.integrated_hsp,
@@ -1941,14 +1673,12 @@ fn build_ohos_internal(
                 cargo_args: ohos_cargo_args,
                 copy_static: args.copy_static,
                 skip_libs: args.skip_libs,
-                dts_cache: args.dts_cache,
                 skip_check: args.skip_check,
                 zigbuild: args.zigbuild,
                 bisheng: args.bisheng,
                 package: args.package.clone(),
                 skip_napi_check: args.skip_napi_check,
                 soname: args.soname.clone(),
-                output_lock_held: args.output_lock_held,
                 frontend_hsp_preflight_done: true,
             })
             .context("preflighting custom multi-package HSP host before core generation")?;
@@ -2089,14 +1819,12 @@ fn build_ohos_internal(
         cargo_args: ohos_cargo_args,
         copy_static: args.copy_static,
         skip_libs: args.skip_libs,
-        dts_cache: args.dts_cache,
         skip_check: args.skip_check,
         zigbuild: args.zigbuild,
         bisheng: args.bisheng,
         package: args.package,
         skip_napi_check: args.skip_napi_check,
         soname: args.soname,
-        output_lock_held: args.output_lock_held,
         frontend_hsp_preflight_done: true,
     };
     if defer_hsp_publication {
@@ -2300,8 +2028,8 @@ fn cargo_package_matches_selector(package: &Package, selector: &str) -> bool {
 mod tests {
     use super::{
         emit_browser_auto_entrypoint, host_dependency_cargo_feature_args,
-        patch_mini_program_web_runtime, rebase_mini_program_auto_entrypoint, BuildWasmArgs,
-        WasmBindgenTargetArg, WasmTargetIsolationGuard,
+        patch_mini_program_web_runtime, preflight_wasm_build_paths,
+        rebase_mini_program_auto_entrypoint, BuildWasmArgs, WasmBindgenTargetArg,
     };
     #[cfg(windows)]
     use super::{wasm_preflight_nofollow, windows_wasm_semantic_path_key};
@@ -2504,39 +2232,17 @@ edition = "2021"
     }
 
     #[test]
-    fn explicit_wasm_guard_allows_cargo_writes_but_rejects_root_aba() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let args = guarded_wasm_args(&root);
-        let guard = WasmTargetIsolationGuard::prepare(&args).unwrap();
-        let core = args.core_target_dir.as_ref().unwrap();
-
-        // Cargo must be able to populate the target root without invalidating
-        // the isolation guard.
-        std::fs::write(core.join("cargo-output"), b"ok").unwrap();
-        guard.validate().unwrap();
-
-        // Moving the same root object away and back preserves its inode but
-        // mutates the guarded parent epoch, so the cross-invocation ABA is not
-        // mistaken for an untouched target root.
-        let displaced = root.join("targets/core-displaced");
-        std::fs::rename(core, &displaced).unwrap();
-        std::fs::rename(&displaced, core).unwrap();
-        assert!(guard.validate().is_err());
-    }
-
-    #[test]
-    fn explicit_wasm_guard_rejects_dotdot_overlap_and_symlink_aliases() {
+    fn explicit_wasm_preflight_rejects_dotdot_overlap_and_symlink_aliases() {
         let temp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
 
         let mut dotdot = guarded_wasm_args(&root);
         dotdot.core_target_dir = Some(root.join("targets/../core"));
-        assert!(WasmTargetIsolationGuard::prepare(&dotdot).is_err());
+        assert!(preflight_wasm_build_paths(&dotdot).is_err());
 
         let mut overlap = guarded_wasm_args(&root);
         overlap.target_dir = Some(root.join("targets/core/host"));
-        assert!(WasmTargetIsolationGuard::prepare(&overlap).is_err());
+        assert!(preflight_wasm_build_paths(&overlap).is_err());
 
         #[cfg(unix)]
         {
@@ -2545,7 +2251,7 @@ edition = "2021"
                 .unwrap();
             let mut alias = guarded_wasm_args(&root);
             alias.core_target_dir = Some(root.join("alias-targets/core"));
-            assert!(WasmTargetIsolationGuard::prepare(&alias).is_err());
+            assert!(preflight_wasm_build_paths(&alias).is_err());
         }
     }
 
@@ -2656,21 +2362,21 @@ edition = "2021"
     }
 
     #[test]
-    fn explicit_wasm_guard_preflights_every_endpoint_before_creating_any_root() {
+    fn explicit_wasm_preflight_checks_every_endpoint_before_creating_any_root() {
         let temp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let args = guarded_wasm_args(&root);
         std::fs::create_dir(root.join("published")).unwrap();
         std::fs::write(&args.host_crates_dir, b"not-a-directory").unwrap();
 
-        assert!(WasmTargetIsolationGuard::prepare(&args).is_err());
+        assert!(preflight_wasm_build_paths(&args).is_err());
         assert!(
             !args.out_dir.exists()
                 && !args.artifact_dir.as_ref().unwrap().exists()
                 && !args.wasm_bindgen_out_dir.as_ref().unwrap().exists()
                 && !args.core_target_dir.as_ref().unwrap().exists()
                 && !args.target_dir.as_ref().unwrap().exists(),
-            "failed endpoint preflight left a guarded wasm root behind"
+            "failed endpoint preflight left a wasm root behind"
         );
         assert_eq!(
             std::fs::read(&args.host_crates_dir).unwrap(),
@@ -2902,8 +2608,8 @@ struct GeneratedComponent {
 
 /// Resolve every selected component for one generated flavor. Each namespace
 /// still owns exactly one bridge file; this function only pluralizes the
-/// package-level discovery and verifies that component/namespace/prefix
-/// identities are canonical before any build command copies an artifact.
+/// package-level discovery and verifies that component/namespace/prefix names
+/// are valid before any build command copies an artifact.
 fn generated_components(out_dir: &Utf8Path, flavor: &str) -> Result<Vec<GeneratedComponent>> {
     let components_dir = out_dir.join("components");
     let mut components = Vec::new();
@@ -2961,7 +2667,7 @@ fn generated_components(out_dir: &Utf8Path, flavor: &str) -> Result<Vec<Generate
             || !prefixes.insert(component.native_export_prefix.as_str())
         {
             bail!(
-                "generated JavaScript components for `{flavor}` have a duplicate canonical identity field: {component:?}"
+                "generated JavaScript components for `{flavor}` have a duplicate component, namespace, or native export prefix: {component:?}"
             );
         }
     }

@@ -23,30 +23,23 @@ use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{CargoOpt, DependencyKind, MetadataCommand, Package, PackageId, TargetKind};
 use fs_err as fs;
-use sha2::{Digest, Sha256};
-use std::hash::Hasher;
-use uniffi_meta::Checksum;
 
-const HOST_BUNDLE_SCHEMA_VERSION: u32 = 4;
-
-/// Canonical identity of one selected JavaScript component before Cargo
-/// dependency planning.  The generator supplies these in stable order, but
-/// the planner independently verifies that order and every native prefix so a
-/// host crate can never accidentally bind a bridge to a similarly named
-/// package.
+/// Names and native prefix for one selected JavaScript component before Cargo
+/// dependency planning. The generator supplies these in stable order, and the
+/// planner verifies that order so a host crate cannot bind a bridge to a
+/// similarly named package.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct HostComponentIdentity {
+pub(crate) struct SelectedHostComponent {
     pub(crate) crate_name: String,
     pub(crate) namespace: String,
     pub(crate) native_export_prefix: String,
-    pub(crate) interface_abi_digest: String,
 }
 
-impl HostComponentIdentity {
+impl SelectedHostComponent {
     pub(crate) fn describe(&self) -> String {
         format!(
-            "component `{}` (namespace `{}`, native export prefix `{}`, interface ABI `{}`)",
-            self.crate_name, self.namespace, self.native_export_prefix, self.interface_abi_digest
+            "component `{}` (namespace `{}`, native export prefix `{}`)",
+            self.crate_name, self.namespace, self.native_export_prefix
         )
     }
 }
@@ -55,8 +48,8 @@ impl HostComponentIdentity {
 struct PlannedPackageDependency {
     /// Rust extern-crate key written in every generated host Cargo.toml.
     dependency_key: String,
-    /// Resolved Cargo package identity.  Package names alone are not unique
-    /// enough to prove that an aliased direct dependency is the dependency
+    /// Resolved Cargo package ID. Package names alone are not unique enough
+    /// to prove that an aliased direct dependency is the dependency
     /// selected by the current root resolve graph.
     package_id: PackageId,
     /// Cargo package name, which may differ from its Rust lib target.
@@ -66,7 +59,7 @@ struct PlannedPackageDependency {
 
 #[derive(Clone, Debug)]
 struct PlannedComponentDependency {
-    identity: HostComponentIdentity,
+    component: SelectedHostComponent,
     package: PlannedPackageDependency,
 }
 
@@ -98,25 +91,6 @@ impl HostCratePlan {
 
     fn ohos_host_package_name(&self) -> String {
         composite_host_package_name(&self.meta.package_name)
-    }
-
-    fn ohos_composite_identity(&self) -> Result<String> {
-        composite_host_identity(
-            &self.ohos_host_package_name(),
-            &self.ohos_artifact_stem(),
-            &self
-                .components
-                .iter()
-                .map(|component| {
-                    (
-                        component.identity.crate_name.clone(),
-                        component.identity.namespace.clone(),
-                        component.identity.native_export_prefix.clone(),
-                        component.identity.interface_abi_digest.clone(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
     }
 }
 
@@ -243,33 +217,32 @@ fn core_metadata_from_package(
 /// that compiles only by accident (or routes to the wrong component).
 pub(crate) fn plan(
     options: &HostCrateOptions,
-    identities: &[HostComponentIdentity],
+    selected_components: &[SelectedHostComponent],
     want_wasm: bool,
     want_napi: bool,
     want_ohos: bool,
 ) -> Result<HostCratePlan> {
-    if identities.is_empty() {
+    if selected_components.is_empty() {
         bail!("host-crate generation requires at least one selected component");
     }
 
-    let mut canonical_identities = identities.to_vec();
-    canonical_identities.sort();
-    if canonical_identities != identities {
+    let mut canonical_components = selected_components.to_vec();
+    canonical_components.sort();
+    if canonical_components != selected_components {
         bail!(
-            "host-crate component identities must be supplied in canonical (crate, namespace, native prefix, interface ABI digest) order"
+            "host-crate components must be supplied in canonical (crate, namespace, native prefix) order"
         );
     }
-    for identity in identities {
+    for component in selected_components {
         let expected =
-            uniffi_bindgen::interface::native_export_prefix_for_component(&identity.crate_name);
-        if identity.crate_name.is_empty()
-            || identity.namespace.is_empty()
-            || identity.native_export_prefix != expected
-            || !is_sha256(&identity.interface_abi_digest)
+            uniffi_bindgen::interface::native_export_prefix_for_component(&component.crate_name);
+        if component.crate_name.is_empty()
+            || component.namespace.is_empty()
+            || component.native_export_prefix != expected
         {
             bail!(
-                "host-crate component identity is invalid for {}",
-                identity.describe()
+                "host-crate component selection is invalid for {}",
+                component.describe()
             );
         }
     }
@@ -330,9 +303,9 @@ pub(crate) fn plan(
     let root_dependency = planned_root_dependency(root)?;
     let direct_packages = resolved_direct_normal_packages(&metadata, root, root_node)?;
 
-    let mut components = Vec::with_capacity(identities.len());
-    for identity in identities {
-        let expected_lib_target = rust_crate_key(&identity.crate_name);
+    let mut components = Vec::with_capacity(selected_components.len());
+    for component in selected_components {
+        let expected_lib_target = rust_crate_key(&component.crate_name);
         let mut candidates = Vec::new();
 
         if package_exposes_lib_target(root, &expected_lib_target) {
@@ -359,16 +332,16 @@ pub(crate) fn plan(
         });
         match candidates.as_slice() {
             [package] => components.push(PlannedComponentDependency {
-                identity: identity.clone(),
+                component: component.clone(),
                 package: package.clone(),
             }),
             [] => bail!(
                 "host-crate component {} is not an exact lib target of the root package or one of its direct normal dependencies",
-                identity.describe()
+                component.describe()
             ),
             _ => bail!(
                 "host-crate component {} has multiple direct package mappings; use one exact dependency key/lib target",
-                identity.describe()
+                component.describe()
             ),
         }
     }
@@ -384,7 +357,7 @@ pub(crate) fn plan(
     let mut collisions = Vec::new();
     for component in &components {
         let package = &component.package;
-        let owner = component.identity.describe();
+        let owner = component.component.describe();
         match dependency_owners.entry(package.dependency_key.clone()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert((package.package_id.to_string(), vec![owner]));
@@ -611,7 +584,7 @@ fn rust_crate_key(value: &str) -> String {
 /// The per-component bridge files are included into sibling modules in every
 /// generated composite host crate.  Their Rust type metadata identifies an
 /// owner by crate root, not by its public JavaScript namespace, so this name
-/// must be derived from that same normalized crate-root identity.  Keeping
+/// must be derived from that same normalized crate-root name. Keeping
 /// the encoding here makes host inclusion and cross-component bridge paths
 /// share one contract even when a component's Cargo package, Rust lib target,
 /// and JavaScript namespace differ.
@@ -649,8 +622,7 @@ fn package_dir(package: &Package) -> Result<Utf8PathBuf> {
 
 /// Stable logical Cargo package name shared by all generated JavaScript host
 /// flavors. The host directories and artifact extensions remain flavor
-/// specific, but this tuple is intentionally identical for wasm, N-API and
-/// OHOS so a package-level manifest has one unambiguous host identity.
+/// specific, while wasm, N-API, and OHOS use the same package name.
 pub fn composite_host_package_name(package_name: &str) -> String {
     format!("{package_name}-uniffi-js-host")
 }
@@ -659,202 +631,6 @@ pub fn composite_host_package_name(package_name: &str) -> String {
 /// flavors. See [`composite_host_package_name`].
 pub fn composite_host_lib_target(package_name: &str) -> String {
     format!("{}_uniffi_js_host", rust_crate_key(package_name))
-}
-
-/// Canonical composite-host identity shared by generated host bundles and
-/// artifact manifests. Generated contract/sidecar bytes remain bound by the
-/// OHOS bundle fingerprint, while this identity binds the selected component
-/// set to each component's canonical interface ABI digest.
-///
-/// Callers may supply identities in loader order; the serialized payload is
-/// always sorted by the complete
-/// `(component, namespace, nativeExportPrefix, interfaceAbiDigest)` tuple so
-/// equivalent selections have one stable identity.
-pub fn composite_host_identity(
-    package_name: &str,
-    lib_target: &str,
-    components: &[(String, String, String, String)],
-) -> Result<String> {
-    let mut components = components
-        .iter()
-        .map(
-            |(component, namespace, native_export_prefix, interface_abi_digest)| {
-                serde_json::json!({
-                    "component": component,
-                    "namespace": namespace,
-                    "nativeExportPrefix": native_export_prefix,
-                    "interfaceAbiDigest": interface_abi_digest,
-                })
-            },
-        )
-        .collect::<Vec<_>>();
-    components.sort_by(|left, right| {
-        (
-            left["component"].as_str(),
-            left["namespace"].as_str(),
-            left["nativeExportPrefix"].as_str(),
-            left["interfaceAbiDigest"].as_str(),
-        )
-            .cmp(&(
-                right["component"].as_str(),
-                right["namespace"].as_str(),
-                right["nativeExportPrefix"].as_str(),
-                right["interfaceAbiDigest"].as_str(),
-            ))
-    });
-    let payload = serde_json::json!({
-        "packageName": package_name,
-        "libTarget": lib_target,
-        "components": components,
-    });
-    Ok(sha256_bytes(&serde_json::to_vec(&payload)?))
-}
-
-#[derive(Default)]
-struct InterfaceAbiHasher(Sha256);
-
-impl Hasher for InterfaceAbiHasher {
-    fn finish(&self) -> u64 {
-        0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
-
-    fn write_u8(&mut self, value: u8) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_u16(&mut self, value: u16) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_u128(&mut self, value: u128) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.write(&(value as u64).to_le_bytes());
-    }
-
-    fn write_i8(&mut self, value: i8) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_i16(&mut self, value: i16) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_i32(&mut self, value: i32) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_i64(&mut self, value: i64) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_i128(&mut self, value: i128) {
-        self.write(&value.to_le_bytes());
-    }
-
-    fn write_isize(&mut self, value: isize) {
-        self.write(&(value as i64).to_le_bytes());
-    }
-}
-
-fn checksum_named_definitions<T: Checksum>(
-    state: &mut InterfaceAbiHasher,
-    kind: &str,
-    mut definitions: Vec<(&str, &T)>,
-) {
-    definitions.sort_by(|left, right| left.0.cmp(right.0));
-    kind.checksum(state);
-    state.write_u64(definitions.len() as u64);
-    for (name, definition) in definitions {
-        name.checksum(state);
-        definition.checksum(state);
-    }
-}
-
-/// Stable SHA-256 digest of one component's public interface and native ABI.
-///
-/// UniFFI's `Checksum` implementations intentionally omit docstrings and
-/// derived FFI caches while retaining callable/type shape. Sorting top-level
-/// definitions makes the digest independent of metadata discovery order;
-/// record fields, enum variants, callable parameters and methods retain their
-/// ABI-significant order inside each definition.
-pub fn component_interface_abi_digest(ci: &uniffi_bindgen::ComponentInterface) -> String {
-    let ci = ci.canonicalized_for_abi_digest();
-    let mut state = InterfaceAbiHasher::default();
-    "uniffi-component-interface-abi-v1".checksum(&mut state);
-    state.write_u32(ci.uniffi_contract_version());
-    ci.crate_name().checksum(&mut state);
-    ci.namespace().checksum(&mut state);
-    checksum_named_definitions(
-        &mut state,
-        "enum",
-        ci.enum_definitions()
-            .iter()
-            .map(|definition| (definition.name(), definition))
-            .collect(),
-    );
-    checksum_named_definitions(
-        &mut state,
-        "record",
-        ci.record_definitions()
-            .iter()
-            .map(|definition| (definition.name(), definition))
-            .collect(),
-    );
-    checksum_named_definitions(
-        &mut state,
-        "function",
-        ci.function_definitions()
-            .iter()
-            .map(|definition| (definition.name(), definition))
-            .collect(),
-    );
-    checksum_named_definitions(
-        &mut state,
-        "object",
-        ci.object_definitions()
-            .iter()
-            .map(|definition| (definition.name(), definition))
-            .collect(),
-    );
-    checksum_named_definitions(
-        &mut state,
-        "callbackInterface",
-        ci.callback_interface_definitions()
-            .iter()
-            .map(|definition| (definition.name(), definition))
-            .collect(),
-    );
-    checksum_named_definitions(
-        &mut state,
-        "customType",
-        ci.custom_type_definitions()
-            .iter()
-            .map(|definition| (definition.name.as_str(), definition))
-            .collect(),
-    );
-    format!("{:x}", state.0.finalize())
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Emit selected `<host_crates_dir>/{wasm,napi,ohos}/*` composite hosts.
@@ -1009,8 +785,8 @@ fn emit_wasm(
          // wasm32-unknown-unknown` produces the final `cdylib`.\n\n",
     );
     for component in &plan.components {
-        let crate_name = &component.identity.crate_name;
-        let namespace = &component.identity.namespace;
+        let crate_name = &component.component.crate_name;
+        let namespace = &component.component.namespace;
         let rs_path = out_dir
             .join("components")
             .join(namespace)
@@ -1088,8 +864,8 @@ fn emit_napi(
          // final `.node` cdylib consumed by the generated `backend-napi.ts`.\n\n",
     );
     for component in &plan.components {
-        let crate_name = &component.identity.crate_name;
-        let namespace = &component.identity.namespace;
+        let crate_name = &component.component.crate_name;
+        let namespace = &component.component.namespace;
         let actual_node_rs_path = actual_out_dir
             .join("components")
             .join(namespace)
@@ -1192,7 +968,6 @@ fn emit_ohos(
     let package_metadata = render_ohos_package_metadata(&plan.meta);
     let lib_name = plan.ohos_artifact_stem();
     let component_dependencies = render_host_dependencies(plan, &logical_crate_dir)?;
-    let host_composite_identity = plan.ohos_composite_identity()?;
 
     let cargo_toml = format!(
         "# AUTOGENERATED by uniffi_bindgen_javascript (host crate: ohos).\n\
@@ -1223,13 +998,7 @@ fn emit_ohos(
         uniffi_dep = render_uniffi_dependency(plan.meta.uniffi_dep.as_ref(), &logical_crate_dir)?,
         ohos_deps = ohos_deps,
     );
-    let bundle_text = render_ohos_facade_bundle(
-        actual_out_dir,
-        &plan.components,
-        &package_name,
-        &lib_name,
-        &host_composite_identity,
-    )?;
+    let bundle_text = render_ohos_facade_bundle(actual_out_dir, &plan.components)?;
 
     let build_rs = r#"// AUTOGENERATED by uniffi_bindgen_javascript (host crate: ohos).
 extern crate napi_build_ohos;
@@ -1319,8 +1088,8 @@ mod __uniffi_napi_cleanup_hook_key {
 "#,
     );
     for component in &plan.components {
-        let crate_name = &component.identity.crate_name;
-        let namespace = &component.identity.namespace;
+        let crate_name = &component.component.crate_name;
+        let namespace = &component.component.namespace;
         let rs_path = logical_out_dir
             .join("components")
             .join(namespace)
@@ -1350,9 +1119,6 @@ fn preflight_ohos_host_emission(
     ohos_rs_dir: Option<&Utf8PathBuf>,
 ) -> Result<()> {
     let logical_crate_dir = logical_host_dir.join("ohos");
-    let package_name = plan.ohos_host_package_name();
-    let lib_name = plan.ohos_artifact_stem();
-    let host_composite_identity = plan.ohos_composite_identity()?;
 
     // These are the only fallible render steps outside the facade bundle.
     // Execute them now, before `emit` creates even the top-level host dir.
@@ -1360,8 +1126,8 @@ fn preflight_ohos_host_emission(
     let _ = render_uniffi_dependency(plan.meta.uniffi_dep.as_ref(), &logical_crate_dir)?;
     let _ = render_host_dependencies(plan, &logical_crate_dir)?;
     for component in &plan.components {
-        let crate_name = &component.identity.crate_name;
-        let namespace = &component.identity.namespace;
+        let crate_name = &component.component.crate_name;
+        let namespace = &component.component.namespace;
         let rs_path = logical_out_dir
             .join("components")
             .join(namespace)
@@ -1369,13 +1135,7 @@ fn preflight_ohos_host_emission(
             .join(format!("{crate_name}.rs"));
         let _ = relative_path(&logical_crate_dir.join("src"), &rs_path);
     }
-    let _ = render_ohos_facade_bundle(
-        actual_out_dir,
-        &plan.components,
-        &package_name,
-        &lib_name,
-        &host_composite_identity,
-    )?;
+    let _ = render_ohos_facade_bundle(actual_out_dir, &plan.components)?;
     Ok(())
 }
 
@@ -1384,16 +1144,12 @@ fn preflight_ohos_host_emission(
 fn render_ohos_facade_bundle(
     actual_out_dir: &Utf8Path,
     planned_components: &[PlannedComponentDependency],
-    package_name: &str,
-    lib_name: &str,
-    host_composite_identity: &str,
 ) -> Result<String> {
     let mut contracts = Vec::new();
     let mut type_sidecars = Vec::new();
-    let mut components = Vec::new();
     for planned in planned_components {
-        let crate_name = &planned.identity.crate_name;
-        let expected_namespace = &planned.identity.namespace;
+        let crate_name = &planned.component.crate_name;
+        let expected_namespace = &planned.component.namespace;
         let contract_file = format!("{crate_name}.ohos-facade.json");
         let contract_path = actual_out_dir
             .join("components")
@@ -1407,20 +1163,15 @@ fn render_ohos_facade_bundle(
                 format!("validating generated OHOS facade contract {contract_path}")
             })?;
         let (component, namespace, native_export_prefix) =
-            crate::flavors::napi::facade_contract_identity(&contract);
+            crate::flavors::napi::facade_contract_names(&contract);
         if component != crate_name
             || namespace != expected_namespace
-            || native_export_prefix != planned.identity.native_export_prefix
+            || native_export_prefix != planned.component.native_export_prefix
         {
             bail!(
-                "generated OHOS facade contract {contract_path} does not match its selected component identity"
+                "generated OHOS facade contract {contract_path} does not match its selected component names"
             );
         }
-        let contract_digest = sha256_text(&contract_content);
-        let identity_export = crate::flavors::napi::ohos_bridge_identity_export_for_prefix(
-            &native_export_prefix,
-            &contract_digest,
-        );
         let sidecar_file = format!("{crate_name}.ohos-extra-types.d.ts");
         let sidecar_path = actual_out_dir
             .join("components")
@@ -1429,79 +1180,27 @@ fn render_ohos_facade_bundle(
             .join(&sidecar_file);
         let sidecar_content = fs::read_to_string(&sidecar_path)
             .with_context(|| format!("reading generated OHOS type sidecar {sidecar_path}"))?;
-        crate::flavors::napi::validate_ohos_extra_types(
-            &sidecar_content,
-            &identity_export,
-            &contract,
-        )
-        .with_context(|| format!("validating generated OHOS type sidecar {sidecar_path}"))?;
+        crate::flavors::napi::validate_ohos_extra_types(&sidecar_content, &contract)
+            .with_context(|| format!("validating generated OHOS type sidecar {sidecar_path}"))?;
 
         contracts.push(serde_json::json!({
             "file": contract_file.clone(),
-            "sha256": contract_digest,
             "content": contract_content,
-        }));
-        components.push(serde_json::json!({
-            "component": component,
-            "namespace": namespace,
-            "nativeExportPrefix": native_export_prefix,
-            "interfaceAbiDigest": planned.identity.interface_abi_digest,
-            "contractFile": contract_file,
-            "contractSha256": contract_digest,
-            "identityExport": identity_export,
         }));
         type_sidecars.push(serde_json::json!({
             "file": sidecar_file,
-            "sha256": sha256_text(&sidecar_content),
             "content": sidecar_content,
         }));
     }
     contracts.sort_by(|left, right| left["file"].as_str().cmp(&right["file"].as_str()));
     type_sidecars.sort_by(|left, right| left["file"].as_str().cmp(&right["file"].as_str()));
-    components.sort_by(|left, right| {
-        (
-            left["component"].as_str(),
-            left["namespace"].as_str(),
-            left["nativeExportPrefix"].as_str(),
-        )
-            .cmp(&(
-                right["component"].as_str(),
-                right["namespace"].as_str(),
-                right["nativeExportPrefix"].as_str(),
-            ))
-    });
-    let payload = serde_json::json!({
-        "packageName": package_name,
-        "libTarget": lib_name,
-        "hostCompositeIdentity": host_composite_identity,
-        "components": components,
+    let bundle = serde_json::json!({
         "contracts": contracts,
         "typeSidecars": type_sidecars,
-    });
-    let payload_bytes = serde_json::to_vec(&payload)?;
-    let bundle = serde_json::json!({
-        "hostBundleSchemaVersion": HOST_BUNDLE_SCHEMA_VERSION,
-        "fingerprint": sha256_bytes(&payload_bytes),
-        "packageName": payload["packageName"],
-        "libTarget": payload["libTarget"],
-        "hostCompositeIdentity": payload["hostCompositeIdentity"],
-        "components": payload["components"],
-        "contracts": payload["contracts"],
-        "typeSidecars": payload["typeSidecars"],
     });
     let mut bundle_text = serde_json::to_string_pretty(&bundle)?;
     bundle_text.push('\n');
     Ok(bundle_text)
-}
-
-fn sha256_text(value: &str) -> String {
-    sha256_bytes(value.as_bytes())
-}
-
-fn sha256_bytes(value: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(value);
-    format!("{:x}", digest.finalize())
 }
 
 fn render_ohos_package_metadata(meta: &CoreCrateMetadata) -> String {
@@ -1790,95 +1489,6 @@ fn render_uniffi_dependency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniffi_bindgen::cargo_metadata::CrateConfigSupplier;
-    use uniffi_bindgen::{
-        BindgenLoader, BindgenPaths, CargoMetadataOptions, ComponentInterface, GlobalConfig,
-    };
-
-    const CROSS_LOADER_FIXTURE_SOURCE: &str = r#"
-mod api {
-    use std::sync::Arc;
-
-    #[derive(Clone, Debug, uniffi::Record)]
-    pub struct Payload {
-        pub value: u64,
-    }
-
-    #[derive(Clone, Debug, uniffi::Error)]
-    pub enum ApiError {
-        Failed,
-    }
-
-    impl std::fmt::Display for ApiError {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "failed")
-        }
-    }
-
-    impl std::error::Error for ApiError {}
-
-    #[derive(Clone, Debug, uniffi::Error)]
-    pub enum AlternateError {
-        Failed,
-    }
-
-    impl std::fmt::Display for AlternateError {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "alternate failure")
-        }
-    }
-
-    impl std::error::Error for AlternateError {}
-
-    #[derive(Clone, Debug)]
-    pub struct EventId(pub u64);
-    uniffi::custom_newtype!(EventId, u64);
-
-    #[uniffi::export(callback_interface)]
-    pub trait Listener: Send + Sync {
-        async fn on_event(&self, event: Payload) -> Result<EventId, ApiError>;
-    }
-
-    #[derive(uniffi::Object)]
-    pub struct Service;
-
-    #[uniffi::export]
-    impl Service {
-        #[uniffi::constructor]
-        pub fn new(_seed: EventId) -> Arc<Self> {
-            Arc::new(Self)
-        }
-
-        pub async fn fetch(&self, request: Payload) -> Result<Payload, ApiError> {
-            Ok(request)
-        }
-    }
-
-    #[uniffi::export]
-    pub fn produce_events(
-        _seed: EventId,
-    ) -> uniffi::UniFfiStream<Payload, ApiError> {
-        unimplemented!()
-    }
-
-    #[uniffi::export]
-    pub async fn consume_events(
-        events: uniffi::UniFfiInputStream<Payload, ApiError>,
-    ) -> Result<EventId, ApiError> {
-        drop(events);
-        Err(ApiError::Failed)
-    }
-}
-
-pub use api::{
-    consume_events, produce_events, AlternateError, ApiError, EventId, Listener, Payload, Service,
-};
-uniffi::setup_scaffolding!();
-"#;
-
-    fn fixture_abi_digest(label: &str) -> String {
-        sha256_bytes(format!("fixture-interface-abi:{label}").as_bytes())
-    }
 
     fn test_root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1896,94 +1506,17 @@ uniffi::setup_scaffolding!();
         std::fs::write(crate_dir.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
     }
 
-    fn cross_loader_fixture_manifest(root: &std::path::Path) -> Utf8PathBuf {
-        let crate_dir = root.join("abi-loader-fixture");
-        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
-        let uniffi_dir = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("uniffi");
-        let uniffi_dir = serde_json::to_string(uniffi_dir.as_str()).unwrap();
-        std::fs::write(
-            crate_dir.join("Cargo.toml"),
-            format!(
-                r#"[package]
-name = "abi-loader-fixture"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["lib", "cdylib"]
-
-[dependencies]
-async-trait = "0.1"
-uniffi = {{ path = {uniffi_dir}, default-features = false, features = ["macro-scaffolding"] }}
-"#,
-            ),
-        )
-        .unwrap();
-        std::fs::write(crate_dir.join("src/lib.rs"), CROSS_LOADER_FIXTURE_SOURCE).unwrap();
-        Utf8PathBuf::from_path_buf(crate_dir.join("Cargo.toml")).unwrap()
-    }
-
-    fn load_cross_loader_fixture(manifest: &Utf8Path, source: &Utf8Path) -> ComponentInterface {
-        let mut metadata_command = MetadataCommand::new();
-        metadata_command.manifest_path(manifest.as_std_path());
-        let metadata = metadata_command.exec().unwrap();
-        let mut paths = BindgenPaths::default();
-        paths.add_layer(CrateConfigSupplier::from_cargo_metadata(
-            metadata,
-            CargoMetadataOptions::default(),
-        ));
-        let loader = BindgenLoader::new(paths, GlobalConfig::default());
-        let metadata = loader.load_metadata(source).unwrap();
-        loader
-            .load_cis(source, metadata)
-            .unwrap()
-            .into_iter()
-            .find(|ci| ci.crate_name() == "abi_loader_fixture")
-            .unwrap()
-    }
-
-    fn source_fixture_digest(manifest: &Utf8Path, source: &str) -> String {
-        std::fs::write(manifest.parent().unwrap().join("src/lib.rs"), source).unwrap();
-        component_interface_abi_digest(&load_cross_loader_fixture(
-            manifest,
-            Utf8Path::new("src:abi-loader-fixture"),
-        ))
-    }
-
-    fn assert_source_mutation_changes(
-        manifest: &Utf8Path,
-        baseline_digest: &str,
-        before: &str,
-        after: &str,
-        dimension: &str,
-    ) {
-        assert!(
-            CROSS_LOADER_FIXTURE_SOURCE.contains(before),
-            "missing fixture source marker for {dimension}",
-        );
-        let changed = CROSS_LOADER_FIXTURE_SOURCE.replacen(before, after, 1);
-        assert_ne!(
-            source_fixture_digest(manifest, &changed),
-            baseline_digest,
-            "{dimension} must contribute to the interface ABI digest",
-        );
-    }
-
     fn single_component_plan(
         meta: &CoreCrateMetadata,
         crate_name: &str,
         namespace: &str,
     ) -> HostCratePlan {
-        let identity = HostComponentIdentity {
+        let component = SelectedHostComponent {
             crate_name: crate_name.to_string(),
             namespace: namespace.to_string(),
             native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
                 crate_name,
             ),
-            interface_abi_digest: fixture_abi_digest(crate_name),
         };
         let dependency = PlannedPackageDependency {
             dependency_key: rust_crate_key(crate_name),
@@ -1998,7 +1531,7 @@ uniffi = {{ path = {uniffi_dir}, default-features = false, features = ["macro-sc
             root_dependency: dependency.clone(),
             components: vec![PlannedComponentDependency {
                 package: dependency,
-                identity: identity.clone(),
+                component,
             }],
         }
     }
@@ -2016,13 +1549,12 @@ uniffi = {{ path = {uniffi_dir}, default-features = false, features = ["macro-sc
 
     fn fixture_component(key: &str, package_name: &str) -> PlannedComponentDependency {
         PlannedComponentDependency {
-            identity: HostComponentIdentity {
+            component: SelectedHostComponent {
                 crate_name: key.to_string(),
                 namespace: "fixture".to_string(),
                 native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
                     key,
                 ),
-                interface_abi_digest: fixture_abi_digest(key),
             },
             package: fixture_dependency(key, package_name),
         }
@@ -2118,25 +1650,23 @@ component_source_alias = { package = "component-package", path = "../component",
             logical_out_dir: None,
             ohos_rs_dir: None,
         };
-        let identities = vec![
-            HostComponentIdentity {
+        let selected_components = vec![
+            SelectedHostComponent {
                 crate_name: "component_bridge".to_string(),
                 namespace: "component".to_string(),
                 native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
                     "component_bridge",
                 ),
-                interface_abi_digest: fixture_abi_digest("component_bridge"),
             },
-            HostComponentIdentity {
+            SelectedHostComponent {
                 crate_name: "root_bridge".to_string(),
                 namespace: "root".to_string(),
                 native_export_prefix: uniffi_bindgen::interface::native_export_prefix_for_component(
                     "root_bridge",
                 ),
-                interface_abi_digest: fixture_abi_digest("root_bridge"),
             },
         ];
-        let plan = plan(&options, &identities, true, true, true).unwrap();
+        let plan = plan(&options, &selected_components, true, true, true).unwrap();
         assert!(
             !host_output.exists(),
             "read-only host planning must not create the configured host output"
@@ -2164,207 +1694,6 @@ component_source_alias = { package = "component-package", path = "../component",
         );
         assert!(!dependencies.contains("component_source_alias"));
         assert_eq!(dependencies.matches("root_bridge =").count(), 1);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn all_javascript_flavors_share_one_logical_composite_identity() {
-        let forward = vec![
-            (
-                "alpha_core".to_string(),
-                "alpha".to_string(),
-                "ffi_alpha_core".to_string(),
-                fixture_abi_digest("alpha_core"),
-            ),
-            (
-                "beta_core".to_string(),
-                "beta".to_string(),
-                "ffi_beta_core".to_string(),
-                fixture_abi_digest("beta_core"),
-            ),
-        ];
-        let mut reverse = forward.clone();
-        reverse.reverse();
-        let package = composite_host_package_name("composite-core");
-        let lib_target = composite_host_lib_target("composite-core");
-        let forward_identity = composite_host_identity(&package, &lib_target, &forward).unwrap();
-        let reverse_identity = composite_host_identity(&package, &lib_target, &reverse).unwrap();
-
-        assert_eq!(forward_identity, reverse_identity);
-        let mut changed_abi = forward.clone();
-        changed_abi[0].3 = fixture_abi_digest("alpha_core-v2");
-        assert_ne!(
-            composite_host_identity(&package, &lib_target, &changed_abi).unwrap(),
-            forward_identity,
-            "the composite host identity must bind every component ABI digest",
-        );
-        assert_eq!(package, "composite-core-uniffi-js-host");
-        assert_eq!(lib_target, "composite_core_uniffi_js_host");
-        // The digest uses the same tuple even for invocations that never
-        // request Harmony; package manifests must not borrow an OHOS-only
-        // package/lib identity for a NAPI/Wasm-only build.
-        assert_eq!(
-            composite_host_identity(
-                &composite_host_package_name("composite-core"),
-                &composite_host_lib_target("composite-core"),
-                &forward,
-            )
-            .unwrap(),
-            forward_identity
-        );
-    }
-
-    #[test]
-    fn interface_abi_digest_is_order_stable_and_shape_sensitive() {
-        let forward = uniffi_bindgen::ComponentInterface::from_webidl(
-            r#"
-                namespace digest_fixture {
-                    u32 beta();
-                    string alpha(string value);
-                };
-            "#,
-            "digest_fixture",
-        )
-        .unwrap();
-        let reverse = uniffi_bindgen::ComponentInterface::from_webidl(
-            r#"
-                namespace digest_fixture {
-                    string alpha(string value);
-                    u32 beta();
-                };
-            "#,
-            "digest_fixture",
-        )
-        .unwrap();
-        let changed = uniffi_bindgen::ComponentInterface::from_webidl(
-            r#"
-                namespace digest_fixture {
-                    string alpha(string value);
-                    u64 beta();
-                };
-            "#,
-            "digest_fixture",
-        )
-        .unwrap();
-
-        let digest = component_interface_abi_digest(&forward);
-        assert_eq!(digest, component_interface_abi_digest(&reverse));
-        assert_ne!(digest, component_interface_abi_digest(&changed));
-        assert!(is_sha256(&digest));
-    }
-
-    #[test]
-    fn interface_abi_digest_matches_source_and_compiled_metadata_without_losing_shape() {
-        let root = test_root("interface-abi-cross-loader");
-        let manifest = cross_loader_fixture_manifest(&root);
-        let crate_dir = manifest.parent().unwrap();
-        let target_dir = Utf8PathBuf::from_path_buf(root.join("target")).unwrap();
-        let build = std::process::Command::new("cargo")
-            .args(["build", "--manifest-path"])
-            .arg(manifest.as_std_path())
-            .env("CARGO_TARGET_DIR", target_dir.as_std_path())
-            .env_remove("RUSTFLAGS")
-            .output()
-            .unwrap();
-        assert!(
-            build.status.success(),
-            "cross-loader fixture build failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr),
-        );
-        let library = target_dir.join("debug").join(format!(
-            "{}abi_loader_fixture.{}",
-            std::env::consts::DLL_PREFIX,
-            std::env::consts::DLL_EXTENSION,
-        ));
-        assert!(library.is_file(), "fixture cdylib missing at {library}");
-
-        let source = load_cross_loader_fixture(&manifest, Utf8Path::new("src:abi-loader-fixture"));
-        let compiled = load_cross_loader_fixture(&manifest, &library);
-        let source_digest = component_interface_abi_digest(&source);
-        assert_eq!(
-            source_digest,
-            component_interface_abi_digest(&compiled),
-            "source parsing and compiled metadata must describe one canonical ABI",
-        );
-
-        let producer = source.get_function_definition("produce_events").unwrap();
-        assert!(matches!(
-            producer.return_type(),
-            Some(uniffi_bindgen::interface::Type::Stream { .. })
-        ));
-        let consumer = source.get_function_definition("consume_events").unwrap();
-        assert!(consumer.is_async() && consumer.throws());
-        assert!(consumer.arguments().iter().any(|argument| matches!(
-            uniffi_bindgen::interface::AsType::as_type(*argument),
-            uniffi_bindgen::interface::Type::InputStream { .. }
-        )));
-        assert!(source.get_custom_type_definition("EventId").is_some());
-        let callback = source
-            .get_callback_interface_definition("Listener")
-            .unwrap();
-        let callback_method = callback.methods()[0];
-        assert!(callback_method.is_async() && callback_method.throws());
-        let object = source.get_object_definition("Service").unwrap();
-        let object_method = object
-            .methods()
-            .into_iter()
-            .find(|method| method.name() == "fetch")
-            .unwrap();
-        assert!(object_method.is_async() && object_method.throws());
-
-        for (before, after, dimension) in [
-            (
-                "uniffi::UniFfiStream<Payload, ApiError>",
-                "uniffi::UniFfiStream<u64, ApiError>",
-                "output stream item type",
-            ),
-            (
-                "uniffi::UniFfiInputStream<Payload, ApiError>",
-                "uniffi::UniFfiInputStream<Payload, AlternateError>",
-                "input stream error type",
-            ),
-            (
-                "pub struct EventId(pub u64);\n    uniffi::custom_newtype!(EventId, u64);",
-                "pub struct EventId(pub u32);\n    uniffi::custom_newtype!(EventId, u32);",
-                "custom type builtin",
-            ),
-            (
-                "pub async fn fetch(&self, request: Payload)",
-                "pub fn fetch(&self, request: Payload)",
-                "object method async state",
-            ),
-            (
-                "pub async fn fetch(&self, request: Payload) -> Result<Payload, ApiError> {\n            Ok(request)\n        }",
-                "pub async fn fetch(&self, request: Payload) -> Payload {\n            request\n        }",
-                "object method throws state",
-            ),
-            (
-                "async fn on_event(&self, event: Payload)",
-                "fn on_event(&self, event: Payload)",
-                "callback method async state",
-            ),
-            (
-                "async fn on_event(&self, event: Payload) -> Result<EventId, ApiError>;",
-                "async fn on_event(&self, event: Payload) -> EventId;",
-                "callback method throws state",
-            ),
-            (
-                "async fn on_event(&self, event: Payload)",
-                "async fn on_event(&self, event: u64)",
-                "callback method argument type",
-            ),
-        ] {
-            assert_source_mutation_changes(
-                &manifest,
-                &source_digest,
-                before,
-                after,
-                dimension,
-            );
-        }
-
-        std::fs::write(crate_dir.join("src/lib.rs"), CROSS_LOADER_FIXTURE_SOURCE).unwrap();
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -2427,28 +1756,15 @@ edition = "2021"
             ("Index.ets", "export default {};\n"),
             (
                 "demo_core.ohos-extra-types.d.ts",
-                "type_def:{\"kind\":\"fn\",\"name\":\"uniffiohosbridgeidentityfixture\",\"def\":\"function uniffiohosbridgeidentityfixture(): string\",\"typeParameters\":[]}\n",
+                "",
             ),
             (
                 "demo_core.ohos-facade.json",
-                "{\"facadeContractSchemaVersion\":4,\"component\":\"demo_core\",\"namespace\":\"demo_core\",\"nativeExportPrefix\":\"ffi_demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
+                "{\"component\":\"demo_core\",\"namespace\":\"demo_core\",\"nativeExportPrefix\":\"ffi_demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
             ),
         ] {
             std::fs::write(harmony.join(name), body).unwrap();
         }
-        let contract_content =
-            std::fs::read_to_string(harmony.join("demo_core.ohos-facade.json")).unwrap();
-        let identity_export = crate::flavors::napi::ohos_bridge_identity_export_for_prefix(
-            "ffi_demo_core",
-            &sha256_text(&contract_content),
-        );
-        std::fs::write(
-            harmony.join("demo_core.ohos-extra-types.d.ts"),
-            format!(
-                "type_def:{{\"kind\":\"fn\",\"name\":\"{identity_export}\",\"def\":\"function {identity_export}(): string\",\"typeParameters\":[]}}\n"
-            ),
-        )
-        .unwrap();
         std::fs::write(
             root.join("Cargo.toml"),
             r#"[workspace]
@@ -2522,44 +1838,14 @@ edition.workspace = true
         let bundle_path = host.join("ohos/uniffi-ohos-facade-bundle.json");
         let bundle: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&bundle_path).unwrap()).unwrap();
-        assert_eq!(bundle["hostBundleSchemaVersion"], 4);
-        assert_eq!(bundle["packageName"], "demo-core-uniffi-js-host");
-        assert_eq!(bundle["libTarget"], "demo_core_uniffi_js_host");
-        let recomputed_identity = composite_host_identity(
-            bundle["packageName"].as_str().unwrap(),
-            bundle["libTarget"].as_str().unwrap(),
-            &[(
-                "demo_core".to_string(),
-                "demo_core".to_string(),
-                "ffi_demo_core".to_string(),
-                bundle["components"][0]["interfaceAbiDigest"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-            )],
-        )
-        .unwrap();
-        assert_eq!(
-            bundle["hostCompositeIdentity"].as_str(),
-            Some(recomputed_identity.as_str()),
-            "OHOS bundle must use the canonical host identity algorithm"
-        );
-        assert_eq!(bundle["components"][0]["component"], "demo_core");
-        assert_eq!(bundle["components"][0]["namespace"], "demo_core");
-        assert_eq!(
-            bundle["components"][0]["nativeExportPrefix"],
-            "ffi_demo_core"
-        );
-        assert!(bundle["components"][0]["identityExport"]
-            .as_str()
-            .unwrap()
-            .starts_with("ffi_demo_core_uniffiohosbridgeidentity"));
         assert_eq!(bundle["contracts"][0]["file"], "demo_core.ohos-facade.json");
+        assert_eq!(bundle["contracts"][0].as_object().unwrap().len(), 2);
         assert_eq!(
             bundle["typeSidecars"][0]["file"],
             "demo_core.ohos-extra-types.d.ts"
         );
-        assert_eq!(bundle["fingerprint"].as_str().unwrap().len(), 64);
+        assert_eq!(bundle["typeSidecars"][0].as_object().unwrap().len(), 2);
+        assert_eq!(bundle.as_object().unwrap().len(), 2);
         assert!(
             cargo_toml.contains(
                 "napi-derive-ohos = { version = \"1.1.6\", default-features = false, features = [\"strict\", \"type-def\"] }"
@@ -2596,7 +1882,7 @@ edition.workspace = true
         std::fs::write(harmony.join("demo_core.rs"), "").unwrap();
         std::fs::write(
             harmony.join("demo_core.ohos-facade.json"),
-            "{\"facadeContractSchemaVersion\":4,\"component\":\"demo_core\",\"namespace\":\"demo_core\",\"nativeExportPrefix\":\"ffi_demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
+            "{\"component\":\"demo_core\",\"namespace\":\"demo_core\",\"nativeExportPrefix\":\"ffi_demo_core\",\"outputStreams\":[],\"inputStreams\":[]}",
         )
         .unwrap();
         std::fs::write(

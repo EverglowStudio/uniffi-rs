@@ -16,7 +16,6 @@ use camino::Utf8Path;
 use fs_err as fs;
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uniffi_bindgen::interface::{AsType, Callable, Method, Type};
 use uniffi_bindgen::interface::{ObjectImpl, TraitKind};
 use uniffi_bindgen::Component;
@@ -60,21 +59,17 @@ pub fn emit_ohos(
     let ci = &component.ci;
 
     let facade_contract = render_ohos_facade_contract(ci)?;
-    let contract_digest = sha256_text(&facade_contract);
-    let identity_export = ohos_bridge_identity_export(ci, &contract_digest);
-    let rust_source = codegen::render_ohos_rust(ci, &identity_export, &contract_digest)?;
+    let rust_source = codegen::render_ohos_rust(ci)?;
     let adapter = render_ohos_backend_adapter(ci, composite_native_library_stem);
-    let extra_types = render_ohos_extra_types(ci, &identity_export)?;
+    let extra_types = render_ohos_extra_types(ci)?;
     let stream_helpers = render_ohos_stream_helpers(ci);
     let index = render_ohos_index(ci, composite_native_library_stem);
 
-    // Keep the producer on the same sidecar/contract protocol that a host
-    // crate consumes.  The input-stream generic is intentionally keyed by
-    // the checked facade contract's exact native export prefix, not by an
-    // unqualified legacy name or an inferred sidecar suffix.
+    // Validate the two functional inputs consumed by the facade builder
+    // before writing either one to the generated component tree.
     let parsed_facade_contract = parse_ohos_facade_contract(&facade_contract)
         .context("validating generated OHOS facade contract before sidecar emission")?;
-    validate_ohos_extra_types(&extra_types, &identity_export, &parsed_facade_contract)
+    validate_ohos_extra_types(&extra_types, &parsed_facade_contract)
         .context("validating generated OHOS type sidecar before emission")?;
 
     // Finish every render and validation before touching the output tree.  In
@@ -95,29 +90,6 @@ pub fn emit_ohos(
     fs::write(dir.join("stream.ts"), stream_helpers)?;
     fs::write(dir.join("index.ts"), index)?;
     Ok(())
-}
-
-fn sha256_text(value: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(value.as_bytes());
-    format!("{:x}", digest.finalize())
-}
-
-pub(crate) fn ohos_bridge_identity_export(
-    ci: &uniffi_bindgen::ComponentInterface,
-    contract_digest: &str,
-) -> String {
-    ohos_bridge_identity_export_for_prefix(&ci.native_export_prefix(), contract_digest)
-}
-
-pub fn ohos_bridge_identity_export_for_prefix(
-    native_export_prefix: &str,
-    contract_digest: &str,
-) -> String {
-    crate::native_exports::native_export_name_for_prefix(
-        native_export_prefix,
-        &ohos_bridge_identity_key(contract_digest),
-    )
 }
 
 /// Exact raw addon names for one output-stream surface.  The public stream
@@ -168,19 +140,6 @@ pub fn ohos_raw_input_next_type_for_prefix(native_export_prefix: &str, suffix: &
         native_export_prefix,
         &format!("UniffiInputStream{suffix}Next"),
     )
-}
-
-fn ohos_bridge_identity_key(contract_digest: &str) -> String {
-    let encoded = contract_digest
-        .bytes()
-        .map(|byte| match byte {
-            b'0'..=b'9' => (b'a' + (byte - b'0')) as char,
-            b'a'..=b'f' => (b'k' + (byte - b'a')) as char,
-            b'A'..=b'F' => (b'k' + (byte - b'A')) as char,
-            _ => '_',
-        })
-        .collect::<String>();
-    format!("uniffiohosbridgeidentity{encoded}")
 }
 
 enum BackendAdapterTarget<'a> {
@@ -743,10 +702,7 @@ fn collect_ohos_type_names(ty: &Type, out: &mut std::collections::BTreeSet<Strin
     }
 }
 
-fn render_ohos_extra_types(
-    ci: &uniffi_bindgen::ComponentInterface,
-    identity_export: &str,
-) -> Result<String> {
+fn render_ohos_extra_types(ci: &uniffi_bindgen::ComponentInterface) -> Result<String> {
     // This sidecar is the sole authoritative producer of OHOS raw type
     // metadata. The generated host enables napi-derive-ohos's `type-def`
     // compatibility feature only to avoid its upstream no-op compilation bug;
@@ -995,15 +951,6 @@ fn render_ohos_extra_types(
             ),
         )?;
     }
-    // The contract digest is encoded in this sentinel name and the generated
-    // Rust bridge exports precisely this callable.  Keep the declaration in
-    // the checksummed canonical sidecar now that third-party N-API typegen is
-    // intentionally disabled for OHOS hosts.
-    definitions.insert(
-        "fn",
-        identity_export,
-        format!("function {identity_export}(): string"),
-    )?;
     definitions.render()
 }
 
@@ -1200,7 +1147,8 @@ enum CanonicalOhosTypeDefKind {
 struct CanonicalOhosTypeDef {
     kind: CanonicalOhosTypeDefKind,
     name: String,
-    def: String,
+    #[serde(rename = "def")]
+    _def: String,
     #[serde(rename = "typeParameters")]
     type_parameters: Vec<String>,
 }
@@ -1211,12 +1159,10 @@ struct CanonicalOhosTypeDef {
 /// language.
 pub(crate) fn validate_ohos_extra_types(
     content: &str,
-    expected_identity_export: &str,
     contract: &OhosFacadeContract,
 ) -> Result<()> {
     let mut names = std::collections::BTreeSet::new();
     let mut duplicate_name = None;
-    let mut found_identity_export = false;
     let expected_input_stream_type =
         ohos_raw_input_stream_type_for_prefix(&contract.native_export_prefix);
     let requires_input_stream_type = !contract.input_streams.is_empty();
@@ -1257,16 +1203,6 @@ pub(crate) fn validate_ohos_extra_types(
         if !names.insert(definition.name.clone()) && duplicate_name.is_none() {
             duplicate_name = Some(definition.name.clone());
         }
-        if definition.name == expected_identity_export {
-            if !matches!(definition.kind, CanonicalOhosTypeDefKind::Fn)
-                || definition.def != format!("function {expected_identity_export}(): string")
-            {
-                bail!(
-                    "canonical OHOS type sidecar has an invalid bridge identity declaration `{expected_identity_export}`"
-                );
-            }
-            found_identity_export = true;
-        }
     }
     if requires_input_stream_type && input_stream_type_count != 1 {
         bail!(
@@ -1275,11 +1211,6 @@ pub(crate) fn validate_ohos_extra_types(
     }
     if let Some(name) = duplicate_name {
         bail!("canonical OHOS type sidecar repeats declaration `{name}`");
-    }
-    if !found_identity_export {
-        bail!(
-            "canonical OHOS type sidecar is missing bridge identity declaration `{expected_identity_export}`"
-        );
     }
     Ok(())
 }
@@ -1302,36 +1233,9 @@ fn render_ohos_type_def(
     )
 }
 
-/// Exact OHOS facade-contract schema accepted by both producer and consumer.
-/// Other versions are rejected rather than read through a legacy fallback.
-pub(crate) const FACADE_CONTRACT_SCHEMA_VERSION: u32 = 4;
-
-fn preflight_exact_facade_contract_schema_version(content: &str) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_str(content)
-        .context("parsing OHOS facade contract schema-version probe")?;
-    let value = value
-        .as_object()
-        .and_then(|object| object.get("facadeContractSchemaVersion"));
-    match value.and_then(serde_json::Value::as_u64) {
-        Some(version) if version == u64::from(FACADE_CONTRACT_SCHEMA_VERSION) => Ok(()),
-        Some(version) => bail!(
-            "unsupported facadeContractSchemaVersion: expected {FACADE_CONTRACT_SCHEMA_VERSION}, got {version}"
-        ),
-        None => {
-            let got = value
-                .map(serde_json::Value::to_string)
-                .unwrap_or_else(|| "missing".to_string());
-            bail!(
-                "unsupported facadeContractSchemaVersion: expected {FACADE_CONTRACT_SCHEMA_VERSION}, got {got}"
-            );
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct OhosFacadeContract {
-    facade_contract_schema_version: u32,
     component: String,
     namespace: String,
     native_export_prefix: String,
@@ -1357,8 +1261,6 @@ struct OhosOutputStreamContract {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OhosInputStreamContract {
     suffix: String,
-    canonical: String,
-    fingerprint: String,
     item_type: OhosTypeDescriptor,
     error_type: OhosTypeDescriptor,
     next_type: String,
@@ -1411,10 +1313,9 @@ enum OhosTypeDescriptor {
 }
 
 pub(crate) fn parse_ohos_facade_contract(content: &str) -> Result<OhosFacadeContract> {
-    preflight_exact_facade_contract_schema_version(content)?;
     let contract: OhosFacadeContract =
-        serde_json::from_str(content).context("parsing exact OHOS facade contract")?;
-    if uniffi_bindgen::interface::validate_harmony_component_identity(
+        serde_json::from_str(content).context("parsing OHOS facade contract")?;
+    if uniffi_bindgen::interface::validate_harmony_component_names(
         &contract.component,
         &contract.namespace,
     )
@@ -1422,12 +1323,12 @@ pub(crate) fn parse_ohos_facade_contract(content: &str) -> Result<OhosFacadeCont
         || contract.native_export_prefix
             != uniffi_bindgen::interface::native_export_prefix_for_component(&contract.component)
     {
-        bail!("OHOS facade contract has an invalid component identity");
+        bail!("OHOS facade contract has an invalid component name, namespace, or native export prefix");
     }
     Ok(contract)
 }
 
-pub(crate) fn facade_contract_identity(contract: &OhosFacadeContract) -> (&str, &str, &str) {
+pub(crate) fn facade_contract_names(contract: &OhosFacadeContract) -> (&str, &str, &str) {
     (
         &contract.component,
         &contract.namespace,
@@ -1443,8 +1344,6 @@ fn render_ohos_facade_contract(ci: &uniffi_bindgen::ComponentInterface) -> Resul
         .map(|descriptor| {
             let suffix = descriptor.suffix().to_string();
             Ok(OhosInputStreamContract {
-                canonical: descriptor.canonical().to_string(),
-                fingerprint: descriptor.fingerprint().to_string(),
                 item_type: ohos_facade_type_descriptor(ci, descriptor.item_type())?,
                 error_type: ohos_facade_type_descriptor(ci, descriptor.error_type())?,
                 next_type: ohos_raw_input_next_type_for_prefix(&ci.native_export_prefix(), &suffix),
@@ -1496,14 +1395,13 @@ fn render_ohos_facade_contract(ci: &uniffi_bindgen::ComponentInterface) -> Resul
     }
 
     let contract = OhosFacadeContract {
-        facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
         component: ci.crate_name().to_string(),
         namespace: ci.namespace().to_string(),
         native_export_prefix: ci.native_export_prefix(),
         output_streams,
         input_streams,
     };
-    uniffi_bindgen::interface::validate_harmony_component_identity(
+    uniffi_bindgen::interface::validate_harmony_component_names(
         &contract.component,
         &contract.namespace,
     )?;
@@ -2155,8 +2053,6 @@ mod ohos_facade_type_tests {
         let input_streams = has_input_streams
             .then(|| OhosInputStreamContract {
                 suffix: "NumberStringFingerprint8b30e3aa815a2f4a".into(),
-                canonical: "fixture-number-string".into(),
-                fingerprint: "8b30e3aa815a2f4a".into(),
                 item_type: OhosTypeDescriptor::Number,
                 error_type: OhosTypeDescriptor::String,
                 next_type: ohos_raw_input_next_type_for_prefix(
@@ -2171,7 +2067,6 @@ mod ohos_facade_type_tests {
             .into_iter()
             .collect();
         OhosFacadeContract {
-            facade_contract_schema_version: FACADE_CONTRACT_SCHEMA_VERSION,
             component: "fixture".into(),
             namespace: "fixture".into(),
             native_export_prefix: native_export_prefix.into(),
@@ -2312,9 +2207,7 @@ mod ohos_facade_type_tests {
         let ci = ComponentInterface::from_metadata(metadata).unwrap();
         let contract_json = render_ohos_facade_contract(&ci).unwrap();
         let contract = parse_ohos_facade_contract(&contract_json).unwrap();
-        let digest = sha256_text(&contract_json);
-        let identity_export = ohos_bridge_identity_export(&ci, &digest);
-        let sidecar = render_ohos_extra_types(&ci, &identity_export).unwrap();
+        let sidecar = render_ohos_extra_types(&ci).unwrap();
         let prefix = ci.native_export_prefix();
         let output = contract.output_streams.first().unwrap();
 
@@ -2557,7 +2450,7 @@ mod ohos_facade_type_tests {
     }
 
     #[test]
-    fn recursive_named_shapes_terminate_and_cross_component_names_keep_identity() {
+    fn recursive_named_shapes_terminate_and_cross_component_names_keep_owner_qualification() {
         let mut recursive_group = group("facade_graph");
         recursive_group.add_item(
             record(
@@ -2638,22 +2531,14 @@ mod ohos_facade_type_tests {
         let native_export_prefix = "ffi_fixture";
         let contract = test_ohos_input_stream_contract(native_export_prefix, true);
         let raw_input_stream = ohos_raw_input_stream_type_for_prefix(native_export_prefix);
-        let identity_export = "ffi_fixture_uniffiohosbridgeidentityfixture";
-        let identity = test_ohos_type_def(
-            "fn",
-            identity_export,
-            &format!("function {identity_export}(): string"),
-            &[],
-        );
         let raw = test_ohos_type_def("interface", &raw_input_stream, "handle: number", &["T"]);
 
-        validate_ohos_extra_types(&(raw.clone() + &identity), identity_export, &contract).unwrap();
+        validate_ohos_extra_types(&raw, &contract).unwrap();
 
         let cases = [
             (
                 "bare legacy name",
-                test_ohos_type_def("interface", "UniffiInputStream", "handle: number", &["T"])
-                    + &identity,
+                test_ohos_type_def("interface", "UniffiInputStream", "handle: number", &["T"]),
                 "only raw input-stream type",
             ),
             (
@@ -2663,18 +2548,17 @@ mod ohos_facade_type_tests {
                     "ffi_other_UniffiInputStream",
                     "handle: number",
                     &["T"],
-                ) + &identity,
+                ),
                 "only raw input-stream type",
             ),
             (
                 "arbitrary generic",
-                test_ohos_type_def("interface", "OtherGeneric", "handle: number", &["T"])
-                    + &identity,
+                test_ohos_type_def("interface", "OtherGeneric", "handle: number", &["T"]),
                 "only raw input-stream type",
             ),
             (
                 "wrong expected kind",
-                test_ohos_type_def("type", &raw_input_stream, "number", &["T"]) + &identity,
+                test_ohos_type_def("type", &raw_input_stream, "number", &["T"]),
                 "must be an interface",
             ),
             (
@@ -2684,32 +2568,31 @@ mod ohos_facade_type_tests {
                     &raw_input_stream,
                     "handle: number",
                     &["T", "U"],
-                ) + &identity,
+                ),
                 "exact typeParameters",
             ),
             (
                 "missing expected generic",
-                identity.clone(),
+                String::new(),
                 "must declare exactly one raw input-stream type",
             ),
             (
                 "duplicate expected generic",
-                raw.clone() + &raw + &identity,
+                raw.clone() + &raw,
                 "must declare exactly one raw input-stream type",
             ),
         ];
         for (label, sidecar, expected) in cases {
-            let error = validate_ohos_extra_types(&sidecar, identity_export, &contract)
+            let error = validate_ohos_extra_types(&sidecar, &contract)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(expected), "{label}: {error}");
         }
 
         let no_input_contract = test_ohos_input_stream_contract(native_export_prefix, false);
-        let error =
-            validate_ohos_extra_types(&(raw + &identity), identity_export, &no_input_contract)
-                .unwrap_err()
-                .to_string();
+        let error = validate_ohos_extra_types(&raw, &no_input_contract)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("declares no inputStreams"), "{error}");
     }
 

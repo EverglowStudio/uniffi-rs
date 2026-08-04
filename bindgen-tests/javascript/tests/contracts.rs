@@ -1678,11 +1678,9 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(contract["facadeContractSchemaVersion"], 4);
     assert_eq!(contract["component"], "stream_core");
     assert_eq!(contract["namespace"], "stream_core");
     assert_eq!(contract["nativeExportPrefix"], "ffi_stream_core");
-    assert!(contract.get("schemaVersion").is_none());
     assert_eq!(contract["outputStreams"].as_array().unwrap().len(), 6);
     for output in contract["outputStreams"].as_array().unwrap() {
         let fields = output
@@ -1722,15 +1720,15 @@ fn harmony_stream_fallback_static_and_runtime_contract() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|stream| stream["function"] == "ffi_stream_core_optionalEvents")
+        .find(|stream| stream["function"] == "ffi_stream_core_optional_events")
         .expect("facade contract must retain the optional stream item descriptor");
     assert_eq!(
         optional_stream["nextFunction"],
-        "ffi_stream_core_optionalEventsStreamNext"
+        "ffi_stream_core_optional_events_stream_next"
     );
     assert_eq!(
         optional_stream["cancelFunction"],
-        "ffi_stream_core_optionalEventsStreamCancel"
+        "ffi_stream_core_optional_events_stream_cancel"
     );
     assert_eq!(
         optional_stream["itemType"],
@@ -1986,11 +1984,9 @@ fn input_stream_bidi_static_generation_contract() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(contract["facadeContractSchemaVersion"], 4);
     assert_eq!(contract["component"], "input_stream_core");
     assert_eq!(contract["namespace"], "input_stream_core");
     assert_eq!(contract["nativeExportPrefix"], "ffi_input_stream_core");
-    assert!(contract.get("schemaVersion").is_none());
     assert_eq!(contract["inputStreams"].as_array().unwrap().len(), 1);
     let factory = contract["inputStreams"][0]["factory"].as_str().unwrap();
     let input_suffix = contract["inputStreams"][0]["suffix"]
@@ -2012,15 +2008,15 @@ fn input_stream_bidi_static_generation_contract() {
     );
     assert_eq!(
         contract["outputStreams"][0]["function"],
-        "ffi_input_stream_core_runningSum"
+        "ffi_input_stream_core_running_sum"
     );
     assert_eq!(
         contract["outputStreams"][0]["nextFunction"],
-        "ffi_input_stream_core_runningSumStreamNext"
+        "ffi_input_stream_core_running_sum_stream_next"
     );
     assert_eq!(
         contract["outputStreams"][0]["cancelFunction"],
-        "ffi_input_stream_core_runningSumStreamCancel"
+        "ffi_input_stream_core_running_sum_stream_cancel"
     );
     assert_eq!(
         contract["outputStreams"][0]["stepType"],

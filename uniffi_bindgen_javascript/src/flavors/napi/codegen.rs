@@ -174,32 +174,8 @@ fn render_rust(ci: &ComponentInterface, target: NapiTarget) -> Result<String> {
     ))
 }
 
-pub fn render_ohos_rust(
-    ci: &ComponentInterface,
-    identity_export: &str,
-    contract_digest: &str,
-) -> Result<String> {
-    ensure!(
-        identity_export == super::ohos_bridge_identity_export(ci, contract_digest),
-        "invalid OHOS bridge identity export"
-    );
-    ensure!(
-        contract_digest.len() == 64 && contract_digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "invalid OHOS facade contract digest"
-    );
-    let mut rust = render_rust(ci, NapiTarget::Ohos)?;
-    let identity_ident = rust_ident(identity_export);
-    let identity_js_name = LitStr::new(identity_export, Span::call_site());
-    let identity_tokens = quote! {
-        #[allow(non_snake_case)]
-        #[napi(js_name = #identity_js_name)]
-        pub fn #identity_ident() -> String {
-            #contract_digest.to_string()
-        }
-    };
-    let identity_file = parse2::<syn::File>(identity_tokens)?;
-    rust.push_str(&prettyplease::unparse(&identity_file));
-    Ok(rust)
+pub fn render_ohos_rust(ci: &ComponentInterface) -> Result<String> {
+    render_rust(ci, NapiTarget::Ohos)
 }
 
 /// `include!` modules keep Rust names private to their component, but
@@ -4146,7 +4122,6 @@ fn rust_path(path: &str) -> TokenStream {
 
 #[cfg(test)]
 mod renamed_record_core_path_tests {
-    use super::super::ohos_bridge_identity_export;
     use super::*;
     use uniffi_meta::{
         EnumMetadata, EnumShape, FieldMetadata, FnMetadata, MetadataGroup, NamespaceMetadata,
@@ -4303,9 +4278,7 @@ mod renamed_record_core_path_tests {
     fn napi_and_ohos_use_foreign_names_at_the_bridge_and_public_rust_paths_in_core() {
         let ci = dual_model_fixture();
         let napi = render_napi_rust(&ci).expect("NAPI codegen must succeed");
-        let digest = "0".repeat(64);
-        let identity = ohos_bridge_identity_export(&ci, &digest);
-        let ohos = render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed");
+        let ohos = render_ohos_rust(&ci).expect("OHOS codegen must succeed");
 
         for generated in [&napi, &ohos] {
             for core_path in [
@@ -4347,13 +4320,11 @@ mod renamed_record_core_path_tests {
         assert!(ohos.contains("extern crate napi_ohos as napi;"));
         assert!(ohos.contains("use napi_derive_ohos::napi;"));
         assert!(!ohos.contains("use napi_derive::napi;"));
-        assert!(ohos.contains(&identity));
     }
 }
 
 #[cfg(test)]
 mod async_object_receiver_tests {
-    use super::super::ohos_bridge_identity_export;
     use super::*;
     use uniffi_meta::{MetadataGroup, MethodMetadata, NamespaceMetadata, ObjectMetadata};
 
@@ -4402,11 +4373,9 @@ mod async_object_receiver_tests {
     #[test]
     fn async_object_methods_drop_napi_receivers_before_awaiting_core_futures() {
         let ci = fixture();
-        let digest = "0".repeat(64);
-        let identity = ohos_bridge_identity_export(&ci, &digest);
         let rendered = [
             render_napi_rust(&ci).expect("NAPI codegen must succeed"),
-            render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed"),
+            render_ohos_rust(&ci).expect("OHOS codegen must succeed"),
         ];
 
         for source in rendered {
@@ -4445,7 +4414,6 @@ mod async_object_receiver_tests {
 
 #[cfg(test)]
 mod float32_bridge_tests {
-    use super::super::ohos_bridge_identity_export;
     use super::*;
     use uniffi_meta::{
         FieldMetadata, FnMetadata, FnParamMetadata, MetadataGroup, NamespaceMetadata,
@@ -4505,11 +4473,9 @@ mod float32_bridge_tests {
     #[test]
     fn float32_record_uses_js_number_f64_and_preserves_core_f32_contract() {
         let ci = fixture();
-        let digest = "0".repeat(64);
-        let identity = ohos_bridge_identity_export(&ci, &digest);
         let rendered = [
             render_napi_rust(&ci).expect("NAPI codegen must succeed"),
-            render_ohos_rust(&ci, &identity, &digest).expect("OHOS codegen must succeed"),
+            render_ohos_rust(&ci).expect("OHOS codegen must succeed"),
         ];
 
         for source in rendered {
