@@ -29,7 +29,7 @@ pub const UNIFIED_TARGET_UNIVERSE: [PublicTarget; 3] = [
 pub use uniffi_js_engine_schema::{
     ConversionRecipe, EngineRustBridgePlan, RustArgumentBinding, RustBridgePlan, RustCallTarget,
     RustCarrier, RustObjectKind, RustOperationPlan, RustPath, RustReceiverBinding,
-    RustResourceHook, RustReturnBinding, RustStreamResourceGroup, RustType,
+    RustResourceHook, RustReturnBinding, RustStreamResourceGroup, RustType, RustValueBinding,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
