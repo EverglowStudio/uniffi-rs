@@ -645,6 +645,16 @@ fn record_drop(probe_id: &str, terminal: bool) {
 }
 
 #[uniffi::export]
+pub fn bump_counts(mut input: HashMap<String, u32>) -> HashMap<String, u32> {
+    for value in input.values_mut() {
+        *value += 1;
+    }
+    let total = input.values().copied().sum();
+    input.insert("total".to_owned(), total);
+    input
+}
+
+#[uniffi::export]
 pub fn reset_probe(probe_id: String) {
     let mut probes = probes()
         .lock()
@@ -945,6 +955,17 @@ const rawVariantProperty: "tag" = "__UNIFFI_RUNTIME_MATRIX_RAW_VARIANT_PROPERTY_
 function assert(condition: boolean, label: string): void {
   if (!condition) throw new Error(`FAIL ${label}`);
 }
+
+const mapped = api.bumpCounts(new Map<string, number>([["a", 1], ["b", 2]]));
+assert(mapped instanceof Map && mapped.get("a") === 2 && mapped.get("b") === 3
+  && mapped.get("total") === 5, "public Map crosses the engine boundary as a real Map");
+let plainObjectMapRejected = false;
+try {
+  api.bumpCounts({ a: 1 } as unknown as Map<string, number>);
+} catch (_) {
+  plainObjectMapRejected = true;
+}
+assert(plainObjectMapRejected, "public Map rejects plain object carriers");
 
 const rawStart = raw["ffi_runtime_matrix_core_record_items"];
 const rawNext = raw["ffi_runtime_matrix_core_record_items_stream_next"];

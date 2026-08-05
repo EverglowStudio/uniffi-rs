@@ -2188,28 +2188,37 @@ mod tests {
     #[test]
     fn mini_program_web_runtime_patch_removes_free_fetch_and_constructor_lookups() {
         let source = r#"
-const ret = getObject(arg0).fetch(getObject(arg1));
-const ret = fetch(getObject(arg0));
-result = getObject(arg0) instanceof Response;
+const ret = arg0.fetch(arg1);
+const ret = fetch(arg0);
+result = arg0 instanceof Response;
 const ret = new Headers();
-const ret = new Request(getStringFromWasm0(arg0, arg1), getObject(arg2));
+const ret = new Request(getStringFromWasm0(arg0, arg1), arg2);
 if (typeof Response === 'function' && module instanceof Response) {
 }
 "#;
 
-        let patched = patch_mini_program_web_runtime(source);
+        let patched = patch_mini_program_web_runtime(source).unwrap();
 
         assert!(patched.contains("export function setMiniProgramWebRuntime(runtime)"));
-        assert!(patched.contains("__uniffiMiniProgramFetch(getObject(arg1))"));
-        assert!(patched.contains("__uniffiMiniProgramFetch(getObject(arg0))"));
+        assert!(patched.contains("__uniffiMiniProgramFetch(arg1)"));
+        assert!(patched.contains("__uniffiMiniProgramFetch(arg0)"));
         assert!(patched.contains("instanceof __uniffiMiniProgramResponse"));
         assert!(patched.contains("new __uniffiMiniProgramHeaders()"));
         assert!(patched.contains("new __uniffiMiniProgramRequest("));
-        assert!(!patched.contains("getObject(arg0).fetch("));
+        assert!(!patched.contains("arg0.fetch("));
         assert!(!patched.contains("const ret = fetch("));
         assert!(!patched.contains("instanceof Response"));
         assert!(!patched.contains("new Headers()"));
         assert!(!patched.contains("new Request("));
+    }
+
+    #[test]
+    fn mini_program_web_runtime_patch_rejects_unknown_free_web_api_shape() {
+        let error = patch_mini_program_web_runtime("const ret = globalThis.fetch(arg0);")
+            .expect_err("unrecognized free fetch shape must fail generation");
+        assert!(error
+            .to_string()
+            .contains("unpatched browser Web API access"));
     }
 
     #[cfg(feature = "cli-ohos")]
@@ -2780,37 +2789,55 @@ fn patch_mini_program_wasm_bindgen_glue(source: &str, wasm_bindgen_stem: &str) -
         "const ret = typeof window === 'undefined' ? null : window;",
         "const ret = null;",
     );
-    let patched = patch_mini_program_web_runtime(&patched);
+    let patched = patch_mini_program_web_runtime(&patched)?;
     Ok(patch_mini_program_text_encoding(&patched))
 }
 
-fn patch_mini_program_web_runtime(source: &str) -> String {
+fn patch_mini_program_web_runtime(source: &str) -> Result<String> {
     let patched = source
         .replace(
-            "const ret = getObject(arg0).fetch(getObject(arg1));",
-            "const ret = __uniffiMiniProgramFetch(getObject(arg1));",
+            "const ret = arg0.fetch(arg1);",
+            "const ret = __uniffiMiniProgramFetch(arg1);",
         )
         .replace(
-            "const ret = fetch(getObject(arg0));",
-            "const ret = __uniffiMiniProgramFetch(getObject(arg0));",
+            "const ret = fetch(arg0);",
+            "const ret = __uniffiMiniProgramFetch(arg0);",
         )
         .replace(
-            "result = getObject(arg0) instanceof Response;",
-            "result = getObject(arg0) instanceof __uniffiMiniProgramResponse;",
+            "result = arg0 instanceof Response;",
+            "result = arg0 instanceof __uniffiMiniProgramResponse;",
         )
         .replace(
             "const ret = new Headers();",
             "const ret = new __uniffiMiniProgramHeaders();",
         )
         .replace(
-            "const ret = new Request(getStringFromWasm0(arg0, arg1), getObject(arg2));",
-            "const ret = new __uniffiMiniProgramRequest(getStringFromWasm0(arg0, arg1), getObject(arg2));",
+            "const ret = new Request(getStringFromWasm0(arg0, arg1), arg2);",
+            "const ret = new __uniffiMiniProgramRequest(getStringFromWasm0(arg0, arg1), arg2);",
         )
         .replace(
             "if (typeof Response === 'function' && module instanceof Response) {",
             "if (typeof __uniffiMiniProgramResponse === 'function' && module instanceof __uniffiMiniProgramResponse) {",
         );
-    format!("{}\n{}", mini_program_web_runtime_prelude(), patched)
+    for forbidden in [
+        ".fetch(",
+        "const ret = fetch(",
+        "new Headers(",
+        "new Request(",
+        "instanceof Response",
+        "typeof Response",
+    ] {
+        if patched.contains(forbidden) {
+            bail!(
+                "wasm-bindgen Mini Program glue contains unpatched browser Web API access `{forbidden}`"
+            );
+        }
+    }
+    Ok(format!(
+        "{}\n{}",
+        mini_program_web_runtime_prelude(),
+        patched
+    ))
 }
 
 fn mini_program_web_runtime_prelude() -> &'static str {

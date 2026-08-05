@@ -301,17 +301,17 @@ fn cli_build_runs_value_type_methods() {
             .unwrap();
     assert!(
         records.contains("readonly Point: {")
-            && records.contains("new(x: number, y: number): Point")
-            && records.contains("distanceTo(self_: Point")
-            && records.contains("scale(self_: Point"),
+            && records.contains("readonly new: (x: number, y: number) => Point")
+            && records.contains("readonly distanceTo: (self_: Point")
+            && records.contains("readonly scale: (self_: Point"),
         "component declarations should expose static value constructors and methods:\n{records}"
     );
     let enums = records.clone();
     assert!(
-        enums.contains("south(): Direction")
-            && enums.contains("opposite(self_: Direction")
-            && enums.contains("circle(radius: number): Shape")
-            && enums.contains("area(self_: Shape")
+        enums.contains("readonly south: () => Direction")
+            && enums.contains("readonly opposite: (self_: Direction")
+            && enums.contains("readonly circle: (radius: number) => Shape")
+            && enums.contains("readonly area: (self_: Shape")
             && !enums.contains("keyof typeof Direction"),
         "component declarations should expose value constructors/methods without widening flat enum type to helpers:\n{enums}"
     );
@@ -796,10 +796,11 @@ fn cli_managed_layout_replaces_complete_package_and_bench_smoke() {
             .count()
             == 1
             && browser_entry.contains("import * as __glue from ")
+            && browser_entry.contains("const __defaultWasm = new URL(")
             && browser_entry
-                .contains("export const ready = __backend.initWithGlue(__glue, undefined);")
+                .contains("export const ready = __backend.initWithGlue(__glue, __defaultWasm);")
             && browser_entry.contains(
-                "export function init(input) { return __backend.initWithGlue(__glue, input); }",
+                "export function init(input) { return __backend.initWithGlue(__glue, input === undefined ? __defaultWasm : input); }",
             )
             && !browser_entry.contains("export function initWithGlue"),
         "managed Browser index must own the single planned glue loader:\n{browser_entry}"
