@@ -5,7 +5,7 @@
 //! [`super::ir`]; renderers and engine adapters must not import the UniFFI
 //! interface types again.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
@@ -33,9 +33,10 @@ use super::ir::{
     ConversionRecipe, EnginePlan, EngineRustBridgePlan, HostPlan, JsApiIr, JsArgument, JsComponent,
     JsCustomTypeConfig, JsDefaultValue, JsField, JsOperation, JsReceiver, JsType, JsTypeKind,
     JsVariant, LayoutPlan, NormalizedPackage, ResolvedJsConfig, RustArgumentBinding,
-    RustBridgePlan, RustCallTarget, RustCarrier, RustObjectKind, RustOperationPlan, RustPath,
-    RustReceiverBinding, RustResourceHook, RustReturnBinding, RustStreamResourceGroup, RustType,
-    RustValueBinding, UNIFIED_TARGET_UNIVERSE,
+    RustBridgePlan, RustCallTarget, RustCarrier, RustEnumVariant, RustNamedTypeKind,
+    RustNamedTypePlan, RustObjectKind, RustOperationPlan, RustPath, RustReceiverBinding,
+    RustRecordField, RustResourceHook, RustReturnBinding, RustStreamResourceGroup, RustTupleField,
+    RustType, RustValueBinding, RustVariantPayload, UNIFIED_TARGET_UNIVERSE,
 };
 use crate::{CustomTypeConfig, JsConfig};
 
@@ -423,14 +424,14 @@ fn validate_executable_stream_use_sites(
     Ok(())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TypeExtra {
     kind: JsTypeKind,
     source_kind: SourceTypeKind,
     rust_path: RustPath,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceField {
     public_name: String,
     rust_name: String,
@@ -438,20 +439,28 @@ struct SourceField {
     default: Option<JsDefaultValue>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceVariantShape {
+    Named,
+    Tuple,
+    Unit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceVariant {
     public_name: String,
     rust_name: String,
     fields: Vec<SourceField>,
+    shape: SourceVariantShape,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SourceTypeKind {
     Record { fields: Vec<SourceField> },
     Enum { variants: Vec<SourceVariant> },
     Error { variants: Vec<SourceVariant> },
     Custom { builtin: ValueType },
-    Object,
+    Object { kind: ObjectKind },
     Callback,
 }
 
@@ -569,7 +578,9 @@ fn collect_type_definitions(
                 key,
                 TypeExtra {
                     kind: JsTypeKind::Object { kind: object_kind },
-                    source_kind: SourceTypeKind::Object,
+                    source_kind: SourceTypeKind::Object {
+                        kind: abi_object_kind(object.imp()),
+                    },
                     rust_path: RustPath::from_module_path(
                         object
                             .as_type()
@@ -1525,6 +1536,7 @@ fn build_rust_bridge_plan(
     crate_owners: &BTreeMap<String, ComponentKey>,
     build_targets: &[PublicTarget],
 ) -> Result<RustBridgePlan, FrontendError> {
+    let named_types = build_named_type_plans(api, type_ids, type_extras)?;
     let mut operations = Vec::with_capacity(api.operations.len());
     let mut synthetic_operations = Vec::new();
     let mut next_synthetic_id = api
@@ -1861,7 +1873,460 @@ fn build_rust_bridge_plan(
             )
         })
         .collect();
-    Ok(RustBridgePlan { engines })
+    Ok(RustBridgePlan {
+        engines,
+        named_types,
+    })
+}
+
+/// Project the source-side [`TypeExtra`] table into the one Rust lowering
+/// table consumed by every engine.  This is intentionally kept in the
+/// frontend: it is the only place allowed to inspect `ComponentInterface`
+/// and source metadata.  Once this function returns, adapters need only the
+/// owned `RustBridgePlan`.
+fn build_named_type_plans(
+    api: &JsApiIr,
+    type_ids: &BTreeMap<TypeSourceKey, uniffi_js_abi::TypeId>,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+) -> Result<Vec<RustNamedTypePlan>, FrontendError> {
+    validate_custom_bindings_acyclic(api, type_extras)?;
+    let mut plans = Vec::with_capacity(api.types.len());
+
+    for (index, ty) in api.types.iter().enumerate() {
+        let expected_id = uniffi_js_abi::TypeId::new(index as u32);
+        if ty.id != expected_id {
+            return Err(FrontendError::Contract(format!(
+                "named Rust type IDs must be dense: expected {}, found {} for {}",
+                expected_id.index(),
+                ty.id.index(),
+                ty.source_key
+            )));
+        }
+        let extra = type_extras.get(&ty.source_key).ok_or_else(|| {
+            FrontendError::Contract(format!(
+                "missing TypeExtra for named Rust type {}",
+                ty.source_key
+            ))
+        })?;
+        validate_rust_path(&ty.source_key, &extra.rust_path)?;
+        validate_public_source_shape(ty, extra)?;
+        let kind = build_named_type_kind(ty, extra, api, type_ids, type_extras)?;
+        plans.push(RustNamedTypePlan {
+            id: ty.id,
+            rust_path: extra.rust_path.clone(),
+            kind,
+        });
+    }
+    Ok(plans)
+}
+
+fn validate_custom_bindings_acyclic(
+    api: &JsApiIr,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+) -> Result<(), FrontendError> {
+    for ty in &api.types {
+        let Some(SourceTypeKind::Custom { builtin }) = type_extras
+            .get(&ty.source_key)
+            .map(|extra| &extra.source_kind)
+        else {
+            continue;
+        };
+        let mut visiting = BTreeSet::new();
+        validate_custom_value_acyclic(builtin, type_extras, &mut visiting, &ty.source_key)?;
+    }
+    Ok(())
+}
+
+fn validate_custom_value_acyclic(
+    value: &ValueType,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+    visiting: &mut BTreeSet<TypeSourceKey>,
+    owner: &TypeSourceKey,
+) -> Result<(), FrontendError> {
+    match value {
+        ValueType::Named(key) => {
+            let Some(extra) = type_extras.get(key) else {
+                return Err(FrontendError::UnknownTypeOwner(key.to_string()));
+            };
+            let SourceTypeKind::Custom { builtin } = &extra.source_kind else {
+                return Ok(());
+            };
+            if !visiting.insert(key.clone()) {
+                return Err(FrontendError::Contract(format!(
+                    "custom Rust type {} has a recursive builtin binding through {}",
+                    owner, key
+                )));
+            }
+            let result = validate_custom_value_acyclic(builtin, type_extras, visiting, owner);
+            visiting.remove(key);
+            result
+        }
+        ValueType::Optional(inner)
+        | ValueType::Sequence(inner)
+        | ValueType::Set(inner)
+        | ValueType::InputStream(inner)
+        | ValueType::OutputStream(inner) => {
+            validate_custom_value_acyclic(inner, type_extras, visiting, owner)
+        }
+        ValueType::Map(key, value) => {
+            validate_custom_value_acyclic(key, type_extras, visiting, owner)?;
+            validate_custom_value_acyclic(value, type_extras, visiting, owner)
+        }
+        ValueType::Scalar(_) | ValueType::Timestamp | ValueType::Duration => Ok(()),
+    }
+}
+
+fn validate_rust_path(key: &TypeSourceKey, path: &RustPath) -> Result<(), FrontendError> {
+    if path.segments.is_empty() || path.segments.iter().any(String::is_empty) {
+        return Err(FrontendError::Contract(format!(
+            "named Rust type {} is missing a complete Rust path",
+            key
+        )));
+    }
+    Ok(())
+}
+
+fn validate_public_source_shape(ty: &JsType, extra: &TypeExtra) -> Result<(), FrontendError> {
+    let mismatch = || {
+        FrontendError::Contract(format!(
+            "Rust named type shape does not match public graph for {}",
+            ty.source_key
+        ))
+    };
+    match (&ty.kind, &extra.kind, &extra.source_kind) {
+        (
+            JsTypeKind::Record {
+                fields: public_fields,
+            },
+            JsTypeKind::Record {
+                fields: extra_fields,
+            },
+            SourceTypeKind::Record {
+                fields: source_fields,
+            },
+        ) => {
+            if public_fields.len() != source_fields.len()
+                || extra_fields.len() != source_fields.len()
+                || public_fields
+                    .iter()
+                    .zip(source_fields)
+                    .any(|(public, source)| {
+                        public.public_name != source.public_name || public.ty != source.ty
+                    })
+            {
+                return Err(mismatch());
+            }
+        }
+        (
+            JsTypeKind::Enum {
+                variants: public_variants,
+            },
+            JsTypeKind::Enum {
+                variants: extra_variants,
+            },
+            SourceTypeKind::Enum {
+                variants: source_variants,
+            },
+        )
+        | (
+            JsTypeKind::Error {
+                variants: public_variants,
+            },
+            JsTypeKind::Error {
+                variants: extra_variants,
+            },
+            SourceTypeKind::Error {
+                variants: source_variants,
+            },
+        ) => {
+            validate_public_variants(public_variants, extra_variants, source_variants)?;
+        }
+        (
+            JsTypeKind::Custom {
+                builtin: public_builtin,
+                ..
+            },
+            JsTypeKind::Custom {
+                builtin: extra_builtin,
+                ..
+            },
+            SourceTypeKind::Custom {
+                builtin: source_builtin,
+            },
+        ) if public_builtin == source_builtin && extra_builtin == source_builtin => {}
+        (
+            JsTypeKind::Object { kind: public_kind },
+            JsTypeKind::Object { kind: extra_kind },
+            SourceTypeKind::Object { kind: source_kind },
+        ) if public_kind == extra_kind && public_kind == source_kind => {}
+        (JsTypeKind::Callback, JsTypeKind::Callback, SourceTypeKind::Callback) => {}
+        _ => return Err(mismatch()),
+    }
+    Ok(())
+}
+
+fn validate_public_variants(
+    public_variants: &[JsVariant],
+    extra_variants: &[JsVariant],
+    source_variants: &[SourceVariant],
+) -> Result<(), FrontendError> {
+    if public_variants.len() != source_variants.len()
+        || extra_variants.len() != source_variants.len()
+    {
+        return Err(FrontendError::Contract(
+            "named Rust enum/error variant shape does not match public graph".to_owned(),
+        ));
+    }
+    for ((public, extra), source) in public_variants
+        .iter()
+        .zip(extra_variants)
+        .zip(source_variants)
+    {
+        if public.public_name != source.public_name
+            || extra.public_name != source.public_name
+            || public.fields.len() != source.fields.len()
+            || extra.fields.len() != source.fields.len()
+        {
+            return Err(FrontendError::Contract(
+                "named Rust enum/error variant shape does not match public graph".to_owned(),
+            ));
+        }
+        for ((public_field, extra_field), source_field) in
+            public.fields.iter().zip(&extra.fields).zip(&source.fields)
+        {
+            if public_field.public_name != source_field.public_name
+                || public_field.ty != source_field.ty
+                || extra_field.public_name != source_field.public_name
+                || extra_field.ty != source_field.ty
+            {
+                return Err(FrontendError::Contract(
+                    "named Rust enum/error field shape does not match public graph".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_named_type_kind(
+    ty: &JsType,
+    extra: &TypeExtra,
+    api: &JsApiIr,
+    type_ids: &BTreeMap<TypeSourceKey, uniffi_js_abi::TypeId>,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+) -> Result<RustNamedTypeKind, FrontendError> {
+    match &extra.source_kind {
+        SourceTypeKind::Record { fields } => Ok(RustNamedTypeKind::Record {
+            fields: build_named_fields(
+                fields,
+                api,
+                type_ids,
+                type_extras,
+                &format!("record {}", ty.source_key),
+            )?,
+        }),
+        SourceTypeKind::Enum { variants } => Ok(RustNamedTypeKind::Enum {
+            variants: build_enum_variants(
+                variants,
+                api,
+                type_ids,
+                type_extras,
+                &format!("enum {}", ty.source_key),
+            )?,
+        }),
+        SourceTypeKind::Error { variants } => Ok(RustNamedTypeKind::Error {
+            variants: build_enum_variants(
+                variants,
+                api,
+                type_ids,
+                type_extras,
+                &format!("error {}", ty.source_key),
+            )?,
+        }),
+        SourceTypeKind::Custom { builtin } => {
+            let inner =
+                rust_value_binding_for_value_type(builtin, api, type_ids, type_extras, false)?;
+            let id = ty.id;
+            Ok(RustNamedTypeKind::Custom {
+                conversion: ConversionRecipe::Custom(id, Box::new(inner.conversion.clone())),
+                inner,
+            })
+        }
+        SourceTypeKind::Object { kind } => Ok(RustNamedTypeKind::Object {
+            kind: rust_object_kind_from_abi(*kind),
+        }),
+        SourceTypeKind::Callback => Ok(RustNamedTypeKind::Callback),
+    }
+}
+
+fn build_named_fields(
+    fields: &[SourceField],
+    api: &JsApiIr,
+    type_ids: &BTreeMap<TypeSourceKey, uniffi_js_abi::TypeId>,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+    scope: &str,
+) -> Result<Vec<RustRecordField>, FrontendError> {
+    let mut public_names = BTreeMap::<String, u32>::new();
+    let mut rust_names = BTreeMap::<String, u32>::new();
+    fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let order = u32::try_from(index)
+                .map_err(|_| FrontendError::Contract(format!("{scope} has too many fields")))?;
+            if field.public_name.is_empty() || field.rust_name.is_empty() {
+                return Err(FrontendError::Contract(format!(
+                    "{scope} field at declaration order {order} is missing public or Rust name"
+                )));
+            }
+            if let Some(previous) = public_names.insert(field.public_name.clone(), order) {
+                return Err(FrontendError::Contract(format!(
+                    "duplicate public field name {:?} in {scope} (orders {previous} and {order})",
+                    field.public_name
+                )));
+            }
+            if let Some(previous) = rust_names.insert(field.rust_name.clone(), order) {
+                return Err(FrontendError::Contract(format!(
+                    "duplicate Rust field name {:?} in {scope} (orders {previous} and {order})",
+                    field.rust_name
+                )));
+            }
+            Ok(RustRecordField {
+                public_name: field.public_name.clone(),
+                rust_name: field.rust_name.clone(),
+                declaration_order: order,
+                binding: rust_value_binding_for_value_type(
+                    &field.ty,
+                    api,
+                    type_ids,
+                    type_extras,
+                    false,
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn build_enum_variants(
+    variants: &[SourceVariant],
+    api: &JsApiIr,
+    type_ids: &BTreeMap<TypeSourceKey, uniffi_js_abi::TypeId>,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+    scope: &str,
+) -> Result<Vec<RustEnumVariant>, FrontendError> {
+    let mut public_names = BTreeMap::<String, u32>::new();
+    let mut rust_names = BTreeMap::<String, u32>::new();
+    variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| {
+            let order = u32::try_from(index)
+                .map_err(|_| FrontendError::Contract(format!("{scope} has too many variants")))?;
+            if variant.public_name.is_empty() || variant.rust_name.is_empty() {
+                return Err(FrontendError::Contract(format!(
+                    "{scope} variant at declaration order {order} is missing public or Rust name"
+                )));
+            }
+            if let Some(previous) = public_names.insert(variant.public_name.clone(), order) {
+                return Err(FrontendError::Contract(format!(
+                    "duplicate public variant name {:?} in {scope} (orders {previous} and {order})",
+                    variant.public_name
+                )));
+            }
+            if let Some(previous) = rust_names.insert(variant.rust_name.clone(), order) {
+                return Err(FrontendError::Contract(format!(
+                    "duplicate Rust variant name {:?} in {scope} (orders {previous} and {order})",
+                    variant.rust_name
+                )));
+            }
+            let payload = match variant.shape {
+                SourceVariantShape::Unit => {
+                    if !variant.fields.is_empty() {
+                        return Err(FrontendError::Contract(format!(
+                            "{scope} variant {:?} is unit but has fields",
+                            variant.public_name
+                        )));
+                    }
+                    RustVariantPayload::Unit
+                }
+                SourceVariantShape::Named => RustVariantPayload::Named(build_named_fields(
+                    &variant.fields,
+                    api,
+                    type_ids,
+                    type_extras,
+                    &format!("{scope} variant {}", variant.public_name),
+                )?),
+                SourceVariantShape::Tuple => {
+                    let mut public_names = BTreeSet::new();
+                    RustVariantPayload::Tuple(
+                        variant
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .map(|(field_index, field)| {
+                            let declaration_order = u32::try_from(field_index).map_err(|_| {
+                                FrontendError::Contract(format!(
+                                    "{scope} variant {:?} has too many tuple fields",
+                                    variant.public_name
+                                ))
+                            })?;
+                            if field.public_name.is_empty()
+                                || !public_names.insert(field.public_name.clone())
+                            {
+                                return Err(FrontendError::Contract(format!(
+                                    "{scope} variant {:?} has an invalid tuple public field name at declaration order {declaration_order}",
+                                    variant.public_name
+                                )));
+                            }
+                            Ok(RustTupleField {
+                                public_name: field.public_name.clone(),
+                                declaration_order,
+                                binding: rust_value_binding_for_value_type(
+                                    &field.ty,
+                                    api,
+                                    type_ids,
+                                    type_extras,
+                                    false,
+                                )?,
+                            })
+                            })
+                            .collect::<Result<Vec<_>, FrontendError>>()?,
+                    )
+                }
+            };
+            Ok(RustEnumVariant {
+                public_name: variant.public_name.clone(),
+                rust_name: variant.rust_name.clone(),
+                declaration_order: order,
+                payload,
+            })
+        })
+        .collect()
+}
+
+fn rust_value_binding_for_value_type(
+    value_type: &ValueType,
+    api: &JsApiIr,
+    type_ids: &BTreeMap<TypeSourceKey, uniffi_js_abi::TypeId>,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+    callback_role: bool,
+) -> Result<RustValueBinding, FrontendError> {
+    let (rust_type, carrier, conversion) =
+        rust_binding_for_type(value_type, api, type_ids, type_extras, callback_role)?;
+    Ok(RustValueBinding {
+        rust_type,
+        carrier,
+        conversion,
+    })
+}
+
+fn rust_object_kind_from_abi(kind: ObjectKind) -> RustObjectKind {
+    match kind {
+        ObjectKind::Struct => RustObjectKind::Struct,
+        ObjectKind::TraitRustOnly => RustObjectKind::TraitRustOnly,
+        ObjectKind::TraitBoth => RustObjectKind::TraitBoth,
+        ObjectKind::TraitForeignOnly => RustObjectKind::TraitForeignOnly,
+    }
 }
 
 fn rust_value_binding_for_source_type(
@@ -2095,21 +2560,48 @@ fn convert_variant(
     variant: &uniffi_bindgen::interface::Variant,
     crate_owners: &BTreeMap<String, ComponentKey>,
 ) -> Result<SourceVariant, FrontendError> {
+    let shape = if variant.fields().is_empty() {
+        SourceVariantShape::Unit
+    } else if variant
+        .fields()
+        .iter()
+        .all(|field| !field.name().is_empty())
+    {
+        SourceVariantShape::Named
+    } else if variant.fields().iter().all(|field| field.name().is_empty()) {
+        SourceVariantShape::Tuple
+    } else {
+        return Err(FrontendError::Contract(format!(
+            "variant {:?} mixes named and tuple fields",
+            variant.name()
+        )));
+    };
     Ok(SourceVariant {
         public_name: variant.name().to_upper_camel_case(),
         rust_name: variant.rust_name().to_owned(),
         fields: variant
             .fields()
             .iter()
-            .map(|field| {
+            .enumerate()
+            .map(|(index, field)| {
                 Ok(SourceField {
-                    public_name: field.name().to_lower_camel_case(),
+                    // Tuple payloads have no source field names.  The public
+                    // graph still needs checked, addressable field entries,
+                    // so use a deterministic positional spelling; the Rust
+                    // lowering table retains the tuple shape and never treats
+                    // this synthetic name as a Rust member.
+                    public_name: if shape == SourceVariantShape::Tuple {
+                        format!("field{index}")
+                    } else {
+                        field.name().to_lower_camel_case()
+                    },
                     rust_name: field.rust_name().to_owned(),
                     ty: convert_type(&field.as_type(), crate_owners)?,
                     default: field.default_value().map(convert_default),
                 })
             })
             .collect::<Result<Vec<_>, FrontendError>>()?,
+        shape,
     })
 }
 
@@ -2284,6 +2776,392 @@ mod tests {
                 .expect("test interface should parse"),
             config: JsConfig::default(),
         }
+    }
+
+    fn metadata_component(group: uniffi_meta::MetadataGroup) -> Component<JsConfig> {
+        Component {
+            ci: ComponentInterface::from_metadata(group).expect("test metadata should parse"),
+            config: JsConfig::default(),
+        }
+    }
+
+    fn metadata_field(
+        name: &str,
+        orig_name: Option<&str>,
+        ty: uniffi_meta::Type,
+    ) -> uniffi_meta::FieldMetadata {
+        uniffi_meta::FieldMetadata {
+            name: name.to_owned(),
+            orig_name: orig_name.map(ToOwned::to_owned),
+            ty,
+            default: None,
+            docstring: None,
+        }
+    }
+
+    fn named_type_fixture_group() -> uniffi_meta::MetadataGroup {
+        use uniffi_meta::{EnumMetadata, EnumShape, VariantMetadata};
+
+        let crate_name = "named_plan_crate";
+        let object = uniffi_meta::Type::Object {
+            module_path: format!("{crate_name}::types"),
+            name: "PublicObject".to_owned(),
+            imp: uniffi_meta::ObjectImpl::Struct,
+        };
+        let custom = uniffi_meta::Type::Custom {
+            module_path: format!("{crate_name}::types"),
+            name: "Alias".to_owned(),
+            builtin: Box::new(uniffi_meta::Type::String),
+        };
+        let nested = uniffi_meta::Type::Optional {
+            inner_type: Box::new(uniffi_meta::Type::Sequence {
+                inner_type: Box::new(custom.clone()),
+            }),
+        };
+        let mut group = uniffi_meta::MetadataGroup {
+            namespace: uniffi_meta::NamespaceMetadata {
+                crate_name: crate_name.to_owned(),
+                name: "named_plan".to_owned(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            uniffi_meta::CustomTypeMetadata {
+                module_path: format!("{crate_name}::types"),
+                name: "Alias".to_owned(),
+                orig_name: None,
+                builtin: uniffi_meta::Type::String,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            uniffi_meta::ObjectMetadata {
+                module_path: format!("{crate_name}::types"),
+                name: "PublicObject".to_owned(),
+                orig_name: Some("RustObject".to_owned()),
+                remote: false,
+                imp: uniffi_meta::ObjectImpl::Struct,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            uniffi_meta::RecordMetadata {
+                module_path: format!("{crate_name}::types"),
+                name: "PublicRecord".to_owned(),
+                orig_name: Some("RustRecord".to_owned()),
+                rust_path: Some("domain::RustRecord".to_owned()),
+                remote: false,
+                fields: vec![
+                    metadata_field("snake_field", Some("rust_field"), nested),
+                    metadata_field("object_value", None, object.clone()),
+                ],
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            EnumMetadata {
+                module_path: format!("{crate_name}::types"),
+                name: "PublicEnum".to_owned(),
+                orig_name: Some("RustEnum".to_owned()),
+                rust_path: Some("domain::RustEnum".to_owned()),
+                shape: EnumShape::Enum,
+                remote: false,
+                variants: vec![
+                    VariantMetadata {
+                        name: "first_variant".to_owned(),
+                        orig_name: Some("RustFirst".to_owned()),
+                        discr: None,
+                        fields: vec![metadata_field(
+                            "nested_value",
+                            Some("rust_nested"),
+                            uniffi_meta::Type::Map {
+                                key_type: Box::new(uniffi_meta::Type::String),
+                                value_type: Box::new(object.clone()),
+                            },
+                        )],
+                        docstring: None,
+                    },
+                    VariantMetadata {
+                        name: "tuple_payload".to_owned(),
+                        orig_name: Some("RustTuple".to_owned()),
+                        discr: None,
+                        fields: vec![
+                            metadata_field("", None, uniffi_meta::Type::UInt32),
+                            metadata_field("", None, custom.clone()),
+                        ],
+                        docstring: None,
+                    },
+                    VariantMetadata {
+                        name: "unit".to_owned(),
+                        orig_name: Some("RustUnit".to_owned()),
+                        discr: None,
+                        fields: vec![],
+                        docstring: None,
+                    },
+                ],
+                discr_type: None,
+                non_exhaustive: false,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            EnumMetadata {
+                module_path: format!("{crate_name}::types"),
+                name: "PublicError".to_owned(),
+                orig_name: Some("RustError".to_owned()),
+                rust_path: Some("domain::RustError".to_owned()),
+                shape: EnumShape::Error { flat: false },
+                remote: false,
+                variants: vec![VariantMetadata {
+                    name: "failed_case".to_owned(),
+                    orig_name: Some("RustFailed".to_owned()),
+                    discr: None,
+                    fields: vec![metadata_field(
+                        "error_value",
+                        Some("rust_error"),
+                        uniffi_meta::Type::Sequence {
+                            inner_type: Box::new(uniffi_meta::Type::Optional {
+                                inner_type: Box::new(custom),
+                            }),
+                        },
+                    )],
+                    docstring: None,
+                }],
+                discr_type: None,
+                non_exhaustive: false,
+                docstring: None,
+            }
+            .into(),
+        );
+        group
+    }
+
+    fn update_record_metadata(
+        mut group: uniffi_meta::MetadataGroup,
+        update: impl FnOnce(&mut uniffi_meta::RecordMetadata),
+    ) -> uniffi_meta::MetadataGroup {
+        let items = std::mem::take(&mut group.items);
+        let mut updated = std::collections::BTreeSet::new();
+        let mut update = Some(update);
+        for item in items {
+            match item {
+                uniffi_meta::Metadata::Record(mut record) => {
+                    update.take().expect("record fixture occurs once")(&mut record);
+                    updated.insert(record.into());
+                }
+                other => {
+                    updated.insert(other);
+                }
+            }
+        }
+        group.items = updated;
+        group
+    }
+
+    fn update_enum_metadata(
+        mut group: uniffi_meta::MetadataGroup,
+        update: impl FnOnce(&mut uniffi_meta::EnumMetadata),
+    ) -> uniffi_meta::MetadataGroup {
+        let items = std::mem::take(&mut group.items);
+        let mut updated = std::collections::BTreeSet::new();
+        let mut update = Some(update);
+        for item in items {
+            match item {
+                uniffi_meta::Metadata::Enum(mut enum_) if enum_.name == "PublicEnum" => {
+                    update.take().expect("enum fixture occurs once")(&mut enum_);
+                    updated.insert(enum_.into());
+                }
+                other => {
+                    updated.insert(other);
+                }
+            }
+        }
+        group.items = updated;
+        group
+    }
+
+    #[test]
+    fn rust_named_type_plan_preserves_paths_names_order_and_recursive_bindings() {
+        let package = normalize(BindingInput::new(&[metadata_component(
+            named_type_fixture_group(),
+        )]))
+        .unwrap();
+        let named = package.rust.named_types();
+        assert_eq!(
+            named
+                .iter()
+                .map(|entry| entry.id.index())
+                .collect::<Vec<_>>(),
+            (0..named.len() as u32).collect::<Vec<_>>()
+        );
+
+        let record = named
+            .iter()
+            .find(|entry| {
+                entry
+                    .rust_path
+                    .segments
+                    .ends_with(&["RustRecord".to_owned()])
+            })
+            .expect("record lowering entry");
+        let RustNamedTypeKind::Record { fields } = &record.kind else {
+            panic!("expected record lowering entry");
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| (
+                    field.public_name.as_str(),
+                    field.rust_name.as_str(),
+                    field.declaration_order
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("snakeField", "rust_field", 0),
+                ("objectValue", "object_value", 1)
+            ]
+        );
+        assert!(matches!(
+            &fields[0].binding.rust_type,
+            RustType::Option(inner) if matches!(**inner, RustType::Sequence(_))
+        ));
+        assert!(matches!(
+            &fields[0].binding.conversion,
+            ConversionRecipe::Optional(inner)
+                if matches!(**inner, ConversionRecipe::Sequence(_))
+        ));
+        assert!(matches!(
+            fields[1].binding.conversion,
+            ConversionRecipe::Object(_)
+        ));
+
+        let enum_plan = named
+            .iter()
+            .find(|entry| entry.rust_path.segments.ends_with(&["RustEnum".to_owned()]))
+            .expect("enum lowering entry");
+        let RustNamedTypeKind::Enum { variants } = &enum_plan.kind else {
+            panic!("expected enum lowering entry");
+        };
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| (
+                    variant.public_name.as_str(),
+                    variant.rust_name.as_str(),
+                    variant.declaration_order
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("FirstVariant", "RustFirst", 0),
+                ("TuplePayload", "RustTuple", 1),
+                ("Unit", "RustUnit", 2),
+            ]
+        );
+        assert!(matches!(
+            variants[0].payload,
+            RustVariantPayload::Named(ref fields)
+                if fields.len() == 1
+                    && fields[0].public_name == "nestedValue"
+                    && fields[0].rust_name == "rust_nested"
+                    && fields[0].declaration_order == 0
+        ));
+        assert!(matches!(
+            variants[1].payload,
+            RustVariantPayload::Tuple(ref fields)
+                if fields
+                    .iter()
+                    .map(|field| (field.public_name.as_str(), field.declaration_order))
+                    .collect::<Vec<_>>()
+                    == vec![("field0", 0), ("field1", 1)]
+        ));
+        assert!(matches!(variants[2].payload, RustVariantPayload::Unit));
+
+        let error_plan = named
+            .iter()
+            .find(|entry| {
+                entry
+                    .rust_path
+                    .segments
+                    .ends_with(&["RustError".to_owned()])
+            })
+            .expect("error lowering entry");
+        let RustNamedTypeKind::Error { variants } = &error_plan.kind else {
+            panic!("expected error lowering entry");
+        };
+        assert_eq!(variants[0].rust_name, "RustFailed");
+        let RustVariantPayload::Named(fields) = &variants[0].payload else {
+            panic!("expected named error payload");
+        };
+        assert!(matches!(
+            &fields[0].binding.conversion,
+            ConversionRecipe::Sequence(inner)
+                if matches!(**inner, ConversionRecipe::Optional(_))
+        ));
+
+        let custom = named
+            .iter()
+            .find(|entry| entry.rust_path.segments.ends_with(&["Alias".to_owned()]))
+            .expect("custom lowering entry");
+        let RustNamedTypeKind::Custom { inner, conversion } = &custom.kind else {
+            panic!("expected custom lowering entry");
+        };
+        assert_eq!(inner.rust_type, RustType::Scalar(ScalarType::String));
+        assert!(
+            matches!(conversion, ConversionRecipe::Custom(id, inner) if *id == custom.id && matches!(**inner, ConversionRecipe::Identity))
+        );
+
+        let object = named
+            .iter()
+            .find(|entry| {
+                entry
+                    .rust_path
+                    .segments
+                    .ends_with(&["r#RustObject".to_owned()])
+            })
+            .expect("object lowering entry");
+        assert!(matches!(
+            object.kind,
+            RustNamedTypeKind::Object {
+                kind: RustObjectKind::Struct
+            }
+        ));
+        assert_eq!(package.rust.named_type(record.id), Some(record));
+        assert!(package
+            .rust
+            .named_type(uniffi_js_abi::TypeId::new(999))
+            .is_none());
+    }
+
+    #[test]
+    fn duplicate_rust_field_names_fail_named_type_normalization() {
+        let group = update_record_metadata(named_type_fixture_group(), |record| {
+            record.fields[1].orig_name = Some("rust_field".to_owned());
+        });
+        let error = normalize(BindingInput::new(&[metadata_component(group)])).unwrap_err();
+        assert!(error.to_string().contains("duplicate Rust field name"));
+    }
+
+    #[test]
+    fn duplicate_rust_variant_names_fail_named_type_normalization() {
+        let group = update_enum_metadata(named_type_fixture_group(), |enum_| {
+            enum_.variants[1].orig_name = Some("RustFirst".to_owned());
+        });
+        let error = normalize(BindingInput::new(&[metadata_component(group)])).unwrap_err();
+        assert!(error.to_string().contains("duplicate Rust variant name"));
+    }
+
+    #[test]
+    fn mixed_variant_payload_shape_fails_before_public_graph_output() {
+        let group = update_enum_metadata(named_type_fixture_group(), |enum_| {
+            enum_.variants[1].fields[0].name = "named".to_owned();
+        });
+        let error = normalize(BindingInput::new(&[metadata_component(group)])).unwrap_err();
+        assert!(error.to_string().contains("mixes named and tuple fields"));
     }
 
     #[test]

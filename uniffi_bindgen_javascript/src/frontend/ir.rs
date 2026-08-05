@@ -28,8 +28,10 @@ pub const UNIFIED_TARGET_UNIVERSE: [PublicTarget; 3] = [
 // exposes those exact types rather than defining a parallel plan.
 pub use uniffi_js_engine_schema::{
     ConversionRecipe, EngineRustBridgePlan, RustArgumentBinding, RustBridgePlan, RustCallTarget,
-    RustCarrier, RustObjectKind, RustOperationPlan, RustPath, RustReceiverBinding,
-    RustResourceHook, RustReturnBinding, RustStreamResourceGroup, RustType, RustValueBinding,
+    RustCarrier, RustEnumVariant, RustNamedTypeKind, RustNamedTypePlan, RustObjectKind,
+    RustOperationPlan, RustPath, RustReceiverBinding, RustRecordField, RustResourceHook,
+    RustReturnBinding, RustStreamResourceGroup, RustTupleField, RustType, RustValueBinding,
+    RustVariantPayload,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
