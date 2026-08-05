@@ -46,8 +46,6 @@ pub struct HostBuildSpec {
     pub lib_target: String,
     /// Package-relative destination for the final native artifact.
     pub native_artifact: Utf8PathBuf,
-    /// Package-relative destination for the Wasm loader, when applicable.
-    pub loader_artifact: Option<Utf8PathBuf>,
     /// Dependency key used to scope downstream Cargo features for this host.
     pub core_dependency_key: String,
 }
@@ -109,7 +107,6 @@ impl GeneratedPackage {
                     crate_root: flavor.crate_root.clone(),
                     lib_target: flavor.lib_target.clone(),
                     native_artifact: flavor.native_artifact.clone(),
-                    loader_artifact: flavor.loader_artifact.clone(),
                     core_dependency_key: host_plan.core_dependency_key().to_owned(),
                 })
             })
