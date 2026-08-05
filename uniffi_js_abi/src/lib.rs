@@ -67,7 +67,7 @@ pub enum Capability {
     AsyncCallback,
     FallibleCallback,
     CallbackReentrancy,
-    CrossThreadAsyncCallback,
+    CrossThreadCallback,
     InputStream,
     OutputStream,
 }
@@ -354,9 +354,21 @@ pub enum ValueType {
     Map(Box<ValueType>, Box<ValueType>),
     Set(Box<ValueType>),
     /// A structural JavaScript async iterable consumed by native code.
-    InputStream(Box<ValueType>),
+    ///
+    /// The item and error values are kept together in the canonical graph so
+    /// every engine can render the same typed stream binding, including when
+    /// the stream is nested inside a record or container.
+    InputStream {
+        item: Box<ValueType>,
+        error: Box<ValueType>,
+        is_send: bool,
+    },
     /// A pull-based JavaScript async iterable produced by native code.
-    OutputStream(Box<ValueType>),
+    OutputStream {
+        item: Box<ValueType>,
+        error: Box<ValueType>,
+        is_send: bool,
+    },
 }
 
 impl ValueType {
@@ -376,12 +388,20 @@ impl ValueType {
         Self::Set(Box::new(inner))
     }
 
-    pub fn input_stream(item: Self) -> Self {
-        Self::InputStream(Box::new(item))
+    pub fn input_stream(item: Self, error: Self, is_send: bool) -> Self {
+        Self::InputStream {
+            item: Box::new(item),
+            error: Box::new(error),
+            is_send,
+        }
     }
 
-    pub fn output_stream(item: Self) -> Self {
-        Self::OutputStream(Box::new(item))
+    pub fn output_stream(item: Self, error: Self, is_send: bool) -> Self {
+        Self::OutputStream {
+            item: Box::new(item),
+            error: Box::new(error),
+            is_send,
+        }
     }
 
     /// Validate only presence/nullability.  Concrete value conversion remains
@@ -398,11 +418,13 @@ impl ValueType {
     pub fn visit(&self, visitor: &mut impl FnMut(&ValueType)) {
         visitor(self);
         match self {
-            Self::Optional(inner)
-            | Self::Sequence(inner)
-            | Self::Set(inner)
-            | Self::InputStream(inner)
-            | Self::OutputStream(inner) => inner.visit(visitor),
+            Self::Optional(inner) | Self::Sequence(inner) | Self::Set(inner) => {
+                inner.visit(visitor)
+            }
+            Self::InputStream { item, error, .. } | Self::OutputStream { item, error, .. } => {
+                item.visit(visitor);
+                error.visit(visitor);
+            }
             Self::Map(key, value) => {
                 key.visit(visitor);
                 value.visit(visitor);
@@ -1043,10 +1065,11 @@ mod tests {
     #[test]
     fn input_and_output_streams_remain_distinct_in_signatures() {
         let item = ValueType::Scalar(ScalarType::Bytes);
-        let input = ValueType::input_stream(item.clone());
-        let output = ValueType::output_stream(item);
-        assert!(matches!(input, ValueType::InputStream(_)));
-        assert!(matches!(output, ValueType::OutputStream(_)));
+        let input =
+            ValueType::input_stream(item.clone(), ValueType::Scalar(ScalarType::String), false);
+        let output = ValueType::output_stream(item, ValueType::Scalar(ScalarType::String), true);
+        assert!(matches!(input, ValueType::InputStream { .. }));
+        assert!(matches!(output, ValueType::OutputStream { .. }));
         assert_ne!(input, output);
     }
 

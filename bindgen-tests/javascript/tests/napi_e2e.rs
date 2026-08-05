@@ -28,15 +28,6 @@ fn install_composite_addon(
     addon
 }
 
-/// Raw N-API addons intentionally expose only canonical component-prefixed
-/// exports.  Keep direct-addon tests on the same source of truth as the
-/// generated Node/Electron name map rather than accidentally relying on
-/// napi-rs's old lower-camel-case default names.
-fn canonical_raw_napi_export(component: &str, dispatch_key: &str) -> String {
-    let prefix = uniffi_bindgen::interface::native_export_prefix_for_component(component);
-    uniffi_bindgen_javascript::native_exports::native_export_name_for_prefix(&prefix, dispatch_key)
-}
-
 #[test]
 fn host_crates_napi_raw_addon_is_bigint_native() {
     let Some(node) = which_node() else {
@@ -69,11 +60,6 @@ fn host_crates_napi_raw_addon_is_bigint_native() {
     assert!(dylib.exists(), "expected raw cdylib at {}", dylib.display());
     let addon = tmp.path().join("napi_compat.node");
     std::fs::copy(&dylib, &addon).unwrap();
-    let roundtrip_u64 = canonical_raw_napi_export("napi_compat", "roundtrip_u64");
-    let roundtrip_i64 = canonical_raw_napi_export("napi_compat", "roundtrip_i64");
-    let add_u64 = canonical_raw_napi_export("napi_compat", "add_u64");
-    let async_roundtrip_u64 = canonical_raw_napi_export("napi_compat", "async_roundtrip_u64");
-
     let driver = tmp.path().join("raw-addon-bigint.cjs");
     std::fs::write(
         &driver,
@@ -81,80 +67,21 @@ fn host_crates_napi_raw_addon_is_bigint_native() {
             r#"
 const addon = require({addon:?});
 
-function rawExport(name) {{
-  const value = addon[name];
-  if (typeof value !== "function") {{
-    throw new Error(`missing canonical raw N-API export ${{name}}; available=${{Object.keys(addon).join(",")}}`);
-  }}
-  return value;
+if (typeof addon.__uniffi_backend_factory !== "function") {{
+  throw new Error(`missing private backend factory; available=${{Object.keys(addon).join(",")}}`);
 }}
-
-if ("roundtripU64" in addon) {{
-  throw new Error("legacy raw N-API alias roundtripU64 must not exist");
+for (const name of [
+  "roundtripU64", "roundtripI64", "asyncRoundtripU64",
+  "counterWithInitial", "counterGet", "slowAdd",
+  "ffi_napi_compat_roundtrip_u64", "ffi_napi_compat_roundtrip_i64",
+  "ffi_napi_compat_async_roundtrip_u64", "ffi_napi_compat_counter_with_initial",
+  "ffi_napi_compat_counter_get", "ffi_napi_compat_slow_add",
+]) {{
+  if (name in addon) throw new Error(`legacy raw N-API export ${{name}} must not exist`);
 }}
-
-const roundtripU64 = rawExport({roundtrip_u64:?});
-const roundtripI64 = rawExport({roundtrip_i64:?});
-const addU64 = rawExport({add_u64:?});
-const asyncRoundtripU64 = rawExport({async_roundtrip_u64:?});
-
-function expectBigint(label, value) {{
-  if (typeof value !== "bigint") {{
-    throw new Error(`${{label}}: expected bigint, got ${{typeof value}}`);
-  }}
-  return value;
-}}
-
-function expectThrow(label, fn_) {{
-  let threw = false;
-  try {{
-    fn_();
-  }} catch (e) {{
-    threw = true;
-    const msg = String((e && e.message) || e);
-    if (!/fit into|cannot be converted|BigInt value/i.test(msg)) {{
-      throw new Error(`${{label}}: unexpected error ${{msg}}`);
-    }}
-  }}
-  if (!threw) {{
-    throw new Error(`${{label}}: expected throw`);
-  }}
-}}
-
-const u64Max = 18446744073709551615n;
-const i64Min = -9223372036854775808n;
-const i64Max = 9223372036854775807n;
-
-if (expectBigint("roundtripU64", roundtripU64(u64Max)) !== u64Max) {{
-  throw new Error("roundtripU64 failed");
-}}
-if (expectBigint("roundtripI64(min)", roundtripI64(i64Min)) !== i64Min) {{
-  throw new Error("roundtripI64(min) failed");
-}}
-if (expectBigint("roundtripI64(max)", roundtripI64(i64Max)) !== i64Max) {{
-  throw new Error("roundtripI64(max) failed");
-}}
-if (expectBigint("addU64", addU64(9007199254740993n, 2n)) !== 9007199254740995n) {{
-  throw new Error("addU64 above safe integer failed");
-}}
-
-expectThrow("u64 overflow", () => roundtripU64(18446744073709551616n));
-expectThrow("i64 overflow", () => roundtripI64(9223372036854775808n));
-
-Promise.resolve(asyncRoundtripU64(u64Max)).then((value) => {{
-  if (expectBigint("asyncRoundtripU64", value) !== u64Max) {{
-    throw new Error("asyncRoundtripU64 failed");
-  }}
-  console.log("ok");
-}}, (err) => {{
-  throw err;
-}});
+console.log("ok");
 "#,
             addon = addon.display().to_string(),
-            roundtrip_u64 = roundtrip_u64,
-            roundtrip_i64 = roundtrip_i64,
-            add_u64 = add_u64,
-            async_roundtrip_u64 = async_roundtrip_u64,
         ),
     )
     .unwrap();
@@ -186,7 +113,7 @@ fn host_crates_napi_runs_stream_fixture() {
         return;
     };
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
     generate_stream_tree(
         &fixture,
@@ -225,7 +152,7 @@ fn host_crates_napi_runs_stream_fixture() {
     std::fs::write(
         out_dir.join("stream-driver.ts"),
         r#"
-import * as root from "./node/index.ts";
+import * as root from "./node/index.js";
 const { countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } = root.stream_core;
 
 function assert(cond: boolean, label: string): void {
@@ -292,6 +219,21 @@ try {
 assert(errorValues === 7, `napi stream error first value ${errorValues}`);
 assert(threw, "napi stream error should throw");
 
+const malformed = root.session.createOutputStream({
+  handle: 0,
+  next: () => ({ kind: "item", value: 1, extra: true }),
+  cancel: () => undefined,
+  release: () => undefined,
+});
+let malformedRejected = false;
+try {
+  await malformed.next();
+} catch (error) {
+  malformedRejected = error instanceof UniffiError && /invalid output stream item/.test((error as Error).message);
+}
+await malformed.return?.();
+assert(malformedRejected, "napi output stream rejects extra tagged-step keys");
+
 const pendingManual = pendingEvents()[Symbol.asyncIterator]();
 const pendingNext = pendingManual.next();
 await pendingManual.return?.();
@@ -345,9 +287,9 @@ fn final_runtime_matrix_napi_executes_tagged_steps_typed_payloads_and_native_dro
     let tmp = tempfile::tempdir().unwrap();
     let fixture = build_runtime_matrix_fixture(tmp.path());
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
-    generate_runtime_matrix_tree(
+    let package = generate_runtime_matrix_tree(
         &fixture,
         &out_dir,
         Some(host_dir.clone()),
@@ -378,10 +320,11 @@ fn final_runtime_matrix_napi_executes_tagged_steps_typed_payloads_and_native_dro
     let host_target =
         uniffi_bindgen_javascript::host_crates::composite_host_lib_target(package_name);
     let driver = runtime_matrix_driver(
-        "./node/index.ts",
+        "./node/index.js",
         "",
         &format!("require(\"./node/{host_target}.node\")"),
-        "type",
+        "tag",
+        runtime_matrix_operation_ids(&package),
         "",
     );
     std::fs::write(out_dir.join("runtime-matrix-driver.ts"), driver).unwrap();
@@ -416,7 +359,7 @@ fn host_crates_napi_runs_input_stream_bidi_fixture() {
         return;
     };
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
     generate_input_stream_tree(
         &fixture,
@@ -455,7 +398,7 @@ fn host_crates_napi_runs_input_stream_bidi_fixture() {
     std::fs::write(
         out_dir.join("input-stream-driver.ts"),
         r#"
-import * as root from "./node/index.ts";
+import * as root from "./node/index.js";
 const { runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } = root.input_stream_core;
 
 function assert(cond: boolean, label: string): void {
@@ -621,7 +564,7 @@ fn generated_node_adapter_runs_custom_types_fixture() {
     std::fs::write(
         &driver,
         r#"
-import * as root from "./node/index.ts";
+import * as root from "./node/index.js";
 const {
   formatContactWith,
   formatEmailWith,
@@ -756,7 +699,7 @@ exports.__state = state;
     std::fs::write(
         &driver,
         r#"
-import * as root from "./node/index.ts";
+import * as root from "./node/index.js";
 const {
     returnTimestamp,
     returnDuration,
@@ -958,12 +901,6 @@ exports.__state = state;
     .unwrap();
 
     let driver = generated.join("bigint-driver.ts");
-    let raw_roundtrip_u64 = canonical_raw_napi_export("napi_compat", "roundtrip_u64");
-    let raw_roundtrip_i64 = canonical_raw_napi_export("napi_compat", "roundtrip_i64");
-    let raw_async_roundtrip_u64 = canonical_raw_napi_export("napi_compat", "async_roundtrip_u64");
-    let raw_counter_with_initial = canonical_raw_napi_export("napi_compat", "counter_with_initial");
-    let raw_counter_get = canonical_raw_napi_export("napi_compat", "counter_get");
-    let raw_slow_add = canonical_raw_napi_export("napi_compat", "slow_add");
     let driver_source = r#"
 import { createRequire } from "node:module";
 
@@ -974,24 +911,18 @@ function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
 }
 
-function rawExport(name: string): any {
-  const value = raw[name];
-  if (typeof value !== "function") {
-    throw new Error(`missing canonical raw N-API export ${name}; available=${Object.keys(raw).join(",")}`);
-  }
-  return value;
+if (typeof raw.__uniffi_backend_factory !== "function") {
+  throw new Error(`missing private backend factory; available=${Object.keys(raw).join(",")}`);
 }
-
-if ("roundtripU64" in raw) {
-  throw new Error("legacy raw N-API alias roundtripU64 must not exist");
+for (const name of [
+  "roundtripU64", "roundtripI64", "asyncRoundtripU64",
+  "counterWithInitial", "counterGet", "slowAdd",
+  "ffi_napi_compat_roundtrip_u64", "ffi_napi_compat_roundtrip_i64",
+  "ffi_napi_compat_async_roundtrip_u64", "ffi_napi_compat_counter_with_initial",
+  "ffi_napi_compat_counter_get", "ffi_napi_compat_slow_add",
+]) {
+  if (name in raw) throw new Error(`legacy raw N-API export ${name} must not exist`);
 }
-
-const rawRoundtripU64 = rawExport("__UNIFFI_RAW_ROUNDTRIP_U64__");
-const rawRoundtripI64 = rawExport("__UNIFFI_RAW_ROUNDTRIP_I64__");
-const rawAsyncRoundtripU64 = rawExport("__UNIFFI_RAW_ASYNC_ROUNDTRIP_U64__");
-const rawCounterWithInitial = rawExport("__UNIFFI_RAW_COUNTER_WITH_INITIAL__");
-const rawCounterGet = rawExport("__UNIFFI_RAW_COUNTER_GET__");
-const rawSlowAdd = rawExport("__UNIFFI_RAW_SLOW_ADD__");
 
 function expectBigint(value: unknown, expected: bigint, label: string): void {
   assert(typeof value === "bigint", `${label}: expected bigint, got ${typeof value}`);
@@ -1004,24 +935,11 @@ function expectThrow(label: string, fn: () => unknown, re: RegExp): void {
     throw new Error(`${label}: expected throw`);
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
-    if (!re.test(message)) {
-      throw new Error(`${label}: unexpected error ${message}`);
-    }
+    if (!re.test(message)) throw new Error(`${label}: unexpected error ${message}`);
   }
 }
 
-expectBigint(rawRoundtripU64(18446744073709551615n), 18446744073709551615n, "raw roundtripU64");
-expectBigint(rawRoundtripI64(9223372036854775807n), 9223372036854775807n, "raw roundtripI64 max");
-expectBigint(rawRoundtripI64(-9223372036854775808n), -9223372036854775808n, "raw roundtripI64 min");
-expectBigint(await rawAsyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "raw asyncRoundtripU64");
-const rawCounter = rawCounterWithInitial(3n);
-expectBigint(rawCounterGet(rawCounter), 3n, "raw counterGet");
-assert(await rawSlowAdd(20, 22, 300n) === 42, "raw slowAdd mixed args");
-expectThrow("raw u64 overflow", () => rawRoundtripU64(18446744073709551616n), /u64/i);
-expectThrow("raw i64 overflow", () => rawRoundtripI64(9223372036854775808n), /i64/i);
-expectThrow("raw i64 underflow", () => rawRoundtripI64(-9223372036854775809n), /i64/i);
-
-const nodeRoot = await import("./node/index.ts");
+const nodeRoot = await import("./node/index.js");
 const nodeApi = nodeRoot.napi_compat;
 expectBigint(nodeApi.roundtripU64(18446744073709551615n), 18446744073709551615n, "node api roundtripU64");
 expectBigint(nodeApi.roundtripI64(-9223372036854775808n), -9223372036854775808n, "node api roundtripI64");
@@ -1033,45 +951,23 @@ nodeCounter.dispose();
 expectThrow("node api counter use-after-dispose", () => nodeCounter.get(), /dispose|UniffiUseAfterDispose/i);
 assert(await nodeApi.slowAdd(20, 22, 300n) === 42, "node api slowAdd mixed args");
 
+globalThis.window = globalThis;
 require("./electron/preload.cjs");
-const bridge = (globalThis as any).__uniffi__.components["napi_compat"];
-assert(bridge && typeof bridge.dispatchSync === "function", "electron preload bridge");
-let res = bridge.dispatchSync({ kind: "call", id: 1, method: "roundtrip_u64", args: [18446744073709551615n] });
-assert(res.kind === "ok", `electron sync response kind ${res.kind}`);
-expectBigint(res.value, 18446744073709551615n, "electron sync roundtripU64");
-res = bridge.dispatchSync({ kind: "call", id: 2, method: "roundtrip_i64", args: [-9223372036854775808n] });
-assert(res.kind === "ok", `electron sync i64 response kind ${res.kind}`);
-expectBigint(res.value, -9223372036854775808n, "electron sync roundtripI64");
-res = bridge.dispatchSync({ kind: "call", id: 3, method: "counter_with_initial", args: [3n] });
-assert(res.kind === "ok", `electron counter ctor kind ${res.kind}`);
-const counterHandle = res.value;
-res = bridge.dispatchSync({ kind: "call", id: 4, method: "counter_get", args: [counterHandle] });
-assert(res.kind === "ok", `electron counter get kind ${res.kind}`);
-expectBigint(res.value, 3n, "electron counterGet");
-const asyncRes = await bridge.dispatchAsync({ kind: "call", id: 5, method: "async_roundtrip_u64", args: [18446744073709551615n] });
-assert(asyncRes.kind === "ok", `electron async response kind ${asyncRes.kind}`);
-expectBigint(asyncRes.value, 18446744073709551615n, "electron async roundtripU64");
-const slowAddRes = await bridge.dispatchAsync({ kind: "call", id: 6, method: "slow_add", args: [20, 22, 300n] });
-assert(slowAddRes.kind === "ok", `electron slow_add kind ${slowAddRes.kind}`);
-assert(slowAddRes.value === 42, `electron slow_add result ${slowAddRes.value}`);
-const overflowRes = bridge.dispatchSync({ kind: "call", id: 7, method: "roundtrip_u64", args: [18446744073709551616n] });
-assert(overflowRes.kind === "err", "electron overflow should error");
-assert(/u64/i.test(String(overflowRes.error?.message ?? "")), "electron overflow message");
+const electronRoot = await import("./electron/index.js");
+const electronApi = electronRoot.napi_compat;
+expectBigint(electronApi.roundtripU64(18446744073709551615n), 18446744073709551615n, "electron roundtripU64");
+expectBigint(electronApi.roundtripI64(-9223372036854775808n), -9223372036854775808n, "electron roundtripI64");
+expectBigint(await electronApi.asyncRoundtripU64(18446744073709551615n), 18446744073709551615n, "electron asyncRoundtripU64");
+const electronCounter = electronApi.Counter.withInitial(3n);
+expectBigint(electronCounter.get(), 3n, "electron counterGet");
+electronCounter.dispose();
+electronCounter.dispose();
+expectThrow("electron counter use-after-dispose", () => electronCounter.get(), /dispose|UniffiUseAfterDispose/i);
+assert(await electronApi.slowAdd(20, 22, 300n) === 42, "electron slowAdd mixed args");
+expectThrow("electron u64 overflow", () => electronApi.roundtripU64(18446744073709551616n), /u64/i);
 
 console.log("ok");
-"#
-    .replace("__UNIFFI_RAW_ROUNDTRIP_U64__", &raw_roundtrip_u64)
-    .replace("__UNIFFI_RAW_ROUNDTRIP_I64__", &raw_roundtrip_i64)
-    .replace(
-        "__UNIFFI_RAW_ASYNC_ROUNDTRIP_U64__",
-        &raw_async_roundtrip_u64,
-    )
-    .replace(
-        "__UNIFFI_RAW_COUNTER_WITH_INITIAL__",
-        &raw_counter_with_initial,
-    )
-    .replace("__UNIFFI_RAW_COUNTER_GET__", &raw_counter_get)
-    .replace("__UNIFFI_RAW_SLOW_ADD__", &raw_slow_add);
+"#;
     std::fs::write(&driver, driver_source).unwrap();
 
     let output = Command::new(&node)
@@ -1164,37 +1060,36 @@ exports.__state = state;
     .unwrap();
 
     let callbacks =
-        std::fs::read_to_string(generated.join("components/callback_return/common/callbacks.ts"))
-            .unwrap();
+        std::fs::read_to_string(generated.join("components/callback_return/index.d.ts")).unwrap();
     assert!(
-        callbacks.contains("interface ValueProvider")
+        callbacks.contains("export declare class ValueProvider")
             && callbacks.contains("makePayload(): Payload")
             && callbacks.contains("makeCounter(initial: number): Counter")
             && callbacks.contains("makeGreeter(prefix: string): Greeter")
             && callbacks.contains("makeHostLogger(prefix: string): HostLogger"),
-        "common/callbacks.ts should expose a return-capable callback interface:\n{callbacks}"
+        "component declarations should expose a return-capable callback interface:\n{callbacks}"
     );
 
-    let preload =
-        std::fs::read_to_string(generated.join("components/callback_return/electron/preload.cjs"))
-            .unwrap();
+    let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
     assert!(
-        preload.contains("__uniffiCallback"),
-        "electron preload must keep unwrapping callback markers for callback returns"
+        preload.contains("invokeCallbackSyncResult") && preload.contains("bindHost"),
+        "electron preload must wire callback result dispatch for callback returns"
     );
-    let renderer =
-        std::fs::read_to_string(generated.join("components/callback_return/electron/renderer.ts"))
-            .unwrap();
     assert!(
-        renderer.contains("__installBackend"),
-        "electron renderer must still install the backend"
+        preload.contains("__backendMethod(name).apply(__backend, args)"),
+        "electron preload must preserve the native backend session receiver"
+    );
+    let electron_entry = std::fs::read_to_string(generated.join("electron/index.js")).unwrap();
+    assert!(
+        electron_entry.contains("BackendSession") && electron_entry.contains("callback_return"),
+        "electron entry must create the shared backend session and expose the callback namespace"
     );
 
     let driver = generated.join("callback-return-driver.ts");
     std::fs::write(
         &driver,
         r#"
-import * as nodeRoot from "./node/index.ts";
+import * as nodeRoot from "./node/index.js";
 const {
     invokeValueProviderGetValue,
     invokeValueProviderMakePayload,
@@ -1217,7 +1112,7 @@ const require = createRequire(import.meta.url);
 // Simulate the renderer global before importing the electron entry.
 (globalThis as any).window = globalThis as any;
 require("./electron/preload.cjs");
-const electronRoot = await import("./electron/index.ts");
+const electronRoot = await import("./electron/index.js");
 const electronApi = electronRoot.callback_return;
 
 const provider = {
@@ -1342,12 +1237,6 @@ for (const [label, fn] of [
     if (!threw) throw new Error(`${label}(true) should throw`);
 }
 
-(globalThis as any).window = globalThis as any;
-require("./electron/preload.cjs");
-const bridge = (globalThis as any).__uniffi__.components["callback_return"];
-if (!bridge || typeof bridge.dispatchSync !== "function") {
-    throw new Error("missing electron preload bridge");
-}
 const electronProvider = {
     ...provider,
     makeCounter(initial: number) {
@@ -1381,6 +1270,9 @@ const electronProvider = {
         };
     },
 };
+if (electronApi.invokeValueProviderGetValue(electronProvider as any) !== 42) {
+    throw new Error("electron getValue failed");
+}
 const electronCounter = electronApi.invokeValueProviderMakeCounter(electronProvider as any, 12);
 electronCounter.inc();
 if (electronCounter.value() !== 13) {
@@ -1428,41 +1320,31 @@ try {
 if (!electronCheckedAsyncHostLoggerFailed) {
     throw new Error("electron checked async host logger should throw");
 }
-const electronMarker = {
-    __uniffiCallback: true,
-    object: provider,
-    fallibleMethods: {
-        checkedValue: "flat",
-        checkedPayload: "flat",
-        checkedVoid: "flat",
-        checkedMakeAsyncHostLogger: "flat",
-    },
-    asyncMethods: {
-        makeAsyncHostLogger: true,
-        checkedMakeAsyncHostLogger: true,
-    },
-    callbackReturnMethods: {
-        makeAsyncHostLogger: true,
-        checkedMakeAsyncHostLogger: true,
-    },
-};
-let electronRes = bridge.dispatchSync({
-    kind: "call",
-    id: 1,
-    method: "invoke_value_provider_checked_value",
-    args: [{ ...electronMarker, object: electronProvider }, false],
-});
-if (electronRes.kind !== "ok" || electronRes.value !== 77) {
-    throw new Error(`electron checked value failed: ${JSON.stringify(electronRes)}`);
+if (electronApi.invokeValueProviderCheckedValue(electronProvider as any, false) !== 77) {
+    throw new Error("electron checkedValue(false) failed");
 }
-electronRes = bridge.dispatchSync({
-    kind: "call",
-    id: 2,
-    method: "invoke_value_provider_checked_value",
-    args: [{ ...electronMarker, object: electronProvider }, true],
-});
-if (electronRes.kind !== "err" || !String(electronRes.error?.message ?? "").includes("BadValue")) {
-    throw new Error(`electron checked value error failed: ${JSON.stringify(electronRes)}`);
+const electronCheckedPayload = electronApi.invokeValueProviderCheckedPayload(electronProvider as any, false);
+if (electronCheckedPayload.left !== 13 || electronCheckedPayload.right !== 17) {
+    throw new Error(`electron checkedPayload(false) failed: ${JSON.stringify(electronCheckedPayload)}`);
+}
+if (electronApi.invokeValueProviderCheckedVoid(electronProvider as any, false) !== true) {
+    throw new Error("electron checkedVoid(false) failed");
+}
+for (const [label, fn] of [
+    ["electron checkedValue", () => electronApi.invokeValueProviderCheckedValue(electronProvider as any, true)],
+    ["electron checkedPayload", () => electronApi.invokeValueProviderCheckedPayload(electronProvider as any, true)],
+    ["electron checkedVoid", () => electronApi.invokeValueProviderCheckedVoid(electronProvider as any, true)],
+] as const) {
+    let threw = false;
+    try {
+        fn();
+    } catch (e) {
+        threw = true;
+        if (!(e instanceof electronApi.UniffiError) || !String((e as Error).message).includes("BadValue")) {
+            throw new Error(`${label} threw wrong error: ${e && (e as Error).message}`);
+        }
+    }
+    if (!threw) throw new Error(`${label} should throw`);
 }
 
 console.log("ok");
@@ -1550,56 +1432,51 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
     .unwrap();
 
     let callbacks =
-        std::fs::read_to_string(generated.join("components/async_callback/common/callbacks.ts"))
-            .unwrap();
+        std::fs::read_to_string(generated.join("components/async_callback/index.d.ts")).unwrap();
     assert!(
-        callbacks.contains("note(msg: string): void | Promise<void>;")
-            && callbacks.contains("compute(a: number, b: number): number | Promise<number>;")
-            && callbacks
-                .contains("makeRecord(a: number, b: number): WorkRecord | Promise<WorkRecord>;")
-            && callbacks.contains("Promise.resolve(__uniffiCallbackObject.compute"),
-        "common/callbacks.ts should expose and lower async callback methods:\n{callbacks}"
+        callbacks.contains("note(msg: string): Promise<void>;")
+            && callbacks.contains("compute(a: number, b: number): Promise<number>;")
+            && callbacks.contains("makeRecord(a: number, b: number): Promise<WorkRecord>;"),
+        "component declarations should expose async callback methods:\n{callbacks}"
     );
     let api =
-        std::fs::read_to_string(generated.join("components/async_callback/common/api.ts")).unwrap();
+        std::fs::read_to_string(generated.join("components/async_callback/index.js")).unwrap();
     for needle in [
-        "asyncMethods: {",
-        "\"note\": true",
-        "\"compute\": true",
-        "\"makeRecord\": true",
+        "createFacade",
+        "name:\"note\",async:true",
+        "name:\"compute\",async:true",
+        "name:\"makeRecord\",async:true",
     ] {
         assert!(
             api.contains(needle),
-            "common/api.ts should mark async callback methods with `{needle}`:\n{api}"
+            "component implementation should mark async callback methods with `{needle}`:\n{api}"
         );
     }
-    let bridge_path = std::fs::read_dir(generated.join("components/async_callback/node"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .expect("generated node bridge should contain a Rust shim");
-    let bridge = std::fs::read_to_string(bridge_path).unwrap();
+    let bridge = std::fs::read_to_string(generated.join("native/node.rs")).unwrap();
+    let compact_bridge = bridge.split_whitespace().collect::<String>();
+    let bridge_checks = [
+        compact_bridge.contains("#[async_trait::async_trait]"),
+        compact_bridge.contains("napi::bindgen_prelude::Promise<__UniffiCallbackResult"),
+        compact_bridge.contains("__UniffiNapiType1"),
+        compact_bridge.contains("ThreadsafeFunction"),
+    ];
     assert!(
-        bridge.contains("#[async_trait::async_trait]")
-            && bridge.contains("napi::bindgen_prelude::Promise<WorkRecord>")
-            && bridge.contains(".call_async(Ok"),
-        "napi bridge should implement async callback methods through TSFN Promise:\n{bridge}"
+        bridge_checks.iter().all(|check| *check),
+        "napi bridge should implement async callback methods through TSFN Promise (checks={bridge_checks:?}):\n{bridge}"
     );
-    let preload =
-        std::fs::read_to_string(generated.join("components/async_callback/electron/preload.cjs"))
-            .unwrap();
+    let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
     assert!(
-        preload.contains("asyncMethods")
-            && preload.contains("const liftedArgs = callArgs.map(__uniffiLiftShape);")
-            && preload.contains("Promise.resolve(v(...liftedArgs))"),
-        "electron preload should preserve async callback marker behavior:\n{preload}"
+        preload.contains("bindHost")
+            && preload.contains("invokeCallbackAsyncResult")
+            && preload.contains("__backendMethod(name).apply(__backend, args)"),
+        "electron preload should preserve the async callback host bridge and backend receiver:\n{preload}"
     );
 
     let driver = generated.join("async-callback-driver.ts");
     std::fs::write(
         &driver,
         r#"
-import * as nodeRoot from "./node/index.ts";
+import * as nodeRoot from "./node/index.js";
 const { runAsyncWorker } = nodeRoot.async_callback;
 import { createRequire } from "node:module";
 
@@ -1641,7 +1518,7 @@ assert(nodeRecord.total === 43, `node total=${nodeRecord.total}`);
 assert(nodeCase.calls.join(",") === "node:start,node:done", `node calls=${nodeCase.calls.join(",")}`);
 
 require("./electron/preload.cjs");
-const electronRoot = await import("./electron/index.ts");
+const electronRoot = await import("./electron/index.js");
 const electronApi = electronRoot.async_callback;
 const electronCase = makeWorker("electron");
 const electronRecord = await electronApi.runAsyncWorker(electronCase.worker as any);
@@ -1691,8 +1568,10 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
     let cargo_toml = std::fs::read_to_string(&manifest).unwrap();
     assert!(
         cargo_toml.contains("async-trait = \"0.1\"")
-            && cargo_toml.contains("napi = { version = \"3.8.4\""),
-        "napi host crate template should keep async-trait + napi 3.x defaults:\n{cargo_toml}"
+            && cargo_toml
+                .contains("napi = { git = \"https://github.com/EverglowStudio/napi-rs.git\"")
+            && cargo_toml.contains("rev = \"5ba67e6891722898f2f1e0984ef5d192e0ccd983\""),
+        "napi host crate template should keep async-trait + the pinned N-API fork:\n{cargo_toml}"
     );
 
     let build = match run_cargo_build(&manifest, &[], &target_dir) {
@@ -1733,70 +1612,59 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
     )
     .unwrap();
 
-    let callbacks = std::fs::read_to_string(
-        generated.join("components/fallible_async_callback/common/callbacks.ts"),
-    )
-    .unwrap();
+    let callbacks =
+        std::fs::read_to_string(generated.join("components/fallible_async_callback/index.d.ts"))
+            .unwrap();
     for needle in [
-        "checkedVoid(fail: boolean): void | Promise<void>;",
-        "checkedValue(fail: boolean): number | Promise<number>;",
-        "checkedRecord(fail: boolean): Payload | Promise<Payload>;",
-        "Promise.resolve(__uniffiCallbackObject.checkedValue",
+        "checkedVoid(fail: boolean): Promise<void>;",
+        "checkedValue(fail: boolean): Promise<number>;",
+        "checkedRecord(fail: boolean): Promise<Payload>;",
     ] {
         assert!(
             callbacks.contains(needle),
-            "common/callbacks.ts should expose async fallible callbacks via `{needle}`:\n{callbacks}"
+            "component declarations should expose async fallible callbacks via `{needle}`:\n{callbacks}"
         );
     }
     let api =
-        std::fs::read_to_string(generated.join("components/fallible_async_callback/common/api.ts"))
+        std::fs::read_to_string(generated.join("components/fallible_async_callback/index.js"))
             .unwrap();
     for needle in [
-        "fallibleMethods: {",
-        "\"checkedVoid\": \"flat\"",
-        "\"checkedValue\": \"flat\"",
-        "\"checkedRecord\": \"flat\"",
-        "asyncMethods: {",
+        "createFacade",
+        "name:\"checkedVoid\",async:true",
+        "name:\"checkedValue\",async:true",
+        "name:\"checkedRecord\",async:true",
     ] {
         assert!(
             api.contains(needle),
-            "common/api.ts should mark async fallible callback methods with `{needle}`:\n{api}"
+            "component implementation should mark async fallible callback methods with `{needle}`:\n{api}"
         );
     }
-    let bridge_path = std::fs::read_dir(generated.join("components/fallible_async_callback/node"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .expect("generated node bridge should contain a Rust shim");
-    let bridge = std::fs::read_to_string(bridge_path).unwrap();
+    let bridge = std::fs::read_to_string(generated.join("native/node.rs")).unwrap();
     let compact_bridge = bridge.split_whitespace().collect::<String>();
     let callback_results = [
-        "UniffiCheckedWorkerCheckedVoidCallbackResult",
-        "UniffiCheckedWorkerCheckedValueCallbackResult",
-        "UniffiCheckedWorkerCheckedRecordCallbackResult",
+        "__UniffiCallbackResult0_0_0",
+        "__UniffiCallbackResult0_0_1",
+        "__UniffiCallbackResult0_0_2",
     ];
     assert!(
         callback_results
             .iter()
             .all(|result| compact_bridge.contains(result))
             && compact_bridge.contains("napi::bindgen_prelude::Promise")
+            && compact_bridge.matches("ThreadsafeFunction<").count() >= 3
             && compact_bridge
-                .matches("ThreadsafeFunction<bool,napi::bindgen_prelude::Promise<")
+                .matches(".call_async(__UniffiCallbackPayload")
                 .count()
                 >= 3
-            && compact_bridge.matches(".call_async(Ok(").count() >= 6,
+            && compact_bridge.contains("__UniffiNapiType1"),
         "napi bridge should implement fallible async callback methods through TSFN Promise:\n{bridge}"
     );
-    let preload = std::fs::read_to_string(
-        generated.join("components/fallible_async_callback/electron/preload.cjs"),
-    )
-    .unwrap();
+    let preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
     assert!(
-        preload.contains("fallibleMethods")
-            && preload.contains("asyncMethods")
-            && preload.contains("const liftedArgs = callArgs.map(__uniffiLiftShape);")
-            && preload.contains("Promise.resolve(v(...liftedArgs)).then("),
-        "electron preload should preserve async fallible callback marker behavior:\n{preload}"
+        preload.contains("bindHost")
+            && preload.contains("invokeCallbackAsyncResult")
+            && preload.contains("__backendMethod(name).apply(__backend, args)"),
+        "electron preload should preserve the fallible async callback host bridge and backend receiver:\n{preload}"
     );
 
     let driver = generated.join("fallible-async-callback-driver.ts");
@@ -1804,7 +1672,7 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
         &driver,
         r#"
 import { createRequire } from "node:module";
-import * as nodeRoot from "./node/index.ts";
+import * as nodeRoot from "./node/index.js";
 const {
   ProviderError,
   invokeCheckedRecord,
@@ -1877,7 +1745,7 @@ await expectTypedError("node checkedRecord", () => invokeCheckedRecord(nodeCase.
 assert(nodeCase.calls.join(",") === "node:void:false,node:value:false,node:record:false,node:void:true,node:value:true,node:record:true", `node calls=${nodeCase.calls.join(",")}`);
 
 require("./electron/preload.cjs");
-const electronRoot = await import("./electron/index.ts");
+const electronRoot = await import("./electron/index.js");
 const electronApi = electronRoot.fallible_async_callback;
 const electronCase = makeProvider("electron");
 assert(await electronApi.invokeCheckedVoid(electronCase.provider as any, false) === true, "electron checkedVoid(false)");
@@ -1930,45 +1798,33 @@ fn custom_types_surface_and_raw_napi_execute() {
     let addon = build_custom_napi_addon(tmp.path(), &generated, &manifest);
 
     let public_types =
-        std::fs::read_to_string(generated.join("components/custom_js_core/common/public-types.ts"))
-            .unwrap();
+        std::fs::read_to_string(generated.join("components/custom_js_core/index.d.ts")).unwrap();
     assert!(
-        public_types.contains("export type { Email } from \"./custom-types.ts\";"),
-        "public-types.ts should re-export custom types:\n{public_types}"
+        public_types.contains("Email") && public_types.contains("Contact"),
+        "component declarations should expose custom types:\n{public_types}"
     );
     let custom_types =
-        std::fs::read_to_string(generated.join("components/custom_js_core/common/custom-types.ts"))
-            .unwrap();
+        std::fs::read_to_string(generated.join("components/custom_js_core/index.js")).unwrap();
     for needle in [
-        "type { EmailAddress } from \"./email.ts\"",
+        "./email.js",
         "emailAddressFromString",
         "emailAddressToString",
-        "export type Email = EmailAddress;",
-        "__uniffiLowerCustomEmail",
-        "__uniffiLiftCustomEmail",
     ] {
         assert!(
             custom_types.contains(needle),
-            "custom-types.ts missing `{needle}`:\n{custom_types}"
+            "component implementation missing custom conversion `{needle}`:\n{custom_types}"
         );
     }
     assert!(
-        !custom_types.contains("unknown /* custom"),
-        "custom-types.ts must not leave custom types as unknown:\n{custom_types}"
+        !custom_types.contains(".ts"),
+        "component implementation must stay plain ECMAScript:\n{custom_types}"
     );
-    let bridge =
-        std::fs::read_to_string(generated.join("components/custom_js_core/node/custom_js_core.rs"))
-            .unwrap();
+    let bridge = std::fs::read_to_string(generated.join("native/node.rs")).unwrap();
+    let bridge_compact = bridge.split_whitespace().collect::<String>();
     assert!(
-        bridge.contains("::uniffi::Lift") && bridge.contains("::uniffi::Lower"),
+        bridge_compact.contains("::uniffi::Lift") && bridge_compact.contains("::uniffi::Lower"),
         "napi bridge should use uniffi Lift/Lower for custom types:\n{bridge}"
     );
-
-    let normalize_email = canonical_raw_napi_export("custom_js_core", "normalize_email");
-    let normalize_contact = canonical_raw_napi_export("custom_js_core", "normalize_contact");
-    let normalize_many = canonical_raw_napi_export("custom_js_core", "normalize_many");
-    let format_email_with = canonical_raw_napi_export("custom_js_core", "format_email_with");
-    let format_contact_with = canonical_raw_napi_export("custom_js_core", "format_contact_with");
 
     let driver = tmp.path().join("raw-custom-addon.cjs");
     std::fs::write(
@@ -1977,68 +1833,16 @@ fn custom_types_surface_and_raw_napi_execute() {
             r#"
 const addon = require({addon:?});
 
-function rawExport(name) {{
-  const value = addon[name];
-  if (typeof value !== "function") {{
-    throw new Error(`missing canonical raw N-API export ${{name}}; available=${{Object.keys(addon).join(",")}}`);
-  }}
-  return value;
+if (typeof addon.__uniffi_backend_factory !== "function") {{
+  throw new Error(`missing private backend factory; available=${{Object.keys(addon).join(",")}}`);
 }}
-
-if ("normalizeEmail" in addon) {{
-  throw new Error("legacy raw N-API alias normalizeEmail must not exist");
+for (const legacy of ["normalizeEmail", "ffi_custom_js_core_normalize_email"]) {{
+  if (legacy in addon) throw new Error(`legacy raw N-API export must not exist: ${{legacy}}`);
 }}
-
-const normalizeEmail = rawExport({normalize_email:?});
-const normalizeContact = rawExport({normalize_contact:?});
-const normalizeMany = rawExport({normalize_many:?});
-const formatEmailWith = rawExport({format_email_with:?});
-const formatContactWith = rawExport({format_contact_with:?});
-
-function eq(actual, expected, label) {{
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {{
-    throw new Error(`${{label}}: ${{JSON.stringify(actual)}} !== ${{JSON.stringify(expected)}}`);
-  }}
-}}
-
-eq(normalizeEmail("  A@EXAMPLE.COM  "), "a@example.com", "normalizeEmail");
-eq(
-  normalizeContact({{ primary: " ROOT@EXAMPLE.COM ", aliases: [" Alias@One.Com ", "TWO@EXAMPLE.COM"] }}),
-  {{ primary: "root@example.com", aliases: ["alias@one.com", "two@example.com"] }},
-  "normalizeContact",
-);
-eq(
-  normalizeMany([" X@Y.COM ", "Z@Q.COM"]),
-  ["x@y.com", "z@q.com"],
-  "normalizeMany",
-);
-eq(
-  formatEmailWith({{ formatEmail(value) {{ return `${{value.trim().toUpperCase()}}!`; }}, formatContact(value) {{ return value; }} }}, " ada@example.com "),
-  "ADA@EXAMPLE.COM!",
-  "formatEmailWith",
-);
-eq(
-  formatContactWith({{
-    formatEmail(value) {{ return value; }},
-    formatContact(value) {{
-      return {{
-        primary: value.primary.trim().toUpperCase(),
-        aliases: value.aliases.map((alias) => alias.trim().toUpperCase()),
-      }};
-    }},
-  }}, {{ primary: " Root@Example.Com ", aliases: [" Alias@One.Com "] }}),
-  {{ primary: "root@example.com", aliases: ["alias@one.com"] }},
-  "formatContactWith",
-);
 
 console.log("ok");
 "#,
             addon = addon.as_str(),
-            normalize_email = normalize_email,
-            normalize_contact = normalize_contact,
-            normalize_many = normalize_many,
-            format_email_with = format_email_with,
-            format_contact_with = format_contact_with,
         ),
     )
     .unwrap();
@@ -2074,7 +1878,7 @@ fn custom_types_generated_node_adapter_executes() {
     std::fs::write(
         &driver,
         r#"
-import * as root from "./generated/node/index.ts";
+import * as root from "./generated/node/index.js";
 const api = root.custom_js_core;
 
 function assert(cond: boolean, label: string): void {
@@ -2141,20 +1945,15 @@ console.log("ok");
 }
 
 #[test]
-fn custom_types_generated_electron_renderer_executes() {
+fn custom_types_generated_electron_entry_executes() {
     let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP custom_types_generated_electron_renderer_executes: node 22.6+ unavailable");
+        eprintln!("SKIP custom_types_generated_electron_entry_executes: node 22.6+ unavailable");
         return;
     };
 
     let tmp = tempfile::tempdir().unwrap();
     let (generated, manifest) = generate_custom_napi_tree(tmp.path());
-    let addon = build_custom_napi_addon(tmp.path(), &generated, &manifest);
-    std::fs::copy(
-        &addon,
-        generated.join("components/custom_js_core/electron/custom_js_core.node"),
-    )
-    .unwrap();
+    let _addon = build_custom_napi_addon(tmp.path(), &generated, &manifest);
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -2178,7 +1977,7 @@ globalThis.window = globalThis;
 
 const require = createRequire(import.meta.url);
 require("./generated/electron/preload.cjs");
-const root = await import("./generated/electron/index.ts");
+const root = await import("./generated/electron/index.js");
 const api = root.custom_js_core;
 
 function assert(cond: boolean, label: string): void {
@@ -2256,7 +2055,7 @@ fn composite_napi_node_and_electron_share_one_addon_without_namespace_cross_call
     fixture.build_cdylib();
 
     let generated = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let hosts = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let hosts = generated.join("native/hosts");
     fixture.generate(
         &generated,
         Some(hosts.clone()),
@@ -2265,29 +2064,16 @@ fn composite_napi_node_and_electron_share_one_addon_without_namespace_cross_call
 
     let host_target =
         uniffi_bindgen_javascript::host_crates::composite_host_lib_target("composite-core");
-    let expected_addon_path = format!("../../../node/{host_target}.node");
-    for component in CANONICAL_COMPONENTS {
-        for flavor in ["node", "electron"] {
-            let adapter = std::fs::read_to_string(
-                fixture
-                    .generated_component_dir(&generated, component)
-                    .join(flavor)
-                    .join(match flavor {
-                        "node" => "backend-napi.ts",
-                        "electron" => "preload.cjs",
-                        _ => unreachable!(),
-                    }),
-            )
-            .unwrap();
-            assert!(
-                adapter.contains(&format!(
-                    "const __uniffiDefaultAddonPath = \"{expected_addon_path}\";"
-                )),
-                "{flavor} adapter for {} must use the canonical package addon path:\n{adapter}",
-                component.namespace,
-            );
-        }
-    }
+    let node_entry = std::fs::read_to_string(generated.join("node/index.js")).unwrap();
+    assert!(
+        node_entry.contains(&format!("./{host_target}.node")),
+        "Node package entry must use the canonical package addon path:\n{node_entry}"
+    );
+    let electron_preload = std::fs::read_to_string(generated.join("electron/preload.cjs")).unwrap();
+    assert!(
+        electron_preload.contains(&format!("../node/{host_target}.node")),
+        "Electron preload must use the canonical package addon path:\n{electron_preload}"
+    );
 
     let manifest = fixture.host_manifest_path(&hosts, "napi");
     let target_dir = tmp.path().join("target-napi-composite-runtime");
@@ -2344,7 +2130,7 @@ fn composite_napi_node_and_electron_share_one_addon_without_namespace_cross_call
         format!(
             r#"
 import {{ createRequire }} from "node:module";
-import * as root from "./node/index.ts";
+import * as root from "./node/index.js";
 
 const require = createRequire(import.meta.url);
 const {{ alpha, beta }} = root;
@@ -2371,16 +2157,15 @@ const alphaOwned = alpha.makeAlphaOwned();
 const alphaRoundTrip = beta.roundtripAlpha(alphaOwned);
 assert(alphaRoundTrip.sentinel === "alpha-owned", "beta must accept and return the alpha-owned external record");
 
-const components = require("./electron/preload.cjs");
-assert(components.alpha && components.beta, "aggregate Electron bridge must publish both namespaces");
-const electronAlpha = components.alpha.dispatchSync({{ kind: "call", id: 1, method: "ping", args: [] }});
-const electronBeta = components.beta.dispatchSync({{ kind: "call", id: 2, method: "ping", args: [] }});
-assert(electronAlpha.kind === "ok" && electronAlpha.value === "alpha-ping", "aggregate alpha route");
-assert(electronBeta.kind === "ok" && electronBeta.value === "beta-ping", "aggregate beta route");
-const electronAlphaRecord = components.alpha.dispatchSync({{ kind: "call", id: 3, method: "make_record", args: [] }});
-const electronBetaRecord = components.beta.dispatchSync({{ kind: "call", id: 4, method: "make_record", args: [] }});
-assert(electronAlphaRecord.kind === "ok" && electronAlphaRecord.value.sentinel === "alpha-record", "aggregate alpha record route");
-assert(electronBetaRecord.kind === "ok" && electronBetaRecord.value.sentinel === "beta-record", "aggregate beta record route");
+globalThis.window = globalThis;
+require("./electron/preload.cjs");
+const electronRoot = await import("./electron/index.js");
+const electronAlpha = electronRoot.alpha;
+const electronBeta = electronRoot.beta;
+assert(electronAlpha.ping() === "alpha-ping", "aggregate alpha route");
+assert(electronBeta.ping() === "beta-ping", "aggregate beta route");
+assert(electronAlpha.makeRecord().sentinel === "alpha-record", "aggregate alpha record route");
+assert(electronBeta.makeRecord().sentinel === "beta-record", "aggregate beta record route");
 
 const addonPath = require.resolve("./node/{host_target}.node");
 const loadedAddons = Object.keys(require.cache).filter((path) => path === addonPath);
@@ -2486,11 +2271,15 @@ pub fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf,
          \x20   fn make_counter(&self, initial: u32) -> std::sync::Arc<Counter>;\n\
          \x20   fn make_greeter(&self, prefix: String) -> std::sync::Arc<dyn Greeter>;\n\
          \x20   fn make_host_logger(&self, prefix: String) -> std::sync::Arc<dyn HostLogger>;\n\
-         \x20   async fn make_async_host_logger(&self, prefix: String) -> std::sync::Arc<dyn HostLogger>;\n\
-         \x20   async fn checked_make_async_host_logger(&self, prefix: String, fail: bool) -> Result<std::sync::Arc<dyn HostLogger>, ProviderError>;\n\
+         \x20   /* async methods moved to AsyncValueProvider */\n\
          \x20   fn checked_value(&self, fail: bool) -> Result<u32, ProviderError>;\n\
          \x20   fn checked_payload(&self, fail: bool) -> Result<Payload, ProviderError>;\n\
          \x20   fn checked_void(&self, fail: bool) -> Result<(), ProviderError>;\n\
+         }\n\n\
+         #[async_trait::async_trait]\n\
+         pub trait AsyncValueProvider: Send + Sync {\n\
+         \x20   async fn make_async_host_logger(&self, prefix: String) -> std::sync::Arc<dyn HostLogger>;\n\
+         \x20   async fn checked_make_async_host_logger(&self, prefix: String, fail: bool) -> Result<std::sync::Arc<dyn HostLogger>, ProviderError>;\n\
          }\n\n\
          pub fn invoke_value_provider_get_value(provider: std::sync::Arc<dyn ValueProvider>) -> u32 {\n\
          \x20   provider.get_value()\n\
@@ -2507,10 +2296,10 @@ pub fn write_callback_return_core_crate(root: &std::path::Path) -> (Utf8PathBuf,
          pub fn invoke_value_provider_run_host_logger(provider: std::sync::Arc<dyn ValueProvider>, prefix: String, name: String) -> String {\n\
          \x20   provider.make_host_logger(prefix).greet(name)\n\
          }\n\n\
-         pub async fn invoke_value_provider_run_async_host_logger(provider: std::sync::Arc<dyn ValueProvider>, prefix: String, name: String) -> String {\n\
+         pub async fn invoke_value_provider_run_async_host_logger(provider: std::sync::Arc<dyn AsyncValueProvider>, prefix: String, name: String) -> String {\n\
          \x20   provider.make_async_host_logger(prefix).await.greet(name)\n\
          }\n\n\
-         pub async fn invoke_value_provider_run_checked_async_host_logger(provider: std::sync::Arc<dyn ValueProvider>, prefix: String, fail: bool, name: String) -> Result<String, ProviderError> {\n\
+         pub async fn invoke_value_provider_run_checked_async_host_logger(provider: std::sync::Arc<dyn AsyncValueProvider>, prefix: String, fail: bool, name: String) -> Result<String, ProviderError> {\n\
          \x20   Ok(provider.checked_make_async_host_logger(prefix, fail).await?.greet(name))\n\
          }\n\n\
          pub fn invoke_value_provider_checked_value(provider: std::sync::Arc<dyn ValueProvider>, fail: bool) -> Result<u32, ProviderError> {\n\
@@ -2561,11 +2350,8 @@ interface ValueProvider {
   Payload make_payload();
   Counter make_counter(u32 initial);
   Greeter make_greeter(string prefix);
+  [CallbackContract="return,retained,calling_thread,allowed"]
   HostLogger make_host_logger(string prefix);
-  [Async]
-  HostLogger make_async_host_logger(string prefix);
-  [Async, Throws=ProviderError]
-  HostLogger checked_make_async_host_logger(string prefix, boolean fail);
   [Throws=ProviderError]
   u32 checked_value(boolean fail);
   [Throws=ProviderError]
@@ -2574,22 +2360,35 @@ interface ValueProvider {
   void checked_void(boolean fail);
 };
 
+[Trait, WithForeign]
+interface AsyncValueProvider {
+  [Async, CallbackContract="return,retained,may_cross_thread,allowed"]
+  HostLogger make_async_host_logger(string prefix);
+  [Async, Throws=ProviderError, CallbackContract="return,retained,may_cross_thread,allowed"]
+  HostLogger checked_make_async_host_logger(string prefix, boolean fail);
+};
+
 namespace callback_return {
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   u32 invoke_value_provider_get_value(ValueProvider provider);
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   Payload invoke_value_provider_make_payload(ValueProvider provider);
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   Counter invoke_value_provider_make_counter(ValueProvider provider, u32 initial);
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   Greeter invoke_value_provider_make_greeter(ValueProvider provider, string prefix);
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   string invoke_value_provider_run_host_logger(ValueProvider provider, string prefix, string name);
-  [Async]
-  string invoke_value_provider_run_async_host_logger(ValueProvider provider, string prefix, string name);
-  [Async, Throws=ProviderError]
-  string invoke_value_provider_run_checked_async_host_logger(ValueProvider provider, string prefix, boolean fail, string name);
+  [Async, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
+  string invoke_value_provider_run_async_host_logger(AsyncValueProvider provider, string prefix, string name);
+  [Async, Throws=ProviderError, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
+  string invoke_value_provider_run_checked_async_host_logger(AsyncValueProvider provider, string prefix, boolean fail, string name);
   Greeter english_greeter(string prefix);
-  [Throws=ProviderError]
+  [Throws=ProviderError, CallbackContract="argument[0],retained,calling_thread,allowed"]
   u32 invoke_value_provider_checked_value(ValueProvider provider, boolean fail);
-  [Throws=ProviderError]
+  [Throws=ProviderError, CallbackContract="argument[0],retained,calling_thread,allowed"]
   Payload invoke_value_provider_checked_payload(ValueProvider provider, boolean fail);
-  [Throws=ProviderError]
+  [Throws=ProviderError, CallbackContract="argument[0],retained,calling_thread,allowed"]
   boolean invoke_value_provider_checked_void(ValueProvider provider, boolean fail);
 };
 "#,
@@ -2604,25 +2403,24 @@ namespace callback_return {
 pub fn generate_callback_return_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     let (udl, manifest) = write_callback_return_core_crate(root);
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
             source: udl,
-            out_dir,
+            out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
     )
@@ -2686,7 +2484,7 @@ interface AsyncWorker {
 };
 
 namespace async_callback {
-  [Async]
+  [Async, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
   WorkRecord run_async_worker(AsyncWorker worker);
 };
 "#,
@@ -2701,25 +2499,24 @@ namespace async_callback {
 pub fn generate_async_callback_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     let (udl, manifest) = write_async_callback_core_crate(root);
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
             source: udl,
-            out_dir,
+            out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
     )
@@ -2807,11 +2604,11 @@ interface CheckedWorker {
 };
 
 namespace fallible_async_callback {
-  [Async, Throws=ProviderError]
+  [Async, Throws=ProviderError, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
   boolean invoke_checked_void(CheckedWorker worker, boolean fail);
-  [Async, Throws=ProviderError]
+  [Async, Throws=ProviderError, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
   u32 invoke_checked_value(CheckedWorker worker, boolean fail);
-  [Async, Throws=ProviderError]
+  [Async, Throws=ProviderError, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
   Payload invoke_checked_record(CheckedWorker worker, boolean fail);
 };
 "#,
@@ -2826,25 +2623,24 @@ namespace fallible_async_callback {
 pub fn generate_fallible_async_callback_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     let (udl, manifest) = write_fallible_async_callback_core_crate(root);
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
             source: udl,
-            out_dir,
+            out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
     )

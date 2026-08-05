@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use heck::ToLowerCamelCase;
 use uniffi_bindgen::{
     interface::{
         AsType, Callable, ComponentInterface, DefaultValue, Enum, ObjectImpl, TraitKind, Type,
@@ -120,6 +120,42 @@ impl<'a> BindingInput<'a> {
     }
 }
 
+/// Prepare the parser-facing component list for the single canonical
+/// normalization pass.
+///
+/// This is the only production entry point that selects a crate, derives FFI
+/// functions, and imposes the stable namespace/crate ordering.  Once it
+/// returns, package/host/engine renderers receive [`NormalizedPackage`] and
+/// never inspect a `ComponentInterface` themselves.  Build targets are
+/// computed by the caller from the requested flavor set and are passed into
+/// the same normalization call, so an engine plan is never produced for an
+/// unrequested target.
+pub fn prepare_components(
+    components: &mut Vec<Component<JsConfig>>,
+    crate_filter: Option<&str>,
+    build_targets: impl IntoIterator<Item = PublicTarget>,
+) -> Result<NormalizedPackage, FrontendError> {
+    if let Some(crate_filter) = crate_filter {
+        components.retain(|component| component.ci.crate_name() == crate_filter);
+    }
+    if components.is_empty() {
+        return Err(FrontendError::EmptyPackage);
+    }
+    for component in components.iter_mut() {
+        component
+            .ci
+            .derive_ffi_funcs()
+            .map_err(|error| FrontendError::Contract(error.to_string()))?;
+    }
+    components.sort_by_key(|component| {
+        (
+            component.ci.namespace().to_owned(),
+            component.ci.crate_name().to_owned(),
+        )
+    });
+    normalize(BindingInput::new(components).with_build_targets(build_targets))
+}
+
 /// Normalize all selected components exactly once.
 pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendError> {
     if input.components.is_empty() {
@@ -215,13 +251,23 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
                 .get(definition.source_key.component())
                 .copied()
                 .expect("operation component was collected");
-            let receiver = match definition.source_key.owner() {
-                OperationOwner::Object(owner) | OperationOwner::Value(owner) => Some(JsReceiver {
-                    object_type: *type_id_by_key
-                        .get(owner)
-                        .expect("object operation owner was collected"),
-                }),
-                _ => None,
+            // Constructors are owned by their object/value type, but they do
+            // not receive an instance at the Rust call boundary.  Only
+            // methods have a canonical receiver; synthetic stream operations
+            // install their explicit handle receiver later in the Rust plan.
+            let receiver = if definition.source_key.kind() == OperationKind::Method {
+                match definition.source_key.owner() {
+                    OperationOwner::Object(owner) | OperationOwner::Value(owner) => {
+                        Some(JsReceiver {
+                            object_type: *type_id_by_key
+                                .get(owner)
+                                .expect("object operation owner was collected"),
+                        })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
             };
             JsOperation {
                 id: operation.id,
@@ -259,11 +305,6 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
     )?;
     let stream_use_sites = enumerate_stream_use_sites(&identified_operations, &identified_types)
         .map_err(|report| FrontendError::Contract(report.to_string()))?;
-    validate_executable_stream_use_sites(
-        &identified_operations,
-        &operation_extras,
-        &stream_use_sites,
-    )?;
 
     let bridge_input = build_bridge_input(
         &identified_components,
@@ -316,7 +357,6 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
         &operation_extras,
         bridge.callbacks(),
         &stream_use_sites,
-        &crate_owners,
         &build_targets,
     )?;
     let engines = build_targets
@@ -355,73 +395,6 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
         host,
         engines,
     })
-}
-
-fn validate_executable_stream_use_sites(
-    operations: &[IdentifiedOperation],
-    operation_extras: &BTreeMap<OperationSourceKey, OperationExtra>,
-    streams: &[StreamUseSite],
-) -> Result<(), FrontendError> {
-    for stream in streams {
-        let operation = operations
-            .iter()
-            .find(|operation| operation.id == stream.operation_id)
-            .ok_or_else(|| {
-                FrontendError::Contract(format!(
-                    "unsupported stream use-site operation=<unknown:{}> path={} reason=unknown operation",
-                    stream.operation_id.index(),
-                    stream.path
-                ))
-            })?;
-        let metadata = operation_extras
-            .get(&operation.definition.source_key)
-            .and_then(|extra| extra.stream_metadata.get(&stream.path));
-        let Some(metadata) = metadata else {
-            return Err(FrontendError::Contract(format!(
-                "unsupported stream use-site operation={} path={} reason=nested stream values are not executable by the JavaScript frontend",
-                operation.definition.source_key, stream.path
-            )));
-        };
-        if !matches!(
-            operation.definition.source_key.owner(),
-            OperationOwner::Namespace
-        ) {
-            return Err(FrontendError::Contract(format!(
-                "unsupported stream use-site operation={} path={} reason=methods and callback operations cannot expose stream slots",
-                operation.definition.source_key, stream.path
-            )));
-        }
-        match metadata.direction {
-            StreamDirection::Input
-                if matches!(stream.path.segments(), [ValuePathSegment::Argument(_)]) => {}
-            StreamDirection::Output
-                if matches!(stream.path.segments(), [ValuePathSegment::Return])
-                    && operation.definition.source_key.kind()
-                        == OperationKind::OutputStreamStart
-                    && operation.definition.signature.async_kind == AsyncKind::Sync
-                    && operation.definition.signature.throws.is_none() => {}
-            StreamDirection::Input => {
-                return Err(FrontendError::Contract(format!(
-                    "unsupported stream use-site operation={} path={} reason=input streams are executable only as direct namespace arguments",
-                    operation.definition.source_key, stream.path
-                )));
-            }
-            StreamDirection::Output => {
-                let reason = if operation.definition.signature.throws.is_some() {
-                    "output stream source errors must be carried by StreamStep, not operation throws"
-                } else if operation.definition.signature.async_kind == AsyncKind::Async {
-                    "async output stream sources are not executable by the JavaScript frontend"
-                } else {
-                    "output streams are executable only as direct synchronous namespace returns"
-                };
-                return Err(FrontendError::Contract(format!(
-                    "unsupported stream use-site operation={} path={} reason={reason}",
-                    operation.definition.source_key, stream.path
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -485,7 +458,14 @@ fn collect_type_definitions(
                 .iter()
                 .map(|field| {
                     Ok(SourceField {
-                        public_name: field.name().to_lower_camel_case(),
+                        // Keep explicit UniFFI names verbatim.  Unrenamed
+                        // Rust/UDL fields retain the established JavaScript
+                        // lower-camel projection.
+                        public_name: if field.name() == field.rust_name() {
+                            field.name().to_lower_camel_case()
+                        } else {
+                            field.name().to_owned()
+                        },
                         rust_name: field.rust_name().to_owned(),
                         ty: convert_type(&field.as_type(), crate_owners)?,
                         default: field.default_value().map(convert_default),
@@ -753,15 +733,6 @@ struct OperationExtra {
     argument_rust_names: Vec<String>,
     argument_ownership: Vec<Ownership>,
     receiver_ownership: Option<Ownership>,
-    stream_metadata: BTreeMap<ValuePath, SourceStreamMetadata>,
-}
-
-#[derive(Clone)]
-struct SourceStreamMetadata {
-    direction: StreamDirection,
-    item_type: Type,
-    error_type: Type,
-    is_send: bool,
 }
 
 fn collect_operation_definitions(
@@ -1124,67 +1095,8 @@ fn operation_definition(
             argument_rust_names,
             argument_ownership,
             receiver_ownership,
-            stream_metadata: direct_stream_metadata(callable),
         },
     ))
-}
-
-fn direct_stream_metadata(callable: &dyn Callable) -> BTreeMap<ValuePath, SourceStreamMetadata> {
-    let mut metadata = BTreeMap::new();
-    for (index, argument) in callable.arguments().into_iter().enumerate() {
-        let stream = match argument.as_type() {
-            Type::InputStream {
-                item_type,
-                error_type,
-                is_send,
-            } => Some(SourceStreamMetadata {
-                direction: StreamDirection::Input,
-                item_type: (*item_type).clone(),
-                error_type: (*error_type).clone(),
-                is_send,
-            }),
-            Type::Stream {
-                item_type,
-                error_type,
-                is_send,
-            } => Some(SourceStreamMetadata {
-                direction: StreamDirection::Output,
-                item_type: (*item_type).clone(),
-                error_type: (*error_type).clone(),
-                is_send,
-            }),
-            _ => None,
-        };
-        if let Some(stream) = stream {
-            metadata.insert(ValuePath::argument(index as u32), stream);
-        }
-    }
-    if let Some(stream) = callable.return_type().and_then(|ty| match ty {
-        Type::Stream {
-            item_type,
-            error_type,
-            is_send,
-        } => Some(SourceStreamMetadata {
-            direction: StreamDirection::Output,
-            item_type: (**item_type).clone(),
-            error_type: (**error_type).clone(),
-            is_send: *is_send,
-        }),
-        Type::InputStream {
-            item_type,
-            error_type,
-            is_send,
-        } => Some(SourceStreamMetadata {
-            direction: StreamDirection::Input,
-            item_type: (**item_type).clone(),
-            error_type: (**error_type).clone(),
-            is_send: *is_send,
-        }),
-        _ => None,
-    }) {
-        metadata.insert(ValuePath::return_value(), stream);
-    }
-    metadata
 }
 
 fn collect_callback_metadata(
@@ -1286,7 +1198,7 @@ fn metadata_operation_owners(
                         && operation.source_key.name() == metadata.operation_name
                 })
                 .filter(|operation| {
-                    matches!(&operation.return_type, Some(ValueType::OutputStream(_)))
+                    matches!(&operation.return_type, Some(ValueType::OutputStream { .. }))
                 })
                 .map(|_| OperationKind::OutputStreamStart)
                 .unwrap_or(OperationKind::Function);
@@ -1418,8 +1330,8 @@ fn map_callback_path_segment(
             map_callback_path_segment(inner, segments, type_extras, full_path)
         }
         (ValueType::Sequence(inner), CallbackValuePathSegment::SequenceItem)
-        | (ValueType::InputStream(inner), CallbackValuePathSegment::SequenceItem)
-        | (ValueType::OutputStream(inner), CallbackValuePathSegment::SequenceItem) => {
+        | (ValueType::InputStream { item: inner, .. }, CallbackValuePathSegment::SequenceItem)
+        | (ValueType::OutputStream { item: inner, .. }, CallbackValuePathSegment::SequenceItem) => {
             Ok(((*inner.clone()), vec![ValuePathSegment::SequenceItem], 1))
         }
         (ValueType::Set(inner), CallbackValuePathSegment::SetItem) => {
@@ -1533,7 +1445,7 @@ fn build_bridge_input(
         Capability::AsyncCallback,
         Capability::FallibleCallback,
         Capability::CallbackReentrancy,
-        Capability::CrossThreadAsyncCallback,
+        Capability::CrossThreadCallback,
         Capability::InputStream,
         Capability::OutputStream,
     ];
@@ -1567,7 +1479,6 @@ fn build_rust_bridge_plan(
     operation_extras: &BTreeMap<OperationSourceKey, OperationExtra>,
     callbacks: &[CallbackUseSite],
     streams: &[StreamUseSite],
-    crate_owners: &BTreeMap<String, ComponentKey>,
     build_targets: &[PublicTarget],
 ) -> Result<RustBridgePlan, FrontendError> {
     let named_types = build_named_type_plans(api, type_ids, type_extras)?;
@@ -1690,26 +1601,63 @@ fn build_rust_bridge_plan(
             .iter()
             .filter(|stream| stream.operation_id == operation.id)
         {
-            let source_stream = extra.stream_metadata.get(&stream.path).ok_or_else(|| {
+            let js_operation = api
+                .operations
+                .iter()
+                .find(|candidate| candidate.id == operation.id)
+                .ok_or_else(|| {
+                    FrontendError::Contract(format!(
+                        "missing JavaScript operation for stream operation={} path={}",
+                        operation.source_key, stream.path
+                    ))
+                })?;
+            let stream_type = uniffi_js_engine_schema::value_type_for_path(
+                js_operation,
+                &stream.path,
+                &api.types,
+            )
+            .ok_or_else(|| {
                 FrontendError::Contract(format!(
-                    "missing source stream metadata for operation={} path={}",
+                    "stream path does not resolve to a value for operation={} path={}",
                     operation.source_key, stream.path
                 ))
             })?;
-            let item = rust_value_binding_for_source_type(
-                &source_stream.item_type,
+            let (item_type, error_type, is_send, direction) = match stream_type {
+                ValueType::InputStream {
+                    item,
+                    error,
+                    is_send,
+                } => (*item, *error, is_send, StreamDirection::Input),
+                ValueType::OutputStream {
+                    item,
+                    error,
+                    is_send,
+                } => (*item, *error, is_send, StreamDirection::Output),
+                _ => {
+                    return Err(FrontendError::Contract(format!(
+                        "stream path does not resolve to an input/output stream for operation={} path={}",
+                        operation.source_key, stream.path
+                    )))
+                }
+            };
+            if direction != stream.contract.direction {
+                return Err(FrontendError::Contract(format!(
+                    "stream direction mismatch for operation={} path={}",
+                    operation.source_key, stream.path
+                )));
+            }
+            let item = rust_value_binding_for_value_type(
+                &item_type,
                 api,
                 type_ids,
                 type_extras,
-                crate_owners,
                 callback_role,
             )?;
-            let error = rust_value_binding_for_source_type(
-                &source_stream.error_type,
+            let error = rust_value_binding_for_value_type(
+                &error_type,
                 api,
                 type_ids,
                 type_extras,
-                crate_owners,
                 callback_role,
             )?;
             let hooks = match stream.contract.direction {
@@ -1754,7 +1702,9 @@ fn build_rust_bridge_plan(
                 .collect::<Vec<_>>(),
             };
             let mut slot_operation_ids = BTreeMap::new();
-            if stream.contract.direction == StreamDirection::Output {
+            if stream.contract.direction == StreamDirection::Output
+                && operation.kind == OperationKind::OutputStreamStart
+            {
                 slot_operation_ids.insert(OperationKind::OutputStreamStart, operation.id);
             }
             for (kind, hook) in slot_kinds {
@@ -1808,7 +1758,7 @@ fn build_rust_bridge_plan(
                 direction: stream.contract.direction,
                 item,
                 error,
-                is_send: source_stream.is_send,
+                is_send,
                 hooks,
                 slot_operation_ids,
             });
@@ -1996,8 +1946,8 @@ fn validate_custom_value_acyclic(
         ValueType::Optional(inner)
         | ValueType::Sequence(inner)
         | ValueType::Set(inner)
-        | ValueType::InputStream(inner)
-        | ValueType::OutputStream(inner) => {
+        | ValueType::InputStream { item: inner, .. }
+        | ValueType::OutputStream { item: inner, .. } => {
             validate_custom_value_acyclic(inner, type_extras, visiting, owner)
         }
         ValueType::Map(key, value) => {
@@ -2379,24 +2329,6 @@ fn rust_object_kind_from_abi(kind: ObjectKind) -> RustObjectKind {
     }
 }
 
-fn rust_value_binding_for_source_type(
-    source_type: &Type,
-    api: &JsApiIr,
-    type_ids: &BTreeMap<TypeSourceKey, uniffi_js_abi::TypeId>,
-    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
-    crate_owners: &BTreeMap<String, ComponentKey>,
-    callback_role: bool,
-) -> Result<RustValueBinding, FrontendError> {
-    let value_type = convert_type(source_type, crate_owners)?;
-    let (rust_type, carrier, conversion) =
-        rust_binding_for_type(&value_type, api, type_ids, type_extras, callback_role)?;
-    Ok(RustValueBinding {
-        rust_type,
-        carrier,
-        conversion,
-    })
-}
-
 fn stream_handle_binding(direction: StreamDirection) -> RustReceiverBinding {
     let (rust_type, carrier, conversion) = match direction {
         StreamDirection::Input => (
@@ -2545,22 +2477,48 @@ fn rust_binding_for_type(
                 ConversionRecipe::Set(Box::new(conversion)),
             )
         }
-        ValueType::InputStream(inner) => {
+        ValueType::InputStream {
+            item,
+            error,
+            is_send,
+        } => {
             let (rust, _, conversion) =
-                rust_binding_for_type(inner, api, type_ids, type_extras, callback_role)?;
+                rust_binding_for_type(item, api, type_ids, type_extras, callback_role)?;
+            let (error_rust, _, error_conversion) =
+                rust_binding_for_type(error, api, type_ids, type_extras, callback_role)?;
             (
-                RustType::InputStream(Box::new(rust)),
+                RustType::InputStream {
+                    item: Box::new(rust),
+                    error: Box::new(error_rust),
+                    is_send: *is_send,
+                },
                 RustCarrier::InputStream,
-                ConversionRecipe::InputStream(Box::new(conversion)),
+                ConversionRecipe::InputStream {
+                    item: Box::new(conversion),
+                    error: Box::new(error_conversion),
+                },
             )
         }
-        ValueType::OutputStream(inner) => {
+        ValueType::OutputStream {
+            item,
+            error,
+            is_send,
+        } => {
             let (rust, _, conversion) =
-                rust_binding_for_type(inner, api, type_ids, type_extras, callback_role)?;
+                rust_binding_for_type(item, api, type_ids, type_extras, callback_role)?;
+            let (error_rust, _, error_conversion) =
+                rust_binding_for_type(error, api, type_ids, type_extras, callback_role)?;
             (
-                RustType::Stream(Box::new(rust)),
+                RustType::Stream {
+                    item: Box::new(rust),
+                    error: Box::new(error_rust),
+                    is_send: *is_send,
+                },
                 RustCarrier::OutputStream,
-                ConversionRecipe::OutputStream(Box::new(conversion)),
+                ConversionRecipe::OutputStream {
+                    item: Box::new(conversion),
+                    error: Box::new(error_conversion),
+                },
             )
         }
     })
@@ -2627,7 +2585,10 @@ fn convert_variant(
         )));
     };
     Ok(SourceVariant {
-        public_name: variant.name().to_upper_camel_case(),
+        // `name()` is the resolved UniFFI-facing spelling.  Do not apply a
+        // language casing pass here: an explicit `#[uniffi(name = ...)]`
+        // must survive unchanged (for example `Unknown` -> `unknown`).
+        public_name: variant.name().to_owned(),
         rust_name: variant.rust_name().to_owned(),
         fields: variant
             .fields()
@@ -2643,7 +2604,13 @@ fn convert_variant(
                     public_name: if shape == SourceVariantShape::Tuple {
                         format!("field{index}")
                     } else {
-                        field.name().to_lower_camel_case()
+                        // Preserve explicit UniFFI names; only the default
+                        // source spelling is projected to JS lower camel.
+                        if field.name() == field.rust_name() {
+                            field.name().to_lower_camel_case()
+                        } else {
+                            field.name().to_owned()
+                        }
                     },
                     rust_name: field.rust_name().to_owned(),
                     ty: convert_type(&field.as_type(), crate_owners)?,
@@ -2736,12 +2703,24 @@ fn convert_type(
             convert_type(value_type, crate_owners)?,
         ),
         Type::Set { inner_type } => ValueType::set(convert_type(inner_type, crate_owners)?),
-        Type::Stream { item_type, .. } => {
-            ValueType::output_stream(convert_type(item_type, crate_owners)?)
-        }
-        Type::InputStream { item_type, .. } => {
-            ValueType::input_stream(convert_type(item_type, crate_owners)?)
-        }
+        Type::Stream {
+            item_type,
+            error_type,
+            is_send,
+        } => ValueType::output_stream(
+            convert_type(item_type, crate_owners)?,
+            convert_type(error_type, crate_owners)?,
+            *is_send,
+        ),
+        Type::InputStream {
+            item_type,
+            error_type,
+            is_send,
+        } => ValueType::input_stream(
+            convert_type(item_type, crate_owners)?,
+            convert_type(error_type, crate_owners)?,
+            *is_send,
+        ),
     })
 }
 
@@ -3072,7 +3051,7 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("snakeField", "rust_field", 0),
+                ("snake_field", "rust_field", 0),
                 ("objectValue", "object_value", 1)
             ]
         );
@@ -3107,16 +3086,16 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("FirstVariant", "RustFirst", 0),
-                ("TuplePayload", "RustTuple", 1),
-                ("Unit", "RustUnit", 2),
+                ("first_variant", "RustFirst", 0),
+                ("tuple_payload", "RustTuple", 1),
+                ("unit", "RustUnit", 2),
             ]
         );
         assert!(matches!(
             variants[0].payload,
             RustVariantPayload::Named(ref fields)
                 if fields.len() == 1
-                    && fields[0].public_name == "nestedValue"
+                    && fields[0].public_name == "nested_value"
                     && fields[0].rust_name == "rust_nested"
                     && fields[0].declaration_order == 0
         ));
@@ -3195,6 +3174,61 @@ mod tests {
             .rust
             .named_type(uniffi_js_abi::TypeId::new(999))
             .is_none());
+    }
+
+    #[test]
+    fn resolved_variant_names_preserve_explicit_and_default_spelling() {
+        let group = update_enum_metadata(named_type_fixture_group(), |enum_| {
+            enum_.variants.push(uniffi_meta::VariantMetadata {
+                name: "Unknown".to_owned(),
+                orig_name: None,
+                discr: None,
+                fields: vec![],
+                docstring: None,
+            });
+        });
+        let package = normalize(BindingInput::new(&[metadata_component(group)])).unwrap();
+        let api_enum = package
+            .api
+            .types
+            .iter()
+            .find(|ty| ty.public_name == "PublicEnum")
+            .expect("enum API entry");
+        let JsTypeKind::Enum { variants } = &api_enum.kind else {
+            panic!("expected enum API entry");
+        };
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| variant.public_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first_variant", "tuple_payload", "unit", "Unknown"]
+        );
+
+        let enum_plan = package
+            .rust
+            .named_types
+            .iter()
+            .find(|entry| entry.rust_path.segments.ends_with(&["RustEnum".to_owned()]))
+            .expect("enum lowering entry");
+        let RustNamedTypeKind::Enum { variants } = &enum_plan.kind else {
+            panic!("expected enum lowering entry");
+        };
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| variant.public_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first_variant", "tuple_payload", "unit", "Unknown"]
+        );
+        assert_eq!(
+            package.rust.engines.keys().copied().collect::<Vec<_>>(),
+            vec![
+                EngineKind::Napi,
+                EngineKind::WasmBindgen,
+                EngineKind::OhosNapi
+            ]
+        );
     }
 
     #[test]
@@ -3875,6 +3909,27 @@ mod tests {
             .iter()
             .find(|operation| operation.public_name == "add")
             .expect("object method");
+        let constructor = package
+            .api
+            .operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::Constructor)
+            .expect("object constructor");
+        assert!(
+            constructor.receiver.is_none(),
+            "constructors are owned by a type but do not take an instance receiver"
+        );
+        for (engine, plan) in &package.rust.engines {
+            let constructor_plan = plan
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == constructor.id)
+                .expect("each engine keeps the constructor operation");
+            assert!(
+                constructor_plan.receiver.is_none(),
+                "{engine:?} constructor must not carry a receiver"
+            );
+        }
         assert_eq!(
             package.rust.engines[&EngineKind::Napi]
                 .operations
@@ -4047,7 +4102,7 @@ mod tests {
     }
 
     #[test]
-    fn output_stream_source_throws_are_rejected_before_bridge_plan() {
+    fn output_stream_source_throws_are_lowered_by_stream_start() {
         let mut group = uniffi_meta::MetadataGroup {
             namespace: uniffi_meta::NamespaceMetadata {
                 crate_name: "stream_throws_crate".to_owned(),
@@ -4102,11 +4157,24 @@ mod tests {
             ci: ComponentInterface::from_metadata(group).unwrap(),
             config: JsConfig::default(),
         };
-        let error = normalize(BindingInput::new(&[component])).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("stream_throws::namespace::OutputStreamStart::events"));
-        assert!(message.contains("path=return"));
-        assert!(message.contains("StreamStep"));
+        let package = normalize(BindingInput::new(&[component])).unwrap();
+        let start = package.rust.engines[&EngineKind::WasmBindgen]
+            .operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::OutputStreamStart)
+            .expect("fallible output stream start is retained");
+        assert!(start.throws.is_some());
+        assert!(matches!(
+            start
+                .return_value
+                .as_ref()
+                .map(|binding| &binding.rust_type),
+            Some(RustType::Stream { .. })
+        ));
+        assert!(start.stream_resources.iter().any(|resource| {
+            resource.direction == StreamDirection::Output
+                && resource.error.rust_type == RustType::Scalar(ScalarType::String)
+        }));
     }
 
     #[test]
@@ -4384,10 +4452,31 @@ mod tests {
             ci: ComponentInterface::from_metadata(group).unwrap(),
             config: JsConfig::default(),
         };
-        let error = normalize(BindingInput::new(&[component])).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("nested_streams::namespace::Function::consume"));
-        assert!(message.contains("argument[0].field[streams].key"));
-        assert!(message.contains("nested stream values"));
+        let package = normalize(BindingInput::new(&[component])).unwrap();
+        let operation = package.rust.engines[&EngineKind::Napi]
+            .operations
+            .iter()
+            .find(|operation| operation.source_key.name() == "consume")
+            .expect("nested stream operation should be present");
+        assert_eq!(operation.stream_resources.len(), 2);
+        let input = operation
+            .stream_resources
+            .iter()
+            .find(|resource| resource.direction == StreamDirection::Input)
+            .expect("map key input stream should be present");
+        let output = operation
+            .stream_resources
+            .iter()
+            .find(|resource| resource.direction == StreamDirection::Output)
+            .expect("map value output stream should be present");
+        assert_eq!(input.path.to_string(), "argument[0].field[streams].key");
+        assert_eq!(output.path.to_string(), "argument[0].field[streams].value");
+        assert_eq!(input.item.rust_type, RustType::Scalar(ScalarType::U32));
+        assert_eq!(input.error.rust_type, RustType::Scalar(ScalarType::String));
+        assert_eq!(output.item.rust_type, RustType::Scalar(ScalarType::String));
+        assert_eq!(output.error.rust_type, RustType::Scalar(ScalarType::String));
+        assert!(input.is_send && output.is_send);
+        assert_eq!(input.slot_operation_ids.len(), 2);
+        assert_eq!(output.slot_operation_ids.len(), 2);
     }
 }

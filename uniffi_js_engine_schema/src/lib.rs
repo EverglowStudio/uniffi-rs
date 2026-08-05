@@ -15,9 +15,9 @@ use std::fmt;
 
 use uniffi_js_abi::{
     AsyncKind, Capability, CapabilitySet, ComponentId, ComponentKey, IdentifiedComponent,
-    IdentifiedOperation, IdentifiedType, NamedTypeKind, ObjectKind, OperationId, OperationKind,
-    OperationOwner, OperationSourceKey, Ownership, ScalarType, StreamUseSiteId, TypeId,
-    TypeSourceKey, ValueType,
+    IdentifiedOperation, IdentifiedType, JsOperation, JsType, NamedTypeKind, ObjectKind,
+    OperationId, OperationKind, OperationOwner, OperationSourceKey, Ownership, ScalarType,
+    StreamUseSiteId, TypeId, TypeSourceKey, ValueType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -268,9 +268,20 @@ pub enum RustType {
     Sequence(Box<Self>),
     Map(Box<Self>, Box<Self>),
     Set(Box<Self>),
-    Stream(Box<Self>),
-    InputStream(Box<Self>),
-    StreamStep { item: Box<Self>, error: Box<Self> },
+    Stream {
+        item: Box<Self>,
+        error: Box<Self>,
+        is_send: bool,
+    },
+    InputStream {
+        item: Box<Self>,
+        error: Box<Self>,
+        is_send: bool,
+    },
+    StreamStep {
+        item: Box<Self>,
+        error: Box<Self>,
+    },
     Custom(Box<Self>),
 }
 
@@ -351,8 +362,8 @@ pub enum ConversionRecipe {
     Object(TypeId),
     Custom(TypeId, Box<Self>),
     Callback(TypeId),
-    InputStream(Box<Self>),
-    OutputStream(Box<Self>),
+    InputStream { item: Box<Self>, error: Box<Self> },
+    OutputStream { item: Box<Self>, error: Box<Self> },
     StreamStep { item: Box<Self>, error: Box<Self> },
 }
 
@@ -1227,6 +1238,121 @@ pub fn callback_type_for_path(
     resolve_callback_value_path(value, &remaining, &types_by_key, &mut BTreeSet::new())
 }
 
+/// Resolve the complete canonical value at an operation path.
+///
+/// Unlike [`callback_type_for_path`], this walker returns the owned
+/// [`ValueType`] so stream consumers retain the declared item, error and
+/// sendability metadata for every direct or nested use-site.  Optional and
+/// custom wrappers are transparent; container and named payload segments are
+/// consumed exactly as they appear in [`ValuePath`].
+pub fn value_type_for_path(
+    operation: &JsOperation,
+    path: &ValuePath,
+    types: &[JsType],
+) -> Option<ValueType> {
+    let types_by_key = types
+        .iter()
+        .map(|ty| (ty.source_key.clone(), ty))
+        .collect::<BTreeMap<_, _>>();
+    let (value, remaining) = match path.segments().first()? {
+        ValuePathSegment::Argument(index) => (
+            operation.arguments.get(*index as usize)?.ty.clone(),
+            &path.segments()[1..],
+        ),
+        ValuePathSegment::Return => (operation.return_type.clone()?, &path.segments()[1..]),
+        _ => return None,
+    };
+    resolve_value_type_path(&value, remaining, &types_by_key, &mut BTreeSet::new())
+}
+
+fn resolve_value_type_path(
+    value: &ValueType,
+    segments: &[ValuePathSegment],
+    types: &BTreeMap<TypeSourceKey, &JsType>,
+    visiting: &mut BTreeSet<TypeSourceKey>,
+) -> Option<ValueType> {
+    if segments.is_empty() {
+        return Some(value.clone());
+    }
+    match value {
+        ValueType::Optional(inner) => resolve_value_type_path(inner, segments, types, visiting),
+        ValueType::Sequence(inner) => match segments.first()? {
+            ValuePathSegment::SequenceItem => {
+                resolve_value_type_path(inner, &segments[1..], types, visiting)
+            }
+            _ => None,
+        },
+        ValueType::Set(inner) => match segments.first()? {
+            ValuePathSegment::SetItem => {
+                resolve_value_type_path(inner, &segments[1..], types, visiting)
+            }
+            _ => None,
+        },
+        ValueType::Map(key, value) => match segments.first()? {
+            ValuePathSegment::MapKey => {
+                resolve_value_type_path(key, &segments[1..], types, visiting)
+            }
+            ValuePathSegment::MapValue => {
+                resolve_value_type_path(value, &segments[1..], types, visiting)
+            }
+            _ => None,
+        },
+        ValueType::InputStream { item, .. } | ValueType::OutputStream { item, .. } => {
+            match segments.first()? {
+                ValuePathSegment::SequenceItem => {
+                    resolve_value_type_path(item, &segments[1..], types, visiting)
+                }
+                _ => None,
+            }
+        }
+        ValueType::Named(key) => {
+            if !visiting.insert(key.clone()) {
+                return None;
+            }
+            let ty = types.get(key)?;
+            let result = match segments.first()? {
+                _ if matches!(&ty.kind, uniffi_js_abi::JsTypeKind::Custom { .. }) => {
+                    if let uniffi_js_abi::JsTypeKind::Custom { builtin, .. } = &ty.kind {
+                        resolve_value_type_path(builtin, segments, types, visiting)
+                    } else {
+                        None
+                    }
+                }
+                ValuePathSegment::Field(name) => match &ty.kind {
+                    uniffi_js_abi::JsTypeKind::Record { fields } => fields
+                        .iter()
+                        .find(|field| field.public_name == *name)
+                        .and_then(|field| {
+                            resolve_value_type_path(&field.ty, &segments[1..], types, visiting)
+                        }),
+                    _ => None,
+                },
+                ValuePathSegment::Variant(name) => match &ty.kind {
+                    uniffi_js_abi::JsTypeKind::Enum { variants }
+                    | uniffi_js_abi::JsTypeKind::Error { variants } => {
+                        let variant = variants
+                            .iter()
+                            .find(|variant| variant.public_name == *name)?;
+                        let ValuePathSegment::Field(field_name) = segments.get(1)? else {
+                            return None;
+                        };
+                        let field = variant
+                            .fields
+                            .iter()
+                            .find(|field| field.public_name == *field_name)?;
+                        resolve_value_type_path(&field.ty, &segments[2..], types, visiting)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            visiting.remove(key);
+            result
+        }
+        ValueType::Scalar(_) | ValueType::Timestamp | ValueType::Duration => None,
+    }
+}
+
 fn resolve_callback_value_path(
     value: &ValueType,
     segments: &[&ValuePathSegment],
@@ -1270,14 +1396,13 @@ fn resolve_callback_value_path(
             }
             _ => None,
         },
-        ValueType::InputStream(inner) | ValueType::OutputStream(inner) => {
-            match segments.first()? {
-                ValuePathSegment::SequenceItem => {
-                    resolve_callback_value_path(inner, &segments[1..], types, visiting)
-                }
-                _ => None,
+        ValueType::InputStream { item: inner, .. }
+        | ValueType::OutputStream { item: inner, .. } => match segments.first()? {
+            ValuePathSegment::SequenceItem => {
+                resolve_callback_value_path(inner, &segments[1..], types, visiting)
             }
-        }
+            _ => None,
+        },
         ValueType::Named(key) => {
             if !visiting.insert(key.clone()) {
                 return None;
@@ -1478,8 +1603,8 @@ fn enumerate_value_use_sites(
                 errors,
             );
         }
-        ValueType::InputStream(item) | ValueType::OutputStream(item) => {
-            let direction = if matches!(value, ValueType::InputStream(_)) {
+        ValueType::InputStream { item, .. } | ValueType::OutputStream { item, .. } => {
+            let direction = if matches!(value, ValueType::InputStream { .. }) {
                 StreamDirection::Input
             } else {
                 StreamDirection::Output
@@ -1605,16 +1730,6 @@ fn validate_callback_method_contract(
             use_site: callback.path.to_string(),
         });
         return;
-    }
-
-    if callback.contract.threading == CallbackThreading::MayCrossThread
-        && methods
-            .iter()
-            .any(|method| method.operation.definition.signature.async_kind == AsyncKind::Sync)
-    {
-        errors.push(ValidationError::CrossThreadSyncCallback {
-            use_site: callback.path.to_string(),
-        });
     }
 }
 
@@ -1767,13 +1882,8 @@ fn callback_method_capabilities(
     {
         capabilities.insert(Capability::FallibleCallback);
     }
-    if callback.contract.threading == CallbackThreading::MayCrossThread
-        && !methods.is_empty()
-        && methods
-            .iter()
-            .all(|method| method.operation.definition.signature.async_kind == AsyncKind::Async)
-    {
-        capabilities.insert(Capability::CrossThreadAsyncCallback);
+    if callback.contract.threading == CallbackThreading::MayCrossThread && !methods.is_empty() {
+        capabilities.insert(Capability::CrossThreadCallback);
     }
     capabilities
 }
@@ -1885,13 +1995,19 @@ fn infer_value_capabilities(
             required.insert(Capability::Set);
             infer_value_capabilities(inner, types, visiting, required, errors);
         }
-        ValueType::InputStream(inner) => {
+        ValueType::InputStream {
+            item: inner, error, ..
+        } => {
             required.insert(Capability::InputStream);
             infer_value_capabilities(inner, types, visiting, required, errors);
+            infer_value_capabilities(error, types, visiting, required, errors);
         }
-        ValueType::OutputStream(inner) => {
+        ValueType::OutputStream {
+            item: inner, error, ..
+        } => {
             required.insert(Capability::OutputStream);
             infer_value_capabilities(inner, types, visiting, required, errors);
+            infer_value_capabilities(error, types, visiting, required, errors);
         }
     }
 }
@@ -1962,9 +2078,6 @@ pub enum ValidationError {
     UnknownOperation {
         role: &'static str,
         operation_id: OperationId,
-    },
-    CrossThreadSyncCallback {
-        use_site: String,
     },
     MissingCallbackContract {
         operation_id: OperationId,
@@ -2098,10 +2211,6 @@ impl fmt::Display for ValidationError {
             Self::UnknownOperation { role, operation_id } => {
                 write!(formatter, "{role} references unknown operation ID {operation_id}")
             }
-            Self::CrossThreadSyncCallback { use_site } => write!(
-                formatter,
-                "callback at {use_site} is synchronous and may cross threads; the unified base forbids this contract"
-            ),
             Self::MissingCallbackContract {
                 operation_id,
                 use_site,
@@ -2573,7 +2682,7 @@ mod tests {
             Capability::AsyncCallback,
             Capability::FallibleCallback,
             Capability::CallbackReentrancy,
-            Capability::CrossThreadAsyncCallback,
+            Capability::CrossThreadCallback,
             Capability::InputStream,
             Capability::OutputStream,
         ])
@@ -2618,7 +2727,11 @@ mod tests {
                         .unwrap(),
                         FieldDefinition::new(
                             "input",
-                            ValueType::input_stream(ValueType::Scalar(ScalarType::Bytes)),
+                            ValueType::input_stream(
+                                ValueType::Scalar(ScalarType::Bytes),
+                                ValueType::Scalar(ScalarType::String),
+                                false,
+                            ),
                         )
                         .unwrap(),
                     ],
@@ -2807,7 +2920,11 @@ mod tests {
                 "__uniffi_contract_corpus_events",
                 OperationSignature {
                     arguments: vec![],
-                    return_type: Some(ValueType::output_stream(ValueType::Named(event_key))),
+                    return_type: Some(ValueType::output_stream(
+                        ValueType::Named(event_key),
+                        ValueType::Scalar(ScalarType::String),
+                        true,
+                    )),
                     async_kind: AsyncKind::Sync,
                     throws: None,
                 },
@@ -3092,16 +3209,22 @@ mod tests {
     }
 
     #[test]
-    fn cross_thread_sync_callback_is_rejected() {
+    fn cross_thread_callback_capability_covers_sync_methods() {
         let mut input = corpus_input();
         input.callbacks[0].contract.threading = CallbackThreading::MayCrossThread;
-        let report = BridgePlan::build(input).unwrap_err();
-        assert!(report
-            .contains(|error| matches!(error, ValidationError::CrossThreadSyncCallback { .. })));
+        let plan = BridgePlan::build(input).unwrap();
+        let observe = plan
+            .operations()
+            .iter()
+            .find(|operation| operation.operation.definition.public_name == "observe")
+            .unwrap();
+        assert!(observe
+            .required_capabilities
+            .contains(Capability::CrossThreadCallback));
     }
 
     #[test]
-    fn cross_thread_async_callback_capability_comes_from_async_methods() {
+    fn cross_thread_callback_capability_also_covers_async_methods() {
         let mut input = corpus_input();
         input.callbacks[0].contract.threading = CallbackThreading::MayCrossThread;
         for planned in &mut input.operations {
@@ -3120,7 +3243,7 @@ mod tests {
             .unwrap();
         assert!(observe
             .required_capabilities
-            .contains(Capability::CrossThreadAsyncCallback));
+            .contains(Capability::CrossThreadCallback));
     }
 
     #[test]

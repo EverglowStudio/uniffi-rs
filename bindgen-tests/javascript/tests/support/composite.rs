@@ -10,7 +10,10 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
 use uniffi_bindgen::{BindgenLoader, BindgenPaths, GlobalConfig};
-use uniffi_bindgen_javascript::{generate, FlavorTarget, GenerateJsOptions, HostCrateOptions};
+use uniffi_bindgen_javascript::package::GeneratedPackage;
+use uniffi_bindgen_javascript::{
+    generate_package, FlavorTarget, GenerateJsOptions, HostCrateOptions,
+};
 
 /// The stable descriptor used by all composite fixture assertions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,8 +295,8 @@ resolver = "3"
         out_dir: &Utf8PathBuf,
         host_crates_dir: Option<Utf8PathBuf>,
         flavors: Vec<FlavorTarget>,
-    ) {
-        self.generate_with_artifact_dir(out_dir, None, host_crates_dir, flavors);
+    ) -> GeneratedPackage {
+        self.generate_with_artifact_dir(out_dir, None, host_crates_dir, flavors)
     }
 
     /// Variant of [`Self::generate`] that gives adapters a package-level
@@ -306,14 +309,16 @@ resolver = "3"
         artifact_dir: Option<Utf8PathBuf>,
         host_crates_dir: Option<Utf8PathBuf>,
         flavors: Vec<FlavorTarget>,
-    ) {
+    ) -> GeneratedPackage {
         self.assert_loads_both_components();
         let loader = self.bindgen_loader();
-        generate(
+        let host_crates_dir = host_crates_dir.unwrap_or_else(|| out_dir.join("native/hosts"));
+        generate_package(
             &loader,
             GenerateJsOptions {
                 source: self.library_path.clone(),
                 out_dir: out_dir.clone(),
+                package_root: out_dir.clone(),
                 artifact_dir,
                 config_override: None,
                 crate_filter: None,
@@ -321,17 +326,15 @@ resolver = "3"
                 // library's complete metadata set, not a no-dependencies UDL
                 // shortcut.
                 metadata_no_deps: false,
-                host_crates: host_crates_dir.map(|host_crates_dir| HostCrateOptions {
+                host_crates: HostCrateOptions {
                     manifest_path: self.composite_manifest.clone(),
                     host_crates_dir,
                     logical_host_crates_dir: None,
-                    logical_out_dir: None,
-                    ohos_rs_dir: None,
-                }),
+                },
                 flavors,
             },
         )
-        .expect("JavaScript generation should succeed for the composite cdylib");
+        .expect("JavaScript generation should succeed for the composite cdylib")
     }
 }
 

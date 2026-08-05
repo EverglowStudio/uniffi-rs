@@ -6,7 +6,6 @@
 
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -45,16 +44,6 @@ impl TraversalBudget {
             bytes: 0,
             max_entries: MAX_EPHEMERAL_BUILD_ENTRIES,
             max_bytes: 16 * MAX_HSP_ARCHIVE_TOTAL_BYTES,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn bounded(max_entries: usize, max_bytes: u64) -> Self {
-        Self {
-            entries: 0,
-            bytes: 0,
-            max_entries,
-            max_bytes,
         }
     }
 
@@ -160,19 +149,6 @@ impl TemporaryWorkspace {
     pub(in crate::cli) fn build_root(&self) -> &Utf8Path {
         &self.build_root
     }
-}
-
-#[cfg(test)]
-pub(crate) fn read_verified_regular_file_bounded_with_budget(
-    path: &Utf8Path,
-    maximum_bytes: u64,
-    label: &str,
-    budget: &mut TraversalBudget,
-) -> Result<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("reading bounded {label} metadata for {path}"))?;
-    budget.consume(path.as_str(), "file", metadata.len())?;
-    read_verified_regular_file_bounded(path, maximum_bytes, label)
 }
 
 pub(in crate::cli) fn read_verified_regular_file_bounded(
@@ -347,12 +323,6 @@ pub(in crate::cli) fn opened_file_matches_path(
     _path_metadata: &std::fs::Metadata,
 ) -> Result<bool> {
     bail!("file identity is unsupported on this host; refusing verified source {path}")
-}
-
-pub(in crate::cli) fn sha256_bytes(value: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(value);
-    format!("{:x}", digest.finalize())
 }
 
 #[cfg(unix)]
@@ -1153,15 +1123,6 @@ pub(in crate::cli) fn canonicalize_invocation_output(path: &Utf8Path) -> Result<
             Err(error).with_context(|| format!("canonicalizing invocation output {path}"))
         }
     }
-}
-
-pub(in crate::cli) fn require_regular_source_file(path: &Utf8Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("required OHOS package source file is missing: {path}"))?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        bail!("OHOS package source must be a regular non-symlink file: {path}");
-    }
-    Ok(())
 }
 
 pub(in crate::cli) fn copy_dir_recursive(src: &Utf8Path, dst: &Utf8Path) -> Result<()> {

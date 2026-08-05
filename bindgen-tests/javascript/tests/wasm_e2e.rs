@@ -7,14 +7,25 @@ mod shared;
 
 use shared::*;
 use support::*;
-use wasm_bindgen_cli_support::Bindgen;
+use uniffi_bindgen_javascript::host_crates::composite_host_lib_target;
 
 const EMPTY_GENERATED_FILES: &[(&str, &str)] = &[];
 
-// Wasm glue generation is intentionally performed by `wasm-bindgen-cli-support`
-// in this test process. Keep every child command on a Rust-toolchain/system
-// PATH that excludes a developer's ~/.cargo/bin, so a separately installed
-// wasm-bindgen CLI can neither satisfy nor influence the test.
+// The generated Wasm source is expanded by this exact wasm-bindgen fork.
+// Keep every temporary shim on the same revision as the package host crate;
+// mixing crates.io's older runtime with the generated ABI shims leaves helper
+// symbols such as `ensure_unwind_safe` unavailable at compile time.
+const WASM_BINDGEN_DEPENDENCIES: &str = concat!(
+    "wasm-bindgen = { git = \"https://github.com/EverglowStudio/wasm-bindgen.git\", rev = \"192d5272182776f8d5f7c605611414e2b4435701\", package = \"wasm-bindgen\" }\n",
+    "wasm-bindgen-futures = { git = \"https://github.com/EverglowStudio/wasm-bindgen.git\", rev = \"192d5272182776f8d5f7c605611414e2b4435701\", package = \"wasm-bindgen-futures\" }\n",
+    "js-sys = { git = \"https://github.com/EverglowStudio/wasm-bindgen.git\", rev = \"192d5272182776f8d5f7c605611414e2b4435701\", package = \"js-sys\" }\n",
+);
+
+// Wasm glue generation is intentionally performed by the generated package's
+// pinned post-link engine in this test process. Keep every child command on a
+// Rust-toolchain/system PATH that excludes a developer's ~/.cargo/bin, so a
+// separately installed wasm-bindgen CLI can neither satisfy nor influence the
+// test.
 fn wasm_e2e_path() -> &'static std::ffi::OsStr {
     static PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
@@ -50,19 +61,27 @@ fn wasm_e2e_command(program: &std::path::Path) -> Command {
     command
 }
 
-fn run_wasm_bindgen_nodejs_in_process(wasm_artifact: &std::path::Path, out_dir: &std::path::Path) {
-    let mut bindgen = Bindgen::new();
-    bindgen
-        .nodejs(true)
-        .expect("configuring the built-in wasm-bindgen Node.js target should succeed");
-    bindgen.input_path(wasm_artifact);
-    bindgen.typescript(true);
-    bindgen.generate(out_dir).unwrap_or_else(|err| {
-        panic!(
-            "built-in wasm-bindgen failed for {}: {err:#}",
-            wasm_artifact.display()
+fn emit_wasm_post_link(
+    package: &GeneratedPackage,
+    wasm_artifact: &std::path::Path,
+    module_name: &str,
+    out_dir: &Utf8PathBuf,
+) {
+    let wasm_artifact = Utf8PathBuf::from_path_buf(wasm_artifact.to_path_buf())
+        .expect("Wasm artifact path must be valid UTF-8");
+    package
+        .emit_wasm_post_link(
+            &wasm_artifact,
+            module_name,
+            WasmPostLinkTarget::Node,
+            out_dir,
         )
-    });
+        .unwrap_or_else(|err| {
+            panic!(
+                "in-process wasm post-link failed for {}: {err:#}",
+                wasm_artifact
+            )
+        });
 }
 
 fn composite_host_wasm_filename(package_name: &str) -> String {
@@ -109,14 +128,20 @@ namespace wasm_scalar {
     // Minimal Cargo.toml so the uniffi loader recognises this as a crate.
     std::fs::write(
         biz.join("Cargo.toml"),
-        r#"[package]
+        format!(
+            r#"[package]
 name = "wasm_scalar"
 version = "0.0.0"
 edition = "2021"
 
 [lib]
 crate-type = ["rlib"]
+
+[dependencies]
+uniffi = {{ path = {:?} }}
 "#,
+            workspace_root().join("uniffi").as_str()
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -129,16 +154,21 @@ crate-type = ["rlib"]
     let gen_dir = root.join("gen");
     std::fs::create_dir_all(&gen_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
-    generate(
+    let package = generate_package(
         &loader,
         GenerateJsOptions {
             source: udl_path.clone(),
             out_dir: gen_dir.clone(),
+            package_root: gen_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: None,
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: biz.join("Cargo.toml"),
+                host_crates_dir: gen_dir.join("native/hosts"),
+                logical_host_crates_dir: None,
+            },
             flavors: vec![FlavorTarget::Wasm],
         },
     )
@@ -171,13 +201,14 @@ pub async fn async_add(a: u64, b: u64) -> u64 { a.wrapping_add(b) }
     // 4. Shim crate: cdylib with the generated wasm-bindgen Rust file.
     let shim = root.join("shim");
     std::fs::create_dir_all(shim.join("src")).unwrap();
-    let gen_rs = gen_dir.join("components/wasm_scalar/browser/wasm_scalar.rs");
+    let gen_rs = gen_dir.join("native/wasm.rs");
     let shim_src = std::fs::read_to_string(&gen_rs)
         .unwrap_or_else(|_| panic!("generated shim missing at {gen_rs}"));
     std::fs::write(shim.join("src/lib.rs"), shim_src).unwrap();
     std::fs::write(
         shim.join("Cargo.toml"),
-        r#"[package]
+        format!(
+            r#"[package]
 name = "wasm_scalar_shim"
 version = "0.0.0"
 edition = "2021"
@@ -186,11 +217,11 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wasm-bindgen = "=0.2.117"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
-wasm_scalar = { path = "../biz" }
+{WASM_BINDGEN_DEPENDENCIES}
+wasm_scalar = {{ path = "../biz" }}
 "#,
+            WASM_BINDGEN_DEPENDENCIES = WASM_BINDGEN_DEPENDENCIES,
+        ),
     )
     .unwrap();
     // Isolate from any parent workspace so the temp crates build standalone.
@@ -237,19 +268,19 @@ wasm_scalar = { path = "../biz" }
         "expected wasm artifact at {}",
         wasm_file.display()
     );
-    let pkg = root.join("pkg");
-    run_wasm_bindgen_nodejs_in_process(wasm_file.as_path(), pkg.as_std_path());
+    let pkg = gen_dir.join("browser/pkg");
+    let module_name = composite_host_lib_target("wasm_scalar");
+    emit_wasm_post_link(&package, wasm_file.as_path(), &module_name, &pkg);
 
     // 7. Driver: import the CJS glue via createRequire, drive initBackend
     //    then exercise sync / fallible / async scalar paths.
     let driver = r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
-const { initBackend, add, checkedSub, asyncAdd, UniffiError } = root.wasm_scalar;
+import * as root from "./gen/browser/index.js";
+await root.ready;
+const { add, checkedSub, asyncAdd, UniffiError } = root.wasm_scalar;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_scalar_shim.js");
-await initBackend(glue);
 
 // sync scalar — u64 returns bigint
 const s = add(2n, 3n);
@@ -274,7 +305,6 @@ if (r !== 15n) throw new Error(`async add via wasm failed: ${r}`);
 if (typeof r !== "bigint") throw new Error(`u64 should be bigint, got ${typeof r}`);
 
 // initBackend idempotent
-await initBackend(glue);
 
 console.log("ok");
 "#;
@@ -372,14 +402,14 @@ pub enum Shape {
 // runtime catches the thrown JsError and wraps it into `UniffiError`.
 #[derive(Debug)]
 pub enum CheckoutError {
-    OutOfStock(String),
-    PaymentDeclined(String),
+    OutOfStock { sku: String },
+    PaymentDeclined { reason: String },
 }
 impl std::fmt::Display for CheckoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::OutOfStock(s) => write!(f, "OutOfStock({s})"),
-            Self::PaymentDeclined(r) => write!(f, "PaymentDeclined({r})"),
+            Self::OutOfStock { sku } => write!(f, "OutOfStock({sku})"),
+            Self::PaymentDeclined { reason } => write!(f, "PaymentDeclined({reason})"),
         }
     }
 }
@@ -410,9 +440,9 @@ pub fn bigger(s: Shape, factor: f64) -> Shape {
 
 pub fn buy(sku: String, qty: u32) -> Result<u32, CheckoutError> {
     if sku == "rare" {
-        Err(CheckoutError::OutOfStock(sku))
+        Err(CheckoutError::OutOfStock { sku })
     } else if qty == 0 {
-        Err(CheckoutError::PaymentDeclined("zero quantity".into()))
+        Err(CheckoutError::PaymentDeclined { reason: "zero quantity".into() })
     } else {
         Ok(qty * 10)
     }
@@ -420,12 +450,11 @@ pub fn buy(sku: String, qty: u32) -> Result<u32, CheckoutError> {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
-const { initBackend, makeUser, greetUser, invert, bigger, buy, UniffiError } = root.wasm_rec;
+import * as root from "./gen/browser/index.js";
+await root.ready;
+const { makeUser, greetUser, invert, bigger, buy, UniffiError } = root.wasm_rec;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_rec_shim.js");
-await initBackend(glue);
 
 // records: make_user returns a plain object
 const u = makeUser("alice", 30) as { name: string; age: number };
@@ -524,27 +553,26 @@ pub fn rename_users(input: HashMap<String, User>) -> HashMap<String, User> {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
-const { initBackend, bumpCounts, renameUsers } = root.wasm_map;
+import * as root from "./gen/browser/index.js";
+await root.ready;
+const { bumpCounts, renameUsers } = root.wasm_map;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_map_shim.js");
-await initBackend(glue);
 
-const counts = bumpCounts({ a: 1, b: 2 }) as Record<string, number>;
-if (counts.a !== 2 || counts.b !== 3 || counts.total !== 5) {
-    throw new Error(`bumpCounts wrong: ${JSON.stringify(counts)}`);
+const counts = bumpCounts(new Map([["a", 1], ["b", 2]])) as Map<string, number>;
+if (!(counts instanceof Map) || counts.get("a") !== 2 || counts.get("b") !== 3 || counts.get("total") !== 5) {
+    throw new Error(`bumpCounts wrong: ${String(counts)}`);
 }
 
-const users = renameUsers({
-    ada: { name: "Ada", age: 36 },
-    bob: { name: "Bob", age: 41 },
-}) as Record<string, { name: string; age: number }>;
-if (users.ada.name !== "Ada!" || users.ada.age !== 37) {
-    throw new Error(`renameUsers ada wrong: ${JSON.stringify(users)}`);
+const users = renameUsers(new Map([
+    ["ada", { name: "Ada", age: 36 }],
+    ["bob", { name: "Bob", age: 41 }],
+])) as Map<string, { name: string; age: number }>;
+if (!(users instanceof Map) || users.get("ada")?.name !== "Ada!" || users.get("ada")?.age !== 37) {
+    throw new Error(`renameUsers ada wrong: ${String(users)}`);
 }
-if (users.bob.name !== "Bob!" || users.bob.age !== 42) {
-    throw new Error(`renameUsers bob wrong: ${JSON.stringify(users)}`);
+if (users.get("bob")?.name !== "Bob!" || users.get("bob")?.age !== 42) {
+    throw new Error(`renameUsers bob wrong: ${String(users)}`);
 }
 
 console.log("ok");
@@ -632,9 +660,9 @@ pub fn get_far_future_timestamp() -> SystemTime {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
+import * as root from "./gen/browser/index.js";
+await root.ready;
 const {
-    initBackend,
     returnTimestamp,
     returnDuration,
     add,
@@ -645,8 +673,6 @@ const {
 } = root.wasm_time;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_time_shim.js");
-await initBackend(glue);
 
 const ts = new Date("2024-01-02T03:04:05.283Z");
 const tsRound = returnTimestamp(ts);
@@ -741,12 +767,11 @@ impl Counter {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
-const { initBackend, Counter } = root.wasm_obj;
+import * as root from "./gen/browser/index.js";
+await root.ready;
+const { Counter } = root.wasm_obj;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_obj_shim.js");
-await initBackend(glue);
 
 const c = Counter.new(10);
 c.inc();
@@ -803,12 +828,11 @@ impl Counter {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
-const { initBackend, Counter } = root.wasm_arc;
+import * as root from "./gen/browser/index.js";
+await root.ready;
+const { Counter } = root.wasm_arc;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_arc_shim.js");
-await initBackend(glue);
 
 const c = Counter.new(7);
 c.inc(); c.inc(); c.inc();
@@ -871,12 +895,11 @@ pub fn call_greeter(greeter: Arc<dyn Greeter>, name: String) -> String {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
-const { initBackend, englishGreeter, chineseGreeter, callGreeter } = root.wasm_trait;
+import * as root from "./gen/browser/index.js";
+await root.ready;
+const { englishGreeter, chineseGreeter, callGreeter } = root.wasm_trait;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_trait_shim.js");
-await initBackend(glue);
 
 // factory returns a wrapped object
 const en = englishGreeter();
@@ -914,6 +937,7 @@ callback interface Logger {
 };
 
 namespace wasm_cb {
+  [CallbackContract="argument[0],scoped,calling_thread,forbidden"]
   void run_job(Logger logger);
 };
 "#,
@@ -934,12 +958,11 @@ pub fn run_job(logger: Arc<dyn Logger>) {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
-const { initBackend, runJob } = root.wasm_cb;
+import * as root from "./gen/browser/index.js";
+await root.ready;
+const { runJob } = root.wasm_cb;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_cb_shim.js");
-await initBackend(glue);
 
 const received: string[] = [];
 const logger = {
@@ -983,7 +1006,7 @@ interface AsyncWorker {
 };
 
 namespace wasm_async_cb {
-  [Async]
+  [Async, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
   WorkRecord run_async_worker(AsyncWorker worker);
 };
 "#,
@@ -1012,12 +1035,11 @@ pub async fn run_async_worker(worker: Arc<dyn AsyncWorker>) -> WorkRecord {
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
-const { initBackend, runAsyncWorker } = root.wasm_async_cb;
+import * as root from "./gen/browser/index.js";
+await root.ready;
+const { runAsyncWorker } = root.wasm_async_cb;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_async_cb_shim.js");
-await initBackend(glue);
 
 const calls: string[] = [];
 const worker = {
@@ -1083,28 +1105,37 @@ enum ProviderError {
 callback interface Maker {
   Counter make_counter(u32 initial);
   Greeter make_greeter(string prefix);
+  [CallbackContract="return,retained,calling_thread,allowed"]
   Logger make_logger(string prefix);
+  [CallbackContract="return,retained,calling_thread,allowed"]
   HostLogger make_host_logger(string prefix);
-  [Async]
+};
+
+callback interface AsyncMaker {
+  [Async, CallbackContract="return,retained,calling_thread,allowed"]
   Logger make_async_logger(string prefix);
-  [Async]
+  [Async, CallbackContract="return,retained,calling_thread,allowed"]
   HostLogger make_async_host_logger(string prefix);
-  [Async, Throws=ProviderError]
+  [Async, Throws=ProviderError, CallbackContract="return,retained,calling_thread,allowed"]
   Logger checked_make_async_logger(string prefix, boolean fail);
 };
 
 namespace wasm_cb_object {
   Greeter english_greeter(string prefix);
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   Counter invoke_maker_make_counter(Maker maker, u32 initial);
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   Greeter invoke_maker_make_greeter(Maker maker, string prefix);
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   string invoke_maker_run_logger(Maker maker, string prefix, string message);
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   string invoke_maker_run_host_logger(Maker maker, string prefix, string name);
-  [Async]
-  string invoke_maker_run_async_logger(Maker maker, string prefix, string message);
-  [Async]
-  string invoke_maker_run_async_host_logger(Maker maker, string prefix, string name);
-  [Async, Throws=ProviderError]
-  string invoke_maker_checked_make_async_logger(Maker maker, string prefix, boolean fail, string message);
+  [Async, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
+  string invoke_maker_run_async_logger(AsyncMaker maker, string prefix, string message);
+  [Async, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
+  string invoke_maker_run_async_host_logger(AsyncMaker maker, string prefix, string name);
+  [Async, Throws=ProviderError, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
+  string invoke_maker_checked_make_async_logger(AsyncMaker maker, string prefix, boolean fail, string message);
 };
 "#,
         biz_deps: "async-trait = \"0.1\"\n",
@@ -1169,12 +1200,15 @@ pub fn english_greeter(prefix: String) -> Arc<dyn Greeter> {
     Arc::new(English { prefix })
 }
 
-#[async_trait::async_trait(?Send)]
 pub trait Maker: Send + Sync {
     fn make_counter(&self, initial: u32) -> Arc<Counter>;
     fn make_greeter(&self, prefix: String) -> Arc<dyn Greeter>;
     fn make_logger(&self, prefix: String) -> Arc<dyn Logger>;
     fn make_host_logger(&self, prefix: String) -> Arc<dyn HostLogger>;
+}
+
+#[async_trait::async_trait(?Send)]
+pub trait AsyncMaker: Send + Sync {
     async fn make_async_logger(&self, prefix: String) -> Arc<dyn Logger>;
     async fn make_async_host_logger(&self, prefix: String) -> Arc<dyn HostLogger>;
     async fn checked_make_async_logger(
@@ -1201,7 +1235,7 @@ pub fn invoke_maker_run_host_logger(maker: Arc<dyn Maker>, prefix: String, name:
 }
 
 pub async fn invoke_maker_run_async_logger(
-    maker: Arc<dyn Maker>,
+    maker: Arc<dyn AsyncMaker>,
     prefix: String,
     message: String,
 ) -> String {
@@ -1209,7 +1243,7 @@ pub async fn invoke_maker_run_async_logger(
 }
 
 pub async fn invoke_maker_run_async_host_logger(
-    maker: Arc<dyn Maker>,
+    maker: Arc<dyn AsyncMaker>,
     prefix: String,
     name: String,
 ) -> String {
@@ -1217,7 +1251,7 @@ pub async fn invoke_maker_run_async_host_logger(
 }
 
 pub async fn invoke_maker_checked_make_async_logger(
-    maker: Arc<dyn Maker>,
+    maker: Arc<dyn AsyncMaker>,
     prefix: String,
     fail: bool,
     message: String,
@@ -1230,9 +1264,9 @@ pub async fn invoke_maker_checked_make_async_logger(
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
+import * as root from "./gen/browser/index.js";
+await root.ready;
 const {
-    initBackend,
     Counter,
     ProviderError,
     englishGreeter,
@@ -1246,8 +1280,6 @@ const {
 } = root.wasm_cb_object;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_cb_object_shim.js");
-await initBackend(glue);
 
 const maker = {
     makeCounter(initial: number) {
@@ -1385,13 +1417,15 @@ callback interface ValueProvider {
 };
 
 namespace wasm_fallible_cb {
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   u32 invoke_value_provider_get_value(ValueProvider provider);
+  [CallbackContract="argument[0],retained,calling_thread,allowed"]
   Payload invoke_value_provider_make_payload(ValueProvider provider);
-  [Throws=ProviderError]
+  [Throws=ProviderError, CallbackContract="argument[0],retained,calling_thread,allowed"]
   u32 invoke_value_provider_checked_value(ValueProvider provider, boolean fail);
-  [Throws=ProviderError]
+  [Throws=ProviderError, CallbackContract="argument[0],retained,calling_thread,allowed"]
   Payload invoke_value_provider_checked_payload(ValueProvider provider, boolean fail);
-  [Throws=ProviderError]
+  [Throws=ProviderError, CallbackContract="argument[0],retained,calling_thread,allowed"]
   boolean invoke_value_provider_checked_void(ValueProvider provider, boolean fail);
 };
 "#,
@@ -1461,9 +1495,9 @@ pub fn invoke_value_provider_checked_void(
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
+import * as root from "./gen/browser/index.js";
+await root.ready;
 const {
-  initBackend,
   ProviderError,
   invokeValueProviderCheckedPayload,
   invokeValueProviderCheckedValue,
@@ -1474,8 +1508,6 @@ const {
 } = root.wasm_fallible_cb;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_fallible_cb_shim.js");
-await initBackend(glue);
 
 const provider = {
   getValue() {
@@ -1568,11 +1600,11 @@ interface CheckedWorker {
 };
 
 namespace wasm_fallible_async_cb {
-  [Async, Throws=ProviderError]
+  [Async, Throws=ProviderError, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
   boolean invoke_checked_void(CheckedWorker worker, boolean fail);
-  [Async, Throws=ProviderError]
+  [Async, Throws=ProviderError, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
   u32 invoke_checked_value(CheckedWorker worker, boolean fail);
-  [Async, Throws=ProviderError]
+  [Async, Throws=ProviderError, CallbackContract="argument[0],retained,may_cross_thread,allowed"]
   Payload invoke_checked_record(CheckedWorker worker, boolean fail);
 };
 "#,
@@ -1624,19 +1656,17 @@ pub async fn invoke_checked_record(worker: Arc<dyn CheckedWorker>, fail: bool) -
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
+import * as root from "./gen/browser/index.js";
+await root.ready;
 const {
   ProviderError,
   invokeCheckedRecord,
   invokeCheckedValue,
   invokeCheckedVoid,
-  initBackend,
   UniffiError,
 } = root.wasm_fallible_async_cb;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_fallible_async_cb_shim.js");
-await initBackend(glue);
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -1731,7 +1761,9 @@ namespace wasm_custom {
   Email normalize_email(Email value);
   Contact normalize_contact(Contact value);
   sequence<Email> normalize_many(sequence<Email> values);
+  [CallbackContract="argument[0],scoped,calling_thread,forbidden"]
   Email format_email_with(EmailFormatter formatter, Email value);
+  [CallbackContract="argument[0],scoped,calling_thread,forbidden"]
   Contact format_contact_with(EmailFormatter formatter, Contact value);
 };
 "#,
@@ -1802,9 +1834,9 @@ pub fn format_contact_with(formatter: std::sync::Arc<dyn EmailFormatter>, value:
 "#,
         driver_ts: r#"
 import { createRequire } from "node:module";
-import * as root from "./gen/browser/index.ts";
+import * as root from "./gen/browser/index.js";
+await root.ready;
 const {
-  initBackend,
   formatContactWith,
   formatEmailWith,
   normalizeContact,
@@ -1813,8 +1845,6 @@ const {
 } = root.wasm_custom;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/wasm_custom_shim.js");
-await initBackend(glue);
 
 const one = normalizeEmail({ value: "  A@EXAMPLE.COM  " });
 if (one.value !== "a@example.com") throw new Error(`normalizeEmail=${JSON.stringify(one)}`);
@@ -1863,25 +1893,32 @@ console.log("ok");
 [bindings.javascript.customTypes.Email]
 typeName = "EmailAddress"
 imports = [
-  "type { EmailAddress } from \"./email.ts\"",
-  "{ emailAddressFromString, emailAddressToString } from \"./email.ts\"",
+  "import type { EmailAddress } from \"./email.ts\"",
+  "{ emailAddressFromString, emailAddressToString } from \"./email.js\"",
 ]
 intoCustom = "emailAddressFromString({})"
 fromCustom = "emailAddressToString({})"
 "#,
         ),
-        generated_files: &[(
-            "components/wasm_custom/common/email.ts",
-            r#"
+        generated_files: &[
+            (
+                "components/wasm_custom/email.ts",
+                r#"
 export type EmailAddress = { value: string };
-export function emailAddressFromString(value: string): EmailAddress {
+"#,
+            ),
+            (
+                "components/wasm_custom/email.js",
+                r#"
+export function emailAddressFromString(value) {
   return { value };
 }
-export function emailAddressToString(value: EmailAddress): string {
+export function emailAddressToString(value) {
   return value.value;
 }
 "#,
-        )],
+            ),
+        ],
     });
 }
 
@@ -1906,9 +1943,9 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
         return;
     };
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
-    generate_input_stream_tree(
+    let package = generate_input_stream_tree(
         &fixture,
         &out_dir,
         Some(host_dir.clone()),
@@ -1945,19 +1982,18 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
         "expected built input stream wasm at {}",
         wasm_file.display()
     );
-    let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
-    run_wasm_bindgen_nodejs_in_process(wasm_file.as_path(), pkg.as_std_path());
-
+    let pkg = out_dir.join("browser/pkg");
+    let module_name = composite_host_lib_target("input-stream-core");
+    emit_wasm_post_link(&package, wasm_file.as_path(), &module_name, &pkg);
     std::fs::write(
         tmp.path().join("wasm-input-stream-driver.ts"),
         r#"
 import { createRequire } from "node:module";
-import * as root from "./generated/browser/index.ts";
-const { initBackend, runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } = root.input_stream_core;
+import * as root from "./generated/browser/index.js";
+await root.ready;
+const { runningSum, sumInputEvents, takeOneInputEvent, StreamError, UniffiError } = root.input_stream_core;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/input_stream_core_uniffi_js_host.js");
-await initBackend(glue);
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -2086,7 +2122,6 @@ console.log("ok");
 "#,
     )
     .unwrap();
-
     let output = wasm_e2e_command(&node)
         .arg("--experimental-strip-types")
         .arg("--no-warnings")
@@ -2128,9 +2163,9 @@ fn host_crates_wasm_runs_stream_fixture() {
         return;
     };
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
-    generate_stream_tree(
+    let package = generate_stream_tree(
         &fixture,
         &out_dir,
         Some(host_dir.clone()),
@@ -2167,19 +2202,19 @@ fn host_crates_wasm_runs_stream_fixture() {
         "expected built stream wasm at {}",
         wasm_file.display()
     );
-    let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
-    run_wasm_bindgen_nodejs_in_process(wasm_file.as_path(), pkg.as_std_path());
+    let pkg = out_dir.join("browser/pkg");
+    let module_name = composite_host_lib_target("stream-core");
+    emit_wasm_post_link(&package, wasm_file.as_path(), &module_name, &pkg);
 
     std::fs::write(
         tmp.path().join("wasm-stream-driver.ts"),
         r#"
 import { createRequire } from "node:module";
-import * as root from "./generated/browser/index.ts";
-const { initBackend, countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } = root.stream_core;
+import * as root from "./generated/browser/index.js";
+await root.ready;
+const { countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } = root.stream_core;
 
 const require = createRequire(import.meta.url);
-const glue = require("./pkg/stream_core_uniffi_js_host.js");
-await initBackend(glue);
 
 function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
@@ -2302,8 +2337,8 @@ fn final_runtime_matrix_wasm_executes_tagged_steps_typed_payloads_native_drops_a
     );
 
     // The fixture must be independent of a developer-installed CLI.  Its
-    // glue is generated below through wasm-bindgen-cli-support in this test
-    // process, while every child command receives the sanitized PATH.
+    // glue is generated below through the package's pinned post-link engine,
+    // while every child command receives the sanitized PATH.
     let cli_probe = wasm_e2e_command(std::path::Path::new("/bin/sh"))
         .args(["-c", "command -v wasm-bindgen"])
         .output()
@@ -2317,9 +2352,9 @@ fn final_runtime_matrix_wasm_executes_tagged_steps_typed_payloads_native_drops_a
     let tmp = tempfile::tempdir().unwrap();
     let fixture = build_runtime_matrix_fixture(tmp.path());
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
-    generate_runtime_matrix_tree(
+    let package = generate_runtime_matrix_tree(
         &fixture,
         &out_dir,
         Some(host_dir.clone()),
@@ -2354,15 +2389,14 @@ fn final_runtime_matrix_wasm_executes_tagged_steps_typed_payloads_native_drops_a
         "expected final Wasm runtime matrix module at {}",
         wasm_file.display(),
     );
-    let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
-    run_wasm_bindgen_nodejs_in_process(wasm_file.as_path(), pkg.as_std_path());
+    let pkg = out_dir.join("browser/pkg");
+    emit_wasm_post_link(&package, wasm_file.as_path(), &host_target, &pkg);
     assert!(
         pkg.join(format!("{host_target}.js")).exists(),
         "in-process wasm-bindgen must produce final runtime matrix glue"
     );
 
-    let setup =
-        format!("const glue = require(\"./pkg/{host_target}.js\");\nawait api.initBackend(glue);");
+    let setup = format!("const glue = require(\"./generated/browser/pkg/{host_target}.js\");");
     let non_send_assertions = r#"
 api.resetProbe("non-send");
 const local = api.nonSendItems("non-send", 2);
@@ -2375,10 +2409,11 @@ assert(localProbe.streamStarts === 1n && localProbe.streamDrops === 1n
   "Wasm Rc<Cell> non-Send local stream drops exactly once");
 "#;
     let driver = runtime_matrix_driver(
-        "./generated/browser/index.ts",
+        "./generated/browser/index.js",
         &setup,
         "glue",
         "tag",
+        runtime_matrix_operation_ids(&package),
         non_send_assertions,
     );
     std::fs::write(tmp.path().join("wasm-runtime-matrix-driver.ts"), driver).unwrap();
@@ -2422,8 +2457,8 @@ fn composite_wasm_uses_one_in_process_glue_for_isolated_namespaces_without_cli()
     let fixture = CompositeFixture::write(tmp.path());
     fixture.build_cdylib();
     let generated = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let hosts = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
-    fixture.generate(&generated, Some(hosts.clone()), vec![FlavorTarget::Wasm]);
+    let hosts = generated.join("native/hosts");
+    let package = fixture.generate(&generated, Some(hosts.clone()), vec![FlavorTarget::Wasm]);
 
     let host_target =
         uniffi_bindgen_javascript::host_crates::composite_host_lib_target("composite-core");
@@ -2451,8 +2486,8 @@ fn composite_wasm_uses_one_in_process_glue_for_isolated_namespaces_without_cli()
         "expected one composite Wasm module at {}",
         wasm_file.display(),
     );
-    let pkg = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
-    run_wasm_bindgen_nodejs_in_process(&wasm_file, pkg.as_std_path());
+    let pkg = generated.join("browser/pkg");
+    emit_wasm_post_link(&package, &wasm_file, &host_target, &pkg);
     let glue = pkg.join(format!("{host_target}.js"));
     assert!(
         glue.exists(),
@@ -2472,19 +2507,16 @@ fn composite_wasm_uses_one_in_process_glue_for_isolated_namespaces_without_cli()
         format!(
             r#"
 import {{ createRequire }} from "node:module";
-import * as root from "./generated/browser/index.ts";
+import * as root from "./generated/browser/index.js";
+await root.ready;
 
-const require = createRequire(import.meta.url);
-const glue = require("./pkg/{host_target}.js");
 const {{ alpha, beta }} = root;
 
 function assert(condition: boolean, label: string): void {{
   if (!condition) throw new Error(`FAIL ${{label}}`);
 }}
 
-// Both component runtimes receive the exact same in-process glue object.
-await alpha.initBackend(glue);
-await beta.initBackend(glue);
+// Both namespaces are backed by the one in-process wasm-bindgen glue module.
 assert(alpha.ping() === "alpha-ping", "alpha ping must stay in alpha namespace");
 assert(beta.ping() === "beta-ping", "beta ping must stay in beta namespace");
 const alphaRecord = alpha.makeRecord();
@@ -2580,6 +2612,7 @@ pub fn run_wasm_e2e(spec: WasmE2eSpec) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    let keep_tmp = std::env::var_os("KEEP_WASM_E2E").is_some();
     let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
     let name = spec.name;
     let shim_name = format!("{name}_shim");
@@ -2624,16 +2657,21 @@ crate-type = ["rlib"]
         std::fs::write(&path, toml).unwrap();
         path
     });
-    generate(
+    let package = generate_package(
         &loader,
         GenerateJsOptions {
             source: udl_path.clone(),
             out_dir: gen_dir.clone(),
+            package_root: gen_dir.clone(),
             artifact_dir: None,
             config_override,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: None,
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: biz.join("Cargo.toml"),
+                host_crates_dir: gen_dir.join("native/hosts"),
+                logical_host_crates_dir: None,
+            },
             flavors: vec![FlavorTarget::Wasm],
         },
     )
@@ -2645,7 +2683,7 @@ crate-type = ["rlib"]
     // Shim crate.
     let shim = root.join("shim");
     std::fs::create_dir_all(shim.join("src")).unwrap();
-    let gen_rs = gen_dir.join(format!("components/{name}/browser/{name}.rs"));
+    let gen_rs = gen_dir.join("native/wasm.rs");
     let shim_src = std::fs::read_to_string(&gen_rs)
         .unwrap_or_else(|_| panic!("generated shim missing at {gen_rs}"));
     // Regression: the wasm shim must NEVER pull in serde in any form.
@@ -2677,16 +2715,15 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wasm-bindgen = "=0.2.117"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
+{WASM_BINDGEN_DEPENDENCIES}
 async-trait = "0.1"
 {uniffi_dep}
 {name} = {{ path = "../biz" }}
 {extra}
 "#,
+            WASM_BINDGEN_DEPENDENCIES = WASM_BINDGEN_DEPENDENCIES,
             extra = spec.shim_deps,
-            uniffi_dep = uniffi_dep
+            uniffi_dep = uniffi_dep,
         ),
     )
     .unwrap();
@@ -2734,14 +2771,15 @@ async-trait = "0.1"
             .join(format!("wasm32-unknown-unknown/debug/{shim_name}.wasm"))
     };
 
-    // Generate Node.js glue with the built-in wasm-bindgen library.
+    // Generate Node.js glue with the package's in-process post-link engine.
     assert!(
         wasm_file.exists(),
         "expected wasm artifact at {}",
         wasm_file.display()
     );
-    let pkg = root.join("pkg");
-    run_wasm_bindgen_nodejs_in_process(wasm_file.as_path(), pkg.as_std_path());
+    let pkg = gen_dir.join("browser/pkg");
+    let module_name = composite_host_lib_target(name);
+    emit_wasm_post_link(&package, wasm_file.as_path(), &module_name, &pkg);
 
     std::fs::write(root.join("driver.ts"), spec.driver_ts).unwrap();
 
@@ -2753,6 +2791,10 @@ async-trait = "0.1"
         .output()
         .expect("failed to invoke node");
     if !output.status.success() {
+        if keep_tmp {
+            eprintln!("KEEP_WASM_E2E root={}", root);
+            std::mem::forget(tmp);
+        }
         panic!(
             "wasm e2e {name} driver failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),

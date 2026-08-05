@@ -15,11 +15,11 @@ pub(in crate::cli) use engine::{
     absolute_output_path, canonicalize_allow_missing, canonicalize_invocation_output,
     copy_dir_recursive, ensure_file_has_single_link, ensure_member_file_matches,
     normalize_hsp_destinations, path_entry_exists, publish_simple_output_set,
-    read_verified_regular_file, read_verified_regular_file_bounded, require_regular_source_file,
-    sha256_bytes, write_durable_file, HspOutputPaths, InvocationDist, InvocationOutputSpec,
-    ManagedPackageStage, PreparedHspInvocation, PreparedHspPackage, StagedHspOutputs,
-    TemporaryWorkspace, MAX_HSP_ARCHIVE_COMPRESSED_BYTES, MAX_HSP_ARCHIVE_ENTRIES,
-    MAX_HSP_ARCHIVE_MEMBER_BYTES, MAX_HSP_ARCHIVE_PATH_BYTES, MAX_HSP_ARCHIVE_TOTAL_BYTES,
+    read_verified_regular_file, read_verified_regular_file_bounded, write_durable_file,
+    HspOutputPaths, InvocationDist, InvocationOutputSpec, ManagedPackageStage,
+    PreparedHspInvocation, PreparedHspPackage, StagedHspOutputs, TemporaryWorkspace,
+    MAX_HSP_ARCHIVE_COMPRESSED_BYTES, MAX_HSP_ARCHIVE_ENTRIES, MAX_HSP_ARCHIVE_MEMBER_BYTES,
+    MAX_HSP_ARCHIVE_PATH_BYTES, MAX_HSP_ARCHIVE_TOTAL_BYTES,
 };
 
 #[cfg(windows)]

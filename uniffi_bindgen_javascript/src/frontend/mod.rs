@@ -4,4 +4,4 @@ mod ir;
 mod normalize;
 
 pub use ir::*;
-pub use normalize::{normalize, BindingInput, FrontendError};
+pub use normalize::{normalize, prepare_components, BindingInput, FrontendError};

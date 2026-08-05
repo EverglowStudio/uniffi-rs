@@ -373,28 +373,28 @@ pub fn generate_stream_tree(
     out_dir: &Utf8PathBuf,
     host_crates: Option<Utf8PathBuf>,
     flavors: Vec<FlavorTarget>,
-) {
+) -> GeneratedPackage {
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
-    generate(
+    let host_crates_dir = host_crates.unwrap_or_else(|| out_dir.join("native/hosts"));
+    generate_package(
         &loader,
         GenerateJsOptions {
             source: fixture.lib_path.clone(),
             out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: host_crates.map(|host_crates_dir| HostCrateOptions {
+            host_crates: HostCrateOptions {
                 manifest_path: fixture.crate_dir.join("Cargo.toml"),
                 host_crates_dir,
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors,
         },
     )
-    .expect("generator should succeed for native stream fixture");
+    .expect("generator should succeed for native stream fixture")
 }
 
 /// A native fixture shared by the final N-API and Wasm runtime matrix.
@@ -477,16 +477,30 @@ pub enum MatrixEnum {
 pub struct MatrixBuffer {
     unknown_value: String,
     napi_value: u32,
+    probe_id: String,
+}
+
+impl Drop for MatrixBuffer {
+    fn drop(&mut self) {
+        with_probe(&self.probe_id, |probe| increment(&mut probe.object_drops));
+    }
+}
+
+impl MatrixBuffer {
+    fn with_probe(probe_id: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            unknown_value: "object-unknown".to_owned(),
+            napi_value: 17,
+            probe_id: probe_id.into(),
+        })
+    }
 }
 
 #[uniffi::export]
 impl MatrixBuffer {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            unknown_value: "object-unknown".to_owned(),
-            napi_value: 17,
-        })
+        Self::with_probe("object")
     }
 
     pub fn unknown_value(&self) -> String {
@@ -533,6 +547,7 @@ pub struct MatrixProbeSnapshot {
     pub stream_terminal_drops: u64,
     pub stream_cancelled_drops: u64,
     pub stream_drops: u64,
+    pub object_drops: u64,
 }
 
 static PROBES: OnceLock<Mutex<HashMap<String, MatrixProbeSnapshot>>> = OnceLock::new();
@@ -730,7 +745,10 @@ pub fn enum_items(probe_id: String) -> uniffi::UniFfiStream<MatrixEnum, MatrixEr
 #[uniffi::export]
 pub fn buffer_items(probe_id: String) -> uniffi::UniFfiStream<Arc<MatrixBuffer>, MatrixError> {
     record_start(&probe_id);
-    Box::pin(ProbedSequence::new(probe_id, [Ok(MatrixBuffer::new())]))
+    Box::pin(ProbedSequence::new(
+        probe_id.clone(),
+        [Ok(MatrixBuffer::with_probe(probe_id))],
+    ))
 }
 
 #[uniffi::export]
@@ -810,28 +828,28 @@ pub fn generate_runtime_matrix_tree(
     out_dir: &Utf8PathBuf,
     host_crates: Option<Utf8PathBuf>,
     flavors: Vec<FlavorTarget>,
-) {
+) -> GeneratedPackage {
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
-    generate(
+    let host_crates_dir = host_crates.unwrap_or_else(|| out_dir.join("native/hosts"));
+    generate_package(
         &loader,
         GenerateJsOptions {
             source: fixture.lib_path.clone(),
             out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: host_crates.map(|host_crates_dir| HostCrateOptions {
+            host_crates: HostCrateOptions {
                 manifest_path: fixture.crate_dir.join("Cargo.toml"),
                 host_crates_dir,
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors,
         },
     )
-    .expect("generator should succeed for final JavaScript runtime matrix fixture");
+    .expect("generator should succeed for final JavaScript runtime matrix fixture")
 }
 
 /// The N-API and Wasm runtime matrix differ only in how they supply their raw
@@ -842,6 +860,7 @@ pub fn runtime_matrix_driver(
     setup: &str,
     raw_expression: &str,
     raw_variant_property: &str,
+    operation_ids: RuntimeMatrixOperationIds,
     non_send_assertions: &str,
 ) -> String {
     const TEMPLATE: &str = r#"
@@ -849,14 +868,13 @@ import { createRequire } from "node:module";
 import * as root from "__UNIFFI_RUNTIME_MATRIX_PUBLIC_IMPORT__";
 
 const require = createRequire(import.meta.url);
+if (root.ready !== undefined) await root.ready;
 const api = root.runtime_matrix_core;
 __UNIFFI_RUNTIME_MATRIX_SETUP__
 const raw = __UNIFFI_RUNTIME_MATRIX_RAW__;
-// The raw N-API addon exposes a napi-rs enum discriminator as `type`, while
-// the Wasm shim emits its explicit `tag`.  The public TypeScript bridge
-// normalizes both into `tag`; keep the raw assertion deliberately backend
-// aware so this driver proves the transport boundary rather than masking it.
-const rawVariantProperty: "type" | "tag" = "__UNIFFI_RUNTIME_MATRIX_RAW_VARIANT_PROPERTY__";
+const streamOperationIds = __UNIFFI_RUNTIME_MATRIX_OPERATION_IDS__;
+// Native transports expose the canonical tagged enum envelope directly.
+const rawVariantProperty: "tag" = "__UNIFFI_RUNTIME_MATRIX_RAW_VARIANT_PROPERTY__";
 
 function assert(condition: boolean, label: string): void {
   if (!condition) throw new Error(`FAIL ${label}`);
@@ -870,57 +888,88 @@ const rawBufferStart = raw["ffi_runtime_matrix_core_buffer_items"];
 const rawBufferNext = raw["ffi_runtime_matrix_core_buffer_items_stream_next"];
 const rawErrorStart = raw["ffi_runtime_matrix_core_typed_error_items"];
 const rawErrorNext = raw["ffi_runtime_matrix_core_typed_error_items_stream_next"];
-assert(typeof rawStart === "function" && typeof rawNext === "function", "raw record tagged stream exports");
-assert(typeof rawEnumStart === "function" && typeof rawEnumNext === "function", "raw enum tagged stream exports");
-assert(typeof rawBufferStart === "function" && typeof rawBufferNext === "function", "raw object tagged stream exports");
-assert(typeof rawErrorStart === "function" && typeof rawErrorNext === "function", "raw error tagged stream exports");
-const rawHandle = (rawStart as (probe: string) => unknown)("raw-record");
-const rawItem = await (rawNext as (handle: unknown) => Promise<unknown>)(rawHandle) as {
+const hasRawOperationSurface = [rawStart, rawNext, rawEnumStart, rawEnumNext,
+  rawBufferStart, rawBufferNext, rawErrorStart, rawErrorNext]
+  .every((value) => typeof value === "function");
+assert(!hasRawOperationSurface, "raw operation exports must remain private");
+assert(typeof raw.__uniffi_backend_factory === "function",
+  "native Wasm/N-API surface must export only its backend factory");
+const transport = raw.__uniffi_backend_factory(root.session.host);
+function unwrapTransport(rawValue: unknown): unknown {
+  assert((rawValue as { kind?: unknown })?.kind === "value", "backend calls use the value envelope");
+  return (rawValue as { value?: unknown }).value;
+}
+const transportCall = {
+  invokeSync(operationId: number, args: unknown[]): unknown {
+    return unwrapTransport(transport.invokeSync(operationId, args));
+  },
+  async invokeAsync(operationId: number, args: unknown[]): Promise<unknown> {
+    return unwrapTransport(await transport.invokeAsync(operationId, args));
+  },
+  releaseObject(resource: unknown): void { transport.releaseObject(resource); },
+};
+function rawProbeSnapshot(probeId: string): { objectDrops?: bigint; streamDrops?: bigint } {
+  return transportCall.invokeSync(streamOperationIds.probeSnapshot, [probeId]) as {
+    objectDrops?: bigint;
+    streamDrops?: bigint;
+  };
+}
+const rawHandle = transportCall.invokeSync(streamOperationIds.recordStart, ["raw-record"]);
+const rawItem = await transportCall.invokeAsync(streamOperationIds.recordNext, [rawHandle]) as {
   kind?: unknown;
   value?: { unknown?: unknown; napi?: unknown; bytes?: unknown };
 };
 assert(rawItem.kind === "item" && rawItem.value?.unknown === "record-unknown"
   && rawItem.value?.napi === 7 && rawItem.value?.bytes === "record-bytes", "raw Item tagged step");
-const rawDone = await (rawNext as (handle: unknown) => Promise<unknown>)(rawHandle) as { kind?: unknown };
+const rawDone = await transportCall.invokeAsync(streamOperationIds.recordNext, [rawHandle]) as { kind?: unknown };
 assert(rawDone.kind === "done", "raw Done tagged step");
 
-const rawEnumHandle = (rawEnumStart as (probe: string) => unknown)("raw-enum");
-const rawEnumItem = await (rawEnumNext as (handle: unknown) => Promise<unknown>)(rawEnumHandle) as {
+const rawEnumHandle = transportCall.invokeSync(streamOperationIds.enumStart, ["raw-enum"]);
+const rawEnumItem = await transportCall.invokeAsync(streamOperationIds.enumNext, [rawEnumHandle]) as {
   kind?: unknown;
   value?: { type?: unknown; tag?: unknown; napi?: unknown };
 };
 assert(rawEnumItem.kind === "item" && rawEnumItem.value?.[rawVariantProperty] === "unknown"
+  && rawEnumItem.value?.type === undefined
   && rawEnumItem.value?.napi === 9, "raw enum Item preserves N-API type/napi payload");
-const rawBufferEnumItem = await (rawEnumNext as (handle: unknown) => Promise<unknown>)(rawEnumHandle) as {
+const rawBufferEnumItem = await transportCall.invokeAsync(streamOperationIds.enumNext, [rawEnumHandle]) as {
   kind?: unknown;
   value?: { type?: unknown; tag?: unknown };
 };
-assert(rawBufferEnumItem.kind === "item" && rawBufferEnumItem.value?.[rawVariantProperty] === "Buffer",
+assert(rawBufferEnumItem.kind === "item" && rawBufferEnumItem.value?.[rawVariantProperty] === "Buffer"
+  && rawBufferEnumItem.value?.type === undefined,
   "raw enum Item preserves Buffer identifier");
-assert((await (rawEnumNext as (handle: unknown) => Promise<unknown>)(rawEnumHandle) as { kind?: unknown }).kind === "done",
+assert((await transportCall.invokeAsync(streamOperationIds.enumNext, [rawEnumHandle]) as { kind?: unknown }).kind === "done",
   "raw enum stream reaches Done");
 
-const rawBufferHandle = (rawBufferStart as (probe: string) => unknown)("raw-object");
-const rawBufferItem = await (rawBufferNext as (handle: unknown) => Promise<unknown>)(rawBufferHandle) as {
+const rawBufferHandle = transportCall.invokeSync(streamOperationIds.bufferStart, ["raw-object"]);
+const rawBufferItem = await transportCall.invokeAsync(streamOperationIds.bufferNext, [rawBufferHandle]) as {
   kind?: unknown;
   value?: unknown;
 };
 assert(rawBufferItem.kind === "item" && rawBufferItem.value != null, "raw object Item tagged step");
-const rawObject = api.MatrixBuffer.__fromHandle(rawBufferItem.value);
-assert(rawObject.__uniffi.raw === rawBufferItem.value && rawObject.unknownValue() === "object-unknown"
-  && rawObject.napiValue() === 17 && rawObject.bufferValue() === "object-buffer",
-  "public object bridge preserves raw object identity and methods");
-rawObject.dispose();
-assert((await (rawBufferNext as (handle: unknown) => Promise<unknown>)(rawBufferHandle) as { kind?: unknown }).kind === "done",
+assert(typeof rawBufferItem.value === "object" && rawBufferItem.value.surfaceId === "base",
+  "factory object stream item is an owned lease");
+transportCall.releaseObject(rawBufferItem.value);
+assert((await transportCall.invokeAsync(streamOperationIds.bufferNext, [rawBufferHandle]) as { kind?: unknown }).kind === "done",
   "raw object stream reaches Done");
+const objectLease = transportCall.invokeSync(streamOperationIds.objectConstructor, []);
+assert(objectLease && typeof objectLease === "object" && objectLease.surfaceId === "base",
+  "factory object operation returns an owned lease");
+assert(transportCall.invokeSync(streamOperationIds.objectUnknown, [objectLease]) === "object-unknown"
+  && transportCall.invokeSync(streamOperationIds.objectNapi, [objectLease]) === 17
+  && transportCall.invokeSync(streamOperationIds.objectBuffer, [objectLease]) === "object-buffer",
+  "factory object lease preserves native methods");
+transportCall.releaseObject(objectLease);
 
-const rawErrorHandle = (rawErrorStart as (probe: string) => unknown)("raw-error");
-await (rawErrorNext as (handle: unknown) => Promise<unknown>)(rawErrorHandle);
-const rawError = await (rawErrorNext as (handle: unknown) => Promise<unknown>)(rawErrorHandle) as {
+const rawErrorHandle = transportCall.invokeSync(streamOperationIds.errorStart, ["raw-error"]);
+await transportCall.invokeAsync(streamOperationIds.errorNext, [rawErrorHandle]);
+const rawError = await transportCall.invokeAsync(streamOperationIds.errorNext, [rawErrorHandle]) as {
   kind?: unknown;
   error?: { type?: unknown; tag?: unknown; unknownValue?: unknown; napiValue?: unknown; bufferValue?: unknown };
 };
 assert(rawError.kind === "error" && rawError.error?.[rawVariantProperty] === "Detailed"
+  && rawError.error?.type === undefined
   && rawError.error?.unknownValue === "typed-unknown" && rawError.error?.napiValue === 42
   && rawError.error?.bufferValue === "typed-buffer", "raw Error tagged step and structured payload");
 
@@ -945,13 +994,33 @@ assert(bufferEnumResult.done === false && bufferEnumResult.value.tag === "Buffer
   "public enum stream item preserves Buffer identifier");
 assert((await enums.next()).done === true, "public enum stream reaches Done");
 
-const buffers = api.bufferItems("object");
+api.resetProbe("object-live");
+const buffers = api.bufferItems("object-live");
 const objectResult = await buffers.next();
 assert(objectResult.done === false && objectResult.value.unknownValue() === "object-unknown"
   && objectResult.value.napiValue() === 17 && objectResult.value.bufferValue() === "object-buffer",
   "public object stream item executes through bridge");
 objectResult.value.dispose();
 assert((await buffers.next()).done === true, "public object stream reaches Done");
+assert(api.probeSnapshot("object-live").objectDrops === 1n,
+  "normal output stream object release is exactly once");
+
+api.resetProbe("object-cancel");
+const cancelledObjectStream = api.bufferItems("object-cancel");
+const cancelledObject = await cancelledObjectStream.next();
+assert(cancelledObject.done === false, "cancel object stream item is present");
+cancelledObject.value.dispose();
+await cancelledObjectStream.cancel();
+assert(api.probeSnapshot("object-cancel").objectDrops === 1n,
+  "cancelled output stream object release is exactly once");
+
+api.resetProbe("object-close");
+const closeObjectStream = api.bufferItems("object-close");
+const closeObject = await closeObjectStream.next();
+assert(closeObject.done === false, "close object stream item is present");
+await closeObjectStream.cancel();
+// Keep the object lease alive until the session closes so close() must own
+// its release; the raw probe is queried after the public session is closed.
 
 api.resetProbe("error");
 const typed = api.typedErrorItems("error");
@@ -988,6 +1057,66 @@ assert(cancelProbe.streamStarts === 1n && cancelProbe.streamDrops === 1n
   && cancelProbe.streamTerminalDrops === 0n && cancelProbe.streamCancelledDrops === 1n,
   "Cancel must drop Rust stream exactly once");
 
+// Delay one real native OutputStreamNext settlement after the family has
+// already produced its object-bearing Item.  Closing the public session while
+// the cancel leg is held forces deadline detach; the family walker must release
+// the late StreamItem object exactly once before the delayed promise is handed
+// back to JavaScript.
+api.resetProbe("object-late");
+const lateBackend = root.session.backend as {
+  invokeAsync: (operationId: number, args: unknown[]) => Promise<unknown>;
+  cancelOutputStream: (handle: unknown) => Promise<unknown>;
+};
+const nativeInvokeAsync = lateBackend.invokeAsync.bind(lateBackend);
+const nativeCancelOutputStream = lateBackend.cancelOutputStream.bind(lateBackend);
+let lateRawEnvelope: unknown = null;
+let releaseLateRaw: (() => void) | null = null;
+let markLateRawReady: ((value: unknown) => void) | null = null;
+const lateRawReady = new Promise<unknown>((resolve): void => { markLateRawReady = resolve; });
+lateBackend.invokeAsync = (operationId, args) => {
+  const pending = nativeInvokeAsync(operationId, args);
+  if (operationId !== streamOperationIds.bufferNext) return pending;
+  return pending.then((raw) => new Promise<unknown>((resolve): void => {
+    lateRawEnvelope = raw;
+    markLateRawReady?.(raw);
+    releaseLateRaw = () => resolve(raw);
+  }));
+};
+let blockLateCancel = false;
+lateBackend.cancelOutputStream = (handle) => {
+  if (blockLateCancel) return new Promise<unknown>(() => {});
+  return nativeCancelOutputStream(handle);
+};
+const lateStream = api.bufferItems("object-late");
+const lateNext = lateStream.next();
+const lateReady = await Promise.race([
+  lateRawReady,
+  new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); }),
+]);
+assert(lateReady !== "timeout" && lateRawEnvelope !== null,
+  "real object stream produced a delayed raw Item");
+blockLateCancel = true;
+const nativeSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]) =>
+  nativeSetTimeout(callback, delay === 5000 ? 25 : delay, ...args)) as typeof setTimeout;
+const sessionClose = root.session.close();
+globalThis.setTimeout = nativeSetTimeout;
+await sessionClose;
+releaseLateRaw?.();
+const lateResult = await Promise.race([
+  lateNext,
+  new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); }),
+]);
+assert(lateResult !== "timeout" && lateResult.done === true,
+  "late object stream next settles after deadline detach");
+const lateProbe = rawProbeSnapshot("object-late");
+const closeProbe = rawProbeSnapshot("object-close");
+assert(lateProbe.objectDrops === 1n,
+  "late StreamItem object is released exactly once after deadline detach");
+assert(closeProbe.objectDrops === 1n,
+  "session close releases held object exactly once");
+await transport.close();
+
 __UNIFFI_RUNTIME_MATRIX_NON_SEND_ASSERTIONS__
 
 console.log("ok");
@@ -997,6 +1126,26 @@ console.log("ok");
         .replace("__UNIFFI_RUNTIME_MATRIX_PUBLIC_IMPORT__", public_import)
         .replace("__UNIFFI_RUNTIME_MATRIX_SETUP__", setup)
         .replace("__UNIFFI_RUNTIME_MATRIX_RAW__", raw_expression)
+        .replace(
+            "__UNIFFI_RUNTIME_MATRIX_OPERATION_IDS__",
+            &format!(
+                "{{ resetProbe: {}, probeSnapshot: {}, recordStart: {}, recordNext: {}, enumStart: {}, enumNext: {}, bufferStart: {}, bufferNext: {}, errorStart: {}, errorNext: {}, objectConstructor: {}, objectUnknown: {}, objectNapi: {}, objectBuffer: {} }}",
+                operation_ids.reset_probe,
+                operation_ids.probe_snapshot,
+                operation_ids.record_start,
+                operation_ids.record_next,
+                operation_ids.enum_start,
+                operation_ids.enum_next,
+                operation_ids.buffer_start,
+                operation_ids.buffer_next,
+                operation_ids.error_start,
+                operation_ids.error_next,
+                operation_ids.object_constructor,
+                operation_ids.object_unknown,
+                operation_ids.object_napi,
+                operation_ids.object_buffer,
+            ),
+        )
         .replace(
             "__UNIFFI_RUNTIME_MATRIX_RAW_VARIANT_PROPERTY__",
             raw_variant_property,
@@ -1184,28 +1333,28 @@ pub fn generate_input_stream_tree(
     out_dir: &Utf8PathBuf,
     host_crates: Option<Utf8PathBuf>,
     flavors: Vec<FlavorTarget>,
-) {
+) -> GeneratedPackage {
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
-    generate(
+    let host_crates_dir = host_crates.unwrap_or_else(|| out_dir.join("native/hosts"));
+    generate_package(
         &loader,
         GenerateJsOptions {
             source: fixture.lib_path.clone(),
             out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: host_crates.map(|host_crates_dir| HostCrateOptions {
+            host_crates: HostCrateOptions {
                 manifest_path: fixture.crate_dir.join("Cargo.toml"),
                 host_crates_dir,
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors,
         },
     )
-    .expect("generator should succeed for JavaScript input stream fixture");
+    .expect("generator should succeed for JavaScript input stream fixture")
 }
 
 pub fn run_cargo_check(
@@ -1443,6 +1592,7 @@ pub fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBu
          \x20   Finished(string name);\n\
          };\n\n\
          namespace napi_compat {\n\
+         \x20   [CallbackContract=\"argument[0],scoped,calling_thread,forbidden\"]\n\
          \x20   void run_job(Logger logger);\n\
          \x20   JobState current_job_state();\n\
          \x20   Event latest_event();\n\
@@ -1468,25 +1618,24 @@ pub fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBu
 pub fn generate_rich_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     let (udl, manifest) = write_rich_core_crate(root);
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("generated/native/hosts")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
             source: udl,
-            out_dir,
+            out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
     )
@@ -1626,25 +1775,24 @@ namespace napi_temporal_core {
 pub fn generate_temporal_napi_host(root: &std::path::Path) -> Utf8PathBuf {
     let (udl, manifest) = write_temporal_core_crate(root);
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("generated/native/hosts")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
             source: udl,
-            out_dir,
+            out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
     )
@@ -1666,7 +1814,7 @@ version = "0.0.0"
 edition = "2021"
 
 [lib]
-crate-type = ["rlib"]
+crate-type = ["lib", "cdylib"]
 
 [dependencies]
 uniffi = {{ path = {:?}, default-features = false }}
@@ -1764,7 +1912,9 @@ namespace custom_js_core {
   Email normalize_email(Email value);
   Contact normalize_contact(Contact value);
   sequence<Email> normalize_many(sequence<Email> values);
+  [CallbackContract="argument[0],scoped,calling_thread,forbidden"]
   Email format_email_with(EmailFormatter formatter, Email value);
+  [CallbackContract="argument[0],scoped,calling_thread,forbidden"]
   Contact format_contact_with(EmailFormatter formatter, Contact value);
 };
 "#,
@@ -1777,8 +1927,8 @@ namespace custom_js_core {
 [bindings.javascript.customTypes.Email]
 typeName = "EmailAddress"
 imports = [
-  "type { EmailAddress } from \"./email.ts\"",
-  "{ emailAddressFromString, emailAddressToString } from \"./email.ts\"",
+  "type { EmailAddress } from \"./email.js\"",
+  "{ emailAddressFromString, emailAddressToString } from \"./email.js\"",
 ]
 intoCustom = "emailAddressFromString({})"
 fromCustom = "emailAddressToString({})"
@@ -1802,23 +1952,27 @@ pub fn generate_custom_napi_tree(root: &std::path::Path) -> (Utf8PathBuf, Utf8Pa
         GenerateJsOptions {
             source: udl,
             out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: Some(config),
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: None,
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: manifest.clone(),
+                host_crates_dir: out_dir.join("native/hosts"),
+                logical_host_crates_dir: None,
+            },
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Electron],
         },
     )
     .expect("custom napi generator run should succeed");
     std::fs::write(
-        out_dir.join("components/custom_js_core/common/email.ts"),
+        out_dir.join("components/custom_js_core/email.js"),
         r#"
-export type EmailAddress = { value: string };
-export function emailAddressFromString(value: string): EmailAddress {
+export function emailAddressFromString(value) {
   return { value };
 }
-export function emailAddressToString(value: EmailAddress): string {
+export function emailAddressToString(value) {
   return value.value;
 }
 "#,
@@ -1830,56 +1984,19 @@ export function emailAddressToString(value: EmailAddress): string {
 pub fn build_custom_napi_addon(
     root: &std::path::Path,
     generated: &Utf8PathBuf,
-    manifest: &Utf8PathBuf,
+    _manifest: &Utf8PathBuf,
 ) -> Utf8PathBuf {
-    let shim = root.join("custom-napi-shim");
-    std::fs::create_dir_all(shim.join("src")).unwrap();
-    let uniffi_path = workspace_root().join("uniffi");
-    std::fs::write(
-        shim.join("Cargo.toml"),
-        format!(
-            r#"[package]
-name = "custom_js_core_napi"
-version = "0.0.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-custom_js_core = {{ path = {:?} }}
-uniffi = {{ path = {:?}, default-features = false }}
-napi = {{ version = "3.8.4", default-features = false, features = ["napi8", "tokio_rt"] }}
-napi-derive = {{ version = "3.5.3", features = ["type-def"] }}
-
-[build-dependencies]
-napi-build = "2.3.1"
-
-[workspace]
-resolver = "3"
-"#,
-            manifest.parent().unwrap().as_str(),
-            uniffi_path.as_str()
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        shim.join("build.rs"),
-        "extern crate napi_build;\nfn main() { napi_build::setup(); }\n",
-    )
-    .unwrap();
-    let bridge =
-        std::fs::read_to_string(generated.join("components/custom_js_core/node/custom_js_core.rs"))
-            .unwrap();
-    std::fs::write(shim.join("src/lib.rs"), bridge).unwrap();
-
+    // The generated host crate is the only N-API build input.  It includes
+    // `native/node.rs` from this same package root, so tests cannot compile a
+    // second ad-hoc shim or publish an addon from a different generation.
+    let host_manifest = generated.join("native/hosts/napi/Cargo.toml");
+    assert!(
+        host_manifest.is_file(),
+        "generated custom package is missing its N-API host manifest: {host_manifest}"
+    );
     let target_dir = root.join("cargo-target-custom-napi");
-    let output = run_cargo_build(
-        &Utf8PathBuf::from_path_buf(shim.join("Cargo.toml")).unwrap(),
-        &[],
-        &target_dir,
-    )
-    .expect("cargo should be available for custom napi build");
+    let output = run_cargo_build(&host_manifest, &[], &target_dir)
+        .expect("cargo should be available for custom napi build");
     if !output.status.success() {
         panic!(
             "cargo build on custom napi shim failed:\nstdout:\n{}\nstderr:\n{}",
@@ -1887,17 +2004,158 @@ resolver = "3"
             String::from_utf8_lossy(&output.stderr),
         );
     }
-    let dylib = target_dir
-        .join("debug")
-        .join(cdylib_filename("custom_js_core_napi"));
+    let lib_target =
+        uniffi_bindgen_javascript::host_crates::composite_host_lib_target("custom_js_core");
+    let dylib = target_dir.join("debug").join(cdylib_filename(&lib_target));
     assert!(
         dylib.exists(),
         "expected built cdylib at {}",
         dylib.display()
     );
-    let addon = generated.join("components/custom_js_core/node/custom_js_core.node");
+    let addon = generated.join("node").join(format!("{lib_target}.node"));
+    std::fs::create_dir_all(addon.parent().unwrap()).unwrap();
     std::fs::copy(&dylib, &addon).unwrap();
     addon
 }
 use crate::support::*;
 use uniffi_bindgen_javascript::HostCrateOptions;
+use uniffi_js_abi::OperationKind;
+use uniffi_js_engine_schema::StreamDirection;
+
+/// Dense operation slots exported by the canonical Wasm/N-API engine plan for
+/// the runtime matrix fixture.  The test must consume these IDs from the
+/// generated package instead of reconstructing a second operation schema from
+/// generated source or a sidecar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeMatrixOperationIds {
+    pub reset_probe: u32,
+    pub probe_snapshot: u32,
+    pub record_start: u32,
+    pub record_next: u32,
+    pub enum_start: u32,
+    pub enum_next: u32,
+    pub buffer_start: u32,
+    pub buffer_next: u32,
+    pub error_start: u32,
+    pub error_next: u32,
+    pub object_constructor: u32,
+    pub object_unknown: u32,
+    pub object_napi: u32,
+    pub object_buffer: u32,
+}
+
+fn runtime_matrix_stream_slots(package: &GeneratedPackage, operation_name: &str) -> (u32, u32) {
+    let operations = &package
+        .normalized
+        .rust
+        .engines
+        .values()
+        .next()
+        .expect("runtime matrix package has no selected engine")
+        .operations;
+    let operation = operations
+        .iter()
+        .find(|operation| {
+            operation.source_key.name() == operation_name
+                && operation.kind == OperationKind::OutputStreamStart
+        })
+        .unwrap_or_else(|| {
+            let available = operations
+                .iter()
+                .map(|operation| format!("{}:{:?}", operation.source_key.name(), operation.kind))
+                .collect::<Vec<_>>()
+                .join(", ");
+            panic!("runtime matrix operation {operation_name} is missing (available: {available})")
+        });
+    let group = operation
+        .stream_resources
+        .iter()
+        .find(|group| group.direction == StreamDirection::Output)
+        .unwrap_or_else(|| {
+            panic!("runtime matrix operation {operation_name} has no output stream")
+        });
+    let start = group
+        .slot_operation_ids
+        .get(&OperationKind::OutputStreamStart)
+        .unwrap_or_else(|| panic!("runtime matrix operation {operation_name} has no stream start"));
+    let next = group
+        .slot_operation_ids
+        .get(&OperationKind::OutputStreamNext)
+        .unwrap_or_else(|| panic!("runtime matrix operation {operation_name} has no stream next"));
+    (start.index(), next.index())
+}
+
+pub fn runtime_matrix_operation_ids(package: &GeneratedPackage) -> RuntimeMatrixOperationIds {
+    let operations = &package
+        .normalized
+        .rust
+        .engines
+        .values()
+        .next()
+        .expect("runtime matrix package has no selected engine")
+        .operations;
+    let function_id = |name: &str| {
+        operations
+            .iter()
+            .find(|operation| {
+                operation.kind == OperationKind::Function && operation.source_key.name() == name
+            })
+            .map(|operation| operation.operation_id.index())
+            .unwrap_or_else(|| panic!("runtime matrix function {name} is missing"))
+    };
+    let (record_start, record_next) = runtime_matrix_stream_slots(package, "record_items");
+    let (enum_start, enum_next) = runtime_matrix_stream_slots(package, "enum_items");
+    let (buffer_start, buffer_next) = runtime_matrix_stream_slots(package, "buffer_items");
+    let (error_start, error_next) = runtime_matrix_stream_slots(package, "typed_error_items");
+    let object_constructor = package
+        .normalized
+        .rust
+        .engines
+        .values()
+        .next()
+        .expect("runtime matrix package has no selected engine")
+        .operations
+        .iter()
+        .find(|operation| {
+            operation.kind == OperationKind::Constructor && operation.source_key.name() == "new"
+        })
+        .map(|operation| operation.operation_id.index())
+        .expect("runtime matrix MatrixBuffer constructor is missing");
+    let object_methods = package
+        .normalized
+        .rust
+        .engines
+        .values()
+        .next()
+        .expect("runtime matrix package has no selected engine")
+        .operations
+        .iter()
+        .filter(|operation| operation.kind == OperationKind::Method)
+        .filter_map(|operation| Some((operation.source_key.name(), operation.operation_id.index())))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let object_unknown = *object_methods
+        .get("unknown_value")
+        .expect("runtime matrix MatrixBuffer unknown_value method is missing");
+    let object_napi = *object_methods
+        .get("napi_value")
+        .expect("runtime matrix MatrixBuffer napi_value method is missing");
+    let object_buffer = *object_methods
+        .get("buffer_value")
+        .expect("runtime matrix MatrixBuffer buffer_value method is missing");
+    RuntimeMatrixOperationIds {
+        reset_probe: function_id("reset_probe"),
+        probe_snapshot: function_id("probe_snapshot"),
+        record_start,
+        record_next,
+        enum_start,
+        enum_next,
+        buffer_start,
+        buffer_next,
+        error_start,
+        error_next,
+        object_constructor,
+        object_unknown,
+        object_napi,
+        object_buffer,
+    }
+}

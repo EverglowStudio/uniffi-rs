@@ -42,11 +42,12 @@ impl<'a> Model<'a> {
         operations.sort_by_key(|operation| operation.id);
         let mut callback_ids = BTreeMap::<TypeSourceKey, BTreeSet<u32>>::new();
         for operation in &operations {
-            let callback_method =
-                matches!(operation.source_key.owner(), OperationOwner::Callback(_))
-                    || (operation.kind == OperationKind::Method
-                        && operation.receiver_type.is_some()
-                        && model_trait_object(ast, operation.receiver_type));
+            // Callback contracts are represented by the dedicated callback-owner
+            // operations.  TraitBoth also emits an Object/Method operation for
+            // the JS -> Rust call path; that operation is not a callback adapter
+            // method and must not participate in callback-ID validation.
+            let callback_method = operation.kind == OperationKind::CallbackMethod
+                && matches!(operation.source_key.owner(), OperationOwner::Callback(_));
             if callback_method {
                 let Some(method_id) = operation.callback_method_id else {
                     return Err(FacadeError::MissingCallbackMethodId { id: operation.id });
@@ -218,19 +219,6 @@ impl<'a> Model<'a> {
     }
 }
 
-fn model_trait_object(ast: &PublicAst, type_id: Option<uniffi_js_abi::TypeId>) -> bool {
-    type_id
-        .and_then(|type_id| ast.types.iter().find(|ty| ty.id == type_id))
-        .is_some_and(|ty| {
-            matches!(
-                ty.kind,
-                AstTypeKind::Object {
-                    kind: ObjectKind::TraitBoth | ObjectKind::TraitForeignOnly
-                }
-            )
-        })
-}
-
 #[derive(Default)]
 struct Helpers {
     lower: Vec<String>,
@@ -292,19 +280,9 @@ fn ark_import_line(import: &str) -> Option<String> {
     if trimmed.is_empty() {
         return Some(String::new());
     }
-    // Cargo-ohrs copies only the package-root pair.  A relative TypeScript or
-    // JavaScript custom import would therefore create an undeliverable file;
-    // fail deterministically instead of rewriting the module specifier.
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.contains(".ts\"")
-        || lower.contains(".ts'")
-        || lower.contains(".js\"")
-        || lower.contains(".js'")
-        || lower.contains(".tsx\"")
-        || lower.contains(".jsx\"")
-    {
-        return None;
-    }
+    // Custom modules are supplied by the consumer.  Keep the import exactly
+    // as declared instead of rejecting a valid JS/TS specifier while building
+    // the shared facade inventory.
     if trimmed.starts_with("import ") {
         Some(format!("{trimmed};\n"))
     } else {
@@ -417,10 +395,10 @@ fn render_type_name(model: &Model<'_>, ty: &ValueType) -> String {
             render_type_name(model, value)
         ),
         ValueType::Set(inner) => format!("Set<{}>", render_type_name(model, inner)),
-        ValueType::InputStream(inner) => {
+        ValueType::InputStream { item: inner, .. } => {
             format!("UniFfiInputStream<{}>", render_type_name(model, inner))
         }
-        ValueType::OutputStream(inner) => {
+        ValueType::OutputStream { item: inner, .. } => {
             format!("UniFfiStream<{}>", render_type_name(model, inner))
         }
     }
@@ -451,6 +429,9 @@ fn render_type_definitions(model: &Model<'_>, declaration: bool) -> String {
                     out.push_str(&format!(
                         "export declare class {name} extends UniffiError {{\n  constructor(message?: string, variant?: string | null, data?: ArkValue | null);\n}}\n"
                     ));
+                    out.push_str(&format!(
+                        "export interface {name}Constructor {{ new(message?: string, variant?: string | null, data?: ArkValue | null): {name}; }}\n"
+                    ));
                 } else {
                     out.push_str(&format!(
                         "export class {name} extends UniffiError {{\n  constructor(message: string = \"\", variant: string | null = null, data: ArkValue | null = null) {{ super(\"{}\", message, variant, data); }}\n}}\n",
@@ -471,7 +452,7 @@ fn render_type_definitions(model: &Model<'_>, declaration: bool) -> String {
             AstTypeKind::Callback => {
                 out.push_str(&format!("export interface {name} {{\n"));
                 for operation in model.operations.iter().copied().filter(|operation| {
-                    matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key)
+                    matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key && operation.kind == OperationKind::CallbackMethod)
                 }) {
                     out.push_str(&format_callback_signature(model, operation));
                 }
@@ -648,6 +629,13 @@ fn render_api_declarations(model: &Model<'_>, declaration: bool) -> String {
                         model.type_name(&ty.source_key)
                     ));
                 }
+            }
+            if matches!(ty.kind, AstTypeKind::Error { .. }) {
+                out.push_str(&format!(
+                    "  readonly {}: {}Constructor;\n",
+                    model.type_name(&ty.source_key),
+                    model.type_name(&ty.source_key)
+                ));
             }
         }
         out.push_str("}\n");
@@ -944,6 +932,11 @@ export interface ArkFailure {
   readonly variant: string | null;
   readonly data: ArkValue | null;
 }
+export interface ArkCallbackResult {
+  readonly ok: boolean;
+  readonly value?: ArkValue;
+  readonly error?: ArkFailure;
+}
 export class ArkValueResult { readonly kind: "value" = "value"; readonly value: ArkValue; constructor(value: ArkValue) { this.value = value; } }
 export class ArkErrorResult { readonly kind: "error" = "error"; readonly error: ArkFailure; constructor(error: ArkFailure) { this.error = error; } }
 export type ArkCallResult = ArkValueResult | ArkErrorResult;
@@ -1141,6 +1134,14 @@ export class Host {
     if (this.callbackRegistry === null) return Promise.reject(new UniffiError("UniffiCallbackMissing", "callback registry is not attached"));
     return this.callbackRegistry.invokeAsync(callbackType, callbackId, methodId, invocationId, args);
   }
+  invokeCallbackSyncResult(callbackType: number, callbackId: number, methodId: number, args: Array<ArkValue> = []): ArkCallbackResult {
+    try { return { ok: true, value: this.invokeCallbackSync(callbackType, callbackId, methodId, args) }; }
+    catch (error) { return { ok: false, error: __arkCallbackFailure(error as ArkValue) }; }
+  }
+  async invokeCallbackAsyncResult(callbackType: number, callbackId: number, methodId: number, invocationId: number, args: Array<ArkValue> = []): Promise<ArkCallbackResult> {
+    try { return { ok: true, value: await this.invokeCallbackAsync(callbackType, callbackId, methodId, invocationId, args) }; }
+    catch (error) { return { ok: false, error: __arkCallbackFailure(error as ArkValue) }; }
+  }
   pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>> {
     if (this.inputRegistry === null) return Promise.reject(new UniffiError("UniffiInputStreamMissing", "input stream registry is not attached"));
     return this.inputRegistry.pull(handle);
@@ -1150,6 +1151,13 @@ export class Host {
     return this.inputRegistry.cancel(handle);
   }
   releaseInputStream(handle: ArkValue): void { this.inputRegistry?.release(handle); }
+}
+function __arkCallbackFailure(raw: ArkValue): ArkFailure {
+  if (raw instanceof UniffiError) return { errorName: raw.errorName, message: raw.message, variant: raw.variant, data: raw.data };
+  const value = raw as { errorName?: string; message?: string; variant?: string; tag?: string; data?: ArkValue };
+  const variant = value.variant ?? value.tag ?? null;
+  const errorName = value.errorName ?? variant ?? "UniffiCallbackError";
+  return { errorName, message: value.message ?? String(raw), variant, data: value.data ?? null };
 }
 interface ArkInputSlot { readonly pull: () => Promise<ArkStreamStep<ArkValue>>; readonly cancel: () => Promise<void>; readonly release: () => void; readonly detach: () => void; }
 class ArkInputRegistry {
@@ -1629,7 +1637,7 @@ export interface ArkCallbackAdapter { invokeSync(methodId: number, args: Array<A
 export interface ArkCallbackContract { readonly retention: "scoped" | "retained"; readonly threading: "callingThread" | "mayCrossThread"; readonly reentrancy: "forbidden" | "allowed"; }
 export declare class ArkCallbackLease { release(): void; }
 export declare class CallbackRegistry { register(callbackType: number, callback: ArkCallbackAdapter, contract: ArkCallbackContract): number; retain(callbackType: number, callbackId: number): ArkCallbackLease; release(callbackType: number, callbackId: number): void; invokeSync(callbackType: number, callbackId: number, methodId: number, args: Array<ArkValue>): ArkValue; invokeAsync(callbackType: number, callbackId: number, methodId: number, invocationId: number, args: Array<ArkValue>): Promise<ArkValue>; }
-export declare class Host { retainCallback(callbackType: number, callbackId: number): void; releaseCallback(callbackType: number, callbackId: number): void; invokeCallbackSync(callbackType: number, callbackId: number, methodId: number, args?: Array<ArkValue>): ArkValue; invokeCallbackAsync(callbackType: number, callbackId: number, methodId: number, invocationId: number, args?: Array<ArkValue>): Promise<ArkValue>; pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>>; cancelInputStream(handle: ArkValue): Promise<void>; releaseInputStream(handle: ArkValue): void; }
+export declare class Host { retainCallback(callbackType: number, callbackId: number): void; releaseCallback(callbackType: number, callbackId: number): void; invokeCallbackSync(callbackType: number, callbackId: number, methodId: number, args?: Array<ArkValue>): ArkValue; invokeCallbackAsync(callbackType: number, callbackId: number, methodId: number, invocationId: number, args?: Array<ArkValue>): Promise<ArkValue>; invokeCallbackSyncResult(callbackType: number, callbackId: number, methodId: number, args?: Array<ArkValue>): ArkCallbackResult; invokeCallbackAsyncResult(callbackType: number, callbackId: number, methodId: number, invocationId: number, args?: Array<ArkValue>): Promise<ArkCallbackResult>; pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>>; cancelInputStream(handle: ArkValue): Promise<void>; releaseInputStream(handle: ArkValue): void; }
 export declare class ArkCallbackRegistration { readonly callbackType: number; readonly callbackId: number; }
 export declare class ArkCallbackFrame { readonly registrations: Array<ArkCallbackRegistration>; }
 export declare class BackendSession { readonly backend: ArkBackend; readonly host: Host; readonly callbacks: CallbackRegistry; constructor(backend: ArkBackend, host?: Host); invokeSync(operationId: number, args: Array<ArkValue>): ArkValue; invokeAsync(operationId: number, args: Array<ArkValue>): Promise<ArkValue>; registerCallback(callbackType: number, callback: ArkCallbackAdapter, contract: ArkCallbackContract): number; retainCallback(callbackType: number, callbackId: number): ArkCallbackLease; releaseCallback(callbackType: number, callbackId: number): void; beginCallFrame(): ArkCallbackFrame; endCallFrame(frame: ArkCallbackFrame): void; createInputStream<T>(source: UniFfiInputStream<T>, lower: (value: T) => ArkValue): number; createInputView<T>(handle: ArkValue, lift: (value: ArkValue) => T): UniFfiInputStream<T>; pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>>; cancelInputStream(handle: ArkValue): Promise<void>; releaseInputStream(handle: ArkValue): void; releaseOutputStream(handle: ArkValue): void; close(): Promise<void>; }
@@ -1651,8 +1659,7 @@ fn render_callback_interface_adapter(
         .iter()
         .copied()
         .filter(|operation| {
-            matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key)
-                || matches!(operation.source_key.owner(), OperationOwner::Object(key) if key == &ty.source_key && operation.kind == OperationKind::Method)
+            matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key && operation.kind == OperationKind::CallbackMethod)
         })
         .collect::<Vec<_>>();
     let mut out = String::new();
@@ -1923,7 +1930,7 @@ fn render_operation_helpers(
     let lift_name = operation
         .return_type
         .as_ref()
-        .filter(|return_type| !matches!(return_type, ValueType::OutputStream(_)))
+        .filter(|return_type| !matches!(return_type, ValueType::OutputStream { .. }))
         .map(|return_type| {
             lift_helper(
                 model,
@@ -2045,7 +2052,7 @@ fn render_operation_helpers(
 
     if is_output_stream_return(operation) {
         let item = match operation.return_type.as_ref() {
-            Some(ValueType::OutputStream(item)) => item.as_ref(),
+            Some(ValueType::OutputStream { item, .. }) => item.as_ref(),
             _ => unreachable!(),
         };
         let item_lift = lift_helper(
@@ -2162,7 +2169,7 @@ fn render_operation_helpers(
 }
 
 fn is_output_stream_return(operation: &AstOperation) -> bool {
-    matches!(operation.return_type, Some(ValueType::OutputStream(_)))
+    matches!(operation.return_type, Some(ValueType::OutputStream { .. }))
         && operation.kind == OperationKind::OutputStreamStart
 }
 
@@ -2254,7 +2261,7 @@ fn lower_body(
                 item_type = render_type_name(model, inner)
             )
         }
-        ValueType::InputStream(inner) => {
+        ValueType::InputStream { item: inner, .. } => {
             let nested = lower_nested_call(
                 model,
                 helpers,
@@ -2268,7 +2275,7 @@ fn lower_body(
                 item_type = render_type_name(model, inner)
             )
         }
-        ValueType::OutputStream(_) => format!("return {expression} as ArkValue;"),
+        ValueType::OutputStream { .. } => format!("return {expression} as ArkValue;"),
         ValueType::Named(key) => {
             let named = model.ty_for(key);
             let Some(named) = named else {
@@ -2523,7 +2530,7 @@ fn lift_body(
             );
             format!("const source: Set<ArkValue> = {expression} as Set<ArkValue>; const result: Set<{}> = new Set<{}>(); source.forEach((item: ArkValue): void => result.add({nested})); return result;", render_type_name(model, inner), render_type_name(model, inner))
         }
-        ValueType::InputStream(inner) => {
+        ValueType::InputStream { item: inner, .. } => {
             let nested = lift_nested_call(
                 model,
                 helpers,
@@ -2534,9 +2541,20 @@ fn lift_body(
             );
             format!("return session.createInputView<{}>({expression}, (item: ArkValue): {} => {nested});", render_type_name(model, inner), render_type_name(model, inner))
         }
-        ValueType::OutputStream(inner) => format!(
+        ValueType::OutputStream {
+            item: inner,
+            error,
+            is_send,
+        } => format!(
             "return {expression} as {};",
-            render_type_name(model, &ValueType::OutputStream(inner.clone()))
+            render_type_name(
+                model,
+                &ValueType::OutputStream {
+                    item: inner.clone(),
+                    error: error.clone(),
+                    is_send: *is_send,
+                },
+            )
         ),
         ValueType::Named(key) => {
             let Some(named) = model.ty_for(key) else {
@@ -2904,6 +2922,13 @@ fn render_factory_and_namespace(model: &Model<'_>) -> String {
                     }
                     out.push_str("  };\n");
                 }
+            }
+            if matches!(ty.kind, AstTypeKind::Error { .. }) {
+                out.push_str(&format!(
+                    "    {}: {},\n",
+                    model.type_name(&ty.source_key),
+                    model.type_name(&ty.source_key)
+                ));
             }
         }
         out.push_str(&format!(
