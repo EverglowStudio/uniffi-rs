@@ -6,31 +6,56 @@ backend builds run in their own named targets.
 
 ## Test layers
 
-Run an individual layer with:
+The fast smoke layer is the normal edit loop. It only generates the package
+tree and executes the pure-JavaScript facade; it does not compile a host,
+Wasm target, or addon:
 
 ```sh
-cargo test -p uniffi-bindgen-tests-javascript --test smoke
-cargo test -p uniffi-bindgen-tests-javascript --test contracts
-cargo test -p uniffi-bindgen-tests-javascript --test wasm_e2e
-cargo test -p uniffi-bindgen-tests-javascript --test napi_e2e
-cargo test -p uniffi-bindgen-tests-javascript --test host_crates
-cargo test -p uniffi-bindgen-tests-javascript --test cli_build
-cargo test -p uniffi-bindgen-tests-javascript --test cli_build_napi
-cargo test -p uniffi-bindgen-tests-javascript --test cli_build_wasm
+/usr/bin/time -p cargo test -p uniffi-bindgen-tests-javascript --test smoke
 ```
 
-For normal local iteration, run `smoke`, then add `contracts` for generator or
-runtime changes. PR CI should run the complete non-benchmark suite:
+Run the conformance and real backend layers individually with:
+
+```sh
+# Uses the first `tsc` on PATH; it must report Version 5.9.3.
+cargo test -p uniffi-bindgen-tests-javascript --test contracts
+# An explicit compiler path is useful when several Node toolchains are installed.
+UNIFFI_TEST_TYPESCRIPT_COMPILER=/path/to/tsc \
+  cargo test -p uniffi-bindgen-tests-javascript --test contracts
+cargo test -p uniffi-bindgen-tests-javascript --test wasm_e2e -- --nocapture --test-threads=1
+cargo test -p uniffi-bindgen-tests-javascript --test napi_e2e -- --nocapture --test-threads=1
+cargo test -p uniffi-bindgen-tests-javascript --test host_crates -- --nocapture --test-threads=1
+cargo test -p uniffi-bindgen-tests-javascript --test cli_build -- --nocapture --test-threads=1
+cargo test -p uniffi-bindgen-tests-javascript --test cli_build_napi -- --nocapture --test-threads=1
+cargo test -p uniffi-bindgen-tests-javascript --test cli_build_wasm -- --nocapture --test-threads=1
+```
+
+The complete non-benchmark JavaScript suite is:
 
 ```sh
 cargo test -p uniffi-bindgen-tests-javascript --tests
 ```
 
-Nightly and release validation should run that complete suite plus the ignored
-benchmark target and any platform-specific targets available on the runner.
-The Wasm E2E tests use the pinned `wasm-bindgen-cli-support = 0.2.117` library
-in process; a globally installed `wasm-bindgen` executable is not a
-prerequisite.
+Recommended layers are:
+
+- Local daily work: `smoke`, then `contracts` when generator, declarations, or
+  runtime semantics change.
+- Pull requests: the complete `--tests` command above, which runs every
+  non-benchmark smoke, contract, Wasm, N-API/Electron, host, and CLI test.
+- Nightly/release: the complete suite plus the opt-in benchmark and the
+  platform-specific OHOS/Apple/Android jobs available on the runner.
+
+The Wasm E2E tests use the pinned in-process wasm-bindgen library. A globally
+installed `wasm-bindgen` executable is not a test prerequisite and is neither
+looked up nor invoked.
+
+Heavy fixtures keep independent temporary source, generated-package, and
+runtime directories, while reusing ordinary Cargo fingerprints and dependency
+artifacts under `target/javascript-tests/{native,wasm,cli}`. An OS-released
+advisory lock covers each build and same-named artifact copy, so concurrent
+tests cannot consume another fixture's output. These directories are caches,
+not prebuilt test inputs; deleting them is optional and is never part of the
+test workflow.
 
 ## Opt-in JavaScript Benchmarks
 

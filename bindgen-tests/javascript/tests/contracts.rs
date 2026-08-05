@@ -299,6 +299,40 @@ crate-type = ["lib", "cdylib"]
         !implementation.contains(".ts"),
         "ECMAScript facade must not depend on removed TypeScript runtime paths:\n{implementation}"
     );
+
+    // The static facade owner also owns the public declaration contract. Run
+    // the pinned TypeScript 5.9.3 compiler against this generated package so
+    // strictness cannot silently drift into a separate duplicate test.
+    let tsconfig = package_root.join("tsconfig.strict.json");
+    std::fs::write(
+        &tsconfig,
+        r#"{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "skipLibCheck": false
+  },
+  "include": [
+    "shared/**/*.d.ts",
+    "components/**/*.d.ts",
+    "node/**/*.d.ts",
+    "browser/**/*.d.ts"
+  ]
+}
+"#,
+    )
+    .unwrap();
+    let compiler = required_typescript_compiler();
+    let typecheck = run_required_typescript_check(&compiler, tsconfig.as_std_path());
+    assert!(
+        typecheck.status.success(),
+        "strict TypeScript public declaration check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&typecheck.stdout),
+        String::from_utf8_lossy(&typecheck.stderr)
+    );
 }
 #[test]
 fn custom_types_wasm_static_contract() {
@@ -365,9 +399,7 @@ export function emailAddressToString(value) { return value.value; }
 #[test]
 fn harmony_stream_package_contract() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(fixture) = build_stream_fixture(tmp.path()) else {
-        return;
-    };
+    let fixture = build_stream_fixture(tmp.path());
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let host_dir = out_dir.join("native/hosts");
@@ -404,9 +436,7 @@ fn harmony_stream_package_contract() {
 #[test]
 fn input_stream_package_contract() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(fixture) = build_input_stream_fixture(tmp.path()) else {
-        return;
-    };
+    let fixture = build_input_stream_fixture(tmp.path());
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let host_dir = out_dir.join("native/hosts");
@@ -468,16 +498,8 @@ fn input_stream_package_contract() {
 }
 #[test]
 fn wasm_local_uniffi_stream_alias_cargo_checks() {
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("SKIP wasm_local_uniffi_stream_alias_cargo_checks: cargo unavailable");
-        return;
-    };
-    if !has_wasm32_target(&cargo) {
-        eprintln!(
-            "SKIP wasm_local_uniffi_stream_alias_cargo_checks: wasm32-unknown-unknown target unavailable"
-        );
-        return;
-    }
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
 
     let tmp = tempfile::tempdir().unwrap();
     let crate_dir = tmp.path().join("local-stream-core");
@@ -570,6 +592,8 @@ uniffi::setup_scaffolding!();
     )
     .unwrap();
 
+    let target_dir = shared_cargo_target_dir("wasm");
+    let _target_lock = shared_cargo_target_lock("wasm");
     let output = Command::new(&cargo)
         .args([
             "check",
@@ -578,7 +602,7 @@ uniffi::setup_scaffolding!();
             "--target",
             "wasm32-unknown-unknown",
         ])
-        .env("CARGO_TARGET_DIR", tmp.path().join("target-local-stream"))
+        .env("CARGO_TARGET_DIR", target_dir.as_std_path())
         .env("RUSTFLAGS", "-D warnings")
         .output()
         .expect("failed to invoke cargo for wasm local stream fixture");
@@ -678,10 +702,7 @@ fn custom_types_emit_public_contract() {
 
 #[test]
 fn runtime_numeric_lossless_or_reject() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP runtime_numeric_lossless_or_reject: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     // Generate the arithmetic package so we can import its plain-ECMAScript
     // runtime helpers directly.
@@ -773,10 +794,7 @@ console.log("ok");
 
 #[test]
 fn runtime_input_stream_error_lowering_is_canonical() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP runtime_input_stream_error_lowering_is_canonical: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let out = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(out.path().to_path_buf()).unwrap();

@@ -15,7 +15,7 @@ readme = "../README.md"
 
 [dependencies]
 uniffi_bindgen = { path = "../uniffi_bindgen", version = "=0.32.0", default-features = false, optional = true }
-uniffi_bindgen_javascript = { path = "../uniffi_bindgen_javascript", version = "=0.32.0", optional = true }
+uniffi_bindgen_javascript = { path = "../uniffi_bindgen_javascript", version = "=0.32.0", default-features = false, optional = true }
 uniffi_build = { path = "../uniffi_build", version = "=0.32.0", optional = true }
 uniffi_core = { path = "../uniffi_core", version = "=0.32.0" }
 uniffi_macros = { path = "../uniffi_macros", version = "=0.32.0" }
@@ -28,12 +28,10 @@ cargo-config2 = { version = "=0.1.40", optional = true }
 clap = { version = "4", default-features = false, features = [ "cargo", "derive", "error-context", "help", "suggestions", "std", "usage" ], optional = true }
 zip = { version = "0.6", default-features = false, features = ["deflate"], optional = true }
 serde_json = { version = "1", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 toml = { version = "0.9", default-features = false, features = [ "parse", "serde" ], optional = true }
 tempfile = { version = "3", optional = true }
-fs2 = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 goblin = { version = "0.8", optional = true }
 
@@ -57,8 +55,32 @@ bindgen = ["dep:uniffi_bindgen"]
 cargo-metadata = ["dep:cargo_metadata", "uniffi_bindgen?/cargo-metadata"]
 
 # Support for `uniffi_bindgen_main()`. Enable this feature for your
-# `uniffi-bindgen` binaries.
-cli = [ "bindgen", "dep:clap", "dep:camino", "dep:cargo_metadata", "dep:cargo-config2", "dep:serde", "dep:serde_json", "dep:uniffi_bindgen_javascript", "dep:zip", "dep:flate2", "dep:tar", "dep:toml", "dep:tempfile", "dep:fs2", "dep:libc", "dep:goblin", "dep:windows-sys" ]
+# `uniffi-bindgen` binaries. This base CLI intentionally has no JavaScript or
+# OHOS packaging dependencies.
+cli = [ "bindgen", "dep:clap", "dep:camino" ]
+# JavaScript generation/build orchestration. This is a deliberate boundary:
+# JavaScript consumers do not pull the OHOS packager dependency graph.
+cli-javascript = [
+    "cli",
+    "cargo-metadata",
+    "dep:uniffi_bindgen_javascript",
+    "dep:zip",
+    "dep:tempfile",
+    "dep:libc",
+    "dep:windows-sys",
+]
+# OHOS/Harmony packaging extends the JavaScript CLI with only the native
+# package/archive readers it needs.
+cli-ohos = [
+    "cli-javascript",
+    "uniffi_bindgen_javascript/ohos",
+    "dep:cargo-config2",
+    "dep:serde_json",
+    "dep:flate2",
+    "dep:tar",
+    "dep:toml",
+    "dep:goblin",
+]
 # Support for running example/fixture tests for `uniffi-bindgen`.  You probably
 # don't need to enable this.
 bindgen-tests = [ "dep:uniffi_bindgen", "uniffi_bindgen?/bindgen-tests" ]

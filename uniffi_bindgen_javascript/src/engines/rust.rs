@@ -117,6 +117,7 @@ fn wasm_resource_path(path: &[ResourcePathSegment]) -> wasm_bindgen_uniffi_engin
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeFlavor {
     Node,
+    #[cfg(feature = "ohos")]
     Ohos,
 }
 
@@ -124,6 +125,7 @@ impl NativeFlavor {
     fn prefix(self) -> &'static str {
         match self {
             Self::Node => "napi",
+            #[cfg(feature = "ohos")]
             Self::Ohos => "napi_ohos",
         }
     }
@@ -131,6 +133,7 @@ impl NativeFlavor {
     fn derive_import(self) -> &'static str {
         match self {
             Self::Node => "napi_derive::napi",
+            #[cfg(feature = "ohos")]
             Self::Ohos => "napi_derive_ohos::napi",
         }
     }
@@ -138,6 +141,7 @@ impl NativeFlavor {
     fn error_descriptor(self) -> Path {
         syn::parse_str(match self {
             Self::Node => "napi_uniffi_engine::BridgeErrorDescriptor",
+            #[cfg(feature = "ohos")]
             Self::Ohos => "napi_ohos_uniffi_engine::BridgeErrorDescriptor",
         })
         .expect("engine error descriptor path is valid")
@@ -1912,6 +1916,7 @@ fn render_named_type_helpers(package: &NormalizedPackage) -> Result<String> {
 fn render_temporal_helpers(flavor: NativeFlavor) -> Result<String> {
     let napi: Path = syn::parse_str(match flavor {
         NativeFlavor::Node => "napi",
+        #[cfg(feature = "ohos")]
         NativeFlavor::Ohos => "napi_ohos",
     })?;
     let error_descriptor = flavor.error_descriptor();
@@ -2055,6 +2060,7 @@ fn render_temporal_helpers(flavor: NativeFlavor) -> Result<String> {
 fn napi_crate_path(flavor: NativeFlavor) -> Path {
     syn::parse_str(match flavor {
         NativeFlavor::Node => "napi",
+        #[cfg(feature = "ohos")]
         NativeFlavor::Ohos => "napi_ohos",
     })
     .expect("napi crate path is valid")
@@ -2063,6 +2069,7 @@ fn napi_crate_path(flavor: NativeFlavor) -> Path {
 fn engine_crate_path(flavor: NativeFlavor) -> Path {
     syn::parse_str(match flavor {
         NativeFlavor::Node => "napi_uniffi_engine",
+        #[cfg(feature = "ohos")]
         NativeFlavor::Ohos => "napi_ohos_uniffi_engine",
     })
     .expect("napi engine crate path is valid")
@@ -4944,6 +4951,7 @@ pub(crate) fn napi_source(package: &NormalizedPackage) -> Result<String> {
     ))
 }
 
+#[cfg(feature = "ohos")]
 fn ohos_argument(
     package: &NormalizedPackage,
     operation: &RustOperationPlan,
@@ -5059,6 +5067,7 @@ fn ohos_argument(
     })
 }
 
+#[cfg(feature = "ohos")]
 fn ohos_operation(
     package: &NormalizedPackage,
     operation: &RustOperationPlan,
@@ -5248,6 +5257,7 @@ fn ohos_operation(
     })
 }
 
+#[cfg(feature = "ohos")]
 pub(crate) fn ohos_source(package: &NormalizedPackage) -> Result<String> {
     let family = family_plan(package, FamilyFlavor::Ohos)?;
     let operations = package.rust.engines[&EngineKind::OhosNapi]
@@ -5293,6 +5303,11 @@ pub(crate) fn ohos_source(package: &NormalizedPackage) -> Result<String> {
         "{derive_import}{registry}\n{temporal}\n{helpers}\n{operation_helpers}\n{nested_input_helpers}\n{input_stream_helpers}\n{callback_helpers}\n{wrappers}\n{}",
         module.source()
     ))
+}
+
+#[cfg(not(feature = "ohos"))]
+pub(crate) fn ohos_source(_package: &NormalizedPackage) -> Result<String> {
+    bail!("Harmony generation requires the uniffi_bindgen_javascript `ohos` feature")
 }
 
 fn wasm_rust_path(path: &RustPath) -> Result<wasm_bindgen_uniffi_engine::RustPath> {

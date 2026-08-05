@@ -4,12 +4,15 @@
 
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use cargo_metadata::{CargoOpt, DependencyKind, MetadataCommand, Package};
+use cargo_metadata::MetadataCommand;
+#[cfg(feature = "cli-ohos")]
+use cargo_metadata::{CargoOpt, DependencyKind, Package};
 use clap::{Args, Subcommand, ValueEnum};
 use std::process::Command;
+#[cfg(feature = "cli-javascript")]
+use uniffi_bindgen::BindgenPaths;
 use uniffi_bindgen::{
-    cargo_metadata::CrateConfigSupplier, BindgenLoader, BindgenPaths, CargoMetadataOptions,
-    GlobalConfig,
+    cargo_metadata::CrateConfigSupplier, BindgenLoader, CargoMetadataOptions, GlobalConfig,
 };
 use uniffi_bindgen_javascript::{
     FlavorTarget, GenerateJsOptions, HostCrateOptions, WasmPostLinkTarget,
@@ -43,6 +46,7 @@ pub(crate) enum JavascriptCommands {
     BuildNapi(BuildNapiArgs),
 
     /// Build JavaScript + Harmony/OpenHarmony bindings through OHOS Node-API.
+    #[cfg(feature = "cli-ohos")]
     BuildOhos(BuildOhosArgs),
 }
 
@@ -337,6 +341,7 @@ pub(crate) struct BuildNapiArgs {
     pub(crate) metadata_no_deps: bool,
 }
 
+#[cfg(feature = "cli-ohos")]
 #[derive(Clone, Args)]
 pub(crate) struct BuildOhosArgs {
     /// Root package Cargo manifest.
@@ -566,6 +571,7 @@ pub(crate) fn run(args: JavascriptArgs) -> Result<()> {
         JavascriptCommands::Build(args) => build(args),
         JavascriptCommands::BuildWasm(args) => build_wasm(args),
         JavascriptCommands::BuildNapi(args) => build_napi(args),
+        #[cfg(feature = "cli-ohos")]
         JavascriptCommands::BuildOhos(args) => build_ohos(args),
     }
 }
@@ -1360,11 +1366,13 @@ fn build_napi_with_generation(
     Ok(())
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
     build_ohos_with_generation(args, true, None)
 }
 
 /// Build Harmony outputs from an already prepared package.
+#[cfg(feature = "cli-ohos")]
 pub(crate) fn build_ohos_prepared(
     args: BuildOhosArgs,
     package: &uniffi_bindgen_javascript::package::GeneratedPackage,
@@ -1372,6 +1380,7 @@ pub(crate) fn build_ohos_prepared(
     build_ohos_with_generation(args, false, Some(package))
 }
 
+#[cfg(feature = "cli-ohos")]
 fn build_ohos_with_generation(
     mut args: BuildOhosArgs,
     prepare_generation: bool,
@@ -1402,6 +1411,7 @@ fn build_ohos_with_generation(
 
 /// Build every direct JavaScript HSP output in a private source/host mirror,
 /// then replace the completed public outputs from ordinary sibling staging.
+#[cfg(feature = "cli-ohos")]
 fn build_direct_ohos_hsp(
     public: BuildOhosArgs,
     _prepared_package: Option<&uniffi_bindgen_javascript::package::GeneratedPackage>,
@@ -1507,6 +1517,7 @@ fn build_direct_ohos_hsp(
         .context("publishing ordinary staged Harmony HSP outputs")
 }
 
+#[cfg(feature = "cli-ohos")]
 fn planned_direct_ohos_hsp_outputs(
     args: &BuildOhosArgs,
 ) -> Result<Vec<super::artifact_staging::HspOutputPaths>> {
@@ -1608,6 +1619,7 @@ fn planned_direct_ohos_hsp_outputs(
     )?])
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(crate) fn build_ohos_deferred_prepared(
     args: BuildOhosArgs,
     package: &uniffi_bindgen_javascript::package::GeneratedPackage,
@@ -1616,6 +1628,7 @@ pub(crate) fn build_ohos_deferred_prepared(
         .context("deferred JavaScript OHOS build did not produce an HSP invocation")
 }
 
+#[cfg(feature = "cli-ohos")]
 fn build_ohos_internal_with_generation(
     args: BuildOhosArgs,
     defer_hsp_publication: bool,
@@ -1952,6 +1965,7 @@ fn add_cargo_feature_args(command: &mut Command, features: &[String]) {
 /// name, Rust lib target and host dependency alias; querying the host resolve
 /// graph is the only way to avoid silently targeting the wrong package in a
 /// custom host manifest.
+#[cfg(feature = "cli-ohos")]
 fn host_dependency_cargo_feature_args(
     core_manifest_path: &Utf8Path,
     host_manifest_path: &Utf8Path,
@@ -2078,6 +2092,7 @@ fn host_dependency_cargo_feature_args(
     ])
 }
 
+#[cfg(feature = "cli-ohos")]
 fn cargo_package_for_manifest<'a>(
     metadata: &'a cargo_metadata::Metadata,
     manifest_path: &Utf8Path,
@@ -2090,6 +2105,7 @@ fn cargo_package_for_manifest<'a>(
     })
 }
 
+#[cfg(feature = "cli-ohos")]
 fn cargo_package_selector(cargo_args: &[String]) -> Result<Option<String>> {
     let mut selector = None;
     let mut index = 0;
@@ -2121,21 +2137,25 @@ fn cargo_package_selector(cargo_args: &[String]) -> Result<Option<String>> {
     Ok(selector)
 }
 
+#[cfg(feature = "cli-ohos")]
 fn cargo_requests_workspace_members(cargo_args: &[String]) -> bool {
     cargo_args
         .iter()
         .any(|arg| matches!(arg.as_str(), "--workspace" | "--all"))
 }
 
+#[cfg(feature = "cli-ohos")]
 fn cargo_package_matches_selector(package: &Package, selector: &str) -> bool {
     selector == package.name.as_str() || selector == format!("{}@{}", package.name, package.version)
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cli-ohos")]
+    use super::host_dependency_cargo_feature_args;
     use super::{
-        host_dependency_cargo_feature_args, patch_mini_program_web_runtime,
-        preflight_wasm_build_paths, BuildWasmArgs, WasmBindgenTargetArg,
+        patch_mini_program_web_runtime, preflight_wasm_build_paths, BuildWasmArgs,
+        WasmBindgenTargetArg,
     };
     #[cfg(windows)]
     use super::{wasm_preflight_nofollow, windows_wasm_semantic_path_key};
@@ -2192,6 +2212,7 @@ if (typeof Response === 'function' && module instanceof Response) {
         assert!(!patched.contains("new Request("));
     }
 
+    #[cfg(feature = "cli-ohos")]
     #[test]
     fn host_dependency_feature_args_use_the_resolved_host_alias() {
         let temp = tempfile::tempdir().unwrap();
@@ -2253,6 +2274,7 @@ custom_core_alias = { package = "core-package", path = "../core" }
         );
     }
 
+    #[cfg(feature = "cli-ohos")]
     #[test]
     fn host_dependency_feature_args_support_virtual_workspace_package_selection() {
         let temp = tempfile::tempdir().unwrap();
@@ -2326,6 +2348,7 @@ edition = "2021"
         );
     }
 
+    #[cfg(feature = "cli-ohos")]
     #[test]
     fn host_dependency_feature_args_are_empty_without_features() {
         assert!(host_dependency_cargo_feature_args(
@@ -3083,8 +3106,11 @@ fn relative_path_from_dir(from_dir: &Utf8Path, to: &Utf8Path) -> Utf8PathBuf {
 
 struct CargoPackageMetadata {
     target_directory: Utf8PathBuf,
+    #[cfg(feature = "cli-ohos")]
     workspace_root: Utf8PathBuf,
+    #[cfg(feature = "cli-ohos")]
     local_source_roots: Vec<(String, Utf8PathBuf)>,
+    #[cfg(feature = "cli-ohos")]
     package_name: String,
     lib_target_name: String,
 }
@@ -3120,9 +3146,11 @@ fn cargo_package_metadata(manifest_path: &Utf8Path) -> Result<CargoPackageMetada
                 .find(|target| target.kind.iter().any(|kind| kind.to_string() == "lib"))
         })
         .with_context(|| format!("package {} has no lib/cdylib target", package.name))?;
+    #[cfg(feature = "cli-ohos")]
     let workspace_root =
         Utf8PathBuf::from_path_buf(metadata.workspace_root.clone().into_std_path_buf())
             .map_err(|p| anyhow::anyhow!("cargo workspace root is not utf8: {}", p.display()))?;
+    #[cfg(feature = "cli-ohos")]
     let mut local_source_roots = metadata
         .packages
         .iter()
@@ -3137,15 +3165,21 @@ fn cargo_package_metadata(manifest_path: &Utf8Path) -> Result<CargoPackageMetada
             ))
         })
         .collect::<Vec<_>>();
-    local_source_roots.sort();
-    local_source_roots.dedup();
+    #[cfg(feature = "cli-ohos")]
+    {
+        local_source_roots.sort();
+        local_source_roots.dedup();
+    }
     Ok(CargoPackageMetadata {
         target_directory: Utf8PathBuf::from_path_buf(
             metadata.target_directory.clone().into_std_path_buf(),
         )
         .map_err(|p| anyhow::anyhow!("cargo metadata target dir is not utf8: {}", p.display()))?,
+        #[cfg(feature = "cli-ohos")]
         workspace_root,
+        #[cfg(feature = "cli-ohos")]
         local_source_roots,
+        #[cfg(feature = "cli-ohos")]
         package_name: package.name.to_string(),
         lib_target_name: lib_target.name.clone(),
     })

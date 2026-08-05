@@ -7,21 +7,29 @@
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::env;
+#[cfg(feature = "cli-ohos")]
 use std::fs::OpenOptions;
+#[cfg(feature = "cli-ohos")]
 use std::io::{Read, Write};
-#[cfg(windows)]
+#[cfg(all(feature = "cli-ohos", windows))]
 use std::path::Path;
 
-#[cfg(unix)]
+#[cfg(all(feature = "cli-ohos", unix))]
 use std::os::unix::fs::OpenOptionsExt as _;
-#[cfg(windows)]
+#[cfg(all(feature = "cli-ohos", windows))]
 use std::os::windows::fs::OpenOptionsExt as _;
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) const MAX_HSP_ARCHIVE_ENTRIES: usize = 4_096;
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) const MAX_EPHEMERAL_BUILD_ENTRIES: usize = 500_000;
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) const MAX_HSP_ARCHIVE_MEMBER_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) const MAX_HSP_ARCHIVE_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) const MAX_HSP_ARCHIVE_PATH_BYTES: usize = 512;
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) const MAX_HSP_ARCHIVE_COMPRESSED_BYTES: u64 = MAX_HSP_ARCHIVE_TOTAL_BYTES;
 pub(in crate::cli) const MANAGED_PACKAGE_MARKER_NAME: &str = ".uniffi-managed-owner";
 pub(in crate::cli) const MANAGED_PACKAGE_MARKER_CONTENT: &[u8] = b"uniffi-managed-package\n";
@@ -29,6 +37,7 @@ pub(in crate::cli) const MANAGED_PACKAGE_MARKER_CONTENT: &[u8] = b"uniffi-manage
 /// One checked traversal budget is shared by every pass that forms a single
 /// capture/validation/cleanup decision.  Re-running a 500k-entry traversal
 /// three times with independently reset counters is not a meaningful bound.
+#[cfg(feature = "cli-ohos")]
 #[derive(Debug)]
 pub(in crate::cli) struct TraversalBudget {
     pub(in crate::cli) entries: usize,
@@ -37,6 +46,7 @@ pub(in crate::cli) struct TraversalBudget {
     pub(in crate::cli) max_bytes: u64,
 }
 
+#[cfg(feature = "cli-ohos")]
 impl TraversalBudget {
     pub(crate) fn managed() -> Self {
         Self {
@@ -99,6 +109,7 @@ impl TraversalBudget {
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) struct InvocationDist {
     _scratch: tempfile::TempDir,
     pub(in crate::cli) path: Utf8PathBuf,
@@ -109,6 +120,7 @@ pub(in crate::cli) struct InvocationDist {
 /// lifetime. No ownership inventory or recovery state is persisted.
 pub(in crate::cli) struct TemporaryWorkspace {
     _temp: tempfile::TempDir,
+    #[cfg(feature = "cli-ohos")]
     mirror_root: Utf8PathBuf,
     build_root: Utf8PathBuf,
 }
@@ -129,19 +141,23 @@ impl TemporaryWorkspace {
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).map_err(|path| {
             anyhow::anyhow!("temporary workspace path is not UTF-8: {}", path.display())
         })?;
+        #[cfg(feature = "cli-ohos")]
         let mirror_root = root.join("mirror");
         let build_root = root.join("build");
+        #[cfg(feature = "cli-ohos")]
         std::fs::create_dir(&mirror_root)
             .with_context(|| format!("creating temporary source root {mirror_root}"))?;
         std::fs::create_dir(&build_root)
             .with_context(|| format!("creating temporary build root {build_root}"))?;
         Ok(Self {
             _temp: temp,
+            #[cfg(feature = "cli-ohos")]
             mirror_root,
             build_root,
         })
     }
 
+    #[cfg(feature = "cli-ohos")]
     pub(in crate::cli) fn mirror_root(&self) -> &Utf8Path {
         &self.mirror_root
     }
@@ -151,6 +167,7 @@ impl TemporaryWorkspace {
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn read_verified_regular_file_bounded(
     path: &Utf8Path,
     maximum_bytes: u64,
@@ -221,6 +238,7 @@ pub(in crate::cli) fn read_verified_regular_file_bounded(
     Ok(bytes)
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn read_verified_regular_file(path: &Utf8Path) -> Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -263,7 +281,7 @@ pub(in crate::cli) fn read_verified_regular_file(path: &Utf8Path) -> Result<Vec<
     Ok(bytes)
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "cli-ohos", unix))]
 pub(in crate::cli) fn ensure_opened_file_has_single_link(
     file: &std::fs::File,
     path: &Utf8Path,
@@ -274,7 +292,7 @@ pub(in crate::cli) fn ensure_opened_file_has_single_link(
     ensure_file_has_single_link(&metadata, path)
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "cli-ohos", windows))]
 pub(in crate::cli) fn ensure_opened_file_has_single_link(
     file: &std::fs::File,
     path: &Utf8Path,
@@ -285,7 +303,7 @@ pub(in crate::cli) fn ensure_opened_file_has_single_link(
     Ok(())
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(feature = "cli-ohos", not(any(unix, windows))))]
 pub(in crate::cli) fn ensure_opened_file_has_single_link(
     _file: &std::fs::File,
     path: &Utf8Path,
@@ -293,7 +311,7 @@ pub(in crate::cli) fn ensure_opened_file_has_single_link(
     bail!("hardlink validation is unsupported on this host; refusing verified source {path}")
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "cli-ohos", unix))]
 pub(in crate::cli) fn opened_file_matches_path(
     _file: &std::fs::File,
     opened: &std::fs::Metadata,
@@ -304,7 +322,7 @@ pub(in crate::cli) fn opened_file_matches_path(
     Ok(opened.dev() == path_metadata.dev() && opened.ino() == path_metadata.ino())
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "cli-ohos", windows))]
 pub(in crate::cli) fn opened_file_matches_path(
     file: &std::fs::File,
     _opened: &std::fs::Metadata,
@@ -315,7 +333,7 @@ pub(in crate::cli) fn opened_file_matches_path(
         == windows_file_information(path.as_std_path())?.identity)
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(feature = "cli-ohos", not(any(unix, windows))))]
 pub(in crate::cli) fn opened_file_matches_path(
     _file: &std::fs::File,
     _opened: &std::fs::Metadata,
@@ -325,7 +343,7 @@ pub(in crate::cli) fn opened_file_matches_path(
     bail!("file identity is unsupported on this host; refusing verified source {path}")
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "cli-ohos", unix))]
 pub(in crate::cli) fn ensure_file_has_single_link(
     metadata: &std::fs::Metadata,
     path: &Utf8Path,
@@ -337,7 +355,7 @@ pub(in crate::cli) fn ensure_file_has_single_link(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "cli-ohos", windows))]
 pub(in crate::cli) fn ensure_file_has_single_link(
     _metadata: &std::fs::Metadata,
     path: &Utf8Path,
@@ -349,7 +367,7 @@ pub(in crate::cli) fn ensure_file_has_single_link(
     Ok(())
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(feature = "cli-ohos", not(any(unix, windows))))]
 pub(in crate::cli) fn ensure_file_has_single_link(
     _metadata: &std::fs::Metadata,
     path: &Utf8Path,
@@ -357,6 +375,7 @@ pub(in crate::cli) fn ensure_file_has_single_link(
     bail!("hardlink validation is unsupported on this host; refusing generator-owned file {path}")
 }
 
+#[cfg(feature = "cli-ohos")]
 impl InvocationDist {
     pub(in crate::cli) fn new(final_path: Utf8PathBuf) -> Result<Self> {
         let parent = final_path
@@ -432,6 +451,7 @@ impl InvocationDist {
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 fn copy_simple_staged_tree(source: &Utf8Path, destination: &Utf8Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(source)
         .with_context(|| format!("reading staged output source {source}"))?;
@@ -441,6 +461,7 @@ fn copy_simple_staged_tree(source: &Utf8Path, destination: &Utf8Path) -> Result<
     copy_dir_recursive(source, destination)
 }
 
+#[cfg(feature = "cli-ohos")]
 fn remove_simple_destination(path: &Utf8Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -456,6 +477,7 @@ fn remove_simple_destination(path: &Utf8Path) -> Result<()> {
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 fn replace_path_with_staged(
     source: &Utf8Path,
     destination: &Utf8Path,
@@ -474,6 +496,7 @@ fn replace_path_with_staged(
         .with_context(|| format!("publishing staged output {source} -> {destination}"))
 }
 
+#[cfg(feature = "cli-ohos")]
 fn nearest_existing_output_ancestor(path: &Utf8Path) -> Result<Utf8PathBuf> {
     let mut current = path;
     loop {
@@ -501,6 +524,7 @@ fn nearest_existing_output_ancestor(path: &Utf8Path) -> Result<Utf8PathBuf> {
 /// Copy every completed output into same-filesystem staging before the first
 /// public mutation, then replace destinations in deterministic order. A
 /// publication error is reported directly without auxiliary state.
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn publish_simple_output_set<'a>(
     outputs: impl IntoIterator<Item = (&'a Utf8Path, &'a Utf8Path, bool)>,
 ) -> Result<()> {
@@ -584,7 +608,7 @@ pub(in crate::cli) fn absolute_output_path(path: &Utf8Path) -> Result<Utf8PathBu
     Ok(cwd.join(path))
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "cli-ohos", unix))]
 pub(in crate::cli) fn sync_directory(path: &Utf8Path) -> Result<()> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -597,7 +621,7 @@ pub(in crate::cli) fn sync_directory(path: &Utf8Path) -> Result<()> {
         .with_context(|| format!("syncing directory {path}"))
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "cli-ohos", windows))]
 pub(in crate::cli) fn sync_directory(path: &Utf8Path) -> Result<()> {
     // Windows does not expose a portable directory-fsync operation. Payload
     // Individual payload files are flushed before publication.
@@ -605,7 +629,7 @@ pub(in crate::cli) fn sync_directory(path: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(feature = "cli-ohos", not(any(unix, windows))))]
 pub(in crate::cli) fn sync_directory(path: &Utf8Path) -> Result<()> {
     let _ = path;
     Ok(())
@@ -619,6 +643,7 @@ pub(in crate::cli) fn path_entry_exists(path: &Utf8Path) -> Result<bool> {
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::cli) struct HspOutputPaths {
     pub(crate) dist: Option<Utf8PathBuf>,
@@ -630,6 +655,7 @@ pub(in crate::cli) struct HspOutputPaths {
     pub(crate) usage: Utf8PathBuf,
 }
 
+#[cfg(feature = "cli-ohos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::cli) struct HspDestination {
     pub(in crate::cli) label: String,
@@ -637,6 +663,7 @@ pub(in crate::cli) struct HspDestination {
     pub(in crate::cli) is_directory: bool,
 }
 
+#[cfg(feature = "cli-ohos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::cli) struct InvocationOutputSpec {
     pub(crate) label: String,
@@ -644,6 +671,7 @@ pub(in crate::cli) struct InvocationOutputSpec {
     pub(crate) is_directory: bool,
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn hsp_output_destinations(
     outputs: &HspOutputPaths,
     package_label: &str,
@@ -675,6 +703,7 @@ pub(in crate::cli) fn hsp_output_destinations(
     destinations
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn normalize_hsp_destinations(
     outputs: &mut [HspOutputPaths],
     package_labels: &[String],
@@ -756,6 +785,7 @@ pub(in crate::cli) fn normalize_hsp_destinations(
     Ok(destinations)
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn filesystem_comparison_path(path: &Utf8Path) -> Utf8PathBuf {
     if cfg!(any(target_os = "macos", target_os = "windows")) {
         Utf8PathBuf::from(path.as_str().to_lowercase())
@@ -764,12 +794,14 @@ pub(in crate::cli) fn filesystem_comparison_path(path: &Utf8Path) -> Utf8PathBuf
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn output_paths_alias_or_overlap(left: &Utf8Path, right: &Utf8Path) -> bool {
     let left = filesystem_comparison_path(left);
     let right = filesystem_comparison_path(right);
     left == right || left.starts_with(&right) || right.starts_with(&left)
 }
 
+#[cfg(feature = "cli-ohos")]
 fn safe_internal_symlink_target(root: &Utf8Path, path: &Utf8Path) -> Result<Utf8PathBuf> {
     let target = std::fs::read_link(path)
         .with_context(|| format!("reading internal symlink target {path}"))?;
@@ -795,21 +827,25 @@ fn safe_internal_symlink_target(root: &Utf8Path, path: &Utf8Path) -> Result<Utf8
     Ok(target)
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) struct StagedHspOutputs {
     pub(in crate::cli) _staging: tempfile::TempDir,
     pub(in crate::cli) outputs: HspOutputPaths,
     pub(in crate::cli) staged: Vec<(Utf8PathBuf, Utf8PathBuf, bool)>,
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) struct PreparedHspPackage {
     pub(in crate::cli) _invocation_dist: InvocationDist,
     pub(in crate::cli) staged: StagedHspOutputs,
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) struct PreparedHspInvocation {
     pub(in crate::cli) prepared: Vec<PreparedHspPackage>,
 }
 
+#[cfg(feature = "cli-ohos")]
 impl PreparedHspInvocation {
     pub(crate) fn output_paths(&self) -> Vec<HspOutputPaths> {
         self.prepared
@@ -842,6 +878,7 @@ impl PreparedHspInvocation {
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn write_durable_file(path: &Utf8Path, bytes: &[u8]) -> Result<()> {
     if bytes.len() as u64 > MAX_HSP_ARCHIVE_COMPRESSED_BYTES {
         bail!(
@@ -866,6 +903,7 @@ pub(in crate::cli) fn write_durable_file(path: &Utf8Path, bytes: &[u8]) -> Resul
     Ok(())
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn ensure_member_file_matches(
     path: &Utf8Path,
     expected: &[u8],
@@ -882,6 +920,7 @@ pub(in crate::cli) fn ensure_member_file_matches(
     Ok(())
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn canonicalize_allow_missing(path: &Utf8Path) -> Result<Utf8PathBuf> {
     match path.canonicalize_utf8() {
         Ok(path) => Ok(path),
@@ -898,7 +937,7 @@ pub(in crate::cli) fn canonicalize_allow_missing(path: &Utf8Path) -> Result<Utf8
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "cli-ohos", windows))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::cli) struct WindowsFileInformation {
     pub(in crate::cli) identity: (u32, u64),
@@ -906,7 +945,7 @@ pub(in crate::cli) struct WindowsFileInformation {
     pub(in crate::cli) attributes: u32,
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "cli-ohos", windows))]
 pub(in crate::cli) fn windows_file_information_from_file(
     file: &std::fs::File,
 ) -> Result<WindowsFileInformation> {
@@ -933,7 +972,7 @@ pub(in crate::cli) fn windows_file_information_from_file(
     })
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "cli-ohos", windows))]
 pub(in crate::cli) fn windows_file_information(path: &Path) -> Result<WindowsFileInformation> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -1125,11 +1164,13 @@ pub(in crate::cli) fn canonicalize_invocation_output(path: &Utf8Path) -> Result<
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn copy_dir_recursive(src: &Utf8Path, dst: &Utf8Path) -> Result<()> {
     let mut budget = TraversalBudget::managed();
     copy_dir_recursive_with_budget(src, dst, &mut budget)
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn copy_dir_recursive_with_budget(
     src: &Utf8Path,
     dst: &Utf8Path,
@@ -1138,6 +1179,7 @@ pub(in crate::cli) fn copy_dir_recursive_with_budget(
     copy_dir_recursive_inner(src, src, dst, budget)
 }
 
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn copy_dir_recursive_inner(
     source_root: &Utf8Path,
     src: &Utf8Path,

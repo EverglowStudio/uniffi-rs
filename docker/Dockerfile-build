@@ -12,7 +12,9 @@ SHELL ["/bin/bash", "-exo", "pipefail", "-c"]
 # via https://github.com/CircleCI-Public/cimg-base/blob/28e038550d165a5e421a1ffada523ebe11ad525f/24.04/Dockerfile
 ENV DEBIAN_FRONTEND=noninteractive \
     TERM=dumb \
-    PAGER=cat
+    PAGER=cat \
+    NODE_VERSION=22.6.0 \
+    TYPESCRIPT_VERSION=5.9.3
 
 # Configure environment
 RUN echo 'APT::Get::Assume-Yes "true";' > /etc/apt/apt.conf.d/90circleci && \
@@ -48,6 +50,22 @@ RUN echo 'APT::Get::Assume-Yes "true";' > /etc/apt/apt.conf.d/90circleci && \
 	curl -sSL --fail --retry 3 --output /usr/local/bin/dockerize "https://github.com/powerman/dockerize/releases/download/v0.8.0/dockerize-linux-${dockerizeArch}" && \
 	chmod +x /usr/local/bin/dockerize && \
 	dockerize --version
+
+# The JavaScript conformance suite requires a stable Node/TypeScript pair.
+# Install the official Node distribution rather than relying on the base image
+# (which may carry an older distro package).
+RUN case "$(dpkg --print-architecture)" in \
+      amd64) NODE_ARCH=x64 ;; \
+      arm64) NODE_ARCH=arm64 ;; \
+      *) echo "unsupported Node.js architecture" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL --retry 3 --output /tmp/node.tar.xz \
+      "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" && \
+    tar -xJf /tmp/node.tar.xz --strip-components=1 -C /usr/local && \
+    rm /tmp/node.tar.xz && \
+    npm install --global --no-fund --no-audit "typescript@${TYPESCRIPT_VERSION}" && \
+    node --version && \
+    test "$(tsc --version)" = "Version ${TYPESCRIPT_VERSION}"
 
 ENV PATH=/home/circleci/bin:/home/circleci/.local/bin:$PATH \
 	LANG=en_US.UTF-8 \

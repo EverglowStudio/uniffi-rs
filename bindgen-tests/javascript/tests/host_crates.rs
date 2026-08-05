@@ -173,14 +173,10 @@ fn host_crates_napi_passes_cargo_check() {
     let tmp = tempfile::tempdir().unwrap();
     let (_out, host_dir) = generate_synthetic_with_host_crates(tmp.path());
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-napi");
-    let output = match run_cargo_check(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_passes_cargo_check: cargo unavailable: {e}");
-            return;
-        }
-    };
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
+    let output = run_cargo_check(&manifest, &[], &target_dir)
+        .expect("cargo is required for the N-API host crate check");
     if !output.status.success() {
         panic!(
             "cargo check on napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -188,6 +184,7 @@ fn host_crates_napi_passes_cargo_check() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+    drop(_target_lock);
 }
 
 #[test]
@@ -238,7 +235,8 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
     }
 
     let napi_manifest = host_dir.join("napi/Cargo.toml");
-    let napi_target = tmp.path().join("cargo-target-float32-napi");
+    let napi_target = shared_cargo_target_dir("native");
+    let _native_target_lock = shared_cargo_target_lock("native");
     let napi_output = run_cargo_check(&napi_manifest, &[], &napi_target)
         .expect("cargo must be available for the N-API f32 host regression");
     assert!(
@@ -249,14 +247,8 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
     );
 
     let target = "aarch64-unknown-linux-ohos";
-    let Some(target_libdir) = cargo_target_libdir(target)
-        .expect("the rustc selected by cargo must be available for the OHOS f32 host regression")
-    else {
-        eprintln!(
-            "SKIP host_crates_napi_and_ohos_compile_float32_record_fixture: {target} standard library is not installed for Cargo's rust toolchain"
-        );
-        return;
-    };
+    let target_libdir = cargo_target_libdir(target)
+        .expect("the OHOS Rust target must be installed for the f32 host regression");
     assert!(
         target_libdir.is_dir(),
         "Cargo's target libdir must exist before compiling the OHOS host: {}",
@@ -264,7 +256,7 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
     );
 
     let ohos_manifest = host_dir.join("ohos/Cargo.toml");
-    let ohos_target = tmp.path().join("cargo-target-float32-ohos");
+    let ohos_target = shared_cargo_target_dir("native");
     let ohos_output = run_cargo_check(&ohos_manifest, &["--target", target], &ohos_target)
         .expect("cargo must be available for the OHOS f32 host regression");
     assert!(
@@ -273,42 +265,24 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
         String::from_utf8_lossy(&ohos_output.stdout),
         String::from_utf8_lossy(&ohos_output.stderr),
     );
+    drop(_native_target_lock);
 }
 
 #[test]
 fn host_crates_wasm_passes_cargo_check() {
-    // Skip if wasm32 target not installed.
-    let probe = Command::new("rustc")
-        .args([
-            "--print",
-            "target-libdir",
-            "--target",
-            "wasm32-unknown-unknown",
-        ])
-        .output();
-    match probe {
-        Ok(o) if o.status.success() => {}
-        _ => {
-            eprintln!("SKIP host_crates_wasm_passes_cargo_check: wasm32-unknown-unknown target not installed");
-            return;
-        }
-    }
-
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let tmp = tempfile::tempdir().unwrap();
     let (_out, host_dir) = generate_synthetic_with_host_crates(tmp.path());
     let manifest = host_dir.join("wasm/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-wasm");
-    let output = match run_cargo_check(
+    let target_dir = shared_cargo_target_dir("wasm");
+    let _target_lock = shared_cargo_target_lock("wasm");
+    let output = run_cargo_check(
         &manifest,
         &["--target", "wasm32-unknown-unknown"],
         &target_dir,
-    ) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_wasm_passes_cargo_check: cargo unavailable: {e}");
-            return;
-        }
-    };
+    )
+    .expect("cargo is required for the Wasm host crate check");
     if !output.status.success() {
         panic!(
             "cargo check on wasm host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -316,6 +290,7 @@ fn host_crates_wasm_passes_cargo_check() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+    drop(_target_lock);
 }
 
 // ---------------------------------------------------------------------
@@ -368,36 +343,18 @@ fn wasm_flavor_host_passes_cargo_check() {
     let host_dir = generate_synthetic_gated(tmp.path(), vec![FlavorTarget::Wasm]);
     assert!(!host_dir.join("napi").exists());
 
-    // Skip if wasm32 target not installed.
-    let probe = Command::new("rustc")
-        .args([
-            "--print",
-            "target-libdir",
-            "--target",
-            "wasm32-unknown-unknown",
-        ])
-        .output();
-    match probe {
-        Ok(o) if o.status.success() => {}
-        _ => {
-            eprintln!("SKIP host_crates_wasm_only_passes_cargo_check: wasm32 target not installed");
-            return;
-        }
-    }
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
 
     let manifest = host_dir.join("wasm/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-wasm-only");
-    let output = match run_cargo_check(
+    let target_dir = shared_cargo_target_dir("wasm");
+    let _target_lock = shared_cargo_target_lock("wasm");
+    let output = run_cargo_check(
         &manifest,
         &["--target", "wasm32-unknown-unknown"],
         &target_dir,
-    ) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_wasm_only_passes_cargo_check: cargo unavailable: {e}");
-            return;
-        }
-    };
+    )
+    .expect("cargo is required for the wasm-only host crate check");
     if !output.status.success() {
         panic!(
             "cargo check on wasm-only host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -405,6 +362,7 @@ fn wasm_flavor_host_passes_cargo_check() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+    drop(_target_lock);
 }
 
 #[test]
@@ -426,14 +384,10 @@ fn host_crates_napi_compiles_temporal_fixture() {
     );
 
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-temporal-napi-check");
-    let output = match run_cargo_check(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_compiles_temporal_fixture: cargo unavailable: {e}");
-            return;
-        }
-    };
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
+    let output = run_cargo_check(&manifest, &[], &target_dir)
+        .expect("cargo is required for the temporal N-API host check");
     if !output.status.success() {
         panic!(
             "cargo check on temporal napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -441,6 +395,7 @@ fn host_crates_napi_compiles_temporal_fixture() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+    drop(_target_lock);
 
     let package_entry = std::fs::read_to_string(
         tmp.path()
@@ -524,14 +479,10 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
         "napi-derive must use the pinned napi-rs source with type-def, got:\n{cargo_toml}"
     );
 
-    let target_dir = tmp.path().join("cargo-target-napi-rich");
-    let output = match run_cargo_check(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_compiles_enum_callback_async_fixture: cargo unavailable: {e}");
-            return;
-        }
-    };
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
+    let output = run_cargo_check(&manifest, &[], &target_dir)
+        .expect("cargo is required for the rich N-API host check");
     if !output.status.success() {
         panic!(
             "cargo check on rich napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -539,6 +490,7 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+    drop(_target_lock);
 }
 
 #[test]
@@ -661,7 +613,8 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
         );
     }
 
-    let napi_target = forward_root.join("target-napi");
+    let napi_target = shared_cargo_target_dir("native");
+    let _native_target_lock = shared_cargo_target_lock("native");
     let host_feature_args = ["--features", "composite_core/host-gate"];
     let napi = run_cargo_check(
         &forward.host_manifest_path(&forward_hosts, "napi"),
@@ -675,8 +628,10 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
         String::from_utf8_lossy(&napi.stdout),
         String::from_utf8_lossy(&napi.stderr),
     );
+    drop(_native_target_lock);
 
-    let wasm_target = forward_root.join("target-wasm");
+    let wasm_target = shared_cargo_target_dir("wasm");
+    let _wasm_target_lock = shared_cargo_target_lock("wasm");
     let wasm = run_cargo_check(
         &forward.host_manifest_path(&forward_hosts, "wasm"),
         &[
@@ -694,8 +649,10 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
         String::from_utf8_lossy(&wasm.stdout),
         String::from_utf8_lossy(&wasm.stderr),
     );
+    drop(_wasm_target_lock);
 
-    let ohos_target = forward_root.join("target-ohos");
+    let ohos_target = shared_cargo_target_dir("native");
+    let _native_ohos_target_lock = shared_cargo_target_lock("native");
     let ohos = run_cargo_check(
         &forward.host_manifest_path(&forward_hosts, "ohos"),
         &[
@@ -713,6 +670,7 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
         String::from_utf8_lossy(&ohos.stdout),
         String::from_utf8_lossy(&ohos.stderr),
     );
+    drop(_native_ohos_target_lock);
 }
 
 fn regular_tree_snapshot(
@@ -896,7 +854,7 @@ pub fn generate_float32_record_hosts(root: &std::path::Path) -> (Utf8PathBuf, Ut
     .expect("float32 record host generation should succeed");
     (out_dir, host_dir)
 }
-pub fn cargo_target_libdir(target: &str) -> std::io::Result<Option<std::path::PathBuf>> {
+pub fn cargo_target_libdir(target: &str) -> std::io::Result<std::path::PathBuf> {
     let rustc = match std::env::var_os("RUSTC") {
         Some(value) if !value.is_empty() => std::path::PathBuf::from(value),
         _ => {
@@ -914,10 +872,19 @@ pub fn cargo_target_libdir(target: &str) -> std::io::Result<Option<std::path::Pa
         .args(["--print", "target-libdir", "--target", target])
         .output()?;
     if !output.status.success() {
-        return Ok(None);
+        return Err(std::io::Error::other(format!(
+            "rustc target-libdir probe failed for {target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
     let libdir = std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    Ok(libdir.is_dir().then_some(libdir))
+    if !libdir.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "rustc target-libdir is not a directory for {target}: {}",
+            libdir.display()
+        )));
+    }
+    Ok(libdir)
 }
 
 pub fn generate_synthetic_gated(root: &std::path::Path, flavors: Vec<FlavorTarget>) -> Utf8PathBuf {

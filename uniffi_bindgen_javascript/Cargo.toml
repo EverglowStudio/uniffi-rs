@@ -30,7 +30,8 @@ uniffi_js_facade = { path = "../uniffi_js_facade", version = "=0.32.0" }
 # never persist engine provenance.
 napi_uniffi_engine = { package = "napi-uniffi-engine", git = "https://github.com/EverglowStudio/napi-rs.git", rev = "5ba67e6891722898f2f1e0984ef5d192e0ccd983" }
 wasm_bindgen_uniffi_engine = { package = "wasm-bindgen-uniffi-engine", git = "https://github.com/EverglowStudio/wasm-bindgen.git", rev = "192d5272182776f8d5f7c605611414e2b4435701" }
-napi_ohos_uniffi_engine = { package = "napi-ohos-uniffi-engine", git = "https://github.com/EverglowStudio/ohos-rs.git", rev = "89a51a707d6a9ab1871e36b990987f58c9b3a6f7" }
+napi_ohos_uniffi_engine = { package = "napi-ohos-uniffi-engine", git = "https://github.com/EverglowStudio/ohos-rs.git", rev = "89a51a707d6a9ab1871e36b990987f58c9b3a6f7", optional = true }
 
 [features]
-default = []
+default = ["ohos"]
+ohos = ["dep:napi_ohos_uniffi_engine"]

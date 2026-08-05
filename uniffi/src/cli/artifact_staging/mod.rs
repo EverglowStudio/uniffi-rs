@@ -10,18 +10,24 @@ mod engine;
 pub(in crate::cli) mod engine;
 
 // Platform and artifact builders only see this explicit crate-private facade.
-#[cfg_attr(test, allow(unused_imports))]
 pub(in crate::cli) use engine::{
-    absolute_output_path, canonicalize_allow_missing, canonicalize_invocation_output,
-    copy_dir_recursive, ensure_file_has_single_link, ensure_member_file_matches,
-    normalize_hsp_destinations, path_entry_exists, publish_simple_output_set,
-    read_verified_regular_file, read_verified_regular_file_bounded, write_durable_file,
-    HspOutputPaths, InvocationDist, InvocationOutputSpec, ManagedPackageStage,
-    PreparedHspInvocation, PreparedHspPackage, StagedHspOutputs, TemporaryWorkspace,
-    MAX_HSP_ARCHIVE_COMPRESSED_BYTES, MAX_HSP_ARCHIVE_ENTRIES, MAX_HSP_ARCHIVE_MEMBER_BYTES,
-    MAX_HSP_ARCHIVE_PATH_BYTES, MAX_HSP_ARCHIVE_TOTAL_BYTES,
+    canonicalize_invocation_output, path_entry_exists, ManagedPackageStage, TemporaryWorkspace,
 };
 
-#[cfg(windows)]
-#[cfg_attr(test, allow(unused_imports))]
+#[cfg(all(feature = "cli-ohos", not(test)))]
+pub(in crate::cli) use engine::{
+    absolute_output_path, canonicalize_allow_missing, copy_dir_recursive,
+    ensure_file_has_single_link, ensure_member_file_matches, normalize_hsp_destinations,
+    read_verified_regular_file, read_verified_regular_file_bounded, write_durable_file,
+    InvocationDist, PreparedHspPackage, StagedHspOutputs, MAX_HSP_ARCHIVE_COMPRESSED_BYTES,
+    MAX_HSP_ARCHIVE_ENTRIES, MAX_HSP_ARCHIVE_MEMBER_BYTES, MAX_HSP_ARCHIVE_PATH_BYTES,
+    MAX_HSP_ARCHIVE_TOTAL_BYTES,
+};
+
+#[cfg(feature = "cli-ohos")]
+pub(in crate::cli) use engine::{
+    publish_simple_output_set, HspOutputPaths, InvocationOutputSpec, PreparedHspInvocation,
+};
+
+#[cfg(all(feature = "cli-ohos", windows))]
 pub(in crate::cli) use engine::windows_file_information;

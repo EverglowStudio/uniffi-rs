@@ -3,11 +3,12 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use super::javascript::{
-    build_napi_prepared, build_ohos_deferred_prepared, build_ohos_prepared, build_wasm_prepared,
-    cargo_build_command, emit_mini_program_wasm_runtime, generate_js,
-    run_command as javascript_run_command, BuildNapiArgs, BuildOhosArgs, BuildWasmArgs,
+    build_napi_prepared, build_wasm_prepared, cargo_build_command, emit_mini_program_wasm_runtime,
+    generate_js, run_command as javascript_run_command, BuildNapiArgs, BuildWasmArgs,
     NapiBuildFlavorArg, WasmBindgenTargetArg,
 };
+#[cfg(feature = "cli-ohos")]
+use super::javascript::{build_ohos_deferred_prepared, build_ohos_prepared, BuildOhosArgs};
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::MetadataCommand;
@@ -43,8 +44,7 @@ pub(crate) struct BuildArgs {
     #[clap(long, short)]
     out_dir: Option<Utf8PathBuf>,
 
-    /// Artifact target(s) to build: wasm, Mini Program, Node, Electron,
-    /// Harmony, Apple, and Android.
+    /// Artifact target(s) to build.
     #[clap(long = "target", value_enum)]
     target: Vec<ArtifactTargetArg>,
 
@@ -72,7 +72,7 @@ pub(crate) struct BuildArgs {
     /// Directory for built non-source artifacts. With it, wasm-bindgen output
     /// defaults to `<artifact-dir>/browser/pkg` and a composite Node/Electron
     /// addon to `<artifact-dir>/node/<host-stem>.node`; otherwise wasm uses
-    /// `<out-dir>/browser/pkg` and source-only output retains its local fallback.
+    /// `<out-dir>/browser/pkg`.
     #[clap(long = "artifact-dir")]
     artifact_dir: Option<Utf8PathBuf>,
 
@@ -88,8 +88,8 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     release: bool,
 
-    /// Cargo features enabled on the root package for native Apple, Android,
-    /// Harmony, and N-API artifacts. May be repeated or comma-separated.
+    /// Cargo features enabled on the root package for native artifacts.
+    /// May be repeated or comma-separated.
     #[clap(long = "cargo-feature", value_delimiter = ',')]
     cargo_features: Vec<String>,
 
@@ -126,7 +126,8 @@ pub(crate) struct BuildArgs {
     #[clap(long = "napi-target-dir")]
     napi_target_dir: Option<Utf8PathBuf>,
 
-    /// Cargo target directory for the generated wasm host build.
+    /// Cargo target directory for the generated wasm host build. In managed
+    /// mode this is an external cache root with `core` and `host` children.
     #[clap(long = "wasm-target-dir")]
     wasm_target_dir: Option<Utf8PathBuf>,
 
@@ -135,135 +136,169 @@ pub(crate) struct BuildArgs {
     wasm_core_target_dir: Option<Utf8PathBuf>,
 
     /// Output directory for built OHOS dist artifacts (intermediate native output).
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-dist-dir")]
     pub(super) ohos_dist_dir: Option<Utf8PathBuf>,
 
     /// OHPM package name for generated Harmony package metadata (HAR or HSP;
     /// supports scoped names like `@scope/name`).
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-package-name")]
     pub(super) ohos_package_name: Option<String>,
 
     /// Harmony module name override.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-module-name")]
     ohos_module_name: Option<String>,
 
     /// Semantic version override for generated Harmony package metadata.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-package-version")]
     ohos_package_version: Option<String>,
 
     /// Author override for generated Harmony package metadata.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-author")]
     ohos_author: Option<String>,
 
     /// SPDX license override for generated Harmony package metadata.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-license")]
     ohos_license: Option<String>,
 
     /// Description override for generated Harmony package metadata.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-description")]
     ohos_description: Option<String>,
 
     /// Minimum compatible Harmony/OpenHarmony SDK version. Must be explicit for final HAR/HSP packaging.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-compatible-sdk-version")]
     ohos_compatible_sdk_version: Option<String>,
 
     /// Target Harmony/OpenHarmony SDK version. Defaults to the resolved compile SDK.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-target-sdk-version")]
     ohos_target_sdk_version: Option<String>,
 
     /// Compatible SDK type, such as HarmonyOS or OpenHarmony.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-compatible-sdk-type")]
     ohos_compatible_sdk_type: Option<String>,
 
     /// Supported Harmony device type. May be repeated or comma-separated.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-device-type", value_delimiter = ',')]
     ohos_device_types: Vec<String>,
 
     /// Final Harmony package kind. HAR is the default; choose HSP explicitly.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-package-type", value_enum, default_value = "har")]
     pub(super) ohos_package_kind: super::ohos::PackageKind,
 
     /// Build an app-independent integrated HSP.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-integrated-hsp")]
     pub(super) ohos_integrated_hsp: bool,
 
     /// Host application bundleName for a non-integrated HSP.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-hsp-bundle-name")]
     ohos_hsp_bundle_name: Option<String>,
 
     /// Output `.har` path. Defaults to `<artifact-root>/<package>.har`.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-har-out")]
     pub(super) ohos_har_out: Option<Utf8PathBuf>,
 
     /// Standalone runtime HSP extracted from the release tgz.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-runtime-hsp-out")]
     pub(super) ohos_runtime_hsp_out: Option<Utf8PathBuf>,
 
     /// Standalone Interface HAR extracted from the release tgz.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-interface-har-out")]
     pub(super) ohos_interface_har_out: Option<Utf8PathBuf>,
 
     /// Original release tgz emitted by Hvigor assembleHsp.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-tgz-out")]
     pub(super) ohos_tgz_out: Option<Utf8PathBuf>,
 
     /// Hvigor wrapper used to build the final compiled HAR.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-hvigorw")]
     ohos_hvigorw: Option<String>,
 
     /// OHPM executable used to resolve and prepublish the final Harmony package.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-ohpm")]
     ohos_ohpm: Option<String>,
 
     /// DevEco SDK root used by the generated Hvigor project.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-deveco-sdk-home")]
     ohos_deveco_sdk_home: Option<Utf8PathBuf>,
 
     /// Skip final HAR packaging and keep only `dist/` intermediate outputs.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-no-har")]
     pub(super) ohos_no_har: bool,
 
     /// OHOS architecture alias for the built-in OHOS builder. Defaults to `aarch` and `x64`.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-arch")]
     ohos_arch: Vec<String>,
 
-    /// Cargo target directory for the generated OHOS host build.
+    /// Cargo target directory for the generated OHOS host build. In managed
+    /// mode this may be an external Cargo cache outside the package root.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-target-dir")]
     ohos_target_dir: Option<Utf8PathBuf>,
 
     /// Copy OHOS static `.a` libraries in addition to shared `.so` artifacts.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-static")]
     ohos_static: bool,
 
     /// Skip copying OHOS native libraries; still generate TypeScript declarations.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-skip-libs")]
     pub(super) ohos_skip_libs: bool,
 
     /// Skip OHOS napi package version checks.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-skip-check")]
     ohos_skip_check: bool,
 
     /// Use `cargo zigbuild` for OHOS host builds.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-zigbuild")]
     ohos_zigbuild: bool,
 
     /// Use HarmonyOS BiSheng toolchain paths for OHOS host builds.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-bisheng")]
     ohos_bisheng: bool,
 
     /// Package to build when the generated OHOS manifest is a workspace root.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-package")]
     ohos_package: Option<String>,
 
     /// Skip the check that candidate OHOS packages depend on napi-derive-ohos.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-skip-napi-check")]
     ohos_skip_napi_check: bool,
 
     /// SONAME linker value for the generated OHOS shared library.
+    #[cfg(feature = "cli-ohos")]
     #[clap(long = "ohos-soname")]
     ohos_soname: Option<String>,
 
     /// Additional cargo args passed to the OHOS host cargo build after `--`.
+    #[cfg(feature = "cli-ohos")]
     #[clap(last = true)]
     ohos_cargo_args: Vec<String>,
 
@@ -319,6 +354,7 @@ pub(crate) enum ArtifactTargetArg {
     MiniProgram,
     Node,
     Electron,
+    #[cfg(feature = "cli-ohos")]
     Harmony,
     Apple,
     Android,
@@ -333,6 +369,7 @@ struct ExpandedTargets {
     mini_program: bool,
     node: bool,
     electron: bool,
+    #[cfg(feature = "cli-ohos")]
     harmony: bool,
     apple: bool,
     android: bool,
@@ -398,20 +435,25 @@ impl ManagedLayout {
         if args.wasm_bindgen_out_dir.is_some() {
             bail!("--managed-layout derives --wasm-bindgen-out-dir; omit --wasm-bindgen-out-dir");
         }
+        #[cfg(feature = "cli-ohos")]
         if args.ohos_dist_dir.is_some() {
             bail!("--managed-layout derives --ohos-dist-dir; omit --ohos-dist-dir");
         }
+        #[cfg(feature = "cli-ohos")]
         if args.ohos_har_out.is_some() {
             bail!("--managed-layout derives --ohos-har-out; omit --ohos-har-out");
         }
+        #[cfg(feature = "cli-ohos")]
         if args.ohos_runtime_hsp_out.is_some() {
             bail!("--managed-layout derives --ohos-runtime-hsp-out; omit --ohos-runtime-hsp-out");
         }
+        #[cfg(feature = "cli-ohos")]
         if args.ohos_interface_har_out.is_some() {
             bail!(
                 "--managed-layout derives --ohos-interface-har-out; omit --ohos-interface-har-out"
             );
         }
+        #[cfg(feature = "cli-ohos")]
         if args.ohos_tgz_out.is_some() {
             bail!("--managed-layout derives --ohos-tgz-out; omit --ohos-tgz-out");
         }
@@ -451,6 +493,7 @@ impl ManagedLayout {
         args.host_crates_dir = Some(host_crates_root.clone());
         args.package_root = Some(package_dir.clone());
         args.artifact_dir = Some(artifact_root.clone());
+        #[cfg(feature = "cli-ohos")]
         if targets.harmony {
             args.ohos_dist_dir = Some(artifact_root.join("harmony/dist"));
             if !args.ohos_no_har {
@@ -672,19 +715,22 @@ fn managed_private_args(
         .as_deref()
         .map(rebase)
         .transpose()?;
-    private.ohos_dist_dir = public.ohos_dist_dir.as_deref().map(rebase).transpose()?;
-    private.ohos_har_out = public.ohos_har_out.as_deref().map(rebase).transpose()?;
-    private.ohos_runtime_hsp_out = public
-        .ohos_runtime_hsp_out
-        .as_deref()
-        .map(rebase)
-        .transpose()?;
-    private.ohos_interface_har_out = public
-        .ohos_interface_har_out
-        .as_deref()
-        .map(rebase)
-        .transpose()?;
-    private.ohos_tgz_out = public.ohos_tgz_out.as_deref().map(rebase).transpose()?;
+    #[cfg(feature = "cli-ohos")]
+    {
+        private.ohos_dist_dir = public.ohos_dist_dir.as_deref().map(rebase).transpose()?;
+        private.ohos_har_out = public.ohos_har_out.as_deref().map(rebase).transpose()?;
+        private.ohos_runtime_hsp_out = public
+            .ohos_runtime_hsp_out
+            .as_deref()
+            .map(rebase)
+            .transpose()?;
+        private.ohos_interface_har_out = public
+            .ohos_interface_har_out
+            .as_deref()
+            .map(rebase)
+            .transpose()?;
+        private.ohos_tgz_out = public.ohos_tgz_out.as_deref().map(rebase).transpose()?;
+    }
     private.apple_xcframework_out = public
         .apple_xcframework_out
         .as_deref()
@@ -704,12 +750,47 @@ fn managed_private_args(
     private.android_aar_out = public.android_aar_out.as_deref().map(rebase).transpose()?;
     private.package_dir = Some(stage.root().to_path_buf());
     let build_root = stage.root().join("target");
-    private.napi_target_dir = (targets.node || targets.electron).then(|| build_root.join("napi"));
-    private.wasm_core_target_dir =
-        (targets.wasm || targets.mini_program).then(|| build_root.join("wasm/core"));
-    private.wasm_target_dir =
-        (targets.wasm || targets.mini_program).then(|| build_root.join("wasm/host"));
-    private.ohos_target_dir = targets.harmony.then(|| build_root.join("ohos"));
+    private.napi_target_dir = if targets.node || targets.electron {
+        Some(managed_external_cache_dir(
+            public.napi_target_dir.as_deref(),
+            build_root.join("napi"),
+            &layout.package_dir,
+            "N-API",
+        )?)
+    } else {
+        None
+    };
+    if targets.wasm || targets.mini_program {
+        if let Some(cache_root) = public.wasm_target_dir.as_deref() {
+            let cache_root = managed_external_cache_dir(
+                Some(cache_root),
+                build_root.join("wasm"),
+                &layout.package_dir,
+                "Wasm",
+            )?;
+            private.wasm_core_target_dir = Some(cache_root.join("core"));
+            private.wasm_target_dir = Some(cache_root.join("host"));
+        } else {
+            private.wasm_core_target_dir = Some(build_root.join("wasm/core"));
+            private.wasm_target_dir = Some(build_root.join("wasm/host"));
+        }
+    } else {
+        private.wasm_core_target_dir = None;
+        private.wasm_target_dir = None;
+    }
+    #[cfg(feature = "cli-ohos")]
+    {
+        private.ohos_target_dir = if targets.harmony {
+            Some(managed_external_cache_dir(
+                public.ohos_target_dir.as_deref(),
+                build_root.join("ohos"),
+                &layout.package_dir,
+                "OHOS",
+            )?)
+        } else {
+            None
+        };
+    }
     // Generated host manifests are rendered once in the staging tree.  Their
     // dependency paths must point at the eventual package-relative host root,
     // never at the invocation-private staging directory.
@@ -718,12 +799,40 @@ fn managed_private_args(
     Ok(private)
 }
 
+/// Managed outputs are staged as one package, but Cargo's ordinary target
+/// cache is not a public package output.  Honour an explicit cache directory
+/// only when it is disjoint from the managed root; otherwise a failed build
+/// could mutate the currently published package before staging completes.
+fn managed_external_cache_dir(
+    explicit: Option<&Utf8Path>,
+    fallback: Utf8PathBuf,
+    package_dir: &Utf8Path,
+    label: &str,
+) -> Result<Utf8PathBuf> {
+    let Some(explicit) = explicit else {
+        return Ok(fallback);
+    };
+    let cache = canonicalize_invocation_output(explicit)
+        .with_context(|| format!("resolving managed {label} Cargo cache {explicit}"))?;
+    let package = canonicalize_invocation_output(package_dir)
+        .with_context(|| format!("resolving managed package root {package_dir}"))?;
+    if cache == package || cache.starts_with(&package) || package.starts_with(&cache) {
+        bail!(
+            "managed {label} Cargo cache must be disjoint from the managed package root: \
+             cache={cache}, package={package}"
+        );
+    }
+    Ok(cache)
+}
+
+#[cfg(feature = "cli-ohos")]
 struct InvocationMirror {
     _workspace: super::artifact_staging::TemporaryWorkspace,
     root: Utf8PathBuf,
     build_root: Utf8PathBuf,
 }
 
+#[cfg(feature = "cli-ohos")]
 impl InvocationMirror {
     fn new() -> Result<Self> {
         let workspace =
@@ -759,6 +868,7 @@ impl InvocationMirror {
         Ok(mapped)
     }
 }
+#[cfg(feature = "cli-ohos")]
 pub(in crate::cli) fn harmony_archive_stem(package_name: &str) -> Result<String> {
     super::ohos::validate_oh_package_name(package_name)?;
     Ok(package_name.trim_start_matches('@').replace('/', "-"))
@@ -770,6 +880,7 @@ pub(crate) fn run(args: ArtifactsArgs) -> Result<()> {
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 fn ensure_explicit_generated_hsp_outputs(
     args: &mut BuildArgs,
 ) -> Result<super::artifact_staging::HspOutputPaths> {
@@ -832,6 +943,7 @@ fn ensure_explicit_generated_hsp_outputs(
     Ok(outputs)
 }
 
+#[cfg(feature = "cli-ohos")]
 fn invocation_output_specs(
     args: &BuildArgs,
     targets: &ExpandedTargets,
@@ -874,6 +986,7 @@ fn invocation_output_specs(
     if targets.node || targets.electron {
         add_host("napi", true);
     }
+    #[cfg(feature = "cli-ohos")]
     if targets.harmony {
         add_host("ohos", true);
     }
@@ -891,6 +1004,7 @@ fn invocation_output_specs(
     if targets.node || targets.electron {
         add_native("node");
     }
+    #[cfg(feature = "cli-ohos")]
     if targets.harmony {
         add_native("ohos");
     }
@@ -960,6 +1074,7 @@ fn invocation_output_specs(
     Ok(outputs)
 }
 
+#[cfg(feature = "cli-ohos")]
 fn mirror_build_args(
     public: &BuildArgs,
     mirror: &InvocationMirror,
@@ -986,7 +1101,10 @@ fn mirror_build_args(
     let consumes_wasm = targets.wasm || targets.mini_program;
     private.wasm_core_target_dir = consumes_wasm.then(|| mirror.build_root.join("wasm/core"));
     private.wasm_target_dir = consumes_wasm.then(|| mirror.build_root.join("wasm/host"));
-    private.ohos_target_dir = targets.harmony.then(|| mirror.build_root.join("ohos"));
+    #[cfg(feature = "cli-ohos")]
+    {
+        private.ohos_target_dir = targets.harmony.then(|| mirror.build_root.join("ohos"));
+    }
     private.apple_xcframework_out = public
         .apple_xcframework_out
         .as_deref()
@@ -1017,16 +1135,20 @@ fn mirror_build_args(
         .as_deref()
         .map(|path| mirror.map(path))
         .transpose()?;
-    // HSP destinations intentionally remain the public immutable plan. The
-    // OHOS builder returns deferred staged outputs and does not mutate them.
-    private.ohos_dist_dir = public.ohos_dist_dir.clone();
-    private.ohos_runtime_hsp_out = public.ohos_runtime_hsp_out.clone();
-    private.ohos_interface_har_out = public.ohos_interface_har_out.clone();
-    private.ohos_tgz_out = public.ohos_tgz_out.clone();
+    #[cfg(feature = "cli-ohos")]
+    {
+        // HSP destinations intentionally remain the public immutable plan. The
+        // OHOS builder returns deferred staged outputs and does not mutate them.
+        private.ohos_dist_dir = public.ohos_dist_dir.clone();
+        private.ohos_runtime_hsp_out = public.ohos_runtime_hsp_out.clone();
+        private.ohos_interface_har_out = public.ohos_interface_har_out.clone();
+        private.ohos_tgz_out = public.ohos_tgz_out.clone();
+    }
     private.managed_layout = false;
     Ok(private)
 }
 
+#[cfg(feature = "cli-ohos")]
 fn private_output_sources(
     public: &BuildArgs,
     private: &BuildArgs,
@@ -1128,6 +1250,7 @@ fn private_output_sources(
     Ok(sources)
 }
 
+#[cfg(feature = "cli-ohos")]
 fn build_multi_target_hsp(mut public_args: BuildArgs, targets: ExpandedTargets) -> Result<()> {
     super::ohos::preflight_hsp_arches(&public_args.ohos_arch)
         .context("validating Harmony HSP architectures before publication planning")?;
@@ -1212,6 +1335,7 @@ fn prepare_javascript_package(
     if targets.electron {
         flavors.push(FlavorTarget::Electron);
     }
+    #[cfg(feature = "cli-ohos")]
     if targets.harmony {
         flavors.push(FlavorTarget::Harmony);
     }
@@ -1286,7 +1410,9 @@ fn build_private_target_set(
     targets: &ExpandedTargets,
     package: &GeneratedPackage,
 ) -> Result<()> {
+    #[cfg(feature = "cli-ohos")]
     let hsp_first = targets.harmony && args.ohos_package_kind == super::ohos::PackageKind::Hsp;
+    #[cfg(feature = "cli-ohos")]
     if hsp_first {
         build_ohos_deferred_prepared(args.to_ohos_args()?, package)
             .context("building private managed Harmony HSP outputs")?
@@ -1325,6 +1451,7 @@ fn build_private_target_set(
         build_napi_prepared(args.to_napi_args(flavors)?, package)
             .context("building private managed N-API target")?;
     }
+    #[cfg(feature = "cli-ohos")]
     if targets.harmony && !hsp_first {
         build_ohos_prepared(args.to_ohos_args()?, package)
             .context("building private managed Harmony target")?;
@@ -1381,6 +1508,7 @@ fn build(mut args: BuildArgs) -> Result<()> {
         preflight_android_toolchain(&args)
             .context("preflighting Android toolchain before target generation")?;
     }
+    #[cfg(feature = "cli-ohos")]
     if targets.harmony {
         super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
             package_kind: args.ohos_package_kind,
@@ -1405,23 +1533,29 @@ fn build(mut args: BuildArgs) -> Result<()> {
     if let Some(layout) = managed_layout {
         return build_managed_package(args, targets, layout);
     }
+    #[cfg(feature = "cli-ohos")]
     if targets.harmony && args.ohos_package_kind == super::ohos::PackageKind::Hsp {
         return build_multi_target_hsp(args, targets);
     }
     (|| -> Result<()> {
-        let javascript_package = if targets.wasm
-            || targets.mini_program
-            || targets.node
-            || targets.electron
-            || targets.harmony
-        {
-            Some(
-                prepare_javascript_package(&args, &targets)
-                    .context("preparing one JavaScript package for the artifact invocation")?,
-            )
-        } else {
-            None
-        };
+        let javascript_package =
+            if targets.wasm || targets.mini_program || targets.node || targets.electron {
+                Some(
+                    prepare_javascript_package(&args, &targets)
+                        .context("preparing one JavaScript package for the artifact invocation")?,
+                )
+            } else {
+                None
+            };
+        #[cfg(feature = "cli-ohos")]
+        let javascript_package =
+            if targets.harmony {
+                Some(prepare_javascript_package(&args, &targets).context(
+                    "preparing one JavaScript package for the Harmony artifact invocation",
+                )?)
+            } else {
+                javascript_package
+            };
         if targets.apple {
             build_apple(&args).context("building Apple artifact target")?;
         }
@@ -1466,6 +1600,7 @@ fn build(mut args: BuildArgs) -> Result<()> {
             )
             .context("building N-API artifact target")?;
         }
+        #[cfg(feature = "cli-ohos")]
         if targets.harmony {
             build_ohos_prepared(
                 args.to_ohos_args()?,
@@ -1486,17 +1621,20 @@ fn validate_package_root_paths(args: &BuildArgs) -> Result<()> {
         ("host crates", Some(args.host_crates_dir())),
         ("artifact", args.artifact_dir.clone()),
         ("wasm-bindgen", args.wasm_bindgen_out_dir.clone()),
-        ("OHOS dist", args.ohos_dist_dir.clone()),
-        ("OHOS HAR", args.ohos_har_out.clone()),
-        ("OHOS runtime HSP", args.ohos_runtime_hsp_out.clone()),
-        ("OHOS interface HAR", args.ohos_interface_har_out.clone()),
-        ("OHOS tgz", args.ohos_tgz_out.clone()),
         ("Apple XCFramework", args.apple_xcframework_out.clone()),
         ("Apple Swift", args.apple_swift_out.clone()),
         ("Android JNI", args.android_jni_libs_out.clone()),
         ("Android Kotlin", args.android_kotlin_out.clone()),
         ("Android AAR", args.android_aar_out.clone()),
     ];
+    #[cfg(feature = "cli-ohos")]
+    outputs.extend([
+        ("OHOS dist", args.ohos_dist_dir.clone()),
+        ("OHOS HAR", args.ohos_har_out.clone()),
+        ("OHOS runtime HSP", args.ohos_runtime_hsp_out.clone()),
+        ("OHOS interface HAR", args.ohos_interface_har_out.clone()),
+        ("OHOS tgz", args.ohos_tgz_out.clone()),
+    ]);
     for (label, path) in outputs
         .drain(..)
         .filter_map(|(label, path)| path.map(|p| (label, p)))
@@ -1851,6 +1989,7 @@ fn expand_targets(targets: &[ArtifactTargetArg]) -> Result<ExpandedTargets> {
             ArtifactTargetArg::MiniProgram => expanded.mini_program = true,
             ArtifactTargetArg::Node => expanded.node = true,
             ArtifactTargetArg::Electron => expanded.electron = true,
+            #[cfg(feature = "cli-ohos")]
             ArtifactTargetArg::Harmony => expanded.harmony = true,
             ArtifactTargetArg::Apple => expanded.apple = true,
             ArtifactTargetArg::Android => expanded.android = true,
@@ -1859,14 +1998,20 @@ fn expand_targets(targets: &[ArtifactTargetArg]) -> Result<ExpandedTargets> {
                 expanded.mini_program = true;
                 expanded.node = true;
                 expanded.electron = true;
-                expanded.harmony = true;
+                #[cfg(feature = "cli-ohos")]
+                {
+                    expanded.harmony = true;
+                }
             }
             ArtifactTargetArg::All => {
                 expanded.wasm = true;
                 expanded.mini_program = true;
                 expanded.node = true;
                 expanded.electron = true;
-                expanded.harmony = true;
+                #[cfg(feature = "cli-ohos")]
+                {
+                    expanded.harmony = true;
+                }
                 expanded.apple = true;
                 expanded.android = true;
             }
@@ -1970,6 +2115,7 @@ impl BuildArgs {
         })
     }
 
+    #[cfg(feature = "cli-ohos")]
     fn to_ohos_args(&self) -> Result<BuildOhosArgs> {
         Ok(BuildOhosArgs {
             manifest_path: self.manifest_path.clone(),

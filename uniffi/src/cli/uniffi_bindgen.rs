@@ -2,14 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use super::{artifacts, javascript};
+#[cfg(feature = "cli-javascript")]
+use super::artifacts;
+#[cfg(feature = "cli-javascript")]
+use super::javascript;
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::fmt;
 use uniffi_bindgen::{
     bindings::{generate, python, GenerateOptions, TargetLanguage},
-    BindgenLoader, BindgenPaths, GlobalConfig,
+    BindgenLoader, GlobalConfig,
 };
+#[cfg(feature = "cli-javascript")]
 use uniffi_bindgen_javascript::{FlavorTarget, GenerateJsOptions, HostCrateOptions};
 use uniffi_pipeline::PrintOptions;
 
@@ -20,6 +24,7 @@ enum TargetLanguageArg {
     Swift,
     Python,
     Ruby,
+    #[cfg(feature = "cli-javascript")]
     Javascript,
 }
 
@@ -30,6 +35,7 @@ impl fmt::Display for TargetLanguageArg {
             Self::Swift => write!(f, "swift"),
             Self::Python => write!(f, "python"),
             Self::Ruby => write!(f, "ruby"),
+            #[cfg(feature = "cli-javascript")]
             Self::Javascript => write!(f, "javascript"),
         }
     }
@@ -42,6 +48,7 @@ impl From<TargetLanguageArg> for TargetLanguage {
             TargetLanguageArg::Swift => Self::Swift,
             TargetLanguageArg::Python => Self::Python,
             TargetLanguageArg::Ruby => Self::Ruby,
+            #[cfg(feature = "cli-javascript")]
             TargetLanguageArg::Javascript => Self::Javascript,
         }
     }
@@ -51,20 +58,24 @@ impl From<TargetLanguageArg> for TargetLanguage {
 ///
 /// `electron` is not a standalone ABI — it consumes the napi flavor and
 /// additionally emits `preload.cjs` + `index.js`.
+#[cfg(feature = "cli-javascript")]
 #[derive(Copy, Clone, ValueEnum)]
 enum JsFlavorArg {
     Wasm,
     Napi,
     Electron,
+    #[cfg(feature = "cli-ohos")]
     Harmony,
 }
 
+#[cfg(feature = "cli-javascript")]
 impl From<JsFlavorArg> for FlavorTarget {
     fn from(value: JsFlavorArg) -> Self {
         match value {
             JsFlavorArg::Wasm => FlavorTarget::Wasm,
             JsFlavorArg::Napi => FlavorTarget::Napi,
             JsFlavorArg::Electron => FlavorTarget::Electron,
+            #[cfg(feature = "cli-ohos")]
             JsFlavorArg::Harmony => FlavorTarget::Harmony,
         }
     }
@@ -94,6 +105,7 @@ enum Commands {
         /// JavaScript target flavor(s) to emit. Only meaningful when
         /// `--language javascript` is passed. May be repeated.
         /// `electron` implies `napi` plus preload+renderer files.
+        #[cfg(feature = "cli-javascript")]
         #[clap(long = "flavor", value_enum)]
         js_flavor: Vec<JsFlavorArg>,
 
@@ -135,17 +147,20 @@ enum Commands {
         /// Downstream core crate `Cargo.toml` used to derive host-crate
         /// metadata (package name, path dependency target). Required for
         /// JavaScript generation.
+        #[cfg(feature = "cli-javascript")]
         #[clap(long = "manifest-path")]
         manifest_path: Option<Utf8PathBuf>,
 
         /// Directory (default `<out-dir>/native/hosts`) in which to emit
         /// generated host crates. It must remain below the package root.
+        #[cfg(feature = "cli-javascript")]
         #[clap(long = "host-crates-dir")]
         host_crates_dir: Option<Utf8PathBuf>,
 
         /// Directory used by generated JavaScript backend entrypoints as the
         /// default location for built non-source artifacts such as `.node`
         /// addons. Only meaningful with `--language javascript`.
+        #[cfg(feature = "cli-javascript")]
         #[clap(long = "artifact-dir")]
         artifact_dir: Option<Utf8PathBuf>,
 
@@ -192,9 +207,11 @@ enum Commands {
     Pipeline(PipelineArgs),
 
     /// JavaScript-target-specific workflows
+    #[cfg(feature = "cli-javascript")]
     Javascript(javascript::JavascriptArgs),
 
     /// Build final artifacts for UniFFI consumer targets
+    #[cfg(feature = "cli-javascript")]
     Artifacts(artifacts::ArtifactsArgs),
 }
 
@@ -248,6 +265,7 @@ pub fn run_main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Generate {
             language,
+            #[cfg(feature = "cli-javascript")]
             js_flavor,
             out_dir,
             no_format,
@@ -259,8 +277,11 @@ pub fn run_main() -> anyhow::Result<()> {
             no_default_features,
             all_features,
             target,
+            #[cfg(feature = "cli-javascript")]
             manifest_path,
+            #[cfg(feature = "cli-javascript")]
             host_crates_dir,
+            #[cfg(feature = "cli-javascript")]
             artifact_dir,
             ..
         } => {
@@ -270,15 +291,10 @@ pub fn run_main() -> anyhow::Result<()> {
             let out_dir =
                 out_dir.expect("--out-dir is required when generating {language} bindings");
 
-            // Split Javascript off: it's emitted by a standalone crate with
-            // its own option shape (flavors + electron consumption form).
-            let (js_langs, other_langs): (Vec<_>, Vec<_>) = language
-                .into_iter()
-                .partition(|l| matches!(l, TargetLanguageArg::Javascript));
-
-            if !other_langs.is_empty() {
+            #[cfg(not(feature = "cli-javascript"))]
+            {
                 generate(GenerateOptions {
-                    languages: other_langs.into_iter().map(TargetLanguage::from).collect(),
+                    languages: language.into_iter().map(TargetLanguage::from).collect(),
                     out_dir: out_dir.clone(),
                     source: source.clone(),
                     config_override: config.clone(),
@@ -292,17 +308,50 @@ pub fn run_main() -> anyhow::Result<()> {
                 })?;
             }
 
-            if !js_langs.is_empty() {
+            #[cfg(feature = "cli-javascript")]
+            {
+                // Split Javascript off: it is emitted by a standalone crate
+                // with its own option shape (flavors + electron consumption
+                // form).
+                let (js_langs, other_langs): (Vec<_>, Vec<_>) = language
+                    .into_iter()
+                    .partition(|l| matches!(l, TargetLanguageArg::Javascript));
+
+                if !other_langs.is_empty() {
+                    generate(GenerateOptions {
+                        languages: other_langs.into_iter().map(TargetLanguage::from).collect(),
+                        out_dir: out_dir.clone(),
+                        source: source.clone(),
+                        config_override: config.clone(),
+                        crate_filter: crate_name.clone(),
+                        metadata_no_deps,
+                        format: !no_format,
+                        features: features.clone(),
+                        all_features,
+                        no_default_features,
+                        target: target.clone(),
+                    })?;
+                }
+
+                if js_langs.is_empty() {
+                    return Ok(());
+                }
                 if js_flavor.is_empty() {
+                    #[cfg(feature = "cli-ohos")]
                     anyhow::bail!(
                         "--flavor is required when --language javascript is set \
                          (pick one or more of: wasm, napi, electron, harmony)"
+                    );
+                    #[cfg(not(feature = "cli-ohos"))]
+                    anyhow::bail!(
+                        "--flavor is required when --language javascript is set \
+                         (pick one or more of: wasm, napi, electron)"
                     );
                 }
                 let manifest = manifest_path.clone().ok_or_else(|| {
                     anyhow::anyhow!("--language javascript requires --manifest-path <Cargo.toml>")
                 })?;
-                let mut paths = BindgenPaths::default();
+                let mut paths = uniffi_bindgen::BindgenPaths::default();
                 let global_config = if let Some(cfg) = &config {
                     let (global_config, crate_roots_layer) = GlobalConfig::from_file(cfg)?;
                     if let Some(layer) = crate_roots_layer {
@@ -342,10 +391,16 @@ pub fn run_main() -> anyhow::Result<()> {
                     },
                 )?;
             }
+            #[cfg(feature = "cli-javascript")]
+            // The cfg block above owns the return path only for the JS build;
+            // keep the outer match arm fallible without an early process exit.
+            let _ = ();
         }
+        #[cfg(feature = "cli-javascript")]
         Commands::Javascript(args) => {
             javascript::run(args)?;
         }
+        #[cfg(feature = "cli-javascript")]
         Commands::Artifacts(args) => {
             artifacts::run(args)?;
         }

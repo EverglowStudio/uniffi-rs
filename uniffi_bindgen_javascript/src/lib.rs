@@ -4,21 +4,38 @@
 
 //! First-class JavaScript/TypeScript bindings generator for uniffi-rs.
 //!
-//! This crate emits one high-level TypeScript API per generated component plus
-//! one shared runtime, with flavor-specific backend adapters (wasm, N-API,
-//! and OHOS) that satisfy a shared low-level FFI contract. Electron preload +
-//! renderer facades are emitted as a consumption form of the N-API flavor.
+//! This crate prepares one complete package for the selected targets. The
+//! shared facade emits one JavaScript/declaration pair per component, the
+//! platform entrypoints create one `BackendSession`, and the host planner
+//! emits the matching native adapter and Cargo project in the same package.
+//! Wasm, N-API, Electron, and OHOS adapters satisfy the same low-level
+//! contract; Electron preload and renderer files are the N-API consumption
+//! form.
 //!
 //! See `docs/manual/src/javascript/contract.md` for the stable contract
-//! these emitters target.
+//! for the generated package and runtime contract.
 //!
 //! ```text
 //! generated/
 //!   shared/uniffi_runtime.js
-//!   components/<namespace>/common/
-//!   components/<namespace>/{browser,node,electron,harmony}/
-//!   {browser,node,electron,harmony}/index.js
+//!   shared/uniffi_runtime.d.ts
+//!   components/<namespace>/index.js
+//!   components/<namespace>/index.d.ts
+//!   browser/{backend.js,index.js,index.d.ts}
+//!   node/{index.js,index.d.ts}
+//!   electron/{preload.cjs,index.js,index.d.ts}
+//!   Index.ets
+//!   Index.d.ets
+//!   native/{index.d.ts,wasm.rs,node.rs,ohos.rs}
+//!   native/hosts/{wasm,napi,ohos}/
 //! ```
+//!
+//! `GeneratedPackage::prepare` and `GeneratedPackage::write_to` are the
+//! package boundary. The public facade and host files are held in memory until
+//! one write; platform readers use these fixed paths and do not parse a
+//! generated inventory file. An external `wasm-bindgen` executable is not a
+//! generation or test prerequisite: Wasm post-link uses the in-process pinned
+//! `wasm-bindgen-cli-support` engine.
 
 use std::collections::BTreeMap;
 
@@ -39,9 +56,11 @@ pub use host_crates::HostCrateOptions;
 pub struct GenerateJsOptions {
     /// Path to a UDL file or compiled cdylib accepted by the UniFFI loader.
     pub source: Utf8PathBuf,
-    /// Output directory. Component sources live below
-    /// `components/<namespace>/`; each requested flavor also gets one stable,
-    /// namespace-only root entrypoint.
+    /// Output directory for the generated public files. With the package root
+    /// itself as `out_dir`, component files are written to
+    /// `components/<namespace>/index.js` and `.d.ts`; platform entrypoints use
+    /// the fixed `browser/`, `node/`, `electron/`, and package-root Harmony
+    /// paths. A source prefix such as `src/ffi` applies to public files only.
     pub out_dir: Utf8PathBuf,
     /// Root of the complete generated package. `out_dir` must be this root
     /// or a descendant; generated source/native files are published below
@@ -61,9 +80,11 @@ pub struct GenerateJsOptions {
     /// Which flavors / consumption forms to emit.
     pub flavors: Vec<FlavorTarget>,
     /// Host-crate plan for the atomic package. Generation publishes the
-    /// selected `native/hosts/{wasm,napi,ohos}` projects together with its
-    /// source and native bridge files. Source-only generation has no public
-    /// option because a generated package is always an atomic host package.
+    /// selected `native/hosts/{wasm,napi,ohos}` projects together with
+    /// `native/{wasm,node,ohos}.rs` and the public facade files. A generated
+    /// package always publishes the selected host and public files as one
+    /// unit; later build steps consume the frozen `HostBuildSpec` values
+    /// rather than re-reading generated source.
     pub host_crates: HostCrateOptions,
 }
 

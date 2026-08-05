@@ -9,64 +9,13 @@ mod support;
 mod shared;
 
 use shared::*;
-use support::{CompositeFixture, CANONICAL_COMPONENTS};
+use support::{
+    shared_cargo_target_dir, shared_cargo_target_lock, workspace_root, CompositeFixture,
+    CANONICAL_COMPONENTS,
+};
 
 use camino::Utf8PathBuf;
 use std::process::Command;
-
-fn workspace_root() -> Utf8PathBuf {
-    let manifest = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.join("../..").canonicalize_utf8().unwrap()
-}
-
-fn which_tool(name: &str) -> Option<std::path::PathBuf> {
-    let output = Command::new("which").arg(name).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.into())
-    }
-}
-
-fn has_wasm32_target(cargo: &std::path::Path) -> bool {
-    if let Ok(out) = Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).contains("wasm32-unknown-unknown");
-        }
-    }
-    let _ = cargo;
-    true
-}
-
-fn build_uniffi_bindgen(root: &Utf8PathBuf, cargo: &std::path::Path) {
-    let output = Command::new(cargo)
-        .current_dir(root.as_std_path())
-        .args([
-            "build",
-            "-p",
-            "uniffi",
-            "--features",
-            "cli",
-            "--bin",
-            "uniffi-bindgen",
-        ])
-        .output()
-        .expect("failed to build uniffi-bindgen");
-    if !output.status.success() {
-        panic!(
-            "building uniffi-bindgen failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-}
 
 fn write_cli_wasm_fixture(root: &std::path::Path) -> Utf8PathBuf {
     let crate_dir = root.join("cli_wasm_fixture");
@@ -120,20 +69,14 @@ fn write_cli_wasm_fixture(root: &std::path::Path) -> Utf8PathBuf {
 
 #[test]
 fn cli_build_wasm_orchestrates_synthetic_fixture() {
-    let cargo = which_tool("cargo").expect("CLI wasm orchestration requires cargo on PATH");
-    assert!(
-        has_wasm32_target(&cargo),
-        "CLI wasm orchestration requires wasm32-unknown-unknown target"
-    );
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let root = workspace_root();
-    build_uniffi_bindgen(&root, &cargo);
-
-    let cli = root.join(if cfg!(windows) {
-        "target/debug/uniffi-bindgen.exe"
-    } else {
-        "target/debug/uniffi-bindgen"
-    });
-    assert!(cli.exists(), "expected built CLI at {cli}");
+    let cli = build_uniffi_bindgen_cli(&cargo);
+    let target_root = shared_cargo_target_dir("cli");
+    let wasm_core_target_dir = target_root.join("wasm-core");
+    let wasm_target_dir = target_root.join("wasm-host");
+    let _target_lock = shared_cargo_target_lock("cli");
 
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
@@ -143,6 +86,7 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
 
     let output = Command::new(cli.as_std_path())
         .current_dir(&root)
+        .env("CARGO_TARGET_DIR", target_root.as_std_path())
         .arg("javascript")
         .arg("build-wasm")
         .arg("--manifest-path")
@@ -153,6 +97,10 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
         .arg(host_dir.as_str())
         .arg("--wasm-bindgen-out-dir")
         .arg(pkg_dir.as_str())
+        .arg("--core-target-dir")
+        .arg(wasm_core_target_dir.as_str())
+        .arg("--target-dir")
+        .arg(wasm_target_dir.as_str())
         .output()
         .expect("failed to invoke uniffi-bindgen javascript build-wasm");
     if !output.status.success() {
@@ -255,19 +203,10 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
 
 #[test]
 fn cli_artifacts_wasm_and_mini_orchestrate_two_components_without_feature_flags() {
-    let cargo =
-        which_tool("cargo").expect("two-component CLI wasm orchestration requires cargo on PATH");
-    assert!(
-        has_wasm32_target(&cargo),
-        "two-component CLI wasm orchestration requires wasm32-unknown-unknown"
-    );
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let root = workspace_root();
-    build_uniffi_bindgen(&root, &cargo);
-    let cli = root.join(if cfg!(windows) {
-        "target/debug/uniffi-bindgen.exe"
-    } else {
-        "target/debug/uniffi-bindgen"
-    });
+    let cli = build_uniffi_bindgen_cli(&cargo);
 
     let tmp = tempfile::tempdir().unwrap();
     let fixture = CompositeFixture::write(tmp.path());
@@ -276,9 +215,12 @@ fn cli_artifacts_wasm_and_mini_orchestrate_two_components_without_feature_flags(
     let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated/native/hosts")).unwrap();
     let artifact_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated/artifacts")).unwrap();
     let pkg_dir = artifact_dir.join("browser/pkg");
-    let wasm_target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target-wasm")).unwrap();
+    let target_root = shared_cargo_target_dir("cli");
+    let wasm_target_dir = target_root.join("wasm-host");
+    let _target_lock = shared_cargo_target_lock("cli");
     let output = Command::new(cli.as_std_path())
         .current_dir(root.as_std_path())
+        .env("CARGO_TARGET_DIR", target_root.as_std_path())
         .args([
             "artifacts",
             "build",
@@ -394,14 +336,14 @@ fn cli_artifacts_wasm_and_mini_orchestrate_two_components_without_feature_flags(
 
 #[test]
 fn cli_build_wasm_orchestrates_arithmetic_fixture() {
-    let cargo =
-        which_tool("cargo").expect("CLI wasm arithmetic orchestration requires cargo on PATH");
-    assert!(
-        has_wasm32_target(&cargo),
-        "CLI wasm arithmetic orchestration requires wasm32-unknown-unknown target"
-    );
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let root = workspace_root();
     let cli = build_uniffi_bindgen_cli(&cargo);
+    let target_root = shared_cargo_target_dir("cli");
+    let wasm_core_target_dir = target_root.join("wasm-core");
+    let wasm_target_dir = target_root.join("wasm-host");
+    let _target_lock = shared_cargo_target_lock("cli");
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
@@ -410,6 +352,7 @@ fn cli_build_wasm_orchestrates_arithmetic_fixture() {
 
     let output = Command::new(cli.as_std_path())
         .current_dir(&root)
+        .env("CARGO_TARGET_DIR", target_root.as_std_path())
         .arg("javascript")
         .arg("build-wasm")
         .arg("--manifest-path")
@@ -422,6 +365,10 @@ fn cli_build_wasm_orchestrates_arithmetic_fixture() {
         .arg(host_dir.as_str())
         .arg("--wasm-bindgen-out-dir")
         .arg(pkg_dir.as_str())
+        .arg("--core-target-dir")
+        .arg(wasm_core_target_dir.as_str())
+        .arg("--target-dir")
+        .arg(wasm_target_dir.as_str())
         .output()
         .expect("failed to invoke uniffi-bindgen javascript build-wasm");
     if !output.status.success() {

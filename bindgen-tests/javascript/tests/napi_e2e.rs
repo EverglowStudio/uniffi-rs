@@ -30,22 +30,15 @@ fn install_composite_addon(
 
 #[test]
 fn host_crates_napi_raw_addon_is_bigint_native() {
-    let Some(node) = which_node() else {
-        eprintln!("SKIP host_crates_napi_raw_addon_is_bigint_native: node unavailable");
-        return;
-    };
+    let node = which_node();
 
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_rich_napi_host(tmp.path());
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-napi-raw");
-    let output = match run_cargo_build(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_raw_addon_is_bigint_native: cargo unavailable: {e}");
-            return;
-        }
-    };
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
+    let output = run_cargo_build(&manifest, &[], &target_dir)
+        .expect("cargo is required for the raw N-API addon test");
     if !output.status.success() {
         panic!(
             "cargo build for raw napi addon failed:\nstdout:\n{}\nstderr:\n{}",
@@ -55,11 +48,13 @@ fn host_crates_napi_raw_addon_is_bigint_native() {
     }
 
     let dylib = target_dir
+        .as_std_path()
         .join("debug")
         .join(composite_host_cdylib_filename("napi-compat-core"));
     assert!(dylib.exists(), "expected raw cdylib at {}", dylib.display());
     let addon = tmp.path().join("napi_compat.node");
     std::fs::copy(&dylib, &addon).unwrap();
+    drop(_target_lock);
     let driver = tmp.path().join("raw-addon-bigint.cjs");
     std::fs::write(
         &driver,
@@ -104,14 +99,9 @@ console.log("ok");
 
 #[test]
 fn host_crates_napi_runs_stream_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP host_crates_napi_runs_stream_fixture: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
     let tmp = tempfile::tempdir().unwrap();
-    let Some(fixture) = build_stream_fixture(tmp.path()) else {
-        return;
-    };
+    let fixture = build_stream_fixture(tmp.path());
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -123,14 +113,10 @@ fn host_crates_napi_runs_stream_fixture() {
     );
 
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("target-napi-stream");
-    let output = match run_cargo_build(&manifest, &[], &target_dir) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_runs_stream_fixture: cargo unavailable: {e}");
-            return;
-        }
-    };
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
+    let output = run_cargo_build(&manifest, &[], &target_dir)
+        .expect("cargo is required for the N-API stream fixture");
     if !output.status.success() {
         panic!(
             "cargo build on stream napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -140,6 +126,7 @@ fn host_crates_napi_runs_stream_fixture() {
     }
 
     let built_lib = target_dir
+        .as_std_path()
         .join("debug")
         .join(composite_host_cdylib_filename("stream-core"));
     assert!(
@@ -148,6 +135,7 @@ fn host_crates_napi_runs_stream_fixture() {
         built_lib.display()
     );
     install_composite_addon(out_dir.as_std_path(), &built_lib, "stream-core");
+    drop(_target_lock);
 
     std::fs::write(
         out_dir.join("stream-driver.ts"),
@@ -281,9 +269,7 @@ console.log("ok");
 
 #[test]
 fn final_runtime_matrix_napi_executes_tagged_steps_typed_payloads_and_native_drops() {
-    let node = locate_node_with_strip_types().expect(
-        "final N-API runtime matrix requires Node.js 22.6+ with --experimental-strip-types",
-    );
+    let node = locate_node_with_strip_types();
     let tmp = tempfile::tempdir().unwrap();
     let fixture = build_runtime_matrix_fixture(tmp.path());
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
@@ -297,7 +283,8 @@ fn final_runtime_matrix_napi_executes_tagged_steps_typed_payloads_and_native_dro
     );
 
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("target-napi-runtime-matrix");
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
     let build = run_cargo_build(&manifest, &[], &target_dir)
         .expect("final N-API runtime matrix requires cargo to build its host crate");
     assert!(
@@ -309,6 +296,7 @@ fn final_runtime_matrix_napi_executes_tagged_steps_typed_payloads_and_native_dro
 
     let package_name = "runtime-matrix-core";
     let built_lib = target_dir
+        .as_std_path()
         .join("debug")
         .join(composite_host_cdylib_filename(package_name));
     assert!(
@@ -317,6 +305,7 @@ fn final_runtime_matrix_napi_executes_tagged_steps_typed_payloads_and_native_dro
         built_lib.display()
     );
     install_composite_addon(out_dir.as_std_path(), &built_lib, package_name);
+    drop(_target_lock);
     let host_target =
         uniffi_bindgen_javascript::host_crates::composite_host_lib_target(package_name);
     let driver = runtime_matrix_driver(
@@ -350,14 +339,9 @@ fn final_runtime_matrix_napi_executes_tagged_steps_typed_payloads_and_native_dro
 
 #[test]
 fn host_crates_napi_runs_input_stream_bidi_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP host_crates_napi_runs_input_stream_fixture: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
     let tmp = tempfile::tempdir().unwrap();
-    let Some(fixture) = build_input_stream_fixture(tmp.path()) else {
-        return;
-    };
+    let fixture = build_input_stream_fixture(tmp.path());
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -369,14 +353,10 @@ fn host_crates_napi_runs_input_stream_bidi_fixture() {
     );
 
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("target-napi-input-stream");
-    let output = match run_cargo_build(&manifest, &[], &target_dir) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_runs_input_stream_fixture: cargo unavailable: {e}");
-            return;
-        }
-    };
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
+    let output = run_cargo_build(&manifest, &[], &target_dir)
+        .expect("cargo is required for the N-API input stream fixture");
     if !output.status.success() {
         panic!(
             "cargo build on input stream napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -386,6 +366,7 @@ fn host_crates_napi_runs_input_stream_bidi_fixture() {
     }
 
     let built_lib = target_dir
+        .as_std_path()
         .join("debug")
         .join(composite_host_cdylib_filename("input-stream-core"));
     assert!(
@@ -394,6 +375,7 @@ fn host_crates_napi_runs_input_stream_bidi_fixture() {
         built_lib.display()
     );
     install_composite_addon(out_dir.as_std_path(), &built_lib, "input-stream-core");
+    drop(_target_lock);
 
     std::fs::write(
         out_dir.join("input-stream-driver.ts"),
@@ -551,10 +533,7 @@ console.log("ok");
 
 #[test]
 fn generated_node_adapter_runs_custom_types_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP generated_node_adapter_runs_custom_types_fixture: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let tmp = tempfile::tempdir().unwrap();
     let (generated, manifest) = generate_custom_napi_tree(tmp.path());
@@ -644,22 +623,15 @@ console.log("ok");
 
 #[test]
 fn generated_node_adapter_runs_temporal_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP generated_node_adapter_runs_temporal_fixture: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_temporal_napi_host(tmp.path());
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-temporal-napi-runtime");
-    let output = match run_cargo_build(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP generated_node_adapter_runs_temporal_fixture: cargo unavailable: {e}");
-            return;
-        }
-    };
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
+    let output = run_cargo_build(&manifest, &[], &target_dir)
+        .expect("cargo is required for the temporal N-API fixture");
     if !output.status.success() {
         panic!(
             "cargo build on temporal napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -669,7 +641,7 @@ fn generated_node_adapter_runs_temporal_fixture() {
     }
 
     let lib_name = composite_host_cdylib_filename("napi-temporal-core");
-    let built_lib = target_dir.join("debug").join(lib_name);
+    let built_lib = target_dir.as_std_path().join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
         "expected built cdylib at {}",
@@ -678,6 +650,7 @@ fn generated_node_adapter_runs_temporal_fixture() {
 
     let generated = tmp.path().join("generated");
     install_composite_addon(&generated, &built_lib, "napi-temporal-core");
+    drop(_target_lock);
 
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
@@ -850,22 +823,15 @@ console.log("ok");
 
 #[test]
 fn host_crates_napi_runs_bigint_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP host_crates_napi_runs_bigint_fixture: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_rich_napi_host(tmp.path());
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-napi-runtime");
-    let output = match run_cargo_build(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_runs_bigint_fixture: cargo unavailable: {e}");
-            return;
-        }
-    };
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
+    let output = run_cargo_build(&manifest, &[], &target_dir)
+        .expect("cargo is required for the BigInt N-API fixture");
     if !output.status.success() {
         panic!(
             "cargo build on rich napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -875,7 +841,7 @@ fn host_crates_napi_runs_bigint_fixture() {
     }
 
     let lib_name = composite_host_cdylib_filename("napi-compat-core");
-    let built_lib = target_dir.join("debug").join(lib_name);
+    let built_lib = target_dir.as_std_path().join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
         "expected built cdylib at {}",
@@ -884,6 +850,7 @@ fn host_crates_napi_runs_bigint_fixture() {
 
     let generated = tmp.path().join("generated");
     install_composite_addon(&generated, &built_lib, "napi-compat-core");
+    drop(_target_lock);
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -993,23 +960,16 @@ console.log("ok");
 
 #[test]
 fn host_crates_napi_runs_callback_return_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP host_crates_napi_runs_callback_return_fixture: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_callback_return_napi_host(tmp.path());
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-callback-return");
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
 
-    let check = match run_cargo_check(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_runs_callback_return_fixture: cargo unavailable: {e}");
-            return;
-        }
-    };
+    let check = run_cargo_check(&manifest, &[], &target_dir)
+        .expect("cargo is required for the callback-return N-API fixture");
     if !check.status.success() {
         panic!(
             "cargo check on callback-return napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -1018,13 +978,8 @@ fn host_crates_napi_runs_callback_return_fixture() {
         );
     }
 
-    let build = match run_cargo_build(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_runs_callback_return_fixture: cargo unavailable during build: {e}");
-            return;
-        }
-    };
+    let build = run_cargo_build(&manifest, &[], &target_dir)
+        .expect("cargo build is required for the callback-return N-API fixture");
     if !build.status.success() {
         panic!(
             "cargo build on callback-return napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -1034,7 +989,7 @@ fn host_crates_napi_runs_callback_return_fixture() {
     }
 
     let lib_name = composite_host_cdylib_filename("napi-callback-return-core");
-    let built_lib = target_dir.join("debug").join(lib_name);
+    let built_lib = target_dir.as_std_path().join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
         "expected built callback-return cdylib at {}",
@@ -1043,6 +998,7 @@ fn host_crates_napi_runs_callback_return_fixture() {
 
     let generated = tmp.path().join("generated");
     install_composite_addon(&generated, &built_lib, "napi-callback-return-core");
+    drop(_target_lock);
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -1375,17 +1331,13 @@ console.log("ok");
 
 #[test]
 fn host_crates_napi_runs_async_callback_trait_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!(
-            "SKIP host_crates_napi_runs_async_callback_trait_fixture: node 22.6+ unavailable"
-        );
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_async_callback_napi_host(tmp.path());
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-async-callback");
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
 
     let cargo_toml = std::fs::read_to_string(&manifest).unwrap();
     assert!(
@@ -1393,13 +1345,8 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
         "napi host crate must include async-trait for async callback impls:\n{cargo_toml}"
     );
 
-    let build = match run_cargo_build(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_runs_async_callback_trait_fixture: cargo unavailable during build: {e}");
-            return;
-        }
-    };
+    let build = run_cargo_build(&manifest, &[], &target_dir)
+        .expect("cargo build is required for the async-callback N-API fixture");
     if !build.status.success() {
         panic!(
             "cargo build on async-callback napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -1409,7 +1356,7 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
     }
 
     let lib_name = composite_host_cdylib_filename("napi-async-callback-core");
-    let built_lib = target_dir.join("debug").join(lib_name);
+    let built_lib = target_dir.as_std_path().join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
         "expected built async-callback cdylib at {}",
@@ -1418,6 +1365,7 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
 
     let generated = tmp.path().join("generated");
     install_composite_addon(&generated, &built_lib, "napi-async-callback-core");
+    drop(_target_lock);
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -1553,17 +1501,13 @@ console.log("ok");
 
 #[test]
 fn host_crates_napi_runs_fallible_async_callback_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!(
-            "SKIP host_crates_napi_runs_fallible_async_callback_fixture: node 22.6+ unavailable"
-        );
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_fallible_async_callback_napi_host(tmp.path());
     let manifest = host_dir.join("napi/Cargo.toml");
-    let target_dir = tmp.path().join("cargo-target-fallible-async-callback");
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
 
     let cargo_toml = std::fs::read_to_string(&manifest).unwrap();
     assert!(
@@ -1574,13 +1518,8 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
         "napi host crate template should keep async-trait + the pinned N-API fork:\n{cargo_toml}"
     );
 
-    let build = match run_cargo_build(&manifest, &[], &target_dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP host_crates_napi_runs_fallible_async_callback_fixture: cargo unavailable during build: {e}");
-            return;
-        }
-    };
+    let build = run_cargo_build(&manifest, &[], &target_dir)
+        .expect("cargo build is required for the fallible async-callback N-API fixture");
     if !build.status.success() {
         panic!(
             "cargo build on fallible-async napi host crate failed:\nstdout:\n{}\nstderr:\n{}",
@@ -1590,7 +1529,7 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
     }
 
     let lib_name = composite_host_cdylib_filename("napi-fallible-async-callback-core");
-    let built_lib = target_dir.join("debug").join(lib_name);
+    let built_lib = target_dir.as_std_path().join("debug").join(lib_name);
     assert!(
         built_lib.exists(),
         "expected built fallible-async cdylib at {}",
@@ -1599,6 +1538,7 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
 
     let generated = tmp.path().join("generated");
     install_composite_addon(&generated, &built_lib, "napi-fallible-async-callback-core");
+    drop(_target_lock);
     let electron_stub = generated.join("electron/node_modules/electron");
     std::fs::create_dir_all(&electron_stub).unwrap();
     std::fs::write(
@@ -1788,10 +1728,7 @@ console.log("ok");
 
 #[test]
 fn custom_types_surface_and_raw_napi_execute() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP custom_types_surface_and_raw_napi_execute: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let tmp = tempfile::tempdir().unwrap();
     let (generated, manifest) = generate_custom_napi_tree(tmp.path());
@@ -1865,10 +1802,7 @@ console.log("ok");
 
 #[test]
 fn custom_types_generated_node_adapter_executes() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP custom_types_generated_node_adapter_executes: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let tmp = tempfile::tempdir().unwrap();
     let (generated, manifest) = generate_custom_napi_tree(tmp.path());
@@ -1946,10 +1880,7 @@ console.log("ok");
 
 #[test]
 fn custom_types_generated_electron_entry_executes() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP custom_types_generated_electron_entry_executes: node 22.6+ unavailable");
-        return;
-    };
+    let node = locate_node_with_strip_types();
 
     let tmp = tempfile::tempdir().unwrap();
     let (generated, manifest) = generate_custom_napi_tree(tmp.path());
@@ -2046,10 +1977,8 @@ console.log("ok");
 
 #[test]
 fn composite_napi_node_and_electron_share_one_addon_without_namespace_cross_calls() {
-    let node = locate_node_with_strip_types().expect(
-        "composite N-API runtime test requires Node.js 22.6+ with --experimental-strip-types",
-    );
-    let cargo = which_tool("cargo").expect("composite N-API runtime test requires cargo");
+    let node = locate_node_with_strip_types();
+    let cargo = which_tool("cargo");
     let tmp = tempfile::tempdir().unwrap();
     let fixture = CompositeFixture::write(tmp.path());
     fixture.build_cdylib();
@@ -2076,7 +2005,8 @@ fn composite_napi_node_and_electron_share_one_addon_without_namespace_cross_call
     );
 
     let manifest = fixture.host_manifest_path(&hosts, "napi");
-    let target_dir = tmp.path().join("target-napi-composite-runtime");
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
     let build = run_cargo_build(&manifest, &[], &target_dir).unwrap_or_else(|error| {
         panic!("composite N-API runtime test could not invoke {cargo:?}: {error}")
     });
@@ -2087,13 +2017,17 @@ fn composite_napi_node_and_electron_share_one_addon_without_namespace_cross_call
         String::from_utf8_lossy(&build.stderr),
     );
 
-    let built_addon = target_dir.join("debug").join(cdylib_filename(&host_target));
+    let built_addon = target_dir
+        .as_std_path()
+        .join("debug")
+        .join(cdylib_filename(&host_target));
     assert!(
         built_addon.exists(),
         "expected one composite N-API cdylib at {}",
         built_addon.display(),
     );
     let addon = install_composite_addon(generated.as_std_path(), &built_addon, "composite-core");
+    drop(_target_lock);
     assert_eq!(
         addon,
         generated.join("node").join(format!("{host_target}.node")),

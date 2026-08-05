@@ -29,24 +29,11 @@ const WASM_BINDGEN_DEPENDENCIES: &str = concat!(
 fn wasm_e2e_path() -> &'static std::ffi::OsStr {
     static PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        let rustc_bin = Command::new("rustup")
-            .args(["which", "rustc"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| {
-                let rustc =
-                    std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-                rustc.parent().map(std::path::Path::to_path_buf)
-            })
-            .or_else(|| {
-                which_tool("rustc")
-                    .and_then(|rustc| rustc.parent().map(std::path::Path::to_path_buf))
-            });
-        let mut entries = Vec::new();
-        if let Some(rustc_bin) = rustc_bin {
-            entries.push(rustc_bin);
-        }
+        let rustc = which_tool("rustc");
+        let rustc_bin = rustc
+            .parent()
+            .unwrap_or_else(|| panic!("rustc path has no parent: {}", rustc.display()));
+        let mut entries = vec![rustc_bin.to_path_buf()];
         entries.extend([
             std::path::PathBuf::from("/usr/bin"),
             std::path::PathBuf::from("/bin"),
@@ -91,18 +78,9 @@ fn composite_host_wasm_filename(package_name: &str) -> String {
 
 #[test]
 fn runs_generated_wasm_shim_end_to_end() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("skipping wasm e2e: node 22.6+ unavailable");
-        return;
-    };
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("skipping wasm e2e: cargo not found");
-        return;
-    };
-    if !has_wasm32_target(&cargo) {
-        eprintln!("skipping wasm e2e: wasm32-unknown-unknown target not installed");
-        return;
-    }
+    let node = locate_node_with_strip_types();
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let tmp = tempfile::tempdir().unwrap();
     let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
 
@@ -231,12 +209,13 @@ wasm_scalar = {{ path = "../biz" }}
     )
     .unwrap();
 
-    // 5. Build in the same process-lifetime target as the generic fixtures.
-    // The lock covers only Cargo's shared target mutation; this fixture keeps
-    // its own source tree, glue directory, and Node driver.
+    // 5. Build in the stable Wasm target shared by all JavaScript suites.
+    // The advisory lock covers Cargo and the artifact lookup; this fixture
+    // keeps its own source tree, glue directory, and Node driver.
     let wasm_file = {
         let target_dir = wasm_e2e_shared_target_dir();
-        let target_path = target_dir.path().to_str().unwrap();
+        let _target_lock = shared_cargo_target_lock("wasm");
+        let target_path = target_dir.as_std_path().to_str().unwrap();
         let build = wasm_e2e_command(&cargo)
             .args([
                 "build",
@@ -258,7 +237,7 @@ wasm_scalar = {{ path = "../biz" }}
             );
         }
         target_dir
-            .path()
+            .as_std_path()
             .join("wasm32-unknown-unknown/debug/wasm_scalar_shim.wasm")
     };
 
@@ -1924,24 +1903,11 @@ export function emailAddressToString(value) {
 
 #[test]
 fn host_crates_wasm_input_stream_bidi_runs_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP host_crates_wasm_runs_input_stream_fixture: node 22.6+ unavailable");
-        return;
-    };
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("SKIP host_crates_wasm_runs_input_stream_fixture: cargo unavailable");
-        return;
-    };
-    if !has_wasm32_target(&cargo) {
-        eprintln!(
-            "SKIP host_crates_wasm_runs_input_stream_fixture: wasm32-unknown-unknown target unavailable"
-        );
-        return;
-    }
+    let node = locate_node_with_strip_types();
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let tmp = tempfile::tempdir().unwrap();
-    let Some(fixture) = build_input_stream_fixture(tmp.path()) else {
-        return;
-    };
+    let fixture = build_input_stream_fixture(tmp.path());
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -1953,7 +1919,8 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
     );
 
     let manifest = host_dir.join("wasm/Cargo.toml");
-    let target_dir = tmp.path().join("target-wasm-input-stream");
+    let target_dir = shared_cargo_target_dir("wasm");
+    let _target_lock = shared_cargo_target_lock("wasm");
     let build = wasm_e2e_command(&cargo)
         .args([
             "build",
@@ -1962,7 +1929,7 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
             "--target",
             "wasm32-unknown-unknown",
         ])
-        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_TARGET_DIR", target_dir.as_std_path())
         .env("RUSTFLAGS", "-D warnings")
         .output()
         .expect("failed to invoke cargo for wasm input stream host");
@@ -1975,6 +1942,7 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
     }
 
     let wasm_file = target_dir
+        .as_std_path()
         .join("wasm32-unknown-unknown/debug")
         .join(composite_host_wasm_filename("input-stream-core"));
     assert!(
@@ -1982,6 +1950,7 @@ fn host_crates_wasm_input_stream_bidi_runs_fixture() {
         "expected built input stream wasm at {}",
         wasm_file.display()
     );
+    drop(_target_lock);
     let pkg = out_dir.join("browser/pkg");
     let module_name = composite_host_lib_target("input-stream-core");
     emit_wasm_post_link(&package, wasm_file.as_path(), &module_name, &pkg);
@@ -2144,24 +2113,11 @@ console.log("ok");
 
 #[test]
 fn host_crates_wasm_runs_stream_fixture() {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("SKIP host_crates_wasm_runs_stream_fixture: node 22.6+ unavailable");
-        return;
-    };
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("SKIP host_crates_wasm_runs_stream_fixture: cargo unavailable");
-        return;
-    };
-    if !has_wasm32_target(&cargo) {
-        eprintln!(
-            "SKIP host_crates_wasm_runs_stream_fixture: wasm32-unknown-unknown target unavailable"
-        );
-        return;
-    }
+    let node = locate_node_with_strip_types();
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let tmp = tempfile::tempdir().unwrap();
-    let Some(fixture) = build_stream_fixture(tmp.path()) else {
-        return;
-    };
+    let fixture = build_stream_fixture(tmp.path());
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -2173,7 +2129,8 @@ fn host_crates_wasm_runs_stream_fixture() {
     );
 
     let manifest = host_dir.join("wasm/Cargo.toml");
-    let target_dir = tmp.path().join("target-wasm-stream");
+    let target_dir = shared_cargo_target_dir("wasm");
+    let _target_lock = shared_cargo_target_lock("wasm");
     let build = wasm_e2e_command(&cargo)
         .args([
             "build",
@@ -2182,7 +2139,7 @@ fn host_crates_wasm_runs_stream_fixture() {
             "--target",
             "wasm32-unknown-unknown",
         ])
-        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_TARGET_DIR", target_dir.as_std_path())
         .env("RUSTFLAGS", "-D warnings")
         .output()
         .expect("failed to invoke cargo for wasm stream host");
@@ -2195,6 +2152,7 @@ fn host_crates_wasm_runs_stream_fixture() {
     }
 
     let wasm_file = target_dir
+        .as_std_path()
         .join("wasm32-unknown-unknown/debug")
         .join(composite_host_wasm_filename("stream-core"));
     assert!(
@@ -2202,6 +2160,7 @@ fn host_crates_wasm_runs_stream_fixture() {
         "expected built stream wasm at {}",
         wasm_file.display()
     );
+    drop(_target_lock);
     let pkg = out_dir.join("browser/pkg");
     let module_name = composite_host_lib_target("stream-core");
     emit_wasm_post_link(&package, wasm_file.as_path(), &module_name, &pkg);
@@ -2328,26 +2287,9 @@ console.log("ok");
 #[test]
 fn final_runtime_matrix_wasm_executes_tagged_steps_typed_payloads_native_drops_and_non_send_stream()
 {
-    let node = locate_node_with_strip_types()
-        .expect("final Wasm runtime matrix requires Node.js 22.6+ with --experimental-strip-types");
-    let cargo = which_tool("cargo").expect("final Wasm runtime matrix requires cargo");
-    assert!(
-        has_wasm32_target(&cargo),
-        "final Wasm runtime matrix requires the wasm32-unknown-unknown target"
-    );
-
-    // The fixture must be independent of a developer-installed CLI.  Its
-    // glue is generated below through the package's pinned post-link engine,
-    // while every child command receives the sanitized PATH.
-    let cli_probe = wasm_e2e_command(std::path::Path::new("/bin/sh"))
-        .args(["-c", "command -v wasm-bindgen"])
-        .output()
-        .expect("final Wasm runtime matrix must probe its sanitized PATH");
-    assert!(
-        !cli_probe.status.success(),
-        "the final Wasm runtime matrix PATH must not expose an external wasm-bindgen CLI: {}",
-        String::from_utf8_lossy(&cli_probe.stdout).trim(),
-    );
+    let node = locate_node_with_strip_types();
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
 
     let tmp = tempfile::tempdir().unwrap();
     let fixture = build_runtime_matrix_fixture(tmp.path());
@@ -2362,12 +2304,13 @@ fn final_runtime_matrix_wasm_executes_tagged_steps_typed_payloads_native_drops_a
     );
 
     let manifest = host_dir.join("wasm/Cargo.toml");
-    let target_dir = tmp.path().join("target-wasm-runtime-matrix");
+    let target_dir = shared_cargo_target_dir("wasm");
+    let _target_lock = shared_cargo_target_lock("wasm");
     let build = wasm_e2e_command(&cargo)
         .args(["build", "--manifest-path"])
         .arg(manifest.as_std_path())
         .args(["--target", "wasm32-unknown-unknown"])
-        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_TARGET_DIR", target_dir.as_std_path())
         .env("RUSTFLAGS", "-D warnings")
         .output()
         .expect("failed to invoke cargo for final Wasm runtime matrix host");
@@ -2382,6 +2325,7 @@ fn final_runtime_matrix_wasm_executes_tagged_steps_typed_payloads_native_drops_a
     let host_target =
         uniffi_bindgen_javascript::host_crates::composite_host_lib_target(package_name);
     let wasm_file = target_dir
+        .as_std_path()
         .join("wasm32-unknown-unknown/debug")
         .join(composite_host_wasm_filename(package_name));
     assert!(
@@ -2389,6 +2333,7 @@ fn final_runtime_matrix_wasm_executes_tagged_steps_typed_payloads_native_drops_a
         "expected final Wasm runtime matrix module at {}",
         wasm_file.display(),
     );
+    drop(_target_lock);
     let pkg = out_dir.join("browser/pkg");
     emit_wasm_post_link(&package, wasm_file.as_path(), &host_target, &pkg);
     assert!(
@@ -2439,19 +2384,9 @@ assert(localProbe.streamStarts === 1n && localProbe.streamDrops === 1n
 
 #[test]
 fn composite_wasm_uses_one_in_process_glue_for_isolated_namespaces_without_cli() {
-    let node = locate_node_with_strip_types().expect(
-        "composite Wasm runtime test requires Node.js 22.6+ with --experimental-strip-types",
-    );
-    let cargo = which_tool("cargo").expect("composite Wasm runtime test requires cargo");
-    let cli_probe = wasm_e2e_command(std::path::Path::new("/bin/sh"))
-        .args(["-c", "command -v wasm-bindgen"])
-        .output()
-        .expect("composite Wasm runtime test must be able to probe its sanitized PATH");
-    assert!(
-        !cli_probe.status.success(),
-        "the composite Wasm test PATH must not expose an external wasm-bindgen CLI: {}",
-        String::from_utf8_lossy(&cli_probe.stdout).trim(),
-    );
+    let node = locate_node_with_strip_types();
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
 
     let tmp = tempfile::tempdir().unwrap();
     let fixture = CompositeFixture::write(tmp.path());
@@ -2463,12 +2398,13 @@ fn composite_wasm_uses_one_in_process_glue_for_isolated_namespaces_without_cli()
     let host_target =
         uniffi_bindgen_javascript::host_crates::composite_host_lib_target("composite-core");
     let manifest = fixture.host_manifest_path(&hosts, "wasm");
-    let target_dir = tmp.path().join("target-wasm-composite-runtime");
+    let target_dir = shared_cargo_target_dir("wasm");
+    let _target_lock = shared_cargo_target_lock("wasm");
     let build = wasm_e2e_command(&cargo)
         .args(["build", "--manifest-path"])
         .arg(manifest.as_std_path())
         .args(["--target", "wasm32-unknown-unknown"])
-        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_TARGET_DIR", target_dir.as_std_path())
         .output()
         .expect("failed to invoke cargo for composite Wasm host");
     assert!(
@@ -2479,6 +2415,7 @@ fn composite_wasm_uses_one_in_process_glue_for_isolated_namespaces_without_cli()
     );
 
     let wasm_file = target_dir
+        .as_std_path()
         .join("wasm32-unknown-unknown/debug")
         .join(format!("{host_target}.wasm"));
     assert!(
@@ -2486,6 +2423,7 @@ fn composite_wasm_uses_one_in_process_glue_for_isolated_namespaces_without_cli()
         "expected one composite Wasm module at {}",
         wasm_file.display(),
     );
+    drop(_target_lock);
     let pkg = generated.join("browser/pkg");
     emit_wasm_post_link(&package, &wasm_file, &host_target, &pkg);
     let glue = pkg.join(format!("{host_target}.js"));
@@ -2579,38 +2517,20 @@ pub struct WasmE2eSpec {
     pub generated_files: &'static [(&'static str, &'static str)],
 }
 
-/// Returns a process-lifetime target directory shared only by the Wasm E2E
-/// binary. Cargo work is serialized while it mutates this directory; every
-/// fixture still has a unique package name plus its own source, glue, and
-/// Node sandbox. The `TempDir` is never persisted across test processes.
-pub fn wasm_e2e_shared_target_dir() -> std::sync::MutexGuard<'static, tempfile::TempDir> {
-    static TARGET: std::sync::OnceLock<std::sync::Mutex<tempfile::TempDir>> =
-        std::sync::OnceLock::new();
-    TARGET
-        .get_or_init(|| std::sync::Mutex::new(tempfile::tempdir().unwrap()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Returns the stable Wasm target directory shared by all JavaScript suites.
+/// Source trees and generated packages remain temporary and isolated; only
+/// Cargo's dependency/fingerprint cache is reused.
+pub fn wasm_e2e_shared_target_dir() -> camino::Utf8PathBuf {
+    shared_cargo_target_dir("wasm")
 }
 
-/// Execute a Path-A wasm e2e run for the given spec. Skips gracefully
-/// when Node ≥ 22.6, cargo, or the wasm32 target is missing; wasm-bindgen
-/// runs in process and does not require a separately installed CLI.
+/// Execute a Path-A wasm e2e run for the given spec. Required tools and the
+/// wasm32 target are hard requirements; wasm-bindgen runs in process and does
+/// not require a separately installed CLI.
 pub fn run_wasm_e2e(spec: WasmE2eSpec) {
-    let Some(node) = locate_node_with_strip_types() else {
-        eprintln!("skipping wasm e2e {}: node 22.6+ unavailable", spec.name);
-        return;
-    };
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("skipping wasm e2e {}: cargo not found", spec.name);
-        return;
-    };
-    if !has_wasm32_target(&cargo) {
-        eprintln!(
-            "skipping wasm e2e {}: wasm32-unknown-unknown target not installed",
-            spec.name
-        );
-        return;
-    }
+    let node = locate_node_with_strip_types();
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let tmp = tempfile::tempdir().unwrap();
     let keep_tmp = std::env::var_os("KEEP_WASM_E2E").is_some();
     let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
@@ -2740,12 +2660,13 @@ async-trait = "0.1"
     )
     .unwrap();
 
-    // Cargo fingerprints each unique fixture package in the shared,
-    // process-lifetime target directory. Hold the lock only while Cargo
-    // writes; glue generation and Node execution remain independent.
+    // Cargo fingerprints each unique fixture package in the stable shared
+    // target directory. Hold the advisory lock through artifact lookup;
+    // glue generation and Node execution remain independent.
     let wasm_file = {
         let target_dir = wasm_e2e_shared_target_dir();
-        let target_path = target_dir.path().to_str().unwrap();
+        let _target_lock = shared_cargo_target_lock("wasm");
+        let target_path = target_dir.as_std_path().to_str().unwrap();
         let build = wasm_e2e_command(&cargo)
             .args([
                 "build",
@@ -2767,7 +2688,7 @@ async-trait = "0.1"
             );
         }
         target_dir
-            .path()
+            .as_std_path()
             .join(format!("wasm32-unknown-unknown/debug/{shim_name}.wasm"))
     };
 
