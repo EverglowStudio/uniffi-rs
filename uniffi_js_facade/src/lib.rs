@@ -2450,6 +2450,7 @@ mod tests {
                     }],
                 },
             )]),
+            named_types: vec![],
         };
         let api = JsApiIr {
             target_universe: vec![PublicTarget::NodeNapi],
@@ -2733,6 +2734,7 @@ mod tests {
                     operations: rust_operations,
                 },
             )]),
+            named_types: vec![],
         };
         let api = JsApiIr {
             target_universe: vec![PublicTarget::NodeNapi],

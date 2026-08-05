@@ -368,6 +368,84 @@ pub struct RustValueBinding {
     pub conversion: ConversionRecipe,
 }
 
+/// A Rust record field as seen by an engine adapter.
+///
+/// The public spelling is deliberately kept beside the source Rust spelling:
+/// a renderer must never infer one from the other (for example, `snake_case`
+/// is not a reliable inverse of a JavaScript lower-camel name).  The
+/// declaration order is an owned ordinal rather than an incidental position
+/// in a map so adapters can construct/destructure values deterministically.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustRecordField {
+    pub public_name: String,
+    pub rust_name: String,
+    pub declaration_order: u32,
+    pub binding: RustValueBinding,
+}
+
+/// A positional payload field.  Tuple fields have no Rust member name; the
+/// normalized public spelling and declaration order are still part of the
+/// plan and must not be reconstructed by an engine adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustTupleField {
+    /// Public positional property spelling used by the normalized JavaScript
+    /// variant payload.  Tuple fields have no Rust member name.
+    pub public_name: String,
+    pub declaration_order: u32,
+    pub binding: RustValueBinding,
+}
+
+/// The complete payload shape of an enum/error variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RustVariantPayload {
+    Named(Vec<RustRecordField>),
+    Tuple(Vec<RustTupleField>),
+    Unit,
+}
+
+/// Rust enum/error variant lowering metadata.  `public_name` and `rust_name`
+/// are both retained because the source Rust discriminant is allowed to be
+/// renamed independently of the JavaScript API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustEnumVariant {
+    pub public_name: String,
+    pub rust_name: String,
+    pub declaration_order: u32,
+    pub payload: RustVariantPayload,
+}
+
+/// The exhaustive named-type lowering table consumed by all JavaScript
+/// engine adapters.  Public AST fields intentionally do not get copied into
+/// the custom entry: custom lowering only needs the real Rust path, the
+/// builtin binding, and the conversion recipe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RustNamedTypeKind {
+    Record {
+        fields: Vec<RustRecordField>,
+    },
+    Enum {
+        variants: Vec<RustEnumVariant>,
+    },
+    Error {
+        variants: Vec<RustEnumVariant>,
+    },
+    Custom {
+        inner: RustValueBinding,
+        conversion: ConversionRecipe,
+    },
+    Object {
+        kind: RustObjectKind,
+    },
+    Callback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustNamedTypePlan {
+    pub id: TypeId,
+    pub rust_path: RustPath,
+    pub kind: RustNamedTypeKind,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustArgumentBinding {
     pub public_name: String,
@@ -448,6 +526,32 @@ pub struct RustOperationPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustBridgePlan {
     pub engines: BTreeMap<EngineKind, EngineRustBridgePlan>,
+    /// Canonical Rust named-type lowering table shared by every engine.
+    /// Entries are sorted by dense [`TypeId`] and contain no parser or
+    /// renderer state.
+    pub named_types: Vec<RustNamedTypePlan>,
+}
+
+impl RustBridgePlan {
+    /// Iterate the canonical named-type lowering table in dense `TypeId`
+    /// order.  The iterator is read-only so engine adapters cannot mutate the
+    /// frontend's source of truth.
+    pub fn iter_named_types(&self) -> impl Iterator<Item = &RustNamedTypePlan> {
+        self.named_types.iter()
+    }
+
+    /// Return the lowering entry for `id`, if the ID is present in the dense
+    /// table.
+    pub fn named_type(&self, id: TypeId) -> Option<&RustNamedTypePlan> {
+        self.named_types
+            .get(id.index() as usize)
+            .filter(|entry| entry.id == id)
+    }
+
+    /// Borrow the complete table without exposing any mutable access.
+    pub fn named_types(&self) -> &[RustNamedTypePlan] {
+        &self.named_types
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
