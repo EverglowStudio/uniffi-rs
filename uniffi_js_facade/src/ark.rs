@@ -2319,11 +2319,15 @@ fn render_operation_helpers(
             .as_ref()
             .map(|value| render_type_name(model, value))
             .unwrap_or_else(|| "void".to_owned());
+        let lift_call = lift_name
+            .as_deref()
+            .map(|name| format!("{name}(value, session)"))
+            .unwrap_or_else(|| "__arkLiftVoid(value)".to_owned());
         out.push_str(&format!(
-            "  return session.invokeAsync({}, __args).then((value: ArkValue): {} => {{ __endFrame(); return {}(value, session); }}).catch((error: Error): {} => {{ __endFrame(); {} }});\n",
+            "  return session.invokeAsync({}, __args).then((value: ArkValue): {} => {{ __endFrame(); return {}; }}).catch((error: Error): {} => {{ __endFrame(); {} }});\n",
             operation.id.index(),
             resolved_return,
-            lift_name.as_deref().unwrap_or("__arkLiftVoid"),
+            lift_call,
             resolved_return,
             propagate_error
         ));

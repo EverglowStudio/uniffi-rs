@@ -2942,6 +2942,27 @@ mod tests {
             stream_slots: vec![],
             stream_resources: vec![],
         });
+        ast.operations.push(AstOperation {
+            id: OperationId::new(17),
+            source_key: operation_key(
+                &component,
+                OperationOwner::Namespace,
+                OperationKind::Function,
+                "flush_async",
+            ),
+            component_id: ComponentId::new(0),
+            name: "flushAsync".into(),
+            debug_name: "flushAsync".into(),
+            kind: OperationKind::Function,
+            arguments: vec![],
+            return_type: None,
+            async_kind: AsyncKind::Async,
+            throws: None,
+            receiver_type: None,
+            callback_method_id: None,
+            stream_slots: vec![],
+            stream_resources: vec![],
+        });
         let implementation = String::from_utf8(
             render_ark_inventory(&ast)
                 .unwrap()
@@ -2966,6 +2987,8 @@ mod tests {
         assert!(implementation
             .contains("if (!(source instanceof Map)) throw new UniffiError(\"UniffiMapType\""));
         assert!(implementation.contains("let __frameEnded: boolean = false"));
+        assert!(implementation.contains("return __arkLiftVoid(value);"));
+        assert!(!implementation.contains("__arkLiftVoid(value, session)"));
         assert!(implementation.contains("if (value.tag === \"Red\") return \"Red\" as ArkValue;"));
         assert!(implementation
             .contains("const rawCarrier: __ArkRecordCarrier6 = rawValue as __ArkRecordCarrier6"));
