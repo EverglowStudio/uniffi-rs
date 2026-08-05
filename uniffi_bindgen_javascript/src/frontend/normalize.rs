@@ -24,8 +24,8 @@ use uniffi_js_abi::{
 };
 use uniffi_js_engine_schema::{
     callback_type_for_path, enumerate_stream_use_sites, BridgePlan, BridgePlanInput,
-    CallbackContract, CallbackUseSite, EngineCapabilities, EngineKind, PlannedOperation,
-    StreamDirection, StreamUseSite, ValuePath, ValuePathSegment,
+    CallbackContract, CallbackUseSite, ClosePolicy, EngineCapabilities, EngineKind,
+    PlannedOperation, StreamDirection, StreamUseSite, ValuePath, ValuePathSegment,
 };
 use uniffi_meta::{CallbackOperationKind, CallbackUseSiteMetadata, CallbackValuePathSegment};
 
@@ -92,6 +92,8 @@ impl std::error::Error for FrontendError {}
 pub struct BindingInput<'a> {
     pub components: &'a [Component<JsConfig>],
     pub build_targets: Vec<PublicTarget>,
+    /// Canonical lifecycle policy propagated into the one [`BridgePlan`].
+    pub close_policy: ClosePolicy,
 }
 
 impl<'a> BindingInput<'a> {
@@ -99,11 +101,20 @@ impl<'a> BindingInput<'a> {
         Self {
             components,
             build_targets: UNIFIED_TARGET_UNIVERSE.to_vec(),
+            close_policy: ClosePolicy::default(),
         }
     }
 
     pub fn with_build_targets(mut self, targets: impl IntoIterator<Item = PublicTarget>) -> Self {
         self.build_targets = targets.into_iter().collect();
+        self
+    }
+
+    /// Set an explicit lifecycle policy.  This is intentionally a builder
+    /// method so production callers still use the one 5-second default while
+    /// tests can exercise a short deadline without introducing another DTO.
+    pub fn with_close_policy(mut self, close_policy: ClosePolicy) -> Self {
+        self.close_policy = close_policy;
         self
     }
 }
@@ -259,6 +270,7 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
         &identified_operations,
         callback_use_sites.clone(),
         stream_use_sites.clone(),
+        input.close_policy,
     );
     let bridge = BridgePlan::build(bridge_input)
         .map_err(|report| FrontendError::Contract(report.to_string()))?;
@@ -1454,6 +1466,7 @@ fn build_bridge_input(
     operations: &[IdentifiedOperation],
     callbacks: Vec<CallbackUseSite>,
     streams: Vec<StreamUseSite>,
+    close_policy: ClosePolicy,
 ) -> BridgePlanInput {
     let full_capabilities = [
         Capability::Primitive,
@@ -1498,6 +1511,7 @@ fn build_bridge_input(
         callbacks,
         streams,
         targets,
+        close_policy,
     }
 }
 
@@ -2288,6 +2302,26 @@ mod tests {
         assert_eq!(forward.bridge, reverse.bridge);
         assert_eq!(forward.rust, reverse.rust);
         assert_eq!(forward.build_targets, UNIFIED_TARGET_UNIVERSE.to_vec());
+    }
+
+    #[test]
+    fn close_policy_defaults_and_propagates_through_the_single_bridge_plan() {
+        let components = [component("policy_crate", "policy", "string hello();")];
+        let defaulted = normalize(BindingInput::new(&components)).unwrap();
+        assert_eq!(defaulted.bridge.close_policy(), ClosePolicy::default());
+
+        let short = ClosePolicy::new(7);
+        let explicit = normalize(
+            BindingInput::new(&components)
+                .with_close_policy(short)
+                .with_build_targets([PublicTarget::NodeNapi]),
+        )
+        .unwrap();
+        assert_eq!(explicit.bridge.close_policy(), short);
+        assert_ne!(
+            defaulted.bridge.close_policy(),
+            explicit.bridge.close_policy()
+        );
     }
 
     #[test]

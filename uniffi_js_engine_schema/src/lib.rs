@@ -486,6 +486,10 @@ pub struct BridgePlanInput {
     pub streams: Vec<StreamUseSite>,
     /// Every requested engine is validated.  An empty target set is rejected.
     pub targets: Vec<EngineCapabilities>,
+    /// The single lifecycle policy shared by every generated engine and
+    /// public facade.  It is copied into the validated plan once and exposed
+    /// through [`BridgePlan::close_policy`].
+    pub close_policy: ClosePolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -503,6 +507,7 @@ pub struct BridgePlan {
     callbacks: Vec<CallbackUseSite>,
     streams: Vec<StreamUseSite>,
     targets: Vec<EngineCapabilities>,
+    close_policy: ClosePolicy,
 }
 
 type UseSiteKey = (OperationId, ValuePath);
@@ -716,6 +721,7 @@ impl BridgePlan {
             callbacks: input.callbacks,
             streams: input.streams,
             targets: input.targets,
+            close_policy: input.close_policy,
         })
     }
 
@@ -741,6 +747,14 @@ impl BridgePlan {
 
     pub fn targets(&self) -> &[EngineCapabilities] {
         &self.targets
+    }
+
+    /// Return the canonical lifecycle policy selected during normalization.
+    ///
+    /// The policy is immutable after validation so every downstream consumer
+    /// (engine plans, public AST and runtime) observes the same value.
+    pub const fn close_policy(&self) -> ClosePolicy {
+        self.close_policy
     }
 }
 
@@ -2373,6 +2387,24 @@ pub struct ClosePolicy {
     pub on_deadline: DeadlineAction,
 }
 
+impl ClosePolicy {
+    /// The one default used by frontend inputs and hand-authored fixtures.
+    pub const DEFAULT_GRACE_MS: u32 = 5_000;
+
+    pub const fn new(grace_ms: u32) -> Self {
+        Self {
+            grace_ms,
+            on_deadline: DeadlineAction::Detach,
+        }
+    }
+}
+
+impl Default for ClosePolicy {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_GRACE_MS)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionLifecycle {
     phase: SessionPhase,
@@ -2726,6 +2758,7 @@ mod tests {
                 supported: full_capabilities(),
             })
             .collect(),
+            close_policy: ClosePolicy::default(),
         }
     }
 
@@ -2768,6 +2801,16 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn close_policy_is_retained_as_one_immutable_plan_value() {
+        let input = corpus_input();
+        assert_eq!(input.close_policy, ClosePolicy::default());
+        let mut short = input;
+        short.close_policy = ClosePolicy::new(3);
+        let plan = BridgePlan::build(short).unwrap();
+        assert_eq!(plan.close_policy(), ClosePolicy::new(3));
     }
 
     #[test]
