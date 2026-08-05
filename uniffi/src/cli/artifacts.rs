@@ -105,6 +105,12 @@ pub(crate) struct BuildArgs {
     #[clap(long, short)]
     config: Option<Utf8PathBuf>,
 
+    /// Directory of consumer-owned JavaScript/TypeScript support sources used
+    /// by configured custom types. Its contents are copied into the generated
+    /// source root as `support/` before any target is built.
+    #[clap(long = "javascript-support-dir")]
+    javascript_support_dir: Option<Utf8PathBuf>,
+
     /// Optional crate filter passed through to generators.
     #[clap(long = "crate")]
     crate_name: Option<String>,
@@ -1391,7 +1397,7 @@ fn prepare_javascript_package(
         library_path
     };
 
-    generate_js(
+    let package = generate_js(
         &manifest_path,
         generation_source,
         args.out_dir()?,
@@ -1407,7 +1413,128 @@ fn prepare_javascript_package(
         },
         flavors,
         args.artifact_dir.clone(),
-    )
+    )?;
+    install_javascript_support(args)?;
+    Ok(package)
+}
+
+#[derive(Debug)]
+struct SupportSourceEntry {
+    relative: Utf8PathBuf,
+    bytes: Option<Vec<u8>>,
+}
+
+/// Copy consumer-owned custom-type helpers into the invocation's source root.
+/// The complete source tree is validated before replacing the staged copy, so
+/// a malformed file cannot leave a half-updated managed package.  Managed
+/// publication still performs the final whole-directory swap.
+fn install_javascript_support(args: &BuildArgs) -> Result<()> {
+    let Some(configured_source) = args.javascript_support_dir.as_deref() else {
+        return Ok(());
+    };
+    let source = resolve_cwd_path(configured_source)?
+        .canonicalize_utf8()
+        .with_context(|| {
+            format!("canonicalizing JavaScript support directory {configured_source}")
+        })?;
+    let source_metadata = std::fs::symlink_metadata(&source)
+        .with_context(|| format!("reading JavaScript support directory {source}"))?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        bail!("JavaScript support source must be a real directory: {source}");
+    }
+
+    let destination = args.out_dir()?.join("support");
+    let destination_resolved = canonicalize_invocation_output(&destination)?;
+    if source == destination_resolved
+        || source.starts_with(&destination_resolved)
+        || destination_resolved.starts_with(&source)
+    {
+        bail!(
+            "JavaScript support source and generated destination must not overlap: {source} vs {destination_resolved}"
+        );
+    }
+
+    let mut entries = Vec::new();
+    collect_javascript_support(&source, &source, &mut entries)?;
+    entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "generated JavaScript support destination must be a real directory: {destination}"
+            )
+        }
+        Ok(_) => std::fs::remove_dir_all(&destination)
+            .with_context(|| format!("replacing generated JavaScript support {destination}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading generated JavaScript support {destination}"))
+        }
+    }
+    std::fs::create_dir_all(&destination)
+        .with_context(|| format!("creating generated JavaScript support {destination}"))?;
+    for entry in entries {
+        let output = destination.join(&entry.relative);
+        if let Some(bytes) = entry.bytes {
+            let parent = output
+                .parent()
+                .with_context(|| format!("JavaScript support file has no parent: {output}"))?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating JavaScript support parent {parent}"))?;
+            std::fs::write(&output, bytes)
+                .with_context(|| format!("writing generated JavaScript support file {output}"))?;
+        } else {
+            std::fs::create_dir_all(&output).with_context(|| {
+                format!("creating generated JavaScript support directory {output}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_javascript_support(
+    root: &Utf8Path,
+    directory: &Utf8Path,
+    entries: &mut Vec<SupportSourceEntry>,
+) -> Result<()> {
+    let mut children = std::fs::read_dir(directory)
+        .with_context(|| format!("reading JavaScript support directory {directory}"))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = Utf8PathBuf::from_path_buf(child.path()).map_err(|path| {
+            anyhow::anyhow!("JavaScript support path is not UTF-8: {}", path.display())
+        })?;
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| format!("JavaScript support path escaped its root: {path}"))?
+            .to_path_buf();
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("reading JavaScript support entry {path}"))?;
+        if metadata.file_type().is_symlink() {
+            bail!("JavaScript support does not accept symlinks: {path}");
+        }
+        if metadata.is_dir() {
+            entries.push(SupportSourceEntry {
+                relative,
+                bytes: None,
+            });
+            collect_javascript_support(root, &path, entries)?;
+        } else if metadata.is_file() {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("reading JavaScript support source {path}"))?;
+            std::str::from_utf8(&bytes)
+                .with_context(|| format!("JavaScript support source is not UTF-8 text: {path}"))?;
+            entries.push(SupportSourceEntry {
+                relative,
+                bytes: Some(bytes),
+            });
+        } else {
+            bail!("JavaScript support contains a non-file entry: {path}");
+        }
+    }
+    Ok(())
 }
 
 fn build_private_target_set(

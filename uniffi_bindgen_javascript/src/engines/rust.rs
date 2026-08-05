@@ -355,7 +355,8 @@ fn napi_carrier_type_for(
                     )
                 ) =>
             {
-                syn::parse_str("napi::bindgen_prelude::BigInt").map_err(Into::into)
+                syn::parse_str(&format!("{}::bindgen_prelude::BigInt", flavor.prefix()))
+                    .map_err(Into::into)
             }
             ConversionRecipe::Record(id)
             | ConversionRecipe::Enum(id)
@@ -417,7 +418,7 @@ fn napi_carrier_type_for(
                     _ => (ty, ty),
                 };
                 Ok(syn::parse_str(&format!(
-                    "std::collections::HashMap<{}, {}>",
+                    "__UniffiNapiMap<{}, {}>",
                     recurse(key_ty, key, named_types, flavor)?.to_token_stream(),
                     recurse(value_ty, value, named_types, flavor)?.to_token_stream()
                 ))?)
@@ -1472,7 +1473,7 @@ fn lift_expr(
                 .map(|(key, value)| -> ::std::result::Result<_, #error_descriptor> {
                     Ok(({ #key_expression }, { #value_expression }))
                 })
-                .collect::<::std::result::Result<std::collections::HashMap<_, _>, #error_descriptor>>()?))
+                .collect::<::std::result::Result<__UniffiNapiMap<_, _>, #error_descriptor>>()?))
         }
         ConversionRecipe::Custom(id, _) => {
             let helper = path_for_type_helper(id.index(), "lift");
@@ -1929,6 +1930,112 @@ fn render_temporal_helpers(flavor: NativeFlavor) -> Result<String> {
     let source = quote! {
         use #napi::bindgen_prelude::*;
 
+        // napi-rs intentionally maps Rust HashMap values to plain JavaScript
+        // objects.  UniFFI's public cross-engine contract uses a real Map, so
+        // keep that distinction in an engine-private carrier and convert to
+        // the core HashMap only at the typed operation boundary.
+        struct __UniffiNapiMap<K, V>(::std::collections::HashMap<K, V>);
+
+        impl<K, V> TypeName for __UniffiNapiMap<K, V> {
+            fn type_name() -> &'static str { "Map" }
+            fn value_type() -> ValueType { ValueType::Object }
+        }
+
+        impl<K, V> ValidateNapiValue for __UniffiNapiMap<K, V>
+        where
+            K: FromNapiValue + ::std::cmp::Eq + ::std::hash::Hash,
+            V: FromNapiValue,
+        {}
+
+        impl<K, V> FromNapiValue for __UniffiNapiMap<K, V>
+        where
+            K: FromNapiValue + ::std::cmp::Eq + ::std::hash::Hash,
+            V: FromNapiValue,
+        {
+            unsafe fn from_napi_value(
+                env: #napi::sys::napi_env,
+                napi_val: #napi::sys::napi_value,
+            ) -> Result<Self> {
+                let object = Object::from_raw(env, napi_val);
+                let global = Env::from(env).get_global()?;
+                let map_class: Function<'_, (), ()> =
+                    global.get_named_property_unchecked("Map")?;
+                let mut is_map = false;
+                let status = #napi::sys::napi_instanceof(
+                    env,
+                    napi_val,
+                    map_class.raw(),
+                    &mut is_map,
+                );
+                if status != #napi::sys::Status::napi_ok {
+                    return Err(Error::new(
+                        Status::GenericFailure,
+                        "failed to validate JavaScript Map",
+                    ));
+                }
+                if !is_map {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        "expected a JavaScript Map",
+                    ));
+                }
+                let entries: Function<'_, (), Object> = object.get_named_property("entries")?;
+                let iterator = entries.apply(object, ())?;
+                let next: Function<'_, (), Object> = iterator.get_named_property("next")?;
+                let mut values = ::std::collections::HashMap::new();
+                loop {
+                    let step: Object = next.apply(iterator, ())?;
+                    if step.get_named_property::<bool>("done")? {
+                        break;
+                    }
+                    let (key, value): (K, V) =
+                        step.get_named_property_unchecked("value")?;
+                    values.insert(key, value);
+                }
+                Ok(Self(values))
+            }
+        }
+
+        impl<K, V> ToNapiValue for __UniffiNapiMap<K, V>
+        where
+            K: ToNapiValue,
+            V: ToNapiValue,
+        {
+            unsafe fn to_napi_value(
+                raw_env: #napi::sys::napi_env,
+                value: Self,
+            ) -> Result<#napi::sys::napi_value> {
+                let env = Env::from(raw_env);
+                let global = env.get_global()?;
+                let map_class = global
+                    .get_named_property_unchecked::<Function<'_, Array, ()>>("Map")?;
+                let entries = Array::from_vec(&env, value.0.into_iter().collect())?;
+                let map = map_class.new_instance(entries)?;
+                Ok(map.raw())
+            }
+        }
+
+        impl<K, V> ::std::iter::IntoIterator for __UniffiNapiMap<K, V> {
+            type Item = (K, V);
+            type IntoIter = ::std::collections::hash_map::IntoIter<K, V>;
+
+            fn into_iter(self) -> Self::IntoIter {
+                self.0.into_iter()
+            }
+        }
+
+        impl<K, V> ::std::iter::FromIterator<(K, V)> for __UniffiNapiMap<K, V>
+        where
+            K: ::std::cmp::Eq + ::std::hash::Hash,
+        {
+            fn from_iter<T>(iter: T) -> Self
+            where
+                T: IntoIterator<Item = (K, V)>,
+            {
+                Self(iter.into_iter().collect())
+            }
+        }
+
         #[derive(Clone, Debug, PartialEq, Eq, Hash)]
         struct __UniffiTimestamp(pub ::std::time::SystemTime);
 
@@ -2181,7 +2288,7 @@ fn render_callback_proxy_helpers(
                             format!("return_{method_id}"),
                             callback_type,
                             contract.contract,
-                            true,
+                            false,
                             true,
                         ));
                     }
@@ -2733,21 +2840,12 @@ fn render_callback_proxy_helpers(
                                 .__uniffi_inner
                                 .invoker
                                 .with_host(|_env, __uniffi_host| {
-                                    let __uniffi_lease = self
-                                        .__uniffi_inner
-                                        .invoker
-                                        .retain_returned_callback(
-                                            #returned_callback_type_id,
-                                            __uniffi_callback_id,
-                                        )
-                                        .map_err(|error| #error_descriptor::backend(error.to_string()))?;
                                     #return_helper(
                                         __uniffi_host,
                                         #returned_callback_type_id,
                                         __uniffi_callback_id,
                                         #contract_expr,
                                         self.__uniffi_inner.invoker.clone(),
-                                        __uniffi_lease,
                                     )
                                 })
                                 .unwrap_or_else(|error| panic!("callback return retain check failed: {}", error))
@@ -2838,20 +2936,12 @@ fn render_callback_proxy_helpers(
                                     .value
                                     .ok_or_else(|| format!("callback method {} returned ok without a callback id", #method_id))?;
                                 let __uniffi_proxy = match __uniffi_inner.invoker.with_host(|_env, __uniffi_host| {
-                                    let __uniffi_lease = __uniffi_inner
-                                        .invoker
-                                        .retain_returned_callback(
-                                            #returned_callback_type_id,
-                                            __uniffi_callback_id,
-                                        )
-                                        .map_err(|error| format!("callback return retain failed: {}", error))?;
                                     #return_helper(
                                         __uniffi_host,
                                         #returned_callback_type_id,
                                         __uniffi_callback_id,
                                         #contract_expr,
                                         __uniffi_inner.invoker.clone(),
-                                        __uniffi_lease,
                                     )
                                     .map_err(|error| format!("callback return proxy construction failed: {:?}", error))
                                 }) {
@@ -2875,20 +2965,12 @@ fn render_callback_proxy_helpers(
                                 .value
                                 .ok_or_else(|| format!("callback method {} returned ok without a callback id", #method_id))?;
                             let __uniffi_proxy = match __uniffi_inner.invoker.with_host(|_env, __uniffi_host| {
-                                let __uniffi_lease = __uniffi_inner
-                                    .invoker
-                                    .retain_returned_callback(
-                                        #returned_callback_type_id,
-                                        __uniffi_callback_id,
-                                    )
-                                    .map_err(|error| format!("callback return retain failed: {}", error))?;
                                 #return_helper(
                                     __uniffi_host,
                                     #returned_callback_type_id,
                                     __uniffi_callback_id,
                                     #contract_expr,
                                     __uniffi_inner.invoker.clone(),
-                                    __uniffi_lease,
                                 )
                                 .map_err(|error| format!("callback return proxy construction failed: {:?}", error))
                             }) {
@@ -3019,20 +3101,12 @@ fn render_callback_proxy_helpers(
                             let __uniffi_proxy = __uniffi_callback_inner
                                 .invoker
                                 .with_host(|_env, __uniffi_host| {
-                                    let __uniffi_lease = __uniffi_callback_inner
-                                        .invoker
-                                        .retain_returned_callback(
-                                            #returned_callback_type_id,
-                                            __uniffi_callback_id,
-                                        )
-                                        .map_err(|error| format!("callback return retain failed: {}", error))?;
                                     #return_helper(
                                         __uniffi_host,
                                         #returned_callback_type_id,
                                         __uniffi_callback_id,
                                         #contract_expr,
                                         __uniffi_callback_inner.invoker.clone(),
-                                        __uniffi_lease,
                                     )
                                     .map_err(|error| format!("callback return proxy construction failed: {:?}", error))
                                 })
@@ -3056,20 +3130,12 @@ fn render_callback_proxy_helpers(
                             let __uniffi_proxy = __uniffi_callback_inner
                                 .invoker
                                 .with_host(|_env, __uniffi_host| {
-                                    let __uniffi_lease = __uniffi_callback_inner
-                                        .invoker
-                                        .retain_returned_callback(
-                                            #returned_callback_type_id,
-                                            __uniffi_callback_id,
-                                        )
-                                        .map_err(|error| format!("callback return retain failed: {}", error))?;
                                     #return_helper(
                                         __uniffi_host,
                                         #returned_callback_type_id,
                                         __uniffi_callback_id,
                                         #contract_expr,
                                         __uniffi_callback_inner.invoker.clone(),
-                                        __uniffi_lease,
                                     )
                                     .map_err(|error| format!("callback return proxy construction failed: {:?}", error))
                                 })
@@ -3246,7 +3312,7 @@ fn render_callback_proxy_helpers(
 
         let retained_contract =
             contract.retention == uniffi_js_engine_schema::CallbackRetention::Retained;
-        let helper_signature = if retained_contract {
+        let helper_signature = if needs_lease && retained_contract {
             quote! {
                 fn #helper_name(
                     host: &#napi::bindgen_prelude::Object<'static>,
@@ -3691,16 +3757,16 @@ fn render_operation_helpers_for(
                         | ConversionRecipe::Error(_)
                         | ConversionRecipe::Custom(_, _)
                 );
-            let engine_lowers_without_operation_helper = matches!(
-                binding.carrier,
-                RustCarrier::BigInt
-                    | RustCarrier::CallbackProxy
-                    | RustCarrier::InputStream
-                    | RustCarrier::OpaqueHandle
-                    | RustCarrier::OutputStream
-            ) || (binding.carrier
-                == RustCarrier::Primitive
-                && matches!(binding.conversion, ConversionRecipe::Identity));
+            let engine_lowers_without_operation_helper =
+                matches!(
+                    binding.carrier,
+                    RustCarrier::CallbackProxy
+                        | RustCarrier::InputStream
+                        | RustCarrier::OpaqueHandle
+                        | RustCarrier::OutputStream
+                ) || matches!(binding.conversion, ConversionRecipe::BigInt)
+                    || (binding.carrier == RustCarrier::Primitive
+                        && matches!(binding.conversion, ConversionRecipe::Identity));
             if conversion_requires_host(&binding.conversion)
                 || uses_named_type_helper
                 || engine_lowers_without_operation_helper
@@ -3898,19 +3964,20 @@ fn render_operation_helpers_for(
                 });
                 continue;
             }
-            if (binding.carrier == RustCarrier::LocalAdapter
-                || matches!(
-                    binding.carrier,
-                    RustCarrier::Timestamp | RustCarrier::Duration
-                ))
-                && !conversion_requires_host(&binding.conversion)
-                && !matches!(
-                    binding.conversion,
-                    ConversionRecipe::Record(_)
-                        | ConversionRecipe::Enum(_)
-                        | ConversionRecipe::Error(_)
-                        | ConversionRecipe::Custom(_, _)
-                )
+            let uses_named_type_helper = matches!(
+                binding.conversion,
+                ConversionRecipe::Record(_)
+                    | ConversionRecipe::Enum(_)
+                    | ConversionRecipe::Error(_)
+                    | ConversionRecipe::Custom(_, _)
+            );
+            let engine_lifts_without_operation_helper = matches!(
+                binding.conversion,
+                ConversionRecipe::BigInt | ConversionRecipe::Identity
+            );
+            if !conversion_requires_host(&binding.conversion)
+                && !uses_named_type_helper
+                && !engine_lifts_without_operation_helper
             {
                 let value_binding = RustValueBinding {
                     rust_type: binding.rust_type.clone(),
@@ -4616,7 +4683,7 @@ fn napi_argument(
             )
     });
     let generated = match binding.carrier {
-        RustCarrier::BigInt => {
+        RustCarrier::BigInt if matches!(binding.conversion, ConversionRecipe::BigInt) => {
             if matches!(
                 binding.rust_type,
                 RustType::Scalar(uniffi_js_abi::ScalarType::I64)
@@ -4635,7 +4702,7 @@ fn napi_argument(
             ),
         },
         RustCarrier::InputStream => napi_uniffi_engine::ArgumentBinding::InputStreamProxy {
-            rust_type: syn_type(&binding.rust_type, "napi")?,
+            rust_type: core_type_for_binding(package, &value_binding)?,
             build: {
                 let resource_id = operation
                     .stream_resources
@@ -4843,7 +4910,7 @@ fn napi_operation(
     } else {
         match operation.return_value.as_ref() {
             None => napi_uniffi_engine::ReturnBinding::Unit,
-            Some(binding) if matches!(binding.carrier, RustCarrier::BigInt) => {
+            Some(binding) if matches!(binding.conversion, ConversionRecipe::BigInt) => {
                 if matches!(
                     binding.rust_type,
                     RustType::Scalar(uniffi_js_abi::ScalarType::I64)
@@ -5009,7 +5076,7 @@ fn ohos_argument(
         }
     };
     let generated = match binding.carrier {
-        RustCarrier::BigInt => {
+        RustCarrier::BigInt if matches!(binding.conversion, ConversionRecipe::BigInt) => {
             if matches!(
                 binding.rust_type,
                 RustType::Scalar(uniffi_js_abi::ScalarType::I64)
@@ -5029,7 +5096,7 @@ fn ohos_argument(
         },
         RustCarrier::InputStream => {
             napi_ohos_uniffi_engine::OhosArgumentBinding::InputStreamProxy {
-                rust_type: syn_type(&binding.rust_type, "napi_ohos")?,
+                rust_type: core_type_for_binding(package, &value_binding)?,
                 build: path_for_helper(
                     operation.operation_id.index(),
                     &index.to_string(),
@@ -5206,7 +5273,7 @@ fn ohos_operation(
     } else {
         match operation.return_value.as_ref() {
             None => napi_ohos_uniffi_engine::OhosReturnBinding::Unit,
-            Some(binding) if matches!(binding.carrier, RustCarrier::BigInt) => {
+            Some(binding) if matches!(binding.conversion, ConversionRecipe::BigInt) => {
                 if matches!(
                     binding.rust_type,
                     RustType::Scalar(uniffi_js_abi::ScalarType::I64)
@@ -6714,10 +6781,275 @@ namespace resource_paths {
     }
 
     #[test]
+    fn native_input_stream_arguments_use_the_typed_uniffi_stream() {
+        let (package, mut operation, _) = fixture();
+        let item = RustValueBinding {
+            rust_type: RustType::Scalar(uniffi_js_abi::ScalarType::U32),
+            carrier: RustCarrier::Primitive,
+            conversion: ConversionRecipe::Identity,
+        };
+        let error = RustValueBinding {
+            rust_type: RustType::Scalar(uniffi_js_abi::ScalarType::String),
+            carrier: RustCarrier::Primitive,
+            conversion: ConversionRecipe::Identity,
+        };
+        let binding = RustArgumentBinding {
+            public_name: "points".into(),
+            rust_name: "points".into(),
+            rust_type: RustType::InputStream {
+                item: Box::new(item.rust_type.clone()),
+                error: Box::new(error.rust_type.clone()),
+                is_send: true,
+            },
+            carrier: RustCarrier::InputStream,
+            ownership: Ownership::Owned,
+            conversion: ConversionRecipe::InputStream {
+                item: Box::new(item.conversion.clone()),
+                error: Box::new(error.conversion.clone()),
+            },
+        };
+        operation
+            .stream_resources
+            .push(uniffi_js_engine_schema::RustStreamResourceGroup {
+                id: uniffi_js_abi::StreamUseSiteId::new(0),
+                path: uniffi_js_engine_schema::ValuePath::argument(0),
+                direction: uniffi_js_engine_schema::StreamDirection::Input,
+                item,
+                error,
+                is_send: true,
+                hooks: Vec::new(),
+                slot_operation_ids: Default::default(),
+            });
+
+        let node = napi_argument(&package, &operation, 0, &binding, false)
+            .expect("Node input stream argument should plan");
+        let napi_uniffi_engine::ArgumentBinding::InputStreamProxy { rust_type, .. } = node.binding
+        else {
+            panic!("Node input stream argument should use the stream proxy");
+        };
+        assert_eq!(
+            rust_type.to_token_stream().to_string(),
+            "uniffi :: UniFfiInputStream < u32 , String >"
+        );
+
+        #[cfg(feature = "ohos")]
+        {
+            let harmony = ohos_argument(&package, &operation, 0, &binding, false)
+                .expect("Harmony input stream argument should plan");
+            let napi_ohos_uniffi_engine::OhosArgumentBinding::InputStreamProxy {
+                rust_type, ..
+            } = harmony.binding
+            else {
+                panic!("Harmony input stream argument should use the stream proxy");
+            };
+            assert_eq!(
+                rust_type.to_token_stream().to_string(),
+                "uniffi :: UniFfiInputStream < u32 , String >"
+            );
+        }
+    }
+
+    #[test]
     fn native_bridge_escapes_rust_keyword_identifiers() {
         assert_eq!(rust_ident("type").to_string(), "r#type");
         assert_eq!(rust_ident("r#type").to_string(), "r#type");
         assert_eq!(rust_ident("self").to_string(), "__uniffi_self");
+    }
+
+    #[test]
+    fn native_bigint_carriers_use_the_selected_engine_crate() {
+        let binding = RustValueBinding {
+            rust_type: RustType::Scalar(uniffi_js_abi::ScalarType::I64),
+            carrier: RustCarrier::BigInt,
+            conversion: ConversionRecipe::BigInt,
+        };
+
+        let node = napi_carrier_type_for(&binding, &[], NativeFlavor::Node)
+            .expect("Node BigInt carrier should render");
+        assert_eq!(
+            node.to_token_stream().to_string(),
+            "napi :: bindgen_prelude :: BigInt"
+        );
+
+        #[cfg(feature = "ohos")]
+        {
+            let harmony = napi_carrier_type_for(&binding, &[], NativeFlavor::Ohos)
+                .expect("Harmony BigInt carrier should render");
+            assert_eq!(
+                harmony.to_token_stream().to_string(),
+                "napi_ohos :: bindgen_prelude :: BigInt"
+            );
+        }
+    }
+
+    #[test]
+    fn native_optional_bigints_use_typed_operation_helpers() {
+        let (mut package, operation, _) = fixture();
+        let argument = RustArgumentBinding {
+            public_name: "botUserId".into(),
+            rust_name: "bot_user_id".into(),
+            rust_type: RustType::Option(Box::new(RustType::Scalar(uniffi_js_abi::ScalarType::U64))),
+            carrier: RustCarrier::BigInt,
+            ownership: Ownership::Owned,
+            conversion: ConversionRecipe::Optional(Box::new(ConversionRecipe::BigInt)),
+        };
+        let return_value = uniffi_js_engine_schema::RustReturnBinding {
+            rust_type: argument.rust_type.clone(),
+            carrier: argument.carrier,
+            ownership: argument.ownership,
+            conversion: argument.conversion.clone(),
+        };
+        let operation_id = operation.operation_id;
+
+        assert!(matches!(
+            napi_argument(&package, &operation, 0, &argument, false)
+                .expect("optional BigInt Node argument should plan")
+                .binding,
+            napi_uniffi_engine::ArgumentBinding::LowerWith { .. }
+        ));
+        let mut planned = operation.clone();
+        planned.return_value = Some(return_value.clone());
+        assert!(matches!(
+            napi_operation(&package, &planned)
+                .expect("optional BigInt Node return should plan")
+                .return_binding,
+            napi_uniffi_engine::ReturnBinding::LiftWith { .. }
+        ));
+        let node_operation = package
+            .rust
+            .engines
+            .get_mut(&EngineKind::Napi)
+            .expect("fixture has a Node engine")
+            .operations
+            .iter_mut()
+            .find(|candidate| candidate.operation_id == operation_id)
+            .expect("fixture has the Node operation");
+        node_operation.arguments = vec![argument.clone()];
+        node_operation.return_value = Some(return_value.clone());
+        let node_helpers =
+            render_operation_helpers_for(&package, NativeFlavor::Node, EngineKind::Napi)
+                .expect("optional BigInt Node helpers should render");
+        assert!(node_helpers.contains(&format!("fn __uniffi_lower_{}_0", operation_id.index())));
+        assert!(node_helpers.contains(&format!("fn __uniffi_lift_{}_return", operation_id.index())));
+
+        #[cfg(feature = "ohos")]
+        {
+            assert!(matches!(
+                ohos_argument(&package, &operation, 0, &argument, false)
+                    .expect("optional BigInt Harmony argument should plan")
+                    .binding,
+                napi_ohos_uniffi_engine::OhosArgumentBinding::LowerWith { .. }
+            ));
+            assert!(matches!(
+                ohos_operation(&package, &planned)
+                    .expect("optional BigInt Harmony return should plan")
+                    .return_binding,
+                napi_ohos_uniffi_engine::OhosReturnBinding::LiftWith { .. }
+            ));
+            let harmony_operation = package
+                .rust
+                .engines
+                .get_mut(&EngineKind::OhosNapi)
+                .expect("fixture has a Harmony engine")
+                .operations
+                .iter_mut()
+                .find(|candidate| candidate.operation_id == operation_id)
+                .expect("fixture has the Harmony operation");
+            harmony_operation.arguments = vec![argument];
+            harmony_operation.return_value = Some(return_value);
+            let harmony_helpers =
+                render_operation_helpers_for(&package, NativeFlavor::Ohos, EngineKind::OhosNapi)
+                    .expect("optional BigInt Harmony helpers should render");
+            assert!(
+                harmony_helpers.contains(&format!("fn __uniffi_lower_{}_0", operation_id.index()))
+            );
+            assert!(harmony_helpers
+                .contains(&format!("fn __uniffi_lift_{}_return", operation_id.index())));
+        }
+    }
+
+    #[test]
+    fn native_host_free_returns_render_operation_lift_helpers() {
+        fn assert_helper(
+            package: &mut NormalizedPackage,
+            operation: &RustOperationPlan,
+            binding: uniffi_js_engine_schema::RustReturnBinding,
+        ) {
+            let operation_id = operation.operation_id;
+            package
+                .rust
+                .engines
+                .get_mut(&EngineKind::Napi)
+                .expect("fixture has a Node engine")
+                .operations
+                .iter_mut()
+                .find(|candidate| candidate.operation_id == operation_id)
+                .expect("fixture has the Node operation")
+                .return_value = Some(binding.clone());
+            let mut planned = operation.clone();
+            planned.return_value = Some(binding.clone());
+            assert!(matches!(
+                napi_operation(package, &planned)
+                    .expect("host-free Node return should plan")
+                    .return_binding,
+                napi_uniffi_engine::ReturnBinding::LiftWith { .. }
+            ));
+            let node_helpers =
+                render_operation_helpers_for(package, NativeFlavor::Node, EngineKind::Napi)
+                    .expect("host-free Node return helper should render");
+            assert!(
+                node_helpers.contains(&format!("fn __uniffi_lift_{}_return", operation_id.index()))
+            );
+
+            #[cfg(feature = "ohos")]
+            {
+                package
+                    .rust
+                    .engines
+                    .get_mut(&EngineKind::OhosNapi)
+                    .expect("fixture has a Harmony engine")
+                    .operations
+                    .iter_mut()
+                    .find(|candidate| candidate.operation_id == operation_id)
+                    .expect("fixture has the Harmony operation")
+                    .return_value = Some(binding);
+                assert!(matches!(
+                    ohos_operation(package, &planned)
+                        .expect("host-free Harmony return should plan")
+                        .return_binding,
+                    napi_ohos_uniffi_engine::OhosReturnBinding::LiftWith { .. }
+                ));
+                let harmony_helpers =
+                    render_operation_helpers_for(package, NativeFlavor::Ohos, EngineKind::OhosNapi)
+                        .expect("host-free Harmony return helper should render");
+                assert!(harmony_helpers
+                    .contains(&format!("fn __uniffi_lift_{}_return", operation_id.index())));
+            }
+        }
+
+        let (mut package, operation, _) = fixture();
+        assert_helper(
+            &mut package,
+            &operation,
+            uniffi_js_engine_schema::RustReturnBinding {
+                rust_type: RustType::Scalar(uniffi_js_abi::ScalarType::Bytes),
+                carrier: RustCarrier::Bytes,
+                ownership: Ownership::Owned,
+                conversion: ConversionRecipe::Bytes,
+            },
+        );
+        assert_helper(
+            &mut package,
+            &operation,
+            uniffi_js_engine_schema::RustReturnBinding {
+                rust_type: RustType::Option(Box::new(RustType::Scalar(
+                    uniffi_js_abi::ScalarType::String,
+                ))),
+                carrier: RustCarrier::Primitive,
+                ownership: Ownership::Owned,
+                conversion: ConversionRecipe::Optional(Box::new(ConversionRecipe::Identity)),
+            },
+        );
     }
 
     #[cfg(feature = "ohos")]

@@ -2284,7 +2284,7 @@ interface ValueProvider {
   Payload make_payload();
   Counter make_counter(u32 initial);
   Greeter make_greeter(string prefix);
-  [CallbackContract="return,retained,calling_thread,allowed"]
+  [CallbackContract="return,scoped,calling_thread,allowed"]
   HostLogger make_host_logger(string prefix);
   [Throws=ProviderError]
   u32 checked_value(boolean fail);

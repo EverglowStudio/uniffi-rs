@@ -37,6 +37,21 @@ fn package_root_emits_required_host_crate_tree() {
     assert!(!wasm_toml.contains("serde-wasm-bindgen"));
     assert!(!wasm_toml.contains("serde ="));
     assert!(wasm_toml.contains("js-sys"));
+    for required in [
+        "wasm-bindgen = \"=0.2.126\"",
+        "wasm-bindgen-futures = \"=0.4.76\"",
+        "js-sys = \"=0.3.103\"",
+        "wasm-bindgen-uniffi-engine = { git = \"https://github.com/EverglowStudio/wasm-bindgen.git\", rev = \"192d5272182776f8d5f7c605611414e2b4435701\" }",
+    ] {
+        assert!(
+            wasm_toml.contains(required),
+            "wasm Cargo.toml must unify crates.io bindgen dependencies with the engine source; missing `{required}`:\n{wasm_toml}"
+        );
+    }
+    assert!(
+        !wasm_toml.contains("[patch.crates-io]"),
+        "generated Wasm hosts must not persist a workspace patch table:\n{wasm_toml}"
+    );
     assert!(
         wasm_toml.contains("arithmetical = { package = \"uniffi-example-arithmetic\", path ="),
         "wasm Cargo.toml should path-depend on core crate, got:\n{wasm_toml}"
@@ -133,10 +148,10 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     for required in [
         "name = \"uniffi-example-arithmetic-uniffi-js-host\"",
         "name = \"uniffi_example_arithmetic_uniffi_js_host\"",
-        "napi-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"89a51a707d6a9ab1871e36b990987f58c9b3a6f7\", package = \"napi-ohos\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }",
-        "napi-derive-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"89a51a707d6a9ab1871e36b990987f58c9b3a6f7\", package = \"napi-derive-ohos\", features = [\"strict\", \"type-def\"] }",
-        "napi-ohos-uniffi-engine = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"89a51a707d6a9ab1871e36b990987f58c9b3a6f7\" }",
-        "napi-build-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"89a51a707d6a9ab1871e36b990987f58c9b3a6f7\", package = \"napi-build-ohos\" }",
+        "napi-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"2a2ae91d91701aadd34734c24769e783bdbdd3c6\", package = \"napi-ohos\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }",
+        "napi-derive-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"2a2ae91d91701aadd34734c24769e783bdbdd3c6\", package = \"napi-derive-ohos\", features = [\"strict\", \"type-def\"] }",
+        "napi-ohos-uniffi-engine = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"2a2ae91d91701aadd34734c24769e783bdbdd3c6\" }",
+        "napi-build-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"2a2ae91d91701aadd34734c24769e783bdbdd3c6\", package = \"napi-build-ohos\" }",
         "[workspace]",
     ] {
         assert!(
@@ -273,7 +288,7 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
 }
 
 #[test]
-fn host_crates_wasm_passes_cargo_check() {
+fn host_crates_wasm_links_one_bindgen_source() {
     let cargo = which_tool("cargo");
     assert_wasm32_target(&cargo);
     let tmp = tempfile::tempdir().unwrap();
@@ -281,15 +296,15 @@ fn host_crates_wasm_passes_cargo_check() {
     let manifest = host_dir.join("wasm/Cargo.toml");
     let target_dir = shared_cargo_target_dir("wasm");
     let _target_lock = shared_cargo_target_lock("wasm");
-    let output = run_cargo_check(
+    let output = run_cargo_build(
         &manifest,
         &["--target", "wasm32-unknown-unknown"],
         &target_dir,
     )
-    .expect("cargo is required for the Wasm host crate check");
+    .expect("cargo is required for the Wasm host crate link");
     if !output.status.success() {
         panic!(
-            "cargo check on wasm host crate failed:\nstdout:\n{}\nstderr:\n{}",
+            "cargo build on wasm host crate failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -761,12 +776,12 @@ pub fn write_synthetic_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8P
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         core.join("Cargo.toml"),
-        "[package]\nname = \"tiny-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\nname = \"tiny\"\ncrate-type = [\"lib\"]\n\n[dependencies]\n\n[workspace]\nresolver = \"3\"\n",
+        "[package]\nname = \"tiny-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\nname = \"tiny\"\ncrate-type = [\"lib\"]\n\n[dependencies]\n\n[target.'cfg(target_arch = \"wasm32\")'.dependencies]\nwasm-bindgen = \"0.2.126\"\njs-sys = \"0.3.103\"\n\n[workspace]\nresolver = \"3\"\n",
     )
     .unwrap();
     std::fs::write(
         src.join("lib.rs"),
-        "pub fn echo(s: String) -> String { s }\n",
+        "pub fn echo(s: String) -> String { s }\n\n#[cfg(target_arch = \"wasm32\")]\n#[wasm_bindgen::prelude::wasm_bindgen]\npub fn registry_bindgen_probe(value: u32) -> u32 { js_sys::Math::max(value as f64, 1.0) as u32 }\n",
     )
     .unwrap();
     let udl = src.join("tiny.udl");

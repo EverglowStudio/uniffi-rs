@@ -1421,6 +1421,75 @@ fn render_import_line(import: &str) -> String {
     }
 }
 
+fn custom_type_import_alias(ty: &AstType) -> String {
+    format!("__UniffiCustomType{}", ty.id.index())
+}
+
+/// Rewrite the local binding of one configured named import to an
+/// engine-private name.  A custom type commonly uses the same public name for
+/// both its configured import and its generated export; importing the public
+/// name verbatim would make `export type Name = Name` self-referential.
+fn rewrite_custom_type_import(
+    rendered_import: &str,
+    public_name: &str,
+    private_name: &str,
+) -> Option<String> {
+    if public_name.is_empty() {
+        return None;
+    }
+    let open = rendered_import.find('{')?;
+    let relative_close = rendered_import[open + 1..].find('}')?;
+    let close = open + 1 + relative_close;
+    let mut changed = false;
+    let bindings = rendered_import[open + 1..close]
+        .split(',')
+        .map(|binding| {
+            let trimmed = binding.trim();
+            let words = trimmed.split_whitespace().collect::<Vec<_>>();
+            let rewritten = match words.as_slice() {
+                [local] if *local == public_name => {
+                    Some(format!("{public_name} as {private_name}"))
+                }
+                [source, "as", local] if *local == public_name => {
+                    Some(format!("{source} as {private_name}"))
+                }
+                ["type", local] if *local == public_name => {
+                    Some(format!("type {public_name} as {private_name}"))
+                }
+                ["type", source, "as", local] if *local == public_name => {
+                    Some(format!("type {source} as {private_name}"))
+                }
+                _ => None,
+            };
+            if rewritten.is_some() {
+                changed = true;
+            }
+            rewritten.unwrap_or_else(|| trimmed.to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    changed.then(|| {
+        format!(
+            "{} {} {}",
+            &rendered_import[..open + 1],
+            bindings,
+            &rendered_import[close..]
+        )
+    })
+}
+
+fn custom_type_uses_import_alias(ty: &AstType, config: &JsCustomTypeConfig) -> bool {
+    let alias = custom_type_import_alias(ty);
+    config.imports.iter().any(|import| {
+        rewrite_custom_type_import(
+            &render_import_line(import),
+            &config.public_type_name,
+            &alias,
+        )
+        .is_some()
+    })
+}
+
 fn render_runtime_import_line(import: &str, extension: &str) -> Result<String, FacadeError> {
     let trimmed = import.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
@@ -1514,13 +1583,19 @@ fn render_component_declaration(
         .filter(|ty| ty.source_key.component().namespace() == component.namespace)
     {
         if let AstTypeKind::Custom { config, .. } = &ty.kind {
+            let private_name = custom_type_import_alias(ty);
             for import in &config.imports {
-                out.push_str(&render_import_line(import));
+                let rendered = render_import_line(import);
+                out.push_str(
+                    &rewrite_custom_type_import(&rendered, &config.public_type_name, &private_name)
+                        .unwrap_or(rendered),
+                );
             }
         }
     }
     out.push('\n');
     out.push_str("export interface Namespace {\n");
+    out.push_str("  readonly UniffiError: typeof UniffiError;\n");
     let operations: Vec<_> = ast
         .operations
         .iter()
@@ -1563,6 +1638,9 @@ fn render_component_declaration(
         .iter()
         .filter(|ty| ty.source_key.component().namespace() == component.namespace)
     {
+        if matches!(ty.kind, AstTypeKind::Error { .. }) {
+            out.push_str(&format!("  readonly {}: typeof {};\n", ty.name, ty.name));
+        }
         if !value_operations(ast, ty).is_empty() {
             out.push_str(&format!("  readonly {}: {{\n", ty.name));
             for operation in value_operations(ast, ty) {
@@ -1599,7 +1677,7 @@ fn render_component_declaration(
                     return_type
                 };
                 out.push_str(&format!(
-                    "    {}({}): {};\n",
+                    "    readonly {}: ({}) => {};\n",
                     operation.name,
                     all_arguments.join(", "),
                     return_type
@@ -1743,12 +1821,55 @@ fn render_type_declaration(
             ));
         }
         AstTypeKind::Custom { builtin, config } => {
-            let public_type = if config.public_type_name.is_empty() {
+            let public_type = if custom_type_uses_import_alias(ty, config) {
+                custom_type_import_alias(ty)
+            } else if config.public_type_name.is_empty() {
                 render_public_type(ast, builtin)
             } else {
                 config.public_type_name.clone()
             };
             out.push_str(&format!("export type {} = {};\n", ty.name, public_type));
+        }
+        AstTypeKind::Object {
+            kind: uniffi_js_abi::ObjectKind::TraitForeignOnly,
+        } => {
+            out.push_str(&format!("export interface {} {{\n", ty.name));
+            for operation in ast.operations.iter().filter(|operation| {
+                matches!(
+                    operation.source_key.owner(),
+                    OperationOwner::Callback(key)
+                        if key == &ty.source_key
+                            && operation.kind == OperationKind::CallbackMethod
+                )
+            }) {
+                let args = operation
+                    .arguments
+                    .iter()
+                    .map(|argument| {
+                        format!(
+                            "{}: {}",
+                            argument.name,
+                            render_public_type(ast, &argument.ty)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let return_type = operation
+                    .return_type
+                    .as_ref()
+                    .map(|value| render_public_type(ast, value))
+                    .unwrap_or_else(|| "void".to_owned());
+                let return_type = if operation.async_kind == AsyncKind::Async {
+                    format!("Promise<{return_type}>")
+                } else {
+                    return_type
+                };
+                out.push_str(&format!(
+                    "  {}({}): {};\n",
+                    operation.name, args, return_type
+                ));
+            }
+            out.push_str("}\n");
         }
         AstTypeKind::Object { .. } => {
             out.push_str(&format!(
@@ -1823,7 +1944,7 @@ fn render_type_declaration(
                         ty.name.clone()
                     };
                     out.push_str(&format!(
-                        "  {}({}): {};\n",
+                        "  readonly {}: ({}) => {};\n",
                         operation.name, args, return_type
                     ));
                 }
@@ -2564,12 +2685,27 @@ mod tests {
                 assert!(text.contains("ClosePolicy"));
                 assert!(text.contains("onDeadline: \"detach\""));
                 assert!(text.contains("class __ArkDetachedMarker"));
+                assert!(text.contains("const __closePolicy: ClosePolicy = { graceMs:"));
+                assert!(!text.contains("Object.freeze({"));
                 assert!(!text.contains("const __DETACHED = \"__uniffi_detached__\""));
                 assert!(text.contains("if (closed || detached) return new ArkDoneStep();"));
                 assert!(text.contains("return guarded as ArkValue"));
+                assert!(text.contains(
+                    "new Promise<void>((resolve): void => { this.idleWaiters.add(resolve); })"
+                ));
+                assert!(text.contains("function __arkCallbackFailure(error: Error)"));
+                assert!(!text.contains("error as ArkValue"));
+                assert!(!text.contains("(error: ArkValue)"));
+                assert!(text.contains("export class Failure extends UniffiError"));
+                assert!(!text.contains("export interface FailureConstructor"));
+                assert!(!text.contains("Failure_RejectedInput"));
+                assert!(!text.contains("readonly Failure: FailureConstructor"));
             } else {
                 assert!(!text.contains("ClosePolicy"));
                 assert!(!text.contains("configureClosePolicy"));
+                assert!(text.contains("export declare class Failure extends UniffiError"));
+                assert!(!text.contains("export interface FailureConstructor"));
+                assert!(!text.contains("Failure_RejectedInput"));
             }
             for forbidden in [
                 "unknown",
@@ -2609,6 +2745,171 @@ mod tests {
     }
 
     #[test]
+    fn declarations_keep_named_constructors_and_error_values_callable() {
+        let mut shared_ast = corpus_ast();
+        shared_ast
+            .operations
+            .iter_mut()
+            .find(|operation| operation.id == OperationId::new(1))
+            .expect("corpus has an object constructor")
+            .name = "new".into();
+        let shared = render_component_declaration(&shared_ast, &shared_ast.components[0]).unwrap();
+        assert!(shared.contains("readonly new: () => Service;"));
+        assert!(!shared.contains("\n  new(): Service;"));
+        assert!(shared.contains("readonly UniffiError: typeof UniffiError;"));
+        assert!(shared.contains("readonly Failure: typeof Failure;"));
+
+        let mut ark_ast = corpus_ast();
+        let component = ComponentKey::new("corpus").unwrap();
+        let profile = key(&component, "Profile");
+        let constructor = ark_ast
+            .operations
+            .iter_mut()
+            .find(|operation| operation.id == OperationId::new(12))
+            .expect("corpus has a value operation");
+        constructor.kind = OperationKind::Constructor;
+        constructor.source_key = operation_key(
+            &component,
+            OperationOwner::Value(profile.clone()),
+            OperationKind::Constructor,
+            "new",
+        );
+        constructor.name = "new".into();
+        constructor.return_type = Some(ValueType::Named(profile));
+        constructor.receiver_type = None;
+        let declaration = String::from_utf8(
+            render_ark_inventory(&ark_ast)
+                .unwrap()
+                .into_iter()
+                .find(|file| file.path == "Index.d.ets")
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(declaration.contains("readonly new: () => Profile;"));
+        assert!(!declaration.contains("new: (self_: Profile"));
+    }
+
+    #[test]
+    fn custom_type_imports_use_private_aliases_before_public_reexport() {
+        let mut ast = corpus_ast();
+        let custom = ast
+            .types
+            .iter_mut()
+            .find(|ty| matches!(ty.kind, AstTypeKind::Custom { .. }))
+            .expect("corpus has a custom type");
+        custom.name = "EmailAddress".into();
+        let AstTypeKind::Custom { config, .. } = &mut custom.kind else {
+            unreachable!();
+        };
+        config.public_type_name = "EmailAddress".into();
+        config.imports = vec![
+            "type { EmailAddress } from \"../../support/email.js\"".into(),
+            "{ emailAddressFromString } from \"../../support/email.js\"".into(),
+        ];
+
+        let shared = render_component_declaration(&ast, &ast.components[0])
+            .expect("custom declaration should render");
+        assert!(shared.contains(
+            "import type { EmailAddress as __UniffiCustomType5 } from \"../../support/email.js\";"
+        ));
+        assert!(shared.contains("export type EmailAddress = __UniffiCustomType5;"));
+        assert!(!shared.contains("export type EmailAddress = EmailAddress;"));
+
+        let ark = ark::render_inventory(&ast).expect("custom ArkTS inventory should render");
+        for file in ark {
+            let source = String::from_utf8(file.bytes).expect("ArkTS output is UTF-8");
+            assert!(source.contains(
+                "import type { EmailAddress as __UniffiCustomType5 } from \"./support/email.js\";"
+            ));
+            assert!(source.contains("export type EmailAddress = __UniffiCustomType5;"));
+            assert!(!source.contains("export type EmailAddress = EmailAddress;"));
+        }
+    }
+
+    #[test]
+    fn ark_custom_conversion_uses_runtime_direction() {
+        let component = ComponentKey::new("corpus").unwrap();
+        let custom = key(&component, "CustomName");
+        let mut ast = corpus_ast();
+        let custom_type = ast
+            .types
+            .iter_mut()
+            .find(|ty| ty.source_key == custom)
+            .expect("corpus has a custom type");
+        let AstTypeKind::Custom { config, .. } = &mut custom_type.kind else {
+            panic!("corpus custom type kind changed");
+        };
+        config.into_custom = "intoCustom({})".into();
+        config.from_custom = "fromCustom({})".into();
+        ast.operations.push(AstOperation {
+            id: OperationId::new(16),
+            source_key: operation_key(
+                &component,
+                OperationOwner::Namespace,
+                OperationKind::Function,
+                "roundtrip_custom",
+            ),
+            component_id: ComponentId::new(0),
+            name: "roundtripCustom".into(),
+            debug_name: "roundtripCustom".into(),
+            kind: OperationKind::Function,
+            arguments: vec![AstArgument {
+                name: "value".into(),
+                ty: ValueType::Named(custom.clone()),
+                default: None,
+            }],
+            return_type: Some(ValueType::Named(custom)),
+            async_kind: AsyncKind::Sync,
+            throws: None,
+            receiver_type: None,
+            callback_method_id: None,
+            stream_slots: vec![],
+            stream_resources: vec![],
+        });
+        let source = String::from_utf8(
+            render_ark_inventory(&ast)
+                .unwrap()
+                .into_iter()
+                .find(|file| file.path == "Index.ets")
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(source.contains("fromCustom("));
+        assert!(source.contains("intoCustom(__ark_nested_lift"));
+        assert!(!source.contains("intoCustom(value as string"));
+        assert!(!source.contains("fromCustom(__ark_nested_lift"));
+    }
+
+    #[test]
+    fn ark_callback_error_payload_lowers_through_ark_record() {
+        let mut ast = corpus_ast();
+        let component = ComponentKey::new("corpus").unwrap();
+        let failure = key(&component, "Failure");
+        ast.operations
+            .iter_mut()
+            .find(|operation| operation.id == OperationId::new(3))
+            .expect("corpus has a callback method")
+            .throws = Some(failure);
+        let source = String::from_utf8(
+            render_ark_inventory(&ast)
+                .unwrap()
+                .into_iter()
+                .find(|file| file.path == "Index.ets")
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(source.contains("const payloadValue: ArkValue = declared.data"));
+        assert!(source.contains("payloadValue instanceof ArkRecord"));
+        assert!(source.contains("const payload: ArkRecord = payloadValue"));
+        assert!(source.contains("payload.get(\"message\") as string"));
+        assert!(!source.contains("Failure_RejectedInput"));
+        assert!(!source.contains("payload.message"));
+    }
+
+    #[test]
     fn ark_composite_owner_and_stream_surface_is_canonical() {
         let implementation = String::from_utf8(
             render_ark_inventory(&corpus_ast())
@@ -2621,7 +2922,7 @@ mod tests {
         .unwrap();
         assert!(implementation.contains("__invokeValue12(self: Profile, session: BackendSession)"));
         assert!(implementation.contains("__invokeObject13(self: Service, session: BackendSession"));
-        assert!(implementation.contains("const __arkEnum_Event: EventValue"));
+        assert!(implementation.contains("const __arkEnum_Event: __ArkEnumEventVariants"));
         assert!(implementation.contains("Event: __corpus_Event"));
         assert!(implementation.contains("Color: __corpus_Color"));
         assert!(implementation.contains("readonly error: (value: ArkValue) => UniffiError"));
@@ -2642,7 +2943,9 @@ mod tests {
         let types = assign_type_ids([TypeDefinition::new(
             listener_key.clone(),
             "Listener",
-            NamedTypeKind::Callback,
+            NamedTypeKind::Object {
+                kind: uniffi_js_abi::ObjectKind::TraitForeignOnly,
+            },
         )
         .unwrap()])
         .unwrap();
@@ -2709,6 +3012,7 @@ mod tests {
             Capability::String,
             Capability::Callback,
             Capability::RetainedCallback,
+            Capability::ObjectLease,
             Capability::SyncCall,
         ];
         let bridge = BridgePlan::build(BridgePlanInput {
@@ -2793,7 +3097,9 @@ mod tests {
                 id: listener_id,
                 source_key: listener_key.clone(),
                 public_name: "Listener".into(),
-                kind: JsTypeKind::Callback,
+                kind: JsTypeKind::Object {
+                    kind: uniffi_js_abi::ObjectKind::TraitForeignOnly,
+                },
             }],
             operations: identified_operations
                 .iter()
@@ -2825,6 +3131,25 @@ mod tests {
             required_capabilities: CapabilitySet::new(capabilities),
         };
         let facade = FacadeBuilder::new(&api, &bridge, &rust).build().unwrap();
+        let declaration = String::from_utf8(
+            facade
+                .shared_files()
+                .iter()
+                .find(|file| file.path == "components/callback_e2e/index.d.ts")
+                .unwrap()
+                .bytes
+                .clone(),
+        )
+        .unwrap();
+        assert!(declaration
+            .contains("export interface Listener {\n  onEvent(value: string): string;\n}"));
+        assert!(!declaration.contains("export declare class Listener"));
+        for file in facade.ark_files() {
+            let ark = String::from_utf8(file.bytes.clone()).unwrap();
+            assert!(ark.contains("export interface Listener"));
+            assert!(!ark.contains("class Listener extends ObjectLease"));
+            assert!(!ark.contains("Listener.__arkCreate"));
+        }
         let implementation = String::from_utf8(
             facade
                 .shared_files()

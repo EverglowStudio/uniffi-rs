@@ -17,8 +17,9 @@ use uniffi_js_engine_schema::{
 };
 
 use crate::{
-    AstCallbackUseSite, AstComponent, AstOperation, AstStreamResource, AstType, AstTypeKind,
-    AstVariant, FacadeError, PublicAst, PublicFile, PublicFileRole,
+    custom_type_import_alias, rewrite_custom_type_import, AstCallbackUseSite, AstComponent,
+    AstOperation, AstStreamResource, AstType, AstTypeKind, AstVariant, FacadeError, PublicAst,
+    PublicFile, PublicFileRole,
 };
 
 #[derive(Clone, Debug)]
@@ -136,14 +137,21 @@ impl<'a> Model<'a> {
         let mut custom_imports = BTreeSet::new();
         for ty in &types {
             if let AstTypeKind::Custom { config, .. } = &ty.kind {
+                let private_name = custom_type_import_alias(ty);
                 for import in &config.imports {
-                    let line = ark_import_line(import).ok_or_else(|| {
-                        FacadeError::UnsupportedArkImport {
+                    let line = ark_import_line(import, ty.source_key.component().namespace())
+                        .ok_or_else(|| FacadeError::UnsupportedArkImport {
                             import: import.clone(),
-                        }
-                    })?;
+                        })?;
                     if !line.is_empty() {
-                        custom_imports.insert(line);
+                        custom_imports.insert(
+                            rewrite_custom_type_import(
+                                &line,
+                                &config.public_type_name,
+                                &private_name,
+                            )
+                            .unwrap_or(line),
+                        );
                     }
                 }
             }
@@ -275,19 +283,52 @@ fn safe_ident(value: &str) -> String {
     }
 }
 
-fn ark_import_line(import: &str) -> Option<String> {
+fn ark_import_line(import: &str, component_namespace: &str) -> Option<String> {
     let trimmed = import.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return Some(String::new());
     }
-    // Custom modules are supplied by the consumer.  Keep the import exactly
-    // as declared instead of rejecting a valid JS/TS specifier while building
-    // the shared facade inventory.
-    if trimmed.starts_with("import ") {
-        Some(format!("{trimmed};\n"))
+    // Custom modules are supplied by the consumer. Preserve the import shape;
+    // package-relative paths are rebased below for the ArkTS root facade.
+    let line = if trimmed.starts_with("import ") {
+        format!("{trimmed};\n")
     } else {
-        Some(format!("import {trimmed};\n"))
+        format!("import {trimmed};\n")
+    };
+    rebase_ark_import(&line, component_namespace)
+}
+
+/// Custom import paths are authored relative to the shared component module
+/// (`components/<namespace>/index.js`).  ArkTS has one package-root facade, so
+/// resolve the same package file and emit a module specifier relative to
+/// `Index.ets`.  Imports which escape the generated source root are rejected:
+/// managed custom support must be copied into that atomic root.
+fn rebase_ark_import(line: &str, component_namespace: &str) -> Option<String> {
+    let quote_end = line.rfind(['"', '\''])?;
+    let quote = line.as_bytes()[quote_end] as char;
+    let quote_start = line[..quote_end].rfind(quote)?;
+    let specifier = &line[quote_start + 1..quote_end];
+    if !specifier.starts_with('.') {
+        return Some(line.to_owned());
     }
+
+    let mut resolved = vec!["components", component_namespace];
+    for segment in specifier.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                resolved.pop()?;
+            }
+            value => resolved.push(value),
+        }
+    }
+    let rebased = format!("./{}", resolved.join("/"));
+    Some(format!(
+        "{}{}{}",
+        &line[..quote_start + 1],
+        rebased,
+        &line[quote_end..]
+    ))
 }
 
 fn render_implementation(model: &Model<'_>) -> Result<String, FacadeError> {
@@ -301,7 +342,7 @@ fn render_implementation(model: &Model<'_>) -> Result<String, FacadeError> {
     out.push_str(ARK_RUNTIME);
     out.push('\n');
     out.push_str(&format!(
-        "const __closePolicy: ClosePolicy = Object.freeze({{ graceMs: {}, onDeadline: \"detach\" }});\n",
+        "const __closePolicy: ClosePolicy = {{ graceMs: {}, onDeadline: \"detach\" }};\n",
         model.ast.close_policy.grace_ms
     ));
     out.push_str(&render_type_definitions(model, false));
@@ -422,15 +463,12 @@ fn render_type_definitions(model: &Model<'_>, declaration: bool) -> String {
                 out.push_str("}\n");
             }
             AstTypeKind::Enum { variants } => {
-                render_enum_definition(model, &mut out, name, variants, declaration)
+                render_enum_definition(model, &mut out, ty, name, variants, declaration)
             }
-            AstTypeKind::Error { variants } => {
+            AstTypeKind::Error { .. } => {
                 if declaration {
                     out.push_str(&format!(
                         "export declare class {name} extends UniffiError {{\n  constructor(message?: string, variant?: string | null, data?: ArkValue | null);\n}}\n"
-                    ));
-                    out.push_str(&format!(
-                        "export interface {name}Constructor {{ new(message?: string, variant?: string | null, data?: ArkValue | null): {name}; }}\n"
                     ));
                 } else {
                     out.push_str(&format!(
@@ -438,15 +476,40 @@ fn render_type_definitions(model: &Model<'_>, declaration: bool) -> String {
                         name
                     ));
                 }
-                let _ = variants;
             }
             AstTypeKind::Custom { config, builtin } => {
-                let public_type = if config.public_type_name.is_empty() {
+                let private_name = custom_type_import_alias(ty);
+                let uses_import_alias = config.imports.iter().any(|import| {
+                    ark_import_line(import, ty.source_key.component().namespace()).is_some_and(
+                        |line| {
+                            rewrite_custom_type_import(
+                                &line,
+                                &config.public_type_name,
+                                &private_name,
+                            )
+                            .is_some()
+                        },
+                    )
+                });
+                let public_type = if uses_import_alias {
+                    private_name
+                } else if config.public_type_name.is_empty() {
                     render_type_name(model, builtin)
                 } else {
                     config.public_type_name.clone()
                 };
                 out.push_str(&format!("export type {name} = {public_type};\n"));
+            }
+            AstTypeKind::Object {
+                kind: ObjectKind::TraitForeignOnly,
+            } => {
+                out.push_str(&format!("export interface {name} {{\n"));
+                for operation in model.operations.iter().copied().filter(|operation| {
+                    matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key && operation.kind == OperationKind::CallbackMethod)
+                }) {
+                    out.push_str(&format_callback_signature(model, operation));
+                }
+                out.push_str("}\n");
             }
             AstTypeKind::Object { .. } => {}
             AstTypeKind::Callback => {
@@ -466,6 +529,7 @@ fn render_type_definitions(model: &Model<'_>, declaration: bool) -> String {
 fn render_enum_definition(
     model: &Model<'_>,
     out: &mut String,
+    ty: &AstType,
     name: String,
     variants: &[AstVariant],
     declaration: bool,
@@ -516,6 +580,13 @@ fn render_enum_definition(
             ));
         }
     }
+    for operation in model.operations.iter().copied().filter(|operation| {
+        matches!(operation.source_key.owner(), OperationOwner::Value(key) if key == &ty.source_key)
+    }) {
+        out.push_str(&format_api_value_operation_signature(
+            model, operation, "  ",
+        ));
+    }
     out.push_str("}\n");
     // ArkTS forbids a type alias and value declaration from sharing a name.
     // Keep the enum value namespace package-local; public consumers reach it
@@ -524,7 +595,21 @@ fn render_enum_definition(
         return;
     }
     let value_name = format!("__arkEnum_{}", safe_ident(&name));
-    out.push_str(&format!("const {value_name}: {name}Value = {{\n"));
+    let variants_type = format!("__ArkEnum{}Variants", safe_ident(&name));
+    out.push_str(&format!("interface {variants_type} {{\n"));
+    for variant in variants {
+        let variant_name = format!("{name}_{}", safe_ident(&variant.name));
+        if variant.fields.is_empty() {
+            out.push_str(&format!("  readonly {}: {variant_name};\n", variant.name));
+        } else {
+            out.push_str(&format!(
+                "  readonly {}: (value: {variant_name}Input) => {variant_name};\n",
+                variant.name
+            ));
+        }
+    }
+    out.push_str("}\n");
+    out.push_str(&format!("const {value_name}: {variants_type} = {{\n"));
     for variant in variants {
         let variant_name = format!("{name}_{}", safe_ident(&variant.name));
         if variant.fields.is_empty() {
@@ -630,13 +715,6 @@ fn render_api_declarations(model: &Model<'_>, declaration: bool) -> String {
                     ));
                 }
             }
-            if matches!(ty.kind, AstTypeKind::Error { .. }) {
-                out.push_str(&format!(
-                    "  readonly {}: {}Constructor;\n",
-                    model.type_name(&ty.source_key),
-                    model.type_name(&ty.source_key)
-                ));
-            }
         }
         out.push_str("}\n");
 
@@ -657,7 +735,7 @@ fn render_api_declarations(model: &Model<'_>, declaration: bool) -> String {
                     matches!(operation.source_key.owner(), OperationOwner::Value(key) if key == &ty.source_key)
                 })
                 .collect::<Vec<_>>();
-            if !value_ops.is_empty() {
+            if !value_ops.is_empty() && !matches!(ty.kind, AstTypeKind::Enum { .. }) {
                 out.push_str(&format!(
                     "export interface {}Value {{\n",
                     model.type_name(&ty.source_key)
@@ -759,7 +837,11 @@ fn format_api_value_operation_signature(
         OperationOwner::Value(key) => model.type_name(key),
         _ => return format_api_operation_signature(model, operation, indent),
     };
-    let mut args = vec![format!("self_: {owner}")];
+    let mut args = if operation.kind == OperationKind::Constructor {
+        Vec::new()
+    } else {
+        vec![format!("self_: {owner}")]
+    };
     args.extend(operation.arguments.iter().map(|argument| {
         format!(
             "{}{}: {}",
@@ -822,7 +904,14 @@ fn operation_return_type(model: &Model<'_>, operation: &AstOperation) -> String 
 fn render_object_classes(model: &Model<'_>) -> String {
     let mut out = String::new();
     for ty in &model.types {
-        if !matches!(ty.kind, AstTypeKind::Object { .. }) {
+        if !matches!(ty.kind, AstTypeKind::Object { .. })
+            || matches!(
+                ty.kind,
+                AstTypeKind::Object {
+                    kind: ObjectKind::TraitForeignOnly
+                }
+            )
+        {
             continue;
         }
         let name = model.type_name(&ty.source_key);
@@ -868,7 +957,14 @@ fn render_object_classes(model: &Model<'_>) -> String {
 fn render_object_declarations(model: &Model<'_>) -> String {
     let mut out = String::new();
     for ty in &model.types {
-        if !matches!(ty.kind, AstTypeKind::Object { .. }) {
+        if !matches!(ty.kind, AstTypeKind::Object { .. })
+            || matches!(
+                ty.kind,
+                AstTypeKind::Object {
+                    kind: ObjectKind::TraitForeignOnly
+                }
+            )
+        {
             continue;
         }
         let name = model.type_name(&ty.source_key);
@@ -900,7 +996,8 @@ function __validateClosePolicy(policy: ClosePolicy): ClosePolicy {
   if (policy === null) throw new UniffiError("UniffiClosePolicy", "close policy must be an object");
   if (!Number.isFinite(policy.graceMs) || !Number.isInteger(policy.graceMs) || policy.graceMs < 0) throw new UniffiError("UniffiClosePolicy", "close policy graceMs must be a finite non-negative integer");
   if (policy.onDeadline !== "detach") throw new UniffiError("UniffiClosePolicy", "close policy onDeadline must be detach");
-  return Object.freeze({ graceMs: policy.graceMs, onDeadline: "detach" });
+  const validated: ClosePolicy = { graceMs: policy.graceMs, onDeadline: "detach" };
+  return validated;
 }
 function __sameClosePolicy(left: ClosePolicy, right: ClosePolicy): boolean { return left.graceMs === right.graceMs && left.onDeadline === right.onDeadline; }
 function __sessionClosePolicy(session: BackendSession): ClosePolicy { const state: __ClosePolicyState | undefined = __CLOSE_POLICY_STATES.get(session); if (state === undefined || state.policy === null) throw new UniffiError("UniffiClosePolicy", "generated facade did not install close policy"); return state.policy; }
@@ -1136,11 +1233,11 @@ export class Host {
   }
   invokeCallbackSyncResult(callbackType: number, callbackId: number, methodId: number, args: Array<ArkValue> = []): ArkCallbackResult {
     try { return { ok: true, value: this.invokeCallbackSync(callbackType, callbackId, methodId, args) }; }
-    catch (error) { return { ok: false, error: __arkCallbackFailure(error as ArkValue) }; }
+    catch (error) { return { ok: false, error: __arkCallbackFailure(error) }; }
   }
   async invokeCallbackAsyncResult(callbackType: number, callbackId: number, methodId: number, invocationId: number, args: Array<ArkValue> = []): Promise<ArkCallbackResult> {
     try { return { ok: true, value: await this.invokeCallbackAsync(callbackType, callbackId, methodId, invocationId, args) }; }
-    catch (error) { return { ok: false, error: __arkCallbackFailure(error as ArkValue) }; }
+    catch (error) { return { ok: false, error: __arkCallbackFailure(error) }; }
   }
   pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>> {
     if (this.inputRegistry === null) return Promise.reject(new UniffiError("UniffiInputStreamMissing", "input stream registry is not attached"));
@@ -1152,12 +1249,9 @@ export class Host {
   }
   releaseInputStream(handle: ArkValue): void { this.inputRegistry?.release(handle); }
 }
-function __arkCallbackFailure(raw: ArkValue): ArkFailure {
-  if (raw instanceof UniffiError) return { errorName: raw.errorName, message: raw.message, variant: raw.variant, data: raw.data };
-  const value = raw as { errorName?: string; message?: string; variant?: string; tag?: string; data?: ArkValue };
-  const variant = value.variant ?? value.tag ?? null;
-  const errorName = value.errorName ?? variant ?? "UniffiCallbackError";
-  return { errorName, message: value.message ?? String(raw), variant, data: value.data ?? null };
+function __arkCallbackFailure(error: Error): ArkFailure {
+  if (error instanceof UniffiError) return { errorName: error.errorName, message: error.message, variant: error.variant, data: error.data };
+  return { errorName: error.name, message: error.message, variant: null, data: null };
 }
 interface ArkInputSlot { readonly pull: () => Promise<ArkStreamStep<ArkValue>>; readonly cancel: () => Promise<void>; readonly release: () => void; readonly detach: () => void; }
 class ArkInputRegistry {
@@ -1470,7 +1564,7 @@ export class BackendSession {
   private closePromise: Promise<void> | null = null;
   private deadlineTimer: number | null = null;
   private closeResolve: (() => void) | null = null;
-  private closeReject: ((reason?: ArkValue) => void) | null = null;
+  private closeReject: ((reason?: Error) => void) | null = null;
   private readonly waiters: Set<() => void> = new Set<() => void>();
   private readonly idleWaiters: Set<() => void> = new Set<() => void>();
   private activeGuards: number = 0;
@@ -1494,13 +1588,13 @@ export class BackendSession {
     const guarded: Promise<T | __ArkDetachedMarker> = new Promise<T | __ArkDetachedMarker>((resolve, reject) => {
       settle = (): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); resolve(__DETACHED); };
       this.waiters.add(settle);
-      Promise.resolve(promise).then((value: T): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); resolve(this.generationActive(generation) ? value : __DETACHED); }, (error: ArkValue): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); if (this.generationActive(generation)) reject(error); else resolve(__DETACHED); });
+      Promise.resolve(promise).then((value: T): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); resolve(this.generationActive(generation) ? value : __DETACHED); }, (error: Error): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); if (this.generationActive(generation)) reject(error); else resolve(__DETACHED); });
     });
     guarded.catch((): void => undefined);
     return guarded;
   }
   private notifyIdle(): void { if (this.activeGuards !== 0) return; for (const resolve of Array.from(this.idleWaiters)) { this.idleWaiters.delete(resolve); resolve(); } }
-  private awaitIdle(): Promise<void> { if (this.activeGuards === 0) return Promise.resolve(); return new Promise<void>((resolve): void => this.idleWaiters.add(resolve)); }
+  private awaitIdle(): Promise<void> { if (this.activeGuards === 0) return Promise.resolve(); return new Promise<void>((resolve): void => { this.idleWaiters.add(resolve); }); }
   invokeSync(operationId: number, args: Array<ArkValue>): ArkValue { this.ensureOpen(); return __decodeResult(this.backend.invokeSync(operationId, args)); }
   invokeAsync(operationId: number, args: Array<ArkValue>): Promise<ArkValue> {
     try { this.ensureOpen(); } catch (error) { return Promise.reject(error); }
@@ -1563,38 +1657,38 @@ export class BackendSession {
     __markPolicyClosed(this);
     this.closePromise = new Promise<void>((resolve, reject): void => { this.closeResolve = resolve; this.closeReject = reject; });
     this.deadlineTimer = setTimeout((): void => this.deadlineDetach(), policy.graceMs);
-    this.runTeardown().then((errors: Array<ArkValue>): void => this.finishNaturalClose(errors), (error: ArkValue): void => this.finishNaturalClose([error])).catch((): void => undefined);
+    this.runTeardown().then((errors: Array<Error>): void => this.finishNaturalClose(errors), (error: Error): void => this.finishNaturalClose([error])).catch((): void => undefined);
     return this.closePromise;
   }
-  private async runTeardown(): Promise<Array<ArkValue>> {
-    const errors: Array<ArkValue> = [];
+  private async runTeardown(): Promise<Array<Error>> {
+    const errors: Array<Error> = [];
     const pending: Array<Promise<void>> = [];
     for (const stream of this.streams.slice()) {
       try {
         const result: Promise<void> | void = stream.cancel();
-        pending.push(this.guardPromise(result, this.currentGeneration).then((): void => undefined).catch((error): void => { if (!this.detached) errors.push(error as ArkValue); }));
-      } catch (error) { if (!this.detached) errors.push(error as ArkValue); }
+        pending.push(this.guardPromise(result, this.currentGeneration).then((): void => undefined).catch((error: Error): void => { if (!this.detached) errors.push(error); }));
+      } catch (error) { if (!this.detached) errors.push(error); }
     }
     try {
       const inputClose: Promise<void> = this.inputRegistry.close();
-      pending.push(this.guardPromise(inputClose, this.currentGeneration).then((): void => undefined).catch((error): void => { if (!this.detached) errors.push(error as ArkValue); }));
-    } catch (error) { if (!this.detached) errors.push(error as ArkValue); }
+      pending.push(this.guardPromise(inputClose, this.currentGeneration).then((): void => undefined).catch((error: Error): void => { if (!this.detached) errors.push(error); }));
+    } catch (error) { if (!this.detached) errors.push(error); }
     for (const object of this.objects.slice()) { try { object.dispose(); } catch (_) {} }
     if (this.backend.close !== undefined) {
       try {
         const backendClose: Promise<void> | void = this.backend.close();
-        pending.push(this.guardPromise(backendClose, this.currentGeneration).then((): void => undefined).catch((error): void => { if (!this.detached) errors.push(error as ArkValue); }));
-      } catch (error) { if (!this.detached) errors.push(error as ArkValue); }
+        pending.push(this.guardPromise(backendClose, this.currentGeneration).then((): void => undefined).catch((error: Error): void => { if (!this.detached) errors.push(error); }));
+      } catch (error) { if (!this.detached) errors.push(error); }
     }
     await Promise.all(pending);
     if (!this.detached) await this.awaitIdle();
     return errors;
   }
-  private finishNaturalClose(errors: Array<ArkValue>): void {
+  private finishNaturalClose(errors: Array<Error>): void {
     if (this.phase === "closed") return;
     if (this.deadlineTimer !== null) { clearTimeout(this.deadlineTimer); this.deadlineTimer = null; }
     if (!this.detached) { this.callbacks.detach(); this.phase = "closed"; this.currentGeneration += 1; }
-    const resolve: (() => void) | null = this.closeResolve; const reject: ((reason?: ArkValue) => void) | null = this.closeReject; this.closeResolve = null; this.closeReject = null;
+    const resolve: (() => void) | null = this.closeResolve; const reject: ((reason?: Error) => void) | null = this.closeReject; this.closeResolve = null; this.closeReject = null;
     if (this.detached || errors.length === 0) resolve?.(); else reject?.(errors[0]);
   }
   private deadlineDetach(): void {
@@ -1843,13 +1937,13 @@ fn render_callback_error_helper(
 ) -> String {
     let Some(error_type) = model.ty_for(error_key) else {
         return format!(
-            "function __arkLowerCallbackError{}(error: ArkValue, _session: BackendSession): UniffiError {{ return error instanceof UniffiError ? error : new UniffiError(\"UniffiCallbackError\", \"callback error is not declared\"); }}\n",
+            "function __arkLowerCallbackError{}(error: Error, _session: BackendSession): UniffiError {{ return error instanceof UniffiError ? error : new UniffiError(\"UniffiCallbackError\", \"callback error is not declared\"); }}\n",
             operation.id.index()
         );
     };
     let error_name = model.type_name(error_key);
     let mut out = format!(
-        "function __arkLowerCallbackError{}(error: ArkValue, session: BackendSession): UniffiError {{\n  if (!(error instanceof {})) {{ if (error instanceof UniffiError && error.errorName === \"{}\") return new {}(error.message, error.variant, error.data); return new UniffiError(\"{}\", \"callback failed\"); }}\n  const declared: {} = error as {};\n  const variant: string | null = declared.variant;\n",
+        "function __arkLowerCallbackError{}(error: Error, session: BackendSession): UniffiError {{\n  if (!(error instanceof {})) {{ if (error instanceof UniffiError && error.errorName === \"{}\") return new {}(error.message, error.variant, error.data); return new UniffiError(\"{}\", \"callback failed\"); }}\n  const declared: {} = error as {};\n  const variant: string | null = declared.variant;\n",
         operation.id.index(),
         error_name,
         escape_string(&error_name),
@@ -1868,12 +1962,8 @@ fn render_callback_error_helper(
                 continue;
             }
             out.push_str(&format!(
-                "  if (variant === \"{}\") {{ if (declared.data === null) throw new UniffiError(\"UniffiCallbackProtocol\", \"callback error payload is missing\"); const payload: {}_{}Input = declared.data as {}_{}Input; const data: ArkRecord = new ArkRecord();\n",
-                variant.name,
-                error_name,
-                safe_ident(&variant.name),
-                error_name,
-                safe_ident(&variant.name)
+                "  if (variant === \"{}\") {{ if (declared.data === null) throw new UniffiError(\"UniffiCallbackProtocol\", \"callback error payload is missing\"); const payloadValue: ArkValue = declared.data; if (!(payloadValue instanceof ArkRecord)) throw new UniffiError(\"UniffiCallbackProtocol\", \"callback error payload must be an ArkRecord\"); const payload: ArkRecord = payloadValue; const data: ArkRecord = new ArkRecord();\n",
+                variant.name
             ));
             for field in &variant.fields {
                 let lower = lower_helper(
@@ -1893,7 +1983,7 @@ fn render_callback_error_helper(
                     Some(operation.id),
                 );
                 out.push_str(&format!(
-                    "    data.set(\"{}\", {}(payload.{} as {}, session));\n",
+                    "    data.set(\"{}\", {}(payload.get(\"{}\") as {}, session));\n",
                     field.name,
                     lower,
                     field.name,
@@ -2140,7 +2230,7 @@ fn render_operation_helpers(
             .map(|value| render_type_name(model, value))
             .unwrap_or_else(|| "void".to_owned());
         out.push_str(&format!(
-            "  return session.invokeAsync({}, __args).then((value: ArkValue): {} => {{ session.endCallFrame(__frame); return {}(value, session); }}, (error: ArkValue): {} => {{ session.endCallFrame(__frame); {} }});\n",
+            "  return session.invokeAsync({}, __args).then((value: ArkValue): {} => {{ session.endCallFrame(__frame); return {}(value, session); }}, (error: Error): {} => {{ session.endCallFrame(__frame); {} }});\n",
             operation.id.index(),
             resolved_return,
             lift_name.as_deref().unwrap_or("__arkLiftVoid"),
@@ -2284,7 +2374,7 @@ fn lower_body(
             };
             match &named.kind {
                 AstTypeKind::Custom { builtin, config } => {
-                    let converted = custom_expression(&config.into_custom, expression);
+                    let converted = custom_expression(&config.from_custom, expression);
                     let builtin_call =
                         lower_nested_call(model, helpers, builtin, &converted, path, operation_id);
                     format!("return {builtin_call};")
@@ -2405,7 +2495,7 @@ fn lower_body(
                             continue;
                         }
                         body.push_str(
-                            "if (declared.data === null) throw new UniffiError(\"UniffiErrorPayload\", \"error payload is missing\"); const payload: ArkRecord = declared.data as ArkRecord;\n",
+                            "if (declared.data === null) throw new UniffiError(\"UniffiErrorPayload\", \"error payload is missing\"); const payloadValue: ArkValue = declared.data; if (!(payloadValue instanceof ArkRecord)) throw new UniffiError(\"UniffiErrorPayload\", \"error payload must be an ArkRecord\"); const payload: ArkRecord = payloadValue;\n",
                         );
                         for field in &variant.fields {
                             let field_path =
@@ -2567,7 +2657,7 @@ fn lift_body(
                         lift_nested_call(model, helpers, builtin, expression, path, operation_id);
                     format!(
                         "return ({}) as {};",
-                        custom_expression(&config.from_custom, &nested),
+                        custom_expression(&config.into_custom, &nested),
                         render_type_name(model, ty)
                     )
                 }
@@ -2774,7 +2864,10 @@ fn scalar_name(scalar: ScalarType) -> &'static str {
 fn render_factory_and_namespace(model: &Model<'_>) -> String {
     let mut out = String::new();
     for ty in &model.types {
-        if !matches!(ty.kind, AstTypeKind::Object { .. }) {
+        if !matches!(
+            &ty.kind,
+            AstTypeKind::Object { kind } if *kind != ObjectKind::TraitForeignOnly
+        ) {
             continue;
         }
         let name = model.type_name(&ty.source_key);
@@ -2788,7 +2881,10 @@ fn render_factory_and_namespace(model: &Model<'_>) -> String {
     }
     out.push_str("export function createNamespace(session: BackendSession): Namespace {\n  __installClosePolicy(session, __closePolicy);\n");
     for ty in &model.types {
-        if matches!(ty.kind, AstTypeKind::Object { .. }) {
+        if matches!(
+            &ty.kind,
+            AstTypeKind::Object { kind } if *kind != ObjectKind::TraitForeignOnly
+        ) {
             out.push_str(&format!(
                 "  session.registerObjectFactory({}, __factory{});\n",
                 ty.id.index(),
@@ -2922,13 +3018,6 @@ fn render_factory_and_namespace(model: &Model<'_>) -> String {
                     }
                     out.push_str("  };\n");
                 }
-            }
-            if matches!(ty.kind, AstTypeKind::Error { .. }) {
-                out.push_str(&format!(
-                    "    {}: {},\n",
-                    model.type_name(&ty.source_key),
-                    model.type_name(&ty.source_key)
-                ));
             }
         }
         out.push_str(&format!(

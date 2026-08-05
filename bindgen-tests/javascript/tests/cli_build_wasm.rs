@@ -131,10 +131,11 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
             .count()
             == 1
             && browser_entry.contains("import * as __glue from ")
+            && browser_entry.contains("const __defaultWasm = new URL(")
             && browser_entry
-                .contains("export const ready = __backend.initWithGlue(__glue, undefined);")
+                .contains("export const ready = __backend.initWithGlue(__glue, __defaultWasm);")
             && browser_entry.contains(
-                "export function init(input) { return __backend.initWithGlue(__glue, input); }",
+                "export function init(input) { return __backend.initWithGlue(__glue, input === undefined ? __defaultWasm : input); }",
             )
             && !browser_entry.contains("export function initWithGlue"),
         "Web index must own the planned glue loader and ready/init lifecycle:\n{browser_entry}"
@@ -273,10 +274,11 @@ fn cli_artifacts_wasm_and_mini_orchestrate_two_components_without_feature_flags(
             .matches("import * as __backend from \"./backend.js\";")
             .count()
             == 1
+            && browser_entry.contains("const __defaultWasm = new URL(")
             && browser_entry
-                .contains("export const ready = __backend.initWithGlue(__glue, undefined);")
+                .contains("export const ready = __backend.initWithGlue(__glue, __defaultWasm);")
             && browser_entry.contains(
-                "export function init(input) { return __backend.initWithGlue(__glue, input); }",
+                "export function init(input) { return __backend.initWithGlue(__glue, input === undefined ? __defaultWasm : input); }",
             ),
         "two-component Browser index must load the planned backend exactly once:\n{browser_entry}"
     );

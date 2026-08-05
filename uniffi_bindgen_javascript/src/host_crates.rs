@@ -530,9 +530,9 @@ fn render_host_crate(
             format!(
                 "{dependency_text}{uniffi_dep}async-trait = \"0.1\"\n\
                  futures-channel = \"0.3\"\n\
-                 wasm-bindgen = {{ git = \"https://github.com/EverglowStudio/wasm-bindgen.git\", rev = \"{WASM_REV}\", package = \"wasm-bindgen\" }}\n\
-                 wasm-bindgen-futures = {{ git = \"https://github.com/EverglowStudio/wasm-bindgen.git\", rev = \"{WASM_REV}\", package = \"wasm-bindgen-futures\" }}\n\
-                 js-sys = {{ git = \"https://github.com/EverglowStudio/wasm-bindgen.git\", rev = \"{WASM_REV}\", package = \"js-sys\" }}\n\
+                 wasm-bindgen = \"=0.2.126\"\n\
+                 wasm-bindgen-futures = \"=0.4.76\"\n\
+                 js-sys = \"=0.3.103\"\n\
                  wasm-bindgen-uniffi-engine = {{ git = \"https://github.com/EverglowStudio/wasm-bindgen.git\", rev = \"{WASM_REV}\" }}\n"
             ),
             String::new(),
@@ -588,7 +588,7 @@ fn render_host_crate(
 
 const NAPI_REV: &str = "5ba67e6891722898f2f1e0984ef5d192e0ccd983";
 const WASM_REV: &str = "192d5272182776f8d5f7c605611414e2b4435701";
-const OHOS_REV: &str = "89a51a707d6a9ab1871e36b990987f58c9b3a6f7";
+const OHOS_REV: &str = "2a2ae91d91701aadd34734c24769e783bdbdd3c6";
 
 fn package_file(
     path: Utf8PathBuf,

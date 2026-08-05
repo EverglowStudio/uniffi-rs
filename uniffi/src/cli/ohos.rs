@@ -3734,6 +3734,19 @@ fn stage_package(
             .with_context(|| format!("reading generated Harmony facade {facade_path}"))?,
     )
     .with_context(|| format!("writing OHOS package native facade in {package_dir}"))?;
+    let support_source = package_dist_dir.join("support");
+    if path_entry_exists(&support_source)? {
+        let metadata = std::fs::symlink_metadata(&support_source)
+            .with_context(|| format!("reading generated Harmony support {support_source}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("generated Harmony support must be a real directory: {support_source}");
+        }
+        // Index.ets is consumed both at the OHPM package root and as the
+        // compiled native facade under src/main/ets.  Keep its package-local
+        // `./support/*` imports valid in both physical reader locations.
+        copy_dir_recursive(&support_source, &package_dir.join("support"))?;
+        copy_dir_recursive(&support_source, &package_dir.join("src/main/ets/support"))?;
+    }
     std::fs::write(
         package_dir.join("build-profile.json5"),
         render_build_profile_json5(metadata, kind, integrated_hsp)?,
@@ -4007,11 +4020,11 @@ fn copy_dist_to_package_libs(
         let Some(name) = source.file_name() else {
             continue;
         };
-        // Component facades are already staged under `src/main/ets/components`
-        // as ArkTS sources.  They are not native ABI directories and must not
-        // be copied beneath `libs`, where HSP inventory validation accepts
-        // only ABI directories containing `.so` files.
-        if name == "native-facade.d.ts" || name == "component-facades" {
+        // Component facades and consumer-owned support are already staged as
+        // ArkTS sources.  They are not native ABI directories and must not be
+        // copied beneath `libs`, where HSP inventory validation accepts only
+        // ABI directories containing `.so` files.
+        if name == "native-facade.d.ts" || name == "component-facades" || name == "support" {
             continue;
         }
         if file_type.is_symlink() {
@@ -5370,5 +5383,42 @@ fn emit_index_d_ts(
         .context("writing generated Harmony native declarations")?;
     std::fs::write(dist_dir.join("native-facade.ets"), &index)
         .context("writing generated Harmony native facade input")?;
+    let support_source = generated_source_root.join("support");
+    if path_entry_exists(&support_source)? {
+        let metadata = std::fs::symlink_metadata(&support_source)
+            .with_context(|| format!("reading generated Harmony support {support_source}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("generated Harmony support must be a real directory: {support_source}");
+        }
+        copy_dir_recursive(&support_source, &dist_dir.join("support"))
+            .context("copying generated Harmony support into package dist")?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod support_staging_tests {
+    use super::*;
+
+    #[test]
+    fn package_libs_exclude_ark_support_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(temp.path()).unwrap();
+        let dist = root.join("dist");
+        let libs = root.join("package/libs");
+        std::fs::create_dir_all(dist.join("support")).unwrap();
+        std::fs::create_dir_all(dist.join("component-facades")).unwrap();
+        std::fs::create_dir_all(dist.join("arm64-v8a")).unwrap();
+        std::fs::write(dist.join("native-facade.d.ts"), "export {};\n").unwrap();
+        std::fs::write(dist.join("support/email.d.ts"), "export {};\n").unwrap();
+        std::fs::write(dist.join("component-facades/core.ets"), "export {};\n").unwrap();
+        std::fs::write(dist.join("arm64-v8a/libcore.so"), b"ELF").unwrap();
+
+        copy_dist_to_package_libs(&dist, &libs, false).unwrap();
+
+        assert!(libs.join("index.d.ts").is_file());
+        assert!(libs.join("arm64-v8a/libcore.so").is_file());
+        assert!(!libs.join("support").exists());
+        assert!(!libs.join("component-facades").exists());
+    }
 }

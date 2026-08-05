@@ -23,6 +23,7 @@ fn empty_build_args() -> BuildArgs {
         cargo_bin: "cargo".to_string(),
         no_format: false,
         config: None,
+        javascript_support_dir: None,
         crate_name: None,
         metadata_no_deps: false,
         wasm_bindgen_out_dir: None,
@@ -716,6 +717,42 @@ fn javascript_build_defaults_to_embedded_tooling() {
     assert!(javascript_src.contains("emit_wasm_post_link"));
     #[cfg(feature = "cli-ohos")]
     assert!(javascript_src.contains("super::ohos::build"));
+}
+
+#[test]
+fn javascript_support_is_validated_and_copied_into_the_source_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = Utf8Path::from_path(temp.path()).unwrap();
+    let source = root.join("consumer-support");
+    std::fs::create_dir_all(source.join("nested")).unwrap();
+    std::fs::write(source.join("email.js"), "export const email = true;\n").unwrap();
+    std::fs::write(
+        source.join("nested/email.d.ts"),
+        "export declare const email: boolean;\n",
+    )
+    .unwrap();
+
+    let package = root.join("package");
+    let mut args = empty_build_args();
+    args.out_dir = Some(package.join("src/ffi"));
+    args.package_root = Some(package.clone());
+    args.javascript_support_dir = Some(source.clone());
+    install_javascript_support(&args).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(package.join("src/ffi/support/email.js")).unwrap(),
+        "export const email = true;\n"
+    );
+    assert!(package.join("src/ffi/support/nested/email.d.ts").is_file());
+
+    std::fs::write(source.join("invalid.bin"), [0xff, 0xfe]).unwrap();
+    let error = install_javascript_support(&args).unwrap_err().to_string();
+    assert!(error.contains("not UTF-8 text"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(package.join("src/ffi/support/email.js")).unwrap(),
+        "export const email = true;\n",
+        "validation failure must leave the previously copied support tree unchanged"
+    );
 }
 
 #[cfg(feature = "cli-ohos")]
