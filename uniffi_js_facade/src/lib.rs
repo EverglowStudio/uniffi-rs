@@ -2902,9 +2902,10 @@ mod tests {
         )
         .unwrap();
         assert!(source.contains("const payloadValue: ArkValue = declared.data"));
-        assert!(source.contains("payloadValue instanceof ArkRecord"));
-        assert!(source.contains("const payload: ArkRecord = payloadValue"));
-        assert!(source.contains("payload.get(\"message\") as string"));
+        assert!(source.contains("__arkRecordField2(payloadValue, \"message\") as string"));
+        assert!(!source.contains("payloadValue instanceof ArkRecord"));
+        assert!(!source.contains("const payload: ArkRecord = payloadValue"));
+        assert!(!source.contains("payload.get(\"message\") as string"));
         assert!(!source.contains("Failure_RejectedInput"));
         assert!(!source.contains("payload.message"));
     }
@@ -2931,6 +2932,12 @@ mod tests {
         assert!(!implementation.contains("fromHandle"));
         assert!(!implementation.contains("handleValue"));
         assert!(!implementation.contains("export const Event:"));
+        assert!(implementation.contains("function __arkStreamStepField"));
+        assert!(implementation
+            .contains("if (!(source instanceof Map)) throw new UniffiError(\"UniffiMapType\""));
+        assert!(implementation.contains("let __frameEnded: boolean = false"));
+        assert!(!implementation.contains(".then((value: ArkValue): void => { session.endCallFrame"));
+        assert!(!implementation.contains("}, (error: Error):"));
     }
 
     #[test]

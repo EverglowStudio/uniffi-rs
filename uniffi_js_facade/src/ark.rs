@@ -523,6 +523,89 @@ fn render_type_definitions(model: &Model<'_>, declaration: bool) -> String {
             }
         }
     }
+    if !declaration {
+        out.push_str(&render_record_field_readers(model));
+    }
+    out
+}
+
+/// Return the private reader name for a tagged value carrier.  The reader is
+/// generated from the named type's public fields, so ArkTS never has to use a
+/// dynamic property/index signature to consume an OHOS N-API plain object.
+fn record_field_reader_name(type_id: u32) -> String {
+    format!("__arkRecordField{type_id}")
+}
+
+fn render_record_field_readers(model: &Model<'_>) -> String {
+    let mut out = String::new();
+    for ty in &model.types {
+        let fields = match &ty.kind {
+            AstTypeKind::Record { fields } => fields,
+            AstTypeKind::Enum { variants } | AstTypeKind::Error { variants } => {
+                // Tagged N-API enum/error carriers put the discriminator and
+                // all variant payload fields on one plain object.  Keep one
+                // statically declared carrier per named type and de-duplicate
+                // fields shared by multiple variants.
+                let mut names = BTreeSet::from(["tag".to_owned()]);
+                let mut fields = Vec::new();
+                for variant in variants {
+                    for field in &variant.fields {
+                        if names.insert(field.name.clone()) {
+                            fields.push(field.clone());
+                        }
+                    }
+                }
+                let carrier_name = format!("__ArkRecordCarrier{}", ty.id.index());
+                out.push_str(&format!("interface {carrier_name} {{\n"));
+                out.push_str("  tag?: ArkValue;\n");
+                for field in &fields {
+                    out.push_str(&format!("  {}?: ArkValue;\n", field.name));
+                }
+                out.push_str("}\n");
+                out.push_str(&render_record_field_reader_body(
+                    ty.id.index(),
+                    &carrier_name,
+                    std::iter::once("tag".to_owned())
+                        .chain(fields.iter().map(|field| field.name.clone())),
+                ));
+                continue;
+            }
+            _ => continue,
+        };
+        let carrier_name = format!("__ArkRecordCarrier{}", ty.id.index());
+        out.push_str(&format!("interface {carrier_name} {{\n"));
+        for field in fields {
+            out.push_str(&format!("  {}?: ArkValue;\n", field.name));
+        }
+        out.push_str("}\n");
+        out.push_str(&render_record_field_reader_body(
+            ty.id.index(),
+            &carrier_name,
+            fields.iter().map(|field| field.name.clone()),
+        ));
+    }
+    out
+}
+
+fn render_record_field_reader_body(
+    type_id: u32,
+    carrier_name: &str,
+    fields: impl IntoIterator<Item = String>,
+) -> String {
+    let reader = record_field_reader_name(type_id);
+    let mut out = format!(
+        "function {reader}(value: ArkValue, name: string): ArkValue {{\n  if (value instanceof ArkRecord) return value.get(name);\n  const raw: {carrier_name} = value as {carrier_name};\n"
+    );
+    for field in fields {
+        out.push_str(&format!(
+            "  if (name === \"{}\") {{ const field: ArkValue | undefined = raw.{}; if (field === undefined) throw new UniffiError(\"UniffiRecordField\", \"missing record field \" + name); return field; }}\n",
+            escape_string(&field),
+            field,
+        ));
+    }
+    out.push_str(
+        "  throw new UniffiError(\"UniffiRecordField\", \"invalid record field \" + name);\n}\n",
+    );
     out
 }
 
@@ -1023,6 +1106,15 @@ export class ArkRecord {
   }
 }
 export type ArkValue = ArkPrimitive | Uint8Array | Date | ArkRecord | Array<ArkValue> | Map<ArkValue, ArkValue> | Set<ArkValue> | null;
+interface __ArkStreamStepCarrier { kind?: ArkValue; value?: ArkValue; error?: ArkValue; }
+function __arkStreamStepField(value: ArkValue, name: string): ArkValue {
+  if (value instanceof ArkRecord) return value.get(name);
+  const raw: __ArkStreamStepCarrier = value as __ArkStreamStepCarrier;
+  if (name === "kind") { const field: ArkValue | undefined = raw.kind; if (field === undefined) throw new UniffiError("UniffiRecordField", "missing stream step field " + name); return field; }
+  if (name === "value") { const field: ArkValue | undefined = raw.value; if (field === undefined) throw new UniffiError("UniffiRecordField", "missing stream step field " + name); return field; }
+  if (name === "error") { const field: ArkValue | undefined = raw.error; if (field === undefined) throw new UniffiError("UniffiRecordField", "missing stream step field " + name); return field; }
+  throw new UniffiError("UniffiRecordField", "invalid stream step field " + name);
+}
 export interface ArkFailure {
   readonly errorName: string;
   readonly message: string;
@@ -1410,17 +1502,13 @@ class ArkOutputStream<T> implements UniFfiStream<T> {
       if (rawValue === __DETACHED || this.detached) return new ArkDoneStep();
       const raw: ArkCallResult = rawValue as ArkCallResult;
       const value: ArkValue = __decodeResult(raw);
-      if (!(value instanceof ArkRecord)) {
-        const error: UniffiError = await this.abort(new UniffiError("UniffiStreamProtocol", "stream step is not tagged"));
-        return new ArkErrorStep(error);
-      }
-      const kind: ArkValue = value.get("kind");
-      if (kind === "item") return new ArkItemStep<T>(this.spec.lift(value.get("value")));
+      const kind: ArkValue = __arkStreamStepField(value, "kind");
+      if (kind === "item") return new ArkItemStep<T>(this.spec.lift(__arkStreamStepField(value, "value")));
       if (kind === "done") { this.phase = "done"; this.finish(); return new ArkDoneStep(); }
       if (kind === "error") {
         this.phase = "done";
         this.finish();
-        const errorValue: ArkValue = value.get("error");
+        const errorValue: ArkValue = __arkStreamStepField(value, "error");
         return new ArkErrorStep(this.spec.error(errorValue));
       }
       const error: UniffiError = await this.abort(new UniffiError("UniffiStreamProtocol", "invalid stream step tag"));
@@ -1588,7 +1676,7 @@ export class BackendSession {
     const guarded: Promise<T | __ArkDetachedMarker> = new Promise<T | __ArkDetachedMarker>((resolve, reject) => {
       settle = (): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); resolve(__DETACHED); };
       this.waiters.add(settle);
-      Promise.resolve(promise).then((value: T): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); resolve(this.generationActive(generation) ? value : __DETACHED); }, (error: Error): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); if (this.generationActive(generation)) reject(error); else resolve(__DETACHED); });
+      Promise.resolve(promise).then((value: T): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); resolve(this.generationActive(generation) ? value : __DETACHED); }).catch((error: Error): void => { if (!this.waiters.delete(settle)) return; this.activeGuards -= 1; this.notifyIdle(); if (this.generationActive(generation)) reject(error); else resolve(__DETACHED); });
     });
     guarded.catch((): void => undefined);
     return guarded;
@@ -1657,7 +1745,7 @@ export class BackendSession {
     __markPolicyClosed(this);
     this.closePromise = new Promise<void>((resolve, reject): void => { this.closeResolve = resolve; this.closeReject = reject; });
     this.deadlineTimer = setTimeout((): void => this.deadlineDetach(), policy.graceMs);
-    this.runTeardown().then((errors: Array<Error>): void => this.finishNaturalClose(errors), (error: Error): void => this.finishNaturalClose([error])).catch((): void => undefined);
+    this.runTeardown().catch((error: Error): Array<Error> => [error]).then((errors: Array<Error>): void => this.finishNaturalClose(errors)).catch((): void => undefined);
     return this.closePromise;
   }
   private async runTeardown(): Promise<Array<Error>> {
@@ -1962,7 +2050,7 @@ fn render_callback_error_helper(
                 continue;
             }
             out.push_str(&format!(
-                "  if (variant === \"{}\") {{ if (declared.data === null) throw new UniffiError(\"UniffiCallbackProtocol\", \"callback error payload is missing\"); const payloadValue: ArkValue = declared.data; if (!(payloadValue instanceof ArkRecord)) throw new UniffiError(\"UniffiCallbackProtocol\", \"callback error payload must be an ArkRecord\"); const payload: ArkRecord = payloadValue; const data: ArkRecord = new ArkRecord();\n",
+                "  if (variant === \"{}\") {{ if (declared.data === null) throw new UniffiError(\"UniffiCallbackProtocol\", \"callback error payload is missing\"); const payloadValue: ArkValue = declared.data; const data: ArkRecord = new ArkRecord();\n",
                 variant.name
             ));
             for field in &variant.fields {
@@ -1983,10 +2071,11 @@ fn render_callback_error_helper(
                     Some(operation.id),
                 );
                 out.push_str(&format!(
-                    "    data.set(\"{}\", {}(payload.get(\"{}\") as {}, session));\n",
+                    "    data.set(\"{}\", {}(__arkRecordField{}(payloadValue, \"{}\") as {}, session));\n",
                     field.name,
                     lower,
-                    field.name,
+                    error_type.id.index(),
+                    escape_string(&field.name),
                     render_type_name(model, &field.ty)
                 ));
             }
@@ -2102,7 +2191,7 @@ fn render_operation_helpers(
     out.push_str(&format!(
         "function {function_name}({signature}): {return_type} {{\n"
     ));
-    out.push_str("  const __frame: ArkCallbackFrame = session.beginCallFrame();\n  const __args: Array<ArkValue> = new Array<ArkValue>();\n  let __omitted: boolean = false;\n");
+    out.push_str("  const __frame: ArkCallbackFrame = session.beginCallFrame();\n  let __frameEnded: boolean = false;\n  const __endFrame: () => void = (): void => { if (__frameEnded) return; __frameEnded = true; session.endCallFrame(__frame); };\n  const __args: Array<ArkValue> = new Array<ArkValue>();\n  let __omitted: boolean = false;\n");
     for (argument, lower_name) in operation.arguments.iter().zip(lower_names.iter()) {
         let value = &argument.name;
         let default = argument
@@ -2214,7 +2303,7 @@ fn render_operation_helpers(
             )
         };
         out.push_str(&format!(
-            "  const __outputSpec: ArkOutputSpec<{}> = {{ {start}, next: (handle: ArkValue): Promise<ArkCallResult> => session.invokeAsync({}, __singleArgument(handle)).then((value: ArkValue): ArkCallResult => new ArkValueResult(value)), cancel: {cancel}, lift: (value: ArkValue): {} => {item_lift}(value, session), error: {error_decoder}, release: (handle: ArkValue): void => session.releaseOutputStream(handle), onClose: (): void => session.endCallFrame(__frame) }};\n  return session.createOutputStream(__outputSpec);\n",
+            "  const __outputSpec: ArkOutputSpec<{}> = {{ {start}, next: (handle: ArkValue): Promise<ArkCallResult> => session.invokeAsync({}, __singleArgument(handle)).then((value: ArkValue): ArkCallResult => new ArkValueResult(value)), cancel: {cancel}, lift: (value: ArkValue): {} => {item_lift}(value, session), error: {error_decoder}, release: (handle: ArkValue): void => session.releaseOutputStream(handle), onClose: (): void => __endFrame() }};\n  return session.createOutputStream(__outputSpec);\n",
             render_type_name(model, item),
             next_id.index(),
             render_type_name(model, item)
@@ -2230,7 +2319,7 @@ fn render_operation_helpers(
             .map(|value| render_type_name(model, value))
             .unwrap_or_else(|| "void".to_owned());
         out.push_str(&format!(
-            "  return session.invokeAsync({}, __args).then((value: ArkValue): {} => {{ session.endCallFrame(__frame); return {}(value, session); }}, (error: Error): {} => {{ session.endCallFrame(__frame); {} }});\n",
+            "  return session.invokeAsync({}, __args).then((value: ArkValue): {} => {{ __endFrame(); return {}(value, session); }}).catch((error: Error): {} => {{ __endFrame(); {} }});\n",
             operation.id.index(),
             resolved_return,
             lift_name.as_deref().unwrap_or("__arkLiftVoid"),
@@ -2240,7 +2329,7 @@ fn render_operation_helpers(
     } else {
         if operation.return_type.is_some() {
             out.push_str(&format!(
-                "  try {{ const __value: ArkValue = session.invokeSync({}, __args); const __result: {} = {}(__value, session); session.endCallFrame(__frame); return __result; }} catch (error) {{ session.endCallFrame(__frame); {} }}\n",
+                "  try {{ const __value: ArkValue = session.invokeSync({}, __args); const __result: {} = {}(__value, session); __endFrame(); return __result; }} catch (error) {{ __endFrame(); {} }}\n",
                 operation.id.index(),
                 return_type,
                 lift_name.as_deref().unwrap_or("__arkLiftVoid"),
@@ -2248,7 +2337,7 @@ fn render_operation_helpers(
             ));
         } else {
             out.push_str(&format!(
-                "  try {{ session.invokeSync({}, __args); session.endCallFrame(__frame); return; }} catch (error) {{ session.endCallFrame(__frame); {} }}\n",
+                "  try {{ session.invokeSync({}, __args); __endFrame(); return; }} catch (error) {{ __endFrame(); {} }}\n",
                 operation.id.index(),
                 propagate_error
             ));
@@ -2411,7 +2500,8 @@ fn lower_body(
                     "throw new UniffiError(\"UniffiCallbackContract\", \"missing canonical callback contract\");".to_owned()
                 }
                 AstTypeKind::Record { fields } => {
-                    let mut body = format!("const result: ArkRecord = new ArkRecord();\n");
+                    let carrier_name = format!("__ArkRecordCarrier{}", named.id.index());
+                    let mut body = format!("const result: {carrier_name} = {{}};\n");
                     for field in fields {
                         let field_type = render_type_name(model, &field.ty);
                         let field_path = format!("{path}.field[{}]", field.name);
@@ -2430,7 +2520,7 @@ fn lower_body(
                         if let Some(default) = &field.default {
                             if matches!(default, DefaultValue::Unspecified) {
                                 body.push_str(&format!(
-                                    "if ({field_name} !== undefined) result.set(\"{field}\", {field_call});\n",
+                                    "if ({field_name} !== undefined) result.{field} = {field_call};\n",
                                     field_name = format!("fieldValue_{}", safe_ident(&field.name)),
                                     field = escape_string(&field.name),
                                     field_call = field_call
@@ -2438,7 +2528,7 @@ fn lower_body(
                             } else {
                                 let literal = render_default_for_type(default, &field.ty);
                                 body.push_str(&format!(
-                                    "if ({field_name} === undefined) result.set(\"{field}\", {lower_default}); else result.set(\"{field}\", {field_call});\n",
+                                    "if ({field_name} === undefined) result.{field} = {lower_default}; else result.{field} = {field_call};\n",
                                     field_name = format!("fieldValue_{}", safe_ident(&field.name)),
                                     field = escape_string(&field.name),
                                     lower_default = lower_nested_call(model, helpers, &field.ty, &literal, &field_path, operation_id)
@@ -2446,19 +2536,20 @@ fn lower_body(
                             }
                         } else {
                             body.push_str(&format!(
-                                "if ({field_name} === undefined) throw new UniffiError(\"UniffiRecordField\", \"missing record field {field}\"); result.set(\"{field}\", {field_call});\n",
+                                "if ({field_name} === undefined) throw new UniffiError(\"UniffiRecordField\", \"missing record field {field}\"); result.{field} = {field_call};\n",
                                 field_name = format!("fieldValue_{}", safe_ident(&field.name)),
                                 field = escape_string(&field.name)
                             ));
                         }
                     }
-                    body.push_str("return result;");
+                    body.push_str("return result as ArkValue;");
                     body
                 }
                 AstTypeKind::Enum { variants } => {
+                    let carrier_name = format!("__ArkRecordCarrier{}", named.id.index());
                     let mut body = String::new();
                     for variant in variants {
-                        body.push_str(&format!("if ({expression}.tag === \"{}\") {{ const result: ArkRecord = new ArkRecord(); result.set(\"tag\", \"{}\");\n", variant.name, variant.name));
+                        body.push_str(&format!("if ({expression}.tag === \"{}\") {{ const result: {carrier_name} = {{ tag: \"{}\" }};\n", variant.name, variant.name));
                         for field in &variant.fields {
                             let field_path =
                                 format!("{path}.variant[{}].field[{}]", variant.name, field.name);
@@ -2470,32 +2561,30 @@ fn lower_body(
                                 &field_path,
                                 operation_id,
                             );
-                            body.push_str(&format!(
-                                "result.set(\"{}\", {});\n",
-                                field.name, nested
-                            ));
+                            body.push_str(&format!("result.{} = {};\n", field.name, nested));
                         }
-                        body.push_str("return result; }\n");
+                        body.push_str("return result as ArkValue; }\n");
                     }
                     body.push_str("throw new UniffiError(\"UniffiEnumVariant\", \"unrecognized enum variant\");");
                     body
                 }
                 AstTypeKind::Error { variants } => {
                     let error_name = model.type_name(key);
+                    let carrier_name = format!("__ArkRecordCarrier{}", named.id.index());
                     let mut body = format!(
-                        "if (!({expression} instanceof {error_name})) throw new UniffiError(\"UniffiErrorType\", \"expected {error_name}\");\nconst declared: {error_name} = {expression} as {error_name};\nconst variant: string | null = declared.variant;\nconst result: ArkRecord = new ArkRecord();\n"
+                        "if (!({expression} instanceof {error_name})) throw new UniffiError(\"UniffiErrorType\", \"expected {error_name}\");\nconst declared: {error_name} = {expression} as {error_name};\nconst variant: string | null = declared.variant;\nconst result: {carrier_name} = {{}};\n"
                     );
                     for variant in variants {
                         body.push_str(&format!(
-                            "if (variant === \"{}\") {{ result.set(\"tag\", \"{}\");\n",
+                            "if (variant === \"{}\") {{ result.tag = \"{}\";\n",
                             variant.name, variant.name
                         ));
                         if variant.fields.is_empty() {
-                            body.push_str("return result; }\n");
+                            body.push_str("return result as ArkValue; }\n");
                             continue;
                         }
                         body.push_str(
-                            "if (declared.data === null) throw new UniffiError(\"UniffiErrorPayload\", \"error payload is missing\"); const payloadValue: ArkValue = declared.data; if (!(payloadValue instanceof ArkRecord)) throw new UniffiError(\"UniffiErrorPayload\", \"error payload must be an ArkRecord\"); const payload: ArkRecord = payloadValue;\n",
+                            "if (declared.data === null) throw new UniffiError(\"UniffiErrorPayload\", \"error payload is missing\"); const payloadValue: ArkValue = declared.data;\n",
                         );
                         for field in &variant.fields {
                             let field_path =
@@ -2505,19 +2594,17 @@ fn lower_body(
                                 helpers,
                                 &field.ty,
                                 &format!(
-                                    "payload.get(\"{}\") as {}",
-                                    field.name,
+                                    "{}(payloadValue, \"{}\") as {}",
+                                    record_field_reader_name(named.id.index()),
+                                    escape_string(&field.name),
                                     render_type_name(model, &field.ty)
                                 ),
                                 &field_path,
                                 operation_id,
                             );
-                            body.push_str(&format!(
-                                "result.set(\"{}\", {});\n",
-                                field.name, nested
-                            ));
+                            body.push_str(&format!("result.{} = {};\n", field.name, nested));
                         }
-                        body.push_str("return result; }\n");
+                        body.push_str("return result as ArkValue; }\n");
                     }
                     body.push_str("throw new UniffiError(\"UniffiErrorVariant\", \"unrecognized error variant\");");
                     body
@@ -2607,7 +2694,7 @@ fn lift_body(
                 &format!("{path}.value"),
                 operation_id,
             );
-            format!("const source: Map<ArkValue, ArkValue> = {expression} as Map<ArkValue, ArkValue>; const result: Map<{}, {}> = new Map<{}, {}>(); source.forEach((entryValue: ArkValue, entryKey: ArkValue): void => {{ result.set({key_call}, {value_call}); }}); return result;", render_type_name(model, key), render_type_name(model, value), render_type_name(model, key), render_type_name(model, value))
+            format!("const source: Map<ArkValue, ArkValue> = {expression} as Map<ArkValue, ArkValue>; if (!(source instanceof Map)) throw new UniffiError(\"UniffiMapType\", \"expected JavaScript Map\"); const result: Map<{}, {}> = new Map<{}, {}>(); source.forEach((entryValue: ArkValue, entryKey: ArkValue): void => {{ result.set({key_call}, {value_call}); }}); return result;", render_type_name(model, key), render_type_name(model, value), render_type_name(model, key), render_type_name(model, value))
         }
         ValueType::Set(inner) => {
             let nested = lift_nested_call(
@@ -2680,16 +2767,18 @@ fn lift_body(
                     format!("return {expression} as {};", render_type_name(model, ty))
                 }
                 AstTypeKind::Record { fields } => {
-                    let mut body = format!(
-                        "const raw: ArkRecord = {expression} as ArkRecord;\nconst result: {} = {{",
-                        render_type_name(model, ty)
-                    );
+                    let mut body = format!("const result: {} = {{", render_type_name(model, ty));
                     for field in fields {
                         let nested = lift_nested_call(
                             model,
                             helpers,
                             &field.ty,
-                            &format!("raw.get(\"{}\")", field.name),
+                            &format!(
+                                "{}({}, \"{}\")",
+                                record_field_reader_name(named.id.index()),
+                                expression,
+                                escape_string(&field.name)
+                            ),
                             &format!("{path}.field[{}]", field.name),
                             operation_id,
                         );
@@ -2699,7 +2788,11 @@ fn lift_body(
                     body
                 }
                 AstTypeKind::Enum { variants } => {
-                    let mut body = format!("const raw: ArkRecord = {expression} as ArkRecord; const tag: string = raw.get(\"tag\") as string;\n");
+                    let mut body = format!(
+                        "const tag: string = {}({}, \"tag\") as string;\n",
+                        record_field_reader_name(named.id.index()),
+                        expression
+                    );
                     for variant in variants {
                         let variant_name =
                             format!("{}_{}", model.type_name(key), safe_ident(&variant.name));
@@ -2709,7 +2802,12 @@ fn lift_body(
                                 model,
                                 helpers,
                                 &field.ty,
-                                &format!("raw.get(\"{}\")", field.name),
+                                &format!(
+                                    "{}({}, \"{}\")",
+                                    record_field_reader_name(named.id.index()),
+                                    expression,
+                                    escape_string(&field.name)
+                                ),
                                 &format!("{path}.variant[{}].field[{}]", variant.name, field.name),
                                 operation_id,
                             );
@@ -2727,7 +2825,9 @@ fn lift_body(
                 AstTypeKind::Error { variants } => {
                     let error_name = model.type_name(key);
                     let mut body = format!(
-                        "const raw: ArkRecord = {expression} as ArkRecord; const tag: string = raw.get(\"tag\") as string;\n"
+                        "const tag: string = {}({}, \"tag\") as string;\n",
+                        record_field_reader_name(named.id.index()),
+                        expression
                     );
                     for variant in variants {
                         if variant.fields.is_empty() {
@@ -2746,7 +2846,12 @@ fn lift_body(
                                 model,
                                 helpers,
                                 &field.ty,
-                                &format!("raw.get(\"{}\")", field.name),
+                                &format!(
+                                    "{}({}, \"{}\")",
+                                    record_field_reader_name(named.id.index()),
+                                    expression,
+                                    escape_string(&field.name)
+                                ),
                                 &format!("{path}.variant[{}].field[{}]", variant.name, field.name),
                                 operation_id,
                             );
