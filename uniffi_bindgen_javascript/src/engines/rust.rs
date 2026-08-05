@@ -2657,6 +2657,12 @@ fn render_callback_proxy_helpers(
                     #sync_cross_field: host
                         .get_named_property::<#napi::bindgen_prelude::Function<#host_sync_args, #result_name>>("invokeCallbackSyncResult")
                         .map_err(|error| #error_descriptor::backend(error.to_string()))?
+                        // `invokeCallbackSyncResult` is a Host instance
+                        // method.  Threadsafe functions retain the function
+                        // value but do not retain its receiver, so bind the
+                        // host before handing the function to N-API.
+                        .bind(host)
+                        .map_err(|error| #error_descriptor::backend(error.to_string()))?
                         .build_threadsafe_function::<#payload_name>()
                         .callee_handled::<false>()
                         .build_callback(|context| {
@@ -2678,6 +2684,10 @@ fn render_callback_proxy_helpers(
                 #sync_cross_init
                 #async_field: host
                     .get_named_property::<#napi::bindgen_prelude::Function<#host_async_args, #async_result_type>>("invokeCallbackAsyncResult")
+                    .map_err(|error| #error_descriptor::backend(error.to_string()))?
+                    // See the sync cross-thread path above: an unbound
+                    // Host method loses `this` when N-API invokes it.
+                    .bind(host)
                     .map_err(|error| #error_descriptor::backend(error.to_string()))?
                     .build_threadsafe_function::<#payload_name>()
                     .callee_handled::<false>()
@@ -2905,7 +2915,7 @@ fn render_callback_proxy_helpers(
                 let __uniffi_result = __uniffi_host
                     .get_named_property::<#napi::bindgen_prelude::Function<#sync_call_args_name, #result_name>>("invokeCallbackSyncResult")
                     .unwrap_or_else(|error| panic!("callback sync host function unavailable: {}", error))
-                    .call(#sync_call_args_name {
+                    .apply(__uniffi_host, #sync_call_args_name {
                         callback_type: self.__uniffi_inner.callback_type,
                         callback_id: self.__uniffi_inner.callback_id,
                         method_id: #method_id,
@@ -4136,6 +4146,10 @@ fn render_input_stream_helpers(
                     let pull = host
                         .get_named_property::<#napi::bindgen_prelude::Function<u32, #napi::bindgen_prelude::Promise<#step>>>("pullInputStream")
                         .map_err(|error| #error_descriptor::backend(error.to_string()))?
+                        // `pullInputStream` is an instance method on Host;
+                        // retain its receiver when constructing the TSFN.
+                        .bind(host)
+                        .map_err(|error| #error_descriptor::backend(error.to_string()))?
                         .build_threadsafe_function::<u32>()
                         .callee_handled::<false>()
                         .build_callback(|context| Ok(context.value))
@@ -4143,6 +4157,10 @@ fn render_input_stream_helpers(
                     let pull = ::std::sync::Arc::new(pull);
                     let cancel = host
                         .get_named_property::<#napi::bindgen_prelude::Function<u32, #napi::bindgen_prelude::Promise<#napi::bindgen_prelude::Unknown<'static>>>>("cancelInputStream")
+                        .map_err(|error| #error_descriptor::backend(error.to_string()))?
+                        // See `pullInputStream` above: this method reads the
+                        // Host's input registry through `this` as well.
+                        .bind(host)
                         .map_err(|error| #error_descriptor::backend(error.to_string()))?
                         .build_threadsafe_function::<u32>()
                         .callee_handled::<false>()
