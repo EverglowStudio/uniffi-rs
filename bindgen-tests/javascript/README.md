@@ -49,6 +49,38 @@ The Wasm E2E tests use the pinned in-process wasm-bindgen library. A globally
 installed `wasm-bindgen` executable is not a test prerequisite and is neither
 looked up nor invoked.
 
+## Consumer-owned JavaScript support sources
+
+`artifacts build` can package custom-type JavaScript/TypeScript helpers from a
+consumer-owned directory:
+
+```sh
+uniffi-bindgen artifacts build \
+  --manifest-path path/to/Cargo.toml \
+  --target wasm \
+  --out-dir generated \
+  --javascript-support-dir path/to/support
+```
+
+The support directory is a UTF-8 text source tree. It must be a real directory
+with no symlinks; all files are validated before the generated source-root
+`support/` tree is replaced. Custom-type imports in the generated shared
+components therefore use paths such as `../../support/email.js`. The ArkTS
+`Index.ets` printer rebases the same import to `./support/email.js`, and managed
+Harmony staging carries the copied tree with the rest of the package.
+
+With `--managed-layout --package-dir <dir>`, support sources are copied into
+the private sibling stage and published together with generated source, host,
+native, and Harmony outputs only after a successful build. There is no support
+manifest, schema, content hash, or identity file. Keep the source directory
+disjoint from the generated output; the builder rejects overlap.
+
+Web `ready` and argument-free `init()` use the generated module-relative Wasm
+URL and share the same one-shot initialization promise. Public maps are real
+JavaScript `Map` instances on every engine, including N-API and ArkTS, rather
+than plain objects. The in-process wasm-bindgen support library is used by the
+tests, so installing an external `wasm-bindgen` CLI is unnecessary.
+
 Heavy fixtures keep independent temporary source, generated-package, and
 runtime directories, while reusing ordinary Cargo fingerprints and dependency
 artifacts under `target/javascript-tests/{native,wasm,cli}`. An OS-released
