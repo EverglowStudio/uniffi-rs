@@ -737,6 +737,7 @@ fn cli_managed_layout_replaces_complete_package_and_bench_smoke() {
     for path in [
         "src/index.web.js",
         "src/index.mini-program.js",
+        "src/index.mini-program.d.ts",
         "src/index.node.js",
         "src/ffi/shared/uniffi_runtime.js",
         "src/ffi/shared/uniffi_runtime.d.ts",
@@ -746,6 +747,7 @@ fn cli_managed_layout_replaces_complete_package_and_bench_smoke() {
         "src/ffi/browser/index.d.ts",
         "src/ffi/browser/backend.js",
         "src/ffi/browser/index.mini-program.js",
+        "src/ffi/browser/index.mini-program.d.ts",
         "src/ffi/node/index.js",
         "src/ffi/node/index.d.ts",
         "native/hosts/wasm/Cargo.toml",
@@ -786,6 +788,8 @@ fn cli_managed_layout_replaces_complete_package_and_bench_smoke() {
 
     let browser_entry =
         std::fs::read_to_string(package_dir.join("src/ffi/browser/index.js")).unwrap();
+    let browser_declaration =
+        std::fs::read_to_string(package_dir.join("src/ffi/browser/index.d.ts")).unwrap();
     assert!(
         browser_entry
             .matches("import * as __backend from \"./backend.js\";")
@@ -799,6 +803,10 @@ fn cli_managed_layout_replaces_complete_package_and_bench_smoke() {
             )
             && !browser_entry.contains("export function initWithGlue"),
         "managed Browser index must own the single planned glue loader:\n{browser_entry}"
+    );
+    assert!(
+        browser_declaration.contains("export function close(): Promise<void>;"),
+        "managed Browser declaration must expose its close runtime export:\n{browser_declaration}"
     );
     let browser_backend =
         std::fs::read_to_string(package_dir.join("src/ffi/browser/backend.js")).unwrap();
@@ -825,6 +833,22 @@ fn cli_managed_layout_replaces_complete_package_and_bench_smoke() {
 
     let mini_runtime =
         std::fs::read_to_string(package_dir.join("src/ffi/browser/index.mini-program.js")).unwrap();
+    let mini_declaration =
+        std::fs::read_to_string(package_dir.join("src/ffi/browser/index.mini-program.d.ts"))
+            .unwrap();
+    for declaration in [
+        "export declare const DEFAULT_WASM_PATH: string;",
+        "export declare function init(wasmPath?: string)",
+        "export declare function initWithPath(wasmPath: string)",
+        "export declare function setMiniProgramWebRuntime(runtime: MiniProgramWebRuntime)",
+        "export declare function initWithGlue(",
+        "export { session, close, cli_wasm } from \"./index.js\";",
+    ] {
+        assert!(
+            mini_declaration.contains(declaration),
+            "Mini Program declaration is missing `{declaration}`:\n{mini_declaration}"
+        );
+    }
     for forbidden in [
         "?url",
         "fetch(",

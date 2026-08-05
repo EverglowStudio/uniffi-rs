@@ -156,6 +156,12 @@ fn rust_path(path: &RustPath) -> Result<Path> {
 fn rust_ident(value: &str) -> Ident {
     if let Some(value) = value.strip_prefix("r#") {
         Ident::new_raw(value, Span::call_site())
+    } else if syn::parse_str::<Ident>(value).is_err() {
+        if matches!(value, "crate" | "self" | "Self" | "super") {
+            Ident::new(&format!("__uniffi_{value}"), Span::call_site())
+        } else {
+            Ident::new_raw(value, Span::call_site())
+        }
     } else {
         Ident::new(value, Span::call_site())
     }
@@ -3677,19 +3683,27 @@ fn render_operation_helpers_for(
                 });
                 continue;
             }
-            if binding.carrier != RustCarrier::LocalAdapter
-                && !matches!(
-                    binding.carrier,
-                    RustCarrier::Timestamp | RustCarrier::Duration
-                )
-                || conversion_requires_host(&binding.conversion)
-                || matches!(
+            let uses_named_type_helper = binding.carrier == RustCarrier::LocalAdapter
+                && matches!(
                     binding.conversion,
                     ConversionRecipe::Record(_)
                         | ConversionRecipe::Enum(_)
                         | ConversionRecipe::Error(_)
                         | ConversionRecipe::Custom(_, _)
-                )
+                );
+            let engine_lowers_without_operation_helper = matches!(
+                binding.carrier,
+                RustCarrier::BigInt
+                    | RustCarrier::CallbackProxy
+                    | RustCarrier::InputStream
+                    | RustCarrier::OpaqueHandle
+                    | RustCarrier::OutputStream
+            ) || (binding.carrier
+                == RustCarrier::Primitive
+                && matches!(binding.conversion, ConversionRecipe::Identity));
+            if conversion_requires_host(&binding.conversion)
+                || uses_named_type_helper
+                || engine_lowers_without_operation_helper
             {
                 continue;
             }
@@ -4691,7 +4705,7 @@ fn napi_argument(
                 lower: type_helper.expect("type helper checked above"),
             }
         }
-        RustCarrier::LocalAdapter if !conversion_requires_host(&binding.conversion) => {
+        _ if !conversion_requires_host(&binding.conversion) => {
             napi_uniffi_engine::ArgumentBinding::LowerWith {
                 carrier_type: syn,
                 lower: path_for_helper(operation.operation_id.index(), &index.to_string(), "lower"),
@@ -5050,7 +5064,7 @@ fn ohos_argument(
                 lower: type_helper.expect("type helper checked above"),
             }
         }
-        RustCarrier::LocalAdapter if !conversion_requires_host(&binding.conversion) => {
+        _ if !conversion_requires_host(&binding.conversion) => {
             napi_ohos_uniffi_engine::OhosArgumentBinding::LowerWith {
                 carrier_type: syn,
                 lower: path_for_helper(operation.operation_id.index(), &index.to_string(), "lower"),
@@ -5159,6 +5173,9 @@ fn ohos_operation(
         .return_value
         .as_ref()
         .map(|binding| {
+            if matches!(binding.conversion, ConversionRecipe::StreamStep { .. }) {
+                return Ok(stream_step_carrier_type(operation.operation_id.index()));
+            }
             napi_carrier_type_for(
                 &RustValueBinding {
                     rust_type: binding.rust_type.clone(),
@@ -5214,6 +5231,12 @@ fn ohos_operation(
             Some(binding) if matches!(binding.carrier, RustCarrier::CallbackProxy) => {
                 napi_ohos_uniffi_engine::OhosReturnBinding::CallbackLease {
                     carrier_type: return_type.expect("callback carrier type"),
+                    lift: path_for_helper(operation.operation_id.index(), "return", "lift"),
+                }
+            }
+            Some(binding) if matches!(binding.conversion, ConversionRecipe::StreamStep { .. }) => {
+                napi_ohos_uniffi_engine::OhosReturnBinding::LiftWith {
+                    carrier_type: return_type.expect("stream-step carrier type"),
                     lift: path_for_helper(operation.operation_id.index(), "return", "lift"),
                 }
             }
@@ -6625,5 +6648,105 @@ namespace resource_paths {
                 && site.type_id == object_id.index()
                 && site.ownership == wasm_bindgen_uniffi_engine::WasmOwnership::Owned
         }));
+    }
+
+    #[test]
+    fn native_optional_primitive_arguments_use_host_free_lowering() {
+        let (mut package, operation, _) = fixture();
+        let binding = RustArgumentBinding {
+            public_name: "rootDir".into(),
+            rust_name: "root_dir".into(),
+            rust_type: RustType::Option(Box::new(RustType::Scalar(
+                uniffi_js_abi::ScalarType::String,
+            ))),
+            carrier: RustCarrier::Primitive,
+            ownership: Ownership::Owned,
+            conversion: ConversionRecipe::Optional(Box::new(ConversionRecipe::Identity)),
+        };
+
+        let node = napi_argument(&package, &operation, 0, &binding, false)
+            .expect("optional primitive Node argument should plan");
+        assert!(matches!(
+            node.binding,
+            napi_uniffi_engine::ArgumentBinding::LowerWith { .. }
+        ));
+        let operation_id = operation.operation_id;
+        package
+            .rust
+            .engines
+            .get_mut(&EngineKind::Napi)
+            .expect("fixture has a Node engine")
+            .operations
+            .iter_mut()
+            .find(|candidate| candidate.operation_id == operation_id)
+            .expect("fixture has the Node operation")
+            .arguments = vec![binding.clone()];
+        let node_helpers =
+            render_operation_helpers_for(&package, NativeFlavor::Node, EngineKind::Napi)
+                .expect("optional primitive Node helper should render");
+        assert!(node_helpers.contains(&format!("fn __uniffi_lower_{}_0", operation_id.index())));
+
+        #[cfg(feature = "ohos")]
+        {
+            let harmony = ohos_argument(&package, &operation, 0, &binding, false)
+                .expect("optional primitive Harmony argument should plan");
+            assert!(matches!(
+                harmony.binding,
+                napi_ohos_uniffi_engine::OhosArgumentBinding::LowerWith { .. }
+            ));
+            package
+                .rust
+                .engines
+                .get_mut(&EngineKind::OhosNapi)
+                .expect("fixture has a Harmony engine")
+                .operations
+                .iter_mut()
+                .find(|candidate| candidate.operation_id == operation_id)
+                .expect("fixture has the Harmony operation")
+                .arguments = vec![binding];
+            let harmony_helpers =
+                render_operation_helpers_for(&package, NativeFlavor::Ohos, EngineKind::OhosNapi)
+                    .expect("optional primitive Harmony helper should render");
+            assert!(
+                harmony_helpers.contains(&format!("fn __uniffi_lower_{}_0", operation_id.index()))
+            );
+        }
+    }
+
+    #[test]
+    fn native_bridge_escapes_rust_keyword_identifiers() {
+        assert_eq!(rust_ident("type").to_string(), "r#type");
+        assert_eq!(rust_ident("r#type").to_string(), "r#type");
+        assert_eq!(rust_ident("self").to_string(), "__uniffi_self");
+    }
+
+    #[cfg(feature = "ohos")]
+    #[test]
+    fn ohos_stream_step_returns_use_the_generated_step_carrier() {
+        let (package, mut operation, _) = fixture();
+        operation.return_value = Some(uniffi_js_engine_schema::RustReturnBinding {
+            rust_type: RustType::StreamStep {
+                item: Box::new(RustType::Scalar(uniffi_js_abi::ScalarType::String)),
+                error: Box::new(RustType::Scalar(uniffi_js_abi::ScalarType::String)),
+            },
+            carrier: RustCarrier::StreamStep,
+            ownership: Ownership::Owned,
+            conversion: ConversionRecipe::StreamStep {
+                item: Box::new(ConversionRecipe::Identity),
+                error: Box::new(ConversionRecipe::Identity),
+            },
+        });
+
+        let plan = ohos_operation(&package, &operation)
+            .expect("Harmony stream-step operation should plan");
+        let napi_ohos_uniffi_engine::OhosReturnBinding::LiftWith { carrier_type, .. } =
+            plan.return_binding
+        else {
+            panic!("Harmony stream-step operation must use a typed lift helper");
+        };
+        assert_eq!(
+            carrier_type.to_token_stream().to_string(),
+            format!("__UniffiNapiStreamStep{}", operation.operation_id.index())
+        );
     }
 }

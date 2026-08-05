@@ -301,6 +301,15 @@ fn cli_artifacts_wasm_and_mini_orchestrate_two_components_without_feature_flags(
     }
     let mini_entry =
         std::fs::read_to_string(out_dir.join("browser/index.mini-program.js")).unwrap();
+    let mini_declaration =
+        std::fs::read_to_string(out_dir.join("browser/index.mini-program.d.ts")).unwrap();
+    assert!(
+        mini_declaration.contains("export { session, close, alpha, beta } from \"./index.js\";")
+            && mini_declaration.contains("export declare const DEFAULT_WASM_PATH: string;")
+            && mini_declaration
+                .contains("setMiniProgramWebRuntime(runtime: MiniProgramWebRuntime)"),
+        "two-component Mini Program declaration must match its runtime entry:\n{mini_declaration}"
+    );
     for (label, auto_entry) in [("Mini Program", mini_entry)] {
         assert!(
             auto_entry.contains("import * as __backend from \"./backend.js\";")

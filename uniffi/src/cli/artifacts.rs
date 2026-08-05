@@ -594,6 +594,11 @@ impl ManagedLayout {
             &self.package_dir.join("src/index.mini-program.js"),
             &self.source_root.join("browser/index.mini-program.js"),
             "mini-program",
+        )?;
+        self.write_entrypoint(
+            &self.package_dir.join("src/index.mini-program.d.ts"),
+            &self.source_root.join("browser/index.mini-program.js"),
+            "mini-program declarations",
         )
     }
 

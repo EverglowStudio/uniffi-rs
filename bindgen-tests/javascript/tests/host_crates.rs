@@ -209,6 +209,10 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
             "the host crate must not ask N-API to marshal f32 directly: {source}"
         );
         assert!(
+            compact.contains("#[napi(js_name=\"type\")]pubr#type:String"),
+            "the native carrier must preserve a public keyword field through a raw Rust identifier: {source}"
+        );
+        assert!(
             compact.contains("asyncfn__uniffi_raw_operation_2"),
             "async object receiver must use an async raw operation wrapper: {source}"
         );
@@ -812,13 +816,13 @@ pub fn write_float32_record_core_crate(root: &std::path::Path) -> (Utf8PathBuf, 
     .unwrap();
     std::fs::write(
         src.join("lib.rs"),
-        "#[derive(Clone, Debug)]\npub struct Float32Record {\n    pub speed: f32,\n}\n\npub fn roundtrip_float32_record(value: Float32Record) -> Float32Record {\n    value\n}\n\npub struct AsyncService;\n\nimpl AsyncService {\n    pub fn new() -> std::sync::Arc<Self> {\n        std::sync::Arc::new(Self)\n    }\n\n    pub async fn greet(&self, message: String) -> String {\n        message\n    }\n}\n",
+        "#[derive(Clone, Debug)]\npub struct Float32Record {\n    pub speed: f32,\n    pub r#type: String,\n}\n\npub fn roundtrip_float32_record(value: Float32Record) -> Float32Record {\n    value\n}\n\npub struct AsyncService;\n\nimpl AsyncService {\n    pub fn new() -> std::sync::Arc<Self> {\n        std::sync::Arc::new(Self)\n    }\n\n    pub async fn greet(&self, message: String) -> String {\n        message\n    }\n}\n",
     )
     .unwrap();
     let udl = src.join("float32_record_core.udl");
     std::fs::write(
         &udl,
-        "dictionary Float32Record {\n    float speed;\n};\n\ninterface AsyncService {\n    constructor();\n    [Async]\n    string greet(string message);\n};\n\nnamespace float32_record_core {\n    Float32Record roundtrip_float32_record(Float32Record value);\n};\n",
+        "dictionary Float32Record {\n    float speed;\n    string type;\n};\n\ninterface AsyncService {\n    constructor();\n    [Async]\n    string greet(string message);\n};\n\nnamespace float32_record_core {\n    Float32Record roundtrip_float32_record(Float32Record value);\n};\n",
     )
     .unwrap();
     (

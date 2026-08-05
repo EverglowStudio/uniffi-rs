@@ -464,7 +464,7 @@ fn render_browser_entrypoint(
             "export declare let {namespace}: import({component_path:?}).Namespace;\n"
         ));
     }
-    declaration.push_str("export declare let session: BackendSession;\nexport const ready: Promise<ReadyApi>;\nexport function init(input?: unknown): Promise<ReadyApi>;\n");
+    declaration.push_str("export declare let session: BackendSession;\nexport const ready: Promise<ReadyApi>;\nexport function init(input?: unknown): Promise<ReadyApi>;\nexport function close(): Promise<void>;\n");
     // The browser index is the only loader.  It imports the planned glue
     // once, starts the backend coordinator, and explicitly re-exports its
     // public bindings without exposing `initWithGlue` as a compatibility
