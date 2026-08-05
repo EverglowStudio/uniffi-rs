@@ -17,8 +17,8 @@ use uniffi_js_abi::{
     TypeId, TypeSourceKey, ValueType,
 };
 use uniffi_js_engine_schema::{
-    BridgePlan, ConversionRecipe, RustBridgePlan, RustOperationPlan, RustStreamResourceGroup,
-    RustType, RustValueBinding, StreamDirection,
+    BridgePlan, ClosePolicy, ConversionRecipe, RustBridgePlan, RustOperationPlan,
+    RustStreamResourceGroup, RustType, RustValueBinding, StreamDirection,
 };
 use uniffi_js_engine_schema::{
     CallbackContract, CallbackReentrancy, CallbackRetention, CallbackThreading, ValuePath,
@@ -64,6 +64,8 @@ pub enum PublicFileRole {
 /// metadata so a printer never infers an ID or a resource slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicAst {
+    /// Canonical close policy copied mechanically from `BridgePlan`.
+    pub close_policy: ClosePolicy,
     pub target_universe: Vec<PublicTarget>,
     pub components: Vec<AstComponent>,
     pub types: Vec<AstType>,
@@ -312,6 +314,7 @@ impl<'a> FacadeBuilder<'a> {
             .collect();
 
         Ok(PublicAst {
+            close_policy: self.bridge.close_policy(),
             target_universe: self.api.target_universe.clone(),
             components,
             types,
@@ -999,7 +1002,11 @@ fn render_descriptors(
     component: &AstComponent,
     operations: &[&AstOperation],
 ) -> String {
-    let mut out = format!("{{ componentId:{}, types: {{", component.id.index());
+    let mut out = format!(
+        "{{ closePolicy:{{graceMs:{},onDeadline:\"detach\"}}, componentId:{}, types: {{",
+        ast.close_policy.grace_ms,
+        component.id.index()
+    );
     for ty in &ast.types {
         out.push_str(&format!(
             "\"{}\":{},",
@@ -2285,6 +2292,7 @@ mod tests {
             .unwrap()
             .throws = Some(failure.clone());
         PublicAst {
+            close_policy: ClosePolicy::default(),
             target_universe: vec![
                 PublicTarget::NodeNapi,
                 PublicTarget::BrowserWasm,
@@ -2340,6 +2348,7 @@ mod tests {
     #[test]
     fn scalar_shapes_are_canonical() {
         let empty = PublicAst {
+            close_policy: ClosePolicy::default(),
             target_universe: vec![],
             components: vec![],
             types: vec![],
@@ -2410,6 +2419,7 @@ mod tests {
             callbacks: vec![],
             streams: vec![],
             targets: vec![EngineCapabilities::new(EngineKind::Napi, full_capabilities)],
+            close_policy: ClosePolicy::default(),
         })
         .unwrap();
         let operation_id = identified_operations[0].id;
@@ -2505,6 +2515,17 @@ mod tests {
         );
         for file in &ark {
             let text = String::from_utf8(file.bytes.clone()).unwrap();
+            if file.path.ends_with(".ets") && !file.path.ends_with(".d.ets") {
+                assert!(text.contains("ClosePolicy"));
+                assert!(text.contains("onDeadline: \"detach\""));
+                assert!(text.contains("class __ArkDetachedMarker"));
+                assert!(!text.contains("const __DETACHED = \"__uniffi_detached__\""));
+                assert!(text.contains("if (closed || detached) return new ArkDoneStep();"));
+                assert!(text.contains("return guarded as ArkValue"));
+            } else {
+                assert!(!text.contains("ClosePolicy"));
+                assert!(!text.contains("configureClosePolicy"));
+            }
             for forbidden in [
                 "unknown",
                 "Record<",
@@ -2665,6 +2686,7 @@ mod tests {
             }],
             streams: vec![],
             targets: vec![EngineCapabilities::new(EngineKind::Napi, capabilities)],
+            close_policy: ClosePolicy::default(),
         })
         .unwrap();
         assert_eq!(bridge.callbacks().len(), 1);
@@ -2943,10 +2965,12 @@ await session.close();
         };
         let normalized = normalize(
             BindingInput::new(&[component])
+                .with_close_policy(ClosePolicy::new(7))
                 .with_build_targets([uniffi_js_abi::PublicTarget::NodeNapi]),
         )
         .unwrap();
         let facade = build(&normalized.api, &normalized.bridge, &normalized.rust).unwrap();
+        assert_eq!(facade.ast.close_policy, ClosePolicy::new(7));
         let events = facade
             .ast
             .operations
@@ -3006,6 +3030,18 @@ await session.close();
                 .clone(),
         )
         .unwrap();
+        assert!(implementation.contains("closePolicy:{graceMs:7,onDeadline:\"detach\"}"));
+        let ark_implementation = String::from_utf8(
+            facade
+                .ark_files()
+                .iter()
+                .find(|file| file.path == "Index.ets")
+                .unwrap()
+                .bytes
+                .clone(),
+        )
+        .unwrap();
+        assert!(ark_implementation.contains("graceMs: 7"));
         let root = std::env::temp_dir().join(format!(
             "uniffi-js-normalized-u3s-{}",
             SystemTime::now()
@@ -3653,7 +3689,8 @@ await session.close();
         fs::write(root.join("components/corpus/index.js"), implementation).unwrap();
         let script = r#"
 import { createNamespace } from "./components/corpus/index.js";
-import { BackendSession, Host, ObjectLease } from "./shared/uniffi_runtime.js";
+import { BackendSession, Host, ObjectLease, createFacade } from "./shared/uniffi_runtime.js";
+const installPolicy = (session) => { createFacade(session, {closePolicy:{graceMs:5000,onDeadline:"detach"}}); return session; };
 const engine = {
   invokeSync(id, args) {
     if (id === 0) return {kind:"value", value: args[0]};
@@ -3713,7 +3750,7 @@ await input.cancel();
 input.release();
 let outputCancelCalls = 0;
 let outputReleaseCalls = 0;
-const cancellingSession = new BackendSession({invokeSync() { return 1; }, async invokeAsync() { return {kind:"item", value:1}; }, cancelOutputStream() { outputCancelCalls += 1; return Promise.reject({errorName:"CancelFailed", message:"cancel failed"}); }, releaseOutputStream() { outputReleaseCalls += 1; }, close() {}}, new Host());
+const cancellingSession = installPolicy(new BackendSession({invokeSync() { return 1; }, async invokeAsync() { return {kind:"item", value:1}; }, cancelOutputStream() { outputCancelCalls += 1; return Promise.reject({errorName:"CancelFailed", message:"cancel failed"}); }, releaseOutputStream() { outputReleaseCalls += 1; }, close() {}}, new Host()));
 const cancellingOutput = cancellingSession.createOutputStream({start: () => 1, next: () => ({kind:"item", value:1})});
 await cancellingOutput.next();
 try { await cancellingOutput.cancel(); throw Error("cancel rejection"); } catch (error) { if (error.errorName !== "CancelFailed") throw error; }
@@ -3730,7 +3767,7 @@ if (session.invokeCallbackSync(3, mixed, 0, [1]) !== 2) throw Error("sync callba
 if (await session.invokeCallbackAsync(3, mixed, 1, 99, [1]) !== 3) throw Error("async callback");
 const badCallback = session.registerCallback(4, () => Promise.resolve(1), { methods: { 0: { name: null } } });
 try { session.invokeCallbackSync(4, badCallback, 0, []); throw Error("sync callback Promise"); } catch (error) { if (error.errorName !== "UniffiCallbackProtocol") throw error; }
-const badBackend = new BackendSession({invokeSync() { return Promise.resolve(1); }, async invokeAsync() { return {kind:"value", value:1}; }, close() {}}, new Host());
+const badBackend = installPolicy(new BackendSession({invokeSync() { return Promise.resolve(1); }, async invokeAsync() { return {kind:"value", value:1}; }, close() {}}, new Host()));
 try { badBackend.invokeSync(0, []); throw Error("sync invoke Promise"); } catch (error) { if (error.errorName !== "UniffiBackendProtocol") throw error; }
 await badBackend.close();
 try { api.fail(); throw Error("error envelope"); } catch (error) { if (error.errorName !== "Failure" || error.variant !== "Rejected" || error.data?.message !== "no") throw error; }

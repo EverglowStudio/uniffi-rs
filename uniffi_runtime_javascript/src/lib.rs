@@ -68,6 +68,7 @@ mod tests {
 import {
   BackendSession,
   Host,
+  createFacade,
   invokeOperation,
   liftValue,
   lowerValue,
@@ -90,17 +91,19 @@ const expectAsyncError = async (fn, errorName) => {
   }
 };
 const scalar = (name) => ({ kind: "scalar", name });
+const defaultPolicy = { graceMs: 5000, onDeadline: "detach" };
+const withPolicy = (session, policy) => { createFacade(session, { closePolicy: policy }); return session; };
 
 let nativeRetains = 0;
 let nativeReleases = 0;
 const hostA = new Host();
 hostA.retainCallback = () => { nativeRetains += 1; };
 hostA.releaseCallback = () => { nativeReleases += 1; };
-const sessionA = new BackendSession({
+const sessionA = withPolicy(new BackendSession({
   invokeSync() {},
   async invokeAsync() {},
   close() {},
-}, hostA);
+}, hostA), defaultPolicy);
 const callbackA = sessionA.registerCallback(7, () => "A", { methods: { 0: { name: null } } });
 const callbackLeaseA = sessionA.retainCallback(7, callbackA);
 callbackLeaseA.release();
@@ -174,7 +177,7 @@ if (liftValue("x", customDescriptor, null, customContext) !== "public:x") throw 
 let naturalCancel = 0;
 let naturalRelease = 0;
 let naturalFinish = 0;
-const naturalSession = new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, new Host());
+const naturalSession = withPolicy(new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, new Host()), defaultPolicy);
 const natural = naturalSession.createOutputStream({
   start: () => 17,
   next: () => ({ kind: "error", error: { errorName: "NaturalError", message: "done" } }),
@@ -187,10 +190,11 @@ if (naturalCancel !== 0 || naturalRelease !== 1 || naturalFinish !== 1) throw Er
 await natural.cancel();
 if (naturalCancel !== 0 || naturalRelease !== 1 || naturalFinish !== 1) throw Error("natural output error re-cleanup");
 await naturalSession.close();
+if (naturalSession._deadlineTimer !== null) throw Error("natural close left deadline timer");
 
 let transportCancel = 0;
 let transportRelease = 0;
-const transportSession = new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, new Host());
+const transportSession = withPolicy(new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, new Host()), defaultPolicy);
 const transport = transportSession.createOutputStream({
   start: () => 18,
   next: () => ({ kind: "not-a-step" }),
@@ -201,11 +205,76 @@ await expectAsyncError(() => transport.next(), "UniffiStreamProtocolError");
 if (transportCancel !== 1 || transportRelease !== 1) throw Error("transport output cancellation");
 await transportSession.close();
 
-const voidSession = new BackendSession({
+// U4A3 close policy: one shared deadline detaches every generation, including
+// callback, output/input stream and backend promises that never settle.
+const shortPolicy = { graceMs: 10, onDeadline: "detach" };
+let lateCallbackCalls = 0;
+const lateHost = new Host();
+lateHost.retainCallback = () => { lateCallbackCalls += 1; };
+lateHost.releaseCallback = () => { lateCallbackCalls += 1; };
+const callbackNever = withPolicy(new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, lateHost), shortPolicy);
+const callbackId = callbackNever.registerCallback(31, { wait: async () => { await new Promise(() => {}); } }, { methods: { 0: { name: "wait", async: true } }, reentrancy: "allowed" });
+const callbackPending = lateHost.invokeCallbackAsync(31, callbackId, 0, 99, []);
+const callbackClose = callbackNever.close();
+if (callbackNever.close() !== callbackClose) throw Error("close was not idempotent");
+try { lateHost.invokeCallbackSync(31, callbackId, 0, []); throw Error("callback started during closing"); } catch (error) { if (error.errorName !== "UniffiSessionClosed") throw error; }
+await callbackClose;
+if (callbackNever.callbacks.callbacks.size !== 0 || callbackNever.phase !== "closed") throw Error("callback deadline detach");
+try { lateHost.invokeCallbackSync(31, callbackId, 0, []); throw Error("late callback was accepted"); } catch (error) { if (error.errorName !== "UniffiSessionClosed") throw error; }
+lateHost.retainCallback(31, callbackId);
+if (lateCallbackCalls !== 0) throw Error("late callback retain reached original host");
+await expectAsyncError(() => callbackPending, "UniffiSessionClosed");
+try { new BackendSession({ invokeSync() {}, async invokeAsync() {} }, lateHost); throw Error("host was rebound after detach"); } catch (error) { if (error.errorName !== "UniffiHostSession") throw error; }
+
+const outputNever = withPolicy(new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, new Host()), shortPolicy);
+const outputPendingStream = outputNever.createOutputStream({ start: () => 1, next: () => new Promise(() => {}), cancel: () => new Promise(() => {}), release: () => {} });
+const outputPending = outputPendingStream.next();
+await outputNever.close();
+if (outputNever.outputStreams.size !== 0) throw Error("output registry was not detached");
+await outputPending;
+
+let sequenceBackendClose = 0;
+let sequenceCancelCalls = 0;
+const sequenceSession = withPolicy(new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() { sequenceBackendClose += 1; } }, new Host()), shortPolicy);
+const sequenceStream = sequenceSession.createOutputStream({ start: () => 2, next: () => new Promise(() => {}), cancel: () => { sequenceCancelCalls += 1; return new Promise(() => {}); }, release: () => {} });
+void sequenceStream.next();
+await Promise.resolve();
+const sequenceClose = sequenceSession.close();
+if (sequenceBackendClose !== 1) throw Error("backend close waited behind stream cancellation");
+await sequenceClose;
+if (sequenceCancelCalls !== 1) throw Error("output cancel was not started exactly once");
+
+let sourceReturnCalls = 0;
+const inputSource = { [Symbol.asyncIterator]() { return { next: () => new Promise(() => {}), return: () => { sourceReturnCalls += 1; return new Promise(() => {}); } }; } };
+const inputNever = withPolicy(new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, new Host()), shortPolicy);
+const inputMarker = inputNever.createInputStream(inputSource, {});
+const inputPending = inputNever.pullInputStream(inputMarker.handle);
+await inputNever.close();
+if (inputNever.inputStreams.size !== 0) throw Error("input registry was not detached");
+if (sourceReturnCalls !== 1) throw Error("input return was not started exactly once");
+const lateInput = await inputNever.host.pullInputStream(inputMarker.handle);
+if (lateInput.kind !== "done") throw Error("late input pull reached source");
+await inputPending;
+
+const backendNever = withPolicy(new BackendSession({ invokeSync() {}, async invokeAsync() {}, close: () => new Promise(() => {}) }, new Host()), shortPolicy);
+await backendNever.close();
+if (backendNever.phase !== "closed") throw Error("backend close deadline");
+
+const unconfigured = new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, new Host());
+const missingPolicyClose = unconfigured.close();
+if (unconfigured.close() !== missingPolicyClose) throw Error("missing-policy close was not idempotent");
+await expectAsyncError(() => missingPolicyClose, "UniffiClosePolicy");
+try { unconfigured.invokeSync(0, []); throw Error("unconfigured session remained open"); } catch (error) { if (error.errorName !== "UniffiSessionClosed") throw error; }
+
+const policySession = withPolicy(new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, new Host()), defaultPolicy);
+try { withPolicy(new BackendSession({ invokeSync() {} }, new Host()), { graceMs: Infinity, onDeadline: "detach" }); throw Error("invalid policy accepted"); } catch (error) { if (error.errorName !== "UniffiClosePolicy") throw error; }
+await policySession.close();
+
+const voidSession = withPolicy(new BackendSession({
   invokeSync: () => ({ kind: "value", value: null }),
   async invokeAsync() { return { kind: "value", value: "ignored" }; },
   close() {},
-}, new Host());
+}, new Host()), defaultPolicy);
 const voidDescriptor = { name: "void", id: 0, args: [], returnType: null, async: false };
 if (invokeOperation(voidSession, voidDescriptor, []) !== undefined) throw Error("void sync return");
 voidDescriptor.async = true;
@@ -213,7 +282,7 @@ if (await invokeOperation(voidSession, voidDescriptor, []) !== undefined) throw 
 await voidSession.close();
 
 const hostB = new Host();
-const sessionB = new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, hostB);
+const sessionB = withPolicy(new BackendSession({ invokeSync() {}, async invokeAsync() {}, close() {} }, hostB), defaultPolicy);
 const callbackB = sessionB.registerCallback(7, () => "B", { methods: { 0: { name: null } } });
 try {
   hostA.invokeCallbackSync(7, callbackB, 0, []);

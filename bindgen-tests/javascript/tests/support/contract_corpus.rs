@@ -11,8 +11,8 @@ use uniffi_js_abi::{
 };
 use uniffi_js_engine_schema::{
     assign_stream_use_site_ids, BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy,
-    CallbackRetention, CallbackThreading, CallbackUseSite, EngineCapabilities, EngineKind,
-    PlannedOperation, StreamContract, StreamUseSite, ValuePath,
+    CallbackRetention, CallbackThreading, CallbackUseSite, ClosePolicy, EngineCapabilities,
+    EngineKind, PlannedOperation, StreamContract, StreamUseSite, ValuePath,
 };
 
 pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
@@ -364,6 +364,7 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
             supported: full_capabilities.clone(),
         })
         .collect(),
+        close_policy: ClosePolicy::default(),
     })
     .unwrap()
 }
