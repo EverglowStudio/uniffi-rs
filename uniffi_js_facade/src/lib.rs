@@ -2725,6 +2725,16 @@ mod tests {
                 );
             }
         }
+        let ark_declaration = String::from_utf8(
+            ark.iter()
+                .find(|file| file.path == "Index.d.ets")
+                .unwrap()
+                .bytes
+                .clone(),
+        )
+        .unwrap();
+        assert!(ark_declaration.contains("export interface ArkCallbackResult"));
+        assert!(ark_declaration.contains("readonly error_message?: string"));
         let declaration = String::from_utf8(
             shared
                 .iter()
@@ -2984,6 +2994,7 @@ mod tests {
         assert!(!implementation.contains("handleValue"));
         assert!(!implementation.contains("export const Event:"));
         assert!(implementation.contains("function __arkStreamStepField"));
+        assert!(implementation.contains("error_message: failure.message"));
         assert!(implementation
             .contains("if (!(source instanceof Map)) throw new UniffiError(\"UniffiMapType\""));
         assert!(implementation.contains("let __frameEnded: boolean = false"));

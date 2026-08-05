@@ -1125,6 +1125,7 @@ export interface ArkCallbackResult {
   readonly ok: boolean;
   readonly value?: ArkValue;
   readonly error?: ArkFailure;
+  readonly error_message?: string;
 }
 export class ArkValueResult { readonly kind: "value" = "value"; readonly value: ArkValue; constructor(value: ArkValue) { this.value = value; } }
 export class ArkErrorResult { readonly kind: "error" = "error"; readonly error: ArkFailure; constructor(error: ArkFailure) { this.error = error; } }
@@ -1325,11 +1326,11 @@ export class Host {
   }
   invokeCallbackSyncResult(callbackType: number, callbackId: number, methodId: number, args: Array<ArkValue> = []): ArkCallbackResult {
     try { return { ok: true, value: this.invokeCallbackSync(callbackType, callbackId, methodId, args) }; }
-    catch (error) { return { ok: false, error: __arkCallbackFailure(error) }; }
+    catch (error) { const failure: ArkFailure = __arkCallbackFailure(error); return { ok: false, error: failure, error_message: failure.message }; }
   }
   async invokeCallbackAsyncResult(callbackType: number, callbackId: number, methodId: number, invocationId: number, args: Array<ArkValue> = []): Promise<ArkCallbackResult> {
     try { return { ok: true, value: await this.invokeCallbackAsync(callbackType, callbackId, methodId, invocationId, args) }; }
-    catch (error) { return { ok: false, error: __arkCallbackFailure(error) }; }
+    catch (error) { const failure: ArkFailure = __arkCallbackFailure(error); return { ok: false, error: failure, error_message: failure.message }; }
   }
   pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>> {
     if (this.inputRegistry === null) return Promise.reject(new UniffiError("UniffiInputStreamMissing", "input stream registry is not attached"));
@@ -1804,6 +1805,7 @@ fn render_runtime_declarations() -> String {
 export declare class ArkRecord { set(name: string, value: ArkValue): void; has(name: string): boolean; get(name: string): ArkValue; }
 export type ArkValue = ArkPrimitive | Uint8Array | Date | ArkRecord | Array<ArkValue> | Map<ArkValue, ArkValue> | Set<ArkValue> | null;
 export interface ArkFailure { readonly errorName: string; readonly message: string; readonly variant: string | null; readonly data: ArkValue | null; }
+export interface ArkCallbackResult { readonly ok: boolean; readonly value?: ArkValue; readonly error?: ArkFailure; readonly error_message?: string; }
 export declare class ArkValueResult { readonly kind: "value"; readonly value: ArkValue; constructor(value: ArkValue); }
 export declare class ArkErrorResult { readonly kind: "error"; readonly error: ArkFailure; constructor(error: ArkFailure); }
 export type ArkCallResult = ArkValueResult | ArkErrorResult;

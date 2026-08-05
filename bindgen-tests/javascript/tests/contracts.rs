@@ -489,6 +489,17 @@ fn input_stream_package_contract() {
         native_wasm.contains("running_sum") && native_wasm.contains("ForeignInputStreamOps"),
         "Wasm adapter must retain input-stream operations: {native_wasm}"
     );
+    let native_ohos = std::fs::read_to_string(out_dir.join("native/ohos.rs")).unwrap();
+    let native_ohos_compact: String = native_ohos
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    assert!(
+        native_ohos_compact.contains("pullInputStream")
+            && native_ohos_compact.contains("cancelInputStream")
+            && native_ohos_compact.matches(".bind(host)").count() >= 2,
+        "Harmony input-stream methods must retain Host as `this`:\n{native_ohos}"
+    );
     assert!(
         !out_dir
             .join("components/input_stream_core/harmony")
@@ -697,6 +708,96 @@ fn custom_types_emit_public_contract() {
     assert!(
         !implementation.contains(".ts"),
         "custom implementation must not reference removed TypeScript sidecar paths:\n{implementation}"
+    );
+}
+
+#[test]
+fn harmony_custom_callbacks_keep_host_receiver_for_sync_and_cross_thread_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (udl, config, manifest) = write_custom_core_crate(tmp.path());
+
+    // The calling-thread fixture exercises the real custom Email carrier in
+    // the synchronous callback proxy. The native adapter must call the Host
+    // method with its receiver, rather than extracting the method and calling
+    // it as a bare function.
+    let calling_thread_root =
+        Utf8PathBuf::from_path_buf(tmp.path().join("calling-thread")).unwrap();
+    std::fs::create_dir_all(&calling_thread_root).unwrap();
+    let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: udl.clone(),
+            out_dir: calling_thread_root.clone(),
+            package_root: calling_thread_root.clone(),
+            artifact_dir: None,
+            config_override: Some(config.clone()),
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: manifest.clone(),
+                host_crates_dir: calling_thread_root.join("native/hosts"),
+                logical_host_crates_dir: None,
+            },
+            flavors: vec![FlavorTarget::Harmony],
+        },
+    )
+    .expect("Harmony custom callback generation should succeed");
+    let calling_thread_native =
+        std::fs::read_to_string(calling_thread_root.join("native/ohos.rs")).unwrap();
+    let calling_thread_native_compact: String = calling_thread_native
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    assert!(
+        calling_thread_native_compact.contains(".apply(__uniffi_host,"),
+        "sync custom callback must preserve Host as `this`:\n{calling_thread_native}"
+    );
+
+    // Reuse the same custom type with a may-cross-thread async callback. In
+    // this path the callback is handed to a ThreadsafeFunction, so the
+    // extracted Host method must be bound before N-API retains it.
+    let async_udl = tmp.path().join("custom-core/src/custom_js_core_async.udl");
+    let async_source = std::fs::read_to_string(&udl)
+        .unwrap()
+        .replace(
+            "Email format_email(Email value);",
+            "[Async]\n  Email format_email(Email value);",
+        )
+        .replace(
+            "[CallbackContract=\"argument[0],scoped,calling_thread,forbidden\"]\n  Email format_email_with",
+            "[Async, CallbackContract=\"argument[0],scoped,may_cross_thread,forbidden\"]\n  Email format_email_with",
+        );
+    std::fs::write(&async_udl, async_source).unwrap();
+    let async_root = Utf8PathBuf::from_path_buf(tmp.path().join("async")).unwrap();
+    std::fs::create_dir_all(&async_root).unwrap();
+    generate(
+        &loader,
+        GenerateJsOptions {
+            source: Utf8PathBuf::from_path_buf(async_udl).unwrap(),
+            out_dir: async_root.clone(),
+            package_root: async_root.clone(),
+            artifact_dir: None,
+            config_override: Some(config),
+            crate_filter: None,
+            metadata_no_deps: true,
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
+                manifest_path: manifest,
+                host_crates_dir: async_root.join("native/hosts"),
+                logical_host_crates_dir: None,
+            },
+            flavors: vec![FlavorTarget::Harmony],
+        },
+    )
+    .expect("Harmony custom async callback generation should succeed");
+    let async_native = std::fs::read_to_string(async_root.join("native/ohos.rs")).unwrap();
+    let async_native_compact: String = async_native
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    assert!(
+        async_native_compact.matches(".bind(host)").count() >= 2,
+        "async/cross-thread custom callbacks must bind Host before creating TSFNs:\n{async_native}"
     );
 }
 
