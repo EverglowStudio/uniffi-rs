@@ -1,0 +1,17 @@
+[package]
+name = "uniffi_js_facade"
+version = "0.32.0"
+description = "Target-neutral public JavaScript facade AST and printers for UniFFI"
+license = "MPL-2.0"
+edition = "2021"
+keywords = ["ffi", "bindgen", "javascript"]
+
+[dependencies]
+uniffi_js_abi = { path = "../uniffi_js_abi", version = "=0.32.0" }
+uniffi_js_engine_schema = { path = "../uniffi_js_engine_schema", version = "=0.32.0" }
+uniffi_runtime_javascript = { path = "../uniffi_runtime_javascript", version = "=0.32.0" }
+
+[dev-dependencies]
+uniffi_bindgen = { path = "../uniffi_bindgen", version = "=0.32.0" }
+uniffi_bindgen_javascript = { path = "../uniffi_bindgen_javascript", version = "=0.32.0" }
+uniffi_meta = { path = "../uniffi_meta", version = "=0.32.0" }

@@ -2860,6 +2860,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniffi_js_facade"
+version = "0.32.0"
+dependencies = [
+ "uniffi_bindgen",
+ "uniffi_bindgen_javascript",
+ "uniffi_js_abi",
+ "uniffi_js_engine_schema",
+ "uniffi_meta",
+ "uniffi_runtime_javascript",
+]
+
+[[package]]
 name = "uniffi_macros"
 version = "0.32.0"
 dependencies = [
@@ -2917,9 +2929,6 @@ dependencies = [
 [[package]]
 name = "uniffi_runtime_javascript"
 version = "0.32.0"
-dependencies = [
- "camino",
-]
 
 [[package]]
 name = "uniffi_testing"
