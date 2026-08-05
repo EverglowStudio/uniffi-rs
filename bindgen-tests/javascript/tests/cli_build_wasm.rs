@@ -45,19 +45,6 @@ fn has_wasm32_target(cargo: &std::path::Path) -> bool {
     true
 }
 
-fn node_supports_strip_types(node: &std::path::Path) -> bool {
-    let Ok(output) = Command::new(node)
-        .arg("--experimental-strip-types")
-        .arg("--no-warnings")
-        .arg("-e")
-        .arg("console.log('ok')")
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
-}
-
 fn build_uniffi_bindgen(root: &Utf8PathBuf, cargo: &std::path::Path) {
     let output = Command::new(cargo)
         .current_dir(root.as_std_path())
@@ -133,16 +120,11 @@ fn write_cli_wasm_fixture(root: &std::path::Path) -> Utf8PathBuf {
 
 #[test]
 fn cli_build_wasm_orchestrates_synthetic_fixture() {
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("SKIP cli_build_wasm_orchestrates_synthetic_fixture: cargo unavailable");
-        return;
-    };
-    if !has_wasm32_target(&cargo) {
-        eprintln!(
-            "SKIP cli_build_wasm_orchestrates_synthetic_fixture: wasm32-unknown-unknown target not installed"
-        );
-        return;
-    }
+    let cargo = which_tool("cargo").expect("CLI wasm orchestration requires cargo on PATH");
+    assert!(
+        has_wasm32_target(&cargo),
+        "CLI wasm orchestration requires wasm32-unknown-unknown target"
+    );
     let root = workspace_root();
     build_uniffi_bindgen(&root, &cargo);
 
@@ -155,8 +137,8 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
 
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
-    let pkg_dir = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated/native/hosts")).unwrap();
+    let pkg_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated/browser/pkg")).unwrap();
     let manifest = write_cli_wasm_fixture(tmp.path());
 
     let output = Command::new(cli.as_std_path())
@@ -182,26 +164,51 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
     }
 
     for path in [
-        "shared/runtime.ts",
-        "browser/index.ts",
-        "browser/index.web.ts",
-        "components/cli_wasm/common/api.ts",
-        "components/cli_wasm/browser/index.ts",
-        "components/cli_wasm/browser/backend-wasm.ts",
+        "shared/uniffi_runtime.js",
+        "shared/uniffi_runtime.d.ts",
+        "browser/index.js",
+        "browser/index.d.ts",
+        "browser/backend.js",
+        "components/cli_wasm/index.js",
+        "components/cli_wasm/index.d.ts",
+        "native/wasm.rs",
     ] {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing generated JS file: {file}");
     }
-    let browser_rs = std::fs::read_dir(out_dir.join("components/cli_wasm/browser"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
-        .expect("the cli_wasm browser component should contain a wasm shim");
-    let browser_rs_text = std::fs::read_to_string(&browser_rs).unwrap();
+    let browser_entry = std::fs::read_to_string(out_dir.join("browser/index.js")).unwrap();
     assert!(
-        browser_rs_text.contains("#[wasm_bindgen"),
-        "browser/*.rs should be a wasm-bindgen shim"
+        browser_entry
+            .matches("import * as __backend from \"./backend.js\";")
+            .count()
+            == 1
+            && browser_entry.contains("import * as __glue from ")
+            && browser_entry
+                .contains("export const ready = __backend.initWithGlue(__glue, undefined);")
+            && browser_entry.contains(
+                "export function init(input) { return __backend.initWithGlue(__glue, input); }",
+            )
+            && !browser_entry.contains("export function initWithGlue"),
+        "Web index must own the planned glue loader and ready/init lifecycle:\n{browser_entry}"
+    );
+    let browser_backend = std::fs::read_to_string(out_dir.join("browser/backend.js")).unwrap();
+    assert!(
+        browser_backend.contains("let __bootPromise;")
+            && browser_backend.contains("if (__bootPromise !== undefined) return __bootPromise;")
+            && browser_backend.contains("__bootPromise = (async () => {")
+            && browser_backend.contains("export function initWithGlue")
+            && !browser_backend.contains("export const ready"),
+        "browser backend must expose only the explicit idempotent coordinator:\n{browser_backend}"
+    );
+    assert!(
+        !browser_backend.contains("import * as namespaces from \"./index.js\";")
+            && !browser_backend.contains("export * from \"./index.js\";"),
+        "browser backend must not self-import the canonical index:\n{browser_backend}"
+    );
+    let browser_rs_text = std::fs::read_to_string(out_dir.join("native/wasm.rs")).unwrap();
+    assert!(
+        browser_rs_text.contains("wasm_bindgen"),
+        "native/wasm.rs should be a wasm-bindgen host adapter"
     );
 
     let host_manifest = host_dir.join("wasm/Cargo.toml");
@@ -210,11 +217,11 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
     let host_lib_text = std::fs::read_to_string(&host_lib).unwrap();
     assert!(
         host_lib_text.contains("include!("),
-        "generated wasm host crate should include the per-component shim"
+        "generated wasm host crate should include the package-level wasm adapter"
     );
     assert!(
-        host_lib_text.contains("components/cli_wasm/browser/"),
-        "generated wasm host crate should point at the browser shim"
+        host_lib_text.contains("../../../wasm.rs"),
+        "generated wasm host crate should include the package-level wasm adapter:\n{host_lib_text}"
     );
 
     assert!(
@@ -238,113 +245,11 @@ fn cli_build_wasm_orchestrates_synthetic_fixture() {
             .any(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm")),
         "wasm-bindgen output dir should contain a .wasm artifact: {pkg_entries:?}"
     );
-    let glue_stem = pkg_entries
-        .iter()
-        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("js"))
-        .and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
-        .expect("wasm-bindgen output dir should contain a .js glue file");
-    let web_entry = std::fs::read_to_string(out_dir.join("browser/index.web.ts")).unwrap();
     assert!(
-        web_entry.contains(&format!("{glue_stem}.js"))
-            && web_entry.contains(&format!("{glue_stem}_bg.wasm?url"))
-            && web_entry.contains("import { cli_wasm } from \"./index.ts\";")
-            && web_entry.contains("export const ready: Promise<void> = init();")
-            && web_entry.contains("export * from \"./index.ts\";"),
-        "browser auto-entrypoint should initialize through the root namespace, import the real wasm-bindgen output, and re-export the explicit entrypoint:\n{web_entry}"
-    );
-
-    let node = which_tool("node").expect(
-        "Browser readonly-default runtime acceptance requires Node.js with --experimental-strip-types",
-    );
-    assert!(
-        node_supports_strip_types(&node),
-        "Browser readonly-default runtime acceptance requires Node.js with --experimental-strip-types"
-    );
-    // Wrap the real in-process wasm-bindgen named exports in an explicitly
-    // frozen object. The generated Browser coordinator must shadow the
-    // inherited non-writable default rather than assigning through it.
-    let readonly_glue = pkg_dir.join("readonly-default-glue.mjs");
-    std::fs::write(
-        readonly_glue.as_std_path(),
-        format!(
-            r#"import init, * as actualGlue from "./{glue_stem}.js";
-import {{ readFile }} from "node:fs/promises";
-
-export let defaultCalls = 0;
-export const readonlyGlue = Object.freeze({{
-    ...actualGlue,
-    default: async (_input) => {{
-        defaultCalls += 1;
-        const bytes = await readFile(new URL("./{glue_stem}_bg.wasm", import.meta.url));
-        return init(bytes);
-    }},
-}});
-"#,
-        ),
-    )
-    .unwrap();
-    let glue_import = web_entry
-        .lines()
-        .find(|line| line.starts_with("import * as glue from "))
-        .expect("generated Browser entry must import wasm-bindgen glue");
-    let wasm_url_import = web_entry
-        .lines()
-        .find(|line| line.starts_with("import wasmUrl from "))
-        .expect("generated Browser entry must import its wasm URL asset");
-    let readonly_entry = web_entry
-        .replace(
-            glue_import,
-            "import { readonlyGlue as glue } from \"../../pkg/readonly-default-glue.mjs\";",
-        )
-        // Node does not understand Vite's `?url` import. The wrapper owns
-        // loading the real wasm bytes, so preserving every other generated
-        // statement exercises the Browser coordinator.
-        .replace(wasm_url_import, "const wasmUrl: unknown = undefined;");
-    let readonly_entry_path = out_dir.join("browser/index.web.readonly-default-test.ts");
-    std::fs::write(readonly_entry_path.as_std_path(), readonly_entry).unwrap();
-    let driver = tmp.path().join("browser-readonly-default-driver.ts");
-    std::fs::write(
-        &driver,
-        r#"import { defaultCalls, readonlyGlue } from "./pkg/readonly-default-glue.mjs";
-
-if (!Object.isFrozen(readonlyGlue)) {
-    throw new Error("readonly glue fixture must retain a frozen real named-export object");
-}
-const browser = await import("./generated/browser/index.web.readonly-default-test.ts");
-await browser.ready;
-if (defaultCalls !== 1) {
-    throw new Error(`expected one default initialization, got ${defaultCalls}`);
-}
-await Promise.all([browser.init(undefined), browser.init(undefined)]);
-if (defaultCalls !== 1) {
-    throw new Error(`repeated Browser init invoked default ${defaultCalls} times`);
-}
-if (browser.cli_wasm.add(2n, 3n) !== 5n) {
-    throw new Error("Browser API was not callable through the readonly-default coordinator");
-}
-console.log("browser readonly default ok");
-"#,
-    )
-    .unwrap();
-    let run = Command::new(&node)
-        .arg("--experimental-strip-types")
-        .arg("--no-warnings")
-        .arg(&driver)
-        .current_dir(tmp.path())
-        .output()
-        .expect("failed to run Browser readonly-default driver");
-    if !run.status.success() {
-        panic!(
-            "Browser readonly-default driver failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr),
-        );
-    }
-    assert!(
-        String::from_utf8_lossy(&run.stdout).contains("browser readonly default ok"),
-        "Browser readonly-default driver did not report success:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
+        pkg_entries
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("js")),
+        "wasm-bindgen output must include a JS glue file"
     );
 }
 
@@ -368,8 +273,8 @@ fn cli_artifacts_wasm_and_mini_orchestrate_two_components_without_feature_flags(
     let fixture = CompositeFixture::write(tmp.path());
     fixture.build_cdylib();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
-    let artifact_dir = Utf8PathBuf::from_path_buf(tmp.path().join("artifacts")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated/native/hosts")).unwrap();
+    let artifact_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated/artifacts")).unwrap();
     let pkg_dir = artifact_dir.join("browser/pkg");
     let wasm_target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target-wasm")).unwrap();
     let output = Command::new(cli.as_std_path())
@@ -420,82 +325,87 @@ fn cli_artifacts_wasm_and_mini_orchestrate_two_components_without_feature_flags(
         .file_stem()
         .and_then(|stem| stem.to_str())
         .expect("wasm-bindgen glue path must have a UTF-8 file stem");
-    let auto_entries = [
-        (
-            "Browser",
-            std::fs::read_to_string(out_dir.join("browser/index.web.ts")).unwrap(),
-        ),
-        (
-            "Mini Program",
-            std::fs::read_to_string(out_dir.join("browser/index.mini-program.ts")).unwrap(),
-        ),
-    ];
-    for (label, auto_entry) in &auto_entries {
+    let browser_entry = std::fs::read_to_string(out_dir.join("browser/index.js")).unwrap();
+    assert!(
+        browser_entry
+            .matches("import * as __backend from \"./backend.js\";")
+            .count()
+            == 1
+            && browser_entry
+                .contains("export const ready = __backend.initWithGlue(__glue, undefined);")
+            && browser_entry.contains(
+                "export function init(input) { return __backend.initWithGlue(__glue, input); }",
+            ),
+        "two-component Browser index must load the planned backend exactly once:\n{browser_entry}"
+    );
+    let browser_backend = std::fs::read_to_string(out_dir.join("browser/backend.js")).unwrap();
+    assert!(
+        browser_backend.contains("let __bootPromise;")
+            && browser_backend.contains("if (__bootPromise !== undefined) return __bootPromise;")
+            && browser_backend.contains("__bootPromise = (async () => {")
+            && !browser_backend.contains("export const ready"),
+        "two-component Browser backend must guard one idempotent initialization:\n{browser_backend}"
+    );
+    for component in CANONICAL_COMPONENTS {
         assert!(
-            auto_entry.contains("import { alpha, beta } from \"./index.ts\";"),
-            "two-component {label} auto entry must import both namespaces:\n{auto_entry}"
+            browser_backend.contains(component.namespace)
+                && browser_backend.contains(&format!(
+                    "__{}Module.createNamespace(session)",
+                    component.namespace
+                )),
+            "two-component Browser backend must expose namespace {}:\n{browser_backend}",
+            component.namespace,
+        );
+    }
+    let mini_entry =
+        std::fs::read_to_string(out_dir.join("browser/index.mini-program.js")).unwrap();
+    for (label, auto_entry) in [("Mini Program", mini_entry)] {
+        assert!(
+            auto_entry.contains("import * as __backend from \"./backend.js\";")
+                && auto_entry
+                    .contains("export { session, close, alpha, beta } from \"./backend.js\";",),
+            "two-component {label} auto entry must compose the backend coordinator:\n{auto_entry}"
         );
         assert!(
-            auto_entry.contains(&format!("{glue_stem}.js")),
+            !auto_entry.contains("import * as namespaces from \"./index.js\";")
+                && !auto_entry.contains("export * from \"./index.js\";"),
+            "two-component {label} auto entry must not self-import index.js:\n{auto_entry}"
+        );
+        assert!(
+            auto_entry.contains("let readyPromise = null;")
+                && auto_entry.contains("readyPromise ??= installAll(customGlue, wasmPath);")
+                && auto_entry.contains("return __backend.initWithGlue(customGlue, wasmPath);")
+                && auto_entry.matches("return __backend.initWithGlue(customGlue, wasmPath);").count() == 1
+                && auto_entry.contains("return initWithGlue(glue, wasmPath);")
+                && auto_entry.contains(&format!("{glue_stem}.js")),
             "two-component {label} auto entry must use the one canonical glue module:\n{auto_entry}"
         );
-        for component in CANONICAL_COMPONENTS {
-            assert_eq!(
-                auto_entry
-                    .matches(&format!(
-                        "{}.initBackend(initializedGlue)",
-                        component.namespace
-                    ))
-                    .count(),
-                1,
-                "{label} auto entry must initialize {} once:\n{auto_entry}",
-                component.namespace,
-            );
-        }
     }
-    for component in CANONICAL_COMPONENTS {
-        assert!(
-            out_dir
-                .join("components")
-                .join(component.namespace)
-                .join("browser")
-                .join(component.bridge_filename)
-                .exists(),
-            "missing Browser bridge for {}",
-            component.namespace,
-        );
-    }
+    assert!(
+        out_dir.join("native/wasm.rs").exists(),
+        "missing package wasm adapter"
+    );
     let host_lib = std::fs::read_to_string(host_dir.join("wasm/src/lib.rs")).unwrap();
-    for component in CANONICAL_COMPONENTS {
-        assert!(
-            host_lib.contains(&format!(
-                "components/{}/browser/{}",
-                component.namespace, component.bridge_filename
-            )),
-            "one composite wasm host must include {}:\n{host_lib}",
-            component.namespace,
-        );
-    }
+    assert!(
+        host_lib.contains("../../../wasm.rs"),
+        "one composite wasm host must include the package wasm adapter:\n{host_lib}"
+    );
 }
 
 #[test]
 fn cli_build_wasm_orchestrates_arithmetic_fixture() {
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("SKIP cli_build_wasm_orchestrates_arithmetic_fixture: cargo unavailable");
-        return;
-    };
-    if !has_wasm32_target(&cargo) {
-        eprintln!(
-            "SKIP cli_build_wasm_orchestrates_arithmetic_fixture: wasm32-unknown-unknown target not installed"
-        );
-        return;
-    }
+    let cargo =
+        which_tool("cargo").expect("CLI wasm arithmetic orchestration requires cargo on PATH");
+    assert!(
+        has_wasm32_target(&cargo),
+        "CLI wasm arithmetic orchestration requires wasm32-unknown-unknown target"
+    );
     let root = workspace_root();
     let cli = build_uniffi_bindgen_cli(&cargo);
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
-    let pkg_dir = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
+    let pkg_dir = out_dir.join("browser/pkg");
     let (manifest, source) = shared::write_cli_wasm_fixture(tmp.path());
 
     let output = Command::new(cli.as_std_path())
@@ -523,11 +433,14 @@ fn cli_build_wasm_orchestrates_arithmetic_fixture() {
     }
 
     for path in [
-        "shared/runtime.ts",
-        "browser/index.ts",
-        "components/cli_wasm/common/api.ts",
-        "components/cli_wasm/browser/index.ts",
-        "components/cli_wasm/browser/backend-wasm.ts",
+        "shared/uniffi_runtime.js",
+        "shared/uniffi_runtime.d.ts",
+        "browser/index.js",
+        "browser/index.d.ts",
+        "browser/backend.js",
+        "components/cli_wasm/index.js",
+        "components/cli_wasm/index.d.ts",
+        "native/wasm.rs",
     ] {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing generated JS file: {file}");

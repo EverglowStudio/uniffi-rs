@@ -9,20 +9,11 @@ use shared::*;
 use support::*;
 use uniffi_bindgen_javascript::HostCrateOptions;
 
-fn contains_rust_identifier(source: &str, identifier: &str) -> bool {
-    let is_identifier_char = |ch: char| ch == '_' || ch.is_ascii_alphanumeric();
-    source.match_indices(identifier).any(|(start, _)| {
-        let before = source[..start].chars().next_back();
-        let after = source[start + identifier.len()..].chars().next();
-        !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
-    })
-}
-
 #[test]
-fn emits_host_crate_tree_when_opted_in() {
+fn package_root_emits_required_host_crate_tree() {
     let out = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(out.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(out.path().join("rust_modules")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(out.path().join("generated/native/hosts")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     generate_arithmetic_with_host_crates(&out_dir, &host_dir);
 
@@ -58,8 +49,7 @@ fn emits_host_crate_tree_when_opted_in() {
 
     let wasm_lib = std::fs::read_to_string(host_dir.join("wasm/src/lib.rs")).unwrap();
     assert!(
-        wasm_lib.contains("include!(")
-            && wasm_lib.contains("components/arithmetic/browser/arithmetical.rs"),
+        wasm_lib.contains("include!(") && wasm_lib.contains("wasm.rs"),
         "wasm lib.rs must include the generated component browser bridge, got:\n{wasm_lib}"
     );
 
@@ -79,8 +69,7 @@ fn emits_host_crate_tree_when_opted_in() {
 
     let napi_lib = std::fs::read_to_string(host_dir.join("napi/src/lib.rs")).unwrap();
     assert!(
-        napi_lib.contains("include!(")
-            && napi_lib.contains("components/arithmetic/node/arithmetical.rs"),
+        napi_lib.contains("include!(") && napi_lib.contains("node.rs"),
         "napi lib.rs must include the generated component node bridge, got:\n{napi_lib}"
     );
 
@@ -89,20 +78,21 @@ fn emits_host_crate_tree_when_opted_in() {
 }
 
 #[test]
-fn does_not_emit_host_crates_by_default() {
+fn generated_package_always_contains_native_host_tree() {
     let out = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(out.path().to_path_buf()).unwrap();
     generate_arithmetic(&out_dir);
-    assert!(!out_dir.join("rust_modules").exists());
-    assert!(!out_dir.join("wasm/Cargo.toml").exists());
-    assert!(!out_dir.join("napi/Cargo.toml").exists());
+    // A package always includes its native adapters and host plan. The
+    // package root owns the deterministic host directory.
+    assert!(out_dir.join("native").is_dir());
+    assert!(out_dir.join("native/hosts").is_dir());
 }
 
 #[test]
 fn emits_ohos_host_crate_when_harmony_is_requested() {
     let out = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(out.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(out.path().join("rust_modules")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(out.path().join("generated/native/hosts")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let source = workspace_root().join("examples/arithmetic/src/arithmetic.udl");
     let manifest = workspace_root().join("examples/arithmetic/Cargo.toml");
@@ -112,17 +102,16 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
         GenerateJsOptions {
             source,
             out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors: vec![FlavorTarget::Harmony],
         },
     )
@@ -144,10 +133,10 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     for required in [
         "name = \"uniffi-example-arithmetic-uniffi-js-host\"",
         "name = \"uniffi_example_arithmetic_uniffi_js_host\"",
-        "napi-ohos = { version = \"1.1.6\"",
-        "napi-derive-ohos = { version = \"1.1.6\", default-features = false, features = [\"strict\", \"type-def\"] }",
-        "napi-build-ohos = \"1.1.6\"",
-        "features = [\"napi8\", \"tokio_rt\"]",
+        "napi-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"89a51a707d6a9ab1871e36b990987f58c9b3a6f7\", package = \"napi-ohos\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }",
+        "napi-derive-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"89a51a707d6a9ab1871e36b990987f58c9b3a6f7\", package = \"napi-derive-ohos\", features = [\"strict\", \"type-def\"] }",
+        "napi-ohos-uniffi-engine = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"89a51a707d6a9ab1871e36b990987f58c9b3a6f7\" }",
+        "napi-build-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"89a51a707d6a9ab1871e36b990987f58c9b3a6f7\", package = \"napi-build-ohos\" }",
         "[workspace]",
     ] {
         assert!(
@@ -167,29 +156,9 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     }
     let build_rs = std::fs::read_to_string(host_dir.join("ohos/build.rs")).unwrap();
     assert!(build_rs.contains("napi_build_ohos::setup"));
-    assert!(!build_rs.contains("std::fs::write"));
-    assert!(!build_rs.contains("ohos-extra-types.d.ts"));
-    let bundle: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(host_dir.join("ohos/uniffi-ohos-facade-bundle.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(bundle.as_object().unwrap().len(), 2);
-    assert_eq!(bundle["contracts"].as_array().map(Vec::len), Some(1));
-    assert_eq!(bundle["typeSidecars"].as_array().map(Vec::len), Some(1));
-    assert_eq!(
-        bundle["contracts"][0]["file"],
-        "arithmetical.ohos-facade.json"
-    );
-    assert_eq!(bundle["contracts"][0].as_object().unwrap().len(), 2);
-    assert_eq!(
-        bundle["typeSidecars"][0]["file"],
-        "arithmetical.ohos-extra-types.d.ts"
-    );
-    assert_eq!(bundle["typeSidecars"][0].as_object().unwrap().len(), 2);
     let lib_rs = std::fs::read_to_string(host_dir.join("ohos/src/lib.rs")).unwrap();
     assert!(
-        lib_rs.contains("include!(")
-            && lib_rs.contains("components/arithmetic/harmony/arithmetical.rs"),
+        lib_rs.contains("include!(") && lib_rs.contains("ohos.rs"),
         "OHOS lib.rs must include generated component harmony bridge:\n{lib_rs}"
     );
 }
@@ -227,45 +196,40 @@ fn host_crates_napi_and_ohos_compile_float32_record_fixture() {
     let (out_dir, host_dir) = generate_float32_record_hosts(tmp.path());
 
     for bridge in [
-        out_dir.join("components/float32_record_core/node/float32_record_core.rs"),
-        out_dir.join("components/float32_record_core/harmony/float32_record_core.rs"),
+        out_dir.join("native/node.rs"),
+        out_dir.join("native/ohos.rs"),
     ] {
         let source = std::fs::read_to_string(&bridge).unwrap();
         let compact = source.split_whitespace().collect::<String>();
         assert!(
-            source.contains("pub speed: f64")
-                && source.contains("speed: value.speed as f32")
-                && source.contains("speed: value.speed as f64"),
+            compact.contains("pubspeed:f64")
+                && compact.contains("speed:value.speedasf32")
+                && compact.contains("speed:value.speedasf64"),
             "float32 bridge must adapt JS number at the FFI boundary: {source}"
         );
         assert!(
             !source.contains("pub speed: f32"),
             "the host crate must not ask N-API to marshal f32 directly: {source}"
         );
-        let async_body = compact
-            .split_once("let__uniffi_future=asyncmove{")
-            .and_then(|(_, after_start)| {
-                after_start
-                    .split_once("};drop(handle);")
-                    .map(|(body, _)| body)
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "async object receiver must construct a named future and drop its ClassInstance: {source}"
-                )
-            });
         assert!(
-            compact.contains(
-                "pubfnasync_service_greet(__uniffi_env:Env,handle:napi::bindgen_prelude::ClassInstance<'_,AsyncService>,message:String,)->napi::bindgen_prelude::Result<napi::bindgen_prelude::PromiseRaw<'static,String>>",
-            ) && compact.contains(
-                "let__uniffi_message=message;let__uniffi_core=(*(handle)).__uniffi_core_clone();let__uniffi_future=asyncmove{",
-            ) && compact.contains(
-                "drop(handle);let__uniffi_promise=__uniffi_env.spawn_future(__uniffi_future)?;",
-            ) && compact.contains(
-                "std::mem::transmute::<napi::bindgen_prelude::PromiseRaw<'_,String>,napi::bindgen_prelude::PromiseRaw<'static,String>,>(__uniffi_promise)",
-            ) && !contains_rust_identifier(async_body, "handle")
-                && !compact.contains("unsafeimplSend"),
-            "async object receivers must lower before a Send future, drop the ClassInstance before spawn, and return the transmuted raw Promise: {source}"
+            compact.contains("asyncfn__uniffi_raw_operation_2"),
+            "async object receiver must use an async raw operation wrapper: {source}"
+        );
+        assert!(
+            compact.contains("__uniffi_receiver:u32"),
+            "async object receiver must cross N-API as a u32 lease: {source}"
+        );
+        assert!(
+            compact.contains("__uniffi_lower_2_1(__uniffi_receiver)"),
+            "async object receiver must lower through its typed lease helper: {source}"
+        );
+        assert!(
+            compact.contains("__uniffi_native_operation_2(__uniffi_receiver,message).await"),
+            "async object receiver must reach the native future after lowering: {source}"
+        );
+        assert!(
+            !compact.contains("ClassInstance"),
+            "async object receivers must not capture a N-API ClassInstance across the native future: {source}"
         );
         assert!(
             !source.contains("pub async fn async_service_greet("),
@@ -359,7 +323,7 @@ fn host_crates_wasm_passes_cargo_check() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn host_crates_wasm_only_skips_napi() {
+fn wasm_flavor_gates_napi_host() {
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_synthetic_gated(tmp.path(), vec![FlavorTarget::Wasm]);
     assert!(host_dir.join("wasm/Cargo.toml").exists());
@@ -371,7 +335,7 @@ fn host_crates_wasm_only_skips_napi() {
 }
 
 #[test]
-fn host_crates_napi_only_skips_wasm() {
+fn napi_flavor_gates_wasm_host() {
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_synthetic_gated(tmp.path(), vec![FlavorTarget::Napi]);
     assert!(host_dir.join("napi/Cargo.toml").exists());
@@ -383,7 +347,7 @@ fn host_crates_napi_only_skips_wasm() {
 }
 
 #[test]
-fn host_crates_electron_only_emits_napi_and_skips_wasm() {
+fn electron_flavor_reuses_napi_host() {
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_synthetic_gated(tmp.path(), vec![FlavorTarget::Electron]);
     assert!(
@@ -397,10 +361,9 @@ fn host_crates_electron_only_emits_napi_and_skips_wasm() {
 }
 
 #[test]
-fn host_crates_wasm_only_passes_cargo_check() {
-    // Regression proof for the broken scenario before flavor gating:
-    // `--flavor wasm --emit-host-crates` would also emit a napi
-    // host crate that `include!`-ed a non-existent `out/node/*.rs`.
+fn wasm_flavor_host_passes_cargo_check() {
+    // Regression proof for flavor gating: a wasm-only package must not emit
+    // a N-API host crate that includes a non-existent node adapter.
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = generate_synthetic_gated(tmp.path(), vec![FlavorTarget::Wasm]);
     assert!(!host_dir.join("napi").exists());
@@ -450,11 +413,7 @@ fn host_crates_napi_compiles_temporal_fixture() {
     let host_dir = generate_temporal_napi_host(tmp.path());
 
     let bridge = std::fs::read_to_string(
-        Utf8PathBuf::from_path_buf(
-            tmp.path()
-                .join("generated/components/napi_temporal_core/node/napi_temporal_core.rs"),
-        )
-        .unwrap(),
+        Utf8PathBuf::from_path_buf(tmp.path().join("generated/native/node.rs")).unwrap(),
     )
     .unwrap();
     assert!(
@@ -483,14 +442,24 @@ fn host_crates_napi_compiles_temporal_fixture() {
         );
     }
 
-    let electron_preload = std::fs::read_to_string(
+    let package_entry = std::fs::read_to_string(
         tmp.path()
-            .join("generated/components/napi_temporal_core/electron/preload.cjs"),
+            .join("generated/components/napi_temporal_core/index.js"),
     )
     .unwrap();
     assert!(
-        !electron_preload.contains("unsupported"),
-        "electron preload should remain on the supported temporal path:\n{electron_preload}"
+        package_entry.contains("createNamespace"),
+        "temporal package entry should expose the canonical namespace factory:\n{package_entry}"
+    );
+    assert!(
+        tmp.path().join("generated/electron/index.js").is_file(),
+        "temporal package must publish the package-level Electron entry"
+    );
+    assert!(
+        !tmp.path()
+            .join("generated/components/napi_temporal_core/electron")
+            .exists(),
+        "temporal package must not recreate a per-component Electron sidecar"
     );
 }
 
@@ -502,70 +471,57 @@ fn host_crates_napi_compiles_enum_callback_async_fixture() {
     // Sanity check: the generated bridge actually uses the newer
     // napi-rs surface whose compatibility is the point of this test.
     let bridge = std::fs::read_to_string(
-        Utf8PathBuf::from_path_buf(
-            tmp.path()
-                .join("generated/components/napi_compat/node/napi_compat.rs"),
-        )
-        .unwrap(),
+        Utf8PathBuf::from_path_buf(tmp.path().join("generated/native/node.rs")).unwrap(),
     )
     .unwrap();
     assert!(
-        bridge.contains("discriminant = \"type\""),
-        "rich fixture should exercise #[napi(discriminant = \"type\")]"
+        bridge.contains("discriminant = \"tag\""),
+        "rich fixture should exercise the tagged #[napi(discriminant = \"tag\")] carrier"
     );
     assert!(
         bridge.contains("string_enum"),
         "rich fixture should exercise #[napi(string_enum)] for flat enums"
     );
     assert!(
-        bridge.contains("ThreadsafeFunction"),
-        "rich fixture should exercise ThreadsafeFunction"
+        bridge.contains("SessionCallbackTransfers")
+            && bridge
+                .split_whitespace()
+                .collect::<String>()
+                .contains("callback_transfer:true"),
+        "rich fixture should exercise the session callback transfer contract"
     );
     assert!(
-        bridge.contains("napi::bindgen_prelude::BigInt"),
+        bridge
+            .split_whitespace()
+            .collect::<String>()
+            .contains("napi::bindgen_prelude::BigInt"),
         "rich fixture should use napi::BigInt for u64/i64, got:\n{bridge}"
     );
     assert!(
         {
             let compact = bridge.split_whitespace().collect::<String>();
-            let inline_future_body = compact
-                .split_once("let__uniffi_promise=__uniffi_env.spawn_future(asyncmove{")
-                .and_then(|(_, after_start)| {
-                    after_start
-                        .split_once("})?;Ok(unsafe{")
-                        .map(|(body, _)| body)
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "async ClassInstance argument must enter the inline Promise future only after lowering: {bridge}"
-                    )
-                });
             compact.contains(
-                "pubfnasync_counter_value(__uniffi_env:Env,counter:napi::bindgen_prelude::ClassInstance<'_,Counter>,)",
-            ) && compact.contains(
-                "napi::bindgen_prelude::PromiseRaw<'static,napi::bindgen_prelude::BigInt>",
-            ) && compact.contains(
-                "let__uniffi_counter=(*(counter)).__uniffi_core_clone();let__uniffi_promise=__uniffi_env.spawn_future(asyncmove{",
-            ) && inline_future_body.contains(
-                "napi_compat::async_counter_value(__uniffi_counter).await",
-            ) && !contains_rust_identifier(inline_future_body, "counter")
-                && compact.contains(
-                    "std::mem::transmute::<napi::bindgen_prelude::PromiseRaw<'_,napi::bindgen_prelude::BigInt>,napi::bindgen_prelude::PromiseRaw<'static,napi::bindgen_prelude::BigInt>,>(__uniffi_promise)",
-                ) && !compact.contains("pubasyncfnasync_counter_value(")
-                && !compact.contains("unsafeimplSend")
+                "asyncfn__uniffi_raw_operation_1(counter:__UniffiNapiObjectLease)",
+            )
+                && compact.contains("crate::__uniffi_lower_1_0(counter)")
+                && compact.contains("crate::__uniffi_native_operation_1(counter).await")
+                && compact.contains("execute_tokio_future_with_finalize_callback")
+                && !compact.contains("ClassInstance")
         },
-        "async function with object args must lower ClassInstance before its Send Promise future and return the transmuted raw Promise:\n{bridge}"
+        "async object arguments must use the private object carrier, lower before the N-API future, and await the native operation:\n{bridge}"
     );
 
     let manifest = host_dir.join("napi/Cargo.toml");
     let cargo_toml = std::fs::read_to_string(&manifest).unwrap();
     assert!(
-        cargo_toml.contains("napi = { version = \"3"),
-        "napi host crate template must default to napi 3.x, got:\n{cargo_toml}"
+        cargo_toml.contains("napi = { git = \"https://github.com/EverglowStudio/napi-rs.git\""),
+        "napi host crate template must use the pinned napi-rs 3.x engine source, got:\n{cargo_toml}"
     );
     assert!(
-        cargo_toml.contains("napi-derive = { version = \"3") && cargo_toml.contains("type-def"),
-        "napi-derive must default to 3.x with type-def, got:\n{cargo_toml}"
+        cargo_toml
+            .contains("napi-derive = { git = \"https://github.com/EverglowStudio/napi-rs.git\"",)
+            && cargo_toml.contains("type-def"),
+        "napi-derive must use the pinned napi-rs source with type-def, got:\n{cargo_toml}"
     );
 
     let target_dir = tmp.path().join("cargo-target-napi-rich");
@@ -594,7 +550,8 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
     let forward = CompositeFixture::write(&forward_root);
     forward.build_cdylib();
     let forward_out = Utf8PathBuf::from_path_buf(forward_root.join("generated")).unwrap();
-    let forward_hosts = Utf8PathBuf::from_path_buf(forward_root.join("rust_modules")).unwrap();
+    let forward_hosts =
+        Utf8PathBuf::from_path_buf(forward_root.join("generated/native/hosts")).unwrap();
     forward.generate(
         &forward_out,
         Some(forward_hosts.clone()),
@@ -609,7 +566,8 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
     let reverse = CompositeFixture::write_reversed(&reverse_root);
     reverse.build_cdylib();
     let reverse_out = Utf8PathBuf::from_path_buf(reverse_root.join("generated")).unwrap();
-    let reverse_hosts = Utf8PathBuf::from_path_buf(reverse_root.join("rust_modules")).unwrap();
+    let reverse_hosts =
+        Utf8PathBuf::from_path_buf(reverse_root.join("generated/native/hosts")).unwrap();
     reverse.generate(
         &reverse_out,
         Some(reverse_hosts.clone()),
@@ -629,7 +587,7 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
     assert_eq!(
         regular_tree_snapshot(forward_hosts.as_std_path(), forward.root().as_std_path()),
         regular_tree_snapshot(reverse_hosts.as_std_path(), reverse.root().as_std_path()),
-        "reverse Cargo dependency/re-export order must not change host crates or OHOS bundle",
+        "reverse Cargo dependency/re-export order must not change host crates or native adapters",
     );
 
     let host_package = "composite-core-uniffi-js-host";
@@ -671,69 +629,35 @@ fn composite_host_crates_are_deterministic_complete_and_compile() {
 
         let lib_rs =
             std::fs::read_to_string(forward_hosts.join(flavor).join("src/lib.rs")).unwrap();
-        for component in CANONICAL_COMPONENTS {
-            let encoded_crate_root = component
-                .crate_name
-                .as_bytes()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            assert!(
-                lib_rs.contains(&format!("mod __uniffi_component_{encoded_crate_root}"))
-                    && lib_rs.contains(&format!(
-                        "components/{}/{}/{}",
-                        component.namespace,
-                        match flavor {
-                            "wasm" => "browser",
-                            "napi" => "node",
-                            "ohos" => "harmony",
-                            _ => unreachable!(),
-                        },
-                        component.bridge_filename,
-                    )),
-                "{flavor} host must include {} in an isolated module:\n{lib_rs}",
-                component.namespace,
-            );
-        }
+        let native = match flavor {
+            "wasm" => "wasm.rs",
+            "napi" => "node.rs",
+            "ohos" => "ohos.rs",
+            _ => unreachable!(),
+        };
+        assert!(
+            lib_rs.contains(native),
+            "{flavor} host must include package-native adapter {native}:\n{lib_rs}"
+        );
     }
 
-    let bundle: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(forward_hosts.join("ohos/uniffi-ohos-facade-bundle.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(bundle.as_object().unwrap().len(), 2);
-    assert_eq!(bundle["contracts"].as_array().map(Vec::len), Some(2));
-    assert_eq!(bundle["typeSidecars"].as_array().map(Vec::len), Some(2));
-    for (index, component) in CANONICAL_COMPONENTS.into_iter().enumerate() {
-        let contract_entry = &bundle["contracts"][index];
-        let sidecar_entry = &bundle["typeSidecars"][index];
-        assert_eq!(contract_entry.as_object().unwrap().len(), 2);
-        assert_eq!(sidecar_entry.as_object().unwrap().len(), 2);
-        assert_eq!(
-            contract_entry["file"],
-            format!("{}.ohos-facade.json", component.crate_name)
+    // A composite package exposes one deterministic native adapter per target
+    // and one host crate per requested flavor.  There is no separate bundle or
+    // sidecar reader: the host source includes the adapter from the same root.
+    for (flavor, native) in [
+        ("wasm", "wasm.rs"),
+        ("napi", "node.rs"),
+        ("ohos", "ohos.rs"),
+    ] {
+        let lib_rs =
+            std::fs::read_to_string(forward_hosts.join(flavor).join("src/lib.rs")).unwrap();
+        assert!(
+            lib_rs.contains(native),
+            "{flavor} host must include the package-native adapter {native}:\n{lib_rs}"
         );
-        assert_eq!(
-            sidecar_entry["file"],
-            format!("{}.ohos-extra-types.d.ts", component.crate_name)
-        );
-        let contract_path = forward_out
-            .join("components")
-            .join(component.namespace)
-            .join("harmony")
-            .join(contract_entry["file"].as_str().unwrap());
-        let sidecar_path = forward_out
-            .join("components")
-            .join(component.namespace)
-            .join("harmony")
-            .join(sidecar_entry["file"].as_str().unwrap());
-        assert_eq!(
-            contract_entry["content"],
-            std::fs::read_to_string(contract_path).unwrap()
-        );
-        assert_eq!(
-            sidecar_entry["content"],
-            std::fs::read_to_string(sidecar_path).unwrap()
+        assert!(
+            forward_out.join("native").join(native).is_file(),
+            "package must contain native/{native}"
         );
     }
 
@@ -849,17 +773,16 @@ pub fn generate_arithmetic_with_host_crates(out_dir: &Utf8PathBuf, host_crates_d
         GenerateJsOptions {
             source,
             out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_crates_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors: vec![
                 FlavorTarget::Wasm,
                 FlavorTarget::Napi,
@@ -895,7 +818,7 @@ pub fn write_synthetic_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8P
 pub fn generate_synthetic_with_host_crates(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
     let (udl, manifest) = write_synthetic_core_crate(root);
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("generated/native/hosts")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
@@ -903,17 +826,16 @@ pub fn generate_synthetic_with_host_crates(root: &std::path::Path) -> (Utf8PathB
         GenerateJsOptions {
             source: udl,
             out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors: vec![FlavorTarget::Wasm, FlavorTarget::Napi],
         },
     )
@@ -950,7 +872,7 @@ pub fn write_float32_record_core_crate(root: &std::path::Path) -> (Utf8PathBuf, 
 pub fn generate_float32_record_hosts(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
     let (udl, manifest) = write_float32_record_core_crate(root);
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("generated/native/hosts")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
@@ -958,17 +880,16 @@ pub fn generate_float32_record_hosts(root: &std::path::Path) -> (Utf8PathBuf, Ut
         GenerateJsOptions {
             source: udl,
             out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(HostCrateOptions {
+            host_crates: HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors: vec![FlavorTarget::Napi, FlavorTarget::Harmony],
         },
     )
@@ -1002,25 +923,24 @@ pub fn cargo_target_libdir(target: &str) -> std::io::Result<Option<std::path::Pa
 pub fn generate_synthetic_gated(root: &std::path::Path, flavors: Vec<FlavorTarget>) -> Utf8PathBuf {
     let (udl, manifest) = write_synthetic_core_crate(root);
     let out_dir = Utf8PathBuf::from_path_buf(root.join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(root.join("rust_modules")).unwrap();
+    let host_dir = Utf8PathBuf::from_path_buf(root.join("generated/native/hosts")).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     generate(
         &loader,
         GenerateJsOptions {
             source: udl,
-            out_dir,
+            out_dir: out_dir.clone(),
+            package_root: out_dir.clone(),
             artifact_dir: None,
             config_override: None,
             crate_filter: None,
             metadata_no_deps: true,
-            host_crates: Some(uniffi_bindgen_javascript::HostCrateOptions {
+            host_crates: uniffi_bindgen_javascript::HostCrateOptions {
                 manifest_path: manifest,
                 host_crates_dir: host_dir.clone(),
                 logical_host_crates_dir: None,
-                logical_out_dir: None,
-                ohos_rs_dir: None,
-            }),
+            },
             flavors,
         },
     )

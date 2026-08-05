@@ -4,7 +4,7 @@
 
 #![cfg(all(feature = "cli", unix))]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -316,7 +316,6 @@ fn custom_host_command(root: &Path, package: Option<&str>, cargo_config: Option<
         .arg(root.join("generated-host"))
         .args(["--ohos-host-manifest-path"])
         .arg(root.join("host-workspace/Cargo.toml"))
-        .arg("--raw-only-facade")
         .args(["--dist-dir"])
         .arg(root.join("dist"))
         .args(["--target-dir"])
@@ -383,32 +382,10 @@ fn static_stream_host_command(
 }
 
 fn stream_api_snapshot(dist: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    let mut snapshot = [
-        "Index.ets",
-        "Index.d.ets",
-        "native-facade.d.ts",
-        "native-facade.ets",
-    ]
-    .into_iter()
-    .map(|name| (PathBuf::from(name), std::fs::read(dist.join(name)).unwrap()))
-    .collect::<BTreeMap<_, _>>();
-    let component_root = dist.join("component-facades");
-    if component_root.is_dir() {
-        let mut entries = std::fs::read_dir(&component_root)
-            .unwrap()
-            .collect::<std::io::Result<Vec<_>>>()
-            .unwrap();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let path = entry.path();
-            if entry.file_type().unwrap().is_file() {
-                snapshot.insert(
-                    PathBuf::from("component-facades").join(entry.file_name()),
-                    std::fs::read(path).unwrap(),
-                );
-            }
-        }
-    }
+    let mut snapshot = ["Index.ets", "Index.d.ets"]
+        .into_iter()
+        .map(|name| (PathBuf::from(name), std::fs::read(dist.join(name)).unwrap()))
+        .collect::<BTreeMap<_, _>>();
     snapshot
 }
 
@@ -523,7 +500,7 @@ fn assert_published_wasm_stream_consumer(root: &Path, package_root: &Path) {
     let published_glue = artifact_root.join("uniffi_ohos_public_core_uniffi_js_host.js");
     let published_wasm = artifact_root.join("uniffi_ohos_public_core_uniffi_js_host_bg.wasm");
     let declarations = artifact_root.join("uniffi_ohos_public_core_uniffi_js_host.d.ts");
-    let host_manifest = package_root.join("artifacts/rust/wasm/Cargo.toml");
+    let host_manifest = package_root.join("native/hosts/wasm/Cargo.toml");
     for (label, path) in [
         ("glue", published_glue.as_path()),
         ("wasm", published_wasm.as_path()),
@@ -539,7 +516,7 @@ fn assert_published_wasm_stream_consumer(root: &Path, package_root: &Path) {
     assert!(std::fs::read(&published_wasm)
         .unwrap()
         .starts_with(b"\0asm"));
-    assert!(!package_root.join("artifacts/rust/wasm/target").exists());
+    assert!(!package_root.join("native/hosts/wasm/target").exists());
 
     let mut metadata = Command::new("cargo");
     metadata
@@ -560,7 +537,7 @@ fn assert_published_wasm_stream_consumer(root: &Path, package_root: &Path) {
         r#"
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { uniffi_ohos_public_core } from "./package/src/ffi/browser/index.ts";
+import { uniffi_ohos_public_core } from "./package/src/ffi/browser/index.js";
 
 const glue = await import(pathToFileURL(process.env.UNIFFI_TEST_PUBLISHED_WASM_GLUE!).href);
 const bytes = await readFile(process.env.UNIFFI_TEST_PUBLISHED_WASM_BYTES!);
@@ -594,7 +571,7 @@ console.log("published managed wasm stream smoke ok");
     assert!(stdout.contains("published managed wasm stream smoke ok"));
 }
 fn assert_direct_web_wasm_consumer(root: &Path, public: &Path, label: &str) {
-    let entry = public.join("generated/browser/index.ts");
+    let entry = public.join("generated/browser/index.js");
     let host_manifest = public.join("host/wasm/Cargo.toml");
     let pkg = public.join("artifacts/browser/pkg");
     for path in [
@@ -675,7 +652,7 @@ console.log("direct wasm stream smoke ok");
 }
 
 fn assert_direct_mini_program_consumer(root: &Path, public: &Path) {
-    let entry = public.join("generated/browser/index.mini-program.ts");
+    let entry = public.join("generated/browser/index.mini-program.js");
     let artifact = public.join("artifacts/mini-program");
     let glue = artifact.join("uniffi_ohos_public_core_uniffi_js_host.js");
     let wasm = artifact.join("uniffi_ohos_public_core_uniffi_js_host_bg.wasm");
@@ -1433,11 +1410,6 @@ fn assert_namespaced_harmony_public_surface(
     let declarations = archive_utf8(files, "package/Index.d.ets", label);
     let component_source_path = format!("package/src/main/ets/components/{namespace}.ets");
     let component_declaration_path = format!("package/src/main/ets/components/{namespace}.d.ets");
-    assert!(
-        !files.contains_key(&format!("package/src/main/ets/components/{namespace}.d.ts")),
-        "{label} must not contain a legacy component .d.ts declaration"
-    );
-
     let component_declarations = archive_utf8(files, &component_declaration_path, label);
     let component_source = files
         .contains_key(&component_source_path)
@@ -1485,11 +1457,7 @@ fn assert_namespaced_harmony_public_surface(
         assert!(!index.contains("export *"));
     }
     for root in std::iter::once(&declarations).chain(index.iter()) {
-        for forbidden in [
-            "native-facade",
-            "countEventsStreamNext",
-            "UniffiInputStream",
-        ] {
+        for forbidden in ["countEventsStreamNext", "UniffiInputStream"] {
             assert!(
                 !root.contains(forbidden),
                 "{label} root leaked flat/raw binding {forbidden}:\n{root}"
@@ -2544,7 +2512,7 @@ fn public_direct_and_managed_node_hsp_publish_fixed_artifacts() {
     assert!(direct_tgz.is_file(), "direct HSP tgz was not published");
     assert_published_node_stream_consumer(
         &direct,
-        &direct_public.join("generated/node/index.ts"),
+        &direct_public.join("generated/node/index.js"),
         &direct_node,
         "direct",
     );
@@ -2569,7 +2537,7 @@ fn public_direct_and_managed_node_hsp_publish_fixed_artifacts() {
     assert!(managed_tgz.is_file(), "managed HSP tgz was not published");
     assert_published_node_stream_consumer(
         &managed,
-        &package.join("src/index.node.ts"),
+        &package.join("src/index.node.js"),
         &managed_node,
         "managed-fresh",
     );
@@ -2585,7 +2553,7 @@ fn public_direct_and_managed_node_hsp_publish_fixed_artifacts() {
     assert_managed_package_root(&package);
     assert_published_node_stream_consumer(
         &managed,
-        &package.join("src/index.node.ts"),
+        &package.join("src/index.node.js"),
         &managed_node,
         "managed-repeat",
     );
@@ -2850,8 +2818,8 @@ fn public_managed_facade_static_host_and_native_library_are_consumed() {
     assert_no_managed_staging(&package);
 
     let dist = package.join("artifacts/harmony/dist");
-    let facade = std::fs::read_to_string(dist.join("native-facade.ets")).unwrap();
-    let native_declarations = std::fs::read_to_string(dist.join("native-facade.d.ts")).unwrap();
+    let facade = std::fs::read_to_string(dist.join("Index.ets")).unwrap();
+    let native_declarations = std::fs::read_to_string(dist.join("Index.d.ets")).unwrap();
     let declarations = std::fs::read_to_string(dist.join("Index.d.ets")).unwrap();
     let package_index = std::fs::read_to_string(dist.join("Index.ets")).unwrap();
     assert!(!dist.join("harmony-facade-contract.json").exists());
@@ -2864,16 +2832,6 @@ fn public_managed_facade_static_host_and_native_library_are_consumed() {
     assert!(native_declarations
         .contains("function ffi_uniffi_ohos_public_core_count_events_stream_next("));
 
-    let component_facade = std::fs::read_to_string(
-        dist.join("component-facades")
-            .join(format!("{FIXTURE_COMPONENT}.ets")),
-    )
-    .unwrap();
-    let component_declarations = std::fs::read_to_string(
-        dist.join("component-facades")
-            .join(format!("{FIXTURE_COMPONENT}.d.ets")),
-    )
-    .unwrap();
     let root_import = format!(
         "import * as {FIXTURE_COMPONENT} from \"./src/main/ets/components/{FIXTURE_COMPONENT}\";"
     );
@@ -2888,13 +2846,9 @@ fn public_managed_facade_static_host_and_native_library_are_consumed() {
         assert!(!public_root.contains("countEventsStreamNext"));
         assert!(!public_root.contains("UniffiInputStream"));
     }
-    for source in [&component_facade, &component_declarations] {
-        assert!(source.contains("countEventsStream"));
-        assert!(source.contains("echoEventsStream"));
-        assert!(source.contains("UniffiInputStream"));
-        assert!(!source.contains("CountEventsEventsStream"));
-        assert!(!source.contains("countEventsEvents"));
-    }
+    assert!(facade.contains("countEventsStream"));
+    assert!(facade.contains("echoEventsStream"));
+    assert!(native_declarations.contains("countEventsStream"));
 
     let committed = snapshot(&package);
     let mut failure = managed_command(root, "unsupported-arch");
@@ -2918,31 +2872,10 @@ fn public_managed_facade_static_host_and_native_library_are_consumed() {
     assert_managed_package_root(&package);
     assert_no_managed_staging(&package);
 
-    // Consume the generated host through the public custom-host path. This
-    // proves that the facade bundle itself contains the functional inputs the
-    // OHOS builder needs, without a manifest or persistent identity cache.
-    let static_manifest = package.join("artifacts/rust/ohos/Cargo.toml");
-    let static_bundle = static_manifest
-        .parent()
-        .unwrap()
-        .join("uniffi-ohos-facade-bundle.json");
-    assert!(static_manifest.is_file() && static_bundle.is_file());
-    let bundle: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&static_bundle).unwrap()).unwrap();
-    assert_eq!(
-        bundle
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        ["contracts", "typeSidecars"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-    );
-    assert_eq!(bundle["contracts"].as_array().unwrap().len(), 1);
-    assert_eq!(bundle["typeSidecars"].as_array().unwrap().len(), 1);
+    // Consume the generated host through the public custom-host path. The
+    // complete host directory is the package unit; no sidecar bundle is read.
+    let static_manifest = package.join("native/hosts/ohos/Cargo.toml");
+    assert!(static_manifest.is_file());
 
     let static_host = static_manifest.parent().unwrap();
     let generated_build_rs = std::fs::read_to_string(static_host.join("build.rs")).unwrap();
@@ -3012,7 +2945,7 @@ fn public_managed_facade_static_host_and_native_library_are_consumed() {
     );
     assert_eq!(stream_api_snapshot(&static_dist), first_api);
 
-    let static_facade = std::fs::read_to_string(static_dist.join("native-facade.ets")).unwrap();
+    let static_facade = std::fs::read_to_string(static_dist.join("Index.ets")).unwrap();
     assert!(static_facade.contains("countEventsStream"));
     assert!(static_facade.contains("echoEventsStream"));
     assert!(!static_facade.contains("countEventsEvents"));
@@ -3064,15 +2997,6 @@ fn public_javascript_cli_runs_unfiltered_filtered_unfiltered_workspace_sequence(
     std::fs::write(
         workspace.join("Cargo.toml"),
         "[workspace]\nmembers = [\"package-a\", \"package-b\"]\nresolver = \"2\"\n",
-    )
-    .unwrap();
-    std::fs::write(
-        workspace.join("uniffi-ohos-facade-bundle.json"),
-        r#"{
-  "contracts": [],
-  "typeSidecars": []
-}
-"#,
     )
     .unwrap();
     write_custom_host_package(&workspace, "package-a");

@@ -113,10 +113,7 @@ fn write_cli_napi_fixture(root: &std::path::Path) -> Utf8PathBuf {
 
 #[test]
 fn cli_build_napi_orchestrates_synthetic_fixture() {
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("SKIP cli_build_napi_orchestrates_synthetic_fixture: cargo unavailable");
-        return;
-    };
+    let cargo = which_tool("cargo").expect("CLI N-API orchestration requires cargo on PATH");
 
     let root = workspace_root();
     build_uniffi_bindgen(&root, &cargo);
@@ -130,7 +127,7 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
 
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
     let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target")).unwrap();
     let manifest = write_cli_napi_fixture(tmp.path());
 
@@ -157,16 +154,16 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
     }
 
     for path in [
-        "shared/runtime.ts",
-        "node/index.ts",
-        "components/cli_napi/common/api.ts",
-        "components/cli_napi/node/index.ts",
-        "components/cli_napi/node/backend-napi.ts",
-        "electron/index.ts",
+        "shared/uniffi_runtime.js",
+        "shared/uniffi_runtime.d.ts",
+        "node/index.js",
+        "node/index.d.ts",
+        "components/cli_napi/index.js",
+        "components/cli_napi/index.d.ts",
+        "electron/index.js",
         "electron/preload.cjs",
-        "components/cli_napi/electron/index.ts",
-        "components/cli_napi/electron/preload.cjs",
-        "components/cli_napi/electron/renderer.ts",
+        "electron/index.d.ts",
+        "native/node.rs",
     ] {
         let file = out_dir.join(path);
         assert!(file.exists(), "missing generated N-API file: {file}");
@@ -179,30 +176,23 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
         host_dir.join("napi/Cargo.toml").exists(),
         "missing generated napi host crate"
     );
-    let backend_napi =
-        std::fs::read_to_string(out_dir.join("components/cli_napi/node/backend-napi.ts")).unwrap();
+    let backend_napi = std::fs::read_to_string(out_dir.join("node/index.js")).unwrap();
     assert!(
-        backend_napi.contains("UNIFFI_CLI_NAPI_NAPI_PATH")
-            && backend_napi.contains("UNIFFI_NAPI_PATH")
-            && backend_napi.contains("uniffi-bindgen javascript build-napi")
-            && backend_napi.contains("function __uniffiLoadNativeAddon"),
-        "backend-napi.ts should expose an actionable env-overridable addon loader:\n{backend_napi}"
+        backend_napi.contains("__uniffi_backend_factory")
+            && backend_napi.contains("createRequire")
+            && backend_napi.contains("new BackendSession"),
+        "node entry should expose the generated native backend:\n{backend_napi}"
     );
 
-    let Some(node) = which_tool("node") else {
-        eprintln!("SKIP cli_build_napi_orchestrates_synthetic_fixture: node unavailable");
-        return;
-    };
-    if !node_supports_strip_types(&node) {
-        eprintln!(
-            "SKIP cli_build_napi_orchestrates_synthetic_fixture: node --experimental-strip-types unavailable"
-        );
-        return;
-    }
+    let node = which_tool("node").expect("CLI N-API runtime acceptance requires Node.js");
+    assert!(
+        node_supports_strip_types(&node),
+        "CLI N-API runtime acceptance requires node --experimental-strip-types"
+    );
     let driver = tmp.path().join("generated-adapter-driver.ts");
     std::fs::write(
         &driver,
-        "import * as root from './generated/node/index.ts';\n\
+        "import * as root from './generated/node/index.js';\n\
          const value = root.cli_napi.add(2n, 3n);\n\
          if (value !== 5n) throw new Error(`expected 5n, got ${value}`);\n\
          console.log('ok');\n",
@@ -226,28 +216,7 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
         "generated N-API adapter driver did not print ok"
     );
 
-    let default_addon = single_node_addon(out_dir.join("node"));
-    let override_addon = tmp.path().join("override_cli_napi.node");
-    std::fs::copy(&default_addon, &override_addon).unwrap();
-    std::fs::remove_file(&default_addon).unwrap();
-    let override_run = Command::new(&node)
-        .arg("--experimental-strip-types")
-        .arg("--no-warnings")
-        .arg(&driver)
-        .env("UNIFFI_CLI_NAPI_NAPI_PATH", override_addon)
-        .output()
-        .expect("failed to run generated N-API adapter driver through env override");
-    if !override_run.status.success() {
-        panic!(
-            "generated N-API adapter driver failed through env override:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&override_run.stdout),
-            String::from_utf8_lossy(&override_run.stderr),
-        );
-    }
-    assert!(
-        String::from_utf8_lossy(&override_run.stdout).contains("ok"),
-        "generated N-API env override driver did not print ok"
-    );
+    assert!(single_node_addon(out_dir.join("node")).exists());
 }
 
 #[test]
@@ -267,8 +236,8 @@ fn cli_build_napi_orchestrates_two_components_without_feature_flags() {
     let fixture = CompositeFixture::write(tmp.path());
     fixture.build_cdylib();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
-    let artifact_dir = Utf8PathBuf::from_path_buf(tmp.path().join("artifacts")).unwrap();
+    let host_dir = out_dir.join("native/hosts");
+    let artifact_dir = out_dir.join("artifacts");
     let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target-napi")).unwrap();
     let output = Command::new(cli.as_std_path())
         .current_dir(root.as_std_path())
@@ -312,54 +281,23 @@ fn cli_build_napi_orchestrates_two_components_without_feature_flags() {
         host_dir.join("napi/Cargo.toml").exists(),
         "two components must produce one N-API host crate"
     );
-    let expected_addon_path = format!("../../../artifacts/node/{composite_addon}");
-    for component in CANONICAL_COMPONENTS {
-        for flavor in ["node", "electron"] {
-            assert!(
-                out_dir
-                    .join("components")
-                    .join(component.namespace)
-                    .join(flavor)
-                    .join(component.bridge_filename)
-                    .exists(),
-                "missing {flavor} bridge for {}",
-                component.namespace,
-            );
-        }
+    assert!(
+        host_lib.contains("../../../node.rs"),
+        "one composite N-API host must include the package node adapter:\n{host_lib}"
+    );
+    let expected_addon_path = format!("../artifacts/node/{composite_addon}");
+    let node_entry = std::fs::read_to_string(out_dir.join("node/index.js")).unwrap();
+    let electron_preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    for (surface, source) in [
+        ("Node entry", node_entry),
+        ("Electron preload", electron_preload),
+    ] {
         assert!(
-            host_lib.contains(&format!(
-                "components/{}/node/{}",
-                component.namespace, component.bridge_filename
-            )),
-            "one composite N-API host must include {}:\n{host_lib}",
-            component.namespace,
+            source.contains(&expected_addon_path),
+            "{surface} must use the one canonical composite addon path `{expected_addon_path}`:\n{source}"
         );
-        let node_backend = std::fs::read_to_string(
-            out_dir
-                .join("components")
-                .join(component.namespace)
-                .join("node/backend-napi.ts"),
-        )
-        .unwrap();
-        let electron_preload = std::fs::read_to_string(
-            out_dir
-                .join("components")
-                .join(component.namespace)
-                .join("electron/preload.cjs"),
-        )
-        .unwrap();
-        for (surface, source) in [
-            ("Node backend", node_backend),
-            ("Electron preload", electron_preload),
-        ] {
-            assert!(
-                source.contains(&expected_addon_path),
-                "{surface} for {} must use the one canonical composite addon path `{expected_addon_path}`:\n{source}",
-                component.namespace,
-            );
-        }
     }
-    for platform_entry in ["node/index.ts", "electron/index.ts"] {
+    for platform_entry in ["node/index.js", "electron/index.js"] {
         let source = std::fs::read_to_string(out_dir.join(platform_entry)).unwrap();
         for component in CANONICAL_COMPONENTS {
             assert!(

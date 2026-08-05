@@ -165,7 +165,11 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
                     .unwrap(),
                     ArgumentDefinition::new(
                         "input",
-                        ValueType::input_stream(ValueType::Named(record_key)),
+                        ValueType::input_stream(
+                            ValueType::Named(record_key),
+                            ValueType::Named(error_key.clone()),
+                            false,
+                        ),
                         Ownership::Borrowed,
                     )
                     .unwrap(),
@@ -268,7 +272,7 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
                 .unwrap()],
                 return_type: None,
                 async_kind: AsyncKind::Async,
-                throws: Some(error_key),
+                throws: Some(error_key.clone()),
             },
         )
         .unwrap(),
@@ -285,7 +289,11 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
             "__uniffi_unified_contract_corpus_events",
             OperationSignature {
                 arguments: vec![],
-                return_type: Some(ValueType::output_stream(ValueType::Named(enum_key))),
+                return_type: Some(ValueType::output_stream(
+                    ValueType::Named(enum_key),
+                    ValueType::Named(error_key),
+                    true,
+                )),
                 async_kind: AsyncKind::Sync,
                 throws: None,
             },
@@ -327,7 +335,7 @@ pub fn unified_contract_corpus(reverse_discovery_order: bool) -> BridgePlan {
         Capability::AsyncCallback,
         Capability::FallibleCallback,
         Capability::CallbackReentrancy,
-        Capability::CrossThreadAsyncCallback,
+        Capability::CrossThreadCallback,
         Capability::InputStream,
         Capability::OutputStream,
     ]);

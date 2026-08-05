@@ -13,6 +13,7 @@ fn empty_build_args() -> BuildArgs {
         library_path: None,
         source: None,
         host_crates_dir: None,
+        package_root: None,
         logical_host_crates_dir: None,
         artifact_dir: None,
         managed_layout: false,
@@ -147,12 +148,12 @@ fn managed_stage_marked_repeat_replaces_the_entire_generation() {
         "a new generation must never seed files from the public root"
     );
     std::fs::create_dir_all(stage.root().join("src")).unwrap();
-    std::fs::write(stage.root().join("src/index.web.ts"), "new\n").unwrap();
+    std::fs::write(stage.root().join("src/index.web.js"), "new\n").unwrap();
     stage.publish().unwrap();
 
     assert!(!public.join("old-only.txt").exists());
     assert_eq!(
-        std::fs::read_to_string(public.join("src/index.web.ts")).unwrap(),
+        std::fs::read_to_string(public.join("src/index.web.js")).unwrap(),
         "new\n"
     );
     assert_no_staging_residue(parent, "package");
@@ -243,7 +244,7 @@ fn managed_entrypoint_output_is_deterministic() {
         let layout = ManagedLayout {
             source_root: root.join("src/ffi"),
             artifact_root: root.join("artifacts"),
-            host_crates_root: root.join("artifacts/rust"),
+            host_crates_root: root.join("native/hosts"),
             package_dir: root.clone(),
         };
         layout.emit_web_entrypoint().unwrap();
@@ -251,10 +252,10 @@ fn managed_entrypoint_output_is_deterministic() {
         layout.emit_node_entrypoint().unwrap();
         layout.emit_electron_entrypoint().unwrap();
         [
-            "src/index.web.ts",
-            "src/index.mini-program.ts",
-            "src/index.node.ts",
-            "src/index.electron.ts",
+            "src/index.web.js",
+            "src/index.mini-program.js",
+            "src/index.node.js",
+            "src/index.electron.js",
         ]
         .map(|path| std::fs::read(root.join(path)).unwrap())
     };
@@ -264,7 +265,7 @@ fn managed_entrypoint_output_is_deterministic() {
     assert_eq!(first, second);
     assert!(String::from_utf8(first[0].clone())
         .unwrap()
-        .contains("export * from \"./ffi/browser/index.web.ts\";"));
+        .contains("export * from \"./ffi/browser/index.js\";"));
 }
 
 #[test]
@@ -289,8 +290,9 @@ fn managed_layout_derives_paths_without_creating_the_public_root() {
     );
     assert_eq!(
         args.host_crates_dir.as_deref(),
-        Some(package.join("artifacts/rust").as_path())
+        Some(package.join("native/hosts").as_path())
     );
+    assert_eq!(args.package_root.as_deref(), Some(package.as_path()));
     assert!(!package.exists());
 }
 
@@ -532,7 +534,7 @@ fn artifacts_cli_no_longer_exposes_checkout_tool_flags() {
 #[test]
 fn javascript_build_defaults_to_embedded_tooling() {
     let javascript_src = include_str!("../javascript.rs");
-    assert!(javascript_src.contains("run_wasm_bindgen_in_process"));
+    assert!(javascript_src.contains("run_wasm_post_link"));
     assert!(javascript_src.contains("super::ohos::build"));
 }
 

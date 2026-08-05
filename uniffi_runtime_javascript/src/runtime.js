@@ -33,7 +33,9 @@ export function errorDescriptor(raw) {
       errorName: typeof raw.errorName === "string" ? raw.errorName : "UniffiUnknownError",
       variant: typeof raw.variant === "string" ? raw.variant : (typeof raw.tag === "string" ? raw.tag : null),
       data: Object.prototype.hasOwnProperty.call(raw, "data") ? raw.data : raw,
-      message: typeof raw.message === "string" ? raw.message : String(raw),
+      message: typeof raw.message === "string"
+        ? raw.message
+        : (typeof raw.variant === "string" ? raw.variant : (typeof raw.tag === "string" ? raw.tag : String(raw))),
       descriptor: raw.descriptor ?? null,
       stack: typeof raw.stack === "string" ? raw.stack : undefined,
     };
@@ -276,9 +278,12 @@ export class CallbackRegistry {
   _methodSpec(entry, methodId) {
     if (!entry.methods || !Object.prototype.hasOwnProperty.call(entry.methods, methodId)) return null;
     const raw = entry.methods?.[methodId];
-    if (raw && typeof raw === "object") return raw;
-    if (typeof raw === "string") return { name: raw };
-    return null;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw;
+    throw new UniffiError({
+      errorName: "UniffiCallbackProtocol",
+      data: { methodId },
+      message: "callback method descriptor must be an object",
+    });
   }
 
   _invokeLocal(entry, methodSpec, args) {
@@ -379,10 +384,62 @@ export class Host {
   async invokeCallbackAsync(callbackType, callbackId, methodId, _invocationId, args) {
     return await this.invokeCallbackSync(callbackType, callbackId, methodId, args);
   }
+  // Native callback proxies use this engine-private result envelope so a
+  // rejected callback can cross the N-API promise boundary without losing its
+  // typed UniFFI error fields.  The public callback methods keep their
+  // ordinary throwing semantics.
+  invokeCallbackSyncResult(callbackType, callbackId, methodId, args) {
+    try {
+      return { ok: true, value: this.invokeCallbackSync(callbackType, callbackId, methodId, args) };
+    } catch (error) {
+      const methodSpec = this.callbackRegistry?._methodSpec(this.callbackRegistry._entry(callbackType, callbackId), methodId);
+      return methodSpec?.throws ? { ok: false, error: callbackResultError(error, methodSpec) } : { ok: false, errorMessage: String(error?.message ?? error) };
+    }
+  }
+  async invokeCallbackAsyncResult(callbackType, callbackId, methodId, invocationId, args) {
+    try {
+      const value = await this.invokeCallbackAsync(callbackType, callbackId, methodId, invocationId, args);
+      return { ok: true, value };
+    } catch (error) {
+      const methodSpec = this.callbackRegistry?._methodSpec(this.callbackRegistry._entry(callbackType, callbackId), methodId);
+      return methodSpec?.throws ? { ok: false, error: callbackResultError(error, methodSpec) } : { ok: false, errorMessage: String(error?.message ?? error) };
+    }
+  }
   pullInputStream(_handle) { return Promise.resolve({ kind: "done" }); }
   cancelInputStream(_handle) { return Promise.resolve(); }
   releaseInputStream(_handle) {}
   releaseObject(_handle) {}
+}
+
+function callbackResultError(raw, methodSpec = null) {
+  const details = errorDescriptor(raw);
+  const descriptor = details.descriptor;
+  const variant = details.variant;
+  const variantDescriptor = descriptor?.variants && variant ? descriptor.variants[variant] : null;
+  const fields = variantDescriptor?.fields && typeof variantDescriptor.fields === "object" ? variantDescriptor.fields : null;
+  // Unit-only declared errors are carried as the exact variant string, which
+  // is the native enum carrier.  Payload/mixed errors keep the tagged object
+  // shape expected by the generated native enum bridge.
+  if (methodSpec?.throws && descriptor?.kind === "enum" && variant && (!fields || Object.keys(fields).length === 0) && descriptor.unit === true) {
+    return variant;
+  }
+  if (raw && typeof raw === "object") {
+    const data = details.data && typeof details.data === "object" && !Array.isArray(details.data)
+      ? details.data
+      : null;
+    if (methodSpec?.throws && descriptor?.kind === "enum" && variant) {
+      return { tag: variant, ...(data || {}), variant, data };
+    }
+    return {
+      tag: variant || "UniffiCallbackError",
+      ...(data || {}),
+      message: details.message,
+      errorName: details.errorName || variant || "UniffiCallbackError",
+      variant: variant || null,
+      data,
+    };
+  }
+  return { tag: "UniffiCallbackError", errorName: "UniffiCallbackError", variant: "UniffiCallbackError", data: null, message: details.message };
 }
 
 // The engine receives the exact host object supplied to BackendSession.  Keep
@@ -430,6 +487,40 @@ function installHostRegistries(host) {
       return result;
     }
     return Promise.reject(new UniffiError({ errorName: "UniffiCallbackMissing", message: `unknown callback ${typeId}:${callbackId}` }));
+  };
+  host.invokeCallbackSyncResult = function invokeCallbackSyncResult(typeId, callbackId, methodId, args = []) {
+    try {
+      return { ok: true, value: host.invokeCallbackSync(typeId, callbackId, methodId, args) };
+    } catch (error) {
+      const methodSpec = registries.callbackRegistry
+        ? registries.callbackRegistry._methodSpec(registries.callbackRegistry._entry(typeId, callbackId), methodId)
+        : null;
+      return methodSpec?.throws
+        ? { ok: false, error: callbackResultError(error, methodSpec) }
+        : { ok: false, errorMessage: String(error?.message ?? error) };
+    }
+  };
+  host.invokeCallbackAsyncResult = function invokeCallbackAsyncResult(typeId, callbackId, methodId, invocationId, args = []) {
+    try {
+      return Promise.resolve(host.invokeCallbackAsync(typeId, callbackId, methodId, invocationId, args)).then(
+        (value) => ({ ok: true, value }),
+        (error) => {
+          const methodSpec = registries.callbackRegistry
+            ? registries.callbackRegistry._methodSpec(registries.callbackRegistry._entry(typeId, callbackId), methodId)
+            : null;
+          return methodSpec?.throws
+            ? { ok: false, error: callbackResultError(error, methodSpec) }
+            : { ok: false, errorMessage: String(error?.message ?? error) };
+        },
+      );
+    } catch (error) {
+      const methodSpec = registries.callbackRegistry
+        ? registries.callbackRegistry._methodSpec(registries.callbackRegistry._entry(typeId, callbackId), methodId)
+        : null;
+      return Promise.resolve(methodSpec?.throws
+        ? { ok: false, error: callbackResultError(error, methodSpec) }
+        : { ok: false, errorMessage: String(error?.message ?? error) });
+    }
   };
   host.registerInputStream = function registerInputStream(source, options = {}) {
     if (registries.detached || registries.session?.phase !== "open") throw closedError();
@@ -518,6 +609,11 @@ class InputStreamHost extends Host {
       next: () => this.pullInputStream(handle),
       cancel: () => this.cancelInputStream(handle),
       release: () => this.releaseInputStream(handle),
+      [Symbol.asyncIterator]() { return this; },
+      async return() {
+        await this.cancel();
+        return { done: true, value: undefined };
+      },
     };
   }
 
@@ -894,9 +990,9 @@ export class BackendSession {
     const terminal = () => ({ done: true, value: undefined });
     const validateStep = (step) => {
       if (!isObject(step) || typeof step.kind !== "string") throw new UniffiError({ errorName: "UniffiStreamProtocolError", message: "output stream step must be tagged" });
-      if (step.kind === "item" && own(step, "value") && !own(step, "error")) return { kind: "item", value: step.value };
+      if (step.kind === "item" && Object.keys(step).length === 2 && own(step, "value") && !own(step, "error")) return { kind: "item", value: step.value };
       if (step.kind === "done" && Object.keys(step).length === 1) return { kind: "done" };
-      if (step.kind === "error" && own(step, "error") && !own(step, "value")) return { kind: "error", error: step.error };
+      if (step.kind === "error" && Object.keys(step).length === 2 && own(step, "error") && !own(step, "value")) return { kind: "error", error: step.error };
       throw new UniffiError({ errorName: "UniffiStreamProtocolError", message: `invalid output stream ${step.kind} step` });
     };
     const ensureStarted = () => {
@@ -994,6 +1090,8 @@ export class BackendSession {
     const stream = {
       next: () => pull(stream),
       async cancel() { if (phase === "idle") { phase = "cancelled"; session.outputStreams.delete(stream); finishFrame(); return; } if (phase === "starting" || phase === "active") await doCancel(handle, { propagate: true }); },
+      [Symbol.asyncIterator]() { return this; },
+      async return() { await this.cancel(); return terminal(); },
       detach() {
         detached = true;
         phase = "cancelled";
@@ -1264,7 +1362,18 @@ function normalizeOperationError(raw, descriptor, session) {
       }
       payload[name] = liftValue(data[name], field?.type || field, session, descriptor.context, descriptor);
     }
+    // Keep the canonical discriminant alongside the decoded payload fields;
+    // consumers use the same tagged shape for errors and ordinary enums.
+    payload.tag = details.variant;
     data = payload;
+  } else if (
+    data === null
+    || (isObject(data) && own(data, "tag") && Object.keys(data).length === 1)
+  ) {
+    // Unit errors carry their discriminant as the complete payload on the
+    // wire.  Preserve the established public `data === variant` shape while
+    // still requiring the structured tag for protocol validation.
+    data = details.variant;
   }
   const ErrorClass = descriptor.context.errorClasses?.[declared.typeId];
   if (typeof ErrorClass !== "function") {
@@ -1427,9 +1536,9 @@ function streamSlot(resource, kind) {
 
 function streamStep(step) {
   if (!isObject(step) || typeof step.kind !== "string") throw new UniffiError({ errorName: "UniffiStreamProtocolError", message: "stream step must be tagged" });
-  if (step.kind === "item" && own(step, "value") && !own(step, "error")) return { kind: "item", value: step.value };
+  if (step.kind === "item" && Object.keys(step).length === 2 && own(step, "value") && !own(step, "error")) return { kind: "item", value: step.value };
   if (step.kind === "done" && Object.keys(step).length === 1) return { kind: "done" };
-  if (step.kind === "error" && own(step, "error") && !own(step, "value")) return { kind: "error", error: step.error };
+  if (step.kind === "error" && Object.keys(step).length === 2 && own(step, "error") && !own(step, "value")) return { kind: "error", error: step.error };
   throw new UniffiError({ errorName: "UniffiStreamProtocolError", message: `invalid stream ${step.kind} step` });
 }
 
@@ -1439,10 +1548,67 @@ function streamErrorLifter(resource, context, session, operation) {
     const named = resolveNamedDescriptor(errorDescriptor, context);
     if (named?.kind === "enum" && named.error) {
       const declared = { throws: { name: errorDescriptor.name, typeId: errorDescriptor.typeId }, context };
-      return (raw) => normalizeOperationError(raw, declared, session);
+      return (raw) => {
+        // N-API string-enum carriers encode unit errors as the variant string;
+        // normalizeOperationError consumes the canonical tagged descriptor.
+        // Re-wrap only this unit-error shape so stream failures retain their
+        // generated declared Error class while payload errors stay strict.
+        const canonical = named.unit && typeof raw === "string" ? { tag: raw } : raw;
+        return normalizeOperationError(canonical, declared, session);
+      };
     }
   }
   return (raw) => asUniffiError(raw);
+}
+
+// Input stream sources are supplied by JavaScript, so their rejected
+// promises contain an Error object rather than the carrier expected by the
+// generated native stream adapter.  Lower the rejection through the same
+// declared error descriptor used by ordinary operation arguments.  In
+// particular, unit error enums use the exact variant string on the wire;
+// payload variants use a validated tagged object and never forward arbitrary
+// Error properties into the ABI.
+function lowerInputStreamError(raw, descriptor, context, session, operation, path) {
+  const streamPath = path || pathForStream(operation, descriptor, "Input");
+  const resource = streamResourceAt(operation, streamPath, "Input");
+  const errorType = resource?.error;
+  if (!errorType) throw streamPlanError(`input stream at ${String(streamPath)} is missing its error descriptor`);
+  const named = errorType.kind === "named" ? resolveNamedDescriptor(errorType, context) : errorType;
+  if (!named || named.kind !== "enum" || !named.error) {
+    return lowerValue(raw, errorType, context, session, operation, streamPath);
+  }
+
+  const details = errorDescriptor(raw);
+  const variant = details.variant || (typeof raw === "string" ? raw : null);
+  if (typeof variant !== "string" || !named.variants?.[variant]) {
+    throw new UniffiError({
+      errorName: "UniffiInputStreamError",
+      message: `unknown ${errorType.name || "input stream"} error variant ${String(variant)}`,
+    });
+  }
+  const fields = named.variants[variant]?.fields || {};
+  if (Object.keys(fields).length === 0) return variant;
+
+  const source = details.data && typeof details.data === "object" && !Array.isArray(details.data)
+    ? details.data
+    : (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null);
+  if (!source) {
+    throw new UniffiError({
+      errorName: "UniffiInputStreamError",
+      message: `input stream error variant ${variant} requires a payload object`,
+    });
+  }
+  const carrier = { tag: variant };
+  for (const [name, field] of Object.entries(fields)) {
+    if (!own(source, name)) {
+      throw new UniffiError({
+        errorName: "UniffiInputStreamError",
+        message: `input stream error variant ${variant} is missing payload field ${name}`,
+      });
+    }
+    carrier[name] = source[name];
+  }
+  return lowerValue(carrier, errorType, context, session, operation, streamPath);
 }
 
 function createBackendInputStream(session, handle, resource, context, operation) {
@@ -1490,7 +1656,10 @@ export function lowerValue(value, descriptor, context = null, session = null, op
   if (value === undefined) throw new UniffiError({ errorName: "UniffiUndefined", message: "undefined is not a UniFFI value; use null for an optional value" });
   switch (descriptor.kind) {
     case "scalar": return lowerPrimitive(value, descriptor.name);
-    case "timestamp": if (!(value instanceof Date) || Number.isNaN(value.getTime())) throw new UniffiError({ errorName: "UniffiTimestampType", message: "timestamp requires a valid Date" }); return value;
+    case "timestamp":
+      if (!(value instanceof Date)) throw new UniffiError({ errorName: "UniffiTimestampType", message: "timestamp requires a valid Date" });
+      if (Number.isNaN(value.getTime())) throw new UniffiError({ errorName: "UniffiTimestampType", message: "timestamp is an invalid Date (timestamp exceeds JS Date range)" });
+      return value;
     case "duration": if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new UniffiError({ errorName: "UniffiDurationType", message: "duration requires a finite non-negative number" }); return value;
     case "sequence": if (!Array.isArray(value)) throw new UniffiError({ errorName: "UniffiSequenceType", message: "sequence requires an Array" }); return value.map((item) => lowerValue(item, descriptor.inner, context, session, operation, appendValuePath(path, "item")));
     case "map": if (!(value instanceof Map)) throw new UniffiError({ errorName: "UniffiMapType", message: "map requires a Map" }); return new Map([...value].map(([key, item]) => [lowerValue(key, descriptor.key, context, session, operation, appendValuePath(path, "key")), lowerValue(item, descriptor.value, context, session, operation, appendValuePath(path, "value"))]));
@@ -1499,6 +1668,7 @@ export function lowerValue(value, descriptor, context = null, session = null, op
       if (!session || !session.createInputStream) return value;
       const marker = session.createInputStream(value, {
         lowerItem: (item) => lowerValue(item, descriptor.inner, context, session, operation, appendValuePath(path, "item")),
+        lowerError: (error) => lowerInputStreamError(error, descriptor, context, session, operation, path),
       });
       return marker && own(marker, "handle") ? marker.handle : marker;
     }
@@ -1750,6 +1920,11 @@ export function createFacade(session, descriptors = {}) {
   if (!session || typeof session.invokeSync !== "function" || typeof session.invokeAsync !== "function") throw new UniffiError({ errorName: "UniffiSessionType", message: "createFacade requires a BackendSession" });
   if (descriptors.closePolicy !== undefined) installClosePolicy(session, descriptors.closePolicy);
   const namespace = {};
+  // Keep the shared base error constructor available on every component
+  // namespace.  Generated component modules export it as well, and exposing
+  // the same constructor here preserves `component.UniffiError` identity for
+  // callers that consume only the ready namespace facade.
+  namespace.UniffiError = UniffiError;
   for (const descriptor of Object.values(descriptors.operations || {})) {
     descriptor.context = descriptors;
     if (descriptor.surface === "namespace" && !descriptor.receiver && descriptor.componentId === descriptors.componentId) namespace[descriptor.name] = makeOperation(session, descriptor);
@@ -1789,6 +1964,18 @@ export function createFacade(session, descriptors = {}) {
     for (const descriptor of objectConstructors.get(Number(typeId)) || []) BoundClass[descriptor.name] = makeOperation(session, descriptor);
     Object.freeze(BoundClass);
     if (classEntry?.public !== false) namespace[typeName] = BoundClass;
+  }
+  // Generated error constructors are part of the component's public value
+  // surface just like object classes.  Keep the constructor identity that
+  // the operation error envelope uses so consumers can rely on
+  // `error instanceof namespace.SomeError` without importing a private
+  // implementation module.
+  for (const typeName of descriptors.publicTypes || []) {
+    const typeId = descriptors.typeNames?.[typeName];
+    const descriptor = typeDescriptorForName(descriptors, typeName);
+    if (!descriptor?.error || typeId === undefined) continue;
+    const ErrorClass = descriptors.errorClasses?.[typeId];
+    if (typeof ErrorClass === "function") namespace[typeName] = ErrorClass;
   }
   const valueTypeNames = new Set(Object.keys(descriptors.values || {}));
   for (const typeName of descriptors.publicTypes || []) {

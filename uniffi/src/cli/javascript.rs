@@ -11,8 +11,9 @@ use uniffi_bindgen::{
     cargo_metadata::CrateConfigSupplier, BindgenLoader, BindgenPaths, CargoMetadataOptions,
     GlobalConfig,
 };
-use uniffi_bindgen_javascript::{generate, FlavorTarget, GenerateJsOptions, HostCrateOptions};
-use wasm_bindgen_cli_support::Bindgen;
+use uniffi_bindgen_javascript::{
+    FlavorTarget, GenerateJsOptions, HostCrateOptions, WasmPostLinkTarget,
+};
 
 #[derive(Args)]
 pub(crate) struct JavascriptArgs {
@@ -67,8 +68,8 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     source: Option<Utf8PathBuf>,
 
-    /// Directory (default `rust_modules`) in which to emit the generated host crates.
-    #[clap(long = "host-crates-dir", default_value = "rust_modules")]
+    /// Directory (default `<out-dir>/native/hosts`) in which to emit generated host crates.
+    #[clap(long = "host-crates-dir", default_value = "native/hosts")]
     host_crates_dir: Utf8PathBuf,
 
     /// Directory for built non-source artifacts. With it, wasm-bindgen output
@@ -134,6 +135,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir.clone(),
+            package_root: self.out_dir.clone(),
             logical_host_crates_dir: None,
             artifact_dir: self.artifact_dir.clone(),
             wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
@@ -157,6 +159,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir.clone(),
+            package_root: self.out_dir.clone(),
             logical_host_crates_dir: None,
             artifact_dir: self.artifact_dir.clone(),
             flavor: self.napi_flavor.clone(),
@@ -194,9 +197,14 @@ pub(crate) struct BuildWasmArgs {
     #[clap(long)]
     pub(crate) source: Option<Utf8PathBuf>,
 
-    /// Directory (default `rust_modules`) in which to emit the generated wasm host crate.
-    #[clap(long = "host-crates-dir", default_value = "rust_modules")]
+    /// Directory (default `<out-dir>/native/hosts`) in which to emit the generated wasm host crate.
+    #[clap(long = "host-crates-dir", default_value = "native/hosts")]
     pub(crate) host_crates_dir: Utf8PathBuf,
+
+    /// Root of the complete generated package. The host directory and source
+    /// output must both remain below this root.
+    #[clap(skip)]
+    pub(crate) package_root: Utf8PathBuf,
 
     #[clap(skip)]
     pub(crate) logical_host_crates_dir: Option<Utf8PathBuf>,
@@ -275,9 +283,13 @@ pub(crate) struct BuildNapiArgs {
     #[clap(long)]
     pub(crate) source: Option<Utf8PathBuf>,
 
-    /// Directory (default `rust_modules`) in which to emit the generated napi host crate.
-    #[clap(long = "host-crates-dir", default_value = "rust_modules")]
+    /// Directory (default `<out-dir>/native/hosts`) in which to emit the generated napi host crate.
+    #[clap(long = "host-crates-dir", default_value = "native/hosts")]
     pub(crate) host_crates_dir: Utf8PathBuf,
+
+    /// Root of the complete generated package.
+    #[clap(skip)]
+    pub(crate) package_root: Utf8PathBuf,
 
     #[clap(skip)]
     pub(crate) logical_host_crates_dir: Option<Utf8PathBuf>,
@@ -343,9 +355,13 @@ pub(crate) struct BuildOhosArgs {
     #[clap(long)]
     pub(crate) source: Option<Utf8PathBuf>,
 
-    /// Directory (default `rust_modules`) in which to emit the generated OHOS host crate.
-    #[clap(long = "host-crates-dir", default_value = "rust_modules")]
+    /// Directory (default `<out-dir>/native/hosts`) in which to emit the generated OHOS host crate.
+    #[clap(long = "host-crates-dir", default_value = "native/hosts")]
     pub(crate) host_crates_dir: Utf8PathBuf,
+
+    /// Root of the complete generated package.
+    #[clap(skip)]
+    pub(crate) package_root: Utf8PathBuf,
 
     #[clap(skip)]
     pub(crate) logical_host_crates_dir: Option<Utf8PathBuf>,
@@ -354,10 +370,6 @@ pub(crate) struct BuildOhosArgs {
     /// workspace) instead of the default generated composite host manifest.
     #[clap(long = "ohos-host-manifest-path")]
     pub(crate) ohos_host_manifest_path: Option<Utf8PathBuf>,
-
-    /// Build an explicitly raw-only custom host without a generated facade contract.
-    #[clap(long = "raw-only-facade", requires = "ohos_host_manifest_path")]
-    pub(crate) raw_only_facade: bool,
 
     /// Directory for built non-source artifacts. Defaults to `<host-crate>/dist` for OHOS output when omitted.
     #[clap(long = "artifact-dir")]
@@ -549,12 +561,6 @@ pub(crate) enum WasmBindgenTargetArg {
     Deno,
 }
 
-impl WasmBindgenTargetArg {
-    fn emits_web_auto_entrypoint(self) -> bool {
-        matches!(self, Self::Web)
-    }
-}
-
 pub(crate) fn run(args: JavascriptArgs) -> Result<()> {
     match args.command {
         JavascriptCommands::Build(args) => build(args),
@@ -568,14 +574,15 @@ pub(crate) fn generate_js(
     manifest_path: &Utf8Path,
     source: Utf8PathBuf,
     out_dir: Utf8PathBuf,
+    package_root: Utf8PathBuf,
     config: Option<Utf8PathBuf>,
     crate_name: Option<String>,
     metadata_no_deps: bool,
     no_format: bool,
-    host_crates: Option<HostCrateOptions>,
+    host_crates: HostCrateOptions,
     flavors: Vec<FlavorTarget>,
     artifact_dir: Option<Utf8PathBuf>,
-) -> Result<()> {
+) -> Result<uniffi_bindgen_javascript::package::GeneratedPackage> {
     let mut paths = BindgenPaths::default();
     let global_config = if let Some(cfg) = &config {
         let (global_config, crate_roots_layer) = GlobalConfig::from_file(cfg)?;
@@ -602,11 +609,12 @@ pub(crate) fn generate_js(
         },
     ));
     let loader = BindgenLoader::new(paths, global_config);
-    generate(
+    let package = uniffi_bindgen_javascript::generate_package(
         &loader,
         GenerateJsOptions {
             source,
             out_dir,
+            package_root,
             artifact_dir,
             config_override: config,
             crate_filter: crate_name,
@@ -619,16 +627,104 @@ pub(crate) fn generate_js(
         // keep compatibility with existing GenerateJsOptions shape; formatting
         // is not yet a configurable concern for the JS target.
     }
-    Ok(())
+    Ok(package)
 }
 
 fn build(args: BuildArgs) -> Result<()> {
-    build_wasm(args.wasm_args()).context("building JavaScript wasm target")?;
-    build_napi(args.napi_args()).context("building JavaScript N-API target")?;
+    // Prepare one complete package before either target builder runs.  The
+    // builders below only consume this frozen value; they never invoke the
+    // JavaScript generator a second time or infer names from generated host
+    // manifests.
+    let manifest_path = canonicalize_or_keep(&args.manifest_path);
+    let core_meta = cargo_package_metadata(&manifest_path)?;
+    let mut build_core =
+        cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
+    add_cargo_feature_args(&mut build_core, &args.cargo_features);
+    run_command(
+        &args.cargo_bin,
+        &mut build_core,
+        "cargo",
+        "install Rust's cargo toolchain or pass --cargo-bin <path>",
+    )?;
+    let generation_source = if let Some(source) = &args.source {
+        canonicalize_or_keep(source)
+    } else {
+        let library_path = args
+            .library_path
+            .clone()
+            .map(|path| canonicalize_or_keep(&path))
+            .unwrap_or_else(|| core_meta.host_cdylib_path(args.release));
+        if !library_path.exists() {
+            bail!(
+                "built library not found at {}. Ensure the downstream crate declares a cdylib target, pass --library-path <path>, or pass --source <udl-or-library>",
+                library_path
+            );
+        }
+        library_path
+    };
+    let host_crates_dir = if args.host_crates_dir == Utf8Path::new("native/hosts") {
+        args.out_dir.join("native/hosts")
+    } else {
+        args.host_crates_dir.clone()
+    };
+    let mut flavors = vec![FlavorTarget::Wasm];
+    if args.napi_flavor.is_empty() {
+        flavors.extend([FlavorTarget::Napi, FlavorTarget::Electron]);
+    } else {
+        flavors.extend(args.napi_flavor.iter().copied().map(FlavorTarget::from));
+    }
+    let package = generate_js(
+        &manifest_path,
+        generation_source,
+        args.out_dir.clone(),
+        args.out_dir.clone(),
+        args.config.clone(),
+        args.crate_name.clone(),
+        args.metadata_no_deps,
+        args.no_format,
+        HostCrateOptions {
+            manifest_path: manifest_path.clone(),
+            host_crates_dir,
+            logical_host_crates_dir: None,
+        },
+        flavors,
+        args.artifact_dir.clone(),
+    )?;
+    build_wasm_with_generation(args.wasm_args(), false, Some(&package))
+        .context("building JavaScript wasm target")?;
+    build_napi_with_generation(args.napi_args(), false, Some(&package))
+        .context("building JavaScript N-API target")?;
     Ok(())
 }
 
-pub(crate) fn build_wasm(mut args: BuildWasmArgs) -> Result<()> {
+pub(crate) fn build_wasm(args: BuildWasmArgs) -> Result<()> {
+    build_wasm_with_generation(args, true, None)
+}
+
+/// Build a wasm host whose package sources have already been prepared by the
+/// managed artifact coordinator.  This path performs no second JavaScript
+/// generation pass.
+pub(crate) fn build_wasm_prepared(
+    args: BuildWasmArgs,
+    package: &uniffi_bindgen_javascript::package::GeneratedPackage,
+) -> Result<()> {
+    build_wasm_with_generation(args, false, Some(package))
+}
+
+fn build_wasm_with_generation(
+    mut args: BuildWasmArgs,
+    prepare_generation: bool,
+    prepared_package: Option<&uniffi_bindgen_javascript::package::GeneratedPackage>,
+) -> Result<()> {
+    normalize_default_package_root(&mut args.package_root, &args.out_dir);
+    normalize_default_host_crates_dir(&mut args.host_crates_dir, &args.package_root);
+    validate_package_paths(
+        &args.package_root,
+        &args.out_dir,
+        &args.host_crates_dir,
+        args.artifact_dir.as_deref(),
+        args.wasm_bindgen_out_dir.as_deref(),
+    )?;
     let workspace = (args.core_target_dir.is_none() || args.target_dir.is_none())
         .then(|| {
             super::artifact_staging::TemporaryWorkspace::create("uniffi-javascript-wasm-invocation")
@@ -655,7 +751,7 @@ pub(crate) fn build_wasm(mut args: BuildWasmArgs) -> Result<()> {
         );
     }
     preflight_wasm_build_paths(&args)?;
-    let result = build_wasm_inner(args);
+    let result = build_wasm_inner(args, prepare_generation, prepared_package);
     drop(workspace);
     result
 }
@@ -914,7 +1010,11 @@ fn preflight_wasm_build_paths(args: &BuildWasmArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_wasm_inner(args: BuildWasmArgs) -> Result<()> {
+fn build_wasm_inner(
+    args: BuildWasmArgs,
+    prepare_generation: bool,
+    prepared_package: Option<&uniffi_bindgen_javascript::package::GeneratedPackage>,
+) -> Result<()> {
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let core_meta = cargo_package_metadata(&manifest_path)?;
 
@@ -986,33 +1086,38 @@ fn build_wasm_inner(args: BuildWasmArgs) -> Result<()> {
         library_path
     };
 
-    generate_js(
-        &manifest_path,
-        generation_source,
-        args.out_dir.clone(),
-        args.config.clone(),
-        args.crate_name.clone(),
-        args.metadata_no_deps,
-        args.no_format,
-        Some(HostCrateOptions {
-            manifest_path: manifest_path.clone(),
-            host_crates_dir: args.host_crates_dir.clone(),
-            logical_host_crates_dir: args.logical_host_crates_dir.clone(),
-            logical_out_dir: None,
-            ohos_rs_dir: None,
-        }),
-        vec![FlavorTarget::Wasm],
-        args.artifact_dir.clone(),
-    )?;
-
-    let host_root = if args.host_crates_dir.is_absolute() {
-        args.host_crates_dir.clone()
+    // A standalone invocation creates its package plan here.  The managed
+    // coordinator passes the exact plan it already prepared, so no second
+    // generation pass (and no rediscovery from generated files) is possible.
+    let owned_package = if prepared_package.is_none() && prepare_generation {
+        Some(generate_js(
+            &manifest_path,
+            generation_source,
+            args.out_dir.clone(),
+            args.package_root.clone(),
+            args.config.clone(),
+            args.crate_name.clone(),
+            args.metadata_no_deps,
+            args.no_format,
+            HostCrateOptions {
+                manifest_path: manifest_path.clone(),
+                host_crates_dir: args.host_crates_dir.clone(),
+                logical_host_crates_dir: args.logical_host_crates_dir.clone(),
+            },
+            vec![FlavorTarget::Wasm],
+            args.artifact_dir.clone(),
+        )?)
     } else {
-        Utf8PathBuf::from_path_buf(std::env::current_dir()?)
-            .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?
-            .join(&args.host_crates_dir)
+        None
     };
-    let wasm_manifest = host_root.join("wasm/Cargo.toml");
+    let package = prepared_package
+        .or(owned_package.as_ref())
+        .context("wasm build is missing the frozen generated package plan")?;
+
+    let wasm_spec = package
+        .wasm_host_spec()
+        .context("Wasm build package has no browser host build spec")?;
+    let wasm_manifest = host_manifest_path(&args.package_root, wasm_spec)?;
     if !wasm_manifest.exists() {
         bail!(
             "wasm host crate was not emitted at {}",
@@ -1022,12 +1127,7 @@ fn build_wasm_inner(args: BuildWasmArgs) -> Result<()> {
         );
     }
 
-    let wasm_cargo_args = host_dependency_cargo_feature_args(
-        &manifest_path,
-        &wasm_manifest,
-        &[],
-        &args.cargo_features,
-    )?;
+    let wasm_cargo_args = host_feature_args(wasm_spec, &args.cargo_features);
     let wasm_cargo_args = wasm_cargo_args
         .iter()
         .map(String::as_str)
@@ -1053,12 +1153,12 @@ fn build_wasm_inner(args: BuildWasmArgs) -> Result<()> {
         "cargo",
         "install Rust's wasm32-unknown-unknown target with `rustup target add wasm32-unknown-unknown`",
     )?;
-    let wasm_meta = cargo_package_metadata(&wasm_manifest)?;
-    let wasm_artifact = if let Some(target_dir) = &target_dir {
-        wasm_meta.wasm_artifact_path_in(target_dir, args.release)
-    } else {
-        wasm_meta.wasm_artifact_path(args.release)
-    };
+    let wasm_artifact = wasm_artifact_path_from_spec(
+        &args.package_root,
+        wasm_spec,
+        target_dir.as_deref(),
+        args.release,
+    );
     if !wasm_artifact.exists() {
         bail!(
             "built wasm artifact not found at {} after cargo build",
@@ -1078,23 +1178,53 @@ fn build_wasm_inner(args: BuildWasmArgs) -> Result<()> {
     std::fs::create_dir_all(&wasm_bindgen_out_dir)
         .with_context(|| format!("creating wasm-bindgen output dir {wasm_bindgen_out_dir}"))?;
 
-    run_wasm_bindgen_in_process(
+    package.emit_wasm_post_link(
         &wasm_artifact,
+        &wasm_spec.lib_target,
+        match args.wasm_bindgen_target {
+            WasmBindgenTargetArg::Web => WasmPostLinkTarget::Web,
+            WasmBindgenTargetArg::Nodejs => WasmPostLinkTarget::Node,
+            WasmBindgenTargetArg::Bundler => WasmPostLinkTarget::Bundler,
+            WasmBindgenTargetArg::NoModules | WasmBindgenTargetArg::Deno => {
+                bail!(
+                    "wasm post-link target {:?} is not supported by the UniFFI engine",
+                    args.wasm_bindgen_target
+                )
+            }
+        },
         &wasm_bindgen_out_dir,
-        args.wasm_bindgen_target,
-    )?;
-
-    emit_browser_auto_entrypoint(
-        &args.out_dir,
-        &wasm_bindgen_out_dir,
-        &wasm_meta.lib_target_name,
-        args.wasm_bindgen_target,
     )?;
 
     Ok(())
 }
 
 pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
+    build_napi_with_generation(args, true, None)
+}
+
+/// Build a N-API host whose package files were prepared by the artifact
+/// coordinator; no second JavaScript generation is performed.
+pub(crate) fn build_napi_prepared(
+    args: BuildNapiArgs,
+    package: &uniffi_bindgen_javascript::package::GeneratedPackage,
+) -> Result<()> {
+    build_napi_with_generation(args, false, Some(package))
+}
+
+fn build_napi_with_generation(
+    mut args: BuildNapiArgs,
+    prepare_generation: bool,
+    prepared_package: Option<&uniffi_bindgen_javascript::package::GeneratedPackage>,
+) -> Result<()> {
+    normalize_default_package_root(&mut args.package_root, &args.out_dir);
+    normalize_default_host_crates_dir(&mut args.host_crates_dir, &args.package_root);
+    validate_package_paths(
+        &args.package_root,
+        &args.out_dir,
+        &args.host_crates_dir,
+        args.artifact_dir.as_deref(),
+        None,
+    )?;
     let manifest_path = canonicalize_or_keep(&args.manifest_path);
     let core_meta = cargo_package_metadata(&manifest_path)?;
 
@@ -1135,33 +1265,34 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
             .collect()
     };
 
-    generate_js(
-        &manifest_path,
-        generation_source,
-        args.out_dir.clone(),
-        args.config.clone(),
-        args.crate_name.clone(),
-        args.metadata_no_deps,
-        args.no_format,
-        Some(HostCrateOptions {
-            manifest_path: manifest_path.clone(),
-            host_crates_dir: args.host_crates_dir.clone(),
-            logical_host_crates_dir: args.logical_host_crates_dir.clone(),
-            logical_out_dir: None,
-            ohos_rs_dir: None,
-        }),
-        flavors.clone(),
-        args.artifact_dir.clone(),
-    )?;
-
-    let host_root = if args.host_crates_dir.is_absolute() {
-        args.host_crates_dir.clone()
+    let owned_package = if prepared_package.is_none() && prepare_generation {
+        Some(generate_js(
+            &manifest_path,
+            generation_source,
+            args.out_dir.clone(),
+            args.package_root.clone(),
+            args.config.clone(),
+            args.crate_name.clone(),
+            args.metadata_no_deps,
+            args.no_format,
+            HostCrateOptions {
+                manifest_path: manifest_path.clone(),
+                host_crates_dir: args.host_crates_dir.clone(),
+                logical_host_crates_dir: args.logical_host_crates_dir.clone(),
+            },
+            flavors.clone(),
+            args.artifact_dir.clone(),
+        )?)
     } else {
-        Utf8PathBuf::from_path_buf(std::env::current_dir()?)
-            .map_err(|p| anyhow::anyhow!("cwd is not utf8: {}", p.display()))?
-            .join(&args.host_crates_dir)
+        None
     };
-    let napi_manifest = host_root.join("napi/Cargo.toml");
+    let package = prepared_package
+        .or(owned_package.as_ref())
+        .context("N-API build is missing the frozen generated package plan")?;
+    let napi_spec = package
+        .node_host_spec()
+        .context("N-API build package has no Node host build spec")?;
+    let napi_manifest = host_manifest_path(&args.package_root, napi_spec)?;
     if !napi_manifest.exists() {
         bail!(
             "napi host crate was not emitted at {}",
@@ -1172,12 +1303,7 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
     }
 
     let target_dir = args.target_dir.as_ref().map(resolve_cwd_path).transpose()?;
-    let napi_cargo_args = host_dependency_cargo_feature_args(
-        &manifest_path,
-        &napi_manifest,
-        &[],
-        &args.cargo_features,
-    )?;
+    let napi_cargo_args = host_feature_args(napi_spec, &args.cargo_features);
     let napi_cargo_args = napi_cargo_args
         .iter()
         .map(String::as_str)
@@ -1201,12 +1327,12 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
         "install Rust's cargo toolchain or pass --cargo-bin <path>",
     )?;
 
-    let napi_meta = cargo_package_metadata(&napi_manifest)?;
-    let napi_artifact = if let Some(target_dir) = &target_dir {
-        napi_meta.host_cdylib_path_in(target_dir, args.release)
-    } else {
-        napi_meta.host_cdylib_path(args.release)
-    };
+    let napi_artifact = host_cdylib_path_from_spec(
+        &args.package_root,
+        napi_spec,
+        target_dir.as_deref(),
+        args.release,
+    );
     if !napi_artifact.exists() {
         bail!(
             "built napi artifact not found at {} after cargo build",
@@ -1214,58 +1340,17 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
         );
     }
 
-    let mut generated_by_flavor = Vec::new();
-    for flavor in &flavors {
-        let subdir = match flavor {
-            FlavorTarget::Napi => "node",
-            FlavorTarget::Electron => "electron",
-            FlavorTarget::Wasm | FlavorTarget::Harmony => continue,
-        };
-        let components = generated_components(&args.out_dir, subdir)?;
-        for component in &components {
-            let flavor_dir = args
-                .out_dir
-                .join("components")
-                .join(&component.namespace)
-                .join(subdir);
-            let bridge = ensure_single_generated_rs(&flavor_dir)
-                .with_context(|| format!("finding generated Rust bridge in {flavor_dir}"))?;
-            if bridge != component.component {
-                bail!(
-                    "generated JavaScript component `{}` namespace `{}` has bridge `{bridge}` in {flavor_dir}; expected its exact component crate name",
-                    component.component,
-                    component.namespace,
-                );
-            }
-            let addon_stem = generated_addon_stem(&flavor_dir)
-                .with_context(|| format!("finding generated addon name in {flavor_dir}"))?;
-            if addon_stem != napi_meta.lib_target_name {
-                bail!(
-                    "generated JavaScript component `{}` namespace `{}` points at addon `{addon_stem}`, but composite N-API host target is `{}`",
-                    component.component,
-                    component.namespace,
-                    napi_meta.lib_target_name,
-                );
-            }
-        }
-        generated_by_flavor.push((subdir, components));
-    }
-    let Some((_, first_components)) = generated_by_flavor.first() else {
+    if !flavors
+        .iter()
+        .any(|flavor| matches!(flavor, FlavorTarget::Napi | FlavorTarget::Electron))
+    {
         bail!("N-API build selected no N-API/Electron generation flavors");
-    };
-    for (subdir, components) in &generated_by_flavor[1..] {
-        if components != first_components {
-            bail!(
-                "generated JavaScript component set differs between N-API and `{subdir}` flavors; composite addon publication requires one exact component set"
-            );
-        }
     }
-    let addon_dir = args
-        .artifact_dir
-        .as_ref()
-        .map(|dir| dir.join("node"))
-        .unwrap_or_else(|| args.out_dir.join("node"));
-    let addon_path = addon_dir.join(format!("{}.node", napi_meta.lib_target_name));
+    let addon_path = package_path(&args.package_root, &napi_spec.native_artifact)?;
+    let addon_dir = addon_path
+        .parent()
+        .map(Utf8Path::to_path_buf)
+        .context("N-API package artifact path has no parent")?;
     std::fs::create_dir_all(&addon_dir)
         .with_context(|| format!("creating composite addon output dir {addon_dir}"))?;
     std::fs::copy(&napi_artifact, &addon_path).with_context(|| {
@@ -1276,10 +1361,40 @@ pub(crate) fn build_napi(args: BuildNapiArgs) -> Result<()> {
 }
 
 pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
-    if args.package_kind == super::ohos::PackageKind::Hsp {
-        return build_direct_ohos_hsp(args);
+    build_ohos_with_generation(args, true, None)
+}
+
+/// Build Harmony outputs from an already prepared package.
+pub(crate) fn build_ohos_prepared(
+    args: BuildOhosArgs,
+    package: &uniffi_bindgen_javascript::package::GeneratedPackage,
+) -> Result<()> {
+    build_ohos_with_generation(args, false, Some(package))
+}
+
+fn build_ohos_with_generation(
+    mut args: BuildOhosArgs,
+    prepare_generation: bool,
+    prepared_package: Option<&uniffi_bindgen_javascript::package::GeneratedPackage>,
+) -> Result<()> {
+    normalize_default_package_root(&mut args.package_root, &args.out_dir);
+    normalize_default_host_crates_dir(&mut args.host_crates_dir, &args.package_root);
+    validate_package_paths(
+        &args.package_root,
+        &args.out_dir,
+        &args.host_crates_dir,
+        args.artifact_dir.as_deref(),
+        None,
+    )?;
+    if let Some(dist_dir) = args.dist_dir.as_deref() {
+        validate_package_child(&args.package_root, dist_dir, "OHOS dist")?;
     }
-    if let Some(prepared) = build_ohos_internal(args, false)? {
+    if args.package_kind == super::ohos::PackageKind::Hsp {
+        return build_direct_ohos_hsp(args, prepared_package);
+    }
+    if let Some(prepared) =
+        build_ohos_internal_with_generation(args, false, prepare_generation, prepared_package)?
+    {
         prepared.commit()?;
     }
     Ok(())
@@ -1287,7 +1402,10 @@ pub(crate) fn build_ohos(args: BuildOhosArgs) -> Result<()> {
 
 /// Build every direct JavaScript HSP output in a private source/host mirror,
 /// then replace the completed public outputs from ordinary sibling staging.
-fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
+fn build_direct_ohos_hsp(
+    public: BuildOhosArgs,
+    _prepared_package: Option<&uniffi_bindgen_javascript::package::GeneratedPackage>,
+) -> Result<()> {
     super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
         package_kind: public.package_kind,
         integrated_hsp: public.integrated_hsp,
@@ -1327,15 +1445,15 @@ fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
         path: public_out,
         is_directory: true,
     }];
+    specifications.push(super::artifact_staging::InvocationOutputSpec {
+        label: "OHOS native engine adapter".into(),
+        path: public.package_root.join("native/ohos.rs"),
+        is_directory: false,
+    });
     for (label, relative, is_directory) in [
         ("OHOS host Cargo manifest", "Cargo.toml", false),
         ("OHOS host Cargo lock", "Cargo.lock", false),
         ("OHOS host build script", "build.rs", false),
-        (
-            "OHOS facade bundle",
-            "uniffi-ohos-facade-bundle.json",
-            false,
-        ),
         ("OHOS host source", "src", true),
     ] {
         specifications.push(super::artifact_staging::InvocationOutputSpec {
@@ -1353,22 +1471,20 @@ fn build_direct_ohos_hsp(public: BuildOhosArgs) -> Result<()> {
     let private_host = mirror.join("host");
     let private_ohos = private_host.join("ohos");
     let mut private = public.clone();
+    private.package_root = invocation.mirror_root().to_path_buf();
     private.out_dir = private_out.clone();
     private.host_crates_dir = private_host;
     private.logical_host_crates_dir = Some(public_host.clone());
     private.target_dir = Some(build_root.join("ohos"));
 
-    let mut sources = vec![private_out];
-    for relative in [
-        "Cargo.toml",
-        "Cargo.lock",
-        "build.rs",
-        "uniffi-ohos-facade-bundle.json",
-        "src",
-    ] {
+    let mut sources = vec![private_out, private.package_root.join("native/ohos.rs")];
+    for relative in ["Cargo.toml", "Cargo.lock", "build.rs", "src"] {
         sources.push(private_ohos.join(relative));
     }
-    let prepared = build_ohos_internal(private, true)?
+    // The direct HSP path rebuilds the private mirror with rebased package
+    // paths, so a package prepared for the public root cannot be reused here.
+    // The ordinary (non-HSP) coordinator is the path that shares a package.
+    let prepared = build_ohos_internal_with_generation(private, true, true, None)?
         .context("private JavaScript HSP build did not return a deferred generation")?;
     if prepared.output_paths() != outputs {
         bail!("direct JavaScript HSP output plan changed during private generation");
@@ -1418,16 +1534,6 @@ fn planned_direct_ohos_hsp_outputs(
         .as_ref()
         .map(|path| canonicalize_or_keep(path))
     {
-        let facade_mode = if args.raw_only_facade {
-            super::ohos::FacadeMode::RawOnly
-        } else {
-            super::ohos::FacadeMode::Required(
-                custom_manifest
-                    .parent()
-                    .context("custom OHOS host manifest has no parent")?
-                    .join("uniffi-ohos-facade-bundle.json"),
-            )
-        };
         let mut cargo_args = host_dependency_cargo_feature_args(
             &manifest_path,
             &custom_manifest,
@@ -1438,12 +1544,12 @@ fn planned_direct_ohos_hsp_outputs(
         let mut additional_source_roots = core_meta.local_source_roots.clone();
         additional_source_roots.push(("core-workspace".into(), core_meta.workspace_root.clone()));
         additional_source_roots.push(("generated-bindings".into(), args.out_dir.clone()));
+        additional_source_roots.push(("generated-package-root".into(), args.package_root.clone()));
         return super::ohos::planned_hsp_host_build_outputs(&super::ohos::BuildOptions {
             cargo_bin: args.cargo_bin.clone(),
             core_manifest_path: Some(manifest_path),
             additional_source_roots,
             manifest_path: custom_manifest,
-            facade_mode,
             dist_dir,
             package_name: args.package_name.clone(),
             module_name: args.module_name.clone(),
@@ -1502,16 +1608,19 @@ fn planned_direct_ohos_hsp_outputs(
     )?])
 }
 
-pub(crate) fn build_ohos_deferred(
+pub(crate) fn build_ohos_deferred_prepared(
     args: BuildOhosArgs,
+    package: &uniffi_bindgen_javascript::package::GeneratedPackage,
 ) -> Result<super::artifact_staging::PreparedHspInvocation> {
-    build_ohos_internal(args, true)?
+    build_ohos_internal_with_generation(args, true, false, Some(package))?
         .context("deferred JavaScript OHOS build did not produce an HSP invocation")
 }
 
-fn build_ohos_internal(
+fn build_ohos_internal_with_generation(
     args: BuildOhosArgs,
     defer_hsp_publication: bool,
+    prepare_generation: bool,
+    prepared_package: Option<&uniffi_bindgen_javascript::package::GeneratedPackage>,
 ) -> Result<Option<super::artifact_staging::PreparedHspInvocation>> {
     super::ohos::preflight_hsp_frontend(super::ohos::HspFrontendPreflight {
         package_kind: args.package_kind,
@@ -1613,16 +1722,6 @@ fn build_ohos_internal(
 
     if args.package_kind == super::ohos::PackageKind::Hsp {
         if let Some(custom_manifest) = custom_ohos_manifest.as_ref() {
-            let facade_mode = if args.raw_only_facade {
-                super::ohos::FacadeMode::RawOnly
-            } else {
-                super::ohos::FacadeMode::Required(
-                    custom_manifest
-                        .parent()
-                        .context("custom OHOS host manifest has no parent")?
-                        .join("uniffi-ohos-facade-bundle.json"),
-                )
-            };
             let arches = if args.arch.is_empty() {
                 vec!["aarch".to_string(), "x64".to_string()]
             } else {
@@ -1639,12 +1738,13 @@ fn build_ohos_internal(
             additional_source_roots
                 .push(("core-workspace".into(), core_meta.workspace_root.clone()));
             additional_source_roots.push(("generated-bindings".into(), args.out_dir.clone()));
+            additional_source_roots
+                .push(("generated-package-root".into(), args.package_root.clone()));
             super::ohos::preflight_hsp_host_build(&super::ohos::BuildOptions {
                 cargo_bin: args.cargo_bin.clone(),
                 core_manifest_path: Some(manifest_path.clone()),
                 additional_source_roots,
                 manifest_path: custom_manifest.clone(),
-                facade_mode,
                 dist_dir: dist_dir.clone(),
                 package_name: args.package_name.clone(),
                 module_name: args.module_name.clone(),
@@ -1728,26 +1828,33 @@ fn build_ohos_internal(
         library_path
     };
 
-    generate_js(
-        &manifest_path,
-        generation_source,
-        args.out_dir.clone(),
-        args.config.clone(),
-        args.crate_name.clone(),
-        args.metadata_no_deps,
-        args.no_format,
-        Some(HostCrateOptions {
-            manifest_path: manifest_path.clone(),
-            host_crates_dir: args.host_crates_dir.clone(),
-            logical_host_crates_dir: args.logical_host_crates_dir.clone(),
-            logical_out_dir: None,
-            ohos_rs_dir: None,
-        }),
-        vec![FlavorTarget::Harmony],
-        args.artifact_dir.clone(),
-    )?;
-
-    let generated_ohos_manifest = ohos_dir.join("Cargo.toml");
+    let owned_package = if prepared_package.is_none() && prepare_generation {
+        Some(generate_js(
+            &manifest_path,
+            generation_source,
+            args.out_dir.clone(),
+            args.package_root.clone(),
+            args.config.clone(),
+            args.crate_name.clone(),
+            args.metadata_no_deps,
+            args.no_format,
+            HostCrateOptions {
+                manifest_path: manifest_path.clone(),
+                host_crates_dir: args.host_crates_dir.clone(),
+                logical_host_crates_dir: args.logical_host_crates_dir.clone(),
+            },
+            vec![FlavorTarget::Harmony],
+            args.artifact_dir.clone(),
+        )?)
+    } else {
+        None
+    };
+    let package = prepared_package.or(owned_package.as_ref());
+    let generated_ohos_manifest = package
+        .and_then(|package| package.ohos_host_spec())
+        .map(|spec| host_manifest_path(&args.package_root, spec))
+        .transpose()?
+        .unwrap_or_else(|| ohos_dir.join("Cargo.toml"));
     if !generated_ohos_manifest.exists() {
         bail!(
             "OHOS host crate was not emitted at {}",
@@ -1756,41 +1863,41 @@ fn build_ohos_internal(
                 .unwrap_or_else(|| Utf8Path::new("<unknown>"))
         );
     }
-    let ohos_manifest = custom_ohos_manifest.unwrap_or(generated_ohos_manifest);
+    let ohos_manifest = custom_ohos_manifest
+        .clone()
+        .unwrap_or(generated_ohos_manifest);
     if !ohos_manifest.exists() {
         bail!("custom OHOS host manifest does not exist: {ohos_manifest}");
     }
-    let facade_mode = if args.raw_only_facade {
-        super::ohos::FacadeMode::RawOnly
-    } else {
-        let facade_bundle_path = ohos_manifest
-            .parent()
-            .context("OHOS host manifest has no parent for its facade bundle")?
-            .join("uniffi-ohos-facade-bundle.json");
-        super::ohos::FacadeMode::Required(facade_bundle_path)
-    };
-
     let arches = if args.arch.is_empty() {
         vec!["aarch".to_string(), "x64".to_string()]
     } else {
         args.arch.clone()
     };
-    let mut ohos_cargo_args = host_dependency_cargo_feature_args(
-        &manifest_path,
-        &ohos_manifest,
-        &args.cargo_args,
-        &args.cargo_features,
-    )?;
+    let mut ohos_cargo_args = if custom_ohos_manifest.is_some() {
+        host_dependency_cargo_feature_args(
+            &manifest_path,
+            &ohos_manifest,
+            &args.cargo_args,
+            &args.cargo_features,
+        )?
+    } else {
+        let package = package.context("OHOS build is missing the frozen generated package plan")?;
+        let spec = package
+            .ohos_host_spec()
+            .context("OHOS package has no Harmony host build spec")?;
+        host_feature_args(spec, &args.cargo_features)
+    };
     ohos_cargo_args.extend(args.cargo_args);
     let mut additional_source_roots = core_meta.local_source_roots.clone();
     additional_source_roots.push(("core-workspace".into(), core_meta.workspace_root.clone()));
     additional_source_roots.push(("generated-bindings".into(), args.out_dir.clone()));
+    additional_source_roots.push(("generated-package-root".into(), args.package_root.clone()));
     let options = super::ohos::BuildOptions {
         cargo_bin: args.cargo_bin.clone(),
         core_manifest_path: Some(manifest_path),
         additional_source_roots,
         manifest_path: ohos_manifest,
-        facade_mode,
         dist_dir,
         package_name: args.package_name,
         module_name: args.module_name,
@@ -2027,9 +2134,8 @@ fn cargo_package_matches_selector(package: &Package, selector: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_browser_auto_entrypoint, host_dependency_cargo_feature_args,
-        patch_mini_program_web_runtime, preflight_wasm_build_paths,
-        rebase_mini_program_auto_entrypoint, BuildWasmArgs, WasmBindgenTargetArg,
+        host_dependency_cargo_feature_args, patch_mini_program_web_runtime,
+        preflight_wasm_build_paths, BuildWasmArgs, WasmBindgenTargetArg,
     };
     #[cfg(windows)]
     use super::{wasm_preflight_nofollow, windows_wasm_semantic_path_key};
@@ -2042,6 +2148,7 @@ mod tests {
             library_path: None,
             source: None,
             host_crates_dir: root.join("published/host"),
+            package_root: root.join("published"),
             logical_host_crates_dir: None,
             artifact_dir: Some(root.join("published/artifacts")),
             wasm_bindgen_out_dir: Some(root.join("published/wasm-bindgen")),
@@ -2383,146 +2490,9 @@ edition = "2021"
             b"not-a-directory"
         );
     }
-
-    #[test]
-    fn mini_program_entrypoint_rebases_private_write_to_public_artifact_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let actual_out = root.join("private/generated");
-        let logical_out = root.join("public/generated");
-        let logical_mini = root.join("public/artifacts/mini-program");
-        for (namespace, bridge) in [("demo", "demo"), ("other", "other")] {
-            let browser_dir = actual_out
-                .join("components")
-                .join(namespace)
-                .join("browser");
-            std::fs::create_dir_all(&browser_dir).unwrap();
-            std::fs::write(browser_dir.join(format!("{bridge}.rs")), "// bridge").unwrap();
-        }
-        rebase_mini_program_auto_entrypoint(&actual_out, &logical_out, &logical_mini, "demo_wasm")
-            .unwrap();
-        let entry =
-            std::fs::read_to_string(actual_out.join("browser/index.mini-program.ts")).unwrap();
-        assert!(
-            entry.contains("import * as glue from \"../../artifacts/mini-program/demo_wasm.js\";"),
-            "private entrypoint did not encode its public relative import: {entry}"
-        );
-        assert!(
-            entry.contains("import { demo, other } from \"./index.ts\";"),
-            "Mini Program entrypoint did not import every root namespace: {entry}"
-        );
-        assert!(
-            entry.contains(
-                "import type { WasmBindgenGlue } from \"../components/demo/browser/index.ts\";"
-            ),
-            "Mini Program entrypoint did not resolve its component type through the namespaced tree: {entry}"
-        );
-        assert!(
-            entry.contains("await Promise.all([")
-                && entry.contains("demo.initBackend(initializedGlue)")
-                && entry.contains("other.initBackend(initializedGlue)"),
-            "Mini Program entrypoint did not initialize all component backends from one glue module: {entry}"
-        );
-        assert_eq!(
-            entry.matches("initializedModule.default as").count(),
-            1,
-            "Mini Program entrypoint should initialize wasm-bindgen glue once: {entry}"
-        );
-        assert_eq!(
-            entry
-                .matches("Object.defineProperty(initializedGlue, \"default\"")
-                .count(),
-            1,
-            "Mini Program entrypoint should shadow a read-only module default exactly once: {entry}"
-        );
-        assert!(
-            !entry.contains("initializedGlue.default ="),
-            "Mini Program entrypoint must not assign through a read-only module prototype: {entry}"
-        );
-        assert_eq!(
-            entry.matches("demo.initBackend(initializedGlue)").count(),
-            1
-        );
-        assert_eq!(
-            entry.matches("other.initBackend(initializedGlue)").count(),
-            1
-        );
-        assert!(!entry.contains("private"));
-    }
-
-    #[test]
-    fn browser_entrypoint_safely_shadows_read_only_default_for_all_components() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let out = root.join("generated");
-        let glue = root.join("artifacts/browser/pkg");
-        for namespace in ["alpha", "beta"] {
-            let browser_dir = out.join("components").join(namespace).join("browser");
-            std::fs::create_dir_all(&browser_dir).unwrap();
-            std::fs::write(browser_dir.join(format!("{namespace}.rs")), "// bridge").unwrap();
-        }
-        std::fs::create_dir_all(&glue).unwrap();
-
-        emit_browser_auto_entrypoint(&out, &glue, "composite_host", WasmBindgenTargetArg::Web)
-            .unwrap();
-
-        let entry = std::fs::read_to_string(out.join("browser/index.web.ts")).unwrap();
-        assert!(entry.contains("import { alpha, beta } from \"./index.ts\";"));
-        assert_eq!(entry.matches("initializedModule.default as").count(), 1);
-        assert_eq!(
-            entry
-                .matches("Object.defineProperty(initializedGlue, \"default\"")
-                .count(),
-            1,
-            "Browser entrypoint should shadow a read-only module default exactly once: {entry}"
-        );
-        assert!(
-            !entry.contains("initializedGlue.default ="),
-            "Browser entrypoint must not assign through a read-only module prototype: {entry}"
-        );
-        assert_eq!(
-            entry.matches("alpha.initBackend(initializedGlue)").count(),
-            1
-        );
-        assert_eq!(
-            entry.matches("beta.initBackend(initializedGlue)").count(),
-            1
-        );
-    }
 }
 
-fn run_wasm_bindgen_in_process(
-    wasm_artifact: &Utf8Path,
-    out_dir: &Utf8Path,
-    target: WasmBindgenTargetArg,
-) -> Result<()> {
-    let mut bindgen = Bindgen::new();
-    match target {
-        WasmBindgenTargetArg::Web => {
-            bindgen.web(true)?;
-        }
-        WasmBindgenTargetArg::Nodejs => {
-            bindgen.nodejs(true)?;
-        }
-        WasmBindgenTargetArg::Bundler => {
-            bindgen.bundler(true)?;
-        }
-        WasmBindgenTargetArg::NoModules => {
-            bindgen.no_modules(true)?;
-        }
-        WasmBindgenTargetArg::Deno => {
-            bindgen.deno(true)?;
-        }
-    };
-    bindgen.input_path(wasm_artifact.as_std_path());
-    bindgen.typescript(true);
-    bindgen
-        .generate(out_dir.as_std_path())
-        .with_context(|| format!("running built-in wasm-bindgen for {wasm_artifact}"))?;
-    Ok(())
-}
-
-fn cargo_build_command<'a>(
+pub(crate) fn cargo_build_command<'a>(
     cargo_bin: &str,
     manifest_path: &'a Utf8Path,
     extra_args: &[&'a str],
@@ -2544,7 +2514,7 @@ fn cargo_build_command<'a>(
     command
 }
 
-fn run_command(
+pub(crate) fn run_command(
     binary: &str,
     command: &mut Command,
     tool_name: &str,
@@ -2579,229 +2549,117 @@ fn resolve_cwd_path(path: &Utf8PathBuf) -> Result<Utf8PathBuf> {
     }
 }
 
-fn ensure_single_generated_rs(dir: &Utf8Path) -> Result<String> {
-    let mut stems = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {dir}"))? {
-        let entry = entry?;
-        let path = Utf8PathBuf::from_path_buf(entry.path())
-            .map_err(|p| anyhow::anyhow!("generated path is not utf8: {}", p.display()))?;
-        if path.extension() == Some("rs") {
-            let stem = path
-                .file_stem()
-                .with_context(|| format!("generated Rust bridge path has no stem: {path}"))?;
-            stems.push(stem.to_string());
-        }
+fn package_path(package_root: &Utf8Path, relative: &Utf8Path) -> Result<Utf8PathBuf> {
+    resolve_cwd_path(&package_root.join(relative))
+}
+
+fn host_manifest_path(
+    package_root: &Utf8Path,
+    spec: &uniffi_bindgen_javascript::package::HostBuildSpec,
+) -> Result<Utf8PathBuf> {
+    Ok(package_path(package_root, &spec.crate_root)?.join("Cargo.toml"))
+}
+
+fn host_feature_args(
+    spec: &uniffi_bindgen_javascript::package::HostBuildSpec,
+    features: &[String],
+) -> Vec<String> {
+    if features.is_empty() {
+        return Vec::new();
     }
-    match stems.as_slice() {
-        [stem] => Ok(stem.clone()),
-        [] => bail!("no generated Rust bridge (*.rs) found in {dir}"),
-        _ => bail!("multiple generated Rust bridges found in {dir}: {stems:?}"),
+    vec![
+        "--features".to_owned(),
+        features
+            .iter()
+            .map(|feature| format!("{}/{}", spec.core_dependency_key, feature))
+            .collect::<Vec<_>>()
+            .join(","),
+    ]
+}
+
+fn host_cdylib_path_from_spec(
+    package_root: &Utf8Path,
+    spec: &uniffi_bindgen_javascript::package::HostBuildSpec,
+    target_dir: Option<&Utf8Path>,
+    release: bool,
+) -> Utf8PathBuf {
+    let root = target_dir
+        .map(Utf8Path::to_path_buf)
+        .unwrap_or_else(|| package_root.join(&spec.crate_root).join("target"));
+    root.join(if release { "release" } else { "debug" })
+        .join(host_cdylib_filename(&spec.lib_target))
+}
+
+fn wasm_artifact_path_from_spec(
+    package_root: &Utf8Path,
+    spec: &uniffi_bindgen_javascript::package::HostBuildSpec,
+    target_dir: Option<&Utf8Path>,
+    release: bool,
+) -> Utf8PathBuf {
+    let root = target_dir
+        .map(Utf8Path::to_path_buf)
+        .unwrap_or_else(|| package_root.join(&spec.crate_root).join("target"));
+    root.join("wasm32-unknown-unknown")
+        .join(if release { "release" } else { "debug" })
+        .join(format!("{}.wasm", spec.lib_target))
+}
+
+fn normalize_default_host_crates_dir(host_crates_dir: &mut Utf8PathBuf, package_root: &Utf8Path) {
+    if host_crates_dir == Utf8Path::new("native/hosts") {
+        *host_crates_dir = package_root.join("native/hosts");
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GeneratedComponent {
-    component: String,
-    namespace: String,
-    native_export_prefix: String,
+fn normalize_default_package_root(package_root: &mut Utf8PathBuf, out_dir: &Utf8Path) {
+    // Clap's `skip` fields receive an empty default for the direct
+    // `javascript build-{wasm,napi,ohos}` commands.  The generated source
+    // directory is the package root for those commands; coordinators pass an
+    // explicit staging root and are left untouched.
+    if package_root.as_str().is_empty() {
+        *package_root = out_dir.to_path_buf();
+    }
 }
 
-/// Resolve every selected component for one generated flavor. Each namespace
-/// still owns exactly one bridge file; this function only pluralizes the
-/// package-level discovery and verifies that component/namespace/prefix names
-/// are valid before any build command copies an artifact.
-fn generated_components(out_dir: &Utf8Path, flavor: &str) -> Result<Vec<GeneratedComponent>> {
-    let components_dir = out_dir.join("components");
-    let mut components = Vec::new();
-    for entry in std::fs::read_dir(&components_dir)
-        .with_context(|| format!("reading generated component root {components_dir}"))?
-    {
-        let entry = entry.with_context(|| format!("reading an entry below {components_dir}"))?;
-        let path = Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
-            anyhow::anyhow!(
-                "generated component path is not UTF-8 below {components_dir}: {}",
-                path.display()
-            )
-        })?;
-        if !entry
-            .file_type()
-            .with_context(|| format!("reading file type for generated component path {path}"))?
-            .is_dir()
-        {
-            continue;
-        }
-        let namespace = path
-            .file_name()
-            .with_context(|| format!("generated component directory has no name: {path}"))?
-            .to_string();
-        let flavor_dir = path.join(flavor);
-        if flavor_dir.is_dir() {
-            let component = ensure_single_generated_rs(&flavor_dir)?;
-            let native_export_prefix =
-                uniffi_bindgen::interface::native_export_prefix_for_component(&component);
-            components.push(GeneratedComponent {
-                component,
-                namespace,
-                native_export_prefix,
-            });
-        }
-    }
-    components.sort_by(|left, right| {
-        (&left.component, &left.namespace, &left.native_export_prefix).cmp(&(
-            &right.component,
-            &right.namespace,
-            &right.native_export_prefix,
-        ))
-    });
-    if components.is_empty() {
-        bail!(
-            "no generated JavaScript component with `{flavor}` flavor found below {components_dir}"
-        );
-    }
-    let mut component_names = std::collections::BTreeSet::new();
-    let mut namespaces = std::collections::BTreeSet::new();
-    let mut prefixes = std::collections::BTreeSet::new();
-    for component in &components {
-        if !component_names.insert(component.component.as_str())
-            || !namespaces.insert(component.namespace.as_str())
-            || !prefixes.insert(component.native_export_prefix.as_str())
-        {
-            bail!(
-                "generated JavaScript components for `{flavor}` have a duplicate component, namespace, or native export prefix: {component:?}"
-            );
-        }
-    }
-    Ok(components)
-}
-
-fn generated_addon_stem(dir: &Utf8Path) -> Result<String> {
-    for file_name in ["backend-napi.ts", "preload.cjs"] {
-        let path = dir.join(file_name);
-        if path.exists() {
-            let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
-            if let Some(stem) = parse_node_addon_stem(&text) {
-                return Ok(stem);
-            }
-        }
-    }
-    bail!("no generated addon reference (*.node) found in {dir}")
-}
-
-fn parse_node_addon_stem(text: &str) -> Option<String> {
-    let marker = ".node";
-    for (idx, _) in text.match_indices(marker) {
-        let before = &text[..idx];
-        let Some(quote_idx) = before.rfind(['"', '\'']) else {
-            continue;
-        };
-        let raw = &text[quote_idx + 1..idx];
-        let Some(stem) = raw.rsplit(['/', '\\']).next() else {
-            continue;
-        };
-        if !stem.is_empty() {
-            return Some(stem.to_string());
-        }
-    }
-    None
-}
-
-fn emit_browser_auto_entrypoint(
-    out_dir: &Utf8Path,
-    wasm_bindgen_out_dir: &Utf8Path,
-    wasm_bindgen_stem: &str,
-    target: WasmBindgenTargetArg,
-) -> Result<()> {
-    let browser_dir = out_dir.join("browser");
-    let entrypoint = browser_dir.join("index.web.ts");
-    if !target.emits_web_auto_entrypoint() {
-        if entrypoint.exists() {
-            std::fs::remove_file(&entrypoint)
-                .with_context(|| format!("removing stale browser auto-entrypoint {entrypoint}"))?;
-        }
-        return Ok(());
-    }
-
-    let components = generated_components(out_dir, "browser")?;
-    let namespace_imports = components
-        .iter()
-        .map(|component| component.namespace.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let glue_type_namespace = &components[0].namespace;
-    let component_initializers = components
-        .iter()
-        .map(|component| {
-            format!(
-                "        {}.initBackend(initializedGlue),",
-                component.namespace
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    std::fs::create_dir_all(&browser_dir)
-        .with_context(|| format!("creating browser output dir {browser_dir}"))?;
-    let browser_dir_abs = browser_dir
-        .canonicalize_utf8()
-        .with_context(|| format!("canonicalizing browser dir {browser_dir}"))?;
-    let wasm_bindgen_out_dir_abs = wasm_bindgen_out_dir.canonicalize_utf8().with_context(|| {
-        format!("canonicalizing wasm-bindgen output dir {wasm_bindgen_out_dir}")
-    })?;
-    let rel_pkg_dir = relative_path_from_dir(&browser_dir_abs, &wasm_bindgen_out_dir_abs)
-        .to_string()
-        .replace('\\', "/");
-    let rel_pkg_dir = if rel_pkg_dir.is_empty() {
-        ".".to_string()
-    } else if rel_pkg_dir.starts_with('.') {
-        rel_pkg_dir
+fn absolute_lexical(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
     } else {
-        format!("./{rel_pkg_dir}")
-    };
-    let glue_path = format!("{rel_pkg_dir}/{wasm_bindgen_stem}.js");
-    let wasm_url_path = format!("{rel_pkg_dir}/{wasm_bindgen_stem}_bg.wasm?url");
+        Ok(Utf8PathBuf::from_path_buf(std::env::current_dir()?)
+            .map_err(|p| anyhow::anyhow!("cwd is not UTF-8: {}", p.display()))?
+            .join(path))
+    }
+}
 
-    let source = format!(
-        r#"// AUTOGENERATED by uniffi_bindgen_javascript (wasm web auto-entrypoint).
-//
-// This file is emitted by `uniffi-bindgen javascript build-wasm`
-// after UniFFI's in-process wasm-bindgen runner has produced the final JS glue
-// and `.wasm` asset. Advanced consumers can still import
-// `./index.ts` and call `initBackend(glue, init?)` manually.
+fn validate_package_paths(
+    package_root: &Utf8Path,
+    out_dir: &Utf8Path,
+    host_crates_dir: &Utf8Path,
+    artifact_dir: Option<&Utf8Path>,
+    wasm_bindgen_out_dir: Option<&Utf8Path>,
+) -> Result<()> {
+    let root = absolute_lexical(package_root)?;
+    let mut paths = vec![
+        ("generated source", out_dir),
+        ("host crates", host_crates_dir),
+    ];
+    if let Some(path) = artifact_dir {
+        paths.push(("artifact", path));
+    }
+    if let Some(path) = wasm_bindgen_out_dir {
+        paths.push(("wasm-bindgen", path));
+    }
+    for (label, path) in paths {
+        validate_package_child(&root, path, label)?;
+    }
+    Ok(())
+}
 
-import * as glue from "{glue_path}";
-import wasmUrl from "{wasm_url_path}";
-import {{ {namespace_imports} }} from "./index.ts";
-import type {{ WasmBindgenGlue }} from "../components/{glue_type_namespace}/browser/index.ts";
-
-export * from "./index.ts";
-
-let readyPromise: Promise<void> | null = null;
-
-async function installAll(input: unknown): Promise<void> {{
-    const initializedModule = await glue;
-    if (typeof initializedModule.default === "function") {{
-        await (initializedModule.default as (value?: unknown) => Promise<unknown>)(input);
-    }}
-    // Keep every named wasm-bindgen export through the module prototype while
-    // hiding `default`: each namespace adapter must install its scoped backend
-    // without initializing the one composite glue module a second time.
-    const initializedGlue = Object.create(initializedModule) as WasmBindgenGlue;
-    Object.defineProperty(initializedGlue, "default", {{ value: undefined }});
-    await Promise.all([
-{component_initializers}
-    ]);
-}}
-
-export function init(input: unknown = wasmUrl): Promise<void> {{
-    readyPromise ??= installAll(input);
-    return readyPromise;
-}}
-
-export const ready: Promise<void> = init();
-"#,
-    );
-    std::fs::write(&entrypoint, source)
-        .with_context(|| format!("writing browser auto-entrypoint {entrypoint}"))?;
+fn validate_package_child(root: &Utf8Path, path: &Utf8Path, label: &str) -> Result<()> {
+    let root = absolute_lexical(root)?;
+    let path = absolute_lexical(path)?;
+    if path != root && !path.starts_with(&root) {
+        bail!("{label} output {path} must remain below package root {root}");
+    }
     Ok(())
 }
 
@@ -3097,20 +2955,6 @@ fn emit_mini_program_auto_entrypoint(
     )
 }
 
-pub(crate) fn rebase_mini_program_auto_entrypoint(
-    actual_out_dir: &Utf8Path,
-    logical_out_dir: &Utf8Path,
-    logical_mini_program_out_dir: &Utf8Path,
-    wasm_bindgen_stem: &str,
-) -> Result<()> {
-    write_mini_program_auto_entrypoint(
-        actual_out_dir,
-        logical_out_dir,
-        logical_mini_program_out_dir,
-        wasm_bindgen_stem,
-    )
-}
-
 fn write_mini_program_auto_entrypoint(
     actual_out_dir: &Utf8Path,
     logical_out_dir: &Utf8Path,
@@ -3118,7 +2962,7 @@ fn write_mini_program_auto_entrypoint(
     wasm_bindgen_stem: &str,
 ) -> Result<()> {
     let browser_dir = actual_out_dir.join("browser");
-    let entrypoint = browser_dir.join("index.mini-program.ts");
+    let entrypoint = browser_dir.join("index.mini-program.js");
     std::fs::create_dir_all(&browser_dir)
         .with_context(|| format!("creating browser output dir {browser_dir}"))?;
     let logical_browser_dir = logical_out_dir.join("browser");
@@ -3135,24 +2979,23 @@ fn write_mini_program_auto_entrypoint(
     };
     let glue_path = format!("{rel_artifact_dir}/{wasm_bindgen_stem}.js");
     let default_wasm_path = mini_program_default_wasm_path(wasm_bindgen_stem);
-    let components = generated_components(actual_out_dir, "browser")?;
-    let namespace_imports = components
-        .iter()
-        .map(|component| component.namespace.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let glue_type_namespace = &components[0].namespace;
-    let component_initializers = components
-        .iter()
-        .map(|component| {
+    let mut components = std::fs::read_dir(actual_out_dir.join("components"))
+        .with_context(|| {
             format!(
-                "        {}.initBackend(initializedGlue),",
-                component.namespace
+                "reading generated component namespaces below {}",
+                actual_out_dir.join("components")
             )
+        })?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .and_then(|_| entry.file_name().into_string().ok())
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-
+        .collect::<Vec<_>>();
+    components.sort();
     let source = format!(
         r#"// AUTOGENERATED by uniffi_bindgen_javascript (wasm Mini Program auto-entrypoint).
 //
@@ -3161,76 +3004,56 @@ fn write_mini_program_auto_entrypoint(
 // calls `WXWebAssembly.instantiate(packagePath, imports)`.
 
 import * as glue from "{glue_path}";
-import {{ {namespace_imports} }} from "./index.ts";
-import type {{ WasmBindgenGlue }} from "../components/{glue_type_namespace}/browser/index.ts";
+import * as __backend from "./backend.js";
 
-export * from "./index.ts";
-
-declare const WXWebAssembly:
-    | undefined
-    | {{
-          instantiate(
-              path: string,
-              imports: WebAssembly.Imports,
-          ): Promise<WebAssembly.WebAssemblyInstantiatedSource>;
-      }};
+export {{ session, close{component_exports} }} from "./backend.js";
 
 export const DEFAULT_WASM_PATH = "{default_wasm_path}";
 
-export type MiniProgramWebRuntime = {{
-    fetch: unknown;
-    Headers: unknown;
-    Request: unknown;
-    Response: unknown;
-}};
+let readyPromise = null;
 
-let readyPromise: Promise<void> | null = null;
-
-function assertWXWebAssembly(): void {{
-    if (typeof WXWebAssembly === "undefined" || typeof WXWebAssembly.instantiate !== "function") {{
+function assertWXWebAssembly() {{
+    const runtime = globalThis.WXWebAssembly;
+    if (!runtime || typeof runtime.instantiate !== "function") {{
         throw new Error("UniFFI Mini Program wasm init requires WXWebAssembly.instantiate(path, imports)");
     }}
 }}
 
-export function init(wasmPath: string = DEFAULT_WASM_PATH): Promise<void> {{
+export function init(wasmPath = DEFAULT_WASM_PATH) {{
     return initWithGlue(glue, wasmPath);
 }}
 
-export function initWithPath(wasmPath: string): Promise<void> {{
+export function initWithPath(wasmPath) {{
     return init(wasmPath);
 }}
 
-export function setMiniProgramWebRuntime(runtime: MiniProgramWebRuntime): void {{
-    const runtimeGlue = glue as typeof glue & {{
-        setMiniProgramWebRuntime(value: MiniProgramWebRuntime): void;
-    }};
-    runtimeGlue.setMiniProgramWebRuntime(runtime);
+export function setMiniProgramWebRuntime(runtime) {{
+    if (typeof glue.setMiniProgramWebRuntime !== "function") {{
+        throw new Error("UniFFI Mini Program wasm glue does not expose setMiniProgramWebRuntime");
+    }}
+    glue.setMiniProgramWebRuntime(runtime);
 }}
 
 export function initWithGlue(
-    customGlue: WasmBindgenGlue | Promise<WasmBindgenGlue>,
-    wasmPath: string,
-): Promise<void> {{
+    customGlue,
+    wasmPath,
+) {{
     assertWXWebAssembly();
     readyPromise ??= installAll(customGlue, wasmPath);
     return readyPromise;
 }}
 
 async function installAll(
-    customGlue: WasmBindgenGlue | Promise<WasmBindgenGlue>,
-    wasmPath: string,
-): Promise<void> {{
-    const initializedModule = await customGlue;
-    if (typeof initializedModule.default === "function") {{
-        await (initializedModule.default as (value?: unknown) => Promise<unknown>)(wasmPath);
-    }}
-    const initializedGlue = Object.create(initializedModule) as WasmBindgenGlue;
-    Object.defineProperty(initializedGlue, "default", {{ value: undefined }});
-    await Promise.all([
-{component_initializers}
-    ]);
+    customGlue,
+    wasmPath,
+) {{
+    return __backend.initWithGlue(customGlue, wasmPath);
 }}
 "#,
+        component_exports = components
+            .iter()
+            .map(|component| format!(", {component}"))
+            .collect::<String>(),
     );
     std::fs::write(&entrypoint, source)
         .with_context(|| format!("writing Mini Program auto-entrypoint {entrypoint}"))?;
@@ -3275,17 +3098,6 @@ impl CargoPackageMetadata {
         target_directory
             .join(if release { "release" } else { "debug" })
             .join(host_cdylib_filename(&self.lib_target_name))
-    }
-
-    fn wasm_artifact_path(&self, release: bool) -> Utf8PathBuf {
-        self.wasm_artifact_path_in(&self.target_directory, release)
-    }
-
-    fn wasm_artifact_path_in(&self, target_directory: &Utf8Path, release: bool) -> Utf8PathBuf {
-        target_directory
-            .join("wasm32-unknown-unknown")
-            .join(if release { "release" } else { "debug" })
-            .join(format!("{}.wasm", self.lib_target_name))
     }
 }
 

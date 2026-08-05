@@ -50,7 +50,7 @@ impl From<TargetLanguageArg> for TargetLanguage {
 /// Which JS backend(s) to emit when `--language javascript` is set.
 ///
 /// `electron` is not a standalone ABI — it consumes the napi flavor and
-/// additionally emits `preload.cjs` + `renderer.ts`.
+/// additionally emits `preload.cjs` + `index.js`.
 #[derive(Copy, Clone, ValueEnum)]
 enum JsFlavorArg {
     Wasm,
@@ -132,22 +132,14 @@ enum Commands {
         /// * `src:[crate-name]` to generate from Rust sources
         source: Utf8PathBuf,
 
-        /// Opt-in: also emit Rust host crates (`rust_modules/wasm`,
-        /// `rust_modules/napi`) from the generated bridge files. Only
-        /// meaningful with `--language javascript`. Requires
-        /// `--manifest-path`.
-        #[clap(long = "emit-host-crates")]
-        emit_host_crates: bool,
-
         /// Downstream core crate `Cargo.toml` used to derive host-crate
-        /// metadata (package name, path dependency target). Required
-        /// when `--emit-host-crates` is passed.
+        /// metadata (package name, path dependency target). Required for
+        /// JavaScript generation.
         #[clap(long = "manifest-path")]
         manifest_path: Option<Utf8PathBuf>,
 
-        /// Directory (default `rust_modules`) in which to emit
-        /// `wasm/` and `napi/` host crates. Relative paths resolve
-        /// against the current working directory.
+        /// Directory (default `<out-dir>/native/hosts`) in which to emit
+        /// generated host crates. It must remain below the package root.
         #[clap(long = "host-crates-dir")]
         host_crates_dir: Option<Utf8PathBuf>,
 
@@ -267,7 +259,6 @@ pub fn run_main() -> anyhow::Result<()> {
             no_default_features,
             all_features,
             target,
-            emit_host_crates,
             manifest_path,
             host_crates_dir,
             artifact_dir,
@@ -308,6 +299,9 @@ pub fn run_main() -> anyhow::Result<()> {
                          (pick one or more of: wasm, napi, electron, harmony)"
                     );
                 }
+                let manifest = manifest_path.clone().ok_or_else(|| {
+                    anyhow::anyhow!("--language javascript requires --manifest-path <Cargo.toml>")
+                })?;
                 let mut paths = BindgenPaths::default();
                 let global_config = if let Some(cfg) = &config {
                     let (global_config, crate_roots_layer) = GlobalConfig::from_file(cfg)?;
@@ -326,33 +320,24 @@ pub fn run_main() -> anyhow::Result<()> {
                     features,
                 })?;
                 let loader = BindgenLoader::new(paths, global_config);
+                let package_root = out_dir.clone();
                 uniffi_bindgen_javascript::generate(
                     &loader,
                     GenerateJsOptions {
                         source,
+                        package_root: package_root.clone(),
                         out_dir,
                         artifact_dir,
                         config_override: config,
                         crate_filter: crate_name,
                         metadata_no_deps,
                         flavors: js_flavor.into_iter().map(FlavorTarget::from).collect(),
-                        host_crates: if emit_host_crates {
-                            let manifest = manifest_path.clone().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "--emit-host-crates requires --manifest-path <Cargo.toml>"
-                                )
-                            })?;
-                            Some(HostCrateOptions {
-                                manifest_path: manifest,
-                                host_crates_dir: host_crates_dir
-                                    .clone()
-                                    .unwrap_or_else(|| Utf8PathBuf::from("rust_modules")),
-                                logical_host_crates_dir: None,
-                                logical_out_dir: None,
-                                ohos_rs_dir: None,
-                            })
-                        } else {
-                            None
+                        host_crates: HostCrateOptions {
+                            manifest_path: manifest,
+                            host_crates_dir: host_crates_dir
+                                .clone()
+                                .unwrap_or_else(|| package_root.join("native/hosts")),
+                            logical_host_crates_dir: None,
                         },
                     },
                 )?;

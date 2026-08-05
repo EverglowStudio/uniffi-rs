@@ -357,8 +357,7 @@ impl<'a> FacadeBuilder<'a> {
         rust_operations: &BTreeMap<OperationId, &RustOperationPlan>,
     ) -> Result<AstOperation, FacadeError> {
         ensure_identifier(&operation.public_name, "public operation name")?;
-        if matches!(operation.source_key.owner(), OperationOwner::Callback(_))
-            && operation.callback_method_id.is_none()
+        if operation.kind == OperationKind::CallbackMethod && operation.callback_method_id.is_none()
         {
             return Err(FacadeError::MissingCallbackMethodId { id: operation.id });
         }
@@ -485,12 +484,36 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
             | ConversionRecipe::Object(id)
             | ConversionRecipe::Callback(id)
             | ConversionRecipe::Custom(id, _) => named_type(types, *id),
-            ConversionRecipe::InputStream(inner) => Some(ValueType::InputStream(Box::new(
-                from_conversion(inner, rust_type_inner(rust_type), types)?,
-            ))),
-            ConversionRecipe::OutputStream(inner) => Some(ValueType::OutputStream(Box::new(
-                from_conversion(inner, rust_type_inner(rust_type), types)?,
-            ))),
+            ConversionRecipe::InputStream { item, error } => {
+                let RustType::InputStream {
+                    item: rust_item,
+                    error: rust_error,
+                    is_send,
+                } = rust_type
+                else {
+                    return None;
+                };
+                Some(ValueType::InputStream {
+                    item: Box::new(from_conversion(item, rust_item, types)?),
+                    error: Box::new(from_conversion(error, rust_error, types)?),
+                    is_send: *is_send,
+                })
+            }
+            ConversionRecipe::OutputStream { item, error } => {
+                let RustType::Stream {
+                    item: rust_item,
+                    error: rust_error,
+                    is_send,
+                } = rust_type
+                else {
+                    return None;
+                };
+                Some(ValueType::OutputStream {
+                    item: Box::new(from_conversion(item, rust_item, types)?),
+                    error: Box::new(from_conversion(error, rust_error, types)?),
+                    is_send: *is_send,
+                })
+            }
             ConversionRecipe::StreamStep { .. } => None,
         }
     }
@@ -500,9 +523,8 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
             RustType::Option(inner)
             | RustType::Sequence(inner)
             | RustType::Set(inner)
-            | RustType::Stream(inner)
-            | RustType::InputStream(inner)
             | RustType::Custom(inner) => inner,
+            RustType::Stream { item, .. } | RustType::InputStream { item, .. } => item,
             RustType::Map(_, value) => value,
             _ => rust_type,
         }
@@ -524,12 +546,24 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
                 Box::new(from_rust_type(value, types)?),
             )),
             RustType::Set(inner) => Some(ValueType::Set(Box::new(from_rust_type(inner, types)?))),
-            RustType::Stream(inner) => Some(ValueType::OutputStream(Box::new(from_rust_type(
-                inner, types,
-            )?))),
-            RustType::InputStream(inner) => Some(ValueType::InputStream(Box::new(from_rust_type(
-                inner, types,
-            )?))),
+            RustType::Stream {
+                item,
+                error,
+                is_send,
+            } => Some(ValueType::OutputStream {
+                item: Box::new(from_rust_type(item, types)?),
+                error: Box::new(from_rust_type(error, types)?),
+                is_send: *is_send,
+            }),
+            RustType::InputStream {
+                item,
+                error,
+                is_send,
+            } => Some(ValueType::InputStream {
+                item: Box::new(from_rust_type(item, types)?),
+                error: Box::new(from_rust_type(error, types)?),
+                is_send: *is_send,
+            }),
             RustType::Custom(inner) => from_rust_type(inner, types),
             RustType::Unit | RustType::Path(_) | RustType::StreamStep { .. } => None,
         }
@@ -828,6 +862,8 @@ export class Host {
   releaseCallback(callbackType: number, callbackId: number): void;
   invokeCallbackSync(callbackType: number, callbackId: number, methodId: number, args?: unknown[]): unknown;
   invokeCallbackAsync(callbackType: number, callbackId: number, methodId: number, invocationId: number, args?: unknown[]): Promise<unknown>;
+  invokeCallbackSyncResult(callbackType: number, callbackId: number, methodId: number, args?: unknown[]): { ok: boolean; value?: unknown; error?: unknown };
+  invokeCallbackAsyncResult(callbackType: number, callbackId: number, methodId: number, invocationId: number, args?: unknown[]): Promise<{ ok: boolean; value?: unknown; error?: unknown }>;
   pullInputStream(handle: unknown): Promise<unknown>;
   cancelInputStream(handle: unknown): Promise<void>;
   releaseInputStream(handle: unknown): void;
@@ -853,8 +889,8 @@ export class ObjectLease<T = unknown> {
   private constructor();
   dispose(): void;
 }
-export interface UniFfiStream<T> { next(): Promise<IteratorResult<T>>; cancel(): Promise<void>; }
-export interface UniFfiInputStream<T> { next(): Promise<IteratorResult<T>>; cancel?(): Promise<void>; release?(): void; }
+export interface UniFfiStream<T> { next(): Promise<IteratorResult<T>>; cancel(): Promise<void>; [Symbol.asyncIterator](): AsyncIterator<T>; }
+export interface UniFfiInputStream<T> { next(): Promise<IteratorResult<T>>; cancel?(): Promise<void>; release?(): void; [Symbol.asyncIterator](): AsyncIterator<T>; }
 export declare function createBackendSession(backend: unknown, host?: Host): BackendSession;
 export declare function createFacade(session: BackendSession, descriptors: unknown): Record<string, unknown>;
 export declare function invokeOperation(session: BackendSession, descriptor: unknown, args?: unknown[]): unknown;
@@ -1293,7 +1329,7 @@ fn render_callback_methods(ast: &PublicAst, ty: &AstType) -> String {
     ast.operations
         .iter()
         .filter_map(|operation| {
-            let is_method = matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key)
+            let is_method = matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key && operation.kind == OperationKind::CallbackMethod)
                 || matches!(operation.source_key.owner(), OperationOwner::Object(key) if key == &ty.source_key && operation.kind == OperationKind::Method);
             if !is_method {
                 return None;
@@ -1390,7 +1426,10 @@ fn render_runtime_import_line(import: &str, extension: &str) -> Result<String, F
     if trimmed.is_empty() {
         return Ok(String::new());
     }
-    if trimmed.starts_with("import type ") {
+    // TOML custom-type configs may use either `import type { ... }` or the
+    // shorthand `type { ... }`.  Both are declaration-only dependencies and
+    // must never be emitted into executable `.js` component modules.
+    if trimmed.starts_with("import type ") || trimmed.starts_with("type ") {
         return Ok(String::new());
     }
     let normalized = if extension == "js" {
@@ -1793,7 +1832,7 @@ fn render_type_declaration(
         }
         AstTypeKind::Callback => {
             out.push_str(&format!("export interface {} {{\n", ty.name));
-            for operation in ast.operations.iter().filter(|operation| matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key)) {
+            for operation in ast.operations.iter().filter(|operation| matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key && operation.kind == OperationKind::CallbackMethod)) {
                 let args = operation.arguments.iter().map(|argument| format!("{}: {}", argument.name, render_public_type(ast, &argument.ty))).collect::<Vec<_>>().join(", ");
                 let return_type = operation.return_type.as_ref().map(|value| render_public_type(ast, value)).unwrap_or_else(|| "void".to_owned());
                 let return_type = if operation.async_kind == AsyncKind::Async { format!("Promise<{return_type}>") } else { return_type };
@@ -1830,10 +1869,10 @@ fn render_public_type(ast: &PublicAst, ty: &ValueType) -> String {
             render_public_type(ast, value)
         ),
         ValueType::Set(inner) => format!("Set<{}>", render_public_type(ast, inner)),
-        ValueType::InputStream(inner) => {
+        ValueType::InputStream { item: inner, .. } => {
             format!("UniFfiInputStream<{}>", render_public_type(ast, inner))
         }
-        ValueType::OutputStream(inner) => {
+        ValueType::OutputStream { item: inner, .. } => {
             format!("UniFfiStream<{}>", render_public_type(ast, inner))
         }
     }
@@ -1878,11 +1917,11 @@ fn render_value_descriptor(ast: &PublicAst, ty: &ValueType) -> String {
             "{{kind:\"set\",inner:{}}}",
             render_value_descriptor(ast, inner)
         ),
-        ValueType::InputStream(inner) => format!(
+        ValueType::InputStream { item: inner, .. } => format!(
             "{{kind:\"inputStream\",inner:{}}}",
             render_value_descriptor(ast, inner)
         ),
-        ValueType::OutputStream(inner) => format!(
+        ValueType::OutputStream { item: inner, .. } => format!(
             "{{kind:\"outputStream\",inner:{}}}",
             render_value_descriptor(ast, inner)
         ),
@@ -2078,7 +2117,7 @@ mod tests {
                        stream_slots: Vec<AstStreamSlot>| {
             let stream_resources = if kind == OperationKind::OutputStreamStart {
                 let item = match ret.as_ref() {
-                    Some(ValueType::OutputStream(item)) => item.as_ref().clone(),
+                    Some(ValueType::OutputStream { item, .. }) => item.as_ref().clone(),
                     _ => ValueType::Scalar(ScalarType::String),
                 };
                 let mut slots = BTreeMap::new();
@@ -2189,7 +2228,11 @@ mod tests {
             "events",
             "events",
             vec![],
-            Some(ValueType::OutputStream(Box::new(ValueType::Named(event)))),
+            Some(ValueType::OutputStream {
+                item: Box::new(ValueType::Named(event)),
+                error: Box::new(ValueType::Scalar(ScalarType::String)),
+                is_send: false,
+            }),
             AsyncKind::Sync,
             None,
             None,
@@ -2336,11 +2379,13 @@ mod tests {
             .unwrap();
         custom.imports = vec![
             "import type { TypeOnly } from \"./types.ts\";".into(),
+            "type { ShorthandOnly } from \"./shorthand.ts\";".into(),
             "import { convert } from \"./convert.ts\";".into(),
         ];
         let implementation =
             render_component_implementation(&ast, &ast.components[0], "js").unwrap();
         assert!(!implementation.contains("import type"));
+        assert!(!implementation.contains("ShorthandOnly"));
         assert!(!implementation.contains(".ts\""));
         assert!(implementation.contains("./convert.js"));
     }
@@ -3762,7 +3807,7 @@ const lease = createNamespace(leaseSession).getService();
 await leaseSession.close();
 lease.dispose();
 if (leaseReleases !== 1) throw Error("object close/dispose idempotence");
-const mixed = session.registerCallback(3, {syncMethod(value) { return value + 1; }, asyncMethod(value) { return Promise.resolve(value + 2); }}, {methods:{0:"syncMethod", 1:"asyncMethod"}});
+const mixed = session.registerCallback(3, {syncMethod(value) { return value + 1; }, asyncMethod(value) { return Promise.resolve(value + 2); }}, {methods:{0:{name:"syncMethod", async:false}, 1:{name:"asyncMethod", async:true}}});
 if (session.invokeCallbackSync(3, mixed, 0, [1]) !== 2) throw Error("sync callback");
 if (await session.invokeCallbackAsync(3, mixed, 1, 99, [1]) !== 3) throw Error("async callback");
 const badCallback = session.registerCallback(4, () => Promise.resolve(1), { methods: { 0: { name: null } } });

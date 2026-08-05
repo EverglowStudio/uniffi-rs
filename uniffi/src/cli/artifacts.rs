@@ -3,8 +3,9 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use super::javascript::{
-    build_napi, build_ohos, build_ohos_deferred, build_wasm, emit_mini_program_wasm_runtime,
-    generate_js, rebase_mini_program_auto_entrypoint, BuildNapiArgs, BuildOhosArgs, BuildWasmArgs,
+    build_napi_prepared, build_ohos_deferred_prepared, build_ohos_prepared, build_wasm_prepared,
+    cargo_build_command, emit_mini_program_wasm_runtime, generate_js,
+    run_command as javascript_run_command, BuildNapiArgs, BuildOhosArgs, BuildWasmArgs,
     NapiBuildFlavorArg, WasmBindgenTargetArg,
 };
 use anyhow::{bail, Context, Result};
@@ -16,7 +17,7 @@ use std::io::{Seek, Write};
 use std::os::unix::fs::symlink;
 use std::process::Command;
 use uniffi_bindgen::bindings::{generate, GenerateOptions, TargetLanguage};
-use uniffi_bindgen_javascript::{FlavorTarget, HostCrateOptions};
+use uniffi_bindgen_javascript::{package::GeneratedPackage, FlavorTarget, HostCrateOptions};
 
 use super::artifact_staging::*;
 
@@ -55,9 +56,15 @@ pub(crate) struct BuildArgs {
     #[clap(long)]
     source: Option<Utf8PathBuf>,
 
-    /// Directory (default `rust_modules`, or `<package-dir>/artifacts/rust` in managed mode) in which to emit generated host crates.
+    /// Directory (default `<out-dir>/native/hosts`, or `<package-dir>/native/hosts`
+    /// in managed mode) in which to emit generated host crates.
     #[clap(long = "host-crates-dir")]
     host_crates_dir: Option<Utf8PathBuf>,
+
+    /// Invocation package root. All generated source, native and host files
+    /// must remain below this directory.
+    #[clap(skip)]
+    package_root: Option<Utf8PathBuf>,
 
     #[clap(skip)]
     logical_host_crates_dir: Option<Utf8PathBuf>,
@@ -438,10 +445,11 @@ impl ManagedLayout {
         let meta = cargo_package_metadata(&args.manifest_path)?;
         let source_root = package_dir.join("src/ffi");
         let artifact_root = package_dir.join("artifacts");
-        let host_crates_root = artifact_root.join("rust");
+        let host_crates_root = package_dir.join("native/hosts");
 
         args.out_dir = Some(source_root.clone());
         args.host_crates_dir = Some(host_crates_root.clone());
+        args.package_root = Some(package_dir.clone());
         args.artifact_dir = Some(artifact_root.clone());
         if targets.harmony {
             args.ohos_dist_dir = Some(artifact_root.join("harmony/dist"));
@@ -532,32 +540,32 @@ impl ManagedLayout {
 
     fn emit_web_entrypoint(&self) -> Result<()> {
         self.write_entrypoint(
-            &self.package_dir.join("src/index.web.ts"),
-            &self.source_root.join("browser/index.web.ts"),
+            &self.package_dir.join("src/index.web.js"),
+            &self.source_root.join("browser/index.js"),
             "web",
         )
     }
 
     fn emit_mini_program_entrypoint(&self) -> Result<()> {
         self.write_entrypoint(
-            &self.package_dir.join("src/index.mini-program.ts"),
-            &self.source_root.join("browser/index.mini-program.ts"),
+            &self.package_dir.join("src/index.mini-program.js"),
+            &self.source_root.join("browser/index.mini-program.js"),
             "mini-program",
         )
     }
 
     fn emit_node_entrypoint(&self) -> Result<()> {
         self.write_entrypoint(
-            &self.package_dir.join("src/index.node.ts"),
-            &self.source_root.join("node/index.ts"),
+            &self.package_dir.join("src/index.node.js"),
+            &self.source_root.join("node/index.js"),
             "node",
         )
     }
 
     fn emit_electron_entrypoint(&self) -> Result<()> {
         self.write_entrypoint(
-            &self.package_dir.join("src/index.electron.ts"),
-            &self.source_root.join("electron/index.ts"),
+            &self.package_dir.join("src/index.electron.js"),
+            &self.source_root.join("electron/index.js"),
             "electron",
         )
     }
@@ -589,8 +597,12 @@ impl ManagedLayout {
         let gitignore = self.package_dir.join(".gitignore");
         let contents = "\
 # UniFFI generated build artifacts\n\
-/artifacts/\n\
 /target/\n\
+/cache/\n\
+/dist/\n\
+/artifacts/**/target/\n\
+/artifacts/**/cache/\n\
+/artifacts/**/dist/\n\
 node_modules/\n\
 *.node\n\
 *.wasm\n\
@@ -653,6 +665,7 @@ fn managed_private_args(
     };
     private.out_dir = public.out_dir.as_deref().map(rebase).transpose()?;
     private.host_crates_dir = public.host_crates_dir.as_deref().map(rebase).transpose()?;
+    private.package_root = Some(stage.root().to_path_buf());
     private.artifact_dir = public.artifact_dir.as_deref().map(rebase).transpose()?;
     private.wasm_bindgen_out_dir = public
         .wasm_bindgen_out_dir
@@ -697,7 +710,10 @@ fn managed_private_args(
     private.wasm_target_dir =
         (targets.wasm || targets.mini_program).then(|| build_root.join("wasm/host"));
     private.ohos_target_dir = targets.harmony.then(|| build_root.join("ohos"));
-    private.logical_host_crates_dir = None;
+    // Generated host manifests are rendered once in the staging tree.  Their
+    // dependency paths must point at the eventual package-relative host root,
+    // never at the invocation-private staging directory.
+    private.logical_host_crates_dir = Some(layout.host_crates_root.clone());
     private.managed_layout = false;
     Ok(private)
 }
@@ -831,7 +847,7 @@ fn invocation_output_specs(
     let out_dir = resolve_cwd_path(&args.out_dir()?)?;
     add("generated source root", out_dir.clone(), true);
     let host_root = resolve_cwd_path(&args.host_crates_dir())?;
-    let mut add_host = |kind: &str, build_script: bool, facade: bool| {
+    let mut add_host = |kind: &str, build_script: bool| {
         let root = host_root.join(kind);
         add(
             &format!("{kind} host Cargo manifest"),
@@ -850,23 +866,33 @@ fn invocation_output_specs(
                 false,
             );
         }
-        if facade {
-            add(
-                "OHOS facade bundle",
-                root.join("uniffi-ohos-facade-bundle.json"),
-                false,
-            );
-        }
         add(&format!("{kind} host source"), root.join("src"), true);
     };
     if targets.wasm || targets.mini_program {
-        add_host("wasm", false, false);
+        add_host("wasm", false);
     }
     if targets.node || targets.electron {
-        add_host("napi", true, false);
+        add_host("napi", true);
     }
     if targets.harmony {
-        add_host("ohos", true, true);
+        add_host("ohos", true);
+    }
+    let package_root = resolve_cwd_path(&args.package_root())?;
+    let mut add_native = |name: &str| {
+        add(
+            &format!("{name} native engine adapter"),
+            package_root.join(format!("native/{name}.rs")),
+            false,
+        );
+    };
+    if targets.wasm || targets.mini_program {
+        add_native("wasm");
+    }
+    if targets.node || targets.electron {
+        add_native("node");
+    }
+    if targets.harmony {
+        add_native("ohos");
     }
 
     let covered_by_out = |path: &Utf8Path| -> Result<bool> {
@@ -941,7 +967,8 @@ fn mirror_build_args(
 ) -> Result<BuildArgs> {
     let mut private = public.clone();
     let public_host = resolve_cwd_path(&public.host_crates_dir())?;
-    private.logical_host_crates_dir = None;
+    private.logical_host_crates_dir = Some(public_host.clone());
+    private.package_root = Some(mirror.root.clone());
     private.out_dir = Some(mirror.map(&public.out_dir()?)?);
     private.host_crates_dir = Some(mirror.map(&public_host)?);
     private.artifact_dir = public
@@ -1012,7 +1039,20 @@ fn private_output_sources(
         }
         Ok(())
     };
-    add(Some(public.out_dir()?), Some(private.out_dir()?))?;
+    let public_out = public.out_dir()?;
+    let private_out = private.out_dir()?;
+    let public_package_root = public.package_root();
+    let private_package_root = private.package_root();
+    if public_package_root == public_out {
+        // Direct invocations use the source directory as their package root;
+        // the mirrored invocation has a larger root containing native files.
+        add(Some(public_package_root), Some(private_package_root))?;
+    } else {
+        add(Some(public_out), Some(private_out.clone()))?;
+        if private_package_root != private_out {
+            add(Some(public_package_root), Some(private_package_root))?;
+        }
+    }
     add(
         Some(resolve_cwd_path(&public.host_crates_dir())?),
         Some(resolve_cwd_path(&private.host_crates_dir())?),
@@ -1088,85 +1128,6 @@ fn private_output_sources(
     Ok(sources)
 }
 
-fn rebase_private_javascript_host_crates(
-    public: &BuildArgs,
-    private: &BuildArgs,
-    targets: &ExpandedTargets,
-) -> Result<()> {
-    let mut flavors = Vec::new();
-    if targets.wasm || targets.mini_program {
-        flavors.push(FlavorTarget::Wasm);
-    }
-    if targets.node {
-        flavors.push(FlavorTarget::Napi);
-    }
-    if targets.electron {
-        flavors.push(FlavorTarget::Electron);
-    }
-    if targets.harmony {
-        flavors.push(FlavorTarget::Harmony);
-    }
-    if flavors.is_empty() {
-        return Ok(());
-    }
-    let meta = cargo_package_metadata(&public.manifest_path)?;
-    let generation_source = private
-        .source
-        .clone()
-        .or_else(|| private.library_path.clone())
-        .unwrap_or_else(|| {
-            if targets.wasm || targets.mini_program {
-                private
-                    .wasm_core_target_dir
-                    .as_ref()
-                    .map(|target| host_cdylib_path_in(&meta, target, private.release))
-                    .unwrap_or_else(|| host_cdylib_path(&meta, private.release))
-            } else {
-                host_cdylib_path(&meta, private.release)
-            }
-        });
-    if !generation_source.exists() {
-        bail!("private artifact rebase source does not exist: {generation_source}");
-    }
-    generate_js(
-        &private.manifest_path,
-        generation_source,
-        private.out_dir()?,
-        private.config.clone(),
-        private.crate_name.clone(),
-        private.metadata_no_deps,
-        private.no_format,
-        Some(HostCrateOptions {
-            manifest_path: private.manifest_path.clone(),
-            host_crates_dir: private.host_crates_dir(),
-            // Relative Cargo paths must be calculated from the canonical
-            // public filesystem depth. On macOS `/var` publishes under
-            // `/private/var`; using the logical alias here leaves every
-            // external dependency one ancestor short after the root swap.
-            logical_host_crates_dir: Some(canonicalize_invocation_output(
-                &public.host_crates_dir(),
-            )?),
-            logical_out_dir: Some(canonicalize_invocation_output(&public.out_dir()?)?),
-            ohos_rs_dir: None,
-        }),
-        flavors,
-        private.artifact_dir.clone(),
-    )
-    .context("rebasing invocation-private JavaScript host manifests to public paths")?;
-    if targets.mini_program {
-        let wasm_stem =
-            uniffi_bindgen_javascript::host_crates::composite_host_lib_target(&meta.package_name);
-        rebase_mini_program_auto_entrypoint(
-            &private.out_dir()?,
-            &canonicalize_invocation_output(&public.out_dir()?)?,
-            &canonicalize_invocation_output(&public.mini_program_out_dir()?)?,
-            &wasm_stem,
-        )
-        .context("rebasing invocation-private Mini Program entrypoint to public paths")?;
-    }
-    Ok(())
-}
-
 fn build_multi_target_hsp(mut public_args: BuildArgs, targets: ExpandedTargets) -> Result<()> {
     super::ohos::preflight_hsp_arches(&public_args.ohos_arch)
         .context("validating Harmony HSP architectures before publication planning")?;
@@ -1175,7 +1136,9 @@ fn build_multi_target_hsp(mut public_args: BuildArgs, targets: ExpandedTargets) 
     let mirror = InvocationMirror::new()?;
     (|| -> Result<()> {
         let private_args = mirror_build_args(&public_args, &mirror, &targets)?;
-        let prepared_hsp = build_ohos_deferred(private_args.to_ohos_args()?)
+        let package = prepare_javascript_package(&private_args, &targets)
+            .context("preparing one JavaScript package for the HSP invocation")?;
+        let prepared_hsp = build_ohos_deferred_prepared(private_args.to_ohos_args()?, &package)
             .context("building deferred Harmony HSP participant")?;
 
         if targets.apple {
@@ -1185,7 +1148,7 @@ fn build_multi_target_hsp(mut public_args: BuildArgs, targets: ExpandedTargets) 
             build_android(&private_args).context("building private Android artifact target")?;
         }
         if targets.wasm || targets.mini_program {
-            build_wasm(private_args.to_wasm_args()?)
+            build_wasm_prepared(private_args.to_wasm_args()?, &package)
                 .context("building private wasm artifact target")?;
         }
         if targets.mini_program {
@@ -1209,11 +1172,9 @@ fn build_multi_target_hsp(mut public_args: BuildArgs, targets: ExpandedTargets) 
             napi_flavors.push(NapiBuildFlavorArg::Electron);
         }
         if !napi_flavors.is_empty() {
-            build_napi(private_args.to_napi_args(napi_flavors)?)
+            build_napi_prepared(private_args.to_napi_args(napi_flavors)?, &package)
                 .context("building private N-API artifact target")?;
         }
-        rebase_private_javascript_host_crates(&public_args, &private_args, &targets)?;
-
         let generic_sources = private_output_sources(&public_args, &private_args, &specs)?;
         let generic_outputs = generic_sources
             .iter()
@@ -1234,10 +1195,100 @@ fn build_multi_target_hsp(mut public_args: BuildArgs, targets: ExpandedTargets) 
     })()
 }
 
-fn build_private_target_set(args: &BuildArgs, targets: &ExpandedTargets) -> Result<()> {
+/// Prepare the complete JavaScript package once for a coordinated artifact
+/// invocation.  The target builders below only consume the files produced by
+/// this call; they must not run the generator again.
+fn prepare_javascript_package(
+    args: &BuildArgs,
+    targets: &ExpandedTargets,
+) -> Result<GeneratedPackage> {
+    let mut flavors = Vec::new();
+    if targets.wasm || targets.mini_program {
+        flavors.push(FlavorTarget::Wasm);
+    }
+    if targets.node {
+        flavors.push(FlavorTarget::Napi);
+    }
+    if targets.electron {
+        flavors.push(FlavorTarget::Electron);
+    }
+    if targets.harmony {
+        flavors.push(FlavorTarget::Harmony);
+    }
+    if flavors.is_empty() {
+        bail!("JavaScript package preparation requires at least one target flavor");
+    }
+
+    let manifest_path = args.manifest_path.clone();
+    let metadata = cargo_package_metadata(&manifest_path)?;
+    let core_target_dir = if targets.wasm || targets.mini_program {
+        args.wasm_core_target_dir
+            .as_deref()
+            .map(resolve_cwd_path)
+            .transpose()?
+    } else {
+        None
+    };
+    let mut build_core =
+        cargo_build_command(&args.cargo_bin, &manifest_path, &[], args.release, None);
+    add_cargo_feature_args(&mut build_core, args);
+    if let Some(target_dir) = &core_target_dir {
+        build_core
+            .env("CARGO_TARGET_DIR", target_dir.as_str())
+            .env("CARGO_INCREMENTAL", "0");
+    }
+    javascript_run_command(
+        &args.cargo_bin,
+        &mut build_core,
+        "cargo",
+        "install Rust's cargo toolchain or pass --cargo-bin <path>",
+    )?;
+
+    let generation_source = if let Some(source) = &args.source {
+        source.clone()
+    } else {
+        let library_path = args.library_path.clone().unwrap_or_else(|| {
+            core_target_dir
+                .as_deref()
+                .map(|target| host_cdylib_path_in(&metadata, target, args.release))
+                .unwrap_or_else(|| host_cdylib_path(&metadata, args.release))
+        });
+        if !library_path.exists() {
+            bail!(
+                "built library not found at {}. Ensure the downstream crate declares a cdylib target, pass --library-path <path>, or pass --source <udl-or-library>",
+                library_path
+            );
+        }
+        library_path
+    };
+
+    generate_js(
+        &manifest_path,
+        generation_source,
+        args.out_dir()?,
+        args.package_root(),
+        args.config.clone(),
+        args.crate_name.clone(),
+        args.metadata_no_deps,
+        args.no_format,
+        HostCrateOptions {
+            manifest_path: manifest_path.clone(),
+            host_crates_dir: args.host_crates_dir(),
+            logical_host_crates_dir: args.logical_host_crates_dir.clone(),
+        },
+        flavors,
+        args.artifact_dir.clone(),
+    )
+}
+
+fn build_private_target_set(
+    args: &BuildArgs,
+    targets: &ExpandedTargets,
+    package: &GeneratedPackage,
+) -> Result<()> {
     let hsp_first = targets.harmony && args.ohos_package_kind == super::ohos::PackageKind::Hsp;
     if hsp_first {
-        build_ohos_deferred(args.to_ohos_args()?)
+        build_ohos_deferred_prepared(args.to_ohos_args()?, package)
             .context("building private managed Harmony HSP outputs")?
             .commit_private()
             .context("publishing private managed Harmony HSP outputs")?;
@@ -1249,7 +1300,8 @@ fn build_private_target_set(args: &BuildArgs, targets: &ExpandedTargets) -> Resu
         build_android(args).context("building private managed Android target")?;
     }
     if targets.wasm || targets.mini_program {
-        build_wasm(args.to_wasm_args()?).context("building private managed wasm target")?;
+        build_wasm_prepared(args.to_wasm_args()?, package)
+            .context("building private managed wasm target")?;
     }
     if targets.mini_program {
         let meta = cargo_package_metadata(&args.manifest_path)?;
@@ -1270,10 +1322,12 @@ fn build_private_target_set(args: &BuildArgs, targets: &ExpandedTargets) -> Resu
         flavors.push(NapiBuildFlavorArg::Electron);
     }
     if !flavors.is_empty() {
-        build_napi(args.to_napi_args(flavors)?).context("building private managed N-API target")?;
+        build_napi_prepared(args.to_napi_args(flavors)?, package)
+            .context("building private managed N-API target")?;
     }
     if targets.harmony && !hsp_first {
-        build_ohos(args.to_ohos_args()?).context("building private managed Harmony target")?;
+        build_ohos_prepared(args.to_ohos_args()?, package)
+            .context("building private managed Harmony target")?;
     }
     Ok(())
 }
@@ -1287,8 +1341,9 @@ fn build_managed_package(
     let private_layout = layout.rebased(stage.root())?;
     (|| -> Result<()> {
         let private_args = managed_private_args(&stage, &layout, &public_args, &targets)?;
-        build_private_target_set(&private_args, &targets)?;
-        rebase_private_javascript_host_crates(&public_args, &private_args, &targets)?;
+        let package = prepare_javascript_package(&private_args, &targets)
+            .context("preparing one managed JavaScript package")?;
+        build_private_target_set(&private_args, &targets, &package)?;
         let meta = cargo_package_metadata(&public_args.manifest_path)?;
         private_layout
             .emit_supporting_files(&targets, &meta, &private_args)
@@ -1306,9 +1361,6 @@ fn build_managed_package(
                     .with_context(|| format!("reading managed build scratch {build_root}"))
             }
         }
-        if stage.root().join("artifact-manifest.json").exists() {
-            bail!("managed package must not contain artifact-manifest.json");
-        }
         Ok(())
     })()?;
     stage.publish()
@@ -1320,6 +1372,7 @@ fn build(mut args: BuildArgs) -> Result<()> {
         bail!("--target mini-program requires --wasm-bindgen-target web");
     }
     let managed_layout = ManagedLayout::apply(&mut args, &targets)?;
+    validate_package_root_paths(&args)?;
     // Reject deterministic Android toolchain errors before creating the
     // sibling managed staging directory. Managed output containment is
     // validated by `ManagedLayout::apply` before this toolchain probe.
@@ -1356,6 +1409,19 @@ fn build(mut args: BuildArgs) -> Result<()> {
         return build_multi_target_hsp(args, targets);
     }
     (|| -> Result<()> {
+        let javascript_package = if targets.wasm
+            || targets.mini_program
+            || targets.node
+            || targets.electron
+            || targets.harmony
+        {
+            Some(
+                prepare_javascript_package(&args, &targets)
+                    .context("preparing one JavaScript package for the artifact invocation")?,
+            )
+        } else {
+            None
+        };
         if targets.apple {
             build_apple(&args).context("building Apple artifact target")?;
         }
@@ -1363,7 +1429,13 @@ fn build(mut args: BuildArgs) -> Result<()> {
             build_android(&args).context("building Android artifact target")?;
         }
         if targets.wasm || targets.mini_program {
-            build_wasm(args.to_wasm_args()?).context("building wasm artifact target")?;
+            build_wasm_prepared(
+                args.to_wasm_args()?,
+                javascript_package
+                    .as_ref()
+                    .context("wasm artifact invocation has no prepared JavaScript package")?,
+            )
+            .context("building wasm artifact target")?;
         }
         if targets.mini_program {
             let meta = cargo_package_metadata(&args.manifest_path)?;
@@ -1386,16 +1458,55 @@ fn build(mut args: BuildArgs) -> Result<()> {
             napi_flavors.push(NapiBuildFlavorArg::Electron);
         }
         if !napi_flavors.is_empty() {
-            build_napi(args.to_napi_args(napi_flavors)?)
-                .context("building N-API artifact target")?;
+            build_napi_prepared(
+                args.to_napi_args(napi_flavors)?,
+                javascript_package
+                    .as_ref()
+                    .context("N-API artifact invocation has no prepared JavaScript package")?,
+            )
+            .context("building N-API artifact target")?;
         }
         if targets.harmony {
-            build_ohos(args.to_ohos_args()?)
-                .context("building Harmony/OpenHarmony artifact target")?;
+            build_ohos_prepared(
+                args.to_ohos_args()?,
+                javascript_package
+                    .as_ref()
+                    .context("Harmony artifact invocation has no prepared JavaScript package")?,
+            )
+            .context("building Harmony/OpenHarmony artifact target")?;
         }
 
         Ok(())
     })()
+}
+
+fn validate_package_root_paths(args: &BuildArgs) -> Result<()> {
+    let root = canonicalize_invocation_output(&args.package_root())?;
+    let mut outputs = vec![
+        ("host crates", Some(args.host_crates_dir())),
+        ("artifact", args.artifact_dir.clone()),
+        ("wasm-bindgen", args.wasm_bindgen_out_dir.clone()),
+        ("OHOS dist", args.ohos_dist_dir.clone()),
+        ("OHOS HAR", args.ohos_har_out.clone()),
+        ("OHOS runtime HSP", args.ohos_runtime_hsp_out.clone()),
+        ("OHOS interface HAR", args.ohos_interface_har_out.clone()),
+        ("OHOS tgz", args.ohos_tgz_out.clone()),
+        ("Apple XCFramework", args.apple_xcframework_out.clone()),
+        ("Apple Swift", args.apple_swift_out.clone()),
+        ("Android JNI", args.android_jni_libs_out.clone()),
+        ("Android Kotlin", args.android_kotlin_out.clone()),
+        ("Android AAR", args.android_aar_out.clone()),
+    ];
+    for (label, path) in outputs
+        .drain(..)
+        .filter_map(|(label, path)| path.map(|p| (label, p)))
+    {
+        let path = canonicalize_invocation_output(&path)?;
+        if path == root || !path.starts_with(&root) {
+            bail!("{label} output {path} must remain below package root {root}");
+        }
+    }
+    Ok(())
 }
 
 fn build_android(args: &BuildArgs) -> Result<()> {
@@ -1772,9 +1883,17 @@ impl BuildArgs {
     }
 
     fn host_crates_dir(&self) -> Utf8PathBuf {
-        self.host_crates_dir
+        self.host_crates_dir.clone().unwrap_or_else(|| {
+            self.out_dir()
+                .expect("out_dir is validated")
+                .join("native/hosts")
+        })
+    }
+
+    fn package_root(&self) -> Utf8PathBuf {
+        self.package_root
             .clone()
-            .unwrap_or_else(|| Utf8PathBuf::from("rust_modules"))
+            .unwrap_or_else(|| self.out_dir().expect("out_dir is validated"))
     }
 
     fn wasm_bindgen_out_dir(&self) -> Result<Utf8PathBuf> {
@@ -1812,6 +1931,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir(),
+            package_root: self.package_root(),
             logical_host_crates_dir: self.logical_host_crates_dir.clone(),
             artifact_dir: self.artifact_dir.clone(),
             wasm_bindgen_out_dir: self.wasm_bindgen_out_dir.clone(),
@@ -1835,6 +1955,7 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir(),
+            package_root: self.package_root(),
             logical_host_crates_dir: self.logical_host_crates_dir.clone(),
             artifact_dir: self.artifact_dir.clone(),
             flavor,
@@ -1856,9 +1977,9 @@ impl BuildArgs {
             library_path: self.library_path.clone(),
             source: self.source.clone(),
             host_crates_dir: self.host_crates_dir(),
+            package_root: self.package_root(),
             logical_host_crates_dir: self.logical_host_crates_dir.clone(),
             ohos_host_manifest_path: None,
-            raw_only_facade: false,
             artifact_dir: self.artifact_dir.clone(),
             dist_dir: self.ohos_dist_dir.clone(),
             package_name: self.ohos_package_name.clone(),
