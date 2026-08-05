@@ -2050,8 +2050,9 @@ fn render_callback_error_helper(
                 continue;
             }
             out.push_str(&format!(
-                "  if (variant === \"{}\") {{ if (declared.data === null) throw new UniffiError(\"UniffiCallbackProtocol\", \"callback error payload is missing\"); const payloadValue: ArkValue = declared.data; const data: ArkRecord = new ArkRecord();\n",
-                variant.name
+                "  if (variant === \"{}\") {{ if (declared.data === null) throw new UniffiError(\"UniffiCallbackProtocol\", \"callback error payload is missing\"); const payloadValue: ArkValue = declared.data; const data: __ArkRecordCarrier{} = {{}};\n",
+                variant.name,
+                error_type.id.index()
             ));
             for field in &variant.fields {
                 let lower = lower_helper(
@@ -2071,7 +2072,7 @@ fn render_callback_error_helper(
                     Some(operation.id),
                 );
                 out.push_str(&format!(
-                    "    data.set(\"{}\", {}(__arkRecordField{}(payloadValue, \"{}\") as {}, session));\n",
+                    "    data.{} = {}(__arkRecordField{}(payloadValue, \"{}\") as {}, session);\n",
                     field.name,
                     lower,
                     error_type.id.index(),
@@ -2080,7 +2081,7 @@ fn render_callback_error_helper(
                 ));
             }
             out.push_str(&format!(
-                "    return new {}(declared.message, variant, data); }}\n",
+                "    return new {}(declared.message, variant, data as ArkValue); }}\n",
                 error_name
             ));
         }
@@ -2421,7 +2422,7 @@ fn lower_body(
                 operation_id,
             );
             format!(
-                "const result: Map<ArkValue, ArkValue> = new Map<ArkValue, ArkValue>();\n{expression}.forEach((entryValue: {value_type}, entryKey: {key_type}): void => {{ result.set({key_call}, {value_call}); }});\nreturn result;",
+                "if (!({expression} instanceof Map)) throw new UniffiError(\"UniffiMapType\", \"expected JavaScript Map\");\nconst result: Map<ArkValue, ArkValue> = new Map<ArkValue, ArkValue>();\n{expression}.forEach((entryValue: {value_type}, entryKey: {key_type}): void => {{ result.set({key_call}, {value_call}); }});\nreturn result;",
                 value_type = render_type_name(model, value),
                 key_type = render_type_name(model, key)
             )
@@ -2546,6 +2547,17 @@ fn lower_body(
                     body
                 }
                 AstTypeKind::Enum { variants } => {
+                    if variants.iter().all(|variant| variant.fields.is_empty()) {
+                        let mut body = String::new();
+                        for variant in variants {
+                            body.push_str(&format!(
+                                "if ({expression}.tag === \"{}\") return \"{}\" as ArkValue;\n",
+                                variant.name, variant.name
+                            ));
+                        }
+                        body.push_str("throw new UniffiError(\"UniffiEnumVariant\", \"unrecognized enum variant\");");
+                        return body;
+                    }
                     let carrier_name = format!("__ArkRecordCarrier{}", named.id.index());
                     let mut body = String::new();
                     for variant in variants {
@@ -2570,6 +2582,19 @@ fn lower_body(
                 }
                 AstTypeKind::Error { variants } => {
                     let error_name = model.type_name(key);
+                    if variants.iter().all(|variant| variant.fields.is_empty()) {
+                        let mut body = format!(
+                            "if (!({expression} instanceof {error_name})) throw new UniffiError(\"UniffiErrorType\", \"expected {error_name}\");\nconst declared: {error_name} = {expression} as {error_name};\nconst variant: string | null = declared.variant;\n"
+                        );
+                        for variant in variants {
+                            body.push_str(&format!(
+                                "if (variant === \"{}\") return \"{}\" as ArkValue;\n",
+                                variant.name, variant.name
+                            ));
+                        }
+                        body.push_str("throw new UniffiError(\"UniffiErrorVariant\", \"unrecognized error variant\");");
+                        return body;
+                    }
                     let carrier_name = format!("__ArkRecordCarrier{}", named.id.index());
                     let mut body = format!(
                         "if (!({expression} instanceof {error_name})) throw new UniffiError(\"UniffiErrorType\", \"expected {error_name}\");\nconst declared: {error_name} = {expression} as {error_name};\nconst variant: string | null = declared.variant;\nconst result: {carrier_name} = {{}};\n"
@@ -2788,11 +2813,21 @@ fn lift_body(
                     body
                 }
                 AstTypeKind::Enum { variants } => {
-                    let mut body = format!(
-                        "const tag: string = {}({}, \"tag\") as string;\n",
-                        record_field_reader_name(named.id.index()),
-                        expression
-                    );
+                    let unit_only = variants.iter().all(|variant| variant.fields.is_empty());
+                    let mut body = if unit_only {
+                        format!(
+                            "const rawValue: ArkValue = {expression}; const rawCarrier: __ArkRecordCarrier{} = rawValue as __ArkRecordCarrier{}; const rawTag: ArkValue | undefined = rawValue instanceof ArkRecord ? {}(rawValue, \"tag\") : rawCarrier.tag; const tag: string = (rawTag === undefined ? rawValue : rawTag) as string;\n",
+                            named.id.index(),
+                            named.id.index(),
+                            record_field_reader_name(named.id.index())
+                        )
+                    } else {
+                        format!(
+                            "const tag: string = {}({}, \"tag\") as string;\n",
+                            record_field_reader_name(named.id.index()),
+                            expression
+                        )
+                    };
                     for variant in variants {
                         let variant_name =
                             format!("{}_{}", model.type_name(key), safe_ident(&variant.name));
@@ -2824,11 +2859,21 @@ fn lift_body(
                 }
                 AstTypeKind::Error { variants } => {
                     let error_name = model.type_name(key);
-                    let mut body = format!(
-                        "const tag: string = {}({}, \"tag\") as string;\n",
-                        record_field_reader_name(named.id.index()),
-                        expression
-                    );
+                    let unit_only = variants.iter().all(|variant| variant.fields.is_empty());
+                    let mut body = if unit_only {
+                        format!(
+                            "const rawValue: ArkValue = {expression}; const rawCarrier: __ArkRecordCarrier{} = rawValue as __ArkRecordCarrier{}; const rawTag: ArkValue | undefined = rawValue instanceof ArkRecord ? {}(rawValue, \"tag\") : rawCarrier.tag; const tag: string = (rawTag === undefined ? rawValue : rawTag) as string;\n",
+                            named.id.index(),
+                            named.id.index(),
+                            record_field_reader_name(named.id.index())
+                        )
+                    } else {
+                        format!(
+                            "const tag: string = {}({}, \"tag\") as string;\n",
+                            record_field_reader_name(named.id.index()),
+                            expression
+                        )
+                    };
                     for variant in variants {
                         if variant.fields.is_empty() {
                             body.push_str(&format!(

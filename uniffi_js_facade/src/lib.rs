@@ -2902,6 +2902,8 @@ mod tests {
         )
         .unwrap();
         assert!(source.contains("const payloadValue: ArkValue = declared.data"));
+        assert!(source.contains("const data: __ArkRecordCarrier2 = {}"));
+        assert!(source.contains("data.message = "));
         assert!(source.contains("__arkRecordField2(payloadValue, \"message\") as string"));
         assert!(!source.contains("payloadValue instanceof ArkRecord"));
         assert!(!source.contains("const payload: ArkRecord = payloadValue"));
@@ -2912,8 +2914,36 @@ mod tests {
 
     #[test]
     fn ark_composite_owner_and_stream_surface_is_canonical() {
+        let mut ast = corpus_ast();
+        let component = ComponentKey::new("corpus").unwrap();
+        let color = key(&component, "Color");
+        ast.operations.push(AstOperation {
+            id: OperationId::new(16),
+            source_key: operation_key(
+                &component,
+                OperationOwner::Namespace,
+                OperationKind::Function,
+                "roundtrip_color",
+            ),
+            component_id: ComponentId::new(0),
+            name: "roundtripColor".into(),
+            debug_name: "roundtripColor".into(),
+            kind: OperationKind::Function,
+            arguments: vec![AstArgument {
+                name: "value".into(),
+                ty: ValueType::Named(color.clone()),
+                default: None,
+            }],
+            return_type: Some(ValueType::Named(color)),
+            async_kind: AsyncKind::Sync,
+            throws: None,
+            receiver_type: None,
+            callback_method_id: None,
+            stream_slots: vec![],
+            stream_resources: vec![],
+        });
         let implementation = String::from_utf8(
-            render_ark_inventory(&corpus_ast())
+            render_ark_inventory(&ast)
                 .unwrap()
                 .into_iter()
                 .find(|file| file.path == "Index.ets")
@@ -2936,6 +2966,9 @@ mod tests {
         assert!(implementation
             .contains("if (!(source instanceof Map)) throw new UniffiError(\"UniffiMapType\""));
         assert!(implementation.contains("let __frameEnded: boolean = false"));
+        assert!(implementation.contains("if (value.tag === \"Red\") return \"Red\" as ArkValue;"));
+        assert!(implementation
+            .contains("const rawCarrier: __ArkRecordCarrier6 = rawValue as __ArkRecordCarrier6"));
         assert!(!implementation.contains(".then((value: ArkValue): void => { session.endCallFrame"));
         assert!(!implementation.contains("}, (error: Error):"));
     }
