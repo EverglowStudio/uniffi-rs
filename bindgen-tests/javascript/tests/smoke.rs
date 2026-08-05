@@ -7,29 +7,11 @@
 
 mod support;
 
+#[path = "support/shared.rs"]
+mod shared;
+
+use shared::*;
 use support::*;
-
-fn locate_node_with_strip_types() -> Option<std::path::PathBuf> {
-    let node = which_node()?;
-    let output = Command::new(&node).arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let version = String::from_utf8_lossy(&output.stdout);
-    let mut parts = version.trim().trim_start_matches('v').split('.');
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor: u32 = parts.next()?.parse().ok()?;
-    (major > 22 || (major == 22 && minor >= 6)).then_some(node)
-}
-
-fn which_node() -> Option<std::path::PathBuf> {
-    let output = Command::new("which").arg("node").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!path.is_empty()).then_some(path.into())
-}
 
 #[test]
 fn generates_minimal_package_tree() {
@@ -84,8 +66,7 @@ fn generates_minimal_package_tree() {
 
 #[test]
 fn runs_component_api_under_node() {
-    let node = locate_node_with_strip_types()
-        .expect("node 22.6+ with --experimental-strip-types is required");
+    let node = locate_node_with_strip_types();
 
     let out = tempfile::tempdir().unwrap();
     let package_root = Utf8PathBuf::from_path_buf(out.path().to_path_buf()).unwrap();

@@ -6,75 +6,15 @@
 //! cargo test -p uniffi-bindgen-tests-javascript --test benchmark -- --ignored --nocapture
 //! ```
 
+mod support;
+
+#[path = "support/shared.rs"]
+mod shared;
+
 use camino::Utf8PathBuf;
+use shared::*;
 use std::process::Command;
-
-fn workspace_root() -> Utf8PathBuf {
-    let manifest = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.join("../..").canonicalize_utf8().unwrap()
-}
-
-fn which_tool(name: &str) -> Option<std::path::PathBuf> {
-    let output = Command::new("which").arg(name).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.into())
-    }
-}
-
-fn has_wasm32_target(cargo: &std::path::Path) -> bool {
-    if let Ok(out) = Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).contains("wasm32-unknown-unknown");
-        }
-    }
-    let _ = cargo;
-    true
-}
-
-fn node_supports_strip_types(node: &std::path::Path) -> bool {
-    let Ok(output) = Command::new(node)
-        .arg("--experimental-strip-types")
-        .arg("--no-warnings")
-        .arg("-e")
-        .arg("console.log('ok')")
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
-}
-
-fn build_uniffi_bindgen(root: &Utf8PathBuf, cargo: &std::path::Path) {
-    let output = Command::new(cargo)
-        .current_dir(root.as_std_path())
-        .args([
-            "build",
-            "-p",
-            "uniffi",
-            "--features",
-            "cli",
-            "--bin",
-            "uniffi-bindgen",
-        ])
-        .output()
-        .expect("failed to build uniffi-bindgen");
-    if !output.status.success() {
-        panic!(
-            "building uniffi-bindgen failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-}
+use support::*;
 
 fn write_benchmark_fixture(root: &std::path::Path) -> Utf8PathBuf {
     let crate_dir = root.join("js_benchmark_fixture");
@@ -545,42 +485,25 @@ fn javascript_stream_benchmark_fixture_smoke() {
 #[test]
 #[ignore = "opt-in generated JavaScript benchmark"]
 fn javascript_generated_entrypoint_benchmark_quick() {
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("SKIP javascript benchmark: cargo unavailable");
-        return;
-    };
-    if !has_wasm32_target(&cargo) {
-        eprintln!("SKIP javascript benchmark: wasm32-unknown-unknown target not installed");
-        return;
-    }
-    let Some(node) = which_tool("node") else {
-        eprintln!("SKIP javascript benchmark: node unavailable");
-        return;
-    };
-    if !node_supports_strip_types(&node) {
-        eprintln!("SKIP javascript benchmark: node --experimental-strip-types unavailable");
-        return;
-    }
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
+    let node = which_tool("node");
+    assert_node_strip_types(&node);
 
     let root = workspace_root();
-    build_uniffi_bindgen(&root, &cargo);
-
-    let cli = root.join(if cfg!(windows) {
-        "target/debug/uniffi-bindgen.exe"
-    } else {
-        "target/debug/uniffi-bindgen"
-    });
-    assert!(cli.exists(), "expected built CLI at {cli}");
+    let cli = build_uniffi_bindgen_cli(&cargo);
 
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
     let pkg_dir = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
-    let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target")).unwrap();
+    let target_dir = shared_cargo_target_dir("benchmark");
+    let _target_lock = shared_cargo_target_lock("benchmark");
     let manifest = write_benchmark_fixture(tmp.path());
 
     let output = Command::new(cli.as_std_path())
         .current_dir(&root)
+        .env("CARGO_TARGET_DIR", target_dir.as_std_path())
         .arg("javascript")
         .arg("build")
         .arg("--manifest-path")

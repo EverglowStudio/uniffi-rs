@@ -51,7 +51,7 @@ low-level pull is a misuse error; it is not a second consumer.
 
 Completion is never represented by a nullable item. In particular,
 `UniFfiStream<Option<T>, E>` distinguishes `Item(None)` from `Done`. There is
-no nullable-EOF decoder, old-symbol fallback, or legacy step alias.
+no nullable-EOF decoder or alternate step alias.
 
 This is a breaking native output ABI change. Regenerate every binding together
 with the Rust library; mixed old and new generated bindings are unsupported.
@@ -155,10 +155,9 @@ per-component native binaries. Cross-component types reference their owning
 component.
 
 Managed output is one indivisible package directory. Source, composite hosts,
-platform wrappers, and the stream/type metadata consumed by those wrappers are
-created in the same staging build and published together. Consumers use the
-fixed paths inside that root; there is no artifact manifest or cross-file
-identity graph.
+platform wrappers, and the declarations consumed by those wrappers are created
+in the same staging build and published together. Consumers use the fixed paths
+inside that root; the package has no separate inventory file.
 
 Files from different generator runs must not be combined. When the generated
 format changes, delete the package root and generate it again. A future
@@ -169,9 +168,8 @@ HAR is the default package kind. HSP is an explicit package kind, and the two
 publish the same public namespace surface. Core package/HAP validation is
 separate from the availability of a standalone CodeLinter executable.
 
-No HSP aggregate metadata file is published. The namespace and stream surfaces
-are already materialized in the generated ArkTS source and declarations before
-Hvigor packages them.
+The namespace and stream surfaces are already materialized in the generated
+ArkTS source and declarations before Hvigor packages them.
 
 ## wasm-bindgen
 

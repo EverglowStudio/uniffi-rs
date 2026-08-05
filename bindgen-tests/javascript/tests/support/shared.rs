@@ -4,33 +4,48 @@
 // another layer are intentionally dead code in the current crate.
 #![allow(dead_code)]
 
-pub fn which_tool(name: &str) -> Option<std::path::PathBuf> {
-    let output = Command::new("which").arg(name).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
+pub fn which_tool(name: &str) -> std::path::PathBuf {
+    let output = Command::new("which")
+        .arg(name)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to locate required tool {name}: {error}"));
+    assert!(
+        output.status.success(),
+        "required tool {name} is not available on PATH:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.into())
-    }
+    assert!(
+        !path.is_empty(),
+        "required tool {name} resolved to an empty path"
+    );
+    path.into()
 }
 
-/// The final strict TypeScript contracts are deliberately opt-in at the test
-/// command boundary: a CI or developer supplies the compiler path explicitly
-/// instead of the suite silently discovering whichever `tsc` happens to be on
-/// PATH.  Keeping the path in the environment also prevents a machine-local
-/// SDK location from becoming part of the repository contract.
+/// The final strict TypeScript contracts require the exact 5.9.3 compiler.
+/// CI and developers may pin an executable with the environment override;
+/// otherwise the first `tsc` on PATH is resolved and version-checked. This
+/// keeps local SDK locations out of the repository contract while ensuring
+/// missing or mismatched tooling fails the test instead of going green.
 pub const REQUIRED_TYPESCRIPT_COMPILER_ENV: &str = "UNIFFI_TEST_TYPESCRIPT_COMPILER";
 
 pub fn required_typescript_compiler() -> std::path::PathBuf {
-    let compiler = std::env::var_os(REQUIRED_TYPESCRIPT_COMPILER_ENV).unwrap_or_else(|| {
-        panic!(
-            "required strict TypeScript compiler is unset; provide an explicit executable path in {REQUIRED_TYPESCRIPT_COMPILER_ENV}"
-        )
-    });
-    let compiler = std::path::PathBuf::from(compiler);
+    let compiler = std::env::var_os(REQUIRED_TYPESCRIPT_COMPILER_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let output = Command::new("which")
+                .arg("tsc")
+                .output()
+                .unwrap_or_else(|error| panic!("failed to locate required TypeScript compiler: {error}"));
+            assert!(
+                output.status.success(),
+                "required TypeScript compiler is not available on PATH; install TypeScript 5.9.3 or set {REQUIRED_TYPESCRIPT_COMPILER_ENV}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            assert!(!path.is_empty(), "required TypeScript compiler resolved to an empty path");
+            path.into()
+        });
     assert!(
         compiler.is_file(),
         "required strict TypeScript compiler in {REQUIRED_TYPESCRIPT_COMPILER_ENV} is not a file: {}",
@@ -82,51 +97,93 @@ pub fn run_required_typescript_check(
         })
 }
 
-pub fn has_wasm32_target(cargo: &std::path::Path) -> bool {
-    // Ask rustup first; fall back to a dry-run build probe if no rustup.
-    if let Ok(out) = Command::new("rustup")
+pub fn assert_wasm32_target(_cargo: &std::path::Path) {
+    let output = Command::new("rustup")
         .args(["target", "list", "--installed"])
         .output()
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).contains("wasm32-unknown-unknown");
-        }
-    }
-    // No rustup: optimistically report true and let the build surface
-    // the real error; the test skips on build failure anyway.
-    let _ = cargo;
-    true
+        .unwrap_or_else(|error| {
+            panic!("rustup is required to verify wasm32-unknown-unknown: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "rustup failed while checking installed Rust targets\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|target| target.trim() == "wasm32-unknown-unknown"),
+        "required Rust target wasm32-unknown-unknown is unavailable; install it with `rustup target add wasm32-unknown-unknown`"
+    );
 }
 
-pub fn locate_node_with_strip_types() -> Option<std::path::PathBuf> {
-    let node = which_node()?;
-    let output = Command::new(&node).arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
+pub fn locate_node_with_strip_types() -> std::path::PathBuf {
+    let node = which_node();
+    let output = Command::new(&node)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| panic!("failed to execute required Node.js: {error}"));
+    assert!(
+        output.status.success(),
+        "required Node.js rejected --version:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let ver = String::from_utf8_lossy(&output.stdout);
     let ver = ver.trim().trim_start_matches('v');
     let mut parts = ver.split('.');
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor: u32 = parts.next()?.parse().ok()?;
-    if major > 22 || (major == 22 && minor >= 6) {
-        Some(node)
-    } else {
-        None
-    }
+    let major: u32 = parts
+        .next()
+        .unwrap_or_else(|| panic!("unable to parse Node.js version `{ver}`"))
+        .parse()
+        .unwrap_or_else(|error| panic!("unable to parse Node.js major version `{ver}`: {error}"));
+    let minor: u32 = parts
+        .next()
+        .unwrap_or_else(|| panic!("unable to parse Node.js version `{ver}`"))
+        .parse()
+        .unwrap_or_else(|error| panic!("unable to parse Node.js minor version `{ver}`: {error}"));
+    assert!(
+        major > 22 || (major == 22 && minor >= 6),
+        "Node.js >= 22.6 is required for the JavaScript integration suite; found {ver}"
+    );
+    assert_node_strip_types(&node);
+    node
 }
 
-pub fn which_node() -> Option<std::path::PathBuf> {
-    let output = Command::new("which").arg("node").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
+pub fn which_node() -> std::path::PathBuf {
+    let output = Command::new("which")
+        .arg("node")
+        .output()
+        .unwrap_or_else(|error| panic!("failed to locate required Node.js: {error}"));
+    assert!(
+        output.status.success(),
+        "required Node.js is not available on PATH:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.into())
-    }
+    assert!(
+        !path.is_empty(),
+        "required Node.js resolved to an empty path"
+    );
+    path.into()
+}
+
+pub fn assert_node_strip_types(node: &std::path::Path) {
+    let output = Command::new(node)
+        .args([
+            "--experimental-strip-types",
+            "--no-warnings",
+            "-e",
+            "console.log('ok')",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to invoke Node.js strip-types probe: {error}"));
+    assert!(
+        output.status.success(),
+        "Node.js >= 22.6 with --experimental-strip-types is required:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 pub struct StreamFixture {
@@ -134,14 +191,8 @@ pub struct StreamFixture {
     lib_path: Utf8PathBuf,
 }
 
-pub fn build_stream_fixture(root: &std::path::Path) -> Option<StreamFixture> {
-    let cargo = match which_tool("cargo") {
-        Some(cargo) => cargo,
-        None => {
-            eprintln!("SKIP stream fixture: cargo unavailable");
-            return None;
-        }
-    };
+pub fn build_stream_fixture(root: &std::path::Path) -> StreamFixture {
+    let cargo = which_tool("cargo");
     let root = Utf8PathBuf::from_path_buf(root.to_path_buf()).unwrap();
     let crate_dir = root.join("stream-core");
     let src = crate_dir.join("src");
@@ -340,7 +391,8 @@ uniffi::setup_scaffolding!();
     )
     .unwrap();
 
-    let target_dir = root.join("target-stream-core");
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
     let output = Command::new(&cargo)
         .args(["build", "--manifest-path"])
         .arg(crate_dir.join("Cargo.toml").as_std_path())
@@ -355,17 +407,23 @@ uniffi::setup_scaffolding!();
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let lib_path = target_dir
+    let built_lib = target_dir
         .join("debug")
         .join(cdylib_filename("stream-core"));
     assert!(
-        lib_path.exists(),
-        "expected stream fixture cdylib at {lib_path}"
+        built_lib.exists(),
+        "expected stream fixture cdylib at {built_lib}"
     );
-    Some(StreamFixture {
+    let lib_path = root
+        .join("target-stream-core")
+        .join("debug")
+        .join(cdylib_filename("stream-core"));
+    std::fs::create_dir_all(lib_path.parent().unwrap()).unwrap();
+    std::fs::copy(&built_lib, &lib_path).expect("copying stream fixture cdylib should succeed");
+    StreamFixture {
         crate_dir,
         lib_path,
-    })
+    }
 }
 
 pub fn generate_stream_tree(
@@ -410,7 +468,7 @@ pub struct RuntimeMatrixFixture {
 }
 
 pub fn build_runtime_matrix_fixture(root: &std::path::Path) -> RuntimeMatrixFixture {
-    let cargo = which_tool("cargo").expect("final JavaScript runtime matrix requires cargo");
+    let cargo = which_tool("cargo");
     let root = Utf8PathBuf::from_path_buf(root.to_path_buf()).unwrap();
     let crate_dir = root.join("runtime-matrix-core");
     let src = crate_dir.join("src");
@@ -796,7 +854,8 @@ uniffi::setup_scaffolding!();
     )
     .unwrap();
 
-    let target_dir = root.join("target-runtime-matrix-core");
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
     let output = Command::new(&cargo)
         .args(["build", "--manifest-path"])
         .arg(crate_dir.join("Cargo.toml").as_std_path())
@@ -810,13 +869,20 @@ uniffi::setup_scaffolding!();
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let lib_path = target_dir
+    let built_lib = target_dir
         .join("debug")
         .join(cdylib_filename("runtime-matrix-core"));
     assert!(
-        lib_path.exists(),
-        "expected final JavaScript runtime matrix cdylib at {lib_path}"
+        built_lib.exists(),
+        "expected final JavaScript runtime matrix cdylib at {built_lib}"
     );
+    let lib_path = root
+        .join("target-runtime-matrix-core")
+        .join("debug")
+        .join(cdylib_filename("runtime-matrix-core"));
+    std::fs::create_dir_all(lib_path.parent().unwrap()).unwrap();
+    std::fs::copy(&built_lib, &lib_path)
+        .expect("copying runtime matrix fixture cdylib should succeed");
     RuntimeMatrixFixture {
         crate_dir,
         lib_path,
@@ -1057,6 +1123,8 @@ assert(cancelProbe.streamStarts === 1n && cancelProbe.streamDrops === 1n
   && cancelProbe.streamTerminalDrops === 0n && cancelProbe.streamCancelledDrops === 1n,
   "Cancel must drop Rust stream exactly once");
 
+__UNIFFI_RUNTIME_MATRIX_NON_SEND_ASSERTIONS__
+
 // Delay one real native OutputStreamNext settlement after the family has
 // already produced its object-bearing Item.  Closing the public session while
 // the cancel leg is held forces deadline detach; the family walker must release
@@ -1073,19 +1141,28 @@ let lateRawEnvelope: unknown = null;
 let releaseLateRaw: (() => void) | null = null;
 let markLateRawReady: ((value: unknown) => void) | null = null;
 const lateRawReady = new Promise<unknown>((resolve): void => { markLateRawReady = resolve; });
-lateBackend.invokeAsync = (operationId, args) => {
-  const pending = nativeInvokeAsync(operationId, args);
-  if (operationId !== streamOperationIds.bufferNext) return pending;
-  return pending.then((raw) => new Promise<unknown>((resolve): void => {
-    lateRawEnvelope = raw;
-    markLateRawReady?.(raw);
-    releaseLateRaw = () => resolve(raw);
-  }));
-};
 let blockLateCancel = false;
-lateBackend.cancelOutputStream = (handle) => {
-  if (blockLateCancel) return new Promise<unknown>(() => {});
-  return nativeCancelOutputStream(handle);
+// The native backend is intentionally immutable. Install a session-local
+// mutable facade whose methods are defined up front; its closures delay
+// exactly one operation without mutating/faking the production backend.
+root.session.backend = {
+  invokeSync: lateBackend.invokeSync.bind(lateBackend),
+  invokeAsync: (operationId: number, args: unknown[]): Promise<unknown> => {
+    const pending = nativeInvokeAsync(operationId, args);
+    if (operationId !== streamOperationIds.bufferNext) return pending;
+    return pending.then((raw) => new Promise<unknown>((resolve): void => {
+      lateRawEnvelope = raw;
+      markLateRawReady?.(raw);
+      releaseLateRaw = () => resolve(raw);
+    }));
+  },
+  releaseObject: lateBackend.releaseObject.bind(lateBackend),
+  cancelOutputStream: (handle: unknown): Promise<unknown> => {
+    if (blockLateCancel) return new Promise<unknown>(() => {});
+    return nativeCancelOutputStream(handle);
+  },
+  releaseOutputStream: lateBackend.releaseOutputStream.bind(lateBackend),
+  close: lateBackend.close.bind(lateBackend),
 };
 const lateStream = api.bufferItems("object-late");
 const lateNext = lateStream.next();
@@ -1116,8 +1193,6 @@ assert(lateProbe.objectDrops === 1n,
 assert(closeProbe.objectDrops === 1n,
   "session close releases held object exactly once");
 await transport.close();
-
-__UNIFFI_RUNTIME_MATRIX_NON_SEND_ASSERTIONS__
 
 console.log("ok");
 "#;
@@ -1161,11 +1236,8 @@ pub struct InputStreamFixture {
     lib_path: Utf8PathBuf,
 }
 
-pub fn build_input_stream_fixture(root: &std::path::Path) -> Option<InputStreamFixture> {
-    let Some(cargo) = which_tool("cargo") else {
-        eprintln!("SKIP input stream fixture: cargo unavailable");
-        return None;
-    };
+pub fn build_input_stream_fixture(root: &std::path::Path) -> InputStreamFixture {
+    let cargo = which_tool("cargo");
     let crate_dir = Utf8PathBuf::from_path_buf(root.join("input-stream-core")).unwrap();
     let src = crate_dir.join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -1297,7 +1369,8 @@ uniffi::setup_scaffolding!();
     )
     .unwrap();
 
-    let target_dir = root.join("target-input-stream-core");
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
     let output = Command::new(&cargo)
         .args(["build", "--manifest-path"])
         .arg(crate_dir.join("Cargo.toml").as_std_path())
@@ -1312,20 +1385,26 @@ uniffi::setup_scaffolding!();
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    let built_lib = target_dir
+        .join("debug")
+        .join(cdylib_filename("input-stream-core"));
+    assert!(
+        built_lib.exists(),
+        "expected input stream fixture cdylib at {built_lib}"
+    );
     let lib_path = Utf8PathBuf::from_path_buf(
-        target_dir
+        root.join("target-input-stream-core")
             .join("debug")
             .join(cdylib_filename("input-stream-core")),
     )
     .unwrap();
-    assert!(
-        lib_path.exists(),
-        "expected input stream fixture cdylib at {lib_path}"
-    );
-    Some(InputStreamFixture {
+    std::fs::create_dir_all(lib_path.parent().unwrap()).unwrap();
+    std::fs::copy(&built_lib, &lib_path)
+        .expect("copying input stream fixture cdylib should succeed");
+    InputStreamFixture {
         crate_dir,
         lib_path,
-    })
+    }
 }
 
 pub fn generate_input_stream_tree(
@@ -1360,13 +1439,13 @@ pub fn generate_input_stream_tree(
 pub fn run_cargo_check(
     manifest: &Utf8PathBuf,
     extra: &[&str],
-    target_dir: &std::path::Path,
+    target_dir: &Utf8PathBuf,
 ) -> std::io::Result<std::process::Output> {
     let mut cmd = Command::new("cargo");
     cmd.args(["check", "--manifest-path"])
         .arg(manifest.as_std_path())
         .args(extra)
-        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_TARGET_DIR", target_dir.as_std_path())
         .env_remove("RUSTFLAGS");
     cmd.output()
 }
@@ -1379,13 +1458,13 @@ pub fn run_cargo_check(
 pub fn run_cargo_build(
     manifest: &Utf8PathBuf,
     extra: &[&str],
-    target_dir: &std::path::Path,
+    target_dir: &Utf8PathBuf,
 ) -> std::io::Result<std::process::Output> {
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--manifest-path"])
         .arg(manifest.as_std_path())
         .args(extra)
-        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_TARGET_DIR", target_dir.as_std_path())
         .env_remove("RUSTFLAGS");
     cmd.output()
 }
@@ -1401,35 +1480,42 @@ pub fn cdylib_filename(package_name: &str) -> String {
 }
 
 pub fn build_uniffi_bindgen_cli(cargo: &std::path::Path) -> Utf8PathBuf {
-    let root = workspace_root();
-    let build = Command::new(cargo)
-        .current_dir(&root)
-        .args([
-            "build",
-            "-p",
-            "uniffi",
-            "--features",
-            "cli",
-            "--bin",
-            "uniffi-bindgen",
-        ])
-        .output()
-        .expect("failed to build uniffi-bindgen");
-    if !build.status.success() {
-        panic!(
-            "building uniffi-bindgen failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr),
-        );
-    }
+    // Every integration-test binary uses the same workspace target directory.
+    // Build the CLI once per binary and share the resulting executable across
+    // tests, avoiding repeated Cargo work while retaining process isolation.
+    static CLI: std::sync::OnceLock<Utf8PathBuf> = std::sync::OnceLock::new();
+    CLI.get_or_init(|| {
+        let root = workspace_root();
+        let build = Command::new(cargo)
+            .current_dir(&root)
+            .args([
+                "build",
+                "-p",
+                "uniffi",
+                "--features",
+                "cli-javascript",
+                "--bin",
+                "uniffi-bindgen",
+            ])
+            .output()
+            .expect("failed to build uniffi-bindgen");
+        if !build.status.success() {
+            panic!(
+                "building uniffi-bindgen failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&build.stdout),
+                String::from_utf8_lossy(&build.stderr),
+            );
+        }
 
-    let cli = root.join(if cfg!(windows) {
-        "target/debug/uniffi-bindgen.exe"
-    } else {
-        "target/debug/uniffi-bindgen"
-    });
-    assert!(cli.exists(), "expected built CLI at {cli}");
-    cli
+        let cli = root.join(if cfg!(windows) {
+            "target/debug/uniffi-bindgen.exe"
+        } else {
+            "target/debug/uniffi-bindgen"
+        });
+        assert!(cli.exists(), "expected built CLI at {cli}");
+        cli
+    })
+    .clone()
 }
 
 pub fn write_cli_wasm_fixture(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBuf) {
@@ -1982,7 +2068,7 @@ export function emailAddressToString(value) {
 }
 
 pub fn build_custom_napi_addon(
-    root: &std::path::Path,
+    _root: &std::path::Path,
     generated: &Utf8PathBuf,
     _manifest: &Utf8PathBuf,
 ) -> Utf8PathBuf {
@@ -1994,7 +2080,8 @@ pub fn build_custom_napi_addon(
         host_manifest.is_file(),
         "generated custom package is missing its N-API host manifest: {host_manifest}"
     );
-    let target_dir = root.join("cargo-target-custom-napi");
+    let target_dir = shared_cargo_target_dir("native");
+    let _target_lock = shared_cargo_target_lock("native");
     let output = run_cargo_build(&host_manifest, &[], &target_dir)
         .expect("cargo should be available for custom napi build");
     if !output.status.success() {
@@ -2006,7 +2093,10 @@ pub fn build_custom_napi_addon(
     }
     let lib_target =
         uniffi_bindgen_javascript::host_crates::composite_host_lib_target("custom_js_core");
-    let dylib = target_dir.join("debug").join(cdylib_filename(&lib_target));
+    let dylib = target_dir
+        .as_std_path()
+        .join("debug")
+        .join(cdylib_filename(&lib_target));
     assert!(
         dylib.exists(),
         "expected built cdylib at {}",

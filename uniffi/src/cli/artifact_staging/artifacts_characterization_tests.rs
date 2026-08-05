@@ -30,38 +30,71 @@ fn empty_build_args() -> BuildArgs {
         napi_target_dir: None,
         wasm_target_dir: None,
         wasm_core_target_dir: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_dist_dir: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_package_name: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_module_name: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_package_version: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_author: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_license: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_description: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_compatible_sdk_version: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_target_sdk_version: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_compatible_sdk_type: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_device_types: Vec::new(),
+        #[cfg(feature = "cli-ohos")]
         ohos_package_kind: super::super::ohos::PackageKind::Har,
+        #[cfg(feature = "cli-ohos")]
         ohos_integrated_hsp: false,
+        #[cfg(feature = "cli-ohos")]
         ohos_hsp_bundle_name: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_har_out: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_runtime_hsp_out: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_interface_har_out: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_tgz_out: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_hvigorw: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_ohpm: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_deveco_sdk_home: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_no_har: false,
+        #[cfg(feature = "cli-ohos")]
         ohos_arch: Vec::new(),
+        #[cfg(feature = "cli-ohos")]
         ohos_target_dir: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_static: false,
+        #[cfg(feature = "cli-ohos")]
         ohos_skip_libs: false,
+        #[cfg(feature = "cli-ohos")]
         ohos_skip_check: false,
+        #[cfg(feature = "cli-ohos")]
         ohos_zigbuild: false,
+        #[cfg(feature = "cli-ohos")]
         ohos_bisheng: false,
+        #[cfg(feature = "cli-ohos")]
         ohos_package: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_skip_napi_check: false,
+        #[cfg(feature = "cli-ohos")]
         ohos_soname: None,
+        #[cfg(feature = "cli-ohos")]
         ohos_cargo_args: Vec::new(),
         apple_target: Vec::new(),
         apple_xcframework_out: None,
@@ -326,6 +359,117 @@ fn managed_android_aar_override_is_rebased_below_the_private_stage() {
 }
 
 #[test]
+fn managed_layout_keeps_explicit_cargo_caches_outside_the_staging_package() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = Utf8Path::from_path(temp.path()).unwrap();
+    let manifest = write_test_manifest(&parent.join("crate"));
+    let package = parent.join("package");
+    let cache = parent.join("cargo-cache");
+    let mut args = empty_build_args();
+    args.manifest_path = manifest;
+    args.out_dir = None;
+    args.managed_layout = true;
+    args.package_dir = Some(package.clone());
+    args.target = vec![ArtifactTargetArg::Wasm, ArtifactTargetArg::Node];
+    args.napi_target_dir = Some(cache.join("napi"));
+    args.wasm_target_dir = Some(cache.join("wasm"));
+    let targets = expand_targets(&args.target).unwrap();
+
+    let layout = ManagedLayout::apply(&mut args, &targets).unwrap().unwrap();
+    let stage = ManagedPackageStage::begin(&package).unwrap();
+    let private = managed_private_args(&stage, &layout, &args, &targets).unwrap();
+    let resolved_cache = canonicalize_invocation_output(&cache).unwrap();
+    assert_eq!(private.napi_target_dir, Some(resolved_cache.join("napi")));
+    assert_eq!(
+        private.wasm_core_target_dir,
+        Some(resolved_cache.join("wasm/core"))
+    );
+    assert_eq!(
+        private.wasm_target_dir,
+        Some(resolved_cache.join("wasm/host"))
+    );
+    assert!(!private.napi_target_dir.unwrap().starts_with(stage.root()));
+    assert!(!private.wasm_target_dir.unwrap().starts_with(stage.root()));
+
+    drop(stage);
+    assert!(!package.exists());
+    assert_no_staging_residue(parent, "package");
+}
+
+#[cfg(feature = "cli-ohos")]
+#[test]
+fn managed_layout_keeps_explicit_ohos_cargo_cache_outside_the_staging_package() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = Utf8Path::from_path(temp.path()).unwrap();
+    let manifest = write_test_manifest(&parent.join("crate"));
+    let package = parent.join("package");
+    let cache = parent.join("cargo-cache/ohos");
+    let mut args = empty_build_args();
+    args.manifest_path = manifest;
+    args.out_dir = None;
+    args.managed_layout = true;
+    args.package_dir = Some(package.clone());
+    args.target = vec![ArtifactTargetArg::Harmony];
+    args.ohos_no_har = true;
+    args.ohos_target_dir = Some(cache.clone());
+    let targets = expand_targets(&args.target).unwrap();
+
+    let layout = ManagedLayout::apply(&mut args, &targets).unwrap().unwrap();
+    let stage = ManagedPackageStage::begin(&package).unwrap();
+    let private = managed_private_args(&stage, &layout, &args, &targets).unwrap();
+    assert_eq!(
+        private.ohos_target_dir,
+        Some(canonicalize_invocation_output(&cache).unwrap())
+    );
+    assert!(!private.ohos_target_dir.unwrap().starts_with(stage.root()));
+
+    drop(stage);
+    assert!(!package.exists());
+    assert_no_staging_residue(parent, "package");
+}
+
+#[test]
+fn managed_layout_rejects_cargo_cache_overlapping_the_public_package() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = Utf8Path::from_path(temp.path()).unwrap();
+    let manifest = write_test_manifest(&parent.join("crate"));
+    let package = parent.join("package");
+    publish_fixture(&package, "generation.txt", b"old generation\n");
+
+    for cache in [
+        package.join("target"),
+        package.clone(),
+        parent.to_path_buf(),
+    ] {
+        let mut args = empty_build_args();
+        args.manifest_path = manifest.clone();
+        args.out_dir = None;
+        args.managed_layout = true;
+        args.package_dir = Some(package.clone());
+        args.target = vec![ArtifactTargetArg::Wasm];
+        args.wasm_target_dir = Some(cache);
+        let targets = expand_targets(&args.target).unwrap();
+        let layout = ManagedLayout::apply(&mut args, &targets).unwrap().unwrap();
+        let stage = ManagedPackageStage::begin(&package).unwrap();
+
+        let error = match managed_private_args(&stage, &layout, &args, &targets) {
+            Ok(_) => panic!("overlapping managed Cargo cache unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("must be disjoint"),
+            "unexpected overlap error: {error:#}"
+        );
+        drop(stage);
+        assert_eq!(
+            std::fs::read(package.join("generation.txt")).unwrap(),
+            b"old generation\n"
+        );
+        assert_no_staging_residue(parent, "package");
+    }
+}
+
+#[test]
 fn managed_android_aar_escape_fails_before_staging_and_preserves_external_files() {
     let temp = tempfile::tempdir().unwrap();
     let parent = Utf8Path::from_path(temp.path()).unwrap();
@@ -366,6 +510,7 @@ fn managed_android_aar_escape_fails_before_staging_and_preserves_external_files(
     }
 }
 
+#[cfg(feature = "cli-ohos")]
 #[test]
 fn expands_all_js_targets() {
     assert_eq!(
@@ -382,6 +527,23 @@ fn expands_all_js_targets() {
     );
 }
 
+#[cfg(not(feature = "cli-ohos"))]
+#[test]
+fn expands_all_js_targets() {
+    assert_eq!(
+        expand_targets(&[ArtifactTargetArg::AllJs]).unwrap(),
+        ExpandedTargets {
+            wasm: true,
+            mini_program: true,
+            node: true,
+            electron: true,
+            apple: false,
+            android: false,
+        }
+    );
+}
+
+#[cfg(feature = "cli-ohos")]
 #[test]
 fn expands_all_targets() {
     assert_eq!(
@@ -392,6 +554,22 @@ fn expands_all_targets() {
             node: true,
             electron: true,
             harmony: true,
+            apple: true,
+            android: true,
+        }
+    );
+}
+
+#[cfg(not(feature = "cli-ohos"))]
+#[test]
+fn expands_all_targets() {
+    assert_eq!(
+        expand_targets(&[ArtifactTargetArg::All]).unwrap(),
+        ExpandedTargets {
+            wasm: true,
+            mini_program: true,
+            node: true,
+            electron: true,
             apple: true,
             android: true,
         }
@@ -534,10 +712,12 @@ fn artifacts_cli_no_longer_exposes_checkout_tool_flags() {
 #[test]
 fn javascript_build_defaults_to_embedded_tooling() {
     let javascript_src = include_str!("../javascript.rs");
-    assert!(javascript_src.contains("run_wasm_post_link"));
+    assert!(javascript_src.contains("emit_wasm_post_link"));
+    #[cfg(feature = "cli-ohos")]
     assert!(javascript_src.contains("super::ohos::build"));
 }
 
+#[cfg(feature = "cli-ohos")]
 #[test]
 fn artifacts_cli_wires_harmony_har_options() {
     let artifacts_src = include_str!("../artifacts.rs");

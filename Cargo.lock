@@ -1763,7 +1763,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2195,10 +2195,8 @@ dependencies = [
  "cargo_metadata 0.23.1",
  "clap",
  "flate2",
- "fs2",
  "goblin",
  "libc",
- "serde",
  "serde_json",
  "tar",
  "tempfile",
@@ -2289,6 +2287,7 @@ version = "0.32.0"
 dependencies = [
  "anyhow",
  "camino",
+ "fs2",
  "serde_json",
  "tempfile",
  "uniffi_bindgen",

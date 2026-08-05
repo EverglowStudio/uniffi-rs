@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use super::core::workspace_root;
 use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
 use uniffi_bindgen::{BindgenLoader, BindgenPaths, GlobalConfig};
@@ -146,8 +147,9 @@ resolver = "3"
 
         let workspace_manifest = root.join("Cargo.toml");
         let composite_manifest = composite_dir.join("Cargo.toml");
-        let target_dir = root.join("cargo-target-composite");
-        let library_path = target_dir
+        let target_dir = super::core::shared_cargo_target_dir("native");
+        let library_path = root
+            .join("cargo-target-composite")
             .join("debug")
             .join(cdylib_filename("composite_core"));
         Self {
@@ -226,12 +228,12 @@ resolver = "3"
         host_dir.join(flavor).join("Cargo.toml")
     }
 
-    /// Build the one composite cdylib in a fixture-private dev target tree.
-    ///
-    /// No release profile or shared target directory is used: temporary test
-    /// roots may build canonical/reverse fixtures concurrently without stale
-    /// artifact or same-name collision between tests.
+    /// Build the one composite cdylib in the shared dev target and copy it to
+    /// this fixture's private root.  The advisory target lock covers the
+    /// Cargo build and copy, so canonical/reverse fixtures cannot observe a
+    /// same-name artifact from one another.
     pub fn build_cdylib(&self) -> &Utf8Path {
+        let _target_lock = super::core::shared_cargo_target_lock("native");
         let output = Command::new("cargo")
             .args(["build", "--features", "host-gate", "--manifest-path"])
             .arg(self.composite_manifest.as_std_path())
@@ -246,9 +248,22 @@ resolver = "3"
                 String::from_utf8_lossy(&output.stderr),
             );
         }
+        let built_library = self
+            .target_dir
+            .join("debug")
+            .join(cdylib_filename("composite_core"));
+        assert!(
+            built_library.exists(),
+            "expected composite fixture cdylib at {}",
+            built_library
+        );
+        std::fs::create_dir_all(self.library_path.parent().unwrap())
+            .expect("composite fixture private target directory should exist");
+        std::fs::copy(&built_library, &self.library_path)
+            .expect("copying composite fixture cdylib should succeed");
         assert!(
             self.library_path.exists(),
-            "expected composite fixture cdylib at {}",
+            "expected isolated composite fixture cdylib at {}",
             self.library_path
         );
         &self.library_path
@@ -336,11 +351,6 @@ resolver = "3"
         )
         .expect("JavaScript generation should succeed for the composite cdylib")
     }
-}
-
-fn workspace_root() -> Utf8PathBuf {
-    let manifest = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.join("../..").canonicalize_utf8().unwrap()
 }
 
 fn write_component_manifest(

@@ -2,64 +2,17 @@
 
 mod support;
 
-use support::{CompositeFixture, CANONICAL_COMPONENTS};
+#[path = "support/shared.rs"]
+mod shared;
+
+use shared::*;
+use support::{
+    shared_cargo_target_dir, shared_cargo_target_lock, workspace_root, CompositeFixture,
+    CANONICAL_COMPONENTS,
+};
 
 use camino::Utf8PathBuf;
 use std::process::Command;
-
-fn workspace_root() -> Utf8PathBuf {
-    let manifest = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.join("../..").canonicalize_utf8().unwrap()
-}
-
-fn which_tool(name: &str) -> Option<std::path::PathBuf> {
-    let output = Command::new("which").arg(name).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.into())
-    }
-}
-
-fn node_supports_strip_types(node: &std::path::Path) -> bool {
-    let Ok(output) = Command::new(node)
-        .arg("--experimental-strip-types")
-        .arg("--no-warnings")
-        .arg("-e")
-        .arg("console.log('ok')")
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
-}
-
-fn build_uniffi_bindgen(root: &Utf8PathBuf, cargo: &std::path::Path) {
-    let output = Command::new(cargo)
-        .current_dir(root.as_std_path())
-        .args([
-            "build",
-            "-p",
-            "uniffi",
-            "--features",
-            "cli",
-            "--bin",
-            "uniffi-bindgen",
-        ])
-        .output()
-        .expect("failed to build uniffi-bindgen");
-    if !output.status.success() {
-        panic!(
-            "building uniffi-bindgen failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-}
 
 fn write_cli_napi_fixture(root: &std::path::Path) -> Utf8PathBuf {
     let crate_dir = root.join("cli_napi_fixture");
@@ -113,26 +66,22 @@ fn write_cli_napi_fixture(root: &std::path::Path) -> Utf8PathBuf {
 
 #[test]
 fn cli_build_napi_orchestrates_synthetic_fixture() {
-    let cargo = which_tool("cargo").expect("CLI N-API orchestration requires cargo on PATH");
+    let cargo = which_tool("cargo");
 
     let root = workspace_root();
-    build_uniffi_bindgen(&root, &cargo);
-
-    let cli = root.join(if cfg!(windows) {
-        "target/debug/uniffi-bindgen.exe"
-    } else {
-        "target/debug/uniffi-bindgen"
-    });
-    assert!(cli.exists(), "expected built CLI at {cli}");
+    let cli = build_uniffi_bindgen_cli(&cargo);
 
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
-    let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target")).unwrap();
+    let target_root = shared_cargo_target_dir("cli");
+    let target_dir = target_root.join("napi");
+    let _target_lock = shared_cargo_target_lock("cli");
     let manifest = write_cli_napi_fixture(tmp.path());
 
     let output = Command::new(cli.as_std_path())
         .current_dir(&root)
+        .env("CARGO_TARGET_DIR", target_root.as_std_path())
         .arg("javascript")
         .arg("build-napi")
         .arg("--manifest-path")
@@ -184,11 +133,8 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
         "node entry should expose the generated native backend:\n{backend_napi}"
     );
 
-    let node = which_tool("node").expect("CLI N-API runtime acceptance requires Node.js");
-    assert!(
-        node_supports_strip_types(&node),
-        "CLI N-API runtime acceptance requires node --experimental-strip-types"
-    );
+    let node = which_tool("node");
+    assert_node_strip_types(&node);
     let driver = tmp.path().join("generated-adapter-driver.ts");
     std::fs::write(
         &driver,
@@ -221,16 +167,9 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
 
 #[test]
 fn cli_build_napi_orchestrates_two_components_without_feature_flags() {
-    let cargo =
-        which_tool("cargo").expect("two-component CLI N-API orchestration requires cargo on PATH");
+    let cargo = which_tool("cargo");
     let root = workspace_root();
-    build_uniffi_bindgen(&root, &cargo);
-    let cli = root.join(if cfg!(windows) {
-        "target/debug/uniffi-bindgen.exe"
-    } else {
-        "target/debug/uniffi-bindgen"
-    });
-    assert!(cli.exists(), "expected built CLI at {cli}");
+    let cli = build_uniffi_bindgen_cli(&cargo);
 
     let tmp = tempfile::tempdir().unwrap();
     let fixture = CompositeFixture::write(tmp.path());
@@ -238,9 +177,12 @@ fn cli_build_napi_orchestrates_two_components_without_feature_flags() {
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
     let artifact_dir = out_dir.join("artifacts");
-    let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target-napi")).unwrap();
+    let target_root = shared_cargo_target_dir("cli");
+    let target_dir = target_root.join("napi");
+    let _target_lock = shared_cargo_target_lock("cli");
     let output = Command::new(cli.as_std_path())
         .current_dir(root.as_std_path())
+        .env("CARGO_TARGET_DIR", target_root.as_std_path())
         .args([
             "javascript",
             "build-napi",

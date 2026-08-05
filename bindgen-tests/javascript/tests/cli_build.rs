@@ -6,76 +6,10 @@ mod support;
 mod shared;
 
 use shared::*;
+use support::{shared_cargo_target_dir, shared_cargo_target_lock, workspace_root};
 
 use camino::Utf8PathBuf;
 use std::process::Command;
-
-fn workspace_root() -> Utf8PathBuf {
-    let manifest = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.join("../..").canonicalize_utf8().unwrap()
-}
-
-fn which_tool(name: &str) -> Option<std::path::PathBuf> {
-    let output = Command::new("which").arg(name).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.into())
-    }
-}
-
-fn has_wasm32_target(cargo: &std::path::Path) -> bool {
-    if let Ok(out) = Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).contains("wasm32-unknown-unknown");
-        }
-    }
-    let _ = cargo;
-    true
-}
-
-fn node_supports_strip_types(node: &std::path::Path) -> bool {
-    let Ok(output) = Command::new(node)
-        .arg("--experimental-strip-types")
-        .arg("--no-warnings")
-        .arg("-e")
-        .arg("console.log('ok')")
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
-}
-
-fn build_uniffi_bindgen(root: &Utf8PathBuf, cargo: &std::path::Path) {
-    let output = Command::new(cargo)
-        .current_dir(root.as_std_path())
-        .args([
-            "build",
-            "-p",
-            "uniffi",
-            "--features",
-            "cli",
-            "--bin",
-            "uniffi-bindgen",
-        ])
-        .output()
-        .expect("failed to build uniffi-bindgen");
-    if !output.status.success() {
-        panic!(
-            "building uniffi-bindgen failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-}
 
 fn write_cli_build_fixture(root: &std::path::Path) -> Utf8PathBuf {
     let crate_dir = root.join("cli_build_fixture");
@@ -239,30 +173,24 @@ uniffi::setup_scaffolding!();
 
 #[test]
 fn cli_build_orchestrates_wasm_and_napi() {
-    let cargo = which_tool("cargo").expect("combined JavaScript orchestration requires cargo");
-    assert!(
-        has_wasm32_target(&cargo),
-        "combined JavaScript orchestration requires wasm32-unknown-unknown target"
-    );
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let root = workspace_root();
-    build_uniffi_bindgen(&root, &cargo);
-
-    let cli = root.join(if cfg!(windows) {
-        "target/debug/uniffi-bindgen.exe"
-    } else {
-        "target/debug/uniffi-bindgen"
-    });
-    assert!(cli.exists(), "expected built CLI at {cli}");
+    let cli = build_uniffi_bindgen_cli(&cargo);
 
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
     let pkg_dir = out_dir.join("browser/pkg");
-    let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target")).unwrap();
+    let target_root = shared_cargo_target_dir("cli");
+    let target_dir = target_root.join("napi");
+    let wasm_target_dir = target_root.join("wasm-host");
+    let _target_lock = shared_cargo_target_lock("cli");
     let manifest = write_cli_build_fixture(tmp.path());
 
     let output = Command::new(cli.as_std_path())
         .current_dir(&root)
+        .env("CARGO_TARGET_DIR", target_root.as_std_path())
         .arg("javascript")
         .arg("build")
         .arg("--manifest-path")
@@ -275,6 +203,8 @@ fn cli_build_orchestrates_wasm_and_napi() {
         .arg(pkg_dir.as_str())
         .arg("--target-dir")
         .arg(target_dir.as_str())
+        .arg("--wasm-target-dir")
+        .arg(wasm_target_dir.as_str())
         .output()
         .expect("failed to invoke uniffi-bindgen javascript build");
     if !output.status.success() {
@@ -321,36 +251,27 @@ fn cli_build_orchestrates_wasm_and_napi() {
 
 #[test]
 fn cli_build_runs_value_type_methods() {
-    let cargo = which_tool("cargo").expect("value-method orchestration requires cargo");
-    assert!(
-        has_wasm32_target(&cargo),
-        "value-method orchestration requires wasm32-unknown-unknown target"
-    );
-    let node = which_tool("node").expect("value-method runtime acceptance requires Node.js");
-    assert!(
-        node_supports_strip_types(&node),
-        "value-method runtime acceptance requires node --experimental-strip-types"
-    );
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
+    let node = which_tool("node");
+    assert_node_strip_types(&node);
 
     let root = workspace_root();
-    build_uniffi_bindgen(&root, &cargo);
-
-    let cli = root.join(if cfg!(windows) {
-        "target/debug/uniffi-bindgen.exe"
-    } else {
-        "target/debug/uniffi-bindgen"
-    });
-    assert!(cli.exists(), "expected built CLI at {cli}");
+    let cli = build_uniffi_bindgen_cli(&cargo);
 
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
     let pkg_dir = out_dir.join("browser/pkg");
-    let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target")).unwrap();
+    let target_root = shared_cargo_target_dir("cli");
+    let target_dir = target_root.join("napi");
+    let wasm_target_dir = target_root.join("wasm-host");
+    let _target_lock = shared_cargo_target_lock("cli");
     let manifest = write_value_type_method_fixture(tmp.path());
 
     let output = Command::new(cli.as_std_path())
         .current_dir(&root)
+        .env("CARGO_TARGET_DIR", target_root.as_std_path())
         .arg("javascript")
         .arg("build")
         .arg("--manifest-path")
@@ -363,6 +284,8 @@ fn cli_build_runs_value_type_methods() {
         .arg(pkg_dir.as_str())
         .arg("--target-dir")
         .arg(target_dir.as_str())
+        .arg("--wasm-target-dir")
+        .arg(wasm_target_dir.as_str())
         .output()
         .expect("failed to invoke uniffi-bindgen javascript build for value methods");
     if !output.status.success() {
@@ -479,18 +402,18 @@ fn assert_no_node_addons(dir: Utf8PathBuf) {
 }
 #[test]
 fn cli_build_orchestrates_full_javascript_tree() {
-    let cargo = which_tool("cargo").expect("full JavaScript orchestration requires cargo");
-    assert!(
-        has_wasm32_target(&cargo),
-        "full JavaScript orchestration requires wasm32-unknown-unknown target"
-    );
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
     let root = workspace_root();
     let cli = build_uniffi_bindgen_cli(&cargo);
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
     let host_dir = out_dir.join("native/hosts");
     let artifact_dir = out_dir.join("artifacts");
-    let target_dir = Utf8PathBuf::from_path_buf(tmp.path().join("cargo-target-napi")).unwrap();
+    let target_root = shared_cargo_target_dir("cli");
+    let target_dir = target_root.join("napi");
+    let wasm_target_dir = target_root.join("wasm-host");
+    let _target_lock = shared_cargo_target_lock("cli");
     let (manifest, source) = shared::write_cli_wasm_fixture(tmp.path());
     let composite_addon = format!(
         "{}.node",
@@ -499,6 +422,7 @@ fn cli_build_orchestrates_full_javascript_tree() {
 
     let output = Command::new(cli.as_std_path())
         .current_dir(&root)
+        .env("CARGO_TARGET_DIR", target_root.as_std_path())
         .arg("javascript")
         .arg("build")
         .arg("--manifest-path")
@@ -513,6 +437,8 @@ fn cli_build_orchestrates_full_javascript_tree() {
         .arg(artifact_dir.as_str())
         .arg("--target-dir")
         .arg(target_dir.as_str())
+        .arg("--wasm-target-dir")
+        .arg(wasm_target_dir.as_str())
         .arg("--wasm-bindgen-target")
         .arg("nodejs")
         .output()
@@ -613,9 +539,7 @@ fn cli_build_orchestrates_full_javascript_tree() {
         "Nodejs wasm target must retain the planned browser loader:\n{browser_entry}"
     );
 
-    let node = locate_node_with_strip_types().expect(
-        "full JavaScript orchestration runtime matrix requires node --experimental-strip-types",
-    );
+    let node = locate_node_with_strip_types();
 
     // The renderer path can be exercised without launching Electron by
     // stubbing the preload-only `contextBridge` API. This keeps the test
@@ -731,25 +655,24 @@ console.log("combined build runtime ok");
 
 #[test]
 fn cli_managed_layout_replaces_complete_package_and_bench_smoke() {
-    let cargo = which_tool("cargo").expect("managed layout orchestration requires cargo");
-    assert!(
-        has_wasm32_target(&cargo),
-        "managed layout orchestration requires wasm32-unknown-unknown target"
-    );
-    let node = locate_node_with_strip_types()
-        .expect("managed layout runtime acceptance requires node --experimental-strip-types");
+    let cargo = which_tool("cargo");
+    assert_wasm32_target(&cargo);
+    let node = locate_node_with_strip_types();
 
     let root = workspace_root();
     let cli = build_uniffi_bindgen_cli(&cargo);
     let tmp = tempfile::tempdir().unwrap();
     let package_dir = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
-    let target_dir =
-        Utf8PathBuf::from_path_buf(tmp.path().join("managed-cargo-target-napi")).unwrap();
+    let target_root = shared_cargo_target_dir("cli");
+    let target_dir = target_root.join("napi");
+    let wasm_target_dir = target_root.join("wasm");
+    let _target_lock = shared_cargo_target_lock("cli");
     let (manifest, source) = shared::write_cli_wasm_fixture(tmp.path());
 
     for attempt in 1..=2 {
         let output = Command::new(cli.as_std_path())
             .current_dir(&root)
+            .env("CARGO_TARGET_DIR", target_root.as_std_path())
             .arg("artifacts")
             .arg("build")
             .arg("--manifest-path")
@@ -767,6 +690,8 @@ fn cli_managed_layout_replaces_complete_package_and_bench_smoke() {
             .arg(package_dir.as_str())
             .arg("--napi-target-dir")
             .arg(target_dir.as_str())
+            .arg("--wasm-target-dir")
+            .arg(wasm_target_dir.as_str())
             .output()
             .expect("failed to invoke uniffi-bindgen artifacts build --managed-layout");
         if !output.status.success() {

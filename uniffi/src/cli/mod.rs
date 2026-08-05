@@ -2,14 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#[cfg(feature = "cli-javascript")]
 mod artifact_staging;
+#[cfg(feature = "cli-javascript")]
 mod artifacts;
+#[cfg(feature = "cli-javascript")]
 mod javascript;
+#[cfg(feature = "cli-ohos")]
 mod ohos;
 mod swift;
 mod uniffi_bindgen;
 
 pub fn uniffi_bindgen_main() {
+    #[cfg(feature = "cli-ohos")]
     if std::env::var_os("UNIFFI_OHOS_RUSTC_WRAPPER").as_deref() == Some(std::ffi::OsStr::new("1")) {
         ohos::run_rustc_wrapper_main();
     }
