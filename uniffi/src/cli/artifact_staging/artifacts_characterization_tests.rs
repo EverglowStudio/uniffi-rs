@@ -287,6 +287,7 @@ fn managed_entrypoint_output_is_deterministic() {
         [
             "src/index.web.js",
             "src/index.mini-program.js",
+            "src/index.mini-program.d.ts",
             "src/index.node.js",
             "src/index.electron.js",
         ]
