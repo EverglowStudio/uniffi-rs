@@ -429,6 +429,10 @@ struct TypeExtra {
     kind: JsTypeKind,
     source_kind: SourceTypeKind,
     rust_path: RustPath,
+    /// The explicit custom marker path, populated only for custom types.
+    /// This is constructed while source metadata is available so no
+    /// downstream consumer needs to infer it from `rust_path`.
+    tag_path: Option<RustPath>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -513,6 +517,7 @@ fn collect_type_definitions(
                     },
                     source_kind: SourceTypeKind::Record { fields },
                     rust_path: record_rust_path(record, &component.ci),
+                    tag_path: None,
                 },
             );
         }
@@ -559,6 +564,7 @@ fn collect_type_definitions(
                         SourceTypeKind::Enum { variants }
                     },
                     rust_path: enum_rust_path(enum_, &component.ci),
+                    tag_path: None,
                 },
             );
         }
@@ -588,6 +594,7 @@ fn collect_type_definitions(
                             .unwrap_or(component.ci.crate_name()),
                         &rust_object_item_name(object),
                     ),
+                    tag_path: None,
                 },
             );
         }
@@ -608,6 +615,7 @@ fn collect_type_definitions(
                     kind: JsTypeKind::Callback,
                     source_kind: SourceTypeKind::Callback,
                     rust_path: RustPath::from_module_path(callback.module_path(), callback.name()),
+                    tag_path: None,
                 },
             );
         }
@@ -617,6 +625,8 @@ fn collect_type_definitions(
             let builtin = convert_type(&custom.builtin, crate_owners)?;
             let config =
                 custom_type_config(component.config.custom_type(&custom.name), &custom.name);
+            let rust_path = RustPath::from_module_path(&custom.module_path, &custom.name);
+            let tag_path = custom_tag_path(&custom.module_path)?;
             definitions.push(
                 TypeDefinition::new(
                     key.clone(),
@@ -635,7 +645,8 @@ fn collect_type_definitions(
                         config: config.clone(),
                     },
                     source_kind: SourceTypeKind::Custom { builtin },
-                    rust_path: RustPath::from_module_path(&custom.module_path, &custom.name),
+                    rust_path,
+                    tag_path: Some(tag_path),
                 },
             );
         }
@@ -678,6 +689,33 @@ fn enum_rust_path(enum_: &Enum, ci: &ComponentInterface) -> RustPath {
     }
 }
 
+/// Construct the marker type used by custom conversions from the source
+/// module path while the `ComponentInterface` is still available.  The
+/// marker lives at the component crate root regardless of the custom type's
+/// nested public module, so it must not be derived by splitting `rust_path`
+/// in an engine adapter.
+fn custom_tag_path(module_path: &str) -> Result<RustPath, FrontendError> {
+    let segments = module_path.split("::").collect::<Vec<_>>();
+    if module_path.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(FrontendError::Contract(format!(
+            "custom Rust type module path {module_path:?} is missing a complete crate path"
+        )));
+    }
+    let crate_segment = crate_root(module_path);
+    if crate_segment.is_empty() {
+        return Err(FrontendError::Contract(format!(
+            "custom Rust type module path {module_path:?} is missing a crate root"
+        )));
+    }
+    let path = RustPath::new([crate_segment, "UniFfiTag".to_owned()]);
+    if path.segments.len() != 2 || path.segments[1] != "UniFfiTag" {
+        return Err(FrontendError::Contract(format!(
+            "custom Rust type module path {module_path:?} produced an invalid UniFfiTag path"
+        )));
+    }
+    Ok(path)
+}
+
 fn rust_object_kind(implementation: &ObjectImpl) -> RustObjectKind {
     match implementation {
         ObjectImpl::Struct => RustObjectKind::Struct,
@@ -712,8 +750,6 @@ struct OperationExtra {
     object_kind: Option<RustObjectKind>,
     /// Source Rust item name used by the structured core call target.
     item_name: String,
-    /// Generated private FFI symbol, kept outside the core call target.
-    private_ffi_symbol: Option<String>,
     argument_rust_names: Vec<String>,
     argument_ownership: Vec<Ownership>,
     receiver_ownership: Option<Ownership>,
@@ -851,7 +887,6 @@ fn collect_operation_definitions(
                         crate_root(component.ci.crate_name()),
                         callback_symbol
                     );
-                    callback_operation.1.private_ffi_symbol = Some(callback_symbol);
                     push(Ok(callback_operation))?;
                 }
             }
@@ -1086,7 +1121,6 @@ fn operation_definition(
             type_path: type_target.as_ref().map(|(path, _)| path.clone()),
             object_kind: type_target.map(|(_, kind)| kind),
             item_name: callable.rust_name().to_owned(),
-            private_ffi_symbol: Some(private_symbol),
             argument_rust_names,
             argument_ownership,
             receiver_ownership,
@@ -1748,7 +1782,6 @@ fn build_rust_bridge_plan(
                     kind,
                     async_kind: AsyncKind::Async,
                     callback_method_id: None,
-                    private_ffi_symbol: None,
                     call_target: RustCallTarget::StreamHook {
                         parent: operation.id,
                         use_site_id: stream.id,
@@ -1839,7 +1872,6 @@ fn build_rust_bridge_plan(
             kind: operation.kind,
             async_kind: operation.async_kind,
             callback_method_id: operation.callback_method_id,
-            private_ffi_symbol: extra.private_ffi_symbol.clone(),
             call_target,
             receiver,
             arguments,
@@ -2146,8 +2178,16 @@ fn build_named_type_kind(
         SourceTypeKind::Custom { builtin } => {
             let inner =
                 rust_value_binding_for_value_type(builtin, api, type_ids, type_extras, false)?;
+            let tag_path = extra.tag_path.clone().ok_or_else(|| {
+                FrontendError::Contract(format!(
+                    "custom Rust type {} is missing its normalized UniFfiTag path",
+                    ty.source_key
+                ))
+            })?;
+            validate_custom_tag_path(&ty.source_key, &tag_path)?;
             let id = ty.id;
             Ok(RustNamedTypeKind::Custom {
+                tag_path,
                 conversion: ConversionRecipe::Custom(id, Box::new(inner.conversion.clone())),
                 inner,
             })
@@ -2157,6 +2197,16 @@ fn build_named_type_kind(
         }),
         SourceTypeKind::Callback => Ok(RustNamedTypeKind::Callback),
     }
+}
+
+fn validate_custom_tag_path(key: &TypeSourceKey, path: &RustPath) -> Result<(), FrontendError> {
+    if path.segments.len() != 2 || path.segments[0].is_empty() || path.segments[1] != "UniFfiTag" {
+        return Err(FrontendError::Contract(format!(
+            "custom Rust type {} has an invalid normalized UniFfiTag path",
+            key
+        )));
+    }
+    Ok(())
 }
 
 fn build_named_fields(
@@ -3107,9 +3157,19 @@ mod tests {
             .iter()
             .find(|entry| entry.rust_path.segments.ends_with(&["Alias".to_owned()]))
             .expect("custom lowering entry");
-        let RustNamedTypeKind::Custom { inner, conversion } = &custom.kind else {
+        let RustNamedTypeKind::Custom {
+            tag_path,
+            inner,
+            conversion,
+        } = &custom.kind
+        else {
             panic!("expected custom lowering entry");
         };
+        assert_eq!(tag_path.segments, vec!["named_plan_crate", "UniFfiTag"]);
+        assert_eq!(
+            custom.rust_path.segments,
+            vec!["named_plan_crate", "types", "Alias"]
+        );
         assert_eq!(inner.rust_type, RustType::Scalar(ScalarType::String));
         assert!(
             matches!(conversion, ConversionRecipe::Custom(id, inner) if *id == custom.id && matches!(**inner, ConversionRecipe::Identity))
@@ -3135,6 +3195,104 @@ mod tests {
             .rust
             .named_type(uniffi_js_abi::TypeId::new(999))
             .is_none());
+    }
+
+    #[test]
+    fn custom_tag_path_is_explicit_for_renamed_nested_and_raw_types() {
+        let crate_name = "raw-custom-crate";
+        let module_path = format!("{crate_name}::domain::nested");
+        let custom = uniffi_meta::Type::Custom {
+            module_path: module_path.clone(),
+            name: "r#type".to_owned(),
+            builtin: Box::new(uniffi_meta::Type::String),
+        };
+        let mut group = uniffi_meta::MetadataGroup {
+            namespace: uniffi_meta::NamespaceMetadata {
+                crate_name: crate_name.to_owned(),
+                name: "raw_custom".to_owned(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            uniffi_meta::CustomTypeMetadata {
+                module_path: module_path.clone(),
+                name: "r#type".to_owned(),
+                orig_name: Some("RawType".to_owned()),
+                builtin: uniffi_meta::Type::String,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            uniffi_meta::FnMetadata {
+                module_path: format!("{crate_name}::api"),
+                name: "round_trip".to_owned(),
+                orig_name: Some("rust_round_trip".to_owned()),
+                is_async: false,
+                inputs: vec![uniffi_meta::FnParamMetadata::simple(
+                    "value",
+                    custom.clone(),
+                )],
+                return_type: Some(custom),
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        let component = Component {
+            ci: ComponentInterface::from_metadata(group).unwrap(),
+            config: JsConfig {
+                custom_types: std::collections::BTreeMap::from([(
+                    "r#type".to_owned(),
+                    CustomTypeConfig {
+                        type_name: Some("RenamedAlias".to_owned()),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        };
+        let package = normalize(BindingInput::new(&[component])).unwrap();
+        let custom = package
+            .rust
+            .named_types()
+            .iter()
+            .find(|entry| entry.id.index() == 0)
+            .expect("custom lowering entry");
+        assert_eq!(
+            custom.rust_path.segments,
+            vec!["raw_custom_crate", "domain", "nested", "r#type"]
+        );
+        let RustNamedTypeKind::Custom { tag_path, .. } = &custom.kind else {
+            panic!("expected custom lowering entry");
+        };
+        assert_eq!(tag_path.segments, vec!["raw_custom_crate", "UniFfiTag"]);
+        assert_eq!(package.api.types[0].public_name, "RenamedAlias");
+
+        let operation = package
+            .rust
+            .engines
+            .get(&EngineKind::Napi)
+            .unwrap()
+            .operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::Function)
+            .expect("round-trip operation");
+        let RustCallTarget::FreeFunction { module, item } = &operation.call_target else {
+            panic!("expected free-function call target");
+        };
+        assert_eq!(module.segments, vec!["raw_custom_crate", "api"]);
+        assert_eq!(item, "rust_round_trip");
+        assert_eq!(
+            operation.arguments[0].rust_type,
+            RustType::Path(RustPath::new([
+                "raw_custom_crate",
+                "domain",
+                "nested",
+                "r#type",
+            ]))
+        );
     }
 
     #[test]
@@ -3183,6 +3341,81 @@ mod tests {
     }
 
     #[test]
+    fn custom_tag_paths_are_deterministic_across_component_order() {
+        let custom_group = |crate_name: &str, namespace: &str| {
+            let mut group = uniffi_meta::MetadataGroup {
+                namespace: uniffi_meta::NamespaceMetadata {
+                    crate_name: crate_name.to_owned(),
+                    name: namespace.to_owned(),
+                },
+                namespace_docstring: None,
+                items: Default::default(),
+            };
+            group.add_item(
+                uniffi_meta::CustomTypeMetadata {
+                    module_path: format!("{crate_name}::nested::module"),
+                    name: "Alias".to_owned(),
+                    orig_name: None,
+                    builtin: uniffi_meta::Type::String,
+                    docstring: None,
+                }
+                .into(),
+            );
+            group
+        };
+        let forward = normalize(BindingInput::new(&[
+            metadata_component(custom_group("custom-alpha", "alpha")),
+            metadata_component(custom_group("custom-beta", "beta")),
+        ]))
+        .unwrap();
+        let reverse = normalize(BindingInput::new(&[
+            metadata_component(custom_group("custom-beta", "beta")),
+            metadata_component(custom_group("custom-alpha", "alpha")),
+        ]))
+        .unwrap();
+        assert_eq!(forward.rust, reverse.rust);
+        let paths = forward
+            .rust
+            .named_types()
+            .iter()
+            .map(|entry| match &entry.kind {
+                RustNamedTypeKind::Custom { tag_path, .. } => {
+                    (entry.rust_path.clone(), tag_path.clone())
+                }
+                _ => panic!("expected custom lowering entry"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths
+                .iter()
+                .map(|(rust_path, tag_path)| {
+                    (rust_path.segments.clone(), tag_path.segments.clone())
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    vec![
+                        "custom_alpha".to_owned(),
+                        "nested".to_owned(),
+                        "module".to_owned(),
+                        "Alias".to_owned(),
+                    ],
+                    vec!["custom_alpha".to_owned(), "UniFfiTag".to_owned()],
+                ),
+                (
+                    vec![
+                        "custom_beta".to_owned(),
+                        "nested".to_owned(),
+                        "module".to_owned(),
+                        "Alias".to_owned(),
+                    ],
+                    vec!["custom_beta".to_owned(), "UniFfiTag".to_owned()],
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn close_policy_defaults_and_propagates_through_the_single_bridge_plan() {
         let components = [component("policy_crate", "policy", "string hello();")];
         let defaulted = normalize(BindingInput::new(&components)).unwrap();
@@ -3220,7 +3453,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_targets_keep_crate_paths_source_items_and_private_ffi_separate() {
+    fn rust_targets_keep_crate_paths_and_source_items() {
         let mut group = uniffi_meta::MetadataGroup {
             namespace: uniffi_meta::NamespaceMetadata {
                 crate_name: "core-crate".to_owned(),
@@ -3307,9 +3540,6 @@ mod tests {
         };
         assert_eq!(module.segments, vec!["core_crate", "api"]);
         assert_eq!(item, "rust_fetch");
-        let private_ffi_symbol = fetch.private_ffi_symbol.as_deref().unwrap();
-        assert!(private_ffi_symbol.contains("fetch"));
-        assert_ne!(item, private_ffi_symbol);
 
         let record = package
             .rust

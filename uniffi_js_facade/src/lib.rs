@@ -2436,7 +2436,6 @@ mod tests {
                         kind: OperationKind::Function,
                         async_kind: AsyncKind::Sync,
                         callback_method_id: None,
-                        private_ffi_symbol: None,
                         call_target: RustCallTarget::FreeFunction {
                             module: RustPath::new(["minimal"]),
                             item: "echo".into(),
@@ -2701,7 +2700,6 @@ mod tests {
                 kind: operation.definition.source_key.kind(),
                 async_kind: operation.definition.signature.async_kind,
                 callback_method_id: operation.definition.callback_method_id,
-                private_ffi_symbol: None,
                 call_target: if matches!(
                     operation.definition.source_key.owner(),
                     OperationOwner::Callback(_)
