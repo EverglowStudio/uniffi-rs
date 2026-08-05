@@ -293,9 +293,7 @@ pub enum RustCarrier {
 pub enum RustCallTarget {
     FreeFunction {
         module: RustPath,
-        /// The source Rust item name.  This is deliberately not the private
-        /// generated FFI export name; the latter lives on
-        /// [`RustOperationPlan::private_ffi_symbol`].
+        /// The source Rust item name used by the typed engine trampoline.
         item: String,
     },
     Constructor {
@@ -416,8 +414,8 @@ pub struct RustEnumVariant {
 
 /// The exhaustive named-type lowering table consumed by all JavaScript
 /// engine adapters.  Public AST fields intentionally do not get copied into
-/// the custom entry: custom lowering only needs the real Rust path, the
-/// builtin binding, and the conversion recipe.
+/// the custom entry: custom lowering needs the real Rust path, the explicit
+/// `UniFfiTag` path, the builtin binding, and the conversion recipe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RustNamedTypeKind {
     Record {
@@ -430,6 +428,10 @@ pub enum RustNamedTypeKind {
         variants: Vec<RustEnumVariant>,
     },
     Custom {
+        /// The component crate's canonical `UniFfiTag` marker path.  This is
+        /// normalized once from source metadata; adapters must consume it
+        /// directly and must not derive it from `rust_path`.
+        tag_path: RustPath,
         inner: RustValueBinding,
         conversion: ConversionRecipe,
     },
@@ -510,10 +512,6 @@ pub struct RustOperationPlan {
     pub kind: OperationKind,
     pub async_kind: AsyncKind,
     pub callback_method_id: Option<u32>,
-    /// Private generated FFI export used by the backend trampoline.  It is
-    /// kept separate from [`RustCallTarget`] so an FFI symbol can never be
-    /// mistaken for a Rust core item path.
-    pub private_ffi_symbol: Option<String>,
     pub call_target: RustCallTarget,
     pub receiver: Option<RustReceiverBinding>,
     pub arguments: Vec<RustArgumentBinding>,
