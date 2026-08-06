@@ -381,6 +381,19 @@ struct ExpandedTargets {
     android: bool,
 }
 
+impl ExpandedTargets {
+    fn requires_javascript_package(&self) -> bool {
+        #[cfg(feature = "cli-ohos")]
+        {
+            self.wasm || self.mini_program || self.node || self.electron || self.harmony
+        }
+        #[cfg(not(feature = "cli-ohos"))]
+        {
+            self.wasm || self.mini_program || self.node || self.electron
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ManagedLayout {
     package_dir: Utf8PathBuf,
@@ -1540,12 +1553,14 @@ fn collect_javascript_support(
 fn build_private_target_set(
     args: &BuildArgs,
     targets: &ExpandedTargets,
-    package: &GeneratedPackage,
+    package: Option<&GeneratedPackage>,
 ) -> Result<()> {
     #[cfg(feature = "cli-ohos")]
     let hsp_first = targets.harmony && args.ohos_package_kind == super::ohos::PackageKind::Hsp;
     #[cfg(feature = "cli-ohos")]
     if hsp_first {
+        let package =
+            package.context("Harmony artifact invocation has no prepared JavaScript package")?;
         build_ohos_deferred_prepared(args.to_ohos_args()?, package)
             .context("building private managed Harmony HSP outputs")?
             .commit_private()
@@ -1558,6 +1573,8 @@ fn build_private_target_set(
         build_android(args).context("building private managed Android target")?;
     }
     if targets.wasm || targets.mini_program {
+        let package =
+            package.context("wasm artifact invocation has no prepared JavaScript package")?;
         build_wasm_prepared(args.to_wasm_args()?, package)
             .context("building private managed wasm target")?;
     }
@@ -1580,11 +1597,15 @@ fn build_private_target_set(
         flavors.push(NapiBuildFlavorArg::Electron);
     }
     if !flavors.is_empty() {
+        let package =
+            package.context("N-API artifact invocation has no prepared JavaScript package")?;
         build_napi_prepared(args.to_napi_args(flavors)?, package)
             .context("building private managed N-API target")?;
     }
     #[cfg(feature = "cli-ohos")]
     if targets.harmony && !hsp_first {
+        let package =
+            package.context("Harmony artifact invocation has no prepared JavaScript package")?;
         build_ohos_prepared(args.to_ohos_args()?, package)
             .context("building private managed Harmony target")?;
     }
@@ -1600,9 +1621,15 @@ fn build_managed_package(
     let private_layout = layout.rebased(stage.root())?;
     (|| -> Result<()> {
         let private_args = managed_private_args(&stage, &layout, &public_args, &targets)?;
-        let package = prepare_javascript_package(&private_args, &targets)
-            .context("preparing one managed JavaScript package")?;
-        build_private_target_set(&private_args, &targets, &package)?;
+        let package = if targets.requires_javascript_package() {
+            Some(
+                prepare_javascript_package(&private_args, &targets)
+                    .context("preparing one managed JavaScript package")?,
+            )
+        } else {
+            None
+        };
+        build_private_target_set(&private_args, &targets, package.as_ref())?;
         let meta = cargo_package_metadata(&public_args.manifest_path)?;
         private_layout
             .emit_supporting_files(&targets, &meta, &private_args)

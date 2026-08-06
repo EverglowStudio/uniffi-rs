@@ -596,6 +596,122 @@ fn rejects_empty_target_list() {
 }
 
 #[test]
+fn managed_native_only_targets_skip_javascript_package_preparation() {
+    for target in [ArtifactTargetArg::Apple, ArtifactTargetArg::Android] {
+        let targets = expand_targets(&[target]).unwrap();
+        assert!(
+            !targets.requires_javascript_package(),
+            "managed {target:?} invocation must not prepare a JavaScript package"
+        );
+    }
+    let targets = expand_targets(&[ArtifactTargetArg::Apple, ArtifactTargetArg::Android]).unwrap();
+    assert!(!targets.requires_javascript_package());
+}
+
+#[test]
+fn managed_mixed_targets_share_one_javascript_package_plan() {
+    let targets = expand_targets(&[ArtifactTargetArg::All]).unwrap();
+    assert!(targets.requires_javascript_package());
+
+    // The managed coordinator owns the single preparation call and passes its
+    // result through the private target set; native-only targets take the
+    // `None` branch above.
+    let artifacts_src = include_str!("../artifacts.rs");
+    assert_eq!(
+        artifacts_src
+            .matches("preparing one managed JavaScript package")
+            .count(),
+        1,
+        "managed orchestration must prepare one shared JavaScript package"
+    );
+}
+
+#[test]
+fn managed_javascript_builders_fail_closed_without_prepared_package() {
+    let args = empty_build_args();
+    for targets in [
+        ExpandedTargets {
+            wasm: true,
+            ..ExpandedTargets::default()
+        },
+        ExpandedTargets {
+            node: true,
+            ..ExpandedTargets::default()
+        },
+    ] {
+        let error = build_private_target_set(&args, &targets, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no prepared JavaScript package"),
+            "JavaScript builder did not fail closed: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn managed_apple_only_skips_javascript_preparation_before_native_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = Utf8Path::from_path(temp.path()).unwrap();
+    let manifest = write_test_manifest(&parent.join("crate"));
+    let package = parent.join("apple-package");
+    publish_fixture(&package, "generation.txt", b"old generation\n");
+
+    let mut args = empty_build_args();
+    args.manifest_path = manifest;
+    args.out_dir = None;
+    args.managed_layout = true;
+    args.package_dir = Some(package.clone());
+    args.target = vec![ArtifactTargetArg::Apple];
+    args.cargo_bin = parent.join("missing-cargo").to_string();
+
+    let error = build(args).unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(!rendered.contains("JavaScript package preparation requires"));
+    assert!(rendered.contains("building private managed Apple target"));
+    assert_eq!(
+        std::fs::read(package.join("generation.txt")).unwrap(),
+        b"old generation\n"
+    );
+    assert_no_staging_residue(parent, "apple-package");
+}
+
+#[test]
+fn managed_android_only_skips_javascript_preparation_before_native_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = Utf8Path::from_path(temp.path()).unwrap();
+    let manifest = write_test_manifest(&parent.join("crate"));
+    let package = parent.join("android-package");
+    publish_fixture(&package, "generation.txt", b"old generation\n");
+    let ndk = parent.join("ndk");
+    let prebuilt = ndk.join("toolchains/llvm/prebuilt/darwin-x86_64");
+    std::fs::create_dir_all(prebuilt.join("bin")).unwrap();
+    std::fs::write(
+        prebuilt.join("bin/aarch64-linux-android23-clang"),
+        b"fake clang\n",
+    )
+    .unwrap();
+
+    let mut args = empty_build_args();
+    args.manifest_path = manifest;
+    args.out_dir = None;
+    args.managed_layout = true;
+    args.package_dir = Some(package.clone());
+    args.target = vec![ArtifactTargetArg::Android];
+    args.android_abi = vec!["arm64-v8a".to_string()];
+    args.android_ndk_home = Some(ndk);
+    args.cargo_bin = parent.join("missing-cargo").to_string();
+
+    let error = build(args).unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(!rendered.contains("JavaScript package preparation requires"));
+    assert!(rendered.contains("building private managed Android target"));
+    assert_eq!(
+        std::fs::read(package.join("generation.txt")).unwrap(),
+        b"old generation\n"
+    );
+    assert_no_staging_residue(parent, "android-package");
+}
+
+#[test]
 fn apple_helpers_derive_package_contract_names() {
     let meta = test_cargo_metadata(Utf8PathBuf::from("/repo/target"));
     assert_eq!(apple_package_product_name(&meta), "UniCoreApple");
