@@ -1697,24 +1697,14 @@ fn build(mut args: BuildArgs) -> Result<()> {
         return build_multi_target_hsp(args, targets);
     }
     (|| -> Result<()> {
-        let javascript_package =
-            if targets.wasm || targets.mini_program || targets.node || targets.electron {
-                Some(
-                    prepare_javascript_package(&args, &targets)
-                        .context("preparing one JavaScript package for the artifact invocation")?,
-                )
-            } else {
-                None
-            };
-        #[cfg(feature = "cli-ohos")]
-        let javascript_package =
-            if targets.harmony {
-                Some(prepare_javascript_package(&args, &targets).context(
-                    "preparing one JavaScript package for the Harmony artifact invocation",
-                )?)
-            } else {
-                javascript_package
-            };
+        let javascript_package = if targets.requires_javascript_package() {
+            Some(
+                prepare_javascript_package(&args, &targets)
+                    .context("preparing one JavaScript package for the artifact invocation")?,
+            )
+        } else {
+            None
+        };
         if targets.apple {
             build_apple(&args).context("building Apple artifact target")?;
         }
