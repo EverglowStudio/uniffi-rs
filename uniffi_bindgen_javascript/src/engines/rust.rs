@@ -3749,7 +3749,12 @@ fn render_operation_helpers_for(
                 let core = core_type_for_binding(package, &value_binding)?;
                 let name =
                     ident_for_helper(operation.operation_id.index(), &index.to_string(), "lower");
-                let owned = binding.ownership == Ownership::Owned;
+                // An ordinary object argument borrows the public lease from
+                // the package registry.  The canonical ownership still
+                // controls how the lowered Arc crosses the Rust call
+                // boundary (see `rust_call_argument`); it must not decide
+                // whether this registry entry is consumed.
+                let owned = false;
                 let carrier = napi_object_lease_type();
                 source.extend(quote! {
                     fn #name(value: #carrier) -> ::std::result::Result<#core, #error_descriptor> {
@@ -6523,6 +6528,14 @@ namespace resource_paths {
         .collect()
     }
 
+    fn generated_helper_body(source: &str, operation_id: u32) -> &str {
+        let marker = format!("fn __uniffi_lower_{operation_id}_0");
+        let (_, tail) = source
+            .split_once(&marker)
+            .expect("generated object argument helper should be present");
+        tail.split_once("fn ").map_or(tail, |(body, _)| body)
+    }
+
     #[test]
     fn expanded_resource_paths_cover_nested_selectors_and_streams() {
         let (package, operation, object_id) = fixture();
@@ -6795,6 +6808,70 @@ namespace resource_paths {
             assert!(
                 harmony_helpers.contains(&format!("fn __uniffi_lower_{}_0", operation_id.index()))
             );
+        }
+    }
+
+    #[test]
+    fn native_object_argument_helpers_borrow_public_leases() {
+        let (mut package, operation, object_id) = fixture();
+        let object_type = package
+            .rust
+            .named_type(object_id)
+            .expect("fixture object type exists")
+            .rust_path
+            .clone();
+        let binding = RustArgumentBinding {
+            public_name: "counter".into(),
+            rust_name: "counter".into(),
+            rust_type: RustType::Path(object_type),
+            carrier: RustCarrier::OpaqueHandle,
+            ownership: Ownership::Owned,
+            conversion: ConversionRecipe::Object(object_id),
+        };
+        let operation_id = operation.operation_id;
+
+        package
+            .rust
+            .engines
+            .get_mut(&EngineKind::Napi)
+            .expect("fixture has a Node engine")
+            .operations
+            .iter_mut()
+            .find(|candidate| candidate.operation_id == operation_id)
+            .expect("fixture has the Node operation")
+            .arguments = vec![binding.clone()];
+        let node_helpers =
+            render_operation_helpers_for(&package, NativeFlavor::Node, EngineKind::Napi)
+                .expect("Node object argument helper should render");
+        let node_helper = generated_helper_body(&node_helpers, operation_id.index());
+        assert!(node_helper.contains("value . handle , false"));
+        assert!(!node_helper.contains("value . handle , true"));
+        let node_source = napi_source(&package).expect("Node object argument source should render");
+        assert!(node_source.contains("value . handle , false"));
+        assert!(!node_source.contains("value . handle , true"));
+
+        #[cfg(feature = "ohos")]
+        {
+            package
+                .rust
+                .engines
+                .get_mut(&EngineKind::OhosNapi)
+                .expect("fixture has a Harmony engine")
+                .operations
+                .iter_mut()
+                .find(|candidate| candidate.operation_id == operation_id)
+                .expect("fixture has the Harmony operation")
+                .arguments = vec![binding];
+            let harmony_helpers =
+                render_operation_helpers_for(&package, NativeFlavor::Ohos, EngineKind::OhosNapi)
+                    .expect("Harmony object argument helper should render");
+            let harmony_helper = generated_helper_body(&harmony_helpers, operation_id.index());
+            assert!(harmony_helper.contains("value . handle , false"));
+            assert!(!harmony_helper.contains("value . handle , true"));
+            let harmony_source =
+                ohos_source(&package).expect("Harmony object argument source should render");
+            assert!(harmony_source.contains("value . handle , false"));
+            assert!(!harmony_source.contains("value . handle , true"));
         }
     }
 
