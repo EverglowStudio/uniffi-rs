@@ -627,6 +627,39 @@ fn managed_mixed_targets_share_one_javascript_package_plan() {
 }
 
 #[test]
+fn ordinary_mixed_targets_share_one_javascript_package_plan() {
+    let mixed_targets = expand_targets(&[
+        ArtifactTargetArg::Wasm,
+        #[cfg(feature = "cli-ohos")]
+        ArtifactTargetArg::Harmony,
+        #[cfg(not(feature = "cli-ohos"))]
+        ArtifactTargetArg::Node,
+    ])
+    .unwrap();
+    assert!(mixed_targets.requires_javascript_package());
+    let all_targets = expand_targets(&[ArtifactTargetArg::All]).unwrap();
+    assert!(all_targets.requires_javascript_package());
+
+    // Every JavaScript-capable ordinary target, including Harmony when the
+    // OHOS feature is enabled, must consume this one package.  Keep the
+    // source-level count as a regression guard: a second ordinary prepare
+    // call would create a second generation in one invocation.
+    let artifacts_src = include_str!("../artifacts.rs");
+    assert_eq!(
+        artifacts_src
+            .matches("prepare_javascript_package(&args, &targets)")
+            .count(),
+        1,
+        "ordinary orchestration must prepare one shared JavaScript package"
+    );
+    assert!(
+        !artifacts_src
+            .contains("preparing one JavaScript package for the Harmony artifact invocation"),
+        "ordinary Harmony must not prepare a second JavaScript package"
+    );
+}
+
+#[test]
 fn managed_javascript_builders_fail_closed_without_prepared_package() {
     let args = empty_build_args();
     for targets in [
