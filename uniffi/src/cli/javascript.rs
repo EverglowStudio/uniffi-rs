@@ -1322,6 +1322,13 @@ fn build_napi_with_generation(
         None,
     );
     if let Some(target_dir) = &target_dir {
+        // The native cargo wrapper validates target directories before handing
+        // the command to Cargo. Managed builds intentionally allocate a fresh
+        // invocation-private N-API target below their staging root, so create
+        // that directory before entering the wrapper. Cargo itself would
+        // normally create it, but doing so here preserves the wrapper's
+        // no-follow/safe-directory invariant without weakening validation.
+        ensure_napi_target_directory(target_dir)?;
         build_napi_host
             .env("CARGO_TARGET_DIR", target_dir.as_str())
             .env("CARGO_INCREMENTAL", "0");
@@ -1364,6 +1371,11 @@ fn build_napi_with_generation(
     })?;
 
     Ok(())
+}
+
+fn ensure_napi_target_directory(target_dir: &Utf8Path) -> Result<()> {
+    std::fs::create_dir_all(target_dir)
+        .with_context(|| format!("creating N-API Cargo target directory {target_dir}"))
 }
 
 #[cfg(feature = "cli-ohos")]
@@ -2154,8 +2166,8 @@ mod tests {
     #[cfg(feature = "cli-ohos")]
     use super::host_dependency_cargo_feature_args;
     use super::{
-        patch_mini_program_web_runtime, preflight_wasm_build_paths, BuildWasmArgs,
-        WasmBindgenTargetArg,
+        ensure_napi_target_directory, patch_mini_program_web_runtime, preflight_wasm_build_paths,
+        BuildWasmArgs, WasmBindgenTargetArg,
     };
     #[cfg(windows)]
     use super::{wasm_preflight_nofollow, windows_wasm_semantic_path_key};
@@ -2183,6 +2195,45 @@ mod tests {
             crate_name: None,
             metadata_no_deps: false,
         }
+    }
+
+    #[test]
+    fn napi_target_directory_creation_is_nested_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let target = root.join("staging/target/napi");
+
+        ensure_napi_target_directory(&target).unwrap();
+        assert!(target.is_dir());
+
+        // A repeated build reuses the invocation's private target without
+        // replacing it or changing its identity.
+        let identity = std::fs::metadata(&target).unwrap();
+        ensure_napi_target_directory(&target).unwrap();
+        let repeated = std::fs::metadata(&target).unwrap();
+        assert_eq!(identity.file_type(), repeated.file_type());
+        assert_eq!(
+            identity.permissions().readonly(),
+            repeated.permissions().readonly()
+        );
+    }
+
+    #[test]
+    fn napi_target_directory_creation_preserves_existing_path_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let blocker = root.join("staging/target");
+        std::fs::create_dir_all(&blocker).unwrap();
+        std::fs::write(blocker.join("napi"), b"sentinel").unwrap();
+        let target = blocker.join("napi/child");
+
+        let error = ensure_napi_target_directory(&target)
+            .expect_err("a file in the target path must reject directory creation");
+        assert!(error
+            .to_string()
+            .contains("creating N-API Cargo target directory"));
+        assert_eq!(std::fs::read(blocker.join("napi")).unwrap(), b"sentinel");
+        assert!(!target.exists());
     }
 
     #[test]

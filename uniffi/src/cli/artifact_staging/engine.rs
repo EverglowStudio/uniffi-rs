@@ -1038,8 +1038,10 @@ pub(in crate::cli) fn windows_file_information(path: &Path) -> Result<WindowsFil
 ///
 /// Managed builds are generated from scratch in a temporary directory beside
 /// the public package. A successful invocation replaces the whole public
-/// directory. No auxiliary publication protocol or concurrent-writer support
-/// is provided.
+/// directory through a sibling backup/swap. If publication fails after the
+/// old directory is moved aside, the backup is restored before the error is
+/// returned. No auxiliary publication protocol or concurrent-writer support is
+/// provided.
 pub(in crate::cli) struct ManagedPackageStage {
     public_root: Utf8PathBuf,
     staging: tempfile::TempDir,
@@ -1087,24 +1089,106 @@ impl ManagedPackageStage {
     }
 
     pub(in crate::cli) fn publish(self) -> Result<()> {
+        self.publish_with_hook(|_, _| Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(in crate::cli) fn publish_with_test_failure(self) -> Result<()> {
+        self.publish_with_hook(|_, _| bail!("injected managed package publish failure"))
+    }
+
+    fn publish_with_hook<F>(self, after_backup: F) -> Result<()>
+    where
+        F: FnOnce(&Utf8Path, &Utf8Path) -> Result<()>,
+    {
         validate_managed_package_marker(&self.staging_root, "staged managed package")?;
         let public_exists = validate_existing_managed_package_root(&self.public_root)?;
-        if public_exists {
-            std::fs::remove_dir_all(&self.public_root).with_context(|| {
+        let backup_root = managed_backup_path(&self.public_root)?;
+        let mut backup_exists = false;
+        let mut published = false;
+        let result = (|| {
+            if public_exists {
+                std::fs::rename(&self.public_root, &backup_root).with_context(|| {
+                    format!(
+                        "moving previous managed package root {} to backup {}",
+                        self.public_root, backup_root
+                    )
+                })?;
+                backup_exists = true;
+            }
+            after_backup(&backup_root, &self.public_root)?;
+            std::fs::rename(self.staging.path(), &self.public_root).with_context(|| {
                 format!(
-                    "removing previous managed package root {}",
-                    self.public_root
+                    "publishing managed package staging directory {} to {}",
+                    self.staging_root, self.public_root
                 )
             })?;
+            published = true;
+            if backup_exists {
+                std::fs::remove_dir_all(&backup_root)
+                    .with_context(|| format!("removing managed package backup {backup_root}"))?;
+                backup_exists = false;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let rollback: Result<()> = (|| {
+                if published {
+                    remove_managed_package_root(&self.public_root)?;
+                    published = false;
+                }
+                if backup_exists {
+                    std::fs::rename(&backup_root, &self.public_root).with_context(|| {
+                        format!(
+                            "restoring managed package backup {} to {}",
+                            backup_root, self.public_root
+                        )
+                    })?;
+                    backup_exists = false;
+                }
+                Ok(())
+            })();
+            if let Err(rollback_error) = rollback {
+                return Err(error).context(format!(
+                    "managed package publish failed and rollback failed: {rollback_error:#}"
+                ));
+            }
+            return Err(error);
         }
-        std::fs::rename(self.staging.path(), &self.public_root).with_context(|| {
-            format!(
-                "publishing managed package staging directory {} to {}",
-                self.staging_root, self.public_root
-            )
-        })?;
         Ok(())
     }
+}
+
+fn managed_backup_path(public_root: &Utf8Path) -> Result<Utf8PathBuf> {
+    let parent = public_root
+        .parent()
+        .with_context(|| format!("managed package root has no parent: {public_root}"))?;
+    let name = public_root
+        .file_name()
+        .context("managed package root has no file name")?;
+    let temporary = tempfile::Builder::new()
+        .prefix(&format!(".{name}.backup-"))
+        .tempdir_in(parent)
+        .with_context(|| format!("creating managed package backup beside {public_root}"))?;
+    let path = Utf8PathBuf::from_path_buf(temporary.path().to_path_buf()).map_err(|path| {
+        anyhow::anyhow!(
+            "managed package backup path is not utf8: {}",
+            path.display()
+        )
+    })?;
+    std::fs::remove_dir(&path)
+        .with_context(|| format!("reserving managed package backup path {path}"))?;
+    Ok(path)
+}
+
+fn remove_managed_package_root(root: &Utf8Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(root)
+        .with_context(|| format!("reading published managed package root {root}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("published managed package root must be a real directory: {root}");
+    }
+    std::fs::remove_dir_all(root)
+        .with_context(|| format!("removing published managed package root {root}"))
 }
 
 fn validate_existing_managed_package_root(root: &Utf8Path) -> Result<bool> {

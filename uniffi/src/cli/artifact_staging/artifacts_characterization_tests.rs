@@ -142,6 +142,20 @@ fn assert_no_staging_residue(parent: &Utf8Path, public_name: &str) {
     assert!(residue.is_empty(), "staging residue remains: {residue:?}");
 }
 
+fn assert_no_managed_backup_residue(parent: &Utf8Path, public_name: &str) {
+    let prefix = format!(".{public_name}.backup-");
+    let residue = std::fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    assert!(
+        residue.is_empty(),
+        "managed backup residue remains: {residue:?}"
+    );
+}
+
 fn publish_fixture(public: &Utf8Path, file: &str, contents: &[u8]) {
     let stage = ManagedPackageStage::begin(public).unwrap();
     assert_eq!(stage.root().parent(), public.parent());
@@ -254,6 +268,36 @@ fn managed_stage_build_failure_preserves_public_generation() {
         b"old\n"
     );
     assert_no_staging_residue(parent, "package");
+}
+
+#[test]
+fn managed_package_stage_publish_failure_restores_the_complete_public_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = Utf8Path::from_path(temp.path()).unwrap();
+    let public = parent.join("package");
+    publish_fixture(&public, "generation.txt", b"old\n");
+    std::fs::create_dir_all(public.join("metadata")).unwrap();
+    std::fs::write(public.join("metadata/keep.txt"), b"keep\n").unwrap();
+
+    let stage = ManagedPackageStage::begin(&public).unwrap();
+    std::fs::write(stage.root().join("generation.txt"), b"new\n").unwrap();
+    let error = stage.publish_with_test_failure().unwrap_err();
+    assert!(format!("{error:#}").contains("injected managed package publish failure"));
+
+    assert_eq!(
+        std::fs::read(public.join("generation.txt")).unwrap(),
+        b"old\n"
+    );
+    assert_eq!(
+        std::fs::read(public.join("metadata/keep.txt")).unwrap(),
+        b"keep\n"
+    );
+    assert_eq!(
+        std::fs::read(public.join(MANAGED_PACKAGE_MARKER_NAME)).unwrap(),
+        MANAGED_PACKAGE_MARKER_CONTENT
+    );
+    assert_no_staging_residue(parent, "package");
+    assert_no_managed_backup_residue(parent, "package");
 }
 
 #[test]
