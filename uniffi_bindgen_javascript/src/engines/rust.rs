@@ -358,6 +358,12 @@ fn napi_carrier_type_for(
                 syn::parse_str(&format!("{}::bindgen_prelude::BigInt", flavor.prefix()))
                     .map_err(Into::into)
             }
+            ConversionRecipe::Bytes
+                if matches!(ty, RustType::Scalar(uniffi_js_abi::ScalarType::Bytes)) =>
+            {
+                syn::parse_str(&format!("{}::bindgen_prelude::Uint8Array", flavor.prefix()))
+                    .map_err(Into::into)
+            }
             ConversionRecipe::Record(id)
             | ConversionRecipe::Enum(id)
             | ConversionRecipe::Error(id) => type_for_id(*id),
@@ -1234,6 +1240,7 @@ fn lower_expr(
             }),
             _ => expression,
         },
+        ConversionRecipe::Bytes => quote!(#expression.to_vec()),
         ConversionRecipe::Record(_) | ConversionRecipe::Enum(_) | ConversionRecipe::Error(_) => {
             let id = match &binding.conversion {
                 ConversionRecipe::Record(id)
@@ -1376,6 +1383,7 @@ fn lift_expr(
             }
             _ => Ok(expression),
         },
+        ConversionRecipe::Bytes => Ok(quote!(#napi::bindgen_prelude::Uint8Array::new(#expression))),
         ConversionRecipe::Record(_) | ConversionRecipe::Enum(_) | ConversionRecipe::Error(_) => {
             let id = match &binding.conversion {
                 ConversionRecipe::Record(id)
@@ -6975,6 +6983,40 @@ namespace resource_paths {
                 "napi_ohos :: bindgen_prelude :: BigInt"
             );
         }
+    }
+
+    #[test]
+    fn native_bytes_use_uint8array_carriers_and_typed_helpers() {
+        fn assert_flavor(flavor: NativeFlavor, prefix: &str) {
+            let binding = RustValueBinding {
+                rust_type: RustType::Scalar(uniffi_js_abi::ScalarType::Bytes),
+                carrier: RustCarrier::Bytes,
+                conversion: ConversionRecipe::Bytes,
+            };
+
+            let carrier = napi_carrier_type_for(&binding, &[], flavor)
+                .expect("native Bytes carrier should render");
+            assert_eq!(
+                carrier.to_token_stream().to_string(),
+                format!("{prefix} :: bindgen_prelude :: Uint8Array")
+            );
+            assert_eq!(
+                lower_expr(&binding, quote!(value), flavor)
+                    .expect("native Bytes lower should render")
+                    .to_string(),
+                "value . to_vec ()"
+            );
+            assert_eq!(
+                lift_expr(&binding, quote!(value), flavor)
+                    .expect("native Bytes lift should render")
+                    .to_string(),
+                format!("{prefix} :: bindgen_prelude :: Uint8Array :: new (value)")
+            );
+        }
+
+        assert_flavor(NativeFlavor::Node, "napi");
+        #[cfg(feature = "ohos")]
+        assert_flavor(NativeFlavor::Ohos, "napi_ohos");
     }
 
     #[test]
