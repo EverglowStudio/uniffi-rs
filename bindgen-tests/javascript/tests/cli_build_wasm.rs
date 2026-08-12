@@ -54,12 +54,14 @@ fn write_cli_wasm_fixture(root: &std::path::Path) -> Utf8PathBuf {
         src.join("cli_wasm.udl"),
         "namespace cli_wasm {\n\
          \x20   u64 add(u64 a, u64 b);\n\
+         \x20   bytes? roundtrip_optional_bytes(bytes? value);\n\
          };\n",
     )
     .unwrap();
     std::fs::write(
         src.join("lib.rs"),
         "pub fn add(a: u64, b: u64) -> u64 { a + b }\n\n\
+         pub fn roundtrip_optional_bytes(value: Option<Vec<u8>>) -> Option<Vec<u8>> { value }\n\n\
          uniffi::include_scaffolding!(\"cli_wasm\");\n",
     )
     .unwrap();

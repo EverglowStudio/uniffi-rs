@@ -5496,7 +5496,16 @@ fn wasm_carrier(binding: &RustValueBinding) -> wasm_bindgen_uniffi_engine::WasmC
             RustType::Scalar(ScalarType::U64) => C::U64,
             _ => C::JsValue,
         },
-        RustCarrier::Bytes => C::Bytes,
+        // `bytes` can use wasm-bindgen's direct `Vec<u8>` carrier, but a
+        // container around it cannot: `bytes?` needs a `JsValue` so null can
+        // be represented before the generated lowerer produces
+        // `Option<Vec<u8>>`.  The frontend deliberately preserves the inner
+        // carrier through `Optional`, so keep this boundary shape-aware just
+        // like the BigInt and primitive arms below.
+        RustCarrier::Bytes => match binding.rust_type {
+            RustType::Scalar(ScalarType::Bytes) => C::Bytes,
+            _ => C::JsValue,
+        },
         RustCarrier::OpaqueHandle | RustCarrier::InputStream | RustCarrier::OutputStream => C::U32,
         RustCarrier::Primitive => match binding.rust_type {
             RustType::Scalar(ScalarType::Bool) => C::Bool,
