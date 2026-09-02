@@ -2508,7 +2508,10 @@ fn render_stream_helpers(package: &NormalizedPackage) -> Result<String> {
         #[doc(hidden)]
         fn __uniffi_wasm_close_output_stream_impl(handle: u32) -> Result<(), JsValue> {
             #(#output_closers)*
-            __uniffi_wasm_release_object_impl(handle)
+            // Output streams and objects live in independent registries and
+            // may legitimately receive the same numeric handle. Releasing an
+            // object here would therefore dispose an unrelated live object.
+            Ok(())
         }
     });
     Ok(tokens.to_string())

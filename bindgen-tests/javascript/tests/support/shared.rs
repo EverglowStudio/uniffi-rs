@@ -251,6 +251,23 @@ pub struct IdEnvelope {
     pub others: Vec<EventId>,
 }
 
+#[derive(uniffi::Object)]
+pub struct StreamOwner {
+    value: u32,
+}
+
+#[uniffi::export]
+impl StreamOwner {
+    #[uniffi::constructor]
+    pub fn new(value: u32) -> Self {
+        Self { value }
+    }
+
+    pub fn value(&self) -> u32 {
+        self.value
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
 pub enum StreamError {
     Boom,

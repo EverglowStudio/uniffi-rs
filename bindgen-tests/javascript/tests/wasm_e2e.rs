@@ -2171,7 +2171,7 @@ fn host_crates_wasm_runs_stream_fixture() {
 import { createRequire } from "node:module";
 import * as root from "./generated/browser/index.js";
 await root.ready;
-const { countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, streamStartCount, UniffiError } = root.stream_core;
+const { countEvents, emptyOptionalEvents, errorAfterOne, eventIdEnvelope, optionalEvents, pendingEvents, resetStreamStartCount, roundtripEventId, singleOptionalEvent, StreamError, StreamOwner, streamStartCount, UniffiError } = root.stream_core;
 
 const require = createRequire(import.meta.url);
 
@@ -2179,12 +2179,21 @@ function assert(cond: boolean, label: string): void {
   if (!cond) throw new Error(`FAIL ${label}`);
 }
 
+// Wasm objects and output streams intentionally use separate registries. Their
+// numeric handles can overlap, so closing stream handle 2 must not release the
+// second object stored in the object registry.
+const firstOwner = StreamOwner.new(1);
+const collidingOwner = StreamOwner.new(2);
+
 resetStreamStartCount();
 const lazy = countEvents(1);
 assert(streamStartCount() === 0, "wasm stream construction must not start native work");
 assert((await lazy.next()).value.value === 0, "wasm direct next starts lazy stream");
 assert(streamStartCount() === 1, "wasm first next starts exactly once");
 await lazy.cancel();
+assert(collidingOwner.value() === 2, "closing an output stream must not release a colliding object handle");
+firstOwner.dispose();
+collidingOwner.dispose();
 
 resetStreamStartCount();
 const idle = countEvents(1);
