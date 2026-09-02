@@ -132,6 +132,22 @@ fn cli_build_napi_orchestrates_synthetic_fixture() {
             && backend_napi.contains("new BackendSession"),
         "node entry should expose the generated native backend:\n{backend_napi}"
     );
+    let electron_preload = std::fs::read_to_string(out_dir.join("electron/preload.cjs")).unwrap();
+    for expected in [
+        "function __napiCarrier(value)",
+        "Object.prototype.toString.call(value) === \"[object Uint8Array]\"",
+        "return __napiCarrier(__rendererHost[method](...args))",
+        "Promise.resolve(__hostCall(method, args)).then(__napiCarrier)",
+    ] {
+        assert!(
+            electron_preload.contains(expected),
+            "Electron preload must localize callback carriers before N-API using `{expected}`:\n{electron_preload}"
+        );
+    }
+    assert!(
+        electron_preload.contains("return __backendMethod(name).apply(__backend, args)"),
+        "Electron backend operation dispatch must remain unchanged:\n{electron_preload}"
+    );
 
     let node = which_tool("node");
     assert_node_strip_types(&node);

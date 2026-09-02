@@ -174,6 +174,12 @@ const customDescriptor = { kind: "named", name: "Custom", typeId: 11 };
 if (lowerValue({ public: "x" }, customDescriptor, customContext) !== "x") throw Error("custom lower order");
 if (liftValue("x", customDescriptor, null, customContext) !== "public:x") throw Error("custom lift order");
 
+const bridgedBytes = liftValue([0, 127, 255], scalar("Bytes"));
+if (!(bridgedBytes instanceof Uint8Array) || bridgedBytes.join(",") !== "0,127,255") {
+  throw Error("contextBridge byte array lift");
+}
+expectError(() => liftValue([0, -1, 256], scalar("Bytes")), "UniffiBytesType");
+
 let naturalCancel = 0;
 let naturalRelease = 0;
 let naturalFinish = 0;

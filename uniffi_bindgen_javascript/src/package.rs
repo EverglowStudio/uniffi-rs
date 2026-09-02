@@ -520,12 +520,23 @@ function __bindRendererHost(host) {\n\
   if (__rendererHost !== null) throw __plainError({ errorName: \"UniffiElectronHost\", message: \"renderer Host can only be bound once\" });\n\
   __rendererHost = host;\n\
 }\n\
+// contextBridge returns frozen cross-realm carriers that N-API cannot inspect directly.\n\
+function __napiCarrier(value) {\n\
+  if (Object.prototype.toString.call(value) === \"[object Uint8Array]\") return Array.from(value);\n\
+  if (Array.isArray(value)) return value.map(__napiCarrier);\n\
+  if (value && typeof value === \"object\" && typeof value.then !== \"function\") {\n\
+    const result = {};\n\
+    for (const [key, item] of Object.entries(value)) result[key] = __napiCarrier(item);\n\
+    return result;\n\
+  }\n\
+  return value;\n\
+}\n\
 function __hostCall(method, args) {\n\
   if (__rendererHost === null) throw __plainError({ errorName: \"UniffiElectronHost\", message: \"renderer Host is not bound\" });\n\
-  try { return __rendererHost[method](...args); } catch (error) { throw __plainError(error); }\n\
+  try { return __napiCarrier(__rendererHost[method](...args)); } catch (error) { throw __plainError(error); }\n\
 }\n\
 function __hostCallAsync(method, args) {\n\
-  try { return Promise.resolve(__hostCall(method, args)).catch((error) => Promise.reject(__plainError(error))); }\n\
+  try { return Promise.resolve(__hostCall(method, args)).then(__napiCarrier).catch((error) => Promise.reject(__plainError(error))); }\n\
   catch (error) { return Promise.reject(__plainError(error)); }\n\
 }\n\
 const __nativeHost = {\n\
