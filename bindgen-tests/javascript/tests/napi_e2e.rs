@@ -1514,7 +1514,7 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
         cargo_toml.contains("async-trait = \"0.1\"")
             && cargo_toml
                 .contains("napi = { git = \"https://github.com/EverglowStudio/napi-rs.git\"")
-            && cargo_toml.contains("rev = \"5ba67e6891722898f2f1e0984ef5d192e0ccd983\""),
+            && cargo_toml.contains("rev = \"f7417a353d831cfb8b57df2753c26ce50ee6de88\""),
         "napi host crate template should keep async-trait + the pinned N-API fork:\n{cargo_toml}"
     );
 
