@@ -1370,7 +1370,7 @@ dependencies = [
 [[package]]
 name = "napi"
 version = "3.12.0"
-source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=5ba67e6891722898f2f1e0984ef5d192e0ccd983#5ba67e6891722898f2f1e0984ef5d192e0ccd983"
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=f7417a353d831cfb8b57df2753c26ce50ee6de88#f7417a353d831cfb8b57df2753c26ce50ee6de88"
 dependencies = [
  "bitflags 2.11.0",
  "ctor",
@@ -1384,17 +1384,17 @@ dependencies = [
 [[package]]
 name = "napi-build"
 version = "2.4.0"
-source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=5ba67e6891722898f2f1e0984ef5d192e0ccd983#5ba67e6891722898f2f1e0984ef5d192e0ccd983"
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=f7417a353d831cfb8b57df2753c26ce50ee6de88#f7417a353d831cfb8b57df2753c26ce50ee6de88"
 
 [[package]]
 name = "napi-build-ohos"
 version = "1.2.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=2a2ae91d91701aadd34734c24769e783bdbdd3c6#2a2ae91d91701aadd34734c24769e783bdbdd3c6"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
 
 [[package]]
 name = "napi-derive-backend"
 version = "6.1.1"
-source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=5ba67e6891722898f2f1e0984ef5d192e0ccd983#5ba67e6891722898f2f1e0984ef5d192e0ccd983"
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=f7417a353d831cfb8b57df2753c26ce50ee6de88#f7417a353d831cfb8b57df2753c26ce50ee6de88"
 dependencies = [
  "convert_case",
  "proc-macro2",
@@ -1405,7 +1405,7 @@ dependencies = [
 [[package]]
 name = "napi-derive-backend-ohos"
 version = "1.2.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=2a2ae91d91701aadd34734c24769e783bdbdd3c6#2a2ae91d91701aadd34734c24769e783bdbdd3c6"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
 dependencies = [
  "convert_case",
  "proc-macro2",
@@ -1416,12 +1416,12 @@ dependencies = [
 [[package]]
 name = "napi-family-core"
 version = "0.1.0"
-source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=5ba67e6891722898f2f1e0984ef5d192e0ccd983#5ba67e6891722898f2f1e0984ef5d192e0ccd983"
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=f7417a353d831cfb8b57df2753c26ce50ee6de88#f7417a353d831cfb8b57df2753c26ce50ee6de88"
 
 [[package]]
 name = "napi-ohos"
 version = "1.2.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=2a2ae91d91701aadd34734c24769e783bdbdd3c6#2a2ae91d91701aadd34734c24769e783bdbdd3c6"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
 dependencies = [
  "bitflags 2.11.0",
  "ctor",
@@ -1436,7 +1436,7 @@ dependencies = [
 [[package]]
 name = "napi-ohos-uniffi-engine"
 version = "0.1.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=2a2ae91d91701aadd34734c24769e783bdbdd3c6#2a2ae91d91701aadd34734c24769e783bdbdd3c6"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
 dependencies = [
  "napi-derive-backend-ohos",
  "napi-family-core",
@@ -1449,7 +1449,7 @@ dependencies = [
 [[package]]
 name = "napi-sys"
 version = "3.3.0"
-source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=5ba67e6891722898f2f1e0984ef5d192e0ccd983#5ba67e6891722898f2f1e0984ef5d192e0ccd983"
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=f7417a353d831cfb8b57df2753c26ce50ee6de88#f7417a353d831cfb8b57df2753c26ce50ee6de88"
 dependencies = [
  "libloading",
 ]
@@ -1457,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "napi-sys-ohos"
 version = "1.2.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=2a2ae91d91701aadd34734c24769e783bdbdd3c6#2a2ae91d91701aadd34734c24769e783bdbdd3c6"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
 dependencies = [
  "libloading",
 ]
@@ -1465,7 +1465,7 @@ dependencies = [
 [[package]]
 name = "napi-uniffi-engine"
 version = "0.1.0"
-source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=5ba67e6891722898f2f1e0984ef5d192e0ccd983#5ba67e6891722898f2f1e0984ef5d192e0ccd983"
+source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=f7417a353d831cfb8b57df2753c26ce50ee6de88#f7417a353d831cfb8b57df2753c26ce50ee6de88"
 dependencies = [
  "napi",
  "napi-derive-backend",

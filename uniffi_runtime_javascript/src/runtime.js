@@ -1467,8 +1467,12 @@ function liftPrimitive(value, name) {
     return result;
   }
   if (name === "Bytes") {
-    if (!(value instanceof Uint8Array)) throw new UniffiError({ errorName: "UniffiBytesType", message: "backend bytes must be Uint8Array" });
-    return value;
+    if (value instanceof Uint8Array) return value;
+    // Electron contextBridge serializes a backend Uint8Array as an Array.
+    if (Array.isArray(value) && value.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+      return Uint8Array.from(value);
+    }
+    throw new UniffiError({ errorName: "UniffiBytesType", message: "backend bytes must be Uint8Array" });
   }
   const integerBounds = {
     I8: [-128, 127], U8: [0, 255], I16: [-32768, 32767], U16: [0, 65535],
