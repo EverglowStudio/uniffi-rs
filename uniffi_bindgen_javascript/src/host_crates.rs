@@ -586,9 +586,9 @@ fn render_host_crate(
     Ok(files)
 }
 
-const NAPI_REV: &str = "5ba67e6891722898f2f1e0984ef5d192e0ccd983";
+const NAPI_REV: &str = "f7417a353d831cfb8b57df2753c26ce50ee6de88";
 const WASM_REV: &str = "192d5272182776f8d5f7c605611414e2b4435701";
-const OHOS_REV: &str = "2a2ae91d91701aadd34734c24769e783bdbdd3c6";
+const OHOS_REV: &str = "39c139ab5574b7bcc75efec100272bab95506a9f";
 
 fn package_file(
     path: Utf8PathBuf,
