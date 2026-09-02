@@ -4822,19 +4822,20 @@ fn ohos_env(
     };
     let toolchain = resolve_toolchain_paths(&toolchain_root);
     let sysroot = Path::new(ohos_ndk).join("native").join("sysroot");
-    let mut link_flags = vec![
+    let mut compile_flags = vec![
         format!("--target={}", arch.c_target()),
         format!("--sysroot={}", sysroot.to_string_lossy()),
         "-D__MUSL__".to_string(),
     ];
     if arch == Arch::Arm32 {
-        link_flags.extend([
+        compile_flags.extend([
             "-march=armv7-a".to_string(),
             "-mfloat-abi=softfp".to_string(),
             "-mtune=generic-armv7-a".to_string(),
             "-mthumb".to_string(),
         ]);
     }
+    let mut link_flags = compile_flags.clone();
     if let Some(hos_ndk) = &hos_ndk {
         append_hms_link_flags(&mut link_flags, hos_ndk, arch);
     }
@@ -4879,6 +4880,7 @@ fn ohos_env(
     ]);
 
     envs.insert("CARGO_INCREMENTAL".into(), "0".into());
+    apply_ohos_compile_env(&mut envs, arch, &compile_flags);
 
     if let Some(hos_ndk) = &hos_ndk {
         apply_hms_include_env(&mut envs, hos_ndk, arch);
@@ -5301,8 +5303,35 @@ fn apply_hms_include_env(envs: &mut HashMap<String, String>, hos_ndk: &Path, arc
     );
 }
 
+fn apply_ohos_compile_env(
+    envs: &mut HashMap<String, String>,
+    arch: Arch,
+    compile_flags: &[String],
+) {
+    let compile_flags = compile_flags.join(" ");
+    append_env_with_flag(envs, "TARGET_CFLAGS", &compile_flags);
+    append_env_with_flag(envs, "TARGET_CXXFLAGS", &compile_flags);
+    let bindgen_target = arch.rust_target().replace('-', "_");
+    append_env_with_flag(
+        envs,
+        &format!("BINDGEN_EXTRA_CLANG_ARGS_{bindgen_target}"),
+        &compile_flags,
+    );
+    append_env_with_flag(
+        envs,
+        &format!(
+            "BINDGEN_EXTRA_CLANG_ARGS_{}",
+            bindgen_target.to_ascii_uppercase()
+        ),
+        &compile_flags,
+    );
+}
+
 fn append_env_with_flag(envs: &mut HashMap<String, String>, key: &str, append: &str) {
-    let current = env::var(key).unwrap_or_default();
+    let current = envs
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| env::var(key).unwrap_or_default());
     let merged = if current.is_empty() {
         append.to_string()
     } else {
@@ -5420,5 +5449,47 @@ mod support_staging_tests {
         assert!(libs.join("arm64-v8a/libcore.so").is_file());
         assert!(!libs.join("support").exists());
         assert!(!libs.join("component-facades").exists());
+    }
+}
+
+#[cfg(test)]
+mod ohos_compile_environment_tests {
+    use super::*;
+
+    #[test]
+    fn target_compile_environment_includes_sysroot_and_preserves_existing_flags() {
+        let mut envs = HashMap::from([
+            ("TARGET_CFLAGS".to_string(), "-DEXISTING_C".to_string()),
+            ("TARGET_CXXFLAGS".to_string(), "-DEXISTING_CXX".to_string()),
+        ]);
+        let flags = vec![
+            "--target=aarch64-linux-ohos".to_string(),
+            "--sysroot=/sdk/native/sysroot".to_string(),
+            "-D__MUSL__".to_string(),
+        ];
+
+        apply_ohos_compile_env(&mut envs, Arch::Arm64, &flags);
+        append_env_with_flag(&mut envs, "TARGET_CFLAGS", "-I/hms/usr/include");
+
+        assert_eq!(
+            envs.get("TARGET_CFLAGS").map(String::as_str),
+            Some(
+                "-DEXISTING_C --target=aarch64-linux-ohos --sysroot=/sdk/native/sysroot -D__MUSL__ -I/hms/usr/include"
+            )
+        );
+        assert_eq!(
+            envs.get("TARGET_CXXFLAGS").map(String::as_str),
+            Some(
+                "-DEXISTING_CXX --target=aarch64-linux-ohos --sysroot=/sdk/native/sysroot -D__MUSL__"
+            )
+        );
+        for key in [
+            "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos",
+            "BINDGEN_EXTRA_CLANG_ARGS_AARCH64_UNKNOWN_LINUX_OHOS",
+        ] {
+            assert!(envs
+                .get(key)
+                .is_some_and(|value| value.contains("--sysroot=/sdk/native/sysroot")));
+        }
     }
 }
