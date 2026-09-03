@@ -1124,7 +1124,7 @@ export interface ArkFailure {
 export interface ArkCallbackResult {
   readonly ok: boolean;
   readonly value?: ArkValue;
-  readonly error?: ArkFailure;
+  readonly error?: ArkValue;
   readonly error_message?: string;
 }
 export class ArkValueResult { readonly kind: "value" = "value"; readonly value: ArkValue; constructor(value: ArkValue) { this.value = value; } }
@@ -1326,11 +1326,19 @@ export class Host {
   }
   invokeCallbackSyncResult(callbackType: number, callbackId: number, methodId: number, args: Array<ArkValue> = []): ArkCallbackResult {
     try { return { ok: true, value: this.invokeCallbackSync(callbackType, callbackId, methodId, args) }; }
-    catch (error) { const failure: ArkFailure = __arkCallbackFailure(error); return { ok: false, error: failure, error_message: failure.message }; }
+    catch (error) {
+      const failure: ArkFailure = __arkCallbackFailure(error);
+      const carrier: ArkValue | null = __arkCallbackErrorCarrier(failure);
+      return carrier === null ? { ok: false, error_message: failure.message } : { ok: false, error: carrier, error_message: failure.message };
+    }
   }
   async invokeCallbackAsyncResult(callbackType: number, callbackId: number, methodId: number, invocationId: number, args: Array<ArkValue> = []): Promise<ArkCallbackResult> {
     try { return { ok: true, value: await this.invokeCallbackAsync(callbackType, callbackId, methodId, invocationId, args) }; }
-    catch (error) { const failure: ArkFailure = __arkCallbackFailure(error); return { ok: false, error: failure, error_message: failure.message }; }
+    catch (error) {
+      const failure: ArkFailure = __arkCallbackFailure(error);
+      const carrier: ArkValue | null = __arkCallbackErrorCarrier(failure);
+      return carrier === null ? { ok: false, error_message: failure.message } : { ok: false, error: carrier, error_message: failure.message };
+    }
   }
   pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>> {
     if (this.inputRegistry === null) return Promise.reject(new UniffiError("UniffiInputStreamMissing", "input stream registry is not attached"));
@@ -1343,8 +1351,17 @@ export class Host {
   releaseInputStream(handle: ArkValue): void { this.inputRegistry?.release(handle); }
 }
 function __arkCallbackFailure(error: Error): ArkFailure {
-  if (error instanceof UniffiError) return { errorName: error.errorName, message: error.message, variant: error.variant, data: error.data };
+  const candidate: UniffiError = error as UniffiError;
+  if (candidate.errorName !== undefined) return { errorName: candidate.errorName, message: candidate.message, variant: candidate.variant, data: candidate.data };
   return { errorName: error.name, message: error.message, variant: null, data: null };
+}
+interface __ArkCallbackErrorCarrier { tag?: ArkValue; }
+function __arkCallbackErrorCarrier(failure: ArkFailure): ArkValue | null {
+  if (failure.variant === null) return null;
+  if (failure.data === null) return failure.variant;
+  const carrier: __ArkCallbackErrorCarrier = failure.data as __ArkCallbackErrorCarrier;
+  carrier.tag = failure.variant;
+  return failure.data;
 }
 interface ArkInputSlot { readonly pull: () => Promise<ArkStreamStep<ArkValue>>; readonly cancel: () => Promise<void>; readonly release: () => void; readonly detach: () => void; }
 class ArkInputRegistry {
@@ -1805,7 +1822,7 @@ fn render_runtime_declarations() -> String {
 export declare class ArkRecord { set(name: string, value: ArkValue): void; has(name: string): boolean; get(name: string): ArkValue; }
 export type ArkValue = ArkPrimitive | Uint8Array | Date | ArkRecord | Array<ArkValue> | Map<ArkValue, ArkValue> | Set<ArkValue> | null;
 export interface ArkFailure { readonly errorName: string; readonly message: string; readonly variant: string | null; readonly data: ArkValue | null; }
-export interface ArkCallbackResult { readonly ok: boolean; readonly value?: ArkValue; readonly error?: ArkFailure; readonly error_message?: string; }
+export interface ArkCallbackResult { readonly ok: boolean; readonly value?: ArkValue; readonly error?: ArkValue; readonly error_message?: string; }
 export declare class ArkValueResult { readonly kind: "value"; readonly value: ArkValue; constructor(value: ArkValue); }
 export declare class ArkErrorResult { readonly kind: "error"; readonly error: ArkFailure; constructor(error: ArkFailure); }
 export type ArkCallResult = ArkValueResult | ArkErrorResult;
@@ -2033,7 +2050,7 @@ fn render_callback_error_helper(
     };
     let error_name = model.type_name(error_key);
     let mut out = format!(
-        "function __arkLowerCallbackError{}(error: Error, session: BackendSession): UniffiError {{\n  if (!(error instanceof {})) {{ if (error instanceof UniffiError && error.errorName === \"{}\") return new {}(error.message, error.variant, error.data); return new UniffiError(\"{}\", \"callback failed\"); }}\n  const declared: {} = error as {};\n  const variant: string | null = declared.variant;\n",
+        "function __arkLowerCallbackError{}(error: Error, session: BackendSession): UniffiError {{\n  if (!(error instanceof {})) {{ const candidate: UniffiError = error as UniffiError; if (candidate.errorName === \"{}\") return new {}(candidate.message, candidate.variant, candidate.data); return new UniffiError(\"{}\", \"callback failed\"); }}\n  const declared: {} = error as {};\n  const variant: string | null = declared.variant;\n",
         operation.id.index(),
         error_name,
         escape_string(&error_name),
