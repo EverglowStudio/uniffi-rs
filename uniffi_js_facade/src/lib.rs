@@ -2694,6 +2694,10 @@ mod tests {
                     "new Promise<void>((resolve): void => { this.idleWaiters.add(resolve); })"
                 ));
                 assert!(text.contains("function __arkCallbackFailure(error: Error)"));
+                assert!(text.contains("readonly error?: ArkValue"));
+                assert!(text.contains("function __arkCallbackErrorCarrier(failure: ArkFailure)"));
+                assert!(text.contains("carrier.tag = failure.variant"));
+                assert!(text.contains("const candidate: UniffiError = error as UniffiError"));
                 assert!(!text.contains("error as ArkValue"));
                 assert!(!text.contains("(error: ArkValue)"));
                 assert!(text.contains("export class Failure extends UniffiError"));
