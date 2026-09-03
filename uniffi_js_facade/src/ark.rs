@@ -1628,7 +1628,7 @@ function __arkLowerBool(value: boolean): ArkValue { if (value !== true && value 
 function __arkLiftBool(value: ArkValue): boolean { return __arkLowerBool(value as boolean) as boolean; }
 function __arkLowerString(value: string): ArkValue { return value; }
 function __arkLiftString(value: ArkValue): string { return __arkLowerString(value as string) as string; }
-function __arkLowerBytes(value: Uint8Array): ArkValue { if (!(value instanceof Uint8Array)) throw new UniffiError("UniffiBytesType", "Uint8Array required"); return value; }
+function __arkLowerBytes(value: Uint8Array): ArkValue { return value; }
 function __arkLiftBytes(value: ArkValue): Uint8Array { return __arkLowerBytes(value as Uint8Array) as Uint8Array; }
 function __arkLowerI64(value: bigint): ArkValue { return value; }
 function __arkLiftI64(value: ArkValue): bigint { return __arkLowerI64(value as bigint) as bigint; }
