@@ -1152,6 +1152,10 @@ export class UniffiError extends Error {
     return new UniffiError(failure.errorName, failure.message, failure.variant, failure.data);
   }
 }
+function __arkAsUniffiError(error: Error): UniffiError | null {
+  const candidate: UniffiError = error as UniffiError;
+  return candidate.errorName === undefined ? null : candidate;
+}
 export class ArkItemStep<T> { readonly kind: "item" = "item"; readonly value: T; constructor(value: T) { this.value = value; } }
 export class ArkDoneStep { readonly kind: "done" = "done"; }
 export class ArkErrorStep { readonly kind: "error" = "error"; readonly error: UniffiError; constructor(error: UniffiError) { this.error = error; } }
@@ -1351,8 +1355,8 @@ export class Host {
   releaseInputStream(handle: ArkValue): void { this.inputRegistry?.release(handle); }
 }
 function __arkCallbackFailure(error: Error): ArkFailure {
-  const candidate: UniffiError = error as UniffiError;
-  if (candidate.errorName !== undefined) return { errorName: candidate.errorName, message: candidate.message, variant: candidate.variant, data: candidate.data };
+  const candidate: UniffiError | null = __arkAsUniffiError(error);
+  if (candidate !== null) return { errorName: candidate.errorName, message: candidate.message, variant: candidate.variant, data: candidate.data };
   return { errorName: error.name, message: error.message, variant: null, data: null };
 }
 interface __ArkCallbackErrorCarrier { tag?: ArkValue; }
@@ -1395,7 +1399,8 @@ class ArkInputRegistry {
         } catch (error) {
           remove();
           if (detached) return new ArkDoneStep();
-          if (error instanceof UniffiError) return new ArkErrorStep(error);
+          const reason: UniffiError | null = __arkAsUniffiError(error);
+          if (reason !== null) return new ArkErrorStep(reason);
           return new ArkErrorStep(new UniffiError("UniffiInputStreamError", "input stream failed"));
         } finally { pending = false; }
       },
@@ -1482,7 +1487,7 @@ class ArkOutputStream<T> implements UniFfiStream<T> {
     if (this.handle !== null && !this.cancelIssued) {
       this.cancelIssued = true;
       try { await this.spec.cancel(this.handle); }
-      catch (error) { if (error instanceof UniffiError) reason = error; }
+      catch (error) { const cancellationError: UniffiError | null = __arkAsUniffiError(error); if (cancellationError !== null) reason = cancellationError; }
     }
     this.phase = "done";
     this.finish();
@@ -1507,7 +1512,8 @@ class ArkOutputStream<T> implements UniFfiStream<T> {
       } catch (error) {
         this.phase = "done";
         this.finish();
-        return new ArkErrorStep(error instanceof UniffiError ? error : new UniffiError("UniffiStreamStart", "stream start failed"));
+        const startError: UniffiError | null = __arkAsUniffiError(error);
+        return new ArkErrorStep(startError === null ? new UniffiError("UniffiStreamStart", "stream start failed") : startError);
       } finally { this.pending = false; }
     }
     if (this.handle === null) {
@@ -1532,7 +1538,8 @@ class ArkOutputStream<T> implements UniFfiStream<T> {
       const error: UniffiError = await this.abort(new UniffiError("UniffiStreamProtocol", "invalid stream step tag"));
       return new ArkErrorStep(error);
     } catch (error) {
-      const reason: UniffiError = error instanceof UniffiError ? error : new UniffiError("UniffiStreamError", "stream pull failed");
+      const streamError: UniffiError | null = __arkAsUniffiError(error);
+      const reason: UniffiError = streamError === null ? new UniffiError("UniffiStreamError", "stream pull failed") : streamError;
       const aborted: UniffiError = await this.abort(reason);
       return new ArkErrorStep(aborted);
     } finally { this.pending = false; }
@@ -2044,7 +2051,7 @@ fn render_callback_error_helper(
 ) -> String {
     let Some(error_type) = model.ty_for(error_key) else {
         return format!(
-            "function __arkLowerCallbackError{}(error: Error, _session: BackendSession): UniffiError {{ return error instanceof UniffiError ? error : new UniffiError(\"UniffiCallbackError\", \"callback error is not declared\"); }}\n",
+            "function __arkLowerCallbackError{}(error: Error, _session: BackendSession): UniffiError {{ const candidate: UniffiError | null = __arkAsUniffiError(error); return candidate === null ? new UniffiError(\"UniffiCallbackError\", \"callback error is not declared\") : candidate; }}\n",
             operation.id.index()
         );
     };
@@ -2199,13 +2206,13 @@ fn render_operation_helpers(
         .map(|ty| {
             let error_name = model.type_name(&ty.source_key);
             format!(
-                "if (error instanceof UniffiError && error.errorName === \"{}\") throw new {}(error.message, error.variant, error.data); ",
+                "if (__uniffiError !== null && __uniffiError.errorName === \"{}\") throw new {}(__uniffiError.message, __uniffiError.variant, __uniffiError.data); ",
                 escape_string(&error_name), error_name
             )
         })
         .unwrap_or_default();
     let propagate_error = format!(
-        "{}if (error instanceof UniffiError) throw error; throw new UniffiError(\"UniffiOperation\", \"operation failed\"); ",
+        "const __uniffiError: UniffiError | null = __arkAsUniffiError(error); {}if (__uniffiError !== null) throw __uniffiError; throw new UniffiError(\"UniffiOperation\", \"operation failed\"); ",
         normalize_error
     );
     out.push_str(&format!(
