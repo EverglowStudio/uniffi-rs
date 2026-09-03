@@ -1389,7 +1389,7 @@ source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=f7417a353d831cfb
 [[package]]
 name = "napi-build-ohos"
 version = "1.2.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=ac48b791650c3ab994f86a88dfa0996e8fb2a57f#ac48b791650c3ab994f86a88dfa0996e8fb2a57f"
 
 [[package]]
 name = "napi-derive-backend"
@@ -1405,7 +1405,7 @@ dependencies = [
 [[package]]
 name = "napi-derive-backend-ohos"
 version = "1.2.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=ac48b791650c3ab994f86a88dfa0996e8fb2a57f#ac48b791650c3ab994f86a88dfa0996e8fb2a57f"
 dependencies = [
  "convert_case",
  "proc-macro2",
@@ -1421,7 +1421,7 @@ source = "git+https://github.com/EverglowStudio/napi-rs.git?rev=f7417a353d831cfb
 [[package]]
 name = "napi-ohos"
 version = "1.2.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=ac48b791650c3ab994f86a88dfa0996e8fb2a57f#ac48b791650c3ab994f86a88dfa0996e8fb2a57f"
 dependencies = [
  "bitflags 2.11.0",
  "ctor",
@@ -1436,7 +1436,7 @@ dependencies = [
 [[package]]
 name = "napi-ohos-uniffi-engine"
 version = "0.1.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=ac48b791650c3ab994f86a88dfa0996e8fb2a57f#ac48b791650c3ab994f86a88dfa0996e8fb2a57f"
 dependencies = [
  "napi-derive-backend-ohos",
  "napi-family-core",
@@ -1457,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "napi-sys-ohos"
 version = "1.2.0"
-source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=39c139ab5574b7bcc75efec100272bab95506a9f#39c139ab5574b7bcc75efec100272bab95506a9f"
+source = "git+https://github.com/EverglowStudio/ohos-rs.git?rev=ac48b791650c3ab994f86a88dfa0996e8fb2a57f#ac48b791650c3ab994f86a88dfa0996e8fb2a57f"
 dependencies = [
  "libloading",
 ]
