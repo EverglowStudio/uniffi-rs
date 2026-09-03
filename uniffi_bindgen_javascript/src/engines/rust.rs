@@ -146,6 +146,14 @@ impl NativeFlavor {
         })
         .expect("engine error descriptor path is valid")
     }
+
+    fn is_ohos(self) -> bool {
+        match self {
+            Self::Node => false,
+            #[cfg(feature = "ohos")]
+            Self::Ohos => true,
+        }
+    }
 }
 
 fn rust_path(path: &RustPath) -> Result<Path> {
@@ -347,6 +355,9 @@ fn napi_carrier_type_for(
             }
         };
         match conversion {
+            ConversionRecipe::Bytes if flavor.is_ohos() => {
+                syn::parse_str("napi_ohos::bindgen_prelude::Uint8Array").map_err(Into::into)
+            }
             ConversionRecipe::BigInt
                 if matches!(
                     ty,
@@ -1210,6 +1221,7 @@ fn lower_expr(
     let engine_crate = engine_crate_path(flavor);
     let error_descriptor = flavor.error_descriptor();
     let value = match &binding.conversion {
+        ConversionRecipe::Bytes if flavor.is_ohos() => quote!(#expression.as_ref().to_vec()),
         ConversionRecipe::Identity => match binding.rust_type {
             RustType::Scalar(uniffi_js_abi::ScalarType::F32) => quote!(#expression as f32),
             _ => expression,
@@ -1357,6 +1369,9 @@ fn lift_expr(
     // Struct/enum bridge values implement `From<core>` and the reverse.  The
     // recursive container cases preserve the exact named-type boundaries.
     match &binding.conversion {
+        ConversionRecipe::Bytes if flavor.is_ohos() => {
+            Ok(quote!(#napi::bindgen_prelude::Uint8Array::from(#expression)))
+        }
         ConversionRecipe::Identity => match binding.rust_type {
             RustType::Scalar(uniffi_js_abi::ScalarType::F32) => Ok(quote!(#expression as f64)),
             _ => Ok(expression),
@@ -7018,6 +7033,37 @@ namespace callback_errors {
                 harmony.to_token_stream().to_string(),
                 "napi_ohos :: bindgen_prelude :: BigInt"
             );
+        }
+    }
+
+    #[test]
+    fn native_bytes_use_typed_arrays_on_harmony() {
+        let binding = RustValueBinding {
+            rust_type: RustType::Scalar(uniffi_js_abi::ScalarType::Bytes),
+            carrier: RustCarrier::Bytes,
+            conversion: ConversionRecipe::Bytes,
+        };
+
+        let node = napi_carrier_type_for(&binding, &[], NativeFlavor::Node)
+            .expect("Node bytes carrier should render");
+        assert_eq!(node.to_token_stream().to_string(), "Vec < u8 >");
+
+        #[cfg(feature = "ohos")]
+        {
+            let harmony = napi_carrier_type_for(&binding, &[], NativeFlavor::Ohos)
+                .expect("Harmony bytes carrier should render");
+            assert_eq!(
+                harmony.to_token_stream().to_string(),
+                "napi_ohos :: bindgen_prelude :: Uint8Array"
+            );
+            assert!(lower_expr(&binding, quote!(value), NativeFlavor::Ohos)
+                .expect("Harmony bytes lowering should render")
+                .to_string()
+                .contains("as_ref () . to_vec ()"));
+            assert!(lift_expr(&binding, quote!(value), NativeFlavor::Ohos)
+                .expect("Harmony bytes lifting should render")
+                .to_string()
+                .contains("Uint8Array :: from (value)"));
         }
     }
 
