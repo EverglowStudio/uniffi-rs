@@ -588,7 +588,7 @@ fn render_host_crate(
 
 const NAPI_REV: &str = "f7417a353d831cfb8b57df2753c26ce50ee6de88";
 const WASM_REV: &str = "192d5272182776f8d5f7c605611414e2b4435701";
-const OHOS_REV: &str = "39c139ab5574b7bcc75efec100272bab95506a9f";
+const OHOS_REV: &str = "ac48b791650c3ab994f86a88dfa0996e8fb2a57f";
 
 fn package_file(
     path: Utf8PathBuf,

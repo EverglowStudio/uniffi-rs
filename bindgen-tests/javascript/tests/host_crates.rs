@@ -148,10 +148,10 @@ fn emits_ohos_host_crate_when_harmony_is_requested() {
     for required in [
         "name = \"uniffi-example-arithmetic-uniffi-js-host\"",
         "name = \"uniffi_example_arithmetic_uniffi_js_host\"",
-        "napi-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"39c139ab5574b7bcc75efec100272bab95506a9f\", package = \"napi-ohos\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }",
-        "napi-derive-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"39c139ab5574b7bcc75efec100272bab95506a9f\", package = \"napi-derive-ohos\", features = [\"strict\", \"type-def\"] }",
-        "napi-ohos-uniffi-engine = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"39c139ab5574b7bcc75efec100272bab95506a9f\" }",
-        "napi-build-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"39c139ab5574b7bcc75efec100272bab95506a9f\", package = \"napi-build-ohos\" }",
+        "napi-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"ac48b791650c3ab994f86a88dfa0996e8fb2a57f\", package = \"napi-ohos\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }",
+        "napi-derive-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"ac48b791650c3ab994f86a88dfa0996e8fb2a57f\", package = \"napi-derive-ohos\", features = [\"strict\", \"type-def\"] }",
+        "napi-ohos-uniffi-engine = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"ac48b791650c3ab994f86a88dfa0996e8fb2a57f\" }",
+        "napi-build-ohos = { git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"ac48b791650c3ab994f86a88dfa0996e8fb2a57f\", package = \"napi-build-ohos\" }",
         "[workspace]",
     ] {
         assert!(
