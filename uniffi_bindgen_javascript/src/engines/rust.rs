@@ -2991,6 +2991,8 @@ fn render_callback_proxy_helpers(
                             Ok(__uniffi_proxy)
                         }
                     }
+                } else if callback_operation.throws.is_some() {
+                    quote!(Ok(__uniffi_js_result))
                 } else {
                     quote! {
                         if __uniffi_js_result.ok {
@@ -6534,6 +6536,48 @@ namespace resource_paths {
             .split_once(&marker)
             .expect("generated object argument helper should be present");
         tail.split_once("fn ").map_or(tail, |(body, _)| body)
+    }
+
+    #[test]
+    fn ohos_cross_thread_fallible_void_callback_preserves_declared_error() {
+        let ci = ComponentInterface::from_webidl(
+            r#"
+[Error]
+enum StoreError {
+  "Unavailable",
+};
+
+callback interface CredentialStore {
+  [Throws=StoreError]
+  void write(bytes value);
+};
+
+namespace callback_errors {
+  [CallbackContract="argument[0],retained,may_cross_thread,forbidden"]
+  void hold(CredentialStore store);
+};
+"#,
+            "callback_errors",
+        )
+        .expect("callback error fixture should parse");
+        let mut component = Component {
+            ci,
+            config: JsConfig::default(),
+        };
+        component
+            .ci
+            .derive_ffi_funcs()
+            .expect("callback error fixture derives ffi functions");
+        let package =
+            normalize(BindingInput::new(&[component])).expect("callback error fixture normalizes");
+        let source =
+            render_callback_proxy_helpers(&package, NativeFlavor::Ohos, EngineKind::OhosNapi)
+                .expect("OHOS callback proxy renders");
+        let source = source.to_string();
+
+        assert!(source.contains("Ok (__uniffi_js_result)"));
+        assert!(source.contains("__uniffi_result . error"));
+        assert!(!source.contains("callback method 0 returned an error"));
     }
 
     #[test]
