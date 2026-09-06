@@ -1,8 +1,9 @@
 //! Opt-in task, cancellation and time support shared by native and JavaScript WASM.
 //!
-//! Native futures must be `Send`, but never need to be `Sync`. WASM futures stay
-//! in their JavaScript instance. Native spawn and timers use the current Tokio
-//! runtime. Ordinary [`CallContext::run`] does not require an executor.
+//! Native [`spawn`] futures must be `Send`, but never need to be `Sync`.
+//! [`LocalExecutor`] constructs and runs !Send futures on a fixed owner. WASM
+//! futures stay in their JavaScript instance. Native spawn and timers use Tokio.
+//! Ordinary [`CallContext::run`] retains auto traits and needs no executor.
 //!
 //! Cancellation drops the business future before polling explicitly registered
 //! cleanup. Dropping a `Run` also drops its business future synchronously; retain
@@ -10,11 +11,15 @@
 //! Arbitrary Rust destructors cannot perform asynchronous cleanup automatically.
 
 mod context;
+mod local;
 mod task;
 mod time;
 
 pub use context::{
     current_context, CallContext, CancellationToken, Cancelled, CleanupClosed, CleanupFailed, Run,
+};
+pub use local::{
+    defer_local_cleanup, spawn_local, LocalBoxFuture, LocalError, LocalExecutor, LocalObject,
 };
 pub use task::{spawn, TaskError, TaskHandle};
 pub use time::{sleep, timeout, Elapsed};
@@ -51,11 +56,7 @@ pub type BoxStream<'a, T> = Pin<Box<dyn futures_core::Stream<Item = T> + Send + 
 pub type BoxStream<'a, T> = Pin<Box<dyn futures_core::Stream<Item = T> + 'a>>;
 
 /// Run a call with a fresh cancellation context.
-pub fn run<'a, F>(future: F) -> Run<'a, F::Output>
-where
-    F: Future + SendOutsideWasm + 'a,
-    F::Output: 'a,
-{
+pub fn run<F: Future>(future: F) -> Run<F> {
     CallContext::new(CancellationToken::new()).run(future)
 }
 

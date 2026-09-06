@@ -92,8 +92,7 @@ pub enum RustCallStatusCode {
     /// Async function cancelled.  [RustCallStatus::error_buf] will be empty and does not need to
     /// be freed.
     ///
-    /// This is only returned for async functions and only if the bindings code uses the
-    /// [rust_future_cancel] call.
+    /// Returned for async cancellation, including an owner cancelling a local call.
     Cancelled = 3,
 }
 
@@ -126,6 +125,37 @@ pub enum RustCallError {
     ///
     /// The associated value is a message string for the error.
     InternalError(String),
+    /// An asynchronous owner call was cancelled before delivering its result.
+    Cancelled,
+}
+
+/// Scaffolding adapter that preserves the business return ABI while allowing
+/// scheduling failures to use the framework error channel.
+#[doc(hidden)]
+pub struct InternalCallResult<T>(pub Result<T, RustCallError>);
+
+// SAFETY: All successful values and argument-lifting failures use T's existing
+// conversion. Scheduling errors have the same RustCallStatus ABI as other calls.
+unsafe impl<UT, T: crate::LowerReturn<UT>> crate::LowerReturn<UT> for InternalCallResult<T> {
+    type ReturnType = T::ReturnType;
+
+    fn lower_return(value: Self) -> Result<Self::ReturnType, RustCallError> {
+        value.0.and_then(T::lower_return)
+    }
+
+    fn handle_failed_lift(error: LiftArgsError) -> Result<Self::ReturnType, RustCallError> {
+        T::handle_failed_lift(error)
+    }
+}
+
+#[cfg(feature = "async-runtime")]
+impl From<crate::async_runtime::LocalError> for RustCallError {
+    fn from(error: crate::async_runtime::LocalError) -> Self {
+        match error {
+            crate::async_runtime::LocalError::Cancelled => Self::Cancelled,
+            error => Self::InternalError(error.to_string()),
+        }
+    }
 }
 
 /// Error when trying to lift arguments to pass to the scaffolding call
@@ -234,6 +264,10 @@ where
             *out_status.error_buf = <String as Lower<UniFfiTag>>::lower(msg);
             None
         }
+        Ok(Err(RustCallError::Cancelled)) => {
+            *out_status = RustCallStatus::cancelled();
+            None
+        }
         // Callback panicked
         Err(cause) => {
             out_status.code = RustCallStatusCode::UnexpectedError;
@@ -269,6 +303,56 @@ mod test {
     use super::*;
     use crate::{test_util::TestError, Lift, LowerReturn};
     use anyhow::anyhow;
+
+    #[test]
+    fn internal_call_result_preserves_business_and_framework_error_channels() {
+        type Business = Result<i8, TestError>;
+        type Wrapped = InternalCallResult<Business>;
+        let mut status = RustCallStatus::default();
+        let value = rust_call(&mut status, || {
+            <Wrapped as LowerReturn<UniFfiTag>>::lower_return(InternalCallResult(Ok(Ok(42))))
+        });
+        assert_eq!(value, 42);
+        assert_eq!(status.code, RustCallStatusCode::Success);
+
+        let mut status = RustCallStatus::default();
+        rust_call(&mut status, || {
+            <Wrapped as LowerReturn<UniFfiTag>>::lower_return(InternalCallResult(Ok(Err(
+                TestError("business".into()),
+            ))))
+        });
+        assert_eq!(status.code, RustCallStatusCode::Error);
+        assert_eq!(
+            <TestError as Lift<UniFfiTag>>::try_lift(ManuallyDrop::into_inner(status.error_buf))
+                .unwrap()
+                .0,
+            "business"
+        );
+
+        let mut status = RustCallStatus::default();
+        rust_call(&mut status, || {
+            <Wrapped as LowerReturn<UniFfiTag>>::lower_return(InternalCallResult(Err(
+                RustCallError::Cancelled,
+            )))
+        });
+        assert_eq!(status.code, RustCallStatusCode::Cancelled);
+        assert_eq!(status.error_buf.len(), 0);
+
+        let mut status = RustCallStatus::default();
+        rust_call(&mut status, || {
+            <Wrapped as LowerReturn<UniFfiTag>>::handle_failed_lift(LiftArgsError {
+                arg_name: "input",
+                error: anyhow!(TestError("lift".into())),
+            })
+        });
+        assert_eq!(status.code, RustCallStatusCode::Error);
+        assert_eq!(
+            <TestError as Lift<UniFfiTag>>::try_lift(ManuallyDrop::into_inner(status.error_buf))
+                .unwrap()
+                .0,
+            "lift"
+        );
+    }
 
     #[test]
     fn test_rust_call() {

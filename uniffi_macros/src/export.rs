@@ -22,6 +22,7 @@ use self::{
 use crate::util::{create_metadata_items, ident_to_string, mod_path};
 pub(crate) use attributes::{AsyncRuntime, CallbackContractArg, DefaultMap, ExportFnArgs};
 pub use callback_interface::ffi_converter_callback_interface_impl;
+pub(crate) use scaffolding::gen_local_close;
 pub use trait_interface::alter_trait;
 
 // TODO(jplatte): Ensure no generics, …

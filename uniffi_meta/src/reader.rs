@@ -54,6 +54,7 @@ impl<'a> MetadataReader<'a> {
             codes::RECORD => self.read_record()?.into(),
             codes::ENUM => self.read_enum()?.into(),
             codes::INTERFACE => self.read_object(ObjectImpl::Struct)?.into(),
+            codes::LOCAL_INTERFACE => self.read_object(ObjectImpl::LocalStruct)?.into(),
             codes::TRAIT_INTERFACE => {
                 let mut obj = self.read_object(ObjectImpl::Struct)?;
                 obj.imp = ObjectImpl::Trait(self.read_trait_kind()?);
@@ -168,6 +169,11 @@ impl<'a> MetadataReader<'a> {
                 module_path: self.read_string()?,
                 name: self.read_string()?,
                 imp: ObjectImpl::Struct,
+            },
+            codes::TYPE_LOCAL_INTERFACE => Type::Object {
+                module_path: self.read_string()?,
+                name: self.read_string()?,
+                imp: ObjectImpl::LocalStruct,
             },
             codes::TYPE_TRAIT_INTERFACE => {
                 let module_path = self.read_string()?;
@@ -285,15 +291,9 @@ impl<'a> MetadataReader<'a> {
         let self_type = return_type
             .as_ref()
             .and_then(|t| match t {
-                Type::Object {
-                    name,
-                    imp: ObjectImpl::Struct,
-                    ..
-                } if name == &self_name => Some(Type::Object {
-                    module_path: module_path.clone(),
-                    name: self_name.clone(),
-                    imp: ObjectImpl::Struct,
-                }),
+                Type::Object { name, imp, .. } if name == &self_name && imp.has_struct() => {
+                    Some(t.clone())
+                }
                 Type::Record { name, .. } if name == &self_name => Some(Type::Record {
                     module_path: module_path.clone(),
                     name: self_name.clone(),
@@ -304,7 +304,9 @@ impl<'a> MetadataReader<'a> {
                 }),
                 _ => None,
             })
-            .context("Constructor return type must be Self or Arc<Self>")?;
+            .context(
+                "Constructor return type must be Self, Arc<Self>, or Arc<LocalObject<Self>>",
+            )?;
 
         Ok(ConstructorMetadata {
             module_path,
@@ -715,6 +717,111 @@ impl<'a> MetadataReader<'a> {
 mod tests {
     use super::*;
     use crate::metadata::codes;
+
+    fn push_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.push(value.len().try_into().unwrap());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn object_type_metadata(code: u8, name: &str) -> Vec<u8> {
+        let mut bytes = vec![code];
+        push_string(&mut bytes, "example::nested::objects");
+        push_string(&mut bytes, name);
+        bytes
+    }
+
+    fn constructor_metadata(return_type: &[u8], fallible: bool) -> Vec<u8> {
+        let mut bytes = vec![codes::CONSTRUCTOR];
+        push_string(&mut bytes, "example::nested::constructors");
+        push_string(&mut bytes, "Counter");
+        push_string(&mut bytes, "new");
+        bytes.extend_from_slice(&[0, 1, 0]); // no rename, async, no inputs
+        if fallible {
+            bytes.push(codes::TYPE_RESULT);
+        }
+        bytes.extend_from_slice(return_type);
+        if fallible {
+            bytes.push(codes::TYPE_STRING);
+        }
+        bytes.extend_from_slice(&[0, 0]); // no docstring
+        bytes
+    }
+
+    #[test]
+    fn reads_local_object_and_nested_type_metadata() {
+        let mut bytes = object_type_metadata(codes::LOCAL_INTERFACE, "Counter");
+        bytes.extend_from_slice(&[0, 0, 0]); // no rename or docstring
+        let Metadata::Object(object) = read_metadata(&bytes).unwrap() else {
+            panic!("expected object metadata");
+        };
+        assert_eq!(object.imp, ObjectImpl::LocalStruct);
+        assert_eq!(object.module_path, "example::nested::objects");
+        assert_eq!(object.name, "Counter");
+        assert!(object.imp.has_struct());
+        assert!(object.imp.is_local());
+        assert!(!object.imp.is_trait_interface());
+        assert!(!object.imp.has_callback_interface());
+        assert_eq!(object.imp.rust_name_for("Counter"), "r#Counter");
+
+        let local = object_type_metadata(codes::TYPE_LOCAL_INTERFACE, "Counter");
+        let ty = Type::Object {
+            module_path: object.module_path,
+            name: object.name,
+            imp: ObjectImpl::LocalStruct,
+        };
+        assert_eq!(read_metadata_type(&local).unwrap(), ty);
+        let mut optional = vec![codes::TYPE_OPTION];
+        optional.extend(local);
+        assert_eq!(
+            read_metadata_type(&optional).unwrap(),
+            Type::Optional {
+                inner_type: Box::new(ty)
+            }
+        );
+    }
+
+    #[test]
+    fn constructors_preserve_object_implementation_and_definition_module() {
+        for (code, imp) in [
+            (codes::TYPE_INTERFACE, ObjectImpl::Struct),
+            (codes::TYPE_LOCAL_INTERFACE, ObjectImpl::LocalStruct),
+        ] {
+            for fallible in [false, true] {
+                let return_type = object_type_metadata(code, "Counter");
+                let bytes = constructor_metadata(&return_type, fallible);
+                let Metadata::Constructor(constructor) = read_metadata(&bytes).unwrap() else {
+                    panic!("expected constructor metadata");
+                };
+                assert!(constructor.is_async);
+                assert_eq!(constructor.module_path, "example::nested::constructors");
+                assert_eq!(
+                    constructor.self_type,
+                    Some(Type::Object {
+                        module_path: "example::nested::objects".into(),
+                        name: "Counter".into(),
+                        imp,
+                    })
+                );
+                assert_eq!(constructor.throws, fallible.then_some(Type::String));
+            }
+        }
+        assert!(ObjectImpl::Struct.has_struct());
+        assert!(!ObjectImpl::Struct.is_local());
+    }
+
+    #[test]
+    fn rejects_constructor_returning_another_local_object_or_a_trait() {
+        let wrong_object = object_type_metadata(codes::TYPE_LOCAL_INTERFACE, "Other");
+        let mut trait_object = object_type_metadata(codes::TYPE_TRAIT_INTERFACE, "Counter");
+        trait_object.push(codes::TRAIT_KIND_RUST_ONLY);
+        for return_type in [wrong_object, trait_object, vec![codes::TYPE_UNIT]] {
+            let error = read_metadata(&constructor_metadata(&return_type, false)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Constructor return type must be Self, Arc<Self>, or Arc<LocalObject<Self>>"
+            );
+        }
+    }
 
     #[test]
     fn reads_stream_type_metadata() {

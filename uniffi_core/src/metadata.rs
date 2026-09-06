@@ -44,6 +44,7 @@ pub mod codes {
     // A callback lifetime/threading/reentrancy contract for one operation value path.
     // Keep this in lockstep with uniffi_meta::metadata::codes.
     pub const CALLBACK_USE_SITE: u8 = 16;
+    pub const LOCAL_INTERFACE: u8 = 17;
 
     // Type codes
     pub const TYPE_U8: u8 = 0;
@@ -76,6 +77,7 @@ pub mod codes {
     pub const TYPE_HASH_SET: u8 = 27;
     pub const TYPE_STREAM: u8 = 28;
     pub const TYPE_INPUT_STREAM: u8 = 29;
+    pub const TYPE_LOCAL_INTERFACE: u8 = 30;
     pub const TYPE_UNIT: u8 = 255;
 
     // TraitKind sub-codes.

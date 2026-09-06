@@ -1,4 +1,4 @@
-# S01 真实跨端夹具
+# 共用异步层与 local 对象真实跨端夹具
 
 从源码仓库根目录运行（会构建 core、NAPI 和 WASM，需协调 Cargo 共享锁）：
 
@@ -26,7 +26,7 @@ cargo test --locked -p uniffi-bindgen-tests-javascript --test unified_async -- -
 
 直接调用 Cargo 时还需自行设置 `UNIFFI_ASYNC_ARTIFACTS` 为输出目录，以及工具环境中的 `PATH`、`UNIFFI_TEST_PLAYWRIGHT_MODULE`、`UNIFFI_TEST_CHROME`。
 
-唯一业务源码是 `fixture.rs`，复制为独立 core crate 并提取实际编译的 metadata，复用现有 stream fixture 的 `generate_package` 流程和 package 内固定版本的 WASM post-link engine（原 `StreamFixture` 字段私有，直接传递生成参数，不改共享 helper）。生成 manifest 显式启用 `uniffi/async-runtime`、`tokio`、`default-async-runtime-tokio`、`wasm-unstable-single-threaded`；不改根 manifest/lock。测试入口、core 和 WASM host 以 `-Dwarnings` 构建。仅 NAPI host 明确使用 `RUSTFLAGS=''`，并清除 `CARGO_ENCODED_RUSTFLAGS`，避免继承父进程的严格标志。A08 已确认 S00 NAPI 基线本来没有启用 `-Dwarnings`；固定 engine 展开的 nested unsafe、braces、零参数 cb warning 保留显示（数量随导出和生成代码变化），不扩写外部 engine 修 lint。不能将本测试描述为全端 `-Dwarnings`。
+业务源码为 `fixture.rs` 与其 `local.rs` 模块，同一份源码复制为独立 core crate 并提取实际编译的 metadata，复用现有 stream fixture 的 `generate_package` 流程和 package 内固定版本的 WASM post-link engine。生成 manifest 显式启用 `uniffi/async-runtime`、`tokio`、`default-async-runtime-tokio`、`wasm-unstable-single-threaded`，回调 trait 使用已有 async-trait；不改根 lock。测试入口、core 和 WASM host 以 `-Dwarnings` 构建。仅 NAPI host 明确使用 `RUSTFLAGS=''`，并清除 `CARGO_ENCODED_RUSTFLAGS`，避免继承父进程的严格标志。A08 已确认 S00 NAPI 基线本来没有启用 `-Dwarnings`；固定 engine 展开的 nested unsafe、braces、零参数 cb warning 保留显示，不扩写外部 engine 修 lint。不能将本测试描述为全端 `-Dwarnings`。
 
 `contract.mjs` 的相同断言依次在 Node NAPI、Node WASM、真实 Chrome HTTP Window、真实 DedicatedWorker 执行。Chrome 使用独立临时 profile，本地服务器绑定 `127.0.0.1` 的随机端口。worker、browser/context 和 server 在结束或失败时关闭；断言等待、驱动和子进程都有明确 deadline。所有测试调用都通过生成包公开 facade；没有 mock backend、私有 cancellation operation 或 stream options。
 
@@ -35,6 +35,10 @@ cargo test --locked -p uniffi-bindgen-tests-javascript --test unified_async -- -
 流覆盖 Optional None 与 EOF、空流、首个业务错误终止、慢消费无桥接预取、重复 return/cancel、实际 Pending next 被 return 取消，以及 Rust Drop 恰好一次。S01 沿用 per-stream handle 关闭；流的 Drop 不声称已有统一异步 cleanup 支持。
 
 声明探针实际编译并执行 `impl Future + Send`、trait RPITIT `+ Send`、`impl Stream` 和 async stream factory。公开边界分别适配成已支持的 `async fn`、`UniFfiStream`；async stream factory 由首次 pull 时等待 factory 的流适配器承接。这不证明宏直接支持这些原始声明，也不测试原始 trait 的 dyn 兼容性；完整声明归一化仍属于 S03。
+
+S02 的 `LocalCounter` 直接使用 `#[derive(uniffi::Object)] #[uniffi(local, name = "OwnerCounter")]` 与 `#[uniffi::export(local, name = "OwnerCounter")]`。组件持有一个 `LocalExecutor`，async 构造器通过 `executor.create` 返回 `Arc<LocalObject<Self>>`。本体为 `Rc<Cell<_>>`，Rust 方法保持 `&self`；同步与异步方法在 JS 中都返回 Promise，借用参数由生成 helper 在 owner 中建立。框架生成保留名 `close()`；业务代码不再导出同名方法，也不使用 `self: Arc<Self>` 或 `&mut self` 来访问本地本体。局部 trait/其他声明形式由后续阶段补齐。
+
+local 用例检查改名和嵌套模块、同步/异步入口、业务错误与框架错误、方法 await 交错、宿主异步回调重入、逐调用取消及嵌套 !Send 清理、对象重复 close、最后 proxy dispose、owner 回收全部对象，以及取消获胜时未交付代理对应的本体完成析构和清理才结算。native 构造、访问、恢复、Drop 和清理均断言所属线程；WASM 使用当前实例同一事件循环。
 
 日志和独立 core/generated 源码保留在解析后的输出目录中，文件名以 `fixture-*` 开头。`fixture-harness.command.txt` 记录 runner 参数和 Cargo 命令。`fixture-latest-run.txt` 指向最新生成树，各运行的 JSONL 会列出实际通过的 realm/case；只有四个 realm 全部通过才写 `fixture-success.json`。若生成器/host 编译失败，用对应 `fixture-*.stderr.log` 和保留的生成源码定位，不更改此夹具之外的写集。
 

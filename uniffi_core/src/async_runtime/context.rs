@@ -219,11 +219,7 @@ impl CallContext {
     }
     /// Start this context's single call. A second call on the same context panics.
     /// Cancellation before the first poll never polls the business future.
-    pub fn run<'a, F>(&self, future: F) -> Run<'a, F::Output>
-    where
-        F: Future + SendOutsideWasm + 'a,
-        F::Output: 'a,
-    {
+    pub fn run<F: Future>(&self, future: F) -> Run<F> {
         {
             let mut state = lock(&self.inner.state);
             assert!(!state.started, "a CallContext can run only one call");
@@ -477,18 +473,18 @@ impl Future for CleanupDriver {
 
 /// A call future. Its business future is always polled and dropped in its context.
 #[must_use = "poll the call, or retain its context and wait_closed after dropping it"]
-pub struct Run<'a, T> {
+pub struct Run<F: Future> {
     context: CallContext,
-    future: Option<BoxFuture<'a, T>>,
+    future: Option<Pin<Box<F>>>,
     cancellation: Option<Signal>,
-    result: Option<Result<T, Cancelled>>,
+    result: Option<Result<F::Output, Cancelled>>,
     panic: Option<Panic>,
     cleanup: Option<Cleanup>,
     done: bool,
 }
 // Only boxed futures are pinned; result values are never structurally pinned.
-impl<T> Unpin for Run<'_, T> {}
-impl<T> Run<'_, T> {
+impl<F: Future> Unpin for Run<F> {}
+impl<F: Future> Run<F> {
     fn drop_business(&mut self) {
         let _scope = Scope::enter(&self.context);
         if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(self.future.take()))) {
@@ -502,8 +498,8 @@ impl<T> Run<'_, T> {
         self.cleanup = self.context.begin_close();
     }
 }
-impl<T> Future for Run<'_, T> {
-    type Output = Result<T, Cancelled>;
+impl<F: Future> Future for Run<F> {
+    type Output = Result<F::Output, Cancelled>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         assert!(!this.done, "a completed call cannot be polled again");
@@ -565,7 +561,7 @@ impl<T> Future for Run<'_, T> {
         Poll::Ready(this.result.take().unwrap())
     }
 }
-impl<T> Drop for Run<'_, T> {
+impl<F: Future> Drop for Run<F> {
     fn drop(&mut self) {
         let _scope = Scope::enter(&self.context);
         if self.future.is_some() {

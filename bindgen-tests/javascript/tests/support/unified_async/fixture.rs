@@ -1,6 +1,8 @@
 //! One business crate compiled unchanged for native and wasm32.
 #![deny(warnings)]
 
+pub mod local;
+
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::{pending, poll_fn, Future};

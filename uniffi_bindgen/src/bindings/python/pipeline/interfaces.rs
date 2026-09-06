@@ -7,7 +7,7 @@ use uniffi_meta::TraitKind;
 
 pub fn protocol(int: &general::Interface, context: &Context) -> Result<Protocol> {
     Ok(match &int.imp {
-        ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => {
+        ObjectImpl::Struct | ObjectImpl::LocalStruct | ObjectImpl::Trait(TraitKind::RustOnly) => {
             // Interface that's only implemented in Rust:
             //   - Give the interface the main name and append the `Protocol` suffix to the protocol
             //   - Make the protocol inherit from `typing.Protocol`, since the #2264 doesn't affect
@@ -38,7 +38,9 @@ pub fn protocol(int: &general::Interface, context: &Context) -> Result<Protocol>
 pub fn name(int: &general::Interface) -> String {
     // Interface name, see `protocol` for a discussion of the logic here
     match &int.imp {
-        ObjectImpl::Struct | ObjectImpl::Trait(TraitKind::RustOnly) => names::type_name(&int.name),
+        ObjectImpl::Struct | ObjectImpl::LocalStruct | ObjectImpl::Trait(TraitKind::RustOnly) => {
+            names::type_name(&int.name)
+        }
         ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
             names::type_name(&format!("{}Impl", int.name))
         }
@@ -69,7 +71,7 @@ pub fn base_classes(int: &general::Interface, context: &Context) -> Result<Vec<S
                     ObjectImpl::Trait(TraitKind::Both | TraitKind::ForeignOnly) => {
                         (name.to_string(), namespace)
                     }
-                    ObjectImpl::Struct => {
+                    ObjectImpl::Struct | ObjectImpl::LocalStruct => {
                         bail!("Objects can only inherit from traits, not other objects")
                     }
                 }

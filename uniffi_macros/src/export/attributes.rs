@@ -237,6 +237,7 @@ impl UniffiAttributeArgs for ExportFnArgs {
 pub struct ExportImplArgs {
     pub(crate) async_runtime: Option<AsyncRuntime>,
     pub(crate) name: Option<String>,
+    pub(crate) local: Option<kw::local>,
 }
 
 impl Parse for ExportImplArgs {
@@ -248,7 +249,12 @@ impl Parse for ExportImplArgs {
 impl UniffiAttributeArgs for ExportImplArgs {
     fn parse_one(input: ParseStream<'_>) -> syn::Result<Self> {
         let lookahead = input.lookahead1();
-        if lookahead.peek(kw::async_runtime) {
+        if lookahead.peek(kw::local) {
+            Ok(Self {
+                local: Some(input.parse()?),
+                ..Self::default()
+            })
+        } else if lookahead.peek(kw::async_runtime) {
             let _: kw::async_runtime = input.parse()?;
             let _: Token![=] = input.parse()?;
             Ok(Self {
@@ -275,6 +281,7 @@ impl UniffiAttributeArgs for ExportImplArgs {
         Ok(Self {
             async_runtime: either_attribute_arg(self.async_runtime, other.async_runtime)?,
             name: either_attribute_arg(self.name, other.name)?,
+            local: either_attribute_arg(self.local, other.local)?,
         })
     }
 }

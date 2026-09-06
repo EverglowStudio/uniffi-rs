@@ -1,0 +1,5 @@
+error: local methods must take &self; the object body never leaves its owner
+ --> tests/local-ui/mutable_body.rs:7:9
+  |
+7 |     pub fn change(&mut self) {}
+  |         ^^^^^^^^^^^^^^^^^^^^

@@ -22,10 +22,12 @@ use uniffi_pipeline::{MapNode, Node};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Checksum, Ord, PartialOrd, Node, MapNode)]
 pub enum ObjectImpl {
-    // A single Rust type
+    // A single Send + Sync Rust type
     Struct,
     // A trait, with the kind controlling who can export implementations
     Trait(TraitKind),
+    // An owner-local Rust type, exposed through a LocalObject proxy
+    LocalStruct,
 }
 
 /// Controls who can provide implementations of an exported trait
@@ -40,8 +42,7 @@ pub enum TraitKind {
 }
 
 impl ObjectImpl {
-    /// Return the fully qualified name which should be used by Rust code for
-    /// an object with the given name.
+    /// Return the Rust object name, without its module path or pointer/proxy wrapper.
     /// Includes `r#`, traits get a leading `dyn`. If we ever supported associated types, then
     /// this would also include them.
     pub fn rust_name_for(&self, name: &str) -> String {
@@ -61,7 +62,11 @@ impl ObjectImpl {
     }
 
     pub fn has_struct(&self) -> bool {
-        matches!(self, Self::Struct)
+        matches!(self, Self::Struct | Self::LocalStruct)
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::LocalStruct)
     }
 }
 

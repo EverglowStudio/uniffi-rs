@@ -55,6 +55,12 @@ pub(crate) fn render(
                 .any(|operation| operation.callback_use_sites(package).unwrap_or(false)),
         );
     }
+    if managed
+        .iter()
+        .any(|operation| super::async_calls::local_method(operation))
+    {
+        source.push_str(&super::async_calls::local_error_helper(None).to_string());
+    }
     write_temporal_helpers(&mut source);
     source.push_str(&render_callback_helpers(package)?);
     source.push_str(&render_named_helpers(package)?);
@@ -1207,7 +1213,8 @@ fn render_named_helpers(package: &NormalizedPackage) -> Result<String> {
                         }
                     }
                 },
-                uniffi_js_engine_schema::RustObjectKind::TraitRustOnly
+                uniffi_js_engine_schema::RustObjectKind::LocalStruct
+                | uniffi_js_engine_schema::RustObjectKind::TraitRustOnly
                 | uniffi_js_engine_schema::RustObjectKind::TraitBoth
                 | uniffi_js_engine_schema::RustObjectKind::TraitForeignOnly => quote! {
                     #[allow(dead_code)]
@@ -2714,7 +2721,11 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
                 let lowered = lower_operation_value(lowered, fallible, "argument");
                 lowered_arguments.push(quote!(let #core_arg = #lowered;));
             }
-            call_arguments.push(rust_call_argument(quote!(#core_arg), argument.ownership));
+            call_arguments.push(if super::async_calls::local_method(operation) {
+                quote!(#core_arg)
+            } else {
+                rust_call_argument(quote!(#core_arg), argument.ownership)
+            });
         }
         let return_binding = operation
             .return_value
@@ -2768,6 +2779,11 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
                     __uniffi_call_result
                 }
             }
+        } else {
+            call
+        };
+        let call = if super::async_calls::local_method(operation) {
+            quote!((#call).map_err(__uniffi_local_error)?)
         } else {
             call
         };
@@ -3109,6 +3125,19 @@ fn render_call(
             let item = rust_ident(item);
             quote!(#object::#item(#(#args),*))
         }
+        RustCallTarget::Method {
+            object,
+            object_kind: uniffi_js_engine_schema::RustObjectKind::LocalStruct,
+            item,
+            ..
+        } => {
+            let receiver = arguments
+                .first()
+                .ok_or_else(|| anyhow!("local method missing receiver"))?;
+            let object = rust_path(object)?;
+            let helper = rust_ident(&format!("__uniffi_local_{item}"));
+            quote!(#object::#helper(#receiver, #(#args),*))
+        }
         RustCallTarget::Method { item, .. } => {
             let receiver = arguments
                 .first()
@@ -3234,6 +3263,76 @@ namespace async_results {
             }
         }
         panic!("business future must have a closing brace");
+    }
+
+    #[test]
+    fn local_wasm_helpers_commit_raw_results_before_error_and_handle_lifting() {
+        let package = super::super::tests::local_object_package();
+        let wrappers = typed_wrappers(&package);
+        for operation in &package.rust.engines[&EngineKind::WasmBindgen].operations {
+            let name = format!(
+                "__uniffi_typed_wasm_operation_{}",
+                operation.operation_id.index()
+            );
+            let wrapper = wrappers
+                .iter()
+                .find(|wrapper| wrapper.sig.ident == name)
+                .unwrap();
+            let source = compact(wrapper);
+            assert!(wrapper.sig.asyncness.is_some());
+            assert!(compact(&wrapper.sig.output).starts_with("->Result<"));
+            let business = business_future(&source);
+            assert!(!business.contains("__uniffi_store_"));
+            assert!(!business.contains("__uniffi_lift_"));
+            let committed = source
+                .split(".await.map_err(__uniffi_cancelled_error)??")
+                .nth(1)
+                .unwrap();
+            if super::super::async_calls::local_method(operation) {
+                assert!(business.contains("BusinessCounter::__uniffi_local_"));
+                assert!(committed.contains(".map_err(__uniffi_local_error)?"));
+                if operation.throws.is_some() {
+                    assert!(
+                        committed.find(".map_err(__uniffi_local_error)?").unwrap()
+                            < committed.find("Err(error)=>returnErr(").unwrap()
+                    );
+                }
+            } else {
+                assert!(business.contains("BusinessCounter::new().await"));
+                assert!(!source.contains("__uniffi_local_new"));
+                assert!(!committed.contains("__uniffi_local_error"));
+            }
+            if operation.source_key.name() == "read" {
+                assert!(business.contains("__uniffi_local_read_sync(__uniffi_receiver,__uniffi_arg_0,__uniffi_arg_1).await"));
+            }
+            if matches!(operation.source_key.name(), "copy" | "try_copy" | "new") {
+                assert!(committed.contains("__uniffi_store_object_"));
+            }
+        }
+        let helpers = compact(syn::parse_file(&render_named_helpers(&package).unwrap()).unwrap());
+        assert!(helpers.contains(
+            "Arc<::uniffi::async_runtime::LocalObject<local_bridge::r#BusinessCounter>>"
+        ));
+        // Never offer a coercion from the !Send business body to a registry carrier.
+        assert!(!helpers.contains("forlocal_bridge::r#BusinessCounter{"));
+        let errors = compact(super::super::async_calls::local_error_helper(None));
+        assert!(errors.contains("LocalError::Cancelled"));
+        assert!(errors.contains("UniffiCancelled"));
+        assert!(errors.contains("LocalError{error:?}"));
+        assert!(errors.contains("JsValue::from_str(\"errorName\")"));
+        let generated = render(
+            &package,
+            wasm_bindgen_uniffi_engine::ExpansionContext::new(
+                ".",
+                "local_bridge",
+                "0.0.0",
+                std::iter::empty::<String>(),
+                "wasm32-unknown-unknown",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        syn::parse_file(&generated).unwrap();
     }
 
     #[test]

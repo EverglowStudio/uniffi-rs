@@ -73,6 +73,12 @@ impl ExportItem {
 
     pub fn from_impl(item: syn::ItemImpl, attr_args: TokenStream) -> syn::Result<Self> {
         let args: ExportImplArgs = syn::parse(attr_args)?;
+        if args.local.is_some() && item.trait_.is_some() {
+            return Err(syn::Error::new_spanned(
+                &item.self_ty,
+                "local exports currently require inherent methods on a local Object",
+            ));
+        }
         if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
             return Err(syn::Error::new_spanned(
                 &item.generics,
@@ -115,6 +121,15 @@ impl ExportItem {
 
                 let docstring = extract_docstring(&impl_fn.attrs)?;
                 let attrs = ExportedImplFnAttributes::new(&impl_fn.attrs)?;
+                if args.local.is_some() && !attrs.constructor {
+                    let shared_ref = impl_fn.sig.receiver().is_some_and(|receiver| {
+                        matches!(&*receiver.ty, syn::Type::Reference(reference) if reference.mutability.is_none())
+                    });
+                    if !shared_ref {
+                        return Err(syn::Error::new_spanned(&impl_fn.sig,
+                            "local methods must take &self; the object body never leaves its owner"));
+                    }
+                }
 
                 let foreign_self_ident = if let Some(name) = &args.name {
                     Ident::new(name, self_ident.span())
@@ -122,7 +137,7 @@ impl ExportItem {
                     self_ident.clone()
                 };
 
-                let item = if attrs.constructor {
+                let mut item = if attrs.constructor {
                     ImplItem::Constructor(FnSignature::new_constructor(
                         self_ident.clone(),
                         foreign_self_ident,
@@ -139,6 +154,25 @@ impl ExportItem {
                         docstring,
                     )?)
                 };
+
+                if args.local.is_some() {
+                    match &mut item {
+                        ImplItem::Constructor(sig) => {
+                            if !sig.is_async {
+                                return Err(syn::Error::new(sig.span,
+                                    "local constructors must be async and return Arc<LocalObject<Self>> from an explicit owner"));
+                            }
+                        }
+                        ImplItem::Method(sig) => {
+                            if sig.name == "close" || sig.ident == "close" {
+                                return Err(syn::Error::new(sig.span,
+                                    "close is generated for local Objects and waits for owner cleanup"));
+                            }
+                            sig.is_local = true;
+                            sig.is_async = true;
+                        }
+                    }
+                }
 
                 Ok(item)
             })

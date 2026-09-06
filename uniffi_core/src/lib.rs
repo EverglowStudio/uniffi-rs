@@ -84,6 +84,8 @@ mod custom_types;
 pub mod ffi;
 mod ffi_converter_impls;
 mod ffi_converter_traits;
+#[cfg(feature = "async-runtime")]
+mod local_object;
 pub mod metadata;
 pub mod oneshot;
 
@@ -97,6 +99,8 @@ pub use ffi_converter_traits::{
     ConvertError, FfiConverter, FfiConverterArc, HandleAlloc, Lift, LiftRef, LiftReturn, Lower,
     LowerError, LowerReturn, TypeId,
 };
+#[cfg(feature = "async-runtime")]
+pub use local_object::LocalObjectType;
 pub use metadata::*;
 
 // Re-export the libs that we use in the generated code,

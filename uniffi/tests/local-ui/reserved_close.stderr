@@ -1,0 +1,5 @@
+error: close is generated for local Objects and waits for owner cleanup
+ --> tests/local-ui/reserved_close.rs:7:9
+  |
+7 |     pub fn close(&self) {}
+  |         ^^
