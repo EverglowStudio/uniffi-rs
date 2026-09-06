@@ -11,6 +11,7 @@ name = "uniffi_benchmarks"
 bench = false
 
 [dependencies]
+async-trait = { version = "0.1", optional = true }
 uniffi = { path = "../../uniffi", default-features = false }
 uniffi_bindgen = {path = "../../uniffi_bindgen", features = ["bindgen-tests", "test-util"]}
 uniffi-bindgen-kotlin-jni = {path = "../../uniffi-bindgen-kotlin-jni", features = ["test-util"]}
@@ -32,6 +33,8 @@ name = "benchmarks"
 harness = false
 
 [features]
+async-bench = ["dep:async-trait"]
+async-bench-streams = ["async-bench"]
 ffi-trace = ["uniffi/ffi-trace"]
 uniffi-bindgen = ["uniffi/macro-scaffolding"]
 uniffi-bindgen-kotlin-jni = ["uniffi-bindgen-kotlin-jni-runtime"]

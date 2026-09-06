@@ -2446,6 +2446,7 @@ name = "uniffi-fixture-benchmarks"
 version = "0.22.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "camino",
  "clap",
  "criterion",
