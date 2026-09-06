@@ -340,6 +340,8 @@ pub enum RustCallTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RustObjectKind {
     Struct,
+    /// Owner-affine business object carried by Arc<LocalObject<T>>.
+    LocalStruct,
     TraitRustOnly,
     TraitBoth,
     TraitForeignOnly,

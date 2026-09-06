@@ -127,7 +127,7 @@ impl Object {
         self.name = new_name;
     }
 
-    /// Returns the fully qualified name that should be used by Rust code for this object.
+    /// Returns the Rust object name without its module path or pointer/proxy wrapper.
     /// Includes `r#`, traits get a leading `dyn`. If we ever supported associated types, then
     /// this would also include them.
     pub fn rust_name(&self) -> String {
@@ -839,6 +839,144 @@ impl Callable for Method {
 mod test {
     use super::super::ComponentInterface;
     use super::*;
+
+    fn object_metadata(imp: ObjectImpl) -> uniffi_meta::ObjectMetadata {
+        uniffi_meta::ObjectMetadata {
+            module_path: "example::nested::objects".into(),
+            name: "Counter".into(),
+            orig_name: Some("RustCounter".into()),
+            imp,
+            remote: false,
+            docstring: None,
+        }
+    }
+
+    fn constructor_metadata(self_type: Option<Type>) -> uniffi_meta::ConstructorMetadata {
+        uniffi_meta::ConstructorMetadata {
+            module_path: "example::nested::constructors".into(),
+            self_name: "Counter".into(),
+            self_type,
+            name: "new".into(),
+            orig_name: None,
+            is_async: true,
+            inputs: vec![],
+            throws: None,
+            checksum: None,
+            docstring: None,
+        }
+    }
+
+    #[test]
+    fn local_object_constructor_and_async_methods_keep_their_types() {
+        let object = object_metadata(ObjectImpl::LocalStruct);
+        let self_type = Object::from(object.clone()).as_type();
+        let mut group = uniffi_meta::MetadataGroup {
+            namespace: uniffi_meta::NamespaceMetadata {
+                crate_name: "example".into(),
+                name: "example".into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(object.into());
+        group.add_item(constructor_metadata(Some(self_type.clone())).into());
+        // Both synchronous and asynchronous Rust &self methods arrive as async metadata.
+        for name in ["get", "update"] {
+            group.add_item(
+                uniffi_meta::MethodMetadata {
+                    module_path: "example::nested::methods".into(),
+                    self_name: "Counter".into(),
+                    name: name.into(),
+                    orig_name: None,
+                    is_async: true,
+                    inputs: vec![],
+                    return_type: Some(Type::Optional {
+                        inner_type: Box::new(self_type.clone()),
+                    }),
+                    throws: None,
+                    takes_self_by_arc: false,
+                    checksum: None,
+                    docstring: None,
+                }
+                .into(),
+            );
+        }
+        let ci = ComponentInterface::from_metadata(group).unwrap();
+        ci.check_consistency().unwrap();
+        let object = ci.get_object_definition("Counter").unwrap();
+        assert_eq!(object.as_type(), self_type);
+        assert_eq!(object.rust_name(), "r#RustCounter");
+        assert!(object.imp().has_struct());
+        assert!(object.imp().is_local());
+        assert!(ci.has_async_fns());
+        let constructor = object.primary_constructor().unwrap();
+        assert_eq!(constructor.return_type(), Some(&self_type));
+        assert!(constructor.iter_types().any(|ty| ty == &self_type));
+        assert_eq!(
+            constructor.module_path(),
+            Some("example::nested::constructors")
+        );
+        assert!(constructor.ffi_func().is_async());
+        for method in object.methods() {
+            assert_eq!(method.self_type(), Some(self_type.clone()));
+            assert!(!method.takes_self_by_arc());
+            assert!(method.is_async());
+            assert!(method.ffi_func().is_async());
+        }
+        assert!(object.iter_types().any(|ty| ty == &self_type));
+        assert!(ci.iter_local_types().any(|ty| matches!(
+            ty,
+            Type::Object {
+                imp: ObjectImpl::LocalStruct,
+                ..
+            }
+        )));
+        assert!(!ci.iter_local_types().any(|ty| matches!(
+            ty,
+            Type::Object {
+                imp: ObjectImpl::Struct,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn constructor_without_self_type_uses_declared_object_implementation() {
+        for imp in [ObjectImpl::Struct, ObjectImpl::LocalStruct] {
+            let mut ci = ComponentInterface::new("example");
+            ci.add_object_meta(object_metadata(imp)).unwrap();
+            ci.add_constructor_meta(constructor_metadata(None)).unwrap();
+            let object = ci.get_object_definition("Counter").unwrap();
+            let constructor = object.primary_constructor().unwrap();
+            assert_eq!(constructor.return_type(), Some(&object.as_type()));
+            assert!(constructor.iter_types().any(|ty| ty == &object.as_type()));
+        }
+    }
+
+    #[test]
+    fn constructor_rejects_conflicting_local_and_shared_object_metadata() {
+        for (declared, returned) in [
+            (ObjectImpl::LocalStruct, ObjectImpl::Struct),
+            (ObjectImpl::Struct, ObjectImpl::LocalStruct),
+        ] {
+            let mut ci = ComponentInterface::new("example");
+            ci.add_object_meta(object_metadata(declared)).unwrap();
+            let return_type = Object::from(object_metadata(returned)).as_type();
+            let error = ci
+                .add_constructor_meta(constructor_metadata(Some(return_type)))
+                .unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("adding constructor"), "{diagnostic}");
+            assert!(diagnostic.contains("conflicting types"), "{diagnostic}");
+            assert!(diagnostic.contains("LocalStruct"), "{diagnostic}");
+            assert!(diagnostic.contains("Counter"), "{diagnostic}");
+            assert!(ci
+                .get_object_definition("Counter")
+                .unwrap()
+                .constructors()
+                .is_empty());
+        }
+    }
 
     #[test]
     fn test_that_all_argument_and_return_types_become_known() {

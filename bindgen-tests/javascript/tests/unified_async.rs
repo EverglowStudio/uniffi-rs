@@ -149,6 +149,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 uniffi = {{ path = {:?}, features = ["async-runtime", "tokio", "default-async-runtime-tokio", "wasm-unstable-single-threaded"] }}
 futures-util = "0.3"
+async-trait = "0.1"
 
 [workspace]
 resolver = "3"
@@ -156,6 +157,11 @@ resolver = "3"
     fs::write(
         crate_dir.join("src/lib.rs"),
         include_str!("support/unified_async/fixture.rs"),
+    )
+    .unwrap();
+    fs::write(
+        crate_dir.join("src/local.rs"),
+        include_str!("support/unified_async/local.rs"),
     )
     .unwrap();
     for (name, source) in SOURCES {
@@ -289,7 +295,7 @@ resolver = "3"
             "run": root,
             "realms": realms,
             "status": "passed",
-            "declarations": "legal adapters only; direct macro declaration coverage deferred"
+            "declarations": "direct local Object markers and generated async sync/async methods; general Future/Stream declarations deferred to S03"
         }))
         .unwrap(),
     )

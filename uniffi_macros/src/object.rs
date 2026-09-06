@@ -18,6 +18,7 @@ use uniffi_meta::{ObjectImpl, TraitKind};
 #[derive(Clone, Default)]
 pub struct ObjectAttr {
     pub name: Option<String>,
+    pub local: Option<kw::local>,
 }
 
 impl UniffiAttributeArgs for ObjectAttr {
@@ -27,7 +28,15 @@ impl UniffiAttributeArgs for ObjectAttr {
             let _: kw::name = input.parse()?;
             let _: Token![=] = input.parse()?;
             let name = Some(input.parse::<LitStr>()?.value());
-            Ok(Self { name })
+            Ok(Self {
+                name,
+                ..Self::default()
+            })
+        } else if lookahead.peek(kw::local) {
+            Ok(Self {
+                local: Some(input.parse()?),
+                ..Self::default()
+            })
         } else {
             Err(syn::Error::new(
                 input.span(),
@@ -39,6 +48,7 @@ impl UniffiAttributeArgs for ObjectAttr {
     fn merge(self, other: Self) -> syn::Result<Self> {
         Ok(Self {
             name: either_attribute_arg(self.name, other.name)?,
+            local: either_attribute_arg(self.local, other.local)?,
         })
     }
 }
@@ -85,6 +95,17 @@ pub fn expand_object(input: DeriveInput, options: DeriveOptions) -> syn::Result<
     let object = ObjectItem::new(input)?;
     let name = &object.foreign_name();
     let ident = object.ident();
+    let is_local = object.attr.local.is_some();
+    let handle_type = if is_local {
+        quote!(::uniffi::async_runtime::LocalObject<#ident>)
+    } else {
+        quote!(#ident)
+    };
+    let local_close = if is_local {
+        crate::export::gen_local_close(ident, name, !options.generate_metadata)?
+    } else {
+        TokenStream::new()
+    };
     let clone_fn_ident = Ident::new(
         &uniffi_meta::clone_fn_symbol_name(&module_path, name),
         Span::call_site(),
@@ -97,7 +118,11 @@ pub fn expand_object(input: DeriveInput, options: DeriveOptions) -> syn::Result<
         interface_meta_static_var(
             name,
             orig_name_metadata(object.attr.name.is_some(), ident),
-            ObjectImpl::Struct,
+            if is_local {
+                ObjectImpl::LocalStruct
+            } else {
+                ObjectImpl::Struct
+            },
             object.docstring(),
         )
         .unwrap_or_else(syn::Error::into_compile_error)
@@ -114,7 +139,7 @@ pub fn expand_object(input: DeriveInput, options: DeriveOptions) -> syn::Result<
             ::uniffi::deps::trace!("clone: {} ({:?})", #name, handle);
             ::uniffi::rust_call(call_status, || {
                 unsafe {
-                    handle.clone_arc_handle::<#ident>()
+                    handle.clone_arc_handle::<#handle_type>()
                 };
                 ::std::result::Result::Ok(handle)
             })
@@ -129,7 +154,7 @@ pub fn expand_object(input: DeriveInput, options: DeriveOptions) -> syn::Result<
             ::uniffi::deps::trace!("free: {} ({:?})", #name, handle);
             ::uniffi::rust_call(call_status, || {
                 ::std::mem::drop(unsafe {
-                    handle.into_arc::<#ident>()
+                    handle.into_arc::<#handle_type>()
                 });
                 ::std::result::Result::Ok(())
             });
@@ -137,12 +162,32 @@ pub fn expand_object(input: DeriveInput, options: DeriveOptions) -> syn::Result<
 
         #interface_impl
         #meta_static_var
+        #local_close
     })
 }
 
 fn interface_impl(object: &ObjectItem, options: &DeriveOptions) -> TokenStream {
     let name = object.foreign_name();
     let ident = object.ident();
+    if object.attr.local.is_some() {
+        let impl_spec = options.ffi_impl_header("LocalObjectType", ident);
+        let type_id_impl_spec = options.ffi_impl_header("TypeId", ident);
+        return quote! {
+            // SAFETY: The generated clone/free functions both use this exact proxy type.
+            unsafe #impl_spec {
+                const TYPE_ID_META: ::uniffi::MetadataBuffer =
+                    ::uniffi::MetadataBuffer::from_code(::uniffi::metadata::codes::TYPE_LOCAL_INTERFACE)
+                        .concat_str(module_path!())
+                        .concat_str(#name);
+            }
+            #type_id_impl_spec {
+                const TYPE_ID_META: ::uniffi::MetadataBuffer =
+                    ::uniffi::MetadataBuffer::from_code(::uniffi::metadata::codes::TYPE_LOCAL_INTERFACE)
+                        .concat_str(module_path!())
+                        .concat_str(#name);
+            }
+        };
+    }
     let impl_spec = options.ffi_impl_header("FfiConverterArc", ident);
     let lower_return_impl_spec = options.ffi_impl_header("LowerReturn", ident);
     let lower_error_impl_spec = options.ffi_impl_header("LowerError", ident);
@@ -261,6 +306,7 @@ pub(crate) fn interface_meta_static_var(
 ) -> syn::Result<TokenStream> {
     let (code, trait_kind_code) = match imp {
         ObjectImpl::Struct => (uniffi_meta::codes::INTERFACE, None),
+        ObjectImpl::LocalStruct => (uniffi_meta::codes::LOCAL_INTERFACE, None),
         ObjectImpl::Trait(kind) => {
             let trait_kind_code = match kind {
                 TraitKind::RustOnly => uniffi_meta::codes::TRAIT_KIND_RUST_ONLY,

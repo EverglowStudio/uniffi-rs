@@ -21,6 +21,69 @@ pub(super) fn managed(operation: &RustOperationPlan) -> bool {
         )
 }
 
+/// Local helpers own the lifting carriers and return a framework Result outside
+/// the complete business return (including its declared Result, if any).
+pub(super) fn local_method(operation: &RustOperationPlan) -> bool {
+    matches!(
+        operation.call_target,
+        RustCallTarget::Method {
+            object_kind: uniffi_js_engine_schema::RustObjectKind::LocalStruct,
+            ..
+        }
+    )
+}
+
+pub(super) fn local_error_helper(flavor: Option<NativeFlavor>) -> TokenStream {
+    let name = quote! {
+        let name = if matches!(error, ::uniffi::async_runtime::LocalError::Cancelled) {
+            "UniffiCancelled".to_owned()
+        } else {
+            format!("LocalError{error:?}")
+        };
+    };
+    if let Some(flavor) = flavor {
+        let engine = engine_crate_path(flavor);
+        quote! {
+            fn __uniffi_local_error(error: ::uniffi::async_runtime::LocalError) -> #engine::BridgeErrorDescriptor {
+                #name
+                #engine::BridgeErrorDescriptor {
+                    domain: #engine::ErrorDomain::Backend,
+                    error_name: name,
+                    variant: None,
+                    data: #engine::ErrorData::Null,
+                    message: error.to_string(),
+                    native_stack: None,
+                }
+            }
+        }
+    } else {
+        quote! {
+            fn __uniffi_local_error(error: ::uniffi::async_runtime::LocalError) -> JsValue {
+                #name
+                let value = js_sys::Error::new(&error.to_string());
+                value.set_name(&name);
+                js_sys::Reflect::set(&value, &JsValue::from_str("errorName"), &JsValue::from_str(&name))
+                    .expect("fresh local Error is extensible");
+                value.into()
+            }
+        }
+    }
+}
+
+fn result_ok_type(ty: &Type) -> Result<Type> {
+    let syn::Type::Path(path) = ty else {
+        bail!("fallible native wrapper is not a Result")
+    };
+    let syn::PathArguments::AngleBracketed(args) = &path.path.segments.last().unwrap().arguments
+    else {
+        bail!("fallible native wrapper has no Result arguments")
+    };
+    let Some(syn::GenericArgument::Type(ok)) = args.args.first() else {
+        bail!("fallible native wrapper has no result type")
+    };
+    Ok(ok.clone())
+}
+
 pub(super) fn registry(managed_calls: bool) -> TokenStream {
     let start_call = managed_calls.then(|| {
         quote! {
@@ -181,31 +244,33 @@ pub(super) fn wrap(
         let future = quote!(async move { #(#captures)* #(#statements)* });
         let (output, execute) = if let Some(flavor) = flavor {
             let engine = engine_crate_path(flavor);
+            // Run commits the complete raw result before either framework or
+            // declared error conversion. Cancellation can still drop all Rust
+            // resources without leaving an undisclosed handle in the registry.
+            let (old_output, committed) = if local_method(operation) {
+                (
+                    result_ok_type(&old_output)?,
+                    quote!(__uniffi_context.run(#future).await.map_err(__uniffi_cancelled_error)?.map_err(__uniffi_local_error)),
+                )
+            } else {
+                (
+                    old_output,
+                    quote!(__uniffi_context.run(#future).await.map_err(__uniffi_cancelled_error)),
+                )
+            };
             if operation.throws.is_some() {
-                let syn::Type::Path(path) = &old_output else {
-                    bail!("fallible native wrapper is not a Result")
-                };
-                let syn::PathArguments::AngleBracketed(args) =
-                    &path.path.segments.last().unwrap().arguments
-                else {
-                    bail!("fallible native wrapper has no Result arguments")
-                };
-                let Some(syn::GenericArgument::Type(ok)) = args.args.first() else {
-                    bail!("fallible native wrapper has no result type")
-                };
+                let ok = result_ok_type(&old_output)?;
                 let map = path_for_helper(id, "error", "error");
                 (
                     quote!(::std::result::Result<#ok, #engine::BridgeErrorDescriptor>),
                     quote! {
-                        __uniffi_context.run(#future).await.map_err(__uniffi_cancelled_error)?.map_err(#map)
+                        #committed?.map_err(#map)
                     },
                 )
             } else {
                 (
                     quote!(::std::result::Result<#old_output, #engine::BridgeErrorDescriptor>),
-                    quote! {
-                        __uniffi_context.run(#future).await.map_err(__uniffi_cancelled_error)
-                    },
+                    quote! { #committed },
                 )
             }
         } else {

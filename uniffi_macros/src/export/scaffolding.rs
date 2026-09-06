@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use proc_macro2::{Ident, TokenStream};
-use quote::quote;
+use quote::{format_ident, quote};
 use std::iter;
 
 use super::attributes::AsyncRuntime;
@@ -97,6 +97,11 @@ pub(super) fn gen_method_scaffolding(
     udl_mode: bool,
     use_trait: Option<&syn::Path>,
 ) -> syn::Result<TokenStream> {
+    let local_helper = if sig.is_local {
+        gen_local_method(&sig)?
+    } else {
+        TokenStream::new()
+    };
     let scaffolding_func = if sig.receiver.is_none() {
         return Err(syn::Error::new(
             sig.span,
@@ -111,8 +116,90 @@ pub(super) fn gen_method_scaffolding(
             .unwrap_or_else(syn::Error::into_compile_error)
     });
     Ok(quote! {
+        #local_helper
         #scaffolding_func
         #metadata_items
+    })
+}
+
+/// The helper takes owned arguments; any Rust borrows are made inside the owner.
+fn gen_local_method(sig: &FnSignature) -> syn::Result<TokenStream> {
+    if !matches!(sig.require_receiver()?, ReceiverArg::Ref) {
+        return Err(syn::Error::new(
+            sig.span,
+            "local methods must take &self; the object body never leaves its owner",
+        ));
+    }
+    let FnKind::Method { self_ident, .. } = &sig.kind else {
+        return Err(syn::Error::new(
+            sig.span,
+            "local export requires an inherent method",
+        ));
+    };
+    let helper = local_helper_ident(sig);
+    let method = &sig.ident;
+    let return_ty = &sig.return_ty;
+    let names: Vec<_> = (0..sig.args.len())
+        .map(|i| format_ident!("__uniffi_arg_{i}"))
+        .collect();
+    let types = sig.args.iter().map(|arg| &arg.ty);
+    let args = sig.rust_call_params(false);
+    let call = if sig.is_rust_async {
+        quote! { __uniffi_body.#method(#args).await }
+    } else {
+        quote! { __uniffi_body.#method(#args) }
+    };
+    Ok(quote! {
+        impl #self_ident {
+            #[doc(hidden)]
+            pub async fn #helper(
+                __uniffi_proxy: ::std::sync::Arc<::uniffi::async_runtime::LocalObject<Self>>,
+                #(#names: #types,)*
+            ) -> ::std::result::Result<#return_ty, ::uniffi::async_runtime::LocalError> {
+                let uniffi_args = (#(#names,)*);
+                __uniffi_proxy.call(move |__uniffi_body| ::std::boxed::Box::pin(async move {
+                    #call
+                })).await
+            }
+        }
+    })
+}
+
+fn local_helper_ident(sig: &FnSignature) -> Ident {
+    format_ident!(
+        "__uniffi_local_{}",
+        crate::util::ident_to_string(&sig.ident)
+    )
+}
+
+/// Every local object exposes a repeatable close operation independent of its
+/// business methods. Closing the proxy waits for owner-side destruction.
+pub(crate) fn gen_local_close(
+    self_ident: &Ident,
+    foreign_name: &str,
+    udl_mode: bool,
+) -> syn::Result<TokenStream> {
+    let mut sig = FnSignature::new_method(
+        self_ident.clone(),
+        Ident::new(foreign_name, self_ident.span()),
+        syn::parse_quote! { async fn close(&self) },
+        super::attributes::ExportFnArgs::default(),
+        "Cancel this local object's calls and wait for owner cleanup and destruction.".into(),
+    )?;
+    sig.is_local = true;
+    let scaffolding = gen_ffi_function(&sig, None, udl_mode, None)?;
+    let metadata = (!udl_mode).then(|| sig.metadata_items()).transpose()?;
+    Ok(quote! {
+        impl #self_ident {
+            #[doc(hidden)]
+            pub async fn __uniffi_local_close(
+                proxy: ::std::sync::Arc<::uniffi::async_runtime::LocalObject<Self>>,
+            ) -> ::std::result::Result<(), ::uniffi::async_runtime::LocalError> {
+                proxy.close().await
+            }
+        }
+        #scaffolding
+        #metadata
     })
 }
 
@@ -161,6 +248,8 @@ impl ScaffoldingBits {
         let ident = &sig.ident;
         let self_type = if is_trait {
             quote! { dyn #self_ident }
+        } else if sig.is_local {
+            quote! { ::uniffi::async_runtime::LocalObject<#self_ident> }
         } else {
             quote! { #self_ident }
         };
@@ -178,7 +267,14 @@ impl ScaffoldingBits {
             }
         }));
         let call_params = sig.rust_call_params(true);
-        let rust_fn_call = if is_trait {
+        let rust_fn_call = if sig.is_local {
+            let helper = local_helper_ident(sig);
+            let params = (1..=sig.args.len()).map(|i| {
+                let idx = syn::Index::from(i);
+                quote! { uniffi_args.#idx }
+            });
+            quote! { #self_ident::#helper(uniffi_args.0, #(#params),*) }
+        } else if is_trait {
             // For traits use the fully-qualified function name to disambiguate
             let receiver_expr = match sig.require_receiver()? {
                 ReceiverArg::Ref => quote! { &*uniffi_args.0 },
@@ -390,6 +486,21 @@ pub(super) fn gen_ffi_function(
         }
     } else {
         let future_expr = wrap_async_future_expr(rust_fn_call, ar);
+        let future_output = if sig.is_local {
+            quote! { ::uniffi::InternalCallResult<#return_ty> }
+        } else {
+            quote! { #return_ty }
+        };
+        let async_result = if sig.is_local {
+            quote! {
+                ::uniffi::InternalCallResult(
+                    uniffi_result.map(|uniffi_result| #convert_result)
+                        .map_err(::uniffi::RustCallError::from)
+                )
+            }
+        } else {
+            convert_result
+        };
         let scaffolding_fn_ffi_buffer_version =
             ffi_buffer_scaffolding_fn(&ffi_ident, &quote! { ::uniffi::Handle}, &param_types, false);
 
@@ -401,12 +512,12 @@ pub(super) fn gen_ffi_function(
             pub extern "C" fn #ffi_ident(#(#param_names: #param_types,)*) -> ::uniffi::Handle {
                 ::uniffi::deps::trace!("calling: {}", #name);
                 let uniffi_lifted_args = (#lift_closure)();
-                ::uniffi::rust_future_new::<_, #return_ty, _>(
+                ::uniffi::rust_future_new::<_, #future_output, _>(
                     async move {
                         match uniffi_lifted_args {
                             ::std::result::Result::Ok(uniffi_args) => {
                                 let uniffi_result = #future_expr.await;
-                                Ok(#convert_result)
+                                Ok(#async_result)
                             }
                             ::std::result::Result::Err((arg_name, error)) => {
                                 Err(::uniffi::LiftArgsError { arg_name, error })

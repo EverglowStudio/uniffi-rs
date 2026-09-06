@@ -28,6 +28,7 @@ pub mod codes {
     // This is deliberately a standalone metadata item so the existing operation metadata
     // remains usable by non-JavaScript bindings.
     pub const CALLBACK_USE_SITE: u8 = 16;
+    pub const LOCAL_INTERFACE: u8 = 17;
 
     // Type codes
     pub const TYPE_U8: u8 = 0;
@@ -60,6 +61,7 @@ pub mod codes {
     pub const TYPE_HASH_SET: u8 = 27;
     pub const TYPE_STREAM: u8 = 28;
     pub const TYPE_INPUT_STREAM: u8 = 29;
+    pub const TYPE_LOCAL_INTERFACE: u8 = 30;
     pub const TYPE_UNIT: u8 = 255;
 
     // TraitKind sub-codes.

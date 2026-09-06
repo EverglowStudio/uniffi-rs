@@ -528,7 +528,14 @@ fn object_core_type(package: &NormalizedPackage, type_id: uniffi_js_abi::TypeId)
                 | uniffi_js_engine_schema::RustObjectKind::TraitForeignOnly,
         }
     );
-    if trait_object {
+    if matches!(
+        named.kind,
+        uniffi_js_engine_schema::RustNamedTypeKind::Object {
+            kind: uniffi_js_engine_schema::RustObjectKind::LocalStruct,
+        }
+    ) {
+        Ok(syn::parse_quote!(std::sync::Arc<::uniffi::async_runtime::LocalObject<#path>>))
+    } else if trait_object {
         Ok(syn::parse_quote!(std::sync::Arc<dyn #path>))
     } else {
         Ok(syn::parse_quote!(std::sync::Arc<#path>))
@@ -4618,9 +4625,24 @@ fn render_native_operation_wrappers(
             let ty = core_type_for_binding(package, &binding)?;
             let name = rust_ident(&argument.rust_name);
             parameters.push(quote!(#name: #ty));
-            call_arguments.push(rust_call_argument(quote!(#name), argument.ownership));
+            call_arguments.push(if async_calls::local_method(operation) {
+                quote!(#name)
+            } else {
+                rust_call_argument(quote!(#name), argument.ownership)
+            });
         }
-        let call_expression = if let Some(receiver_name) = receiver_name {
+        let call_expression = if let RustCallTarget::Method {
+            object,
+            object_kind: uniffi_js_engine_schema::RustObjectKind::LocalStruct,
+            item,
+            ..
+        } = &operation.call_target
+        {
+            let object = rust_path(object)?;
+            let helper = rust_ident(&format!("__uniffi_local_{item}"));
+            let receiver = receiver_name.expect("local method receiver");
+            quote!(#object::#helper(#receiver, #(#call_arguments),*))
+        } else if let Some(receiver_name) = receiver_name {
             let item = match &operation.call_target {
                 RustCallTarget::Method { item, .. } => rust_ident(item),
                 _ => unreachable!(),
@@ -4682,6 +4704,11 @@ fn render_native_operation_wrappers(
                 .ok_or_else(|| anyhow!("missing error type {}", throws.index()))?;
             let error_path = rust_path(&error_type.rust_path)?;
             syn::parse_quote!(::std::result::Result<#return_type, #error_path>)
+        } else {
+            return_type
+        };
+        let return_type: Type = if async_calls::local_method(operation) {
+            syn::parse_quote!(::std::result::Result<#return_type, ::uniffi::async_runtime::LocalError>)
         } else {
             return_type
         };
@@ -5093,7 +5120,16 @@ pub(crate) fn napi_source(package: &NormalizedPackage) -> Result<String> {
     let callback_helpers =
         render_callback_proxy_helpers(package, NativeFlavor::Node, EngineKind::Napi)?;
     let registry = render_resource_registry(NativeFlavor::Node);
-    let wrappers = render_native_operation_wrappers(package, EngineKind::Napi)?;
+    let local_errors = package.rust.engines[&EngineKind::Napi]
+        .operations
+        .iter()
+        .any(async_calls::local_method)
+        .then(|| async_calls::local_error_helper(Some(NativeFlavor::Node)))
+        .unwrap_or_default();
+    let wrappers = format!(
+        "{local_errors}\n{}",
+        render_native_operation_wrappers(package, EngineKind::Napi)?
+    );
     let wrappers = async_calls::wrap(
         &wrappers,
         &package.rust.engines[&EngineKind::Napi].operations,
@@ -5481,7 +5517,16 @@ pub(crate) fn ohos_source(package: &NormalizedPackage) -> Result<String> {
     let callback_helpers =
         render_callback_proxy_helpers(package, NativeFlavor::Ohos, EngineKind::OhosNapi)?;
     let registry = render_resource_registry(NativeFlavor::Ohos);
-    let wrappers = render_native_operation_wrappers(package, EngineKind::OhosNapi)?;
+    let local_errors = package.rust.engines[&EngineKind::OhosNapi]
+        .operations
+        .iter()
+        .any(async_calls::local_method)
+        .then(|| async_calls::local_error_helper(Some(NativeFlavor::Ohos)))
+        .unwrap_or_default();
+    let wrappers = format!(
+        "{local_errors}\n{}",
+        render_native_operation_wrappers(package, EngineKind::OhosNapi)?
+    );
     let wrappers = async_calls::wrap(
         &wrappers,
         &package.rust.engines[&EngineKind::OhosNapi].operations,
@@ -5796,7 +5841,8 @@ fn wasm_object_kind(
 ) -> wasm_bindgen_uniffi_engine::WasmObjectKind {
     use wasm_bindgen_uniffi_engine::WasmObjectKind as K;
     match kind {
-        uniffi_js_engine_schema::RustObjectKind::Struct => K::Struct,
+        uniffi_js_engine_schema::RustObjectKind::Struct
+        | uniffi_js_engine_schema::RustObjectKind::LocalStruct => K::Struct,
         uniffi_js_engine_schema::RustObjectKind::TraitRustOnly => K::TraitRustOnly,
         uniffi_js_engine_schema::RustObjectKind::TraitBoth => K::TraitBoth,
         uniffi_js_engine_schema::RustObjectKind::TraitForeignOnly => K::TraitForeignOnly,
@@ -6541,6 +6587,238 @@ mod tests {
     use crate::JsConfig;
     use uniffi_bindgen::interface::ComponentInterface;
     use uniffi_bindgen::Component;
+
+    pub(super) fn local_object_package() -> NormalizedPackage {
+        use uniffi_meta::*;
+        let module = "local_bridge";
+        let object = Type::Object {
+            module_path: module.into(),
+            name: "PublicCounter".into(),
+            imp: ObjectImpl::LocalStruct,
+        };
+        let error = Type::Enum {
+            module_path: module.into(),
+            name: "Failure".into(),
+        };
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module.into(),
+                name: module.into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            ObjectMetadata {
+                module_path: module.into(),
+                name: "PublicCounter".into(),
+                orig_name: Some("BusinessCounter".into()),
+                remote: false,
+                imp: ObjectImpl::LocalStruct,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            EnumMetadata {
+                module_path: module.into(),
+                name: "Failure".into(),
+                orig_name: None,
+                rust_path: None,
+                shape: EnumShape::Error { flat: true },
+                remote: false,
+                variants: vec![VariantMetadata {
+                    name: "Failed".into(),
+                    orig_name: None,
+                    discr: None,
+                    fields: vec![],
+                    docstring: None,
+                }],
+                discr_type: None,
+                non_exhaustive: false,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            ConstructorMetadata {
+                module_path: module.into(),
+                self_name: "PublicCounter".into(),
+                self_type: Some(object.clone()),
+                name: "new".into(),
+                orig_name: None,
+                is_async: true,
+                inputs: vec![],
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        // Metadata intentionally marks both originally-sync and async business
+        // methods async. Borrowing is performed inside the owner helper.
+        for (name, original, return_type, throws) in [
+            ("read", "read_sync", Some(Type::UInt32), None),
+            ("copy", "copy_async", Some(object.clone()), None),
+            (
+                "try_copy",
+                "try_copy",
+                Some(object.clone()),
+                Some(error.clone()),
+            ),
+            ("try_unit", "try_unit", None, Some(error)),
+            ("close", "close", None, None),
+        ] {
+            let inputs = if name == "read" {
+                let mut text = FnParamMetadata::simple("label", Type::String);
+                text.by_ref = true;
+                let mut peer = FnParamMetadata::simple("peer", object.clone());
+                peer.by_ref = true;
+                vec![text, peer]
+            } else {
+                vec![]
+            };
+            group.add_item(
+                MethodMetadata {
+                    module_path: module.into(),
+                    self_name: "PublicCounter".into(),
+                    name: name.into(),
+                    orig_name: Some(original.into()),
+                    is_async: true,
+                    inputs,
+                    return_type,
+                    throws,
+                    takes_self_by_arc: false,
+                    checksum: None,
+                    docstring: None,
+                }
+                .into(),
+            );
+        }
+        normalize(BindingInput::new(&[Component {
+            ci: ComponentInterface::from_metadata(group).unwrap(),
+            config: JsConfig::default(),
+        }]))
+        .unwrap()
+    }
+
+    fn compact_local(tokens: impl quote::ToTokens) -> String {
+        tokens
+            .to_token_stream()
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn local_metadata_keeps_affinity_with_struct_abi_and_proxy_carriers() {
+        let package = local_object_package();
+        let named = package
+            .rust
+            .named_types()
+            .iter()
+            .find(|named| {
+                matches!(
+                    named.kind,
+                    uniffi_js_engine_schema::RustNamedTypeKind::Object { .. }
+                )
+            })
+            .unwrap();
+        assert!(matches!(
+            named.kind,
+            uniffi_js_engine_schema::RustNamedTypeKind::Object {
+                kind: uniffi_js_engine_schema::RustObjectKind::LocalStruct,
+            }
+        ));
+        let public = package
+            .api
+            .types
+            .iter()
+            .find(|ty| ty.id == named.id)
+            .unwrap();
+        assert!(matches!(
+            public.kind,
+            crate::frontend::JsTypeKind::Object {
+                kind: uniffi_js_abi::ObjectKind::Struct
+            }
+        ));
+        assert_eq!(
+            compact_local(object_core_type(&package, named.id).unwrap()),
+            "std::sync::Arc<::uniffi::async_runtime::LocalObject<local_bridge::r#BusinessCounter>>"
+        );
+        for engine in package.rust.engines.values() {
+            for operation in &engine.operations {
+                assert_eq!(operation.async_kind, AsyncKind::Async);
+                assert!(matches!(
+                    operation.call_target,
+                    RustCallTarget::Constructor {
+                        object_kind: uniffi_js_engine_schema::RustObjectKind::LocalStruct,
+                        ..
+                    } | RustCallTarget::Method {
+                        object_kind: uniffi_js_engine_schema::RustObjectKind::LocalStruct,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn local_native_helpers_preserve_framework_and_business_results() {
+        let package = local_object_package();
+        let wrappers = render_native_operation_wrappers(&package, EngineKind::Napi).unwrap();
+        let wrapped = async_calls::wrap(
+            &wrappers,
+            &package.rust.engines[&EngineKind::Napi].operations,
+            Some(NativeFlavor::Node),
+        )
+        .unwrap();
+        let file = syn::parse_file(&wrapped).unwrap();
+        let source = compact_local(&file);
+        assert!(source.contains(
+            "BusinessCounter::__uniffi_local_read_sync(__uniffi_receiver,label,peer).await"
+        ));
+        assert!(!source.contains("__uniffi_receiver.read"));
+        assert!(source.contains("BusinessCounter::__uniffi_local_close(__uniffi_receiver,).await"));
+        assert!(!source.contains("__uniffi_local_new"));
+        assert!(source.contains("BusinessCounter::new().await"));
+        assert!(source.contains(
+            ".map_err(__uniffi_cancelled_error)?.map_err(__uniffi_local_error)?.map_err("
+        ));
+        for operation in &package.rust.engines[&EngineKind::Napi].operations {
+            let wrapper_name = format!(
+                "__uniffi_native_operation_{}",
+                operation.operation_id.index()
+            );
+            let function = file
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    syn::Item::Fn(f) if f.sig.ident == wrapper_name => Some(f),
+                    _ => None,
+                })
+                .unwrap();
+            let source = compact_local(function);
+            assert!(source.contains("BridgeErrorDescriptor>"));
+            if async_calls::local_method(operation) {
+                assert!(source.contains(".map_err(__uniffi_local_error)"));
+            } else {
+                assert!(!source.contains(".map_err(__uniffi_local_error)"));
+            }
+            assert!(!source.contains("__uniffi_store_"));
+        }
+        // Exercise the pinned engine expansion as well as our typed wrappers.
+        let generated = napi_source(&package).unwrap();
+        syn::parse_file(&generated).unwrap();
+        let error = compact_local(async_calls::local_error_helper(Some(NativeFlavor::Node)));
+        assert!(error.contains("ErrorDomain::Backend"));
+        assert!(error.contains("LocalError::Cancelled"));
+        assert!(error.contains("UniffiCancelled"));
+        assert!(error.contains("LocalError{error:?}"));
+        #[cfg(feature = "ohos")]
+        syn::parse_file(&ohos_source(&package).unwrap()).unwrap();
+    }
 
     fn fixture() -> (NormalizedPackage, RustOperationPlan, uniffi_js_abi::TypeId) {
         let ci = ComponentInterface::from_webidl(

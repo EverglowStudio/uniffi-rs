@@ -166,6 +166,127 @@ export async function runContract(root, realm) {
     const waiting = observe(api.cancelWithObject(cleanup, true), () => counts(cleanup));
     cancelled(await finishCleanup(cleanup, waiting), 'returned object nested cleanup');
   });
+  await test('local-generated-constructor-sync-async-borrow-and-business-error', async () => {
+    const component = api.LocalComponent.new(1), id = nextId();
+    const counter = await api.OwnerCounter.new(component, id, 10);
+    assert(counter instanceof api.OwnerCounter && counts(id).started === 1, 'renamed local object constructor');
+    const value = counter.value();
+    assert(value instanceof Promise && await value === 10, 'Rust sync method is async across owner');
+    assert(await counter.addLabel(3, 'ab') === 15, 'borrowed argument created on owner');
+    assert(await counter.increment(4) === 19, 'Rc and reference survive Rust await');
+    assert(await counter.fallible(false) === 19, 'business result success');
+    const failure = await observe(counter.fallible(true)).result;
+    assert(!failure.ok && failure.error instanceof api.FixtureError, 'local business error remains typed');
+    open(id, 8);
+    await Promise.all([counter.close(), counter.close()]);
+    assert(counts(id).dropped === 1 && counts(id).cleaned === 1, 'close waits for object destruction and cleanup');
+    const closed = await observe(counter.value()).result;
+    assert(!closed.ok && !(closed.error instanceof api.FixtureError), 'closed is a framework error');
+    counter.dispose(); counter.dispose();
+    await component.close(); component.dispose();
+  });
+  await test('local-methods-interleave-and-host-callback-reenters', async () => {
+    const component = api.LocalComponent.new(1), id = nextId(), blocked = nextId();
+    const counter = await api.OwnerCounter.new(component, id, 0);
+    const waiting = observe(counter.gatedIncrement(blocked, 10));
+    await until(() => counts(blocked).started === 1, 'local gated method entered');
+    assert(await counter.increment(1) === 1 && !waiting.settled, 'await does not serialize the object');
+    const reentered = await counter.visit({ async visit() { return await counter.increment(1); } });
+    assert(reentered === 4 && !waiting.settled, 'host callback can await same-owner method');
+    open(blocked, 1);
+    const result = await waiting.result;
+    assert(result.ok && result.value === 12, 'suspended method resumes with current state');
+    open(id, 8); await counter.close(); counter.dispose();
+    await component.close(); component.dispose();
+  });
+  await test('local-call-cancellation-awaits-owner-nested-cleanup', async () => {
+    const component = api.LocalComponent.new(1), id = nextId(), call = nextId(), pre = nextId();
+    const counter = await api.OwnerCounter.new(component, id, 5);
+    const aborted = new AbortController(); aborted.abort();
+    cancelled(await observe(counter.guarded(pre, { signal: aborted.signal })).result, 'pre-aborted local');
+    assert(counts(pre).started === 0 && counts(pre).dropped === 0, 'pre-aborted local body never starts');
+    const controller = new AbortController();
+    const operation = observe(counter.guarded(call, { signal: controller.signal }), () => counts(call));
+    await until(() => counts(call).started === 1, 'local method entered');
+    controller.abort(); controller.abort();
+    cancelled(await finishCleanup(call, operation), 'local nested cleanup');
+    assert(await counter.value() === 6 && counts(id).dropped === 0, 'cancel releases request and retains object');
+    open(id, 8); await counter.close(); counter.dispose();
+    await component.close(); component.dispose();
+  });
+  await test('local-close-cancels-calls-and-waits-for-body-drop', async () => {
+    const component = api.LocalComponent.new(1), id = nextId(), call = nextId();
+    const counter = await api.OwnerCounter.new(component, id, 0);
+    const operation = observe(counter.guarded(call), () => counts(call));
+    await until(() => counts(call).started === 1, 'method before close');
+    const a = observe(counter.close(), () => counts(id));
+    const b = observe(counter.close(), () => counts(id));
+    cancelled(await finishCleanup(call, operation), 'object close cancels in-flight call');
+    await until(() => counts(id).cleaning === 1, 'object destructor starts local cleanup');
+    await delay(20);
+    assert(!a.settled && !b.settled, 'all close waiters share destructor completion');
+    open(id, 8);
+    assert((await a.result).ok && (await b.result).ok, 'close succeeds after cleanup');
+    assert(a.atSettlement.cleaned === 1 && b.atSettlement.cleaned === 1, 'object cleanup precedes close resolution');
+    counter.dispose(); await component.close(); component.dispose();
+  });
+  await test('local-last-proxy-dispose-requests-owner-release', async () => {
+    const component = api.LocalComponent.new(1), id = nextId();
+    const counter = await api.OwnerCounter.new(component, id, 0);
+    counter.dispose(); counter.dispose();
+    await until(() => counts(id).cleaning === 1, 'last proxy triggers owner destruction');
+    const closing = observe(component.close());
+    await delay(20);
+    assert(!closing.settled && counts(id).dropped === 1, 'owner close waits for detached proxy cleanup');
+    open(id, 8); assert((await closing.result).ok, 'owner release completes');
+    assert(counts(id).cleaned === 1, 'last proxy cleanup once'); component.dispose();
+  });
+  await test('local-owner-close-reclaims-all-objects', async () => {
+    const component = api.LocalComponent.new(1), a = nextId(), b = nextId();
+    const first = await api.OwnerCounter.new(component, a, 0);
+    const second = await api.OwnerCounter.new(component, b, 0);
+    open(a, 8);
+    const closing = observe(component.close());
+    await until(() => counts(b).cleaning === 1, 'owner closes every owned body');
+    assert(!closing.settled, 'owner awaits all cleanup');
+    open(b, 8); assert((await closing.result).ok, 'owner close complete');
+    assert(counts(a).dropped === 1 && counts(b).dropped === 1 && counts(a).cleaned === 1 && counts(b).cleaned === 1,
+      'all owned resources cleaned once');
+    await Promise.all([first.close(), second.close(), component.close()]);
+    first.dispose(); second.dispose(); component.dispose();
+  });
+  await test('local-cancelled-return-proxy-releases-body-before-settlement', async () => {
+    const component = api.LocalComponent.new(1), id = nextId();
+    const operation = observe(component.cancelReturnedCounter(id), () => counts(id));
+    await until(() => counts(id).cleaning === 1, 'undelivered proxy releases its owner body');
+    await delay(20);
+    assert(!operation.settled && counts(id).dropped === 1, 'cancelled return awaits owner destructor cleanup');
+    open(id, 8);
+    cancelled(await operation.result, 'local returned proxy');
+    assert(operation.atSettlement.cleaned === 1, 'no unpublished handle and cleanup before settlement');
+    await component.close(); component.dispose();
+  });
+  for (const kind of ['object', 'owner']) {
+    await test(`local-cancel-${kind}-close-awaits-original-cleanup`, async () => {
+      const component = api.LocalComponent.new(1), id = nextId();
+      const counter = await api.OwnerCounter.new(component, id, 0);
+      const target = kind === 'object' ? counter : component;
+      const controller = new AbortController();
+      const operation = observe(target.close({ signal: controller.signal }), () => counts(id));
+      await until(() => counts(id).cleaning === 1, `${kind} close started destructor cleanup`);
+      controller.abort(); controller.abort();
+      const other = observe(target.close(), () => counts(id));
+      await delay(25);
+      assert(!operation.settled && !other.settled && counts(id).cleaned === 0,
+        `cancelled ${kind} close and second waiter both retain cleanup confirmation`);
+      open(id, 8);
+      cancelled(await operation.result, `cancelled ${kind} close`);
+      assert((await other.result).ok, `second ${kind} close succeeds`);
+      assert(operation.atSettlement.cleaned === 1 && other.atSettlement.cleaned === 1,
+        `both ${kind} close waiters settle after destruction cleanup`);
+      await component.close(); counter.dispose(); component.dispose();
+    });
+  }
   await test('stream-none-eof-and-factory-adapter', async () => {
     for (const factory of [(id) => api.events(id, 0), api.factoryEvents]) {
       const id = nextId();

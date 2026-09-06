@@ -34,4 +34,11 @@ mod test {
         let t = trybuild::TestCases::new();
         t.compile_fail("tests/ui/*.rs");
     }
+
+    #[cfg(feature = "async-runtime")]
+    #[test]
+    fn local_export_ui_tests() {
+        let t = trybuild::TestCases::new();
+        t.compile_fail("tests/local-ui/*.rs");
+    }
 }

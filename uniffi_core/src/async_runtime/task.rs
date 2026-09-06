@@ -37,8 +37,8 @@ impl std::error::Error for TaskError {}
 /// handle and use [`Self::cancel_and_wait`] to confirm cooperative shutdown.
 #[derive(Debug)]
 pub struct TaskHandle<T> {
-    cancellation: CancellationToken,
-    result: oneshot::Receiver<Result<T, TaskError>>,
+    pub(super) cancellation: CancellationToken,
+    pub(super) result: oneshot::Receiver<Result<T, TaskError>>,
 }
 
 impl<T> TaskHandle<T> {

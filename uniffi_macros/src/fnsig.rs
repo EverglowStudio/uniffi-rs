@@ -40,6 +40,9 @@ pub(crate) struct FnSignature {
     // Did `self.name` come from an attribute
     pub name_from_attrs: bool,
     pub is_async: bool,
+    /// Local methods expose an async owner hop even when the Rust method is synchronous.
+    pub is_local: bool,
+    pub is_rust_async: bool,
     pub async_runtime: Option<AsyncRuntime>,
     pub receiver: Option<ReceiverArg>,
     pub args: Vec<NamedArg>,
@@ -210,6 +213,8 @@ impl FnSignature {
                 .unwrap_or_else(|| ident_to_string(&ident)),
             ident,
             is_async,
+            is_local: false,
+            is_rust_async: is_async,
             async_runtime: export_fn_args.async_runtime,
             receiver,
             args,

@@ -433,11 +433,22 @@ struct SourceVariant {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SourceTypeKind {
-    Record { fields: Vec<SourceField> },
-    Enum { variants: Vec<SourceVariant> },
-    Error { variants: Vec<SourceVariant> },
-    Custom { builtin: ValueType },
-    Object { kind: ObjectKind },
+    Record {
+        fields: Vec<SourceField>,
+    },
+    Enum {
+        variants: Vec<SourceVariant>,
+    },
+    Error {
+        variants: Vec<SourceVariant>,
+    },
+    Custom {
+        builtin: ValueType,
+    },
+    Object {
+        kind: ObjectKind,
+        rust_kind: RustObjectKind,
+    },
     Callback,
 }
 
@@ -565,7 +576,8 @@ fn collect_type_definitions(
                 TypeExtra {
                     kind: JsTypeKind::Object { kind: object_kind },
                     source_kind: SourceTypeKind::Object {
-                        kind: abi_object_kind(object.imp()),
+                        kind: object_kind,
+                        rust_kind: rust_object_kind(object.imp()),
                     },
                     rust_path: RustPath::from_module_path(
                         object
@@ -699,6 +711,7 @@ fn custom_tag_path(module_path: &str) -> Result<RustPath, FrontendError> {
 fn rust_object_kind(implementation: &ObjectImpl) -> RustObjectKind {
     match implementation {
         ObjectImpl::Struct => RustObjectKind::Struct,
+        ObjectImpl::LocalStruct => RustObjectKind::LocalStruct,
         ObjectImpl::Trait(TraitKind::RustOnly) => RustObjectKind::TraitRustOnly,
         ObjectImpl::Trait(TraitKind::Both) => RustObjectKind::TraitBoth,
         ObjectImpl::Trait(TraitKind::ForeignOnly) => RustObjectKind::TraitForeignOnly,
@@ -716,7 +729,7 @@ fn rust_object_item_name(object: &uniffi_bindgen::interface::Object) -> String {
 
 fn abi_object_kind(implementation: &ObjectImpl) -> ObjectKind {
     match implementation {
-        ObjectImpl::Struct => ObjectKind::Struct,
+        ObjectImpl::Struct | ObjectImpl::LocalStruct => ObjectKind::Struct,
         ObjectImpl::Trait(TraitKind::RustOnly) => ObjectKind::TraitRustOnly,
         ObjectImpl::Trait(TraitKind::Both) => ObjectKind::TraitBoth,
         ObjectImpl::Trait(TraitKind::ForeignOnly) => ObjectKind::TraitForeignOnly,
@@ -2039,7 +2052,9 @@ fn validate_public_source_shape(ty: &JsType, extra: &TypeExtra) -> Result<(), Fr
         (
             JsTypeKind::Object { kind: public_kind },
             JsTypeKind::Object { kind: extra_kind },
-            SourceTypeKind::Object { kind: source_kind },
+            SourceTypeKind::Object {
+                kind: source_kind, ..
+            },
         ) if public_kind == extra_kind && public_kind == source_kind => {}
         (JsTypeKind::Callback, JsTypeKind::Callback, SourceTypeKind::Callback) => {}
         _ => return Err(mismatch()),
@@ -2142,9 +2157,9 @@ fn build_named_type_kind(
                 inner,
             })
         }
-        SourceTypeKind::Object { kind } => Ok(RustNamedTypeKind::Object {
-            kind: rust_object_kind_from_abi(*kind),
-        }),
+        SourceTypeKind::Object { rust_kind, .. } => {
+            Ok(RustNamedTypeKind::Object { kind: *rust_kind })
+        }
         SourceTypeKind::Callback => Ok(RustNamedTypeKind::Callback),
     }
 }
@@ -2318,15 +2333,6 @@ fn rust_value_binding_for_value_type(
         carrier,
         conversion,
     })
-}
-
-fn rust_object_kind_from_abi(kind: ObjectKind) -> RustObjectKind {
-    match kind {
-        ObjectKind::Struct => RustObjectKind::Struct,
-        ObjectKind::TraitRustOnly => RustObjectKind::TraitRustOnly,
-        ObjectKind::TraitBoth => RustObjectKind::TraitBoth,
-        ObjectKind::TraitForeignOnly => RustObjectKind::TraitForeignOnly,
-    }
 }
 
 fn stream_handle_binding(direction: StreamDirection) -> RustReceiverBinding {

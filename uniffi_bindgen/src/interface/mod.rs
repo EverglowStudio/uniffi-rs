@@ -1270,10 +1270,14 @@ impl ComponentInterface {
         Ok(())
     }
 
-    pub(super) fn add_constructor_meta(&mut self, meta: ConstructorMetadata) -> Result<()> {
+    pub(super) fn add_constructor_meta(&mut self, mut meta: ConstructorMetadata) -> Result<()> {
         let self_name = &meta.self_name;
 
         if let Some(object) = get_object(&mut self.objects, self_name) {
+            // Metadata without an explicit return type (e.g. UDL) uses the declared
+            // object implementation, including LocalStruct. Preserve explicit types
+            // so that the type universe can diagnose conflicting implementations.
+            meta.self_type.get_or_insert_with(|| object.as_type());
             let defn: Constructor = meta.into();
             self.types
                 .add_known_types(defn.iter_types())
