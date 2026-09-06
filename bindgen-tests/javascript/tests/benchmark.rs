@@ -3,7 +3,9 @@
 //! Run with:
 //!
 //! ```text
-//! cargo test -p uniffi-bindgen-tests-javascript --test benchmark -- --ignored --nocapture
+//! UNIFFI_JS_BENCH_SAMPLES=1 cargo test --locked -p uniffi-bindgen-tests-javascript --test benchmark -- --ignored --nocapture
+//! # After generation, measure without rebuilding (default: 30 raw samples/case):
+//! node --experimental-strip-types --no-warnings target/javascript-tests/benchmark-run/benchmark-driver.ts
 //! ```
 
 mod support;
@@ -35,6 +37,7 @@ fn write_benchmark_fixture(root: &std::path::Path) -> Utf8PathBuf {
              name = \"js_benchmark_fixture\"\n\
              crate-type = [\"lib\", \"cdylib\"]\n\n\
              [dependencies]\n\
+             async-trait = \"0.1\"\n\
              uniffi = {{ path = \"{}\", features = [\"tokio\", \"default-async-runtime-tokio\", \"wasm-unstable-single-threaded\"] }}\n\n\
              [workspace]\n\
              resolver = \"3\"\n",
@@ -49,7 +52,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use uniffi::deps::futures_core::Stream;
 
@@ -114,7 +118,7 @@ impl BenchCounter {
     }
 }
 
-#[uniffi::export(with_foreign)]
+#[uniffi::export(rust, foreign)]
 pub trait BenchCallback: Send + Sync {
     fn bump(&self, value: u32) -> u32;
 }
@@ -159,9 +163,29 @@ pub fn nested_data_roundtrip(value: NestedData) -> NestedData {
     value
 }
 
-#[uniffi::export]
+#[uniffi::export(callback(
+    path = "argument[0]",
+    retention = scoped,
+    threading = calling_thread,
+    reentrancy = allowed,
+))]
 pub fn call_callback(cb: Arc<dyn BenchCallback>, value: u32) -> u32 {
     cb.bump(value)
+}
+
+#[uniffi::export(rust, foreign)]
+pub trait BenchAsyncCallback: Send + Sync {
+    async fn bump(&self, value: u32) -> u32;
+}
+
+#[uniffi::export(callback(
+    path = "argument[0]",
+    retention = retained,
+    threading = may_cross_thread,
+    reentrancy = allowed,
+))]
+pub async fn call_async_callback(cb: Arc<dyn BenchAsyncCallback>, value: u32) -> u32 {
+    cb.bump(value).await
 }
 
 #[uniffi::export]
@@ -169,9 +193,121 @@ pub async fn async_add(a: u64, b: u64) -> u64 {
     a + b
 }
 
+// A deterministic pending path: the first poll must suspend and request a wake.
+#[uniffi::export]
+pub async fn pending_add(a: u64, b: u64) -> u64 {
+    let mut pending = true;
+    std::future::poll_fn(|cx| {
+        if pending {
+            pending = false;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(a + b)
+        }
+    }).await
+}
+
+// The JS driver waits for registration, then times wake() through completion.
+#[derive(uniffi::Object)]
+pub struct BenchWake {
+    state: Mutex<(bool, Option<Waker>)>,
+}
+
+#[uniffi::export]
+impl BenchWake {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new((false, None)) })
+    }
+
+    pub async fn wait(&self) -> u32 {
+        std::future::poll_fn(|cx| {
+            let mut state = self.state.lock().unwrap();
+            if state.0 {
+                Poll::Ready(42)
+            } else {
+                state.1 = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }).await
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        self.state.lock().unwrap().1.is_some()
+    }
+
+    pub fn wake(&self) {
+        let waker = {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            state.1.take().expect("wake requires a registered waiter")
+        };
+        waker.wake();
+    }
+}
+
+struct PendingCountStream {
+    inner: CountStream,
+    pending: bool,
+}
+
+impl Stream for PendingCountStream {
+    type Item = Result<StreamItem, BenchStreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.inner.next < self.inner.end && self.pending {
+            self.pending = false;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            self.pending = true;
+            Pin::new(&mut self.inner).poll_next(cx)
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn pending_count_stream(count: u32) -> uniffi::UniFfiStream<StreamItem, BenchStreamError> {
+    Box::pin(PendingCountStream {
+        inner: CountStream { next: 0, end: count },
+        pending: true,
+    })
+}
+
 struct CountStream {
     next: u32,
     end: u32,
+}
+
+// Only the early-exit fixture is instrumented; existing traversal workloads
+// retain their original stream implementation and per-item work.
+static EARLY_EXIT_STREAM_DROPS: AtomicU32 = AtomicU32::new(0);
+
+struct EarlyExitStream(CountStream);
+
+impl Stream for EarlyExitStream {
+    type Item = Result<StreamItem, BenchStreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0).poll_next(cx)
+    }
+}
+
+impl Drop for EarlyExitStream {
+    fn drop(&mut self) {
+        EARLY_EXIT_STREAM_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[uniffi::export]
+pub fn early_exit_stream() -> uniffi::UniFfiStream<StreamItem, BenchStreamError> {
+    Box::pin(EarlyExitStream(CountStream { next: 0, end: 2 }))
+}
+
+#[uniffi::export]
+pub fn early_exit_stream_drops() -> u32 {
+    EARLY_EXIT_STREAM_DROPS.load(Ordering::SeqCst)
 }
 
 impl Stream for CountStream {
@@ -260,225 +396,39 @@ uniffi::setup_scaffolding!();
     )
     .unwrap();
 
+    // Seed once, then retain the standalone lock for repeated runs and A/B reuse.
+    let lock = crate_dir.join("Cargo.lock");
+    if !lock.exists() {
+        std::fs::copy(workspace.join("Cargo.lock"), lock).unwrap();
+    }
     Utf8PathBuf::from_path_buf(crate_dir.join("Cargo.toml")).unwrap()
 }
 
-fn write_benchmark_driver(root: &std::path::Path, glue_js_name: &str) -> std::path::PathBuf {
+fn write_benchmark_driver(root: &std::path::Path) -> std::path::PathBuf {
     let driver = root.join("benchmark-driver.ts");
-    std::fs::write(
-        &driver,
-        format!(
-            r#"
-import {{ createRequire }} from "node:module";
-import {{ performance }} from "node:perf_hooks";
-import * as nodeRoot from "./generated/node/index.ts";
-
-const require = createRequire(import.meta.url);
-const glue = require("./pkg/{glue_js_name}");
-const nodeCore = nodeRoot.js_benchmark_fixture;
-const browserRoot = await import("./generated/browser/index.ts");
-const wasmCore = browserRoot.js_benchmark_fixture;
-await wasmCore.initBackend(glue);
-
-const iterations = Number(process.env.UNIFFI_JS_BENCH_ITERS ?? "200");
-const streamRepetitions = Number(process.env.UNIFFI_JS_STREAM_BENCH_REPS ?? "3");
-const streamCounts = (process.env.UNIFFI_JS_STREAM_BENCH_COUNTS ?? "100,1000,10000")
-  .split(",")
-  .map((value) => Number(value.trim()))
-  .filter((value) => Number.isInteger(value) && value > 0);
-const meta = {{ node: process.version, iterations, mode: "quick" }};
-
-function bench(backend, caseName, fn) {{
-  for (let i = 0; i < Math.min(iterations, 10); i += 1) fn();
-  const start = performance.now();
-  for (let i = 0; i < iterations; i += 1) fn();
-  const elapsedMs = performance.now() - start;
-  console.log(JSON.stringify({{
-    ...meta,
-    backend,
-    case: caseName,
-    elapsedMs,
-    msPerOp: elapsedMs / iterations,
-  }}));
-}}
-
-async function benchAsync(backend, caseName, fn) {{
-  for (let i = 0; i < Math.min(iterations, 10); i += 1) await fn();
-  const start = performance.now();
-  for (let i = 0; i < iterations; i += 1) await fn();
-  const elapsedMs = performance.now() - start;
-  console.log(JSON.stringify({{
-    ...meta,
-    backend,
-    case: caseName,
-    elapsedMs,
-    msPerOp: elapsedMs / iterations,
-  }}));
-}}
-
-async function benchStream(backend, caseName, count, fn) {{
-  await fn(count);
-  const start = performance.now();
-  for (let i = 0; i < streamRepetitions; i += 1) {{
-    await fn(count);
-  }}
-  const elapsedMs = performance.now() - start;
-  const items = count * streamRepetitions;
-  console.log(JSON.stringify({{
-    ...meta,
-    backend,
-    case: caseName,
-    count,
-    repetitions: streamRepetitions,
-    items,
-    elapsedMs,
-    msPerItem: elapsedMs / items,
-    itemsPerSec: items / (elapsedMs / 1000),
-  }}));
-}}
-
-function expectedSum(count) {{
-  return (BigInt(count) * BigInt(count - 1)) / 2n;
-}}
-
-async function* makeStreamItems(count) {{
-  for (let i = 0; i < count; i += 1) {{
-    yield {{ value: i }};
-  }}
-}}
-
-async function consumeOutputStream(core, count) {{
-  let seen = 0;
-  let sum = 0n;
-  for await (const item of core.countStream(count)) {{
-    seen += 1;
-    sum += BigInt(item.value);
-  }}
-  if (seen !== count || sum !== expectedSum(count)) {{
-    throw new Error(`output stream mismatch seen=${{seen}} sum=${{sum}} count=${{count}}`);
-  }}
-}}
-
-async function consumeInputStream(core, count) {{
-  const sum = await core.sumInputStream(makeStreamItems(count));
-  if (sum !== expectedSum(count)) {{
-    throw new Error(`input stream mismatch sum=${{sum}} count=${{count}}`);
-  }}
-}}
-
-async function consumeBidiStream(core, count) {{
-  let seen = 0;
-  let last = 0;
-  for await (const item of core.runningSumStream(makeStreamItems(count))) {{
-    seen += 1;
-    last = item.value;
-  }}
-  const expectedLast = count === 0 ? 0 : Number(expectedSum(count));
-  if (seen !== count || last !== expectedLast) {{
-    throw new Error(`bidi stream mismatch seen=${{seen}} last=${{last}} count=${{count}}`);
-  }}
-}}
-
-async function benchBackend(label, core) {{
-  const record = {{ count: 7, label: "record" }};
-  const enumValue = {{ tag: "One", value: 9 }};
-  const nested = {{
-    record,
-    enumValue,
-    values: [1, 2, 3],
-    counts: {{ a: 1, b: 2 }},
-  }};
-  const largeString = "x".repeat(4096);
-  const callback = {{ bump(value) {{ return value + 1; }} }};
-
-  bench(label, "scalar-u64-add", () => {{
-    if (core.add(2n, 3n) !== 5n) throw new Error(`${{label}} add failed`);
-  }});
-  bench(label, "string-concat", () => {{
-    if (core.concat("a", "b") !== "ab") throw new Error(`${{label}} concat failed`);
-  }});
-  bench(label, "large-string-roundtrip", () => {{
-    if (core.largeStringRoundtrip(largeString).length !== largeString.length) throw new Error(`${{label}} large string failed`);
-  }});
-  bench(label, "record-roundtrip", () => {{
-    if (core.recordRoundtrip(record).count !== 7) throw new Error(`${{label}} record failed`);
-  }});
-  bench(label, "enum-roundtrip", () => {{
-    if (core.enumRoundtrip(enumValue).tag !== "One") throw new Error(`${{label}} enum failed`);
-  }});
-  bench(label, "vec-roundtrip", () => {{
-    if (core.vecRoundtrip([1, 2, 3]).length !== 3) throw new Error(`${{label}} vec failed`);
-  }});
-  bench(label, "map-roundtrip", () => {{
-    if (core.mapRoundtrip({{ a: 1, b: 2 }}).b !== 2) throw new Error(`${{label}} map failed`);
-  }});
-  bench(label, "nested-data-roundtrip", () => {{
-    const value = core.nestedDataRoundtrip(nested);
-    if (value.record.count !== 7 || value.enumValue.tag !== "One" || value.values.length !== 3 || value.counts.b !== 2) {{
-      throw new Error(`${{label}} nested data failed`);
-    }}
-  }});
-  bench(label, "object-method", () => {{
-    const counter = core.BenchCounter.new(1);
-    if (counter.increment() !== 2) throw new Error(`${{label}} object failed`);
-    counter.dispose?.();
-  }});
-  bench(label, "sync-callback", () => {{
-    if (core.callCallback(callback, 4) !== 5) throw new Error(`${{label}} callback failed`);
-  }});
-  await benchAsync(label, "async-u64-add", async () => {{
-    if (await core.asyncAdd(2n, 3n) !== 5n) throw new Error(`${{label}} async add failed`);
-  }});
-  for (const count of streamCounts) {{
-    await benchStream(label, "stream-output", count, async (n) => consumeOutputStream(core, n));
-    await benchStream(label, "stream-input", count, async (n) => consumeInputStream(core, n));
-    await benchStream(label, "stream-bidi", count, async (n) => consumeBidiStream(core, n));
-  }}
-}}
-
-await benchBackend("napi", nodeCore);
-await benchBackend("wasm", wasmCore);
-"#
-        ),
-    )
-    .unwrap();
+    std::fs::write(&driver, include_str!("support/benchmark-driver.ts")).unwrap();
     driver
 }
 
-#[test]
-fn javascript_stream_benchmark_fixture_smoke() {
-    let tmp = tempfile::tempdir().unwrap();
-    let manifest = write_benchmark_fixture(tmp.path());
-    let lib = std::fs::read_to_string(manifest.parent().unwrap().join("src/lib.rs")).unwrap();
-    for needle in [
-        "pub fn count_stream(count: u32) -> uniffi::UniFfiStream<StreamItem, BenchStreamError>",
-        "pub async fn sum_input_stream(",
-        "events: uniffi::UniFfiInputStream<StreamItem, BenchStreamError>",
-        "pub fn running_sum_stream(",
-    ] {
-        assert!(
-            lib.contains(needle),
-            "benchmark fixture should include stream path `{needle}`:\n{lib}"
-        );
-    }
-
-    let driver = write_benchmark_driver(tmp.path(), "fixture_wasm.js");
-    let driver = std::fs::read_to_string(driver).unwrap();
-    for needle in [
-        "UNIFFI_JS_STREAM_BENCH_COUNTS",
-        "\"100,1000,10000\"",
-        "stream-output",
-        "stream-input",
-        "stream-bidi",
-        "countStream(count)",
-        "sumInputStream(makeStreamItems(count))",
-        "runningSumStream(makeStreamItems(count))",
-        "itemsPerSec",
-    ] {
-        assert!(
-            driver.contains(needle),
-            "benchmark driver should include `{needle}`:\n{driver}"
-        );
+// Preserve the independent fixture/host dependency graphs, not just the product lock.
+fn snapshot_cargo_files(
+    root: &std::path::Path,
+    files: &mut std::collections::BTreeMap<String, String>,
+) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if entry.file_type().unwrap().is_dir() {
+            snapshot_cargo_files(&path, files);
+        } else if matches!(
+            entry.file_name().to_str(),
+            Some("Cargo.toml" | "Cargo.lock")
+        ) {
+            files.insert(
+                path.to_str().unwrap().to_owned(),
+                std::fs::read_to_string(path).unwrap(),
+            );
+        }
     }
 }
 
@@ -493,19 +443,22 @@ fn javascript_generated_entrypoint_benchmark_quick() {
     let root = workspace_root();
     let cli = build_uniffi_bindgen_cli(&cargo);
 
-    let tmp = tempfile::tempdir().unwrap();
-    let out_dir = Utf8PathBuf::from_path_buf(tmp.path().join("generated")).unwrap();
-    let host_dir = Utf8PathBuf::from_path_buf(tmp.path().join("rust_modules")).unwrap();
-    let pkg_dir = Utf8PathBuf::from_path_buf(tmp.path().join("pkg")).unwrap();
     let target_dir = shared_cargo_target_dir("benchmark");
     let _target_lock = shared_cargo_target_lock("benchmark");
-    let manifest = write_benchmark_fixture(tmp.path());
+    let run_dir = shared_cargo_target_dir("benchmark-run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let out_dir = run_dir.join("generated");
+    let host_dir = out_dir.join("native/hosts");
+    let pkg_dir = out_dir.join("browser/pkg");
+    let manifest = write_benchmark_fixture(run_dir.as_std_path());
 
     let output = Command::new(cli.as_std_path())
         .current_dir(&root)
         .env("CARGO_TARGET_DIR", target_dir.as_std_path())
         .arg("javascript")
         .arg("build")
+        .arg("--release")
+        .args(["--napi-flavor", "napi"])
         .arg("--manifest-path")
         .arg(manifest.as_str())
         .arg("--out-dir")
@@ -518,31 +471,81 @@ fn javascript_generated_entrypoint_benchmark_quick() {
         .arg("nodejs")
         .arg("--target-dir")
         .arg(target_dir.as_str())
+        .arg("--wasm-target-dir")
+        .arg(target_dir.join("wasm").as_str())
         .output()
         .expect("failed to invoke uniffi-bindgen javascript build for benchmark");
-    if !output.status.success() {
-        panic!(
-            "javascript build benchmark fixture failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
-    let glue_js = std::fs::read_dir(pkg_dir.as_std_path())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("js"))
-        .expect("wasm-bindgen nodejs output should contain JS glue");
-    let glue_js_name = glue_js.file_name().and_then(|s| s.to_str()).unwrap();
-
-    let driver = write_benchmark_driver(tmp.path(), glue_js_name);
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    let driver = write_benchmark_driver(run_dir.as_std_path());
+    let git_output = |args: &[&str]| {
+        let result = Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        String::from_utf8(result.stdout).unwrap().trim().to_owned()
+    };
+    let rust_version = Command::new("rustc").arg("--version").output().unwrap();
+    assert!(rust_version.status.success());
+    let harness_status = git_output(&[
+        "status",
+        "--short",
+        "--",
+        "bindgen-tests/javascript/tests/benchmark.rs",
+        "bindgen-tests/javascript/tests/support/benchmark-driver.ts",
+    ]);
+    let harness_commit = harness_status
+        .is_empty()
+        .then(|| git_output(&["rev-parse", "HEAD"]));
+    let mut cargo_files = std::collections::BTreeMap::new();
+    snapshot_cargo_files(run_dir.as_std_path(), &mut cargo_files);
+    let dependency_snapshot = run_dir.join("benchmark-dependencies.json");
+    std::fs::write(
+        &dependency_snapshot,
+        serde_json::to_vec_pretty(&cargo_files).unwrap(),
+    )
+    .unwrap();
+    let cargo_file_blobs = cargo_files
+        .keys()
+        .map(|path| (path.clone(), git_output(&["hash-object", path])))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let metadata = serde_json::json!({
+        "productCommit": git_output(&["rev-parse", "HEAD"]),
+        "harnessCommit": harness_commit,
+        "harnessBaseCommit": git_output(&["rev-parse", "HEAD"]),
+        "harnessBlobs": git_output(&["hash-object", "bindgen-tests/javascript/tests/benchmark.rs", "bindgen-tests/javascript/tests/support/benchmark-driver.ts"]),
+        "calibrationSourceBlobs": {
+            "uniffi_bindgen_javascript/src/engines/rust.rs": git_output(&["hash-object", "uniffi_bindgen_javascript/src/engines/rust.rs"]),
+            "uniffi_bindgen_javascript/src/engines/rust/wasm_source.rs": git_output(&["hash-object", "uniffi_bindgen_javascript/src/engines/rust/wasm_source.rs"]),
+        },
+        "workingTree": git_output(&["status", "--short"]),
+        "rustc": String::from_utf8(rust_version.stdout).unwrap().trim(),
+        "rustflags": std::env::var("RUSTFLAGS").ok(),
+        "cargoEncodedRustflags": std::env::var("CARGO_ENCODED_RUSTFLAGS").ok(),
+        "productLockBlob": git_output(&["hash-object", "Cargo.lock"]),
+        "cargoFileBlobs": cargo_file_blobs,
+        "dependencySnapshot": dependency_snapshot,
+        "dependencySnapshotBlob": git_output(&["hash-object", dependency_snapshot.as_str()]),
+        "features": ["tokio", "default-async-runtime-tokio", "wasm-unstable-single-threaded"],
+        "profile": "release",
+        "buildExitCode": output.status.code(),
+        "buildCommand": format!("{cli} javascript build --release --napi-flavor napi --manifest-path {manifest} --out-dir {out_dir} --host-crates-dir {host_dir} --wasm-bindgen-out-dir {pkg_dir} --wasm-bindgen-target nodejs --target-dir {target_dir} --wasm-target-dir {target_dir}/wasm"),
+    });
+    std::fs::write(
+        run_dir.join("benchmark-build.json"),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    println!("benchmark driver retained at {driver:?}");
+    assert!(output.status.success(), "javascript build benchmark fixture failed; dependency snapshot and build output retained above");
 
     let run = Command::new(node)
         .arg("--experimental-strip-types")
         .arg("--no-warnings")
         .arg(driver)
-        .current_dir(tmp.path())
+        .current_dir(&run_dir)
         .output()
         .expect("failed to run generated JavaScript benchmark");
     if !run.status.success() {
@@ -557,7 +560,18 @@ fn javascript_generated_entrypoint_benchmark_quick() {
         stdout.contains("\"backend\":\"napi\"") && stdout.contains("\"backend\":\"wasm\""),
         "benchmark should print JSONL rows for both napi and wasm:\n{stdout}"
     );
-    for case in ["stream-output", "stream-input", "stream-bidi"] {
+    for case in [
+        "async-u64-add",
+        "async-pending-add",
+        "async-callback-ready",
+        "async-callback-yield",
+        "host-wake",
+        "stream-return-early",
+        "stream-output",
+        "stream-output-pending",
+        "stream-input",
+        "stream-bidi",
+    ] {
         assert!(
             stdout.contains(&format!("\"case\":\"{case}\"")),
             "benchmark should print JSONL rows for {case}:\n{stdout}"

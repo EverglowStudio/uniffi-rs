@@ -1949,6 +1949,7 @@ fn render_temporal_helpers(flavor: NativeFlavor) -> Result<String> {
         // objects.  UniFFI's public cross-engine contract uses a real Map, so
         // keep that distinction in an engine-private carrier and convert to
         // the core HashMap only at the typed operation boundary.
+        #[derive(Clone, Debug)]
         struct __UniffiNapiMap<K, V>(::std::collections::HashMap<K, V>);
 
         impl<K, V> TypeName for __UniffiNapiMap<K, V> {
@@ -4645,7 +4646,17 @@ fn render_native_operation_wrappers(
                         conversion: binding.conversion.clone(),
                     },
                 )?,
-                call_expression,
+                if matches!(operation.call_target, RustCallTarget::Constructor { .. }) {
+                    // Constructors may return Self or Arc<Self>. Move either
+                    // into the canonical Arc carrier without cloning the object.
+                    if operation.throws.is_some() {
+                        quote!(#call_expression.map(::std::convert::Into::into))
+                    } else {
+                        quote!(::std::convert::Into::into(#call_expression))
+                    }
+                } else {
+                    call_expression
+                },
             ),
             Some(binding) => (
                 core_type_for_binding(
