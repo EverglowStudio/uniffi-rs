@@ -74,6 +74,10 @@ external fun {{ func.name() }}(
 // Note: above all written when we used JNA's `loadIndirect` etc.
 // We now use JNA's "direct mapping" - unclear if same considerations apply exactly.
 internal object IntegrityCheckingUniffiLib {
+    // Calling an instance method forces JVM object initialization, even when
+    // the caller only needs the registration/checksum side effects.
+    internal fun ensureInitialized() = Unit
+
     init {
         Native.register(IntegrityCheckingUniffiLib::class.java, findLibraryName(componentName = "{{ ci.namespace() }}"))
         uniffiCheckContractApiVersion(this)
@@ -87,6 +91,8 @@ internal object IntegrityCheckingUniffiLib {
 }
 
 internal object UniffiLib {
+    internal fun ensureInitialized() = Unit
+
     {% if ci.contains_object_types() %}
     // The Cleaner for the whole library
     internal val CLEANER: UniffiCleaner by lazy {
@@ -132,8 +138,8 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
  * @suppress
  */
 public fun uniffiEnsureInitialized() {
-    IntegrityCheckingUniffiLib
+    IntegrityCheckingUniffiLib.ensureInitialized()
     // UniffiLib() initialized as objects are used, but we still need to explicitly
     // reference it so initialization across crates works as expected.
-    UniffiLib
+    UniffiLib.ensureInitialized()
 }

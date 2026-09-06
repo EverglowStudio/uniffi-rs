@@ -4,8 +4,12 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+#[cfg(feature = "async-bench")]
+pub mod async_bench;
 mod cli;
 mod compare;
+#[cfg(feature = "async-bench")]
+pub use async_bench::*;
 pub use cli::Args;
 pub use compare::CriterionMeasurementTracker;
 
