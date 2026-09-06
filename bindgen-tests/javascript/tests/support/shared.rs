@@ -1163,11 +1163,9 @@ assert(cancelProbe.streamStarts === 1n && cancelProbe.streamDrops === 1n
 
 __UNIFFI_RUNTIME_MATRIX_NON_SEND_ASSERTIONS__
 
-// Delay one real native OutputStreamNext settlement after the family has
-// already produced its object-bearing Item.  Closing the public session while
-// the cancel leg is held forces deadline detach; the family walker must release
-// the late StreamItem object exactly once before the delayed promise is handed
-// back to JavaScript.
+// Delay one real native OutputStreamNext settlement after an object-bearing
+// Item has been produced. Orderly close must wait for that in-flight next and
+// its release; no deadline may report successful cleanup while it is held.
 api.resetProbe("object-late");
 const lateBackend = root.session.backend as {
   invokeAsync: (operationId: number, args: unknown[]) => Promise<unknown>;
@@ -1179,7 +1177,6 @@ let lateRawEnvelope: unknown = null;
 let releaseLateRaw: (() => void) | null = null;
 let markLateRawReady: ((value: unknown) => void) | null = null;
 const lateRawReady = new Promise<unknown>((resolve): void => { markLateRawReady = resolve; });
-let blockLateCancel = false;
 // The native backend is intentionally immutable. Install a session-local
 // mutable facade whose methods are defined up front; its closures delay
 // exactly one operation without mutating/faking the production backend.
@@ -1196,7 +1193,6 @@ root.session.backend = {
   },
   releaseObject: lateBackend.releaseObject.bind(lateBackend),
   cancelOutputStream: (handle: unknown): Promise<unknown> => {
-    if (blockLateCancel) return new Promise<unknown>(() => {});
     return nativeCancelOutputStream(handle);
   },
   releaseOutputStream: lateBackend.releaseOutputStream.bind(lateBackend),
@@ -1210,24 +1206,27 @@ const lateReady = await Promise.race([
 ]);
 assert(lateReady !== "timeout" && lateRawEnvelope !== null,
   "real object stream produced a delayed raw Item");
-blockLateCancel = true;
-const nativeSetTimeout = globalThis.setTimeout;
-globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]) =>
-  nativeSetTimeout(callback, delay === 5000 ? 25 : delay, ...args)) as typeof setTimeout;
+let closeSettled = false;
 const sessionClose = root.session.close();
-globalThis.setTimeout = nativeSetTimeout;
-await sessionClose;
+sessionClose.then((): void => { closeSettled = true; }, (): void => { closeSettled = true; });
+await new Promise<void>((resolve): void => { setTimeout(resolve, 25); });
+assert(!closeSettled, "orderly close must wait for the delayed native next");
 releaseLateRaw?.();
+const closeResult = await Promise.race([
+  sessionClose.then((): string => "closed"),
+  new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); }),
+]);
+assert(closeResult === "closed", "close completes after pending next release");
 const lateResult = await Promise.race([
   lateNext,
   new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); }),
 ]);
 assert(lateResult !== "timeout" && lateResult.done === true,
-  "late object stream next settles after deadline detach");
+  "late object stream next settles after orderly close");
 const lateProbe = rawProbeSnapshot("object-late");
 const closeProbe = rawProbeSnapshot("object-close");
 assert(lateProbe.objectDrops === 1n,
-  "late StreamItem object is released exactly once after deadline detach");
+  "late StreamItem object is released exactly once after orderly close");
 assert(closeProbe.objectDrops === 1n,
   "session close releases held object exactly once");
 await transport.close();
@@ -1672,9 +1671,9 @@ pub fn write_rich_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8PathBu
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         core.join("Cargo.toml"),
-        "[package]\nname = \"napi-compat-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
+        format!("[package]\nname = \"napi-compat-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
          [lib]\nname = \"napi_compat\"\ncrate-type = [\"lib\"]\n\n\
-         [dependencies]\n\n[workspace]\nresolver = \"3\"\n",
+         [dependencies]\nuniffi = {{ path = {:?} }}\n\n[workspace]\nresolver = \"3\"\n", workspace_root().join("uniffi").as_str()),
     )
     .unwrap();
     std::fs::write(
@@ -1773,9 +1772,9 @@ pub fn write_temporal_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8Pa
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         core.join("Cargo.toml"),
-        "[package]\nname = \"napi-temporal-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
+        format!("[package]\nname = \"napi-temporal-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
          [lib]\nname = \"napi_temporal_core\"\ncrate-type = [\"lib\"]\n\n\
-         [dependencies]\n\n[workspace]\nresolver = \"3\"\n",
+         [dependencies]\nuniffi = {{ path = {:?} }}\n\n[workspace]\nresolver = \"3\"\n", workspace_root().join("uniffi").as_str()),
     )
     .unwrap();
     std::fs::write(

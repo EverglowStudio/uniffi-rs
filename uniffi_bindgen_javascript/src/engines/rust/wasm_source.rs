@@ -41,11 +41,29 @@ pub(crate) fn render(
     let mut source = String::new();
     write_prelude(&mut source);
     write_registry(&mut source);
+    let managed = package.rust.engines[&EngineKind::WasmBindgen]
+        .operations
+        .iter()
+        .filter(|operation| super::async_calls::managed(operation))
+        .collect::<Vec<_>>();
+    source.push_str(&super::async_calls::registry(!managed.is_empty()).to_string());
+    if !managed.is_empty() {
+        write_async_helpers(
+            &mut source,
+            managed
+                .iter()
+                .any(|operation| operation.callback_use_sites(package).unwrap_or(false)),
+        );
+    }
     write_temporal_helpers(&mut source);
     source.push_str(&render_callback_helpers(package)?);
     source.push_str(&render_named_helpers(package)?);
     source.push_str(&render_stream_helpers(package)?);
-    source.push_str(&render_operations(package)?);
+    source.push_str(&super::async_calls::wrap(
+        &render_operations(package)?,
+        &package.rust.engines[&EngineKind::WasmBindgen].operations,
+        None,
+    )?);
     source.push_str("\n// wasm-bindgen operation descriptors and ABI shims\n");
     for operation in operations {
         writeln!(source, "{}", operation.tokens).unwrap();
@@ -58,11 +76,12 @@ pub(crate) fn render(
 }
 
 fn engine_plan(package: &NormalizedPackage) -> Result<wasm_bindgen_uniffi_engine::WasmEnginePlan> {
-    let operations = package.rust.engines[&EngineKind::WasmBindgen]
+    let mut operations = package.rust.engines[&EngineKind::WasmBindgen]
         .operations
         .iter()
         .map(|operation| wasm_operation_plan(package, operation))
         .collect::<Result<Vec<_>>>()?;
+    operations.extend(super::async_calls::wasm_controls(operations.len())?);
     wasm_bindgen_uniffi_engine::WasmEnginePlan::build_with_resource_hooks(
         wasm_bindgen_uniffi_engine::ClosePolicy {
             grace_ms: package.bridge.close_policy().grace_ms,
@@ -99,6 +118,52 @@ use std::collections::HashMap;
 
 "#,
     );
+}
+
+fn write_async_helpers(source: &mut String, needs_host: bool) {
+    source.push_str(r#"
+fn __uniffi_cancelled_error(_: ::uniffi::async_runtime::Cancelled) -> JsValue {
+    let error = js_sys::Error::new("call cancelled");
+    error.set_name("UniffiCancelled");
+    js_sys::Reflect::set(&error, &JsValue::from_str("errorName"), &JsValue::from_str("UniffiCancelled"))
+        .expect("fresh cancellation Error is extensible");
+    error.into()
+}
+"#);
+    if !needs_host {
+        return;
+    }
+    source.push_str(r#"
+struct __UniffiCallHostScope(Option<JsValue>);
+impl __UniffiCallHostScope {
+    fn enter(host: &JsValue) -> Self {
+        Self(__UNIFFI_WASM_CALL_HOST.with(|slot| slot.replace(Some(host.clone()))))
+    }
+}
+impl Drop for __UniffiCallHostScope {
+    fn drop(&mut self) { __uniffi_set_call_host(self.0.take()); }
+}
+struct __UniffiWithCallHost<F: std::future::Future> {
+    future: Option<std::pin::Pin<Box<F>>>,
+    host: JsValue,
+}
+fn __uniffi_with_call_host<F: std::future::Future>(future: F, host: JsValue) -> __UniffiWithCallHost<F> {
+    __UniffiWithCallHost { future: Some(Box::pin(future)), host }
+}
+impl<F: std::future::Future> std::future::Future for __UniffiWithCallHost<F> {
+    type Output = F::Output;
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let _scope = __UniffiCallHostScope::enter(&self.host);
+        self.future.as_mut().expect("call future has been dropped").as_mut().poll(cx)
+    }
+}
+impl<F: std::future::Future> Drop for __UniffiWithCallHost<F> {
+    fn drop(&mut self) {
+        let _scope = __UniffiCallHostScope::enter(&self.host);
+        drop(self.future.take());
+    }
+}
+"#);
 }
 
 fn write_registry(source: &mut String) {
@@ -2556,6 +2621,18 @@ fn lower_operation_value(expression: TokenStream, fallible: bool, context: &str)
     }
 }
 
+/// Commit the raw Rust result and finish cleanup before any return value or
+/// declared error is lifted into a Wasm carrier. The outer Result belongs to
+/// argument conversion; the inner value retains the business Result, if any.
+fn managed_call(lowered: Vec<TokenStream>, call: TokenStream) -> TokenStream {
+    quote! {
+        __uniffi_context.run(async move {
+            #(#lowered)*
+            Ok::<_, JsValue>(#call)
+        }).await.map_err(__uniffi_cancelled_error)??
+    }
+}
+
 fn render_operations(package: &NormalizedPackage) -> Result<String> {
     let mut tokens = TokenStream::new();
     for operation in &package.rust.engines[&EngineKind::WasmBindgen].operations {
@@ -2582,13 +2659,17 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
         ));
         let async_fn = matches!(operation.async_kind, uniffi_js_abi::AsyncKind::Async);
         let async_token = async_fn.then(|| quote!(async));
+        let managed = super::async_calls::managed(operation);
+        let fallible = operation.throws.is_some() || managed;
         let needs_host = operation.callback_use_sites(package).unwrap_or(false);
         let mut params = Vec::new();
         let mut call_arguments = Vec::new();
         let mut lowered_arguments = Vec::new();
         if needs_host {
             params.push(quote!(host: JsValue));
-            lowered_arguments.push(quote!(__uniffi_set_call_host(Some(host.clone()));));
+            if !managed {
+                lowered_arguments.push(quote!(__uniffi_set_call_host(Some(host.clone()));));
+            }
         }
         if let Some(receiver) = &operation.receiver {
             let binding = RustValueBinding {
@@ -2600,7 +2681,7 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
             params.push(quote!(receiver: #ty));
             let receiver_value = rust_ident("__uniffi_receiver");
             let lowered = lower_expr(package, &binding, quote!(receiver))?;
-            let lowered = lower_operation_value(lowered, operation.throws.is_some(), "receiver");
+            let lowered = lower_operation_value(lowered, fallible, "receiver");
             lowered_arguments.push(quote!(let #receiver_value = #lowered;));
             call_arguments.push(quote!(#receiver_value));
         }
@@ -2630,8 +2711,7 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
                 ));
             } else {
                 let lowered = lower_expr(package, &binding, quote!(#arg))?;
-                let lowered =
-                    lower_operation_value(lowered, operation.throws.is_some(), "argument");
+                let lowered = lower_operation_value(lowered, fallible, "argument");
                 lowered_arguments.push(quote!(let #core_arg = #lowered;));
             }
             call_arguments.push(rust_call_argument(quote!(#core_arg), argument.ownership));
@@ -2655,7 +2735,7 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
             }
             None => None,
         };
-        let output = if operation.throws.is_some() {
+        let output = if fallible {
             quote!(Result<#return_ty, JsValue>)
         } else {
             return_ty.clone()
@@ -2666,7 +2746,9 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
         // flight (for example when a callback returns another callback
         // proxy). Keep the call-host cell populated through completion and
         // clear it only afterwards.
-        let call = if async_fn {
+        let call = if managed {
+            managed_call(std::mem::take(&mut lowered_arguments), quote!(#call.await))
+        } else if async_fn {
             if needs_host {
                 quote! {
                     {
@@ -2717,7 +2799,7 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
         let lifted = if let Some(binding) = &return_binding {
             let expression = lift_expr(package, binding, quote!(result))?;
             let expression = quote!((|| -> Result<#return_ty, JsValue> { #expression })());
-            if operation.throws.is_some() {
+            if fallible {
                 quote!(#expression)
             } else {
                 // A non-throwing operation still has fallible JS boundary
@@ -2732,7 +2814,7 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
                     }
                 }
             }
-        } else if operation.throws.is_some() {
+        } else if fallible {
             quote!(Ok(()))
         } else {
             quote!(())
@@ -2763,13 +2845,19 @@ fn render_output_stream_start(
         operation.operation_id.index()
     ));
     let registry = output_stream_registry_ident(operation.operation_id.index(), group.id.index());
+    let managed = super::async_calls::managed(operation);
+    let fallible = operation.throws.is_some() || managed;
+    let async_token =
+        (operation.async_kind == uniffi_js_abi::AsyncKind::Async).then(|| quote!(async));
     let needs_host = operation.callback_use_sites(package).unwrap_or(false);
     let mut params = Vec::new();
     let mut lowered = Vec::new();
     let mut arguments = Vec::new();
     if needs_host {
         params.push(quote!(host: JsValue));
-        lowered.push(quote!(__uniffi_set_call_host(Some(host.clone()));));
+        if !managed {
+            lowered.push(quote!(__uniffi_set_call_host(Some(host.clone()));));
+        }
     }
     if let Some(receiver) = &operation.receiver {
         let binding = RustValueBinding {
@@ -2780,7 +2868,7 @@ fn render_output_stream_start(
         let ty = wasm_param_type(&binding);
         params.push(quote!(receiver: #ty));
         let value = lower_expr(package, &binding, quote!(receiver))?;
-        let value = lower_operation_value(value, operation.throws.is_some(), "receiver");
+        let value = lower_operation_value(value, fallible, "receiver");
         lowered.push(quote!(let receiver_value = #value;));
         arguments.push(quote!(receiver_value));
     }
@@ -2807,17 +2895,22 @@ fn render_output_stream_start(
             let make = input_stream_make_ident(operation.operation_id.index(), group.id.index());
             lowered.push(quote!(let #core = #make(host.clone(), #arg);));
         } else {
-            let value = lower_operation_value(value, operation.throws.is_some(), "argument");
+            let value = lower_operation_value(value, fallible, "argument");
             lowered.push(quote!(let #core = #value;));
         }
         arguments.push(rust_call_argument(quote!(#core), argument.ownership));
     }
-    if needs_host {
+    if needs_host && !managed {
         lowered.push(quote!(__uniffi_set_call_host(None);));
     }
     let call = render_call(package, operation, &arguments)?;
     let call = if operation.async_kind == uniffi_js_abi::AsyncKind::Async {
         quote!(#call.await)
+    } else {
+        call
+    };
+    let call = if managed {
+        managed_call(std::mem::take(&mut lowered), call)
     } else {
         call
     };
@@ -2830,7 +2923,7 @@ fn render_output_stream_start(
         }
         None => None,
     };
-    let output = if operation.throws.is_some() {
+    let output = if fallible {
         quote!(Result<u32, JsValue>)
     } else {
         quote!(u32)
@@ -2848,17 +2941,22 @@ fn render_output_stream_start(
             Ok(handle.as_raw() as u32)
         }
     } else {
+        let result = if managed {
+            quote!(Ok(handle.as_raw() as u32))
+        } else {
+            quote!(handle.as_raw() as u32)
+        };
         quote! {
             let stream: ::uniffi::UniFfiStream<#item, #error> = #call;
             let handle = ::uniffi::rust_stream_new(&#registry, stream);
-            handle.as_raw() as u32
+            #result
         }
     };
     let body = invoke;
     let call_body = body;
     Ok(quote! {
         #[doc(hidden)]
-        fn #wrapper(#(#params),*) -> #output {
+        #async_token fn #wrapper(#(#params),*) -> #output {
             #(#lowered)*
             #call_body
         }
@@ -3057,9 +3155,221 @@ mod tests {
     use super::*;
     use crate::frontend::{normalize, BindingInput};
     use crate::JsConfig;
+    use quote::ToTokens;
     use uniffi_bindgen::interface::ComponentInterface;
     use uniffi_bindgen::Component;
     use uniffi_js_abi::Ownership;
+
+    fn async_result_package() -> NormalizedPackage {
+        let ci = ComponentInterface::from_webidl(
+            r#"
+interface Probe {};
+[Error] enum Failure { "Failed" };
+callback interface Logger { void log(string message); };
+dictionary Envelope { sequence<Probe> objects; };
+namespace async_results {
+    [Async] Probe object();
+    [Async, Throws=Failure] Envelope nested();
+    [Async] void unit();
+    [Async, Throws=Failure, CallbackContract="argument[0],retained,calling_thread,allowed"]
+    Probe with_host(Logger logger, Envelope argument);
+};
+"#,
+            "async_results",
+        )
+        .unwrap();
+        let mut component = Component {
+            ci,
+            config: JsConfig::default(),
+        };
+        component.ci.derive_ffi_funcs().unwrap();
+        normalize(BindingInput::new(&[component])).unwrap()
+    }
+
+    fn typed_wrappers(package: &NormalizedPackage) -> Vec<syn::ItemFn> {
+        let source = super::super::async_calls::wrap(
+            &render_operations(package).unwrap(),
+            &package.rust.engines[&EngineKind::WasmBindgen].operations,
+            None,
+        )
+        .unwrap();
+        syn::parse_file(&source)
+            .unwrap()
+            .items
+            .into_iter()
+            .filter_map(|item| {
+                if let syn::Item::Fn(function) = item {
+                    Some(function)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn compact(tokens: impl ToTokens) -> String {
+        tokens
+            .to_token_stream()
+            .to_string()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect()
+    }
+
+    // Inspect the business future independently of the surrounding host scope
+    // and result conversion. A handle inside this future cannot be rolled back
+    // by Run dropping its result when cancellation wins the Ready poll.
+    fn business_future(source: &str) -> &str {
+        let start = source.find("__uniffi_context.run(asyncmove{").unwrap();
+        let start = start + "__uniffi_context.run(asyncmove{".len();
+        let mut depth = 1;
+        for (offset, ch) in source[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                return &source[start..start + offset];
+            }
+        }
+        panic!("business future must have a closing brace");
+    }
+
+    #[test]
+    fn managed_async_results_commit_rust_values_before_lifting() {
+        let package = async_result_package();
+        let wrappers = typed_wrappers(&package);
+        for operation in package.rust.engines[&EngineKind::WasmBindgen]
+            .operations
+            .iter()
+            .filter(|operation| super::super::async_calls::managed(operation))
+        {
+            let name = format!(
+                "__uniffi_typed_wasm_operation_{}",
+                operation.operation_id.index()
+            );
+            let wrapper = wrappers
+                .iter()
+                .find(|wrapper| wrapper.sig.ident == name)
+                .unwrap();
+            let source = compact(wrapper);
+            assert!(source.contains("__uniffi_call_id:f64"));
+            assert!(compact(&wrapper.sig.output).starts_with("->Result<"));
+            let business = business_future(&source);
+            assert!(business.contains(".await)"));
+            assert!(!business.contains("__uniffi_store_"));
+            assert!(!business.contains("__uniffi_lift_"));
+            assert!(!business.contains("rust_stream_new"));
+            let committed = source
+                .split(".await.map_err(__uniffi_cancelled_error)??")
+                .nth(1)
+                .unwrap();
+            match operation.source_key.name() {
+                "object" | "with_host" => assert!(committed.contains("__uniffi_store_object_")),
+                "nested" => assert!(committed.contains("__uniffi_lift_")),
+                "unit" => assert!(committed.contains("Ok(())")),
+                other => panic!("unexpected operation: {other}"),
+            }
+            if operation.throws.is_some() {
+                assert!(committed.contains("Err(error)=>returnErr("));
+            }
+        }
+    }
+
+    #[test]
+    fn managed_async_host_covers_lowering_cleanup_and_error_lifting() {
+        let package = async_result_package();
+        let operation = package.rust.engines[&EngineKind::WasmBindgen]
+            .operations
+            .iter()
+            .find(|operation| operation.source_key.name() == "with_host")
+            .unwrap();
+        let name = format!(
+            "__uniffi_typed_wasm_operation_{}",
+            operation.operation_id.index()
+        );
+        let wrappers = typed_wrappers(&package);
+        let source = compact(
+            wrappers
+                .iter()
+                .find(|wrapper| wrapper.sig.ident == name)
+                .unwrap(),
+        );
+        assert!(
+            source.find("__uniffi_with_call_host(").unwrap()
+                < source.find("__uniffi_context.run(").unwrap()
+        );
+        assert!(business_future(&source).contains("__uniffi_lower_"));
+        assert!(business_future(&source).contains("Result<_,JsValue>"));
+        assert!(source.contains("Err(error)=>returnErr("));
+        assert!(!source.contains("__uniffi_set_call_host"));
+    }
+
+    #[test]
+    fn async_stream_factory_commits_before_registering_stream() {
+        for is_async in [false, true] {
+            let mut group = uniffi_meta::MetadataGroup {
+                namespace: uniffi_meta::NamespaceMetadata {
+                    crate_name: "async_stream_result".into(),
+                    name: "async_stream_result".into(),
+                },
+                namespace_docstring: None,
+                items: Default::default(),
+            };
+            group.add_item(
+                uniffi_meta::FnMetadata {
+                    module_path: "async_stream_result".into(),
+                    name: "events".into(),
+                    orig_name: None,
+                    is_async,
+                    inputs: vec![],
+                    return_type: Some(uniffi_meta::Type::Stream {
+                        item_type: Box::new(uniffi_meta::Type::UInt32),
+                        error_type: Box::new(uniffi_meta::Type::String),
+                        is_send: false,
+                    }),
+                    throws: None,
+                    checksum: None,
+                    docstring: None,
+                }
+                .into(),
+            );
+            let component = Component {
+                ci: ComponentInterface::from_metadata(group).unwrap(),
+                config: JsConfig::default(),
+            };
+            let package = normalize(BindingInput::new(&[component])).unwrap();
+            let operation = package.rust.engines[&EngineKind::WasmBindgen]
+                .operations
+                .iter()
+                .find(|operation| operation.kind == uniffi_js_abi::OperationKind::OutputStreamStart)
+                .unwrap();
+            let name = format!(
+                "__uniffi_typed_wasm_operation_{}",
+                operation.operation_id.index()
+            );
+            let wrappers = typed_wrappers(&package);
+            let wrapper = wrappers
+                .iter()
+                .find(|wrapper| wrapper.sig.ident == name)
+                .unwrap();
+            let source = compact(wrapper);
+            assert_eq!(wrapper.sig.asyncness.is_some(), is_async);
+            if is_async {
+                assert!(!business_future(&source).contains("rust_stream_new"));
+                let committed = source
+                    .split(".await.map_err(__uniffi_cancelled_error)??")
+                    .nth(1)
+                    .unwrap();
+                assert!(committed.contains("rust_stream_new"));
+                assert!(committed.contains("Ok(handle.as_raw()asu32)"));
+            } else {
+                assert!(!source.contains("__uniffi_context.run"));
+                assert_eq!(compact(&wrapper.sig.output), "->u32");
+            }
+        }
+    }
 
     #[test]
     fn host_dispatched_operations_have_no_raw_wasm_wrappers() {

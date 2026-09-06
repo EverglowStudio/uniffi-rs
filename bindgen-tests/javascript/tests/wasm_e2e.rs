@@ -196,16 +196,18 @@ crate-type = ["cdylib"]
 
 [dependencies]
 {WASM_BINDGEN_DEPENDENCIES}
+uniffi = {{ path = {uniffi_path:?}, features = ["async-runtime", "wasm-unstable-single-threaded"] }}
 wasm_scalar = {{ path = "../biz" }}
 "#,
             WASM_BINDGEN_DEPENDENCIES = WASM_BINDGEN_DEPENDENCIES,
+            uniffi_path = workspace_root().join("uniffi").as_str(),
         ),
     )
     .unwrap();
     // Isolate from any parent workspace so the temp crates build standalone.
     std::fs::write(
         root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"biz\", \"shim\"]\nresolver = \"3\"\n",
+        format!("[workspace]\nmembers = [\"biz\", \"shim\"]\nresolver = \"3\"\n\n[patch.crates-io]\n{WASM_BINDGEN_DEPENDENCIES}"),
     )
     .unwrap();
 
@@ -2546,7 +2548,7 @@ pub fn run_wasm_e2e(spec: WasmE2eSpec) {
     let name = spec.name;
     let shim_name = format!("{name}_shim");
     let uniffi_dep = format!(
-        "uniffi = {{ path = {:?} }}",
+        "uniffi = {{ path = {:?}, features = [\"async-runtime\", \"wasm-unstable-single-threaded\"] }}",
         workspace_root().join("uniffi").as_str()
     );
 
@@ -2665,7 +2667,7 @@ async-trait = "0.1"
     }
     std::fs::write(
         root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"biz\", \"shim\"]\nresolver = \"3\"\n",
+        format!("[workspace]\nmembers = [\"biz\", \"shim\"]\nresolver = \"3\"\n\n[patch.crates-io]\n{WASM_BINDGEN_DEPENDENCIES}"),
     )
     .unwrap();
 

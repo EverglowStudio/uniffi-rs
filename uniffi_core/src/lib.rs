@@ -76,6 +76,9 @@ use bytes::buf::Buf;
 // Make Result<> public to support external impls of FfiConverter
 pub use anyhow::Result;
 
+#[cfg(feature = "async-runtime")]
+pub mod async_runtime;
+
 mod arc_or_owned;
 mod custom_types;
 pub mod ffi;

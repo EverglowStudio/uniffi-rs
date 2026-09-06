@@ -43,6 +43,7 @@ tokio = { version = "1", features = ["rt"] }
 trybuild = "1"
 
 [features]
+async-runtime = ["uniffi_core/async-runtime"]
 default = ["cargo-metadata", "macro-scaffolding"]
 # Printout tracing information on FFI calls.  Useful for debugging issues with the bindings code.
 ffi-trace = ["uniffi_core/ffi-trace", "uniffi_bindgen?/ffi-trace"]

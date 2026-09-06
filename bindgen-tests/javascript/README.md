@@ -30,19 +30,21 @@ cargo test -p uniffi-bindgen-tests-javascript --test cli_build_napi -- --nocaptu
 cargo test -p uniffi-bindgen-tests-javascript --test cli_build_wasm -- --nocapture --test-threads=1
 ```
 
-The complete non-benchmark JavaScript suite is:
+The default JavaScript suite (excluding ignored opt-in tests) is:
 
 ```sh
 cargo test -p uniffi-bindgen-tests-javascript --tests
 ```
 
+The opt-in unified async matrix additionally runs Node NAPI, Node WASM, real Chrome Window and DedicatedWorker: from the workspace root, run `python3 bindgen-tests/javascript/tests/support/unified_async/run.py` (see [setup and CLI options](tests/support/unified_async/README.md)); this ignored test is not run by `--tests` alone.
+
 Recommended layers are:
 
 - Local daily work: `smoke`, then `contracts` when generator, declarations, or
   runtime semantics change.
-- Pull requests: the complete `--tests` command above, which runs every
-  non-benchmark smoke, contract, Wasm, N-API/Electron, host, and CLI test.
-- Nightly/release: the complete suite plus the opt-in benchmark and the
+- Pull requests: the default `--tests` command above, which runs the non-ignored
+  smoke, contract, Wasm, N-API/Electron, host, and CLI tests.
+- Nightly/release: the default suite plus the opt-in unified async matrix, benchmark, and the
   platform-specific OHOS/Apple/Android jobs available on the runner.
 
 The Wasm E2E tests use the pinned in-process wasm-bindgen library. A globally

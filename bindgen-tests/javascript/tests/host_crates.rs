@@ -776,7 +776,7 @@ pub fn write_synthetic_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8P
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         core.join("Cargo.toml"),
-        "[package]\nname = \"tiny-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\nname = \"tiny\"\ncrate-type = [\"lib\"]\n\n[dependencies]\n\n[target.'cfg(target_arch = \"wasm32\")'.dependencies]\nwasm-bindgen = \"0.2.126\"\njs-sys = \"0.3.103\"\n\n[workspace]\nresolver = \"3\"\n",
+        format!("[package]\nname = \"tiny-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\nname = \"tiny\"\ncrate-type = [\"lib\"]\n\n[dependencies]\nuniffi = {{ path = {:?} }}\n\n[target.'cfg(target_arch = \"wasm32\")'.dependencies]\nwasm-bindgen = \"0.2.126\"\njs-sys = \"0.3.103\"\n\n[workspace]\nresolver = \"3\"\n", workspace_root().join("uniffi").as_str()),
     )
     .unwrap();
     std::fs::write(
@@ -826,7 +826,7 @@ pub fn write_float32_record_core_crate(root: &std::path::Path) -> (Utf8PathBuf, 
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         core.join("Cargo.toml"),
-        "[package]\nname = \"float32-record-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\nname = \"float32_record_core\"\ncrate-type = [\"lib\"]\n\n[dependencies]\n\n[workspace]\nresolver = \"3\"\n",
+        format!("[package]\nname = \"float32-record-core\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\nname = \"float32_record_core\"\ncrate-type = [\"lib\"]\n\n[dependencies]\nuniffi = {{ path = {:?} }}\n\n[workspace]\nresolver = \"3\"\n", workspace_root().join("uniffi").as_str()),
     )
     .unwrap();
     std::fs::write(
