@@ -1382,9 +1382,12 @@ fn host_crates_napi_runs_async_callback_trait_fixture() {
     let callbacks =
         std::fs::read_to_string(generated.join("components/async_callback/index.d.ts")).unwrap();
     assert!(
-        callbacks.contains("note(msg: string): Promise<void>;")
-            && callbacks.contains("compute(a: number, b: number): Promise<number>;")
-            && callbacks.contains("makeRecord(a: number, b: number): Promise<WorkRecord>;"),
+        callbacks.contains("note(msg: string, options?: CallOptions): Promise<void>;")
+            && callbacks
+                .contains("compute(a: number, b: number, options?: CallOptions): Promise<number>;")
+            && callbacks.contains(
+                "makeRecord(a: number, b: number, options?: CallOptions): Promise<WorkRecord>;"
+            ),
         "component declarations should expose async callback methods:\n{callbacks}"
     );
     let api =
@@ -1556,9 +1559,9 @@ fn host_crates_napi_runs_fallible_async_callback_fixture() {
         std::fs::read_to_string(generated.join("components/fallible_async_callback/index.d.ts"))
             .unwrap();
     for needle in [
-        "checkedVoid(fail: boolean): Promise<void>;",
-        "checkedValue(fail: boolean): Promise<number>;",
-        "checkedRecord(fail: boolean): Promise<Payload>;",
+        "checkedVoid(fail: boolean, options?: CallOptions): Promise<void>;",
+        "checkedValue(fail: boolean, options?: CallOptions): Promise<number>;",
+        "checkedRecord(fail: boolean, options?: CallOptions): Promise<Payload>;",
     ] {
         assert!(
             callbacks.contains(needle),

@@ -19,6 +19,8 @@ use uniffi_js_engine_schema::{
     RustVariantPayload, ValuePath, ValuePathSegment,
 };
 
+#[path = "rust/async_calls.rs"]
+mod async_calls;
 #[path = "rust/wasm_source.rs"]
 pub(crate) mod wasm_source;
 
@@ -1169,8 +1171,9 @@ fn family_operations(
                 id: operation.operation_id.index(),
                 kind: family_kind(operation.kind),
                 async_kind: family_async(operation.async_kind),
-                fallible: operation.throws.is_some(),
-                argument_count: operation.arguments.len(),
+                fallible: operation.throws.is_some() || async_calls::managed(operation),
+                argument_count: operation.arguments.len()
+                    + usize::from(async_calls::managed(operation)),
                 dispatch,
                 receiver: if matches!(
                     operation.kind,
@@ -1202,13 +1205,15 @@ fn family_operations(
 }
 
 fn family_plan(package: &NormalizedPackage, flavor: FamilyFlavor) -> Result<FamilyPlan> {
+    let mut operations = family_operations(package, flavor)?;
+    operations.extend(async_calls::family_controls(operations.len())?);
     FamilyPlan::build(FamilyInput {
         flavor,
         close_policy: napi_uniffi_engine::ClosePolicy {
             grace_ms: package.bridge.close_policy().grace_ms,
             on_deadline: napi_uniffi_engine::DeadlineAction::Detach,
         },
-        operations: family_operations(package, flavor)?,
+        operations,
     })
     .map_err(|error| anyhow!("N-API family plan: {error}"))
 }
@@ -4912,7 +4917,7 @@ fn napi_operation(
     } else {
         None
     };
-    let arguments = if matches!(
+    let mut arguments = if matches!(
         target,
         napi_uniffi_engine::RustOperationTarget::Native { .. }
     ) {
@@ -4925,6 +4930,14 @@ fn napi_operation(
     } else {
         Vec::new()
     };
+    if async_calls::managed(operation) {
+        arguments.push(napi_uniffi_engine::RustArgumentPlan {
+            name: rust_ident("__uniffi_call_id"),
+            binding: napi_uniffi_engine::ArgumentBinding::Direct {
+                carrier_type: syn::parse_quote!(f64),
+            },
+        });
+    }
     let return_type = operation
         .return_value
         .as_ref()
@@ -5012,7 +5025,11 @@ fn napi_operation(
             },
         }
     };
-    let error_binding = if matches!(
+    let error_binding = if async_calls::managed(operation) {
+        napi_uniffi_engine::ErrorBinding::Descriptor {
+            map: syn::parse_quote!(crate::__uniffi_call_error),
+        }
+    } else if matches!(
         target,
         napi_uniffi_engine::RustOperationTarget::Native { .. }
     ) {
@@ -5038,11 +5055,12 @@ fn napi_operation(
 
 pub(crate) fn napi_source(package: &NormalizedPackage) -> Result<String> {
     let family = family_plan(package, FamilyFlavor::Node)?;
-    let operations = package.rust.engines[&EngineKind::Napi]
+    let mut operations = package.rust.engines[&EngineKind::Napi]
         .operations
         .iter()
         .map(|operation| napi_operation(package, operation))
         .collect::<Result<Vec<_>>>()?;
+    operations.extend(async_calls::napi_controls(operations.len())?);
     let rust = napi_uniffi_engine::RustBridgePlan::build_with_resource_hooks(
         &family,
         operations,
@@ -5076,9 +5094,21 @@ pub(crate) fn napi_source(package: &NormalizedPackage) -> Result<String> {
         render_callback_proxy_helpers(package, NativeFlavor::Node, EngineKind::Napi)?;
     let registry = render_resource_registry(NativeFlavor::Node);
     let wrappers = render_native_operation_wrappers(package, EngineKind::Napi)?;
+    let wrappers = async_calls::wrap(
+        &wrappers,
+        &package.rust.engines[&EngineKind::Napi].operations,
+        Some(NativeFlavor::Node),
+    )?;
+    let async_helpers = async_calls::native_helpers(
+        NativeFlavor::Node,
+        package.rust.engines[&EngineKind::Napi]
+            .operations
+            .iter()
+            .any(async_calls::managed),
+    );
     let derive_import = format!("use {};\n", NativeFlavor::Node.derive_import());
     Ok(format!(
-        "{derive_import}{registry}\n{temporal}\n{helpers}\n{operation_helpers}\n{nested_input_helpers}\n{input_stream_helpers}\n{callback_helpers}\n{wrappers}\n{}",
+        "{derive_import}{registry}\n{async_helpers}\n{temporal}\n{helpers}\n{operation_helpers}\n{nested_input_helpers}\n{input_stream_helpers}\n{callback_helpers}\n{wrappers}\n{}",
         module.source()
     ))
 }
@@ -5274,7 +5304,7 @@ fn ohos_operation(
     } else {
         None
     };
-    let arguments = if matches!(
+    let mut arguments = if matches!(
         target,
         napi_ohos_uniffi_engine::OhosOperationTarget::Native { .. }
     ) {
@@ -5287,6 +5317,14 @@ fn ohos_operation(
     } else {
         Vec::new()
     };
+    if async_calls::managed(operation) {
+        arguments.push(napi_ohos_uniffi_engine::OhosArgumentPlan {
+            name: rust_ident("__uniffi_call_id"),
+            binding: napi_ohos_uniffi_engine::OhosArgumentBinding::Direct {
+                carrier_type: syn::parse_quote!(f64),
+            },
+        });
+    }
     let return_type = operation
         .return_value
         .as_ref()
@@ -5375,7 +5413,11 @@ fn ohos_operation(
             },
         }
     };
-    let error_binding = if matches!(
+    let error_binding = if async_calls::managed(operation) {
+        napi_ohos_uniffi_engine::OhosErrorBinding::Descriptor {
+            map: syn::parse_quote!(crate::__uniffi_call_error),
+        }
+    } else if matches!(
         target,
         napi_ohos_uniffi_engine::OhosOperationTarget::Native { .. }
     ) {
@@ -5401,11 +5443,12 @@ fn ohos_operation(
 #[cfg(feature = "ohos")]
 pub(crate) fn ohos_source(package: &NormalizedPackage) -> Result<String> {
     let family = family_plan(package, FamilyFlavor::Ohos)?;
-    let operations = package.rust.engines[&EngineKind::OhosNapi]
+    let mut operations = package.rust.engines[&EngineKind::OhosNapi]
         .operations
         .iter()
         .map(|operation| ohos_operation(package, operation))
         .collect::<Result<Vec<_>>>()?;
+    operations.extend(async_calls::ohos_controls(operations.len())?);
     let rust = napi_ohos_uniffi_engine::OhosBridgePlan::build_with_resource_hooks(
         &family,
         operations,
@@ -5439,9 +5482,21 @@ pub(crate) fn ohos_source(package: &NormalizedPackage) -> Result<String> {
         render_callback_proxy_helpers(package, NativeFlavor::Ohos, EngineKind::OhosNapi)?;
     let registry = render_resource_registry(NativeFlavor::Ohos);
     let wrappers = render_native_operation_wrappers(package, EngineKind::OhosNapi)?;
+    let wrappers = async_calls::wrap(
+        &wrappers,
+        &package.rust.engines[&EngineKind::OhosNapi].operations,
+        Some(NativeFlavor::Ohos),
+    )?;
+    let async_helpers = async_calls::native_helpers(
+        NativeFlavor::Ohos,
+        package.rust.engines[&EngineKind::OhosNapi]
+            .operations
+            .iter()
+            .any(async_calls::managed),
+    );
     let derive_import = format!("use {};\n", NativeFlavor::Ohos.derive_import());
     Ok(format!(
-        "{derive_import}{registry}\n{temporal}\n{helpers}\n{operation_helpers}\n{nested_input_helpers}\n{input_stream_helpers}\n{callback_helpers}\n{wrappers}\n{}",
+        "{derive_import}{registry}\n{async_helpers}\n{temporal}\n{helpers}\n{operation_helpers}\n{nested_input_helpers}\n{input_stream_helpers}\n{callback_helpers}\n{wrappers}\n{}",
         module.source()
     ))
 }
@@ -6286,7 +6341,7 @@ fn wasm_operation_plan(
         })
         .transpose()?;
 
-    let arguments = operation
+    let mut arguments = operation
         .arguments
         .iter()
         .map(|binding| {
@@ -6342,6 +6397,10 @@ fn wasm_operation_plan(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+
+    if async_calls::managed(operation) {
+        arguments.push(async_calls::wasm_call_argument());
+    }
 
     let return_value = operation
         .return_value
@@ -6432,7 +6491,13 @@ fn wasm_operation_plan(
         arguments,
         return_value,
         async_kind: wasm_async(operation.async_kind),
-        throws: operation.throws.map(TypeId::index),
+        // This engine projects `throws` solely to Result ABI fallibility. The
+        // private framework error identity keeps transport cancellation separate
+        // from the component's declared business error type table.
+        throws: operation
+            .throws
+            .map(TypeId::index)
+            .or_else(|| async_calls::managed(operation).then_some(u32::MAX)),
         callback_use_sites,
         resource_use_sites: wasm_resource_use_sites(package, operation),
         resource_hooks: operation
