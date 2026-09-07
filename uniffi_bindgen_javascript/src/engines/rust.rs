@@ -148,14 +148,6 @@ impl NativeFlavor {
         })
         .expect("engine error descriptor path is valid")
     }
-
-    fn is_ohos(self) -> bool {
-        match self {
-            Self::Node => false,
-            #[cfg(feature = "ohos")]
-            Self::Ohos => true,
-        }
-    }
 }
 
 fn rust_path(path: &RustPath) -> Result<Path> {
@@ -452,9 +444,7 @@ fn napi_carrier_type_for(
             }
         };
         match conversion {
-            ConversionRecipe::Bytes if flavor.is_ohos() => {
-                syn::parse_str("napi_ohos::bindgen_prelude::Uint8Array").map_err(Into::into)
-            }
+            ConversionRecipe::Bytes => Ok(syn::parse_quote!(__UniffiNapiBytes)),
             ConversionRecipe::BigInt
                 if matches!(
                     ty,
@@ -1369,7 +1359,7 @@ fn lower_expr(
         );
     }
     let value = match &binding.conversion {
-        ConversionRecipe::Bytes if flavor.is_ohos() => quote!(#expression.as_ref().to_vec()),
+        ConversionRecipe::Bytes => quote!(#expression.0),
         ConversionRecipe::Identity => match binding.rust_type {
             RustType::Scalar(uniffi_js_abi::ScalarType::F32) => quote!(#expression as f32),
             _ => expression,
@@ -1523,9 +1513,7 @@ fn lift_expr(
         ConversionRecipe::InputStream { .. } => Ok(
             quote!(u32::try_from(#expression.handle().as_raw()).expect("input stream handle exceeds u32")),
         ),
-        ConversionRecipe::Bytes if flavor.is_ohos() => {
-            Ok(quote!(#napi::bindgen_prelude::Uint8Array::from(#expression)))
-        }
+        ConversionRecipe::Bytes => Ok(quote!(__UniffiNapiBytes(#expression))),
         ConversionRecipe::Identity => match binding.rust_type {
             RustType::Scalar(uniffi_js_abi::ScalarType::F32) => Ok(quote!(#expression as f64)),
             _ => Ok(expression),
@@ -2100,6 +2088,71 @@ fn render_temporal_helpers(flavor: NativeFlavor) -> Result<String> {
     let error_descriptor = flavor.error_descriptor();
     let source = quote! {
         use #napi::bindgen_prelude::*;
+
+        // Callback result carriers can cross to a Rust worker. Copy bytes on
+        // the JS thread during FromNapiValue, before sending the carrier; a
+        // napi Uint8Array itself retains JS-mutable memory and must not cross.
+        #[derive(Clone, Debug)]
+        pub struct __UniffiNapiBytes(Vec<u8>);
+
+        impl TypeName for __UniffiNapiBytes {
+            fn type_name() -> &'static str { "Uint8Array" }
+            fn value_type() -> ValueType { ValueType::Object }
+        }
+        impl ValidateNapiValue for __UniffiNapiBytes {}
+
+        impl FromNapiValue for __UniffiNapiBytes {
+            unsafe fn from_napi_value(
+                env: #napi::sys::napi_env,
+                value: #napi::sys::napi_value,
+            ) -> Result<Self> {
+                let mut kind = 0;
+                let mut length = 0;
+                let mut buffer = ::std::ptr::null_mut();
+                // SAFETY: N-API invokes conversion on the value's JS thread
+                // with a live handle. Inspect metadata without borrowing data.
+                let status = #napi::sys::napi_get_typedarray_info(
+                    env, value, &mut kind, &mut length, ::std::ptr::null_mut(),
+                    &mut buffer, ::std::ptr::null_mut(),
+                );
+                if status != #napi::sys::Status::napi_ok {
+                    return Err(Error::new(Status::from(status), "expected Uint8Array"));
+                }
+                if kind != #napi::sys::TypedarrayType::uint8_array {
+                    return Err(Error::new(Status::InvalidArg, "expected Uint8Array"));
+                }
+                let mut ordinary_buffer = false;
+                let status = #napi::sys::napi_is_arraybuffer(env, buffer, &mut ordinary_buffer);
+                if status != #napi::sys::Status::napi_ok {
+                    return Err(Error::new(Status::from(status), "failed to inspect byte buffer"));
+                }
+                let bytes = if ordinary_buffer {
+                    // No JS re-entry occurs between borrowing and copying an
+                    // ordinary ArrayBuffer; no borrowed memory leaves this call.
+                    Uint8ArraySlice::from_napi_value(env, value)?.as_ref().to_vec()
+                } else {
+                    // A SharedArrayBuffer may change on another JS worker.
+                    // Let the VM read elements rather than forming a Rust slice.
+                    let length = u32::try_from(length)
+                        .map_err(|_| Error::new(Status::InvalidArg, "byte buffer is too large"))?;
+                    let object = Object::from_raw(env, value);
+                    (0..length).map(|index| object.get_element::<u8>(index))
+                        .collect::<Result<Vec<u8>>>()?
+                };
+                Ok(Self(bytes))
+            }
+        }
+
+        impl ToNapiValue for __UniffiNapiBytes {
+            unsafe fn to_napi_value(
+                env: #napi::sys::napi_env,
+                value: Self,
+            ) -> Result<#napi::sys::napi_value> {
+                // SAFETY: conversion runs on the owning JS thread; napi takes
+                // the owned Vec and manages its allocation after the transfer.
+                Uint8Array::to_napi_value(env, Uint8Array::from(value.0))
+            }
+        }
 
         // napi-rs intentionally maps Rust HashMap values to plain JavaScript
         // objects.  UniFFI's public cross-engine contract uses a real Map, so
@@ -8479,7 +8532,7 @@ namespace callback_errors {
     }
 
     #[test]
-    fn native_bytes_use_typed_arrays_on_harmony() {
+    fn native_bytes_copy_typed_arrays_into_owned_carriers() {
         let binding = RustValueBinding {
             rust_type: RustType::Scalar(uniffi_js_abi::ScalarType::Bytes),
             carrier: RustCarrier::Bytes,
@@ -8488,24 +8541,33 @@ namespace callback_errors {
 
         let node = napi_carrier_type_for(&binding, &[], NativeFlavor::Node)
             .expect("Node bytes carrier should render");
-        assert_eq!(node.to_token_stream().to_string(), "Vec < u8 >");
+        assert_eq!(node.to_token_stream().to_string(), "__UniffiNapiBytes");
+        assert_eq!(
+            lower_expr(&binding, quote!(value), NativeFlavor::Node)
+                .unwrap()
+                .to_string(),
+            "value . 0"
+        );
+        assert_eq!(
+            lift_expr(&binding, quote!(value), NativeFlavor::Node)
+                .unwrap()
+                .to_string(),
+            "__UniffiNapiBytes (value)"
+        );
 
         #[cfg(feature = "ohos")]
         {
             let harmony = napi_carrier_type_for(&binding, &[], NativeFlavor::Ohos)
                 .expect("Harmony bytes carrier should render");
-            assert_eq!(
-                harmony.to_token_stream().to_string(),
-                "napi_ohos :: bindgen_prelude :: Uint8Array"
-            );
+            assert_eq!(harmony.to_token_stream().to_string(), "__UniffiNapiBytes");
             assert!(lower_expr(&binding, quote!(value), NativeFlavor::Ohos)
                 .expect("Harmony bytes lowering should render")
                 .to_string()
-                .contains("as_ref () . to_vec ()"));
+                .contains("value . 0"));
             assert!(lift_expr(&binding, quote!(value), NativeFlavor::Ohos)
                 .expect("Harmony bytes lifting should render")
                 .to_string()
-                .contains("Uint8Array :: from (value)"));
+                .contains("__UniffiNapiBytes (value)"));
         }
     }
 

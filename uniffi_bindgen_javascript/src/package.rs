@@ -688,7 +688,7 @@ function __bindRendererHost(host) {\n\
 }\n\
 // contextBridge returns frozen cross-realm carriers that N-API cannot inspect directly.\n\
 function __napiCarrier(value) {\n\
-  if (Object.prototype.toString.call(value) === \"[object Uint8Array]\") return Array.from(value);\n\
+  if (Object.prototype.toString.call(value) === \"[object Uint8Array]\") return Uint8Array.from(value);\n\
   if (Array.isArray(value)) return value.map(__napiCarrier);\n\
   if (value && typeof value === \"object\" && typeof value.then !== \"function\") {\n\
     const result = {};\n\
@@ -1086,6 +1086,54 @@ mod tests {
                 "{{ create: 3, cancel: 4, release: 5, operations: [{}] }}",
                 factory.id.index()
             )
+        );
+    }
+
+    #[test]
+    fn electron_callback_bytes_are_copied_into_preload_typed_arrays() {
+        let package = stream_control_package();
+        let flavor = crate::host_crates::HostFlavorPlan {
+            crate_version: "0.0.0".into(),
+            lib_target: "control_test".into(),
+            crate_root: "native/host".into(),
+            native_artifact: "native/host.node".into(),
+            loader_artifact: None,
+        };
+        let (preload, _, _) = render_electron_entrypoint(&package, &flavor, "");
+        let start = preload.find("function __napiCarrier(").unwrap();
+        let end = preload.find("function __hostCall(").unwrap();
+        let mut script = format!(
+            "const source = {};\n",
+            serde_json::to_string(&preload[start..end]).unwrap()
+        );
+        script.push_str(
+            r#"
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const convert = vm.runInThisContext(source + '; __napiCarrier');
+const foreign = vm.runInNewContext(`(() => {
+  const bytes = new Uint8Array([171, 3, 5, 171]).subarray(1, 3);
+  return Object.freeze({ value: Object.freeze({ value: bytes }), items: [bytes, null] });
+})()`);
+assert.equal(foreign.value.value instanceof Uint8Array, false);
+const owned = convert(foreign);
+assert.ok(owned.value.value instanceof Uint8Array);
+assert.deepEqual([...owned.value.value], [3, 5]);
+assert.ok(owned.items[0] instanceof Uint8Array);
+assert.equal(owned.items[1], null);
+foreign.value.value[0] = 9;
+assert.equal(owned.value.value[0], 3);
+assert.equal(owned.items[0][0], 3);
+"#,
+        );
+        let output = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
