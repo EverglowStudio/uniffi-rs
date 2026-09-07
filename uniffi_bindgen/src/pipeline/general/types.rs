@@ -66,7 +66,10 @@ pub fn canonical_name(ty: &Type) -> String {
         } => format!(
             "Stream{}{}",
             canonical_name(item_type),
-            canonical_name(error_type),
+            error_type
+                .as_ref()
+                .map(|error| canonical_name(error))
+                .unwrap_or_else(|| "Infallible".into()),
         ),
         Type::InputStream {
             item_type,
@@ -75,7 +78,10 @@ pub fn canonical_name(ty: &Type) -> String {
         } => format!(
             "InputStream{}{}",
             canonical_name(item_type),
-            canonical_name(error_type),
+            error_type
+                .as_ref()
+                .map(|error| canonical_name(error))
+                .unwrap_or_else(|| "Infallible".into()),
         ),
     }
 }
@@ -137,7 +143,9 @@ pub fn map_type(mut ty: Type, context: &Context) -> Result<Type> {
             is_send,
         } => Type::Stream {
             item_type: Box::new(map_type(*item_type, context)?),
-            error_type: Box::new(map_type(*error_type, context)?),
+            error_type: error_type
+                .map(|error| map_type(*error, context).map(Box::new))
+                .transpose()?,
             is_send,
         },
         Type::InputStream {
@@ -146,7 +154,9 @@ pub fn map_type(mut ty: Type, context: &Context) -> Result<Type> {
             is_send,
         } => Type::InputStream {
             item_type: Box::new(map_type(*item_type, context)?),
-            error_type: Box::new(map_type(*error_type, context)?),
+            error_type: error_type
+                .map(|error| map_type(*error, context).map(Box::new))
+                .transpose()?,
             is_send,
         },
         // All other types can be returned unchanged
@@ -268,7 +278,7 @@ mod tests {
     fn maps_stream_type_into_general_ir() {
         let stream_type = Type::Stream {
             item_type: Box::new(Type::UInt32),
-            error_type: Box::new(Type::String),
+            error_type: Some(Box::new(Type::String)),
             is_send: true,
         };
         let context = test_context_with_type(&stream_type);
@@ -280,7 +290,7 @@ mod tests {
             type_node.ty,
             Type::Stream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             }
         );
@@ -290,7 +300,7 @@ mod tests {
     fn maps_input_stream_type_into_general_ir() {
         let stream_type = Type::InputStream {
             item_type: Box::new(Type::UInt32),
-            error_type: Box::new(Type::String),
+            error_type: Some(Box::new(Type::String)),
             is_send: true,
         };
         let context = test_context_with_type(&stream_type);
@@ -305,7 +315,7 @@ mod tests {
             type_node.ty,
             Type::InputStream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             }
         );

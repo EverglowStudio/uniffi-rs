@@ -175,9 +175,6 @@ pub(super) fn registry(managed_calls: bool) -> TokenStream {
 pub(super) fn native_helpers(flavor: NativeFlavor, managed_calls: bool) -> TokenStream {
     let engine = engine_crate_path(flavor);
     let registry = registry(managed_calls);
-    if !managed_calls {
-        return registry;
-    }
     quote! {
         #registry
         fn __uniffi_call_error(error: #engine::BridgeErrorDescriptor) -> #engine::BridgeErrorDescriptor { error }
@@ -315,12 +312,17 @@ pub(super) fn wrap(
 pub(super) fn family_controls(start: usize) -> Result<Vec<FamilyOperation>> {
     CONTROL_NAMES
         .iter()
+        .chain(std::iter::once(&"__uniffi_close_stream"))
         .enumerate()
         .map(|(index, _)| {
             Ok(FamilyOperation {
                 id: u32::try_from(start + index)?,
                 kind: FamilyKind::Function,
-                async_kind: FamilyAsync::Sync,
+                async_kind: if index == 3 {
+                    FamilyAsync::Async
+                } else {
+                    FamilyAsync::Sync
+                },
                 fallible: false,
                 argument_count: usize::from(index != 0),
                 dispatch: FamilyDispatch::Native,
@@ -338,6 +340,7 @@ pub(super) fn napi_controls(start: usize) -> Result<Vec<napi_uniffi_engine::Rust
     use napi_uniffi_engine::*;
     CONTROL_NAMES
         .iter()
+        .chain(std::iter::once(&"__uniffi_close_stream"))
         .enumerate()
         .map(|(index, name)| {
             Ok(napi_uniffi_engine::RustOperationPlan {
@@ -356,7 +359,7 @@ pub(super) fn napi_controls(start: usize) -> Result<Vec<napi_uniffi_engine::Rust
                         },
                     }]
                 },
-                return_binding: if index == 0 {
+                return_binding: if index == 0 || index == 3 {
                     ReturnBinding::Direct {
                         carrier_type: syn::parse_quote!(f64),
                     }
@@ -376,6 +379,7 @@ pub(super) fn ohos_controls(
     use napi_ohos_uniffi_engine::*;
     CONTROL_NAMES
         .iter()
+        .chain(std::iter::once(&"__uniffi_close_stream"))
         .enumerate()
         .map(|(index, name)| {
             Ok(OhosOperationPlan {
@@ -394,7 +398,7 @@ pub(super) fn ohos_controls(
                         },
                     }]
                 },
-                return_binding: if index == 0 {
+                return_binding: if index == 0 || index == 3 {
                     OhosReturnBinding::Direct {
                         carrier_type: syn::parse_quote!(f64),
                     }
@@ -426,6 +430,7 @@ pub(super) fn wasm_controls(
     use wasm_bindgen_uniffi_engine::*;
     CONTROL_NAMES
         .iter()
+        .chain(std::iter::once(&"__uniffi_close_stream"))
         .enumerate()
         .map(|(index, name)| {
             let path = wasm_bindgen_uniffi_engine::RustPath::new(["crate".into(), (*name).into()])?;
@@ -453,14 +458,18 @@ pub(super) fn wasm_controls(
                 } else {
                     vec![arg.clone()]
                 },
-                return_value: (index == 0).then_some(WasmReturnBinding {
+                return_value: (index == 0 || index == 3).then_some(WasmReturnBinding {
                     rust_type: arg.rust_type,
                     carrier: arg.carrier,
                     abi_carrier: arg.abi_carrier,
                     ownership: arg.ownership,
                     conversion: arg.conversion,
                 }),
-                async_kind: WasmAsyncKind::Sync,
+                async_kind: if index == 3 {
+                    WasmAsyncKind::Async
+                } else {
+                    WasmAsyncKind::Sync
+                },
                 throws: None,
                 callback_use_sites: vec![],
                 resource_use_sites: vec![],

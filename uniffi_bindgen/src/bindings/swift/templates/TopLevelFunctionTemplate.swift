@@ -2,7 +2,8 @@
 private func {{ func.input_stream_initialization_fn_name(arg) }}() {
     {{ func.ffi_input_stream_init_func(arg) }}(
         uniffiInputStreamNextCallback,
-        uniffiInputStreamCancelCallback
+        uniffiInputStreamCancelCallback,
+        uniffiInputStreamCloseCallback
     )
 }
 

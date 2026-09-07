@@ -1,6 +1,6 @@
 [package]
 name = "uniffi_js_abi"
-version = "0.32.0"
+version = "0.32.1"
 description = "Engine-neutral JavaScript API contract for UniFFI"
 license = "MPL-2.0"
 edition = "2021"

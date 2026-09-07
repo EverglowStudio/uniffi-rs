@@ -458,8 +458,273 @@ export async function runContract(root, realm) {
     await deadline(Promise.all([stream.return(), stream.return()]), 'pending stream returns');
     assert(counts(id).dropped === 1, 'return confirms native drop before resolution');
     const result = await deadline(pendingNext.result, 'pending next cancellation');
-    assert(result.ok && result.value.done === true, 'pending next ends on return');
+    cancelled(result, 'pending next interrupted by return');
     assert((await stream.next()).done === true, 'pending stream stays closed');
   });
+  assert(cases.length === 27 && cases.filter(name => name.startsWith('actor-')).length === 6,
+    `preserved S01/S02 (21) + S05 (6) baseline: ${cases.length}`);
+  const collect = async (stream) => { const out = []; for await (const item of await stream) out.push(item); return out; };
+  const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+  await test('s03-direct-future-boxfuture-and-rust-default', async () => {
+    assert(await api.directFuture(71) === 71 && await api.directBoxFuture(72) === 72, 'direct Future declarations');
+    assert(api.rustDefault() === 0 && api.rustDefault(9) === 9, 'omitted argument executes Rust Default');
+  });
+  await test('s03-infallible-option-stream-no-prefetch', async () => {
+    const id = nextId(), stream = api.plainEvents(id);
+    assert((await stream.next()).value === 7, 'plain Item first value');
+    const polls = counts(id).polls;
+    await api.pendingValue(0);
+    assert(counts(id).polls === polls && counts(id).produced === 1, 'no demand means no further polling');
+    const none = await stream.next(); assert(!none.done && none.value === null, 'None is data');
+    assert((await stream.next()).value === 9 && (await stream.next()).done, 'plain EOF');
+    assert(counts(id).dropped === 1, 'plain EOF destroys source');
+  });
+  await test('s03-sync-async-future-factory-errors-independent', async () => {
+    const directId = nextId(), direct = api.resultEvents(directId);
+    assert((await direct.next()).value === 7, 'direct fallible stream first item');
+    const directError = await observe(direct.next()).result;
+    assert(!directError.ok && directError.error instanceof api.FixtureError && directError.error.variant === 'Boom', 'direct fallible stream first error');
+    assert((await direct.next()).done && counts(directId).dropped === 1, 'direct fallible stream ends at first error');
+    for (const factory of [api.syncFactory, api.asyncFactory, api.futureFactory]) {
+      const bad = nextId();
+      const failure = await observe((async () => { const stream = await factory(bad, true); return stream.next(); })()).result;
+      assert(!failure.ok && failure.error instanceof api.FixtureError && failure.error.variant === 'Factory', 'factory error is independently typed');
+      assert(counts(bad).started === 0, 'failed factory never constructs a stream');
+      const id = nextId(), stream = await factory(id, false);
+      assert((await stream.next()).value === 7, 'factory item before error');
+      const item = await observe(stream.next()).result;
+      assert(!item.ok && item.error instanceof api.FixtureError && item.error.variant === 'Boom', 'item error independent of factory');
+      assert((await stream.next()).done && counts(id).produced === 2 && counts(id).dropped === 1, 'first item error terminal');
+    }
+  });
+  await test('s03-object-stream-and-rust-trait-methods', async () => {
+    const service = api.StreamService.new();
+    for (const method of ['values', 'valuesLater', 'valuesFuture']) {
+      assert(JSON.stringify(await collect(service[method](nextId()))) === '[7,null,9]', `object ${method} resource slots`);
+    }
+    const provider = api.RustStreamProvider.new();
+    for (const [method, expected] of [['syncValues', [11,12]], ['asyncValues', [13,14]], ['boxedValues', [15,16]], ['staticValues', [17]]]) {
+      assert(JSON.stringify(await collect(provider[method]())) === JSON.stringify(expected), `Rust trait ${method}`);
+    }
+    provider.dispose(); service.dispose();
+  });
+  await test('s03-host-trait-sync-async-boxed-stream', async () => {
+    const provider = {
+      syncValues() { return { async *[Symbol.asyncIterator]() { yield 21; yield 22; } }; },
+      async asyncValues() { return { async *[Symbol.asyncIterator]() { yield 23; } }; },
+      async boxedValues() { return { async *[Symbol.asyncIterator]() { yield 24; } }; },
+      async staticValues() { return { async *[Symbol.asyncIterator]() { yield 25; } }; },
+      async staticConsume(source) { return (await source.next()).value; },
+      async consumeInput() { return 0; },
+    };
+    for (const [kind, expected] of [[0, [21,22]], [1, [23]], [2, [24]], [3, [25]]]) {
+      assert(JSON.stringify(await api.hostValues(provider, kind)) === JSON.stringify(expected), `host stream kind ${kind}`);
+    }
+  });
+  await test('s03-object-input-demand-drop-await-return-onclose', async () => {
+    const service = api.StreamService.new(), id = nextId(), returned = deferred(), closed = deferred();
+    let pulls = 0, returning = 0, closing = 0, cleaned = 0;
+    const input = root.session.createInputStream({
+      async next() { pulls++; return { done: false, value: 31 }; },
+      async cancel() { returning++; await returned.promise; },
+    }, { async onClose() { closing++; await closed.promise; cleaned++; } });
+    const operation = observe(service.consume(input, id, 1), () => ({ cleaned }));
+    await until(() => counts(id).produced === 1, 'Rust consumed one host item');
+    await api.pendingValue(0);
+    assert(pulls === 1 && returning === 0 && !operation.settled, 'single consumer has no prefetch or premature drop');
+    open(id, 1);
+    await until(() => returning === 1, 'Rust input Drop requests producer return');
+    assert(!operation.settled && closing === 0, 'Rust completion waits producer return');
+    returned.resolve(); await until(() => closing === 1, 'onClose entered after producer return');
+    assert(!operation.settled, 'Rust completion waits onClose');
+    closed.resolve(); const result = await operation.result;
+    assert(result.ok && result.value === 31 && operation.atSettlement.cleaned === 1, 'real producer cleanup precedes result');
+    assert(returning === 1 && closing === 1, 'producer closed once'); service.dispose();
+  });
+  await test('s03-host-input-error-cleans-producer', async () => {
+    const service = api.StreamService.new(), id = nextId(); let drops = 0;
+    const input = { async *[Symbol.asyncIterator]() { try { yield 1; throw new api.FixtureError('producer boom', 'Boom'); } finally { drops++; } } };
+    const result = await observe(service.consume(input, id, 3)).result;
+    assert(!result.ok && result.error instanceof api.FixtureError && drops === 1, 'host producer error propagates after generator finally');
+    service.dispose();
+  });
+  await test('s03-host-trait-input-proxy-lives-through-await', async () => {
+    const wait = deferred(), returned = deferred(); let pulled = 0, returning = 0, callbackDone = false;
+    const input = root.session.createInputStream({
+      async next() { pulled++; return { value: 41, done: false }; },
+      async cancel() { returning++; await returned.promise; },
+    });
+    const provider = {
+      syncValues() { return { async *[Symbol.asyncIterator]() {} }; },
+      async asyncValues() { return this.syncValues(); },
+      async boxedValues() { return this.syncValues(); },
+      async staticValues() { return this.syncValues(); },
+      async staticConsume(source) { return (await source.next()).value; },
+      async consumeInput(source) {
+        await wait.promise;
+        try {
+          for await (const item of source) {
+            assert(item === 41, 'foreign producer remains alive during callback await');
+            return item;
+          }
+          throw new Error('host input unexpectedly ended');
+        } finally { callbackDone = true; }
+      },
+    };
+    const operation = observe(api.hostConsume(provider, input));
+    await api.pendingValue(0);
+    assert(returning === 0 && pulled === 0, 'dispatch does not drop Rust input proxy');
+    wait.resolve(); await until(() => returning === 1, 'for await return starts producer cleanup');
+    assert(!callbackDone && !operation.settled, 'iterator return and Rust call both wait producer cleanup');
+    returned.resolve(); assert((await operation.result).value === 41 && callbackDone, 'host input callback returns after cleanup');
+    for (const unpolled of [false, true]) {
+      const ack = deferred(); let returning = 0, calls = 0;
+      const input = root.session.createInputStream({
+        async next() { return { done: false, value: 42 }; },
+        async cancel() { returning++; await ack.promise; },
+      });
+      const ownedProvider = { ...provider, async staticConsume(source) { calls++; return (await source.next()).value; } };
+      const result = observe(api.hostStaticConsume(ownedProvider, input, unpolled));
+      await until(() => returning === 1, 'static callback Future releases input after original Rust handler is dropped');
+      assert(!result.settled && calls === (unpolled ? 0 : 1), 'unpolled Drop or awaited static callback both wait cleanup');
+      ack.resolve(); const completed = await result.result;
+      assert(completed.ok && completed.value === (unpolled ? 0 : 42), 'owned static Future survives handler drop');
+    }
+  });
+  await test('s03-stream-return-pending-next-awaits-cleanup', async () => {
+    const id = nextId(), stream = api.cleanupEvents(id), next = observe(stream.next());
+    await until(() => counts(id).polls > 0, 'stream is pending');
+    const first = observe(stream.return(), () => counts(id)), second = observe(stream.return(), () => counts(id));
+    const result = await finishCleanup(id, first);
+    assert(result.ok && (await second.result).ok && second.atSettlement.cleaned === 1, 'concurrent return shares cleanup ack');
+    cancelled(await next.result, 'pending next cleanup cancellation');
+  });
+  await test('s03-cancelled-factory-drops-undelivered-stream', async () => {
+    const id = nextId(), operation = observe(api.cancelledFactory(id), () => counts(id));
+    cancelled(await finishCleanup(id, operation), 'factory cancels before delivering stream');
+    assert(counts(id).polls === 0 && counts(id).dropped === 1, 'raw stream was never registered or polled');
+    const component = api.LocalComponent.new(1), owner = nextId(), localId = nextId(), counter = await api.OwnerCounter.new(component, owner, 0);
+    const localFactory = observe(counter.cancelRawValues(localId), () => counts(localId));
+    cancelled(await finishCleanup(localId, localFactory), 'local factory cancels raw !Send stream before delivery');
+    assert(counts(localId).polls === 0 && counts(localId).dropped === 1, 'undelivered raw local stream never polled');
+    open(owner, 8); await counter.close(); counter.dispose(); await component.close(); component.dispose();
+  });
+  await test('s03-local-raw-stream-owner-scope-and-trait', async () => {
+    const component = api.LocalComponent.new(1), owner = nextId(), counter = await api.OwnerCounter.new(component, owner, 50);
+    for (const method of ['rawValues', 'asyncRawValues', 'futureRawValues', 'traitRawValues']) {
+      const id = nextId(); open(id, 2); open(id, 4);
+      const stream = method === 'rawValues' ? counter[method](id, false) : counter[method](id);
+      const iterator = await stream, first = await iterator.next();
+      const polls = counts(id).polls;
+      await counter.value();
+      assert(counts(id).polls === polls && counts(id).produced === 1, 'owner subscription does not prefetch while consumer pauses');
+      const values = [first.value, ...await collect(iterator)];
+      assert(values[0] === null && values.length === 2, `local ${method} keeps Item Option`);
+      assert(counts(id).dropped === 1 && counts(id).cleaned === 1, 'owner EOF cleanup acknowledged');
+    }
+    open(owner, 8); await counter.close(); counter.dispose(); await component.close(); component.dispose();
+  });
+  await test('s03-local-pending-stream-return-owner-cleanup', async () => {
+    const component = api.LocalComponent.new(1), owner = nextId(), id = nextId(), counter = await api.OwnerCounter.new(component, owner, 60);
+    const stream = await counter.rawValues(id, true), next = observe(stream.next());
+    await until(() => counts(id).polls > 0, 'raw !Send stream pending on owner');
+    const closing = observe(stream.return(), () => counts(id));
+    assert((await finishCleanup(id, closing)).ok, 'local subscription cleanup acknowledged');
+    cancelled(await next.result, 'local pending next');
+    open(owner, 8); await counter.close(); counter.dispose(); await component.close(); component.dispose();
+  });
+  await test('s03-local-stream-cancel-owner-close-waits-cleanup', async () => {
+    const component = api.LocalComponent.new(1), owner = nextId(), id = nextId(), counter = await api.OwnerCounter.new(component, owner, 60);
+    const stream = await counter.rawValues(id, true), next = observe(stream.next());
+    await until(() => counts(id).polls > 0, 'owner subscription pending before close');
+    open(owner, 8);
+    const abort = new AbortController(), closing = observe(component.close({ signal: abort.signal }), () => counts(id));
+    await until(() => counts(id).cleaning === 1, 'owner closes subscription');
+    abort.abort();
+    const other = observe(component.close(), () => counts(id));
+    cancelled(await finishCleanup(id, closing), 'cancelled owner close with live stream');
+    assert((await other.result).ok && other.atSettlement.cleaned === 1, 'other owner close waits same stream cleanup');
+    cancelled(await next.result, 'owner closes pending stream after cleanup');
+    await stream.return(); counter.dispose(); component.dispose();
+  });
+  await test('r1-infallible-result-value-shapes', async () => {
+    assert(api.infallibleValue(81) === 81, 'sync Result value');
+    assert(await api.infallibleAsyncValue(82) === 82, 'async Result value');
+    assert(await api.infallibleFutureValue(83) === 83, 'boxed Future Result value');
+    assert(api.infallibleUnit() === undefined, 'sync Result unit');
+    assert(await api.infallibleAsyncUnit() === undefined, 'async Result unit');
+    assert(await api.infallibleFutureUnit() === undefined, 'boxed Future Result unit');
+    for (const method of ['new', 'newArc', 'newFuture']) {
+      const object = await api.ResultConstructed[method](84);
+      assert(object.value() === 84, `${method} infallible Result constructor keeps Self/Arc conversion`);
+      object.dispose();
+    }
+  });
+  await test('r1-infallible-result-stream-shapes', async () => {
+    for (const [method, expected] of [
+      ['canonicalInfallible', [71, 72]], ['infallibleResultItems', [73, 74]],
+      ['infallibleSyncFactory', [71, 72]], ['infallibleAsyncFactory', [75, 76]],
+      ['infallibleFutureFactory', [71, 72]],
+    ]) {
+      const values = await collect(await api[method]());
+      assert(JSON.stringify(values) === JSON.stringify(expected), `${method} keeps original Result shape`);
+    }
+  });
+  await test('r1-host-infallible-result-shapes', async () => {
+    const items = (value) => ({ async *[Symbol.asyncIterator]() { yield value; } });
+    const provider = {
+      unit() {}, async asyncUnit() {}, async futureUnit() {},
+      value() { return 91; }, async asyncValue() { return 92; }, async futureValue() { return 93; },
+      canonical() { return items(94); }, async items() { return items(95); },
+      factory() { return items(96); }, async asyncFactory() { return items(97); },
+      async futureFactory() { return items(98); },
+    };
+    for (let kind = 0; kind < 11; kind++) {
+      const values = await api.hostInfallible(provider, kind);
+      assert(values.length === 1 && values[0] === 91 + kind, `reverse original Result shape ${kind}`);
+    }
+  });
+  await test('r1-method-input-stream-transfer', async () => {
+    const service = api.StreamService.new();
+    for (const method of ['echo', 'echoAsync']) {
+      const ack = deferred(), closed = deferred(); let pulls = 0, returning = 0, closing = 0, cleaned = 0;
+      const input = root.session.createInputStream({
+        async next() { pulls++; return { done: false, value: 100 + pulls }; },
+        async cancel() { returning++; await ack.promise; },
+      }, { async onClose() { closing++; await closed.promise; cleaned++; } });
+      const output = await service[method](input);
+      assert(pulls === 0 && returning === 0, `${method} factory preserves the producer without prefetch`);
+      assert((await output.next()).value === 101 && (await output.next()).value === 102, `${method} pulls after factory return`);
+      await api.pendingValue(0);
+      assert(pulls === 2 && returning === 0, `${method} producer remains subscribed`);
+      const first = observe(output.return(), () => ({ cleaned })), second = observe(output.return(), () => ({ cleaned }));
+      await until(() => returning === 1, `${method} subscription return closes producer`);
+      assert(!first.settled && !second.settled && closing === 0, `${method} close awaits producer return gate`);
+      ack.resolve(); await until(() => closing === 1, `${method} producer onClose entered`);
+      assert(!first.settled && !second.settled, `${method} close awaits producer onClose gate`);
+      closed.resolve();
+      assert((await first.result).ok && (await second.result).ok && first.atSettlement.cleaned === 1 && second.atSettlement.cleaned === 1,
+        `${method} concurrent return shares real cleanup`);
+      assert(returning === 1 && closing === 1 && (await output.next()).done, `${method} producer closes once`);
+    }
+    for (const method of ['echoFail', 'echoCancel']) {
+      const ack = deferred(); let pulls = 0, returning = 0, cleaned = 0;
+      const input = root.session.createInputStream({
+        async next() { pulls++; return { done: false, value: 1 }; },
+        async cancel() { returning++; await ack.promise; cleaned++; },
+      });
+      const operation = observe(service[method](input), () => ({ cleaned }));
+      await until(() => returning === 1, `${method} closes undelivered input`);
+      assert(!operation.settled && pulls === 0, `${method} waits cleanup without polling producer`);
+      ack.resolve(); const result = await operation.result;
+      assert(operation.atSettlement.cleaned === 1 && returning === 1, `${method} cleanup precedes terminal result`);
+      if (method === 'echoCancel') cancelled(result, 'cancelled echo factory');
+      else assert(!result.ok && result.error instanceof api.FixtureError && result.error.variant === 'Factory', 'echo factory error stays independent');
+    }
+    service.dispose();
+  });
+  assert(cases.length === 44 && cases.filter(name => name.startsWith('s03-')).length === 13 && cases.filter(name => name.startsWith('r1-')).length === 4,
+    `complete S01/S02/S03/S05 matrix: ${cases.length}`);
+  await deadline(root.close(), `${realm} final session cleanup`);
   return { realm, cases, status: 'passed' };
 }

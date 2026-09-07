@@ -30,22 +30,24 @@ pub struct Argument {
 #[derive(Clone)]
 pub struct ReturnType {
     pub return_ty: syn::ReturnType,
+    pub signature: uniffi_meta::async_signature::ReturnSignature,
 }
 
 impl Function {
     pub fn parse(attrs: FunctionAttributes, f: ItemFn) -> syn::Result<Self> {
+        let return_type = ReturnType::from_signature(&f.sig)?;
         Ok(Self {
             attrs,
             ident: f.sig.ident,
             vis: f.vis.into(),
-            is_async: f.sig.asyncness.is_some(),
+            is_async: return_type.signature.is_async(),
             args: f
                 .sig
                 .inputs
                 .into_iter()
                 .map(Argument::parse)
                 .collect::<syn::Result<Vec<_>>>()?,
-            return_ty: ReturnType::parse(f.sig.output)?,
+            return_ty: return_type,
         })
     }
 
@@ -57,15 +59,23 @@ impl Function {
     ) -> Result<uniffi_meta::FnMetadata> {
         let module_path = item_path.parent()?;
         let names = item_path.public_path_to_item(ir, cache)?;
-        let (return_type, throws) =
-            self.return_ty
-                .return_type_and_throws(ir, cache, &module_path)?;
+        let crate::types::ReturnType {
+            ok: return_type,
+            err: throws,
+            rust_return_is_result,
+            rust_stream_item_is_result,
+        } = self
+            .return_ty
+            .return_type_and_throws(ir, cache, &module_path)?;
 
         Ok(uniffi_meta::FnMetadata {
             module_path: names.module_path,
             name: names.name,
             orig_name: names.orig_name,
             is_async: self.is_async,
+            rust_async: self.return_ty.signature.rust_async,
+            rust_return_is_result,
+            rust_stream_item_is_result,
             docstring: self.attrs.docstring.clone(),
             checksum: None,
             inputs: self
@@ -139,8 +149,11 @@ impl Argument {
 }
 
 impl ReturnType {
-    pub fn parse(return_ty: syn::ReturnType) -> syn::Result<Self> {
-        Ok(Self { return_ty })
+    pub fn from_signature(sig: &syn::Signature) -> syn::Result<Self> {
+        Ok(Self {
+            return_ty: sig.output.clone(),
+            signature: uniffi_meta::async_signature::classify_signature(sig)?,
+        })
     }
 
     pub fn return_type_and_throws<'ir>(
@@ -148,7 +161,7 @@ impl ReturnType {
         ir: &'ir Ir,
         cache: &mut LookupCache<'ir>,
         module_path: &RPath<'ir>,
-    ) -> Result<(Option<uniffi_meta::Type>, Option<uniffi_meta::Type>)> {
+    ) -> Result<crate::types::ReturnType> {
         self._return_type_and_throws(ir, cache, module_path, None)
     }
 
@@ -158,7 +171,7 @@ impl ReturnType {
         cache: &mut LookupCache<'ir>,
         module_path: &RPath<'ir>,
         self_type: &uniffi_meta::Type,
-    ) -> Result<(Option<uniffi_meta::Type>, Option<uniffi_meta::Type>)> {
+    ) -> Result<crate::types::ReturnType> {
         self._return_type_and_throws(ir, cache, module_path, Some(self_type))
     }
 
@@ -168,13 +181,7 @@ impl ReturnType {
         cache: &mut LookupCache<'ir>,
         module_path: &RPath<'ir>,
         self_ty: Option<&uniffi_meta::Type>,
-    ) -> Result<(Option<uniffi_meta::Type>, Option<uniffi_meta::Type>)> {
-        Ok(match &self.return_ty {
-            syn::ReturnType::Default => (None, None),
-            syn::ReturnType::Type(_, return_ty) => {
-                let rt = module_path.resolve_return_type(ir, cache, return_ty, self_ty)?;
-                (rt.ok, rt.err)
-            }
-        })
+    ) -> Result<crate::types::ReturnType> {
+        module_path.resolve_return_type(ir, cache, &self.signature.output, self_ty)
     }
 }

@@ -218,3 +218,96 @@ impl Drop for NestedLocalCleanup {
         .expect("nested local cleanup context");
     }
 }
+
+struct LocalRawStream {
+    guard: LocalCallGuard,
+    remaining: u32,
+    pending: bool,
+}
+impl uniffi::deps::futures_core::Stream for LocalRawStream {
+    type Item = Option<u32>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.guard.owner.check();
+        update(self.guard.id, |s| s.polls += 1);
+        if self.pending {
+            return std::task::Poll::Pending;
+        }
+        if self.remaining == 0 {
+            return std::task::Poll::Ready(None);
+        }
+        self.remaining -= 1;
+        update(self.guard.id, |s| s.produced += 1);
+        std::task::Poll::Ready(Some(if self.remaining == 1 {
+            None
+        } else {
+            Some(self.guard.value.get())
+        }))
+    }
+}
+impl LocalCounter {
+    fn raw_stream(&self, id: u32, pending: bool) -> LocalRawStream {
+        self.owner.check();
+        update(id, |s| s.started += 1);
+        LocalRawStream {
+            guard: LocalCallGuard {
+                id,
+                value: self.value.clone(),
+                owner: self.owner.clone(),
+            },
+            remaining: 2,
+            pending,
+        }
+    }
+}
+#[uniffi::export(local, name = "OwnerCounter")]
+impl LocalCounter {
+    pub fn raw_values(
+        &self,
+        id: u32,
+        pending: bool,
+    ) -> impl uniffi::deps::futures_core::Stream<Item = Option<u32>> + 'static {
+        self.raw_stream(id, pending)
+    }
+    pub async fn cancel_raw_values(
+        &self,
+        id: u32,
+    ) -> impl uniffi::deps::futures_core::Stream<Item = Option<u32>> + 'static {
+        let stream = self.raw_stream(id, false);
+        uniffi::async_runtime::current_context()
+            .expect("local factory context")
+            .cancel();
+        stream
+    }
+    pub async fn async_raw_values(
+        &self,
+        id: u32,
+    ) -> impl uniffi::deps::futures_core::Stream<Item = Option<u32>> + 'static {
+        self.raw_stream(id, false)
+    }
+    pub fn future_raw_values(
+        &self,
+        id: u32,
+    ) -> impl std::future::Future<
+        Output = impl uniffi::deps::futures_core::Stream<Item = Option<u32>> + 'static,
+    > + '_ {
+        async move { self.raw_stream(id, false) }
+    }
+}
+trait LocalRawBusiness {
+    fn trait_raw_values(
+        &self,
+        id: u32,
+    ) -> impl uniffi::deps::futures_core::Stream<Item = Option<u32>> + 'static;
+}
+#[uniffi::export(local, name = "OwnerCounter")]
+impl LocalRawBusiness for LocalCounter {
+    fn trait_raw_values(
+        &self,
+        id: u32,
+    ) -> impl uniffi::deps::futures_core::Stream<Item = Option<u32>> + 'static {
+        self.raw_stream(id, false)
+    }
+}

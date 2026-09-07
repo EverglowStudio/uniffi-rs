@@ -121,11 +121,11 @@ impl CodeType for StreamCodeType {
 #[derive(Debug)]
 pub struct InputStreamCodeType {
     item: Type,
-    error: Type,
+    error: Option<Type>,
 }
 
 impl InputStreamCodeType {
-    pub fn new(item: Type, error: Type) -> Self {
+    pub fn new(item: Type, error: Option<Type>) -> Self {
         Self { item, error }
     }
 }
@@ -142,7 +142,7 @@ impl CodeType for InputStreamCodeType {
         format!(
             "InputStream{}{}",
             super::SwiftCodeOracle.find(&self.item).canonical_name(),
-            super::SwiftCodeOracle.find(&self.error).canonical_name()
+            self.error.as_ref().map(|error| super::SwiftCodeOracle.find(error).canonical_name()).unwrap_or_else(|| "Infallible".into())
         )
     }
 }

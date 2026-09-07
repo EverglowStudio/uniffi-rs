@@ -282,6 +282,10 @@ pub(crate) fn ffi_converter(
 }
 
 pub fn alter_trait(item: &ItemTrait) -> TokenStream {
+    alter_trait_result(item).unwrap_or_else(syn::Error::into_compile_error)
+}
+
+fn alter_trait_result(item: &ItemTrait) -> syn::Result<TokenStream> {
     let ItemTrait {
         attrs,
         vis,
@@ -297,8 +301,33 @@ pub fn alter_trait(item: &ItemTrait) -> TokenStream {
     } = item;
     let async_trait_attr =
         (has_async_method(item) && !has_async_trait_attr(attrs)).then(async_trait_annotation);
+    let items = items
+        .iter()
+        .map(|item| {
+            let syn::TraitItem::Fn(method) = item else {
+                return Ok(quote! { #item });
+            };
+            let variants = super::async_types::variants()
+                .iter()
+                .map(|&wasm| {
+                    let mut method = method.clone();
+                    if let Some(block) = &method.default {
+                        method.default = Some(super::async_types::normalize_body(
+                            &method.sig,
+                            block,
+                            wasm,
+                        )?);
+                    }
+                    method.sig = super::async_types::normalize_signature(&method.sig, wasm)?;
+                    let attr = super::async_types::target_attribute(wasm);
+                    Ok(quote! { #attr #method })
+                })
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote! { #(#variants)* })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
 
-    quote! {
+    Ok(quote! {
         #async_trait_attr
         #(#attrs)*
         #vis #unsafety #auto_token #trait_token #ident #generics #colon_token #supertraits {
@@ -309,7 +338,49 @@ pub fn alter_trait(item: &ItemTrait) -> TokenStream {
                 ::std::option::Option::None
             }
         }
+    })
+}
+
+pub(super) fn alter_impl(item: &syn::ItemImpl) -> syn::Result<TokenStream> {
+    let mut item = item.clone();
+    let has_async = item
+        .items
+        .iter()
+        .any(|i| matches!(i, syn::ImplItem::Fn(m) if m.sig.asyncness.is_some()));
+    let attr = (has_async && !has_async_trait_attr(&item.attrs)).then(async_trait_annotation);
+    let mut items = Vec::new();
+    for member in item.items {
+        let syn::ImplItem::Fn(method) = member else {
+            items.push(quote! { #member });
+            continue;
+        };
+        for &wasm in super::async_types::variants() {
+            let mut variant = method.clone();
+            variant.block = super::async_types::normalize_body(&variant.sig, &variant.block, wasm)?;
+            variant.sig = super::async_types::normalize_signature(&variant.sig, wasm)?;
+            let cfg = super::async_types::target_attribute(wasm);
+            items.push(quote! { #cfg #variant });
+        }
     }
+    item.items = Vec::new();
+    let syn::ItemImpl {
+        attrs,
+        defaultness,
+        unsafety,
+        impl_token,
+        generics,
+        trait_,
+        self_ty,
+        ..
+    } = item;
+    let (negative, trait_path, for_token) = trait_.expect("trait impl checked by caller");
+    let (impl_generics, _, where_clause) = generics.split_for_impl();
+    Ok(quote! {
+        #attr #(#attrs)*
+        #defaultness #unsafety #impl_token #impl_generics #negative #trait_path #for_token #self_ty #where_clause {
+            #(#items)*
+        }
+    })
 }
 
 fn has_async_method(item: &ItemTrait) -> bool {

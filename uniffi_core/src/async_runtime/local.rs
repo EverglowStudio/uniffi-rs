@@ -98,6 +98,8 @@ impl Completion {
     }
 }
 struct Control {
+    // Recover the current executor for owner-only storage, without a strong cycle.
+    executor: Mutex<std::sync::Weak<ExecutorHandle>>,
     stop: CancellationToken,
     changed: Notify,
     done: Arc<Completion>,
@@ -494,6 +496,7 @@ impl LocalExecutor {
         }
         let (sender, receiver) = mpsc::channel(capacity);
         let control = Arc::new(Control {
+            executor: Mutex::new(std::sync::Weak::new()),
             stop: CancellationToken::new(),
             changed: Notify::new(),
             done: Completion::new(),
@@ -529,9 +532,9 @@ impl LocalExecutor {
                 .done
                 .finish(result.map_err(|_| LocalError::ExecutorStopped));
         });
-        Ok(Self {
-            handle: Arc::new(ExecutorHandle { sender, control }),
-        })
+        let handle = Arc::new(ExecutorHandle { sender, control });
+        *handle.control.executor.lock().unwrap() = Arc::downgrade(&handle);
+        Ok(Self { handle })
     }
     /// Request shutdown independently of queue capacity.
     pub fn cancel(&self) {
@@ -913,4 +916,44 @@ async fn drive(control: Arc<Control>, mut receiver: mpsc::Receiver<Packet>) {
         future: Some(Box::pin(driver)),
     }
     .await;
+}
+
+/// Store an already constructed value on the current owner. The value never
+/// crosses a thread: only the same typed ID/control used by create is returned.
+/// This narrow entry point is used by local_stream after local method execution.
+pub(super) fn store_current_local<T: 'static>(value: T) -> Result<LocalObject<T>, LocalError> {
+    let owner = CURRENT
+        .with(|slot| slot.borrow().clone())
+        .ok_or(LocalError::NoOwner)?;
+    if owner.control.stop.is_cancelled() {
+        return Err(LocalError::Closed);
+    }
+    let handle = owner
+        .control
+        .executor
+        .lock()
+        .unwrap()
+        .upgrade()
+        .ok_or(LocalError::Closed)?;
+    let id = owner.id();
+    let control = Arc::new(ObjectControl {
+        stop: CancellationToken::new(),
+        done: Completion::new(),
+        owner: owner.control.clone(),
+    });
+    owner.objects.borrow_mut().insert(
+        id,
+        Entry {
+            value: Rc::new(value),
+            control: control.clone(),
+        },
+    );
+    Ok(LocalObject {
+        proxy: Arc::new(Proxy {
+            executor: LocalExecutor { handle },
+            id,
+            control,
+        }),
+        marker: PhantomData,
+    })
 }

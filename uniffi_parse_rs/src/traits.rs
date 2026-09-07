@@ -30,11 +30,22 @@ pub struct TraitMethod {
 
 impl Trait {
     pub fn parse(env: &CompileEnv, attrs: TraitAttributes, tr: ItemTrait) -> syn::Result<Self> {
+        uniffi_meta::async_signature::validate_generics(&tr.generics)?;
+        let foreign = match attrs.export_ty {
+            TraitExportType::CallbackInterface => true,
+            TraitExportType::TraitInterface(kind) => kind.has_foreign(),
+        };
         let mut methods = vec![];
         for item in tr.items {
             if let TraitItem::Fn(f) = item {
-                if let Some(attrs) = MethodAttributes::parse(env, &f.attrs)? {
-                    methods.push(TraitMethod::parse(attrs, f)?);
+                if let Some(method_attrs) = MethodAttributes::parse(env, &f.attrs)? {
+                    if foreign {
+                        uniffi_meta::async_signature::validate_foreign_async_bounds(
+                            &f.sig,
+                            env.is_wasm(),
+                        )?;
+                    }
+                    methods.push(TraitMethod::parse(method_attrs, f)?);
                 }
             }
         }
@@ -121,18 +132,19 @@ impl Trait {
 
 impl TraitMethod {
     pub fn parse(attrs: MethodAttributes, f: TraitItemFn) -> syn::Result<Self> {
+        let return_type = ReturnType::from_signature(&f.sig)?;
         let mut inputs = f.sig.inputs.into_iter();
         let self_arg = SelfArg::parse(inputs.next(), f.sig.ident.span())?;
 
         Ok(Self {
             attrs,
             ident: f.sig.ident,
-            is_async: f.sig.asyncness.is_some(),
+            is_async: return_type.signature.is_async(),
             self_arg,
             args: inputs
                 .map(Argument::parse)
                 .collect::<syn::Result<Vec<_>>>()?,
-            return_type: ReturnType::parse(f.sig.output)?,
+            return_type,
         })
     }
 
@@ -145,9 +157,14 @@ impl TraitMethod {
         self_ty: &uniffi_meta::Type,
         index: usize,
     ) -> Result<uniffi_meta::TraitMethodMetadata> {
-        let (return_type, throws) =
-            self.return_type
-                .return_type_and_throws_for_method(ir, cache, module_path, self_ty)?;
+        let crate::types::ReturnType {
+            ok: return_type,
+            err: throws,
+            rust_return_is_result,
+            rust_stream_item_is_result,
+        } = self
+            .return_type
+            .return_type_and_throws_for_method(ir, cache, module_path, self_ty)?;
         let item_name = self.ident.unraw().to_string();
         let (name, orig_name) = match &self.attrs.name {
             None => (item_name, None),
@@ -162,6 +179,9 @@ impl TraitMethod {
             orig_name,
             docstring: self.attrs.docstring.clone(),
             is_async: self.is_async,
+            rust_async: self.return_type.signature.rust_async,
+            rust_return_is_result,
+            rust_stream_item_is_result,
             takes_self_by_arc: self.self_arg.takes_self_by_arc(ir, cache, module_path)?,
             inputs: self
                 .args

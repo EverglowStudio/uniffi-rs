@@ -2401,7 +2401,7 @@ fn render_operation_helpers(
         );
         let resource = model.stream_resource(operation, StreamDirection::Output)?;
         let error_decoder = match &resource.error {
-            ValueType::Named(key)
+            Some(error @ ValueType::Named(key))
                 if model
                     .ty_for(key)
                     .is_some_and(|ty| matches!(ty.kind, AstTypeKind::Error { .. })) =>
@@ -2410,7 +2410,7 @@ fn render_operation_helpers(
                     model,
                     helpers,
                     &format!("operation_{}_stream_error", operation.id.index()),
-                    &resource.error,
+                    error,
                     "return.error",
                     Some(operation.id),
                 );

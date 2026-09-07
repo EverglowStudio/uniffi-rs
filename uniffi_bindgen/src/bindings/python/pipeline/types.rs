@@ -168,7 +168,7 @@ mod tests {
         let err = type_name(
             &Type::Stream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             },
             &Context::default(),
@@ -184,7 +184,7 @@ mod tests {
         let err = type_name(
             &Type::InputStream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             },
             &Context::default(),

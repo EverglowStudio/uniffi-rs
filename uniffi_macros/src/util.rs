@@ -345,14 +345,14 @@ pub(crate) fn async_trait_annotation() -> TokenStream {
     #[cfg(feature = "wasm-unstable-single-threaded")]
     {
         quote! {
-            #[cfg_attr(not(target_arch = "wasm32"), ::async_trait::async_trait)]
-            #[cfg_attr(target_arch = "wasm32", ::async_trait::async_trait(?Send))]
+            #[cfg_attr(not(target_arch = "wasm32"), ::uniffi::deps::async_trait::async_trait)]
+            #[cfg_attr(target_arch = "wasm32", ::uniffi::deps::async_trait::async_trait(?Send))]
         }
     }
     #[cfg(not(feature = "wasm-unstable-single-threaded"))]
     {
         quote! {
-            #[::async_trait::async_trait]
+            #[::uniffi::deps::async_trait::async_trait]
         }
     }
 }

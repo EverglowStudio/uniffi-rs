@@ -1,0 +1,5 @@
+error: foreign Future/Stream implementations do not support Sync bounds
+ --> tests/async-ui/foreign_sync.rs:3:89
+  |
+3 |     fn value(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = u32> + Send + Sync + 'static>>;
+  |                                                                                         ^^^^

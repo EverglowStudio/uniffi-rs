@@ -186,7 +186,7 @@ fn normalize_type_module_path(ty: &Type) -> Type {
             is_send,
         } => Type::Stream {
             item_type: Box::new(normalize_type_module_path(item_type)),
-            error_type: Box::new(normalize_type_module_path(error_type)),
+            error_type: error_type.as_ref().map(|error| Box::new(normalize_type_module_path(error))),
             is_send: *is_send,
         },
         Type::InputStream {
@@ -195,7 +195,7 @@ fn normalize_type_module_path(ty: &Type) -> Type {
             is_send,
         } => Type::InputStream {
             item_type: Box::new(normalize_type_module_path(item_type)),
-            error_type: Box::new(normalize_type_module_path(error_type)),
+            error_type: error_type.as_ref().map(|error| Box::new(normalize_type_module_path(error))),
             is_send: *is_send,
         },
         Type::Custom {

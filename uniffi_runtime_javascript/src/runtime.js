@@ -295,13 +295,13 @@ export class CallbackRegistry {
     if (!methodSpec) throw new UniffiError({ errorName: "UniffiCallbackMethod", message: `unknown callback method ${String(methodId)}` });
     if (methodSpec.async === true) throw new UniffiError({ errorName: "UniffiCallbackProtocol", message: "async callback method invoked synchronously" });
     const convertedArgs = methodSpec?.args
-      ? methodSpec.args.map((descriptor, index) => liftValue(args[index], descriptor, this.session, entry.context))
+      ? methodSpec.args.map((descriptor, index) => liftValue(args[index], descriptor, this.session, entry.context, { ...methodSpec, streamArgumentPath: `argument[${index}]` }))
       : args;
     entry.activeSync += 1;
     try {
       let result = this._invokeLocal(entry, methodSpec, convertedArgs);
       if (result && typeof result.then === "function") throw new UniffiError({ errorName: "UniffiCallbackProtocol", message: "sync callback returned a Promise" });
-      if (methodSpec?.returnType) result = lowerValue(result, methodSpec.returnType, entry.context, this.session, { callbackContracts: methodSpec.callbackContracts || {} }, "return");
+      if (methodSpec?.returnType) result = lowerValue(result, methodSpec.returnType, entry.context, this.session, methodSpec, "return");
       return result;
     } catch (raw) {
       throw lowerCallbackError(raw, methodSpec, entry.context, this.session);
@@ -328,7 +328,7 @@ export class CallbackRegistry {
     if (!methodSpec) throw new UniffiError({ errorName: "UniffiCallbackMethod", message: `unknown callback method ${String(methodId)}` });
     if (methodSpec.async === false) throw new UniffiError({ errorName: "UniffiCallbackProtocol", message: "sync callback method invoked asynchronously" });
     const convertedArgs = methodSpec?.args
-      ? methodSpec.args.map((descriptor, index) => liftValue(args[index], descriptor, this.session, entry.context))
+      ? methodSpec.args.map((descriptor, index) => liftValue(args[index], descriptor, this.session, entry.context, { ...methodSpec, streamArgumentPath: `argument[${index}]` }))
       : args;
     entry.activeAsync.add(invocationKey);
     const generation = this.session?.generation;
@@ -341,7 +341,7 @@ export class CallbackRegistry {
         result = await result;
       }
       if (this.session && !this.session._generationActive(generation)) throw closedError();
-      if (methodSpec?.returnType) result = lowerValue(result, methodSpec.returnType, entry.context, this.session, { callbackContracts: methodSpec.callbackContracts || {} }, "return");
+      if (methodSpec?.returnType) result = lowerValue(result, methodSpec.returnType, entry.context, this.session, methodSpec, "return");
       return result;
     } catch (raw) {
       throw lowerCallbackError(raw, methodSpec, entry.context, this.session);
@@ -1093,12 +1093,12 @@ export class BackendSession {
         pending = true;
         try {
           await ensureStarted();
-          if (phase !== "active") { await closePromise; return terminal(); }
+          if (phase !== "active") { await closePromise; throw cancelledError(); }
           if (typeof options.next !== "function") throw streamPlanError("output stream is missing canonical next operation");
           nextPromise = session._guardPromise(Promise.resolve().then(() => phase === "active" ? options.next(handle) : { kind: "done" }));
           const raw = await nextPromise;
           if (raw === DETACHED || detached) throw environmentDestroyedError();
-          if (phase !== "active") { await closePromise; return terminal(); }
+          if (phase !== "active") { await closePromise; throw cancelledError(); }
           const step = validateStep(raw);
           if (step.kind === "item") return { done: false, value: typeof options.liftItem === "function" ? options.liftItem(step.value) : step.value };
           phase = "done";
@@ -1107,7 +1107,7 @@ export class BackendSession {
           return terminal();
         } catch (error) {
           if (detached) throw environmentDestroyedError();
-          if (phase === "cancelled") { await closePromise; return terminal(); }
+          if (phase === "cancelled") { await closePromise; throw cancelledError(); }
           if (phase !== "done") await cancel();
           throw asUniffiError(error);
         } finally { pending = false; nextPromise = null; }
@@ -1477,6 +1477,7 @@ function pathForStream(operation, descriptor, direction) {
   const resources = operation?.streamResources;
   if (!Array.isArray(resources)) throw streamPlanError("operation is missing canonical stream resources");
   if (direction === "Output" && descriptor?.kind === "outputStream") return "return";
+  if (direction === "Input" && operation?.streamArgumentPath) return operation.streamArgumentPath;
   const matches = resources.filter((resource) => resource && resource.direction === direction);
   if (matches.length !== 1) throw streamPlanError(`cannot select one ${direction} stream resource`);
   return matches[0].path;
@@ -1523,10 +1524,11 @@ function streamErrorLifter(resource, context, session, operation) {
 // payload variants use a validated tagged object and never forward arbitrary
 // Error properties into the ABI.
 function lowerInputStreamError(raw, descriptor, context, session, operation, path) {
-  const streamPath = path || pathForStream(operation, descriptor, "Input");
-  const resource = streamResourceAt(operation, streamPath, "Input");
+  const direction = descriptor?.kind === "outputStream" ? "Output" : "Input";
+  const streamPath = path || pathForStream(operation, descriptor, direction);
+  const resource = streamResourceAt(operation, streamPath, direction);
   const errorType = resource?.error;
-  if (!errorType) throw streamPlanError(`input stream at ${String(streamPath)} is missing its error descriptor`);
+  if (!errorType) throw new UniffiError({ errorName: "UniffiUnexpectedStreamError", message: `infallible stream producer failed: ${raw?.message || String(raw)}` });
   const named = errorType.kind === "named" ? resolveNamedDescriptor(errorType, context) : errorType;
   if (!named || named.kind !== "enum" || !named.error) {
     return lowerValue(raw, errorType, context, session, operation, streamPath);
@@ -1571,7 +1573,8 @@ function createBackendInputStream(session, handle, resource, context, operation)
   const liftItem = (item) => liftValue(item, resource.item, session, context, operation);
   const liftError = streamErrorLifter(resource, context, session, operation);
   let cancelled = false;
-  let released = false;
+  let closing = null;
+  let released = null;
   let pending = false;
   const marker = {
     __uniffiInputStream: true,
@@ -1587,16 +1590,22 @@ function createBackendInputStream(session, handle, resource, context, operation)
         return { done: false, value: liftItem(step.value) };
       } finally { pending = false; }
     },
-    async cancel() {
-      if (cancelled) return;
+    cancel() {
+      if (closing) return closing;
       cancelled = true;
-      try { await session._invokeHostAsync(cancelId, [handle]); } finally { if (!released) marker.release(); }
+      closing = (async () => {
+        try { await session._invokeHostAsync(cancelId, [handle]); }
+        finally { await marker.release(); }
+      })();
+      closing.catch(() => {});
+      return closing;
     },
     release() {
-      if (released) return;
-      released = true;
-      session.releaseInputStream(handle);
+      if (!released) released = session.releaseInputStream(handle);
+      return released;
     },
+    [Symbol.asyncIterator]() { return this; },
+    async return() { await marker.cancel(); return { done: true, value: undefined }; },
   };
   return marker;
 }
@@ -1618,7 +1627,8 @@ export function lowerValue(value, descriptor, context = null, session = null, op
     case "sequence": if (!Array.isArray(value)) throw new UniffiError({ errorName: "UniffiSequenceType", message: "sequence requires an Array" }); return value.map((item) => lowerValue(item, descriptor.inner, context, session, operation, appendValuePath(path, "item")));
     case "map": if (!(value instanceof Map)) throw new UniffiError({ errorName: "UniffiMapType", message: "map requires a Map" }); return new Map([...value].map(([key, item]) => [lowerValue(key, descriptor.key, context, session, operation, appendValuePath(path, "key")), lowerValue(item, descriptor.value, context, session, operation, appendValuePath(path, "value"))]));
     case "set": if (!(value instanceof Set)) throw new UniffiError({ errorName: "UniffiSetType", message: "set requires a Set" }); return new Set([...value].map((item) => lowerValue(item, descriptor.inner, context, session, operation, appendValuePath(path, "set-item"))));
-    case "inputStream": {
+    case "inputStream":
+    case "outputStream": {
       if (!session || !session.createInputStream) return value;
       const marker = session.createInputStream(value, {
         lowerItem: (item) => lowerValue(item, descriptor.inner, context, session, operation, appendValuePath(path, "item")),
@@ -1626,7 +1636,6 @@ export function lowerValue(value, descriptor, context = null, session = null, op
       });
       return marker && own(marker, "handle") ? marker.handle : marker;
     }
-    case "outputStream": return value;
     case "named": {
       const named = resolveNamedDescriptor(descriptor, context);
       if (named === descriptor) return value;
@@ -1736,7 +1745,9 @@ export function liftValue(value, descriptor, session = null, context = null, ope
         const nextId = streamSlot(resource, "OutputStreamNext");
         const cancelId = streamSlot(resource, "OutputStreamCancel");
         return session.createOutputStream({
-          handle,
+          // Native sessions retain the resource carrier; WASM uses a number.
+          // Pass the backend's value intact, as the top-level factory does.
+          handle: value,
           next: (activeHandle, callOptions) => session.invokeAsync(nextId, [activeHandle], callOptions),
           cancel: (activeHandle) => session._invokeCleanupAsync(cancelId, [activeHandle]),
           liftItem: (item) => liftValue(item, descriptor.inner, session, context, operation),
@@ -1810,7 +1821,7 @@ function makeOperation(session, descriptor) {
       for (let index = 0; index < descriptor.args.length; index += 1) {
         const argument = descriptor.args[index];
         if (index >= args.length || (args[index] === undefined && (argument.rustDefault || argument.default !== undefined))) {
-          if (argument.rustDefault) break;
+          if (argument.rustDefault) { lowered.push(undefined); continue; }
           if (argument.default !== undefined) {
             lowered.push(lowerValue(argument.default, argument.type, descriptor.context || descriptor, session, descriptor, `argument[${index}]`));
             continue;
@@ -1836,7 +1847,9 @@ function makeOperation(session, descriptor) {
       finishSync();
       throw error;
     }
-    if (descriptor.kind === "OutputStreamStart" && descriptor.returnType?.kind === "outputStream") {
+    // A returned subscription owns the call frame, including input producers
+    // moved into it by either a free function or an object method.
+    if (descriptor.returnType?.kind === "outputStream") {
       const resource = streamResourceAt(descriptor, "return", "Output");
       const nextId = streamSlot(resource, "OutputStreamNext");
       const cancelId = streamSlot(resource, "OutputStreamCancel");
@@ -1857,7 +1870,10 @@ function makeOperation(session, descriptor) {
           return session.createOutputStream({ ...streamOptions, handle });
         }, async (error) => { await finishFrame(); throw normalizeOperationError(error, descriptor, session); }));
       }
-      return session.createOutputStream({ ...streamOptions, start: () => session.invokeSync(descriptor.id, nativeArgs) });
+      return session.createOutputStream({ ...streamOptions, start: () => {
+        try { return session.invokeSync(descriptor.id, nativeArgs); }
+        catch (error) { throw normalizeOperationError(error, descriptor, session); }
+      } });
     }
     const lift = (value) => descriptor.returnType == null
       ? undefined

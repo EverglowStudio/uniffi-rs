@@ -145,12 +145,14 @@ pub enum Type {
     },
     Stream {
         item_type: Box<Type>,
-        error_type: Box<Type>,
+        /// None means the source stream has no business-error variant.
+        error_type: Option<Box<Type>>,
         is_send: bool,
     },
     InputStream {
         item_type: Box<Type>,
-        error_type: Box<Type>,
+        /// None means the source stream has no business-error variant.
+        error_type: Option<Box<Type>>,
         is_send: bool,
     },
     // Custom type on the scaffolding side
@@ -186,7 +188,7 @@ impl Type {
                 item_type,
                 error_type,
                 ..
-            } => Box::new(item_type.iter_types().chain(error_type.iter_types())),
+            } => Box::new(item_type.iter_types().chain(error_type.iter().flat_map(|error| error.iter_types()))),
             Type::Custom { builtin, .. } => builtin.iter_types(),
             _ => Box::new(std::iter::empty()),
         }
@@ -263,7 +265,9 @@ impl Type {
                 ..
             } => {
                 item_type.rename_recursive(name_transformer);
-                error_type.rename_recursive(name_transformer);
+                if let Some(error_type) = error_type {
+                    error_type.rename_recursive(name_transformer);
+                }
             }
             Type::Custom { builtin, .. } => {
                 builtin.rename_recursive(name_transformer);

@@ -7,5 +7,7 @@
 /// on all the functionality.
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod shape_tests;
 
 pub struct UniFfiTag;

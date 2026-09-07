@@ -450,14 +450,29 @@ extern "C" fn input_stream_cancel(_handle: uniffi::Handle) {
     INPUT_STREAM_CANCELS.fetch_add(1, Ordering::SeqCst);
 }
 
+extern "C" fn input_stream_close(
+    _: uniffi::Handle,
+    callback: uniffi::ForeignFutureCallback<()>,
+    data: u64,
+    _: &mut uniffi::ForeignFutureDroppedCallbackStruct,
+) {
+    // This fixture has no producer task: cancel has already released its state.
+    callback(
+        data,
+        uniffi::ForeignFutureResult::from_raw_parts((), uniffi::RustCallStatus::default()),
+    );
+}
+
 fn register_input_stream_callbacks() {
     uniffi_uniffi_fn_func_sum_input_events_input_stream_events_init(
         input_stream_next,
         input_stream_cancel,
+        input_stream_close,
     );
     uniffi_uniffi_fn_func_running_sum_input_stream_events_init(
         input_stream_next,
         input_stream_cancel,
+        input_stream_close,
     );
 }
 
@@ -672,7 +687,7 @@ fn stream_concurrent_next_is_rejected() {
     assert_eq!(value, None);
 
     // The client error belongs only to the second next call. The registry and
-    // first future must remain reachable so raw cancel can wake it to Done.
+    // first future must remain reachable so raw cancel can wake it as cancelled.
     uniffi_uniffi_fn_func_pending_events_stream_cancel(handle);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while pending_poll.load(Ordering::SeqCst) == -1 {
@@ -698,11 +713,8 @@ fn stream_concurrent_next_is_rejected() {
     unsafe {
         ffi_uniffi_rust_future_free_rust_buffer(pending);
     }
-    assert_eq!(status.code, uniffi::RustCallStatusCode::Success);
-    assert_eq!(
-        decode_native_stream_step::<StreamEvent>(buffer.destroy_into_vec()),
-        NativeStreamStep::Done
-    );
+    assert_eq!(status.code, uniffi::RustCallStatusCode::Cancelled);
+    assert!(buffer.destroy_into_vec().is_empty());
 }
 
 #[test]

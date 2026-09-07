@@ -53,6 +53,9 @@ pub struct Function {
     pub(super) orig_name: String,
     pub(super) module_path: String,
     pub(super) is_async: bool,
+    pub(super) rust_async: bool,
+    pub(super) rust_return_is_result: bool,
+    pub(super) rust_stream_item_is_result: bool,
     pub(super) arguments: Vec<Argument>,
     pub(super) return_type: Option<Type>,
     // We don't include the FFIFunc in the hash calculation, because:
@@ -91,15 +94,23 @@ impl Function {
         self.is_async
     }
 
-    pub fn arguments(&self) -> Vec<&Argument> {
-        self.arguments.iter().collect()
+    /// Whether the original Rust declaration uses async fn.
+    pub fn rust_async(&self) -> bool {
+        self.rust_async
     }
 
-    pub fn input_stream_arguments(&self) -> Vec<&Argument> {
-        self.arguments
-            .iter()
-            .filter(|arg| matches!(arg.as_type(), Type::InputStream { .. }))
-            .collect()
+    /// Whether the original Rust output is Result, even without a business error.
+    pub fn rust_return_is_result(&self) -> bool {
+        self.rust_return_is_result
+    }
+
+    /// Original Rust Result Item shape, independent of the stream's business error metadata.
+    pub fn rust_stream_item_is_result(&self) -> bool {
+        self.rust_stream_item_is_result
+    }
+
+    pub fn arguments(&self) -> Vec<&Argument> {
+        self.arguments.iter().collect()
     }
 
     pub fn full_arguments(&self) -> Vec<Argument> {
@@ -132,10 +143,6 @@ impl Function {
 
     pub fn throws_type(&self) -> Option<&Type> {
         self.throws.as_ref()
-    }
-
-    pub fn ffi_input_stream_init_func(&self, arg: &Argument) -> String {
-        uniffi_meta::fn_input_stream_init_symbol_name(&self.module_path, &self.name, arg.name())
     }
 
     pub fn input_stream_initialization_fn_name(&self, arg: &Argument) -> String {
@@ -197,6 +204,9 @@ impl From<uniffi_meta::FnMetadata> for Function {
             orig_name,
             module_path: meta.module_path,
             is_async,
+            rust_async: meta.rust_async,
+            rust_return_is_result: meta.rust_return_is_result,
+            rust_stream_item_is_result: meta.rust_stream_item_is_result,
             arguments,
             return_type,
             ffi_func,
@@ -301,6 +311,9 @@ pub trait Callable {
     fn return_type(&self) -> Option<&Type>;
     fn throws_type(&self) -> Option<&Type>;
     fn is_async(&self) -> bool;
+    fn rust_async(&self) -> bool;
+    fn rust_return_is_result(&self) -> bool;
+    fn rust_stream_item_is_result(&self) -> bool;
     fn docstring(&self) -> Option<&str>;
 
     /// Original Rust source item name, before a foreign-facing rename.
@@ -364,6 +377,21 @@ pub trait Callable {
             .to_owned()
     }
 
+    fn input_stream_arguments(&self) -> Vec<&Argument> {
+        self.arguments()
+            .into_iter()
+            .filter(|arg| matches!(arg.as_type(), Type::InputStream { .. }))
+            .collect()
+    }
+
+    fn ffi_input_stream_init_func(&self, arg: &Argument) -> String {
+        format!(
+            "{}_input_stream_{}_init",
+            self.ffi_func().name(),
+            arg.name()
+        )
+    }
+
     fn is_stream(&self) -> bool {
         matches!(self.return_type(), Some(Type::Stream { .. }))
     }
@@ -377,7 +405,7 @@ pub trait Callable {
 
     fn stream_error_type(&self) -> Option<&Type> {
         match self.return_type() {
-            Some(Type::Stream { error_type, .. }) => Some(error_type),
+            Some(Type::Stream { error_type, .. }) => error_type.as_deref(),
             _ => None,
         }
     }
@@ -392,6 +420,26 @@ pub trait Callable {
 
     fn ffi_stream_cancel_func(&self) -> String {
         format!("{}_stream_cancel", self.ffi_func().name())
+    }
+
+    fn ffi_stream_close_func(&self) -> String {
+        format!("{}_stream_close", self.ffi_func().name())
+    }
+
+    fn ffi_stream_close_rust_future_poll(&self, ci: &ComponentInterface) -> String {
+        ci.ffi_rust_future_poll(None).name().to_owned()
+    }
+
+    fn ffi_stream_close_rust_future_cancel(&self, ci: &ComponentInterface) -> String {
+        ci.ffi_rust_future_cancel(None).name().to_owned()
+    }
+
+    fn ffi_stream_close_rust_future_complete(&self, ci: &ComponentInterface) -> String {
+        ci.ffi_rust_future_complete(None).name().to_owned()
+    }
+
+    fn ffi_stream_close_rust_future_free(&self, ci: &ComponentInterface) -> String {
+        ci.ffi_rust_future_free(None).name().to_owned()
     }
 
     fn ffi_stream_next_rust_future_poll(&self, ci: &ComponentInterface) -> String {
@@ -456,6 +504,18 @@ impl Callable for Function {
         self.is_async
     }
 
+    fn rust_async(&self) -> bool {
+        self.rust_async
+    }
+
+    fn rust_return_is_result(&self) -> bool {
+        self.rust_return_is_result
+    }
+
+    fn rust_stream_item_is_result(&self) -> bool {
+        self.rust_stream_item_is_result
+    }
+
     fn ffi_func(&self) -> &FfiFunction {
         &self.ffi_func
     }
@@ -477,6 +537,18 @@ impl<T: Callable> Callable for &T {
 
     fn is_async(&self) -> bool {
         (*self).is_async()
+    }
+
+    fn rust_async(&self) -> bool {
+        (*self).rust_async()
+    }
+
+    fn rust_return_is_result(&self) -> bool {
+        (*self).rust_return_is_result()
+    }
+
+    fn rust_stream_item_is_result(&self) -> bool {
+        (*self).rust_stream_item_is_result()
     }
 
     fn docstring(&self) -> Option<&str> {
@@ -604,6 +676,9 @@ mod test {
             orig_name: "fn".to_string(),
             module_path: "fn".to_string(),
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             arguments: vec![Argument {
                 name: "a".to_string(),
                 type_: Type::Int32,

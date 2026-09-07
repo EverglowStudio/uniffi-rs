@@ -128,6 +128,8 @@ pub struct Callable {
     pub name: String,
     pub orig_name: String,
     pub async_data: Option<AsyncData>,
+    pub rust_return_is_result: bool,
+    pub rust_stream_item_is_result: bool,
     pub kind: CallableKind,
     pub arguments: Vec<Argument>,
     pub return_type: ReturnType,

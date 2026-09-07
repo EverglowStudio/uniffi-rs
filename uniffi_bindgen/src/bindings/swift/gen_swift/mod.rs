@@ -860,7 +860,7 @@ impl SwiftCodeOracle {
                 item_type,
                 error_type,
                 ..
-            } => Box::new(compounds::InputStreamCodeType::new(*item_type, *error_type)),
+            } => Box::new(compounds::InputStreamCodeType::new(*item_type, error_type.map(|error| *error))),
             Type::Custom { name, builtin, .. } => Box::new(custom::CustomCodeType::new(
                 name,
                 self.create_code_type(*builtin),
@@ -1433,16 +1433,19 @@ mod tests {
             name: "count_events".to_owned(),
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: true,
             inputs: vec![FnParamMetadata {
                 name: "count".to_owned(),
                 ty: Type::UInt32,
-                by_ref: false,
+                pass_by: uniffi_meta::PassBy::Value,
                 optional: false,
                 default: None,
             }],
             return_type: Some(Type::Stream {
                 item_type: Box::new(stream_event_type),
-                error_type: Box::new(stream_error_type.clone()),
+                error_type: Some(Box::new(stream_error_type.clone())),
                 is_send: true,
             }),
             throws: None,
@@ -1454,12 +1457,15 @@ mod tests {
             name: "optional_events".to_owned(),
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: true,
             inputs: vec![],
             return_type: Some(Type::Stream {
                 item_type: Box::new(Type::Optional {
                     inner_type: Box::new(Type::UInt32),
                 }),
-                error_type: Box::new(stream_error_type),
+                error_type: Some(Box::new(stream_error_type)),
                 is_send: true,
             }),
             throws: None,
@@ -1498,6 +1504,9 @@ mod tests {
             name: "ready_value".to_owned(),
             orig_name: None,
             is_async: true,
+            rust_async: true,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: false,
             inputs: vec![],
             return_type: Some(Type::UInt32),
             throws: None,
@@ -1566,14 +1575,17 @@ mod tests {
             name: "sum_events".to_owned(),
             orig_name: None,
             is_async: true,
+            rust_async: true,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),
                 ty: Type::InputStream {
                     item_type: Box::new(counter_event_type.clone()),
-                    error_type: Box::new(stream_error_type.clone()),
+                    error_type: Some(Box::new(stream_error_type.clone())),
                     is_send: true,
                 },
-                by_ref: false,
+                pass_by: uniffi_meta::PassBy::Value,
                 optional: false,
                 default: None,
             }],
@@ -1587,20 +1599,23 @@ mod tests {
             name: "running_sum".to_owned(),
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: true,
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),
                 ty: Type::InputStream {
                     item_type: Box::new(counter_event_type.clone()),
-                    error_type: Box::new(stream_error_type.clone()),
+                    error_type: Some(Box::new(stream_error_type.clone())),
                     is_send: true,
                 },
-                by_ref: false,
+                pass_by: uniffi_meta::PassBy::Value,
                 optional: false,
                 default: None,
             }],
             return_type: Some(Type::Stream {
                 item_type: Box::new(counter_event_type),
-                error_type: Box::new(stream_error_type),
+                error_type: Some(Box::new(stream_error_type)),
                 is_send: true,
             }),
             throws: None,
@@ -1718,6 +1733,7 @@ mod tests {
         assert!(swift.contains("uniffi_stream_core_fn_func_sum_events_input_stream_events_init("));
         assert!(swift.contains("uniffiInputStreamNextCallback"));
         assert!(swift.contains("uniffiInputStreamCancelCallback"));
+        assert!(swift.contains("uniffiInputStreamCloseCallback"));
         assert!(swift.contains("UniffiForeignFutureResultRustBuffer("));
         assert!(!swift.contains("input stream parameters are not supported"));
 
@@ -1794,6 +1810,7 @@ mod tests {
 
         let output = Command::new("swiftc")
             .arg("-typecheck")
+            .arg("-warnings-as-errors")
             .arg("-swift-version")
             .arg("5")
             .arg("-I")
@@ -2375,6 +2392,7 @@ private struct StreamRuntimeFixture {
 
         let output = Command::new("swiftc")
             .arg("-typecheck")
+            .arg("-warnings-as-errors")
             .arg("-swift-version")
             .arg("5")
             .arg("-I")

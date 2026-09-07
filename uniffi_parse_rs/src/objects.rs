@@ -67,16 +67,21 @@ impl Object {
             orig_name: names.orig_name,
             remote: self.attrs.remote,
             docstring: self.attrs.docstring.clone(),
-            imp: ObjectImpl::Struct,
+            imp: if self.attrs.local {
+                ObjectImpl::LocalStruct
+            } else {
+                ObjectImpl::Struct
+            },
         })
     }
 }
 
 impl Constructor {
     pub fn parse(attrs: ConstructorAttributes, f: ImplItemFn) -> syn::Result<Self> {
+        let return_type = ReturnType::from_signature(&f.sig)?;
         Ok(Self {
             attrs,
-            is_async: f.sig.asyncness.is_some(),
+            is_async: return_type.signature.is_async(),
             ident: f.sig.ident,
             args: f
                 .sig
@@ -84,7 +89,7 @@ impl Constructor {
                 .into_iter()
                 .map(Argument::parse)
                 .collect::<syn::Result<Vec<_>>>()?,
-            return_type: ReturnType::parse(f.sig.output)?,
+            return_type,
         })
     }
 
@@ -96,9 +101,14 @@ impl Constructor {
         self_name: &str,
         self_ty: &uniffi_meta::Type,
     ) -> Result<uniffi_meta::ConstructorMetadata> {
-        let (return_type, throws) =
-            self.return_type
-                .return_type_and_throws_for_method(ir, cache, module_path, self_ty)?;
+        let crate::types::ReturnType {
+            ok: return_type,
+            err: throws,
+            rust_return_is_result,
+            rust_stream_item_is_result,
+        } = self
+            .return_type
+            .return_type_and_throws_for_method(ir, cache, module_path, self_ty)?;
         if return_type.as_ref() != Some(self_ty) {
             return Err(Error::new(
                 module_path.file_id(),
@@ -113,31 +123,18 @@ impl Constructor {
         };
         let metadata_module_path = module_path.path_string();
         let metadata_self_name = self_name.to_string();
-        let metadata_self_type = match self_ty {
-            uniffi_meta::Type::Object { imp, .. } => uniffi_meta::Type::Object {
-                module_path: metadata_module_path.clone(),
-                name: metadata_self_name.clone(),
-                imp: *imp,
-            },
-            uniffi_meta::Type::Record { .. } => uniffi_meta::Type::Record {
-                module_path: metadata_module_path.clone(),
-                name: metadata_self_name.clone(),
-            },
-            uniffi_meta::Type::Enum { .. } => uniffi_meta::Type::Enum {
-                module_path: metadata_module_path.clone(),
-                name: metadata_self_name.clone(),
-            },
-            _ => self_ty.clone(),
-        };
 
         Ok(uniffi_meta::ConstructorMetadata {
             module_path: metadata_module_path,
             self_name: metadata_self_name,
-            self_type: Some(metadata_self_type),
+            self_type: Some(self_ty.clone()),
             name,
             orig_name,
             docstring: self.attrs.docstring.clone(),
             is_async: self.is_async,
+            rust_async: self.return_type.signature.rust_async,
+            rust_return_is_result,
+            rust_stream_item_is_result,
             inputs: self
                 .args
                 .iter()
@@ -153,18 +150,19 @@ impl Constructor {
 
 impl Method {
     pub fn parse(attrs: MethodAttributes, f: ImplItemFn) -> syn::Result<Self> {
+        let return_type = ReturnType::from_signature(&f.sig)?;
         let mut inputs = f.sig.inputs.into_iter();
         let self_arg = SelfArg::parse(inputs.next(), f.sig.ident.span())?;
 
         Ok(Self {
             attrs,
             ident: f.sig.ident,
-            is_async: f.sig.asyncness.is_some(),
+            is_async: return_type.signature.is_async(),
             self_arg,
             args: inputs
                 .map(Argument::parse)
                 .collect::<syn::Result<Vec<_>>>()?,
-            return_type: ReturnType::parse(f.sig.output)?,
+            return_type,
         })
     }
 
@@ -176,9 +174,14 @@ impl Method {
         self_name: &str,
         self_ty: &uniffi_meta::Type,
     ) -> Result<uniffi_meta::MethodMetadata> {
-        let (return_type, throws) =
-            self.return_type
-                .return_type_and_throws_for_method(ir, cache, module_path, self_ty)?;
+        let crate::types::ReturnType {
+            ok: return_type,
+            err: throws,
+            rust_return_is_result,
+            rust_stream_item_is_result,
+        } = self
+            .return_type
+            .return_type_and_throws_for_method(ir, cache, module_path, self_ty)?;
         let item_name = self.ident.unraw().to_string();
         let (name, orig_name) = match &self.attrs.name {
             None => (item_name, None),
@@ -192,6 +195,9 @@ impl Method {
             orig_name,
             docstring: self.attrs.docstring.clone(),
             is_async: self.is_async,
+            rust_async: self.return_type.signature.rust_async,
+            rust_return_is_result,
+            rust_stream_item_is_result,
             takes_self_by_arc: self.self_arg.takes_self_by_arc(ir, cache, module_path)?,
             inputs: self
                 .args
@@ -216,6 +222,18 @@ impl Method {
 }
 
 impl SelfArg {
+    pub fn validate_local(&self) -> syn::Result<()> {
+        if matches!(&*self.receiver.ty, syn::Type::Reference(reference) if reference.mutability.is_none())
+        {
+            Ok(())
+        } else {
+            Err(syn::Error::new_spanned(
+                &self.receiver,
+                "local methods must take &self; the object body never leaves its owner",
+            ))
+        }
+    }
+
     /// Parses sig.inputs.first() into a `SelfArg`
     pub fn parse(arg: Option<FnArg>, ident_span: Span) -> syn::Result<Self> {
         match arg {

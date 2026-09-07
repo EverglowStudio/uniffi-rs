@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use syn::{ext::IdentExt, Ident, ItemStruct};
+use syn::{ext::IdentExt, spanned::Spanned, Ident, ItemStruct};
 
 use crate::{
     attrs::{FieldAttributes, RecordAttributes},
@@ -27,6 +27,7 @@ pub struct Field {
 
 impl Record {
     pub fn parse(env: &CompileEnv, attrs: RecordAttributes, st: ItemStruct) -> syn::Result<Self> {
+        uniffi_meta::async_signature::validate_generics(&st.generics)?;
         let mut fields = vec![];
         for f in st.fields {
             if let Some(field_attrs) = FieldAttributes::parse(env, &f.attrs)? {
@@ -66,6 +67,7 @@ impl Record {
 
 impl Field {
     pub fn parse(attrs: FieldAttributes, f: syn::Field) -> syn::Result<Self> {
+        uniffi_meta::async_signature::validate_value_type(&f.ty)?;
         Ok(Self {
             attrs,
             ident: f.ident,
@@ -80,6 +82,18 @@ impl Field {
         module_path: &RPath<'ir>,
     ) -> Result<uniffi_meta::FieldMetadata> {
         let ty = module_path.resolve_uniffi_meta_type(ir, cache, &self.ty, None)?;
+        if ty.iter_types().any(|ty| {
+            matches!(
+                ty,
+                uniffi_meta::Type::Stream { .. } | uniffi_meta::Type::InputStream { .. }
+            )
+        }) {
+            return Err(crate::Error::new(
+                module_path.file_id(),
+                self.ty.span(),
+                crate::ErrorKind::SynError("record fields cannot contain Future/Stream".into()),
+            ));
+        }
         let item_name = match &self.ident {
             Some(i) => i.unraw().to_string(),
             None => "".to_string(),

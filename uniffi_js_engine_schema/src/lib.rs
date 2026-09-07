@@ -459,6 +459,8 @@ pub struct RustNamedTypePlan {
     pub id: TypeId,
     pub rust_path: RustPath,
     pub kind: RustNamedTypeKind,
+    /// Actual exported Rust trait implementations from source metadata.
+    pub implemented_traits: Vec<RustPath>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -524,6 +526,14 @@ pub struct RustOperationPlan {
     pub owner: OperationOwner,
     pub kind: OperationKind,
     pub async_kind: AsyncKind,
+    /// Whether the source Rust declaration used `async fn`.
+    pub rust_async: bool,
+    /// Whether the original Rust return (after one Future) is Result, even
+    /// when its error is Infallible and the host operation has no throws.
+    pub rust_return_is_result: bool,
+    /// Whether the original returned Stream has Result items, including
+    /// Result<T, Infallible>. False for non-stream returns.
+    pub rust_stream_item_is_result: bool,
     pub callback_method_id: Option<u32>,
     pub call_target: RustCallTarget,
     pub receiver: Option<RustReceiverBinding>,
@@ -2002,14 +2012,18 @@ fn infer_value_capabilities(
         } => {
             required.insert(Capability::InputStream);
             infer_value_capabilities(inner, types, visiting, required, errors);
-            infer_value_capabilities(error, types, visiting, required, errors);
+            if let Some(error) = error {
+                infer_value_capabilities(error, types, visiting, required, errors);
+            }
         }
         ValueType::OutputStream {
             item: inner, error, ..
         } => {
             required.insert(Capability::OutputStream);
             infer_value_capabilities(inner, types, visiting, required, errors);
-            infer_value_capabilities(error, types, visiting, required, errors);
+            if let Some(error) = error {
+                infer_value_capabilities(error, types, visiting, required, errors);
+            }
         }
     }
 }

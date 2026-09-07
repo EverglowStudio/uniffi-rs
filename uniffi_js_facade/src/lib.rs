@@ -173,7 +173,7 @@ pub struct AstStreamResource {
     pub path: ValuePath,
     pub direction: StreamDirection,
     pub item: ValueType,
-    pub error: ValueType,
+    pub error: Option<ValueType>,
     pub is_send: bool,
     pub slot_operation_ids: BTreeMap<OperationKind, OperationId>,
 }
@@ -428,14 +428,24 @@ fn ast_stream_resource(
                 path: resource.path.to_string(),
             }
         })?,
-        error: public_stream_value_type(&resource.error, types).ok_or_else(|| {
-            FacadeError::InvalidStreamBinding {
-                path: resource.path.to_string(),
-            }
-        })?,
+        error: if is_infallible_rust_type(&resource.error.rust_type) {
+            None
+        } else {
+            Some(
+                public_stream_value_type(&resource.error, types).ok_or_else(|| {
+                    FacadeError::InvalidStreamBinding {
+                        path: resource.path.to_string(),
+                    }
+                })?,
+            )
+        },
         is_send: resource.is_send,
         slot_operation_ids: resource.slot_operation_ids.clone(),
     })
+}
+
+fn is_infallible_rust_type(ty: &RustType) -> bool {
+    matches!(ty, RustType::Path(path) if path.segments == ["std", "convert", "Infallible"])
 }
 
 fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Option<ValueType> {
@@ -495,7 +505,11 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
                 };
                 Some(ValueType::InputStream {
                     item: Box::new(from_conversion(item, rust_item, types)?),
-                    error: Box::new(from_conversion(error, rust_error, types)?),
+                    error: if is_infallible_rust_type(rust_error) {
+                        None
+                    } else {
+                        Some(Box::new(from_conversion(error, rust_error, types)?))
+                    },
                     is_send: *is_send,
                 })
             }
@@ -510,7 +524,11 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
                 };
                 Some(ValueType::OutputStream {
                     item: Box::new(from_conversion(item, rust_item, types)?),
-                    error: Box::new(from_conversion(error, rust_error, types)?),
+                    error: if is_infallible_rust_type(rust_error) {
+                        None
+                    } else {
+                        Some(Box::new(from_conversion(error, rust_error, types)?))
+                    },
                     is_send: *is_send,
                 })
             }
@@ -552,7 +570,11 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
                 is_send,
             } => Some(ValueType::OutputStream {
                 item: Box::new(from_rust_type(item, types)?),
-                error: Box::new(from_rust_type(error, types)?),
+                error: if is_infallible_rust_type(error) {
+                    None
+                } else {
+                    Some(Box::new(from_rust_type(error, types)?))
+                },
                 is_send: *is_send,
             }),
             RustType::InputStream {
@@ -561,7 +583,11 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
                 is_send,
             } => Some(ValueType::InputStream {
                 item: Box::new(from_rust_type(item, types)?),
-                error: Box::new(from_rust_type(error, types)?),
+                error: if is_infallible_rust_type(error) {
+                    None
+                } else {
+                    Some(Box::new(from_rust_type(error, types)?))
+                },
                 is_send: *is_send,
             }),
             RustType::Custom(inner) => from_rust_type(inner, types),
@@ -1219,7 +1245,11 @@ fn render_stream_resource_descriptor(ast: &PublicAst, resource: &AstStreamResour
         escape_js(&resource.path.to_string()),
         resource.direction,
         render_value_descriptor(ast, &resource.item),
-        render_value_descriptor(ast, &resource.error),
+        resource
+            .error
+            .as_ref()
+            .map(|error| render_value_descriptor(ast, error))
+            .unwrap_or_else(|| "null".to_owned()),
         resource.is_send,
         slots
     )
@@ -1334,7 +1364,7 @@ fn render_callback_methods(ast: &PublicAst, ty: &AstType) -> String {
         .iter()
         .filter_map(|operation| {
             let is_method = matches!(operation.source_key.owner(), OperationOwner::Callback(key) if key == &ty.source_key && operation.kind == OperationKind::CallbackMethod)
-                || matches!(operation.source_key.owner(), OperationOwner::Object(key) if key == &ty.source_key && operation.kind == OperationKind::Method);
+                || matches!(operation.source_key.owner(), OperationOwner::Object(key) if key == &ty.source_key && matches!(operation.kind, OperationKind::Method | OperationKind::OutputStreamStart));
             if !is_method {
                 return None;
             }
@@ -1357,13 +1387,14 @@ fn render_callback_methods(ast: &PublicAst, ty: &AstType) -> String {
                     .map(|ty| format!("{{name:\"{}\",typeId:{}}}", escape_js(&ty.name), ty.id.index()))
                     .unwrap_or_else(|| "null".to_owned());
                 format!(
-                    "\"{}\":{{name:\"{}\",async:{},args:[{}],returnType:{},throws:{},callbackContracts:{}}}",
+                    "\"{}\":{{name:\"{}\",async:{},args:[{}],returnType:{},throws:{},streamResources:[{}],callbackContracts:{}}}",
                     id,
                     escape_js(&operation.name),
                     operation.async_kind == AsyncKind::Async,
                     args,
                     return_type,
                     throws,
+                    operation.stream_resources.iter().map(|resource| render_stream_resource_descriptor(ast, resource)).collect::<Vec<_>>().join(","),
                     render_callback_contracts(ast, operation.id)
                 )
             })
@@ -2396,7 +2427,7 @@ mod tests {
                     path: ValuePath::return_value(),
                     direction: uniffi_js_engine_schema::StreamDirection::Output,
                     item,
-                    error: ValueType::Scalar(ScalarType::String),
+                    error: Some(ValueType::Scalar(ScalarType::String)),
                     is_send: false,
                     slot_operation_ids: slots,
                 }]
@@ -2496,7 +2527,7 @@ mod tests {
             vec![],
             Some(ValueType::OutputStream {
                 item: Box::new(ValueType::Named(event)),
-                error: Box::new(ValueType::Scalar(ScalarType::String)),
+                error: Some(Box::new(ValueType::Scalar(ScalarType::String))),
                 is_send: false,
             }),
             AsyncKind::Sync,
@@ -2746,6 +2777,9 @@ mod tests {
                         owner: OperationOwner::Namespace,
                         kind: OperationKind::Function,
                         async_kind: AsyncKind::Sync,
+                        rust_async: false,
+                        rust_return_is_result: false,
+                        rust_stream_item_is_result: false,
                         callback_method_id: None,
                         call_target: RustCallTarget::FreeFunction {
                             module: RustPath::new(["minimal"]),
@@ -3275,6 +3309,9 @@ mod tests {
                 owner: operation.definition.source_key.owner().clone(),
                 kind: operation.definition.source_key.kind(),
                 async_kind: operation.definition.signature.async_kind,
+                rust_async: operation.definition.signature.async_kind == AsyncKind::Async,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 callback_method_id: operation.definition.callback_method_id,
                 call_target: if matches!(
                     operation.definition.source_key.owner(),
@@ -3516,12 +3553,12 @@ await session.close();
         };
         let input = Type::InputStream {
             item_type: Box::new(Type::UInt32),
-            error_type: Box::new(Type::String),
+            error_type: Some(Box::new(Type::String)),
             is_send: false,
         };
         let output = Type::Stream {
             item_type: Box::new(Type::String),
-            error_type: Box::new(Type::UInt32),
+            error_type: Some(Box::new(Type::UInt32)),
             is_send: false,
         };
         group.add_item(
@@ -3530,6 +3567,9 @@ await session.close();
                 name: "consume".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![FnParamMetadata::simple("source", input.clone())],
                 return_type: None,
                 throws: None,
@@ -3544,6 +3584,9 @@ await session.close();
                 name: "events".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: true,
                 inputs: vec![FnParamMetadata::simple("source", input)],
                 return_type: Some(output),
                 throws: None,
@@ -3558,10 +3601,13 @@ await session.close();
                 name: "produce".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: true,
                 inputs: vec![],
                 return_type: Some(Type::Stream {
                     item_type: Box::new(Type::String),
-                    error_type: Box::new(Type::UInt32),
+                    error_type: Some(Box::new(Type::UInt32)),
                     is_send: false,
                 }),
                 throws: None,
@@ -3857,6 +3903,9 @@ await session.close();
                 name: "new".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![],
                 throws: None,
                 checksum: None,
@@ -3871,6 +3920,9 @@ await session.close();
                 name: "describe".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![],
                 return_type: Some(Type::String),
                 throws: None,
@@ -3896,6 +3948,9 @@ await session.close();
                 name: "on_event".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![FnParamMetadata::simple("value", Type::Int64)],
                 return_type: Some(Type::String),
                 throws: None,
@@ -3911,6 +3966,9 @@ await session.close();
                 name: "process".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: true,
+                rust_stream_item_is_result: false,
                 inputs: vec![
                     FnParamMetadata::simple("value", shared_ty()),
                     FnParamMetadata::simple("alias", alias_ty()),
@@ -3930,7 +3988,7 @@ await session.close();
                     FnParamMetadata {
                         name: "count".into(),
                         ty: Type::Int64,
-                        by_ref: false,
+                        pass_by: uniffi_meta::PassBy::Value,
                         optional: false,
                         default: Some(uniffi_meta::DefaultValueMetadata::Literal(
                             LiteralMetadata::new_int(4),
@@ -3953,6 +4011,9 @@ await session.close();
                 name: "echo_alias".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![FnParamMetadata::simple("value", alias_ty())],
                 return_type: Some(alias_ty()),
                 throws: None,
@@ -3967,6 +4028,9 @@ await session.close();
                 name: "register".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![FnParamMetadata::simple("listener", listener_ty())],
                 return_type: None,
                 throws: None,
@@ -4016,6 +4080,9 @@ await session.close();
                 name: "accept_service".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![FnParamMetadata::simple("service", service_ty())],
                 return_type: Some(service_ty()),
                 throws: None,
@@ -4030,6 +4097,9 @@ await session.close();
                 name: "reverse_register".into(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![FnParamMetadata::simple("listener", listener_ty())],
                 return_type: None,
                 throws: None,
@@ -4358,7 +4428,7 @@ let releaseCount = 0;
 let completeCancellation;
 function makeSession(backend) {
   return new BackendSession({...backend, invokeSync(id, args) {
-    if (id === callControl.create) { const callId = nextCallId++; calls.set(callId, {}); return {kind:"value", value:callId}; }
+    if (id === callControl.create) { const first = nextCallId; nextCallId += 4096; return {kind:"value", value:first}; }
     if (id === callControl.cancel) { assert.ok(calls.has(args[0])); cancelCount++; return {kind:"value", value:null}; }
     if (id === callControl.release) { assert.ok(calls.delete(args[0])); releaseCount++; return {kind:"value", value:null}; }
     return backend.invokeSync(id, args);
@@ -4368,10 +4438,13 @@ const session = makeSession({
   invokeSync(id) { if (id === 11) return {kind:"value", value:"sync"}; throw Error("unexpected sync operation"); },
   invokeAsync(id, args) {
     const callId = args.at(-1);
-    assert.ok(calls.has(callId), "native call must carry an allocated ID at the end");
+    assert.ok(Number.isSafeInteger(callId) && callId > 0 && callId < nextCallId, "native call must carry a reserved ID at the end");
+    assert.ok(!calls.has(callId), "each call ID is used once");
+    calls.set(callId, {});
     const business = args.slice(0, -1);
     seen.push([id, business]);
     if (business.includes("pending")) return new Promise(resolve => { completeCancellation = () => resolve({kind:"error", error:{errorName:"UniffiCancelled", message:"cleaned up"}}); });
+    calls.delete(callId); // Normal completion unregisters in Rust, without an FFI release call.
     return Promise.resolve({kind:"value", value:id === 1 ? 42 : "ok"});
   },
   releaseObject() {},
@@ -4415,7 +4488,7 @@ assert.equal(settled, false, "abort must wait for native cleanup");
 completeCancellation();
 await rejection;
 assert.equal(calls.size, 0);
-assert.equal(releaseCount, nextCallId - 1);
+assert.equal(releaseCount, 1, "only cancellation needs a final release acknowledgement");
 service.dispose();
 await session.close();
 "#;

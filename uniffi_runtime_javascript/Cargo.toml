@@ -1,6 +1,6 @@
 [package]
 name = "uniffi_runtime_javascript"
-version = "0.32.0"
+version = "0.32.1"
 description = "Self-contained ECMAScript runtime delivery API for UniFFI JavaScript backends"
 license = "MPL-2.0"
 edition = "2021"

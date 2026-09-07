@@ -13,6 +13,7 @@ use crate::{
 #[derive(Clone, Default)]
 pub struct ObjectAttributes {
     pub name: Option<String>,
+    pub local: bool,
     pub docstring: Option<String>,
     pub remote: bool,
     pub utraits: UniffiTraitAttrs,
@@ -44,7 +45,10 @@ impl ObjectAttributes {
             if meta.path().is_ident("uniffi") {
                 if let Meta::List(list) = meta {
                     list.parse_nested_meta(|meta| {
-                        if meta.path.is_ident("name") {
+                        if meta.path.is_ident("local") {
+                            parsed.local = true;
+                            Ok(())
+                        } else if meta.path.is_ident("name") {
                             meta.value()?;
                             let name: LitStr = meta.input.parse()?;
                             parsed.name = Some(name.value());
@@ -65,6 +69,7 @@ impl ObjectAttributes {
 #[derive(Default)]
 pub struct ImplAttributes {
     pub name: Option<String>,
+    pub local: bool,
     pub async_runtime: Option<LitStr>,
 }
 
@@ -91,7 +96,10 @@ impl ImplAttributes {
             if meta_is_uniffi_export(module_path, ir, cache, &meta) {
                 if let Meta::List(list) = meta {
                     list.parse_nested_meta(|meta| {
-                        if meta.path.is_ident("name") {
+                        if meta.path.is_ident("local") {
+                            parsed.local = true;
+                            Ok(())
+                        } else if meta.path.is_ident("name") {
                             meta.value()?;
                             let name: LitStr = meta.input.parse()?;
                             parsed.name = Some(name.value());

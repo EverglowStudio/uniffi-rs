@@ -116,6 +116,7 @@ impl<'ir> RPath<'ir> {
             if let Item::Builtin(builtin) = item {
                 match builtin {
                     BuiltinItem::UnitType => path.push_str("()"),
+                    BuiltinItem::Infallible => path.push_str("std::convert::Infallible"),
                     BuiltinItem::Boolean => path.push_str("bool"),
                     BuiltinItem::String => path.push_str("String"),
                     BuiltinItem::Str => path.push_str("str"),
@@ -685,6 +686,9 @@ fn get_builtin_item(path: &Path) -> Option<&'static Item> {
     match path.as_str() {
         "std::primitive::unit" | "core::primitive::unit" => {
             Some(&Item::Builtin(BuiltinItem::UnitType))
+        }
+        "std::convert::Infallible" | "core::convert::Infallible" => {
+            Some(&Item::Builtin(BuiltinItem::Infallible))
         }
         "bool" | "std::primitive::bool" | "core::primitive::bool" => {
             Some(&Item::Builtin(BuiltinItem::Boolean))

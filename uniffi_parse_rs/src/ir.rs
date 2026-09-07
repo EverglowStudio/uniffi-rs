@@ -240,6 +240,7 @@ impl Ir {
                 } else if let Some(attrs) =
                     ObjectAttributes::parse(self, cache, module_path, env, &st.attrs)?
                 {
+                    uniffi_meta::async_signature::validate_generics(&st.generics)?;
                     Some(Item::Object(Object::parse(attrs, st.ident, st.vis)?))
                 } else {
                     Some(Item::NonUniffi(st.vis.into(), st.ident))
@@ -249,6 +250,7 @@ impl Ir {
                 if let Some(attrs) =
                     ObjectAttributes::parse(self, cache, module_path, env, &en.attrs)?
                 {
+                    uniffi_meta::async_signature::validate_generics(&en.generics)?;
                     Some(Item::Object(Object::parse(attrs, en.ident, en.vis)?))
                 } else if let Some(attrs) =
                     EnumAttributes::parse(self, cache, module_path, env, &en.attrs)?
@@ -305,6 +307,10 @@ impl Ir {
 }
 
 impl CrateRoot {
+    pub fn compile_env(&self) -> &CompileEnv {
+        &self.compile_env
+    }
+
     pub fn module_item(&self) -> &Item {
         &self.module
     }

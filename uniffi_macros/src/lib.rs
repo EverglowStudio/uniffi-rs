@@ -84,12 +84,9 @@ pub fn export(attr_args: TokenStream, input: TokenStream) -> TokenStream {
 #[cfg(not(feature = "scaffolding"))]
 #[proc_macro_attribute]
 pub fn export(attr_args: TokenStream, input: TokenStream) -> TokenStream {
-    let input2 = input.clone();
-    match export::is_trait_interface_with_foreign(parse_macro_input!(input2), attr_args) {
-        Ok(true) => export::alter_trait(&parse_macro_input!(input)).into(),
-        Ok(false) => input,
-        Err(e) => e.into_compile_error().into(),
-    }
+    export::without_scaffolding(parse_macro_input!(input), attr_args)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
 
 #[cfg(feature = "scaffolding")]
@@ -178,8 +175,14 @@ pub fn derive_enum(_input: TokenStream) -> TokenStream {
 
 #[cfg(not(feature = "scaffolding"))]
 #[proc_macro_derive(Object, attributes(uniffi))]
-pub fn derive_object(_input: TokenStream) -> TokenStream {
-    TokenStream::default()
+pub fn derive_object(input: TokenStream) -> TokenStream {
+    use util::AttributeSliceExt;
+    let input: syn::DeriveInput = parse_macro_input!(input);
+    match input.attrs.parse_uniffi_attr_args::<object::ObjectAttr>() {
+        Ok(attrs) if attrs.local.is_some() => export::gen_local_close_helper(&input.ident).into(),
+        Ok(_) => TokenStream::default(),
+        Err(error) => error.into_compile_error().into(),
+    }
 }
 
 #[cfg(not(feature = "scaffolding"))]

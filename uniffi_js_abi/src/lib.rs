@@ -360,13 +360,13 @@ pub enum ValueType {
     /// the stream is nested inside a record or container.
     InputStream {
         item: Box<ValueType>,
-        error: Box<ValueType>,
+        error: Option<Box<ValueType>>,
         is_send: bool,
     },
     /// A pull-based JavaScript async iterable produced by native code.
     OutputStream {
         item: Box<ValueType>,
-        error: Box<ValueType>,
+        error: Option<Box<ValueType>>,
         is_send: bool,
     },
 }
@@ -388,18 +388,18 @@ impl ValueType {
         Self::Set(Box::new(inner))
     }
 
-    pub fn input_stream(item: Self, error: Self, is_send: bool) -> Self {
+    pub fn input_stream(item: Self, error: impl Into<Option<Self>>, is_send: bool) -> Self {
         Self::InputStream {
             item: Box::new(item),
-            error: Box::new(error),
+            error: error.into().map(Box::new),
             is_send,
         }
     }
 
-    pub fn output_stream(item: Self, error: Self, is_send: bool) -> Self {
+    pub fn output_stream(item: Self, error: impl Into<Option<Self>>, is_send: bool) -> Self {
         Self::OutputStream {
             item: Box::new(item),
-            error: Box::new(error),
+            error: error.into().map(Box::new),
             is_send,
         }
     }
@@ -423,7 +423,9 @@ impl ValueType {
             }
             Self::InputStream { item, error, .. } | Self::OutputStream { item, error, .. } => {
                 item.visit(visitor);
-                error.visit(visitor);
+                if let Some(error) = error {
+                    error.visit(visitor);
+                }
             }
             Self::Map(key, value) => {
                 key.visit(visitor);

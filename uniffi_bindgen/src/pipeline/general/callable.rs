@@ -33,6 +33,8 @@ pub fn function_callable(func: &initial::Function, context: &Context) -> Result<
         id: func.id,
         name,
         orig_name: func.orig_name.clone(),
+        rust_return_is_result: func.rust_return_is_result,
+        rust_stream_item_is_result: func.rust_stream_item_is_result,
         async_data: function_async_data(func, context)?,
         kind,
         arguments,
@@ -85,6 +87,8 @@ pub fn method_callable_with_kind(
         id: meth.id,
         name,
         orig_name: meth.orig_name.clone(),
+        rust_return_is_result: meth.rust_return_is_result,
+        rust_stream_item_is_result: meth.rust_stream_item_is_result,
         arguments,
         return_type: ReturnType {
             ty: meth.return_type.clone().map_node(context)?,
@@ -127,6 +131,8 @@ pub fn constructor_callable(cons: &initial::Constructor, context: &Context) -> R
         id: cons.id,
         name,
         orig_name: cons.orig_name.clone(),
+        rust_return_is_result: cons.rust_return_is_result,
+        rust_stream_item_is_result: cons.rust_stream_item_is_result,
         async_data: constructor_async_data(cons, interface_name, imp, context)?,
         arguments,
         return_type: ReturnType {

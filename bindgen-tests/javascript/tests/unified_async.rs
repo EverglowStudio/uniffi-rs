@@ -6,7 +6,7 @@
 mod shared;
 mod support;
 
-use shared::{cdylib_filename, locate_node_with_strip_types};
+use shared::{cdylib_filename, locate_node_with_strip_types, required_typescript_compiler};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -86,24 +86,56 @@ fn run(command: &mut Command, logs: &Path, label: &str, seconds: u64) {
     println!("{label}: passed; {}", stdout_path.display());
 }
 
+// Run every realm even when one contract fails, preserving each failure.
+// Builds still fail immediately, and no success marker is written unless all
+// requested realms pass.
+fn run_realm(
+    command: &mut Command,
+    logs: &Path,
+    label: &str,
+    seconds: u64,
+    failures: &mut Vec<String>,
+) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(command, logs, label, seconds)
+    }))
+    .is_err()
+    {
+        failures.push(label.to_owned());
+    }
+}
+
 fn build(manifest: &Utf8PathBuf, target: &Utf8PathBuf, wasm: bool, logs: &Path, label: &str) {
+    // Each retained temporary package owns a lockfile; resolve it once, then
+    // every actual compilation is locked and denies warnings.
+    if !manifest.parent().unwrap().join("Cargo.lock").exists() {
+        fs::copy(
+            workspace_root().join("Cargo.lock"),
+            manifest.parent().unwrap().join("Cargo.lock"),
+        )
+        .unwrap();
+        run(
+            Command::new("cargo")
+                .args([
+                    "metadata",
+                    "--offline",
+                    "--format-version",
+                    "1",
+                    "--manifest-path",
+                ])
+                .arg(manifest),
+            logs,
+            &format!("{label}-lock"),
+            180,
+        );
+    }
     let mut command = Command::new("cargo");
     command
-        .args(["build", "--manifest-path"])
+        .args(["build", "--locked", "--manifest-path"])
         .arg(manifest)
         .env("CARGO_TARGET_DIR", target)
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        // A08: S00 NAPI host builds did not deny the pinned engine's emitted
-        // warnings. Keep that baseline only for this host step; the fixture
-        // core, harness and WASM host remain strict.
-        .env(
-            "RUSTFLAGS",
-            if label == "host-napi" {
-                ""
-            } else {
-                "-Dwarnings"
-            },
-        );
+        .env("RUSTFLAGS", "-Dwarnings");
     if wasm {
         command.args(["--target", "wasm32-unknown-unknown"]);
     }
@@ -169,6 +201,11 @@ resolver = "3"
         include_str!("support/unified_async/actor.rs"),
     )
     .unwrap();
+    fs::write(
+        crate_dir.join("src/declarations.rs"),
+        include_str!("support/unified_async/declarations.rs"),
+    )
+    .unwrap();
     for (name, source) in SOURCES {
         fs::write(root.join(name), source).unwrap();
     }
@@ -214,6 +251,24 @@ resolver = "3"
         },
     )
     .expect("generate unified async package from compiled metadata");
+    fs::write(
+        generated.join("declarations.mts"),
+        include_str!("support/unified_async/declarations.mts"),
+    )
+    .unwrap();
+    fs::write(generated.join("tsconfig.strict.json"), r#"{
+      "compilerOptions": { "strict": true, "noEmit": true, "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext", "skipLibCheck": false },
+      "include": ["declarations.mts", "shared/**/*.d.ts", "components/**/*.d.ts", "node/**/*.d.ts", "browser/**/*.d.ts"]
+    }"#).unwrap();
+    run(
+        Command::new(required_typescript_compiler())
+            .args(["--noEmit", "-p"])
+            .arg(generated.join("tsconfig.strict.json")),
+        logs,
+        "declarations",
+        60,
+    );
+    let mut runtime_failures = Vec::new();
     let host_name = composite_host_lib_target(PACKAGE);
     if !wasm_only {
         let native_lock = shared_cargo_target_lock("native");
@@ -232,7 +287,7 @@ resolver = "3"
         )
         .unwrap();
         drop(native_lock);
-        run(
+        run_realm(
             Command::new(&node)
                 .arg(root.join("node.mjs"))
                 .arg("napi")
@@ -240,6 +295,7 @@ resolver = "3"
             logs,
             "node-napi",
             75,
+            &mut runtime_failures,
         );
     }
 
@@ -265,7 +321,7 @@ resolver = "3"
     package
         .emit_wasm_post_link(&wasm, &host_name, WasmPostLinkTarget::Node, &pkg)
         .unwrap();
-    run(
+    run_realm(
         Command::new(&node)
             .arg(root.join("node.mjs"))
             .arg("wasm")
@@ -273,6 +329,7 @@ resolver = "3"
         logs,
         "node-wasm",
         75,
+        &mut runtime_failures,
     );
 
     // Keep each post-link target's files disjoint. Both execute the same built
@@ -281,13 +338,19 @@ resolver = "3"
     package
         .emit_wasm_post_link(&wasm, &host_name, WasmPostLinkTarget::Web, &pkg)
         .unwrap();
-    run(
+    run_realm(
         Command::new(&node)
             .arg(root.join("chrome.mjs"))
             .current_dir(&root),
         logs,
         "chrome",
         165,
+        &mut runtime_failures,
+    );
+    assert!(
+        runtime_failures.is_empty(),
+        "realm failures: {runtime_failures:?}; retained logs: {}",
+        logs.display()
     );
     let realms = if wasm_only {
         vec!["node-wasm", "chrome-window", "chrome-worker"]
@@ -300,7 +363,12 @@ resolver = "3"
             "run": root,
             "realms": realms,
             "status": "passed",
-            "declarations": "direct local Object markers and generated async sync/async methods; general Future/Stream declarations deferred to S03"
+            "declarations": "S03 direct Future/Stream and factory signatures, strict DTS, all Rust builds locked and deny warnings",
+            "baseline_cases_per_realm": 21,
+            "added_cases_per_realm": 19,
+            "declaration_cases_per_realm": 13,
+            "review_p1_cases_per_realm": 4,
+            "actor_cases_per_realm": 6
         }))
         .unwrap(),
     )

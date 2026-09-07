@@ -1,5 +1,4 @@
 {%- let item_type_name = item_type|type_name(ci) %}
-{%- let error_type_name = error_type|type_name(ci) %}
 
 /**
  * @suppress
@@ -15,11 +14,15 @@ public object {{ ffi_converter_name }}: FfiConverter<Flow<{{ item_type_name }}>,
             value,
             { next -> lowerNext(next) },
             { error ->
-                if (error is {{ error_type_name }}) {
+                {%- if let Some(error_type) = error_type %}
+                if (error is {{ error_type|type_name(ci) }}) {
                     {{ error_type|lower_fn }}(error)
                 } else {
                     null
                 }
+                {%- else %}
+                null
+                {%- endif %}
             },
         )
 

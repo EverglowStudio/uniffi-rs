@@ -209,11 +209,11 @@ impl CodeType for StreamCodeType {
 #[derive(Debug)]
 pub struct InputStreamCodeType {
     item: Type,
-    error: Type,
+    error: Option<Type>,
 }
 
 impl InputStreamCodeType {
-    pub fn new(item: Type, error: Type) -> Self {
+    pub fn new(item: Type, error: Option<Type>) -> Self {
         Self { item, error }
     }
 
@@ -221,8 +221,8 @@ impl InputStreamCodeType {
         &self.item
     }
 
-    fn error(&self) -> &Type {
-        &self.error
+    fn error(&self) -> Option<&Type> {
+        self.error.as_ref()
     }
 }
 
@@ -238,7 +238,7 @@ impl CodeType for InputStreamCodeType {
         format!(
             "InputStream{}{}",
             super::KotlinCodeOracle.find(self.item()).canonical_name(),
-            super::KotlinCodeOracle.find(self.error()).canonical_name()
+            self.error().map(|error| super::KotlinCodeOracle.find(error).canonical_name()).unwrap_or_else(|| "Infallible".into())
         )
     }
 }

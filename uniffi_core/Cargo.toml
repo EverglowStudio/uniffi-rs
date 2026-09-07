@@ -17,7 +17,7 @@ async-compat = { version = "0.2.1", optional = true }
 async-trait = "0.1"
 bytes = "1.11"
 futures-core = "0.3"
-futures-util = { version = "0.3", optional = true }
+futures-util = { version = "0.3" }
 futures-channel = { version = "0.3", optional = true }
 once_cell = "1.10.0"
 static_assertions = "1.1.0"
@@ -38,7 +38,7 @@ futures = "0.3"
 default = []
 
 # Shared task/time/cancellation APIs; existing FFI polling remains independent.
-async-runtime = ["dep:futures-util", "dep:futures-channel", "dep:tokio", "dep:wasm-bindgen-futures", "dep:gloo-timers", "dep:web-time"]
+async-runtime = ["dep:futures-channel", "dep:tokio", "dep:wasm-bindgen-futures", "dep:gloo-timers", "dep:web-time"]
 
 # Printout tracing information on FFI calls.  Useful for debugging issues with the bindings code.
 ffi-trace = []

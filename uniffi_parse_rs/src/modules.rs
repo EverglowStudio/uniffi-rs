@@ -259,6 +259,24 @@ impl Module {
                 }
                 Item::Object(o) => {
                     let meta = o.obj_metadata(ir, cache, module_path.append_child(item))?;
+                    if o.attrs.local {
+                        metadata.items.insert(uniffi_meta::MethodMetadata {
+                            module_path: meta.module_path.clone(),
+                            self_name: meta.name.clone(),
+                            name: "close".into(),
+                            orig_name: None,
+                            is_async: true,
+                            rust_async: true,
+                            rust_return_is_result: false,
+                            rust_stream_item_is_result: false,
+                            takes_self_by_arc: false,
+                            inputs: vec![],
+                            return_type: None,
+                            throws: None,
+                            checksum: None,
+                            docstring: Some("Cancel this local object's calls and wait for owner cleanup and destruction.".into()),
+                        }.into());
+                    }
                     metadata.items.extend(
                         o.attrs
                             .utraits

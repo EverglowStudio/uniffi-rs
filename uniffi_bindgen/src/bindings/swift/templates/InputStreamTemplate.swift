@@ -4,9 +4,11 @@ fileprivate struct {{ ffi_converter_name }} {
             sequence,
             lowerNext: {{ item_type|optional_lower_fn }},
             lowerError: { error in
+                {%- if let Some(error_type) = error_type %}
                 if let typedError = error as? {{ error_type|type_name }} {
                     return {{ error_type|lower_fn }}(typedError)
                 }
+                {%- endif %}
                 return nil
             }
         )

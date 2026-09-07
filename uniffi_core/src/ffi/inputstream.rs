@@ -35,16 +35,31 @@ pub type ForeignInputStreamNextFuture<T, E> =
 pub type ForeignInputStreamNextFuture<T, E> =
     Pin<Box<dyn Future<Output = Result<Option<T>, E>> + 'static>>;
 
+/// Completion must acknowledge producer, registration and callback release.
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded")))]
+pub type ForeignInputStreamCloseFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded"))]
+pub type ForeignInputStreamCloseFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
+
+#[cfg(feature = "async-runtime")]
+use crate::async_runtime::{current_context, BoxFuture, CleanupFailed};
+#[cfg(feature = "async-runtime")]
+use futures_util::{future::Shared, FutureExt};
+#[cfg(feature = "async-runtime")]
+type CloseDone = Shared<BoxFuture<'static, Result<(), CleanupFailed>>>;
+
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded")))]
 pub trait ForeignInputStreamOps<T, E>: Send + Sync + 'static {
     fn next(&self, handle: Handle) -> ForeignInputStreamNextFuture<T, E>;
     fn cancel(&self, handle: Handle);
+    fn close(&self, handle: Handle) -> ForeignInputStreamCloseFuture;
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded"))]
 pub trait ForeignInputStreamOps<T, E>: 'static {
     fn next(&self, handle: Handle) -> ForeignInputStreamNextFuture<T, E>;
     fn cancel(&self, handle: Handle);
+    fn close(&self, handle: Handle) -> ForeignInputStreamCloseFuture;
 }
 
 pub type ForeignInputStreamNextCallback<FfiReturn> = extern "C" fn(
@@ -55,11 +70,19 @@ pub type ForeignInputStreamNextCallback<FfiReturn> = extern "C" fn(
 );
 
 pub type ForeignInputStreamCancelCallback = extern "C" fn(handle: Handle);
+pub type ForeignInputStreamCloseCallback = extern "C" fn(
+    handle: Handle,
+    callback: ForeignFutureCallback<()>,
+    callback_data: u64,
+    dropped_callback: &mut ForeignFutureDroppedCallbackStruct,
+);
 
 struct ForeignInputStreamInner<T: 'static, E: 'static> {
     handle: Handle,
     ops: Arc<dyn ForeignInputStreamOps<T, E>>,
     cancelled: AtomicBool,
+    #[cfg(feature = "async-runtime")]
+    closed: CloseDone,
 }
 
 impl<T: 'static, E: 'static> ForeignInputStreamInner<T, E> {
@@ -82,11 +105,25 @@ impl<T: 'static, E: 'static> ForeignInputStream<T, E> {
     }
 
     pub fn from_handle_and_ops(handle: Handle, ops: Arc<dyn ForeignInputStreamOps<T, E>>) -> Self {
+        #[cfg(feature = "async-runtime")]
+        let closed = {
+            let ops = ops.clone();
+            let handle = handle.clone();
+            let future: BoxFuture<'static, Result<(), CleanupFailed>> = Box::pin(async move {
+                std::panic::AssertUnwindSafe(async move { ops.close(handle).await })
+                    .catch_unwind()
+                    .await
+                    .map_err(|_| CleanupFailed)
+            });
+            future.shared()
+        };
         Self {
             inner: Arc::new(ForeignInputStreamInner {
                 handle,
                 ops,
                 cancelled: AtomicBool::new(false),
+                #[cfg(feature = "async-runtime")]
+                closed,
             }),
             pending_next: None,
             done: false,
@@ -97,6 +134,7 @@ impl<T: 'static, E: 'static> ForeignInputStream<T, E> {
         handle: Handle,
         next: ForeignInputStreamNextCallback<<Result<Option<T>, E> as LiftReturn<UT>>::ReturnType>,
         cancel: ForeignInputStreamCancelCallback,
+        close: ForeignInputStreamCloseCallback,
     ) -> Self
     where
         Result<Option<T>, E>: LiftReturn<UT> + 'static,
@@ -110,6 +148,7 @@ impl<T: 'static, E: 'static> ForeignInputStream<T, E> {
             ForeignInputStreamCallbackOps::<T, E, UT> {
                 next,
                 cancel,
+                close,
                 _phantom: PhantomData,
             },
         )
@@ -117,6 +156,27 @@ impl<T: 'static, E: 'static> ForeignInputStream<T, E> {
 
     pub fn cancel(&self) {
         self.inner.cancel();
+    }
+
+    /// Stop next and await the host's actual release acknowledgement. A dropped
+    /// waiter transfers its shared confirmation to the surrounding CallContext.
+    #[cfg(feature = "async-runtime")]
+    pub async fn close(&mut self) -> Result<(), CleanupFailed> {
+        self.done = true;
+        drop(self.pending_next.take());
+        self.inner.cancel();
+        let mut guard = InputCloseOnDrop(Some(self.inner.closed.clone()));
+        let result = self.inner.closed.clone().await;
+        guard.0 = None;
+        result
+    }
+
+    fn finish(&mut self) {
+        self.done = true;
+        drop(self.pending_next.take());
+        self.inner.cancel();
+        #[cfg(feature = "async-runtime")]
+        drop(InputCloseOnDrop(Some(self.inner.closed.clone())));
     }
 
     pub fn handle(&self) -> Handle {
@@ -134,8 +194,7 @@ impl<T: 'static, E: 'static> Stream for ForeignInputStream<T, E> {
             return Poll::Ready(None);
         }
         if self.inner.cancelled.load(Ordering::Acquire) {
-            self.pending_next = None;
-            self.done = true;
+            self.finish();
             return Poll::Ready(None);
         }
 
@@ -151,13 +210,11 @@ impl<T: 'static, E: 'static> Stream for ForeignInputStream<T, E> {
                 Poll::Ready(Some(Ok(value)))
             }
             Poll::Ready(Ok(None)) => {
-                self.pending_next = None;
-                self.done = true;
+                self.finish();
                 Poll::Ready(None)
             }
             Poll::Ready(Err(error)) => {
-                self.pending_next = None;
-                self.done = true;
+                self.finish();
                 Poll::Ready(Some(Err(error)))
             }
         }
@@ -166,7 +223,33 @@ impl<T: 'static, E: 'static> Stream for ForeignInputStream<T, E> {
 
 impl<T: 'static, E: 'static> Drop for ForeignInputStream<T, E> {
     fn drop(&mut self) {
-        self.inner.cancel();
+        self.finish();
+    }
+}
+
+#[cfg(feature = "async-runtime")]
+struct InputCloseOnDrop(Option<CloseDone>);
+#[cfg(feature = "async-runtime")]
+impl Drop for InputCloseOnDrop {
+    fn drop(&mut self) {
+        let Some(done) = self.0.take() else {
+            return;
+        };
+        let cleanup = async move {
+            done.await.expect("foreign stream cleanup failed");
+        };
+        if let Some(context) = current_context() {
+            context
+                .defer_cleanup(cleanup)
+                .expect("current call accepts input stream cleanup");
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                drop(runtime.spawn(cleanup));
+            }
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(cleanup);
+        }
     }
 }
 
@@ -176,6 +259,7 @@ where
 {
     next: ForeignInputStreamNextCallback<<Result<Option<T>, E> as LiftReturn<UT>>::ReturnType>,
     cancel: ForeignInputStreamCancelCallback,
+    close: ForeignInputStreamCloseCallback,
     _phantom: PhantomData<fn() -> (T, E, UT)>,
 }
 
@@ -198,6 +282,14 @@ where
 
     fn cancel(&self, handle: Handle) {
         (self.cancel)(handle);
+    }
+    fn close(&self, handle: Handle) -> ForeignInputStreamCloseFuture {
+        let close = self.close;
+        Box::pin(foreign_async_call::<_, (), UT>(
+            move |callback, data, dropped| {
+                close(handle, callback, data, dropped);
+            },
+        ))
     }
 }
 
@@ -282,6 +374,9 @@ mod input_stream_tests {
 
         fn cancel(&self, _handle: Handle) {
             self.cancels.fetch_add(1, Ordering::Relaxed);
+        }
+        fn close(&self, _: Handle) -> ForeignInputStreamCloseFuture {
+            Box::pin(async {})
         }
     }
 
@@ -399,6 +494,17 @@ mod input_stream_tests {
     }
 
     extern "C" fn ffi_cancel(_handle: Handle) {}
+    extern "C" fn ffi_close(
+        _: Handle,
+        callback: ForeignFutureCallback<()>,
+        data: u64,
+        _: &mut ForeignFutureDroppedCallbackStruct,
+    ) {
+        callback(
+            data,
+            ForeignFutureResult::from_raw_parts((), RustCallStatus::default()),
+        );
+    }
 
     #[test]
     fn input_stream_ffi_callback_ops_lift_item() {
@@ -406,6 +512,7 @@ mod input_stream_tests {
             Handle::from_raw_unchecked(1),
             ffi_success_next,
             ffi_cancel,
+            ffi_close,
         );
 
         assert_eq!(poll_input_stream(&mut stream), Poll::Ready(Some(Ok(99))));
@@ -417,6 +524,7 @@ mod input_stream_tests {
             Handle::from_raw_unchecked(1),
             ffi_error_next,
             ffi_cancel,
+            ffi_close,
         );
 
         assert_eq!(

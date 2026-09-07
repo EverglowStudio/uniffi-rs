@@ -48,6 +48,7 @@ pub enum Item {
 #[derive(Debug, Clone, Copy)]
 pub enum BuiltinItem {
     UnitType,
+    Infallible,
     Boolean,
     String,
     Str,
