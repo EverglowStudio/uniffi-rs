@@ -5094,6 +5094,29 @@ fn render_native_operation_wrappers(
     Ok(source.to_string())
 }
 
+fn input_stream_argument_helper(operation: &RustOperationPlan, index: usize) -> Result<Path> {
+    let resource_id = operation
+        .stream_resources
+        .iter()
+        .find(|resource| {
+            resource.direction == uniffi_js_engine_schema::StreamDirection::Input
+                && resource.path.segments() == [ValuePathSegment::Argument(index as u32)]
+        })
+        .map(|resource| resource.id.index())
+        .ok_or_else(|| {
+            anyhow!(
+                "input stream argument {} on operation {} has no canonical resource group",
+                index,
+                operation.operation_id.index()
+            )
+        })?;
+    Ok(syn::parse_str(&format!(
+        "crate::__uniffi_input_stream_{}_{}",
+        operation.operation_id.index(),
+        resource_id
+    ))?)
+}
+
 fn napi_argument(
     package: &NormalizedPackage,
     operation: &RustOperationPlan,
@@ -5170,29 +5193,7 @@ fn napi_argument(
         },
         RustCarrier::InputStream => napi_uniffi_engine::ArgumentBinding::InputStreamProxy {
             rust_type: core_type_for_binding(package, &value_binding)?,
-            build: {
-                let resource_id = operation
-                    .stream_resources
-                    .iter()
-                    .find(|resource| {
-                        resource.direction == uniffi_js_engine_schema::StreamDirection::Input
-                            && resource.path.segments()
-                                == [ValuePathSegment::Argument(index as u32)]
-                    })
-                    .map(|resource| resource.id.index())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "input stream argument {} on operation {} has no canonical resource group",
-                            index,
-                            operation.operation_id.index()
-                        )
-                    })?;
-                syn::parse_str(&format!(
-                    "crate::__uniffi_input_stream_{}_{}",
-                    operation.operation_id.index(),
-                    resource_id
-                ))?
-            },
+            build: input_stream_argument_helper(operation, index)?,
         },
         RustCarrier::OpaqueHandle => napi_uniffi_engine::ArgumentBinding::ObjectLease {
             carrier_type: syn,
@@ -5700,11 +5701,7 @@ fn ohos_argument(
         RustCarrier::InputStream => {
             napi_ohos_uniffi_engine::OhosArgumentBinding::InputStreamProxy {
                 rust_type: core_type_for_binding(package, &value_binding)?,
-                build: path_for_helper(
-                    operation.operation_id.index(),
-                    &index.to_string(),
-                    "input_stream",
-                ),
+                build: input_stream_argument_helper(operation, index)?,
             }
         }
         RustCarrier::OpaqueHandle => napi_ohos_uniffi_engine::OhosArgumentBinding::ObjectLease {
@@ -6025,10 +6022,14 @@ pub(crate) fn ohos_source(package: &NormalizedPackage) -> Result<String> {
             .iter()
             .any(async_calls::managed),
     );
-    let derive_import = format!("use {};\n", NativeFlavor::Ohos.derive_import());
+    let derive_import = format!(
+        "use {};\n{}",
+        NativeFlavor::Ohos.derive_import(),
+        rust_trait_imports(package)?
+    );
     Ok(format!(
         "{derive_import}{registry}\n{async_helpers}\n{temporal}\n{helpers}\n{operation_helpers}\n{nested_input_helpers}\n{input_stream_helpers}\n{callback_helpers}\n{wrappers}\n{}",
-        module.source()
+        clean_napi_expansion(&module.source().to_string())?
     ))
 }
 
@@ -6709,6 +6710,68 @@ fn wasm_resource_use_sites(
         );
     }
     output
+}
+
+/// Project the existing object resource walker for contextBridge identity
+/// restoration. Only declared lease positions may enter the preload table.
+pub(crate) fn electron_lease_paths(package: &NormalizedPackage) -> serde_json::Value {
+    use serde_json::json;
+    use wasm_bindgen_uniffi_engine::WasmValuePathSegment as S;
+    let mut plans = serde_json::Map::new();
+    for operation in &package.rust.engines[&EngineKind::Napi].operations {
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for resource in wasm_resource_use_sites(package, operation) {
+            let mut path = Vec::new();
+            let mut returned = false;
+            for segment in resource.path.segments() {
+                path.push(match segment {
+                    S::Receiver => json!(["field", 0]),
+                    S::Argument(index) => json!([
+                        "field",
+                        *index as usize + usize::from(operation.receiver.is_some())
+                    ]),
+                    S::Return => {
+                        returned = true;
+                        continue;
+                    }
+                    S::StreamItem => json!(["step", "item", "value"]),
+                    S::StreamError => json!(["step", "error", "error"]),
+                    S::Field(name) => json!(["field", name]),
+                    S::Variant(name) => json!(["variant", name]),
+                    S::Optional => json!(["optional"]),
+                    S::SequenceItem => json!(["sequence"]),
+                    S::SetItem => json!(["set"]),
+                    S::MapKey => json!(["mapKey"]),
+                    S::MapValue => json!(["mapValue"]),
+                });
+            }
+            if returned {
+                outputs.push(path);
+            } else {
+                inputs.push(path);
+            }
+        }
+        if operation.return_value.as_ref().is_some_and(|binding| {
+            matches!(binding.conversion, ConversionRecipe::OutputStream { .. })
+        }) {
+            outputs.push(Vec::new());
+        }
+        if operation
+            .receiver
+            .as_ref()
+            .is_some_and(|binding| binding.carrier == RustCarrier::OutputStream)
+        {
+            inputs.push(vec![json!(["field", 0])]);
+        }
+        if !inputs.is_empty() || !outputs.is_empty() {
+            plans.insert(
+                operation.operation_id.index().to_string(),
+                json!({"inputs":inputs, "outputs":outputs}),
+            );
+        }
+    }
+    serde_json::Value::Object(plans)
 }
 
 fn wasm_callback_contract(

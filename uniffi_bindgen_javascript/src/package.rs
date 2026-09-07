@@ -476,9 +476,13 @@ function __withStreamClose(backend) {{
   const close = handle => {{
     const raw = key(handle);
     if (closing.has(raw)) return closing.get(raw);
+    // Only live subscriptions need an acknowledgement. Once acknowledged,
+    // absence is the tombstone, including WASM leases already freed by next.
+    if (!live.has(raw)) return Promise.resolve();
     const pending = Promise.resolve().then(() => backend.invokeAsync({close_id}, [raw])).then(result => {{
       if (value(result) !== 1) {{ const error = new Error("stream cleanup failed"); error.name = error.errorName = "UniffiCleanupFailed"; throw error; }}
       live.delete(raw);
+      closing.delete(raw);
     }});
     pending.catch(() => {{}});
     closing.set(raw, pending);
@@ -488,7 +492,7 @@ function __withStreamClose(backend) {{
     const target = backend;
     if (name === "invokeSync") return (id, args) => remember(id, target.invokeSync(id, args));
     if (name === "invokeAsync") return async (id, args) => {{
-      if (cancelling.has(id) && closing.has(key(args[0]))) {{ await close(args[0]); return {{ kind: "value", value: undefined }}; }}
+      if (cancelling.has(id) && (closing.has(key(args[0])) || !live.has(key(args[0])))) {{ await close(args[0]); return {{ kind: "value", value: undefined }}; }}
       let result;
       try {{ result = await target.invokeAsync(id, args); }}
       catch (error) {{
@@ -501,7 +505,7 @@ function __withStreamClose(backend) {{
       if (cancelling.has(id)) await close(args[0]);
       return remember(id, result);
     }};
-    if (name === "cancelOutputStream") return async handle => {{ if (!closing.has(key(handle))) await target.cancelOutputStream(handle); await close(handle); }};
+    if (name === "cancelOutputStream") return async handle => {{ if (live.has(key(handle)) && !closing.has(key(handle))) await target.cancelOutputStream(handle); await close(handle); }};
     if (name === "releaseOutputStream") return async handle => {{ await close(handle); return target.releaseOutputStream(handle); }};
     if (name === "close") return async (...args) => {{ await Promise.all([...live.values()].map(close)); return target.close(...args); }};
     const member = target[name];
@@ -710,8 +714,57 @@ const __nativeHost = {\n\
   invokeCallbackAsyncResult: (...args) => __hostCallAsync(\"invokeCallbackAsyncResult\", args),\n\
   pullInputStream: (...args) => __hostCallAsync(\"pullInputStream\", args),\n\
   cancelInputStream: (...args) => __hostCallAsync(\"cancelInputStream\", args),\n\
-  releaseInputStream: (...args) => __hostCall(\"releaseInputStream\", args),\n};\nconst __backend = __native.__uniffi_backend_factory(__nativeHost);\nconst __requiredBackendMethods = [\"invokeSync\", \"invokeAsync\", \"releaseObject\", \"cancelOutputStream\", \"releaseOutputStream\", \"close\"];\nfunction __backendMethod(name) {\n  if (!__backend || typeof __backend[name] !== \"function\") throw __plainError({ errorName: \"UniffiBackendProtocol\", message: \"native backend is missing \" + name });\n  return __backend[name];\n}\nfor (const method of __requiredBackendMethods) __backendMethod(method);\nfunction __backendCall(name, args) {\n  try { return __backendMethod(name).apply(__backend, args); } catch (error) { throw __plainError(error); }\n}\nfunction __backendCallAsync(name, args) {\n  try { return Promise.resolve(__backendCall(name, args)).catch((error) => Promise.reject(__plainError(error))); }\n  catch (error) { return Promise.reject(__plainError(error)); }\n}\ncontextBridge.exposeInMainWorld(\"__uniffiBackend\", Object.freeze({\n  bindHost(host) { __bindRendererHost(host); },\n  invokeSync: (...args) => __backendCall(\"invokeSync\", args),\n  invokeAsync: (...args) => __backendCallAsync(\"invokeAsync\", args),\n  releaseObject: (...args) => __backendCall(\"releaseObject\", args),\n  cancelOutputStream: (...args) => __backendCallAsync(\"cancelOutputStream\", args),\n  releaseOutputStream: (...args) => __backendCall(\"releaseOutputStream\", args),\n  close: (...args) => __backendCallAsync(\"close\", args),\n}));\n",
+  releaseInputStream: (...args) => __hostCall(\"releaseInputStream\", args),\n};\nconst __backend = __withStreamClose(__native.__uniffi_backend_factory(__nativeHost));\nconst __requiredBackendMethods = [\"invokeSync\", \"invokeAsync\", \"releaseObject\", \"cancelOutputStream\", \"releaseOutputStream\", \"close\"];\nfunction __backendMethod(name) {\n  if (!__backend || typeof __backend[name] !== \"function\") throw __plainError({ errorName: \"UniffiBackendProtocol\", message: \"native backend is missing \" + name });\n  return __backend[name];\n}\nfor (const method of __requiredBackendMethods) __backendMethod(method);\nfunction __backendCall(name, args) {\n  try { args = __restoreArgs(name, args); const result = __backendMethod(name).apply(__backend, args); const finish = value => __finishBackendCall(name, args, value); return result && typeof result.then === \"function\" ? result.then(finish) : finish(result); } catch (error) { throw __plainError(error); }\n}\nfunction __backendCallAsync(name, args) {\n  try { return Promise.resolve(__backendCall(name, args)).catch((error) => Promise.reject(__plainError(error))); }\n  catch (error) { return Promise.reject(__plainError(error)); }\n}\ncontextBridge.exposeInMainWorld(\"__uniffiBackend\", Object.freeze({\n  bindHost(host) { __bindRendererHost(host); },\n  invokeSync: (...args) => __backendCall(\"invokeSync\", args),\n  invokeAsync: (...args) => __backendCallAsync(\"invokeAsync\", args),\n  releaseObject: (...args) => __backendCall(\"releaseObject\", args),\n  cancelOutputStream: (...args) => __backendCallAsync(\"cancelOutputStream\", args),\n  releaseOutputStream: (...args) => __backendCall(\"releaseOutputStream\", args),\n  close: (...args) => __backendCallAsync(\"close\", args),\n}));\n",
     );
+    preload.push_str(&format!(
+        "const __leasePaths = {};\n",
+        crate::engines::electron_lease_paths(package)
+    ));
+    preload.push_str(r#"
+// contextBridge copies objects; the native engine tracks leases by identity.
+// Paths come from the same resource plan as the generated Rust adapters.
+const __leases = new Map();
+const __leaseKey = value => (typeof value.surfaceId === "string" ? "object:" + value.surfaceId : "stream") + ":" + value.handle;
+const __rememberLease = value => { __leases.set(__leaseKey(value), value); return value; };
+const __restoreLease = value => __leases.get(__leaseKey(value)) ?? value;
+function __atLease(value, path, visit) {
+  if (path.length === 0) return visit(value);
+  const [step, ...rest] = path;
+  switch (step[0]) {
+    case "field": {
+      const copy = Array.isArray(value) ? value.slice() : { ...value };
+      copy[step[1]] = __atLease(value[step[1]], rest, visit);
+      return copy;
+    }
+    case "optional": return value == null ? value : __atLease(value, rest, visit);
+    case "variant": return value.tag === step[1] ? __atLease(value, rest, visit) : value;
+    case "step": return value.kind === step[1] ? { ...value, [step[2]]: __atLease(value[step[2]], rest, visit) } : value;
+    case "sequence": return value.map(item => __atLease(item, rest, visit));
+    case "set": return new Set([...value].map(item => __atLease(item, rest, visit)));
+    case "mapKey": return new Map([...value].map(([key, item]) => [__atLease(key, rest, visit), item]));
+    case "mapValue": return new Map([...value].map(([key, item]) => [key, __atLease(item, rest, visit)]));
+    default: throw new Error("invalid generated lease path");
+  }
+}
+function __restoreArgs(name, args) {
+  if (name === "invokeSync" || name === "invokeAsync") {
+    let values = args[1];
+    for (const path of __leasePaths[args[0]]?.inputs ?? []) values = __atLease(values, path, __restoreLease);
+    return [args[0], values];
+  }
+  if (["releaseObject", "cancelOutputStream", "releaseOutputStream"].includes(name)) return [__restoreLease(args[0])];
+  return args;
+}
+function __finishBackendCall(name, args, result) {
+  if (name === "releaseObject" || name === "releaseOutputStream") __leases.delete(__leaseKey(args[0]));
+  if (name === "close") __leases.clear();
+  if ((name === "invokeSync" || name === "invokeAsync") && result?.kind === "value") {
+    for (const path of __leasePaths[args[0]]?.outputs ?? []) __atLease(result.value, path, __rememberLease);
+  }
+  return result;
+}
+"#);
+    preload.push_str(&render_stream_close_wrapper(package));
     // Keep the generated preload opaque: renderer code never receives the
     // native addon or BackendSession object, only an invoke capability.
     if package.api.components.is_empty() {
@@ -966,8 +1019,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn managed_operations_include_async_factories_but_exclude_stream_hooks() {
+    fn stream_control_package() -> NormalizedPackage {
         use crate::frontend::{normalize, BindingInput};
         use uniffi_bindgen::{interface::ComponentInterface, Component};
         use uniffi_meta::{FnMetadata, MetadataGroup, NamespaceMetadata, Type};
@@ -1004,7 +1056,12 @@ mod tests {
             ci: ComponentInterface::from_metadata(group).unwrap(),
             config: crate::JsConfig::default(),
         }];
-        let package = normalize(BindingInput::new(&components)).unwrap();
+        normalize(BindingInput::new(&components)).unwrap()
+    }
+
+    #[test]
+    fn managed_operations_include_async_factories_but_exclude_stream_hooks() {
+        let package = stream_control_package();
         let factory = package
             .api
             .operations
@@ -1029,6 +1086,82 @@ mod tests {
                 "{{ create: 3, cancel: 4, release: 5, operations: [{}] }}",
                 factory.id.index()
             )
+        );
+    }
+
+    #[test]
+    fn stream_close_ack_is_bounded_and_never_recancels_a_released_lease() {
+        let package = stream_control_package();
+        let operations = &package.rust.engines.values().next().unwrap().operations;
+        let id = |kind| {
+            operations
+                .iter()
+                .find(|op| op.kind == kind)
+                .unwrap()
+                .operation_id
+                .index()
+        };
+        let ids = [
+            id(uniffi_js_abi::OperationKind::OutputStreamStart),
+            id(uniffi_js_abi::OperationKind::OutputStreamNext),
+            id(uniffi_js_abi::OperationKind::OutputStreamCancel),
+            operations.len() as u32 + 3,
+        ];
+        let mut script = format!(
+            "const [factory, pull, cancel, ack] = {}; const source = {};\n",
+            serde_json::to_string(&ids).unwrap(),
+            serde_json::to_string(&render_stream_close_wrapper(&package)).unwrap()
+        );
+        script.push_str(r#"
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const maps = [];
+class ObservedMap extends Map { constructor() { super(); maps.push(this); } }
+let nextHandle = 1, acknowledgements = 0, cancellationRequests = 0, releaseAck;
+const ackStarted = () => new Promise(resolve => { releaseAck = resolve; });
+let gate = null;
+const backend = {
+  invokeSync(id) { assert.equal(id, factory); return {kind:'value', value:{handle:nextHandle++}}; },
+  async invokeAsync(id, args) {
+    if (id === ack) { acknowledgements++; if (gate) await gate; return {kind:'value', value:1}; }
+    if (id === pull) throw Object.assign(Error('released WASM lease'), {errorName:'UniffiCancelled'});
+    if (id === cancel) { cancellationRequests++; return {kind:'value'}; }
+    throw Error('unexpected operation');
+  },
+  cancelOutputStream() { cancellationRequests++; throw Error('cannot re-cancel a released WASM lease'); },
+  releaseOutputStream() {}, close() {},
+};
+const wrapped = vm.runInNewContext(source + '; __withStreamClose(backend)', {backend, Map:ObservedMap, Promise});
+(async () => {
+  for (let i = 0; i < 1000; i++) {
+    const handle = wrapped.invokeSync(factory, []).value;
+    await assert.rejects(wrapped.invokeAsync(pull,[handle]), {errorName:'UniffiCancelled'});
+    await wrapped.invokeAsync(cancel,[handle]); await wrapped.cancelOutputStream(handle);
+    await wrapped.releaseOutputStream(handle);
+    assert.deepEqual(maps.map(map => map.size), [0,0], 'no historical resolved close promises');
+  }
+  assert.equal(acknowledgements,1000); assert.equal(cancellationRequests,0);
+  gate = ackStarted(); const handle = wrapped.invokeSync(factory,[]).value;
+  let readSettled=false, closeSettled=false;
+  const reading = assert.rejects(wrapped.invokeAsync(pull,[handle]), {errorName:'UniffiCancelled'}).then(()=>{readSettled=true;});
+  // Wait for the acknowledgement to be entered, not an elapsed-time guess.
+  while (acknowledgements !== 1001) await Promise.resolve();
+  const closing = wrapped.invokeAsync(cancel,[handle]).then(()=>{closeSettled=true;});
+  await Promise.resolve(); assert.equal(readSettled || closeSettled, false);
+  releaseAck(); await Promise.all([reading,closing]);
+  assert.equal(acknowledgements,1001); assert.equal(cancellationRequests,0);
+  await wrapped.releaseOutputStream(handle); await wrapped.close();
+  assert.deepEqual(maps.map(map => map.size), [0,0]);
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"#);
+        let output = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

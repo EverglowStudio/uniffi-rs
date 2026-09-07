@@ -1122,6 +1122,7 @@ export class ArkRecord {
   }
 }
 export type ArkValue = ArkPrimitive | Uint8Array | Date | ArkRecord | Array<ArkValue> | Map<ArkValue, ArkValue> | Set<ArkValue> | null;
+interface __ArkStreamHandle { readonly handle?: ArkValue; }
 interface __ArkStreamStepCarrier { kind?: ArkValue; value?: ArkValue; error?: ArkValue; }
 function __arkStreamStepField(value: ArkValue, name: string): ArkValue {
   if (value instanceof ArkRecord) return value.get(name);
@@ -1168,6 +1169,7 @@ export class UniffiError extends Error {
     return new UniffiError(failure.errorName, failure.message, failure.variant, failure.data);
   }
 }
+function __arkInfallibleInputError(_error: ArkValue | UniffiError): never { throw new UniffiError("UniffiInputStreamError", "infallible input stream failed"); }
 function __arkAsUniffiError(error: Error): UniffiError | null {
   const candidate: UniffiError = error as UniffiError;
   return candidate.errorName === undefined ? null : candidate;
@@ -1176,14 +1178,17 @@ export class ArkItemStep<T> { readonly kind: "item" = "item"; readonly value: T;
 export class ArkDoneStep { readonly kind: "done" = "done"; }
 export class ArkErrorStep { readonly kind: "error" = "error"; readonly error: UniffiError; constructor(error: UniffiError) { this.error = error; } }
 export type ArkStreamStep<T> = ArkItemStep<T> | ArkDoneStep | ArkErrorStep;
+export class ArkHostErrorStep { readonly kind: "error" = "error"; readonly error: ArkValue; constructor(error: ArkValue) { this.error = error; } }
+export type ArkHostStreamStep = ArkItemStep<ArkValue> | ArkDoneStep | ArkHostErrorStep;
 export interface UniFfiStream<T> {
   next(): Promise<ArkStreamStep<T>>;
   cancel(): Promise<void>;
+  release?(): Promise<void>;
 }
 export interface UniFfiInputStream<T> {
   next(): Promise<ArkStreamStep<T>>;
   cancel(): Promise<void>;
-  release(): void;
+  release(): Promise<void>;
 }
 export interface ArkCallbackAdapter {
   invokeSync(methodId: number, args: Array<ArkValue>): ArkValue;
@@ -1361,7 +1366,7 @@ export class Host {
       return carrier === null ? { ok: false, error_message: failure.message } : { ok: false, error: carrier, error_message: failure.message };
     }
   }
-  pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>> {
+  pullInputStream(handle: ArkValue): Promise<ArkHostStreamStep> {
     if (this.inputRegistry === null) return Promise.reject(new UniffiError("UniffiInputStreamMissing", "input stream registry is not attached"));
     return this.inputRegistry.pull(handle);
   }
@@ -1369,7 +1374,7 @@ export class Host {
     if (this.inputRegistry === null) return Promise.resolve();
     return this.inputRegistry.cancel(handle);
   }
-  releaseInputStream(handle: ArkValue): void { this.inputRegistry?.release(handle); }
+  releaseInputStream(handle: ArkValue): Promise<void> { return this.inputRegistry === null ? Promise.resolve() : this.inputRegistry.release(handle); }
 }
 function __arkCallbackFailure(error: Error): ArkFailure {
   const candidate: UniffiError | null = __arkAsUniffiError(error);
@@ -1384,76 +1389,72 @@ function __arkCallbackErrorCarrier(failure: ArkFailure): ArkValue | null {
   carrier.tag = failure.variant;
   return failure.data;
 }
-interface ArkInputSlot { readonly pull: () => Promise<ArkStreamStep<ArkValue>>; readonly cancel: () => Promise<void>; readonly release: () => void; readonly detach: () => void; }
+interface ArkInputSlot { readonly pull: () => Promise<ArkHostStreamStep>; readonly close: () => Promise<void>; readonly detach: () => void; }
 class ArkInputRegistry {
   private nextHandle: number = 1;
   private readonly slots: Map<number, ArkInputSlot> = new Map<number, ArkInputSlot>();
-  register<T>(source: UniFfiInputStream<T>, lower: (value: T) => ArkValue): number {
-    const handle: number = this.nextHandle;
-    this.nextHandle += 1;
-    let pending: boolean = false;
+  register<T>(source: UniFfiStream<T>, lower: (value: T) => ArkValue, lowerError: (error: UniffiError) => ArkValue): number {
+    const handle: number = this.nextHandle++;
+    let pending: Promise<ArkStreamStep<T>> | null = null;
     let closed: boolean = false;
     let detached: boolean = false;
-    let removed: boolean = false;
-    const remove: () => void = (): void => {
-      if (removed) return;
-      removed = true;
+    let closePromise: Promise<void> | null = null;
+    const close: () => Promise<void> = (): Promise<void> => {
+      if (closePromise !== null) return closePromise;
       closed = true;
-      this.slots.delete(handle);
+      closePromise = Promise.resolve().then(async (): Promise<void> => {
+        if (detached) throw __environmentDestroyed();
+        const errors: Array<Error> = [];
+        // cancel is the producer's awaitable cleanup contract. The transport
+        // next is joined separately, never the wrapper waiting for this close.
+        await Promise.all([Promise.resolve().then((): Promise<void> => source.cancel()).catch((error: Error): void => { errors.push(error); }), pending?.then((): void => undefined, (): void => undefined)]);
+        try { await source.release?.(); } catch (error) { errors.push(error); }
+        this.slots.delete(handle);
+        if (errors.length > 0) throw errors[0];
+      });
+      closePromise.catch((): void => undefined);
+      return closePromise;
     };
     const slot: ArkInputSlot = {
-      pull: async (): Promise<ArkStreamStep<ArkValue>> => {
-        if (closed) return new ArkDoneStep();
-        if (pending) throw new UniffiError("UniffiInputStreamConcurrentNext", "concurrent input stream pull");
-        pending = true;
+      pull: async (): Promise<ArkHostStreamStep> => {
+        if (closed) { await closePromise; return new ArkDoneStep(); }
+        if (pending !== null) throw new UniffiError("UniffiInputStreamConcurrentNext", "concurrent input stream pull");
+        pending = Promise.resolve().then((): Promise<ArkStreamStep<T>> => source.next());
         try {
-          const step: ArkStreamStep<T> = await source.next();
-          if (closed || detached) return new ArkDoneStep();
+          const step: ArkStreamStep<T> = await pending;
+          if (detached) throw __environmentDestroyed();
+          if (closed) { await closePromise; return new ArkDoneStep(); }
           if (step.kind === "item") return new ArkItemStep<ArkValue>(lower(step.value));
-          if (step.kind === "done") { remove(); return new ArkDoneStep(); }
-          remove();
-          return new ArkErrorStep(step.error);
+          await close();
+          return step.kind === "done" ? new ArkDoneStep() : new ArkHostErrorStep(lowerError(step.error));
         } catch (error) {
-          remove();
-          if (detached) return new ArkDoneStep();
-          const reason: UniffiError | null = __arkAsUniffiError(error);
-          if (reason !== null) return new ArkErrorStep(reason);
-          return new ArkErrorStep(new UniffiError("UniffiInputStreamError", "input stream failed"));
-        } finally { pending = false; }
+          await close();
+          // The generated lowerer validates the declared error class and
+          // payload; unrelated framework errors still reject the host pull.
+          const declared: UniffiError | null = __arkAsUniffiError(error);
+          if (declared !== null) return new ArkHostErrorStep(lowerError(declared));
+          throw error as Error;
+        } finally { pending = null; }
       },
-      cancel: async (): Promise<void> => {
-        if (removed) return;
-        closed = true;
-        if (detached) { remove(); return; }
-        try { await source.cancel(); }
-        finally { remove(); }
-      },
-      release: (): void => { remove(); },
+      close,
       detach: (): void => { detached = true; closed = true; },
     };
     this.slots.set(handle, slot);
     return handle;
   }
-  pull(handle: ArkValue): Promise<ArkStreamStep<ArkValue>> {
-    const numericHandle: number = handle as number;
-    const slot: ArkInputSlot | undefined = this.slots.get(numericHandle);
-    if (slot === undefined) return Promise.reject(new UniffiError("UniffiInputStreamMissing", "input stream handle is not registered"));
-    return slot.pull();
+  pull(handle: ArkValue): Promise<ArkHostStreamStep> {
+    const slot: ArkInputSlot | undefined = this.slots.get(handle as number);
+    return slot === undefined ? Promise.resolve(new ArkDoneStep()) : slot.pull();
   }
   cancel(handle: ArkValue): Promise<void> {
-    const numericHandle: number = handle as number;
-    const slot: ArkInputSlot | undefined = this.slots.get(numericHandle);
-    return slot === undefined ? Promise.resolve() : slot.cancel();
+    const slot: ArkInputSlot | undefined = this.slots.get(handle as number);
+    return slot === undefined ? Promise.resolve() : slot.close();
   }
-  release(handle: ArkValue): void {
-    const numericHandle: number = handle as number;
-    const slot: ArkInputSlot | undefined = this.slots.get(numericHandle);
-    if (slot !== undefined) slot.release();
-  }
+  release(handle: ArkValue): Promise<void> { return this.cancel(handle); }
   close(): Promise<void> {
-    const pending: Array<Promise<void>> = [];
-    for (const slot of this.slots.values()) pending.push(slot.cancel());
-    return Promise.all(pending).then((): void => undefined);
+    const errors: Array<Error> = [];
+    const pending: Array<Promise<void>> = Array.from(this.slots.values()).map((slot: ArkInputSlot): Promise<void> => slot.close().catch((error: Error): void => { errors.push(error); }));
+    return Promise.all(pending).then((): void => { if (errors.length > 0) throw errors[0]; });
   }
   detach(): void { for (const slot of this.slots.values()) slot.detach(); this.slots.clear(); }
 }
@@ -1461,17 +1462,21 @@ class ArkInputView<T> implements UniFfiInputStream<T> {
   private readonly session: BackendSession;
   private readonly handle: ArkValue;
   private readonly lift: (value: ArkValue) => T;
-  private released: boolean = false;
-  constructor(session: BackendSession, handle: ArkValue, lift: (value: ArkValue) => T) { this.session = session; this.handle = handle; this.lift = lift; }
+  private readonly liftError: (value: ArkValue) => UniffiError;
+  private closePromise: Promise<void> | null = null;
+  constructor(session: BackendSession, handle: ArkValue, lift: (value: ArkValue) => T, liftError: (value: ArkValue) => UniffiError) { this.session = session; this.handle = handle; this.lift = lift; this.liftError = liftError; }
   async next(): Promise<ArkStreamStep<T>> {
-    const step: ArkStreamStep<ArkValue> = await this.session.pullInputStream(this.handle);
+    if (this.closePromise !== null) { await this.closePromise; return new ArkDoneStep(); }
+    const step: ArkHostStreamStep = await this.session.pullInputStream(this.handle);
     if (step.kind === "item") return new ArkItemStep<T>(this.lift(step.value));
-    this.release();
-    if (step.kind === "done") return new ArkDoneStep();
-    return new ArkErrorStep(step.error);
+    await this.release();
+    return step.kind === "done" ? new ArkDoneStep() : new ArkErrorStep(this.liftError(step.error));
   }
-  async cancel(): Promise<void> { try { await this.session.cancelInputStream(this.handle); } finally { this.release(); } }
-  release(): void { if (this.released) return; this.released = true; this.session.releaseInputStream(this.handle); }
+  cancel(): Promise<void> { return this.release(); }
+  release(): Promise<void> {
+    if (this.closePromise === null) this.closePromise = this.session.cancelInputStream(this.handle).finally((): Promise<void> => this.session.releaseInputStream(this.handle));
+    return this.closePromise;
+  }
 }
 export interface ArkOutputSpec<T> {
   readonly handle?: ArkValue;
@@ -1480,8 +1485,8 @@ export interface ArkOutputSpec<T> {
   readonly cancel: (handle: ArkValue) => Promise<void>;
   readonly lift: (value: ArkValue) => T;
   readonly error: (value: ArkValue) => UniffiError;
-  readonly release: (handle: ArkValue) => void;
-  readonly onClose?: () => void;
+  readonly release: (handle: ArkValue) => Promise<void> | void;
+  readonly onClose?: () => Promise<void> | void;
 }
 class ArkOutputStream<T> implements UniFfiStream<T> {
   private readonly session: BackendSession;
@@ -1489,122 +1494,93 @@ class ArkOutputStream<T> implements UniFfiStream<T> {
   private phase: "idle" | "starting" | "active" | "done" | "cancelled" = "idle";
   private handle: ArkValue | null = null;
   private pending: boolean = false;
-  private claimed: boolean = false;
-  private released: boolean = false;
-  private cancelRequested: boolean = false;
-  private cancelIssued: boolean = false;
   private detached: boolean = false;
-  private nextPromise: Promise<ArkStreamStep<T>> | null = null;
-  private cancelPromise: Promise<void> | null = null;
-  constructor(session: BackendSession, spec: ArkOutputSpec<T>) { this.session = session; this.spec = spec; if (spec.handle !== undefined) { this.handle = spec.handle; this.phase = "active"; } }
-  private finish(): void {
-    if (this.released) return;
-    this.released = true;
-    if (this.handle !== null) this.spec.release(this.handle);
-    if (!this.detached) this.spec.onClose?.();
+  private startPromise: Promise<ArkValue> | null = null;
+  private nextPromise: Promise<ArkCallResult> | null = null;
+  private closePromise: Promise<void> | null = null;
+  private releasePromise: Promise<void> | null = null;
+  constructor(session: BackendSession, spec: ArkOutputSpec<T>) { this.session = session; this.spec = spec; if (spec.handle !== undefined) this.handle = spec.handle; }
+  private cancelled(): boolean { return this.phase === "cancelled"; }
+  private finish(): Promise<void> {
+    if (this.releasePromise !== null) return this.releasePromise;
+    this.releasePromise = Promise.resolve().then(async (): Promise<void> => {
+      if (this.detached) throw __environmentDestroyed();
+      try {
+        if (this.handle !== null) {
+          try { await this.session.confirmOutputStreamClose(this.handle); }
+          finally { await this.spec.release(this.handle); }
+        }
+      } finally {
+        this.session.untrackOutputStream(this as UniFfiStream<ArkValue>);
+        await this.spec.onClose?.();
+      }
+    });
+    this.releasePromise.catch((): void => undefined);
+    return this.releasePromise;
   }
-  private async abort(reason: UniffiError): Promise<UniffiError> {
-    if (this.handle !== null && !this.cancelIssued) {
-      this.cancelIssued = true;
-      try { await this.spec.cancel(this.handle); }
-      catch (error) { const cancellationError: UniffiError | null = __arkAsUniffiError(error); if (cancellationError !== null) reason = cancellationError; }
-    }
-    this.phase = "done";
-    this.finish();
-    return reason;
+  private ensureStarted(): Promise<ArkValue> {
+    if (this.startPromise !== null) return this.startPromise;
+    this.phase = "starting";
+    this.startPromise = Promise.resolve().then((): Promise<ArkValue> | ArkValue => this.spec.start()).then((handle: ArkValue): ArkValue => {
+      if (this.detached) throw __environmentDestroyed();
+      this.handle = handle;
+      if (this.phase === "starting") this.phase = "active";
+      return handle;
+    });
+    this.startPromise.catch((): void => undefined);
+    return this.startPromise;
   }
   next(): Promise<ArkStreamStep<T>> {
-    if (this.nextPromise !== null) return Promise.reject(new UniffiError("UniffiStreamConcurrentNext", "concurrent output stream pull"));
-    const pending: Promise<ArkStreamStep<T>> = this.session.trackCallResult(this.nextInner());
-    this.nextPromise = pending;
-    pending.then((): void => { this.nextPromise = null; }, (): void => { this.nextPromise = null; });
-    return pending;
+    if (this.pending) return Promise.reject(new UniffiError("UniffiStreamConcurrentNext", "concurrent output stream pull"));
+    return this.session.trackCallResult(this.nextInner());
   }
   private async nextInner(): Promise<ArkStreamStep<T>> {
-    if (this.claimed && this.pending) return Promise.reject(new UniffiError("UniffiStreamConcurrentNext", "concurrent output stream pull"));
-    this.claimed = true;
-    if (this.phase === "done" || this.phase === "cancelled") return new ArkDoneStep();
-    if (this.phase === "idle") {
-      this.phase = "starting";
-      this.pending = true;
-      try {
-        const started: ArkValue | __ArkDetachedMarker = await this.session.guardPromise(this.spec.start(), this.session.generation);
-        if (started === __DETACHED || this.detached) { this.phase = "cancelled"; return new ArkDoneStep(); }
-        this.handle = started as ArkValue;
-        if (this.cancelRequested) {
-          const error: UniffiError = await this.abort(new UniffiError("UniffiStreamCancelled", "stream was cancelled during start"));
-          return new ArkErrorStep(error);
-        }
-        this.phase = "active";
-      } catch (error) {
-        this.phase = "done";
-        this.finish();
-        const startError: UniffiError | null = __arkAsUniffiError(error);
-        return new ArkErrorStep(startError === null ? new UniffiError("UniffiStreamStart", "stream start failed") : startError);
-      } finally { this.pending = false; }
-    }
-    if (this.handle === null) {
-      const error: UniffiError = await this.abort(new UniffiError("UniffiStreamHandle", "stream handle is missing"));
-      return new ArkErrorStep(error);
-    }
+    if (this.detached) throw __environmentDestroyed();
+    if (this.phase === "done" || this.phase === "cancelled") { if (this.closePromise !== null) await this.closePromise; return new ArkDoneStep(); }
     this.pending = true;
     try {
-      const rawValue: ArkCallResult | __ArkDetachedMarker = await this.session.guardPromise(this.spec.next(this.handle), this.session.generation);
-      if (rawValue === __DETACHED || this.detached) return new ArkDoneStep();
-      const raw: ArkCallResult = rawValue as ArkCallResult;
-      const value: ArkValue = __decodeResult(raw);
+      await this.ensureStarted();
+      if (this.phase !== "active") { await this.closePromise; return new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled")); }
+      const handle: ArkValue = this.handle as ArkValue;
+      this.nextPromise = Promise.resolve().then((): Promise<ArkCallResult> => this.spec.next(handle));
+      const raw: ArkCallResult | __ArkDetachedMarker = await this.session.guardPromise(this.nextPromise);
+      if (raw === __DETACHED || this.detached) throw __environmentDestroyed();
+      if (this.phase !== "active") { await this.closePromise; return new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled")); }
+      const value: ArkValue = __decodeResult(raw as ArkCallResult);
       const kind: ArkValue = __arkStreamStepField(value, "kind");
       if (kind === "item") return new ArkItemStep<T>(this.spec.lift(__arkStreamStepField(value, "value")));
-      if (kind === "done") { this.phase = "done"; this.finish(); return new ArkDoneStep(); }
-      if (kind === "error") {
-        this.phase = "done";
-        this.finish();
-        const errorValue: ArkValue = __arkStreamStepField(value, "error");
-        return new ArkErrorStep(this.spec.error(errorValue));
-      }
-      const error: UniffiError = await this.abort(new UniffiError("UniffiStreamProtocol", "invalid stream step tag"));
-      return new ArkErrorStep(error);
+      if (kind !== "done" && kind !== "error") throw new UniffiError("UniffiStreamProtocol", "invalid stream step tag");
+      this.phase = "done";
+      await this.finish();
+      return kind === "done" ? new ArkDoneStep() : new ArkErrorStep(this.spec.error(__arkStreamStepField(value, "error")));
     } catch (error) {
-      const streamError: UniffiError | null = __arkAsUniffiError(error);
-      const reason: UniffiError = streamError === null ? new UniffiError("UniffiStreamError", "stream pull failed") : streamError;
-      const aborted: UniffiError = await this.abort(reason);
-      return new ArkErrorStep(aborted);
-    } finally { this.pending = false; }
+      if (this.detached) throw __environmentDestroyed();
+      if (this.cancelled()) { await this.closePromise; return new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled")); }
+      if (this.phase !== "done") await this.cancel();
+      const reason: UniffiError | null = __arkAsUniffiError(error);
+      return new ArkErrorStep(reason === null ? new UniffiError("UniffiStreamError", error.message) : reason);
+    } finally { this.pending = false; this.nextPromise = null; }
   }
   cancel(): Promise<void> {
-    if (this.cancelPromise !== null) return this.cancelPromise;
-    this.cancelPromise = this.cancelInner();
-    return this.cancelPromise;
-  }
-  private async cancelInner(): Promise<void> {
-    if (this.phase === "done" || this.phase === "cancelled") return;
-    this.cancelRequested = true;
-    if (this.phase === "starting") {
-      this.phase = "cancelled";
-      if (this.nextPromise !== null) await this.nextPromise;
-      return;
-    }
-    if (this.handle === null) {
-      this.phase = "cancelled";
-      this.finish();
-      return;
-    }
+    if (this.closePromise !== null) return this.closePromise;
+    if (this.phase === "done") return this.finish();
     this.phase = "cancelled";
-    if (!this.cancelIssued) {
-      this.cancelIssued = true;
-      try {
-      const result: void | __ArkDetachedMarker = await this.session.guardPromise(this.spec.cancel(this.handle), this.session.generation);
-        if (result === __DETACHED) throw __environmentDestroyed();
-      } finally {
-        if (this.nextPromise !== null) await this.nextPromise;
-        this.finish();
+    this.closePromise = Promise.resolve().then(async (): Promise<void> => {
+      const errors: Array<Error> = [];
+      if (this.startPromise !== null) {
+        try { await this.startPromise; }
+        catch (error) { const reason: UniffiError | null = __arkAsUniffiError(error); if (reason === null || reason.errorName !== "UniffiCancelled") errors.push(error); }
       }
-    } else {
-      if (this.nextPromise !== null) await this.nextPromise;
-      this.finish();
-    }
+      const stopping: Promise<void> = this.handle === null ? Promise.resolve() : this.spec.cancel(this.handle);
+      // Await the transport next, never nextInner, which waits for this close.
+      await Promise.all([stopping.catch((error: Error): void => { errors.push(error); }), this.nextPromise?.then((): void => undefined, (): void => undefined)]);
+      await this.finish();
+      if (errors.length > 0) throw errors[0];
+    });
+    this.closePromise.catch((): void => undefined);
+    return this.closePromise;
   }
-  detach(): void { this.detached = true; this.phase = "cancelled"; this.pending = false; }
+  detach(): void { this.detached = true; this.phase = "cancelled"; this.session.untrackOutputStream(this as UniFfiStream<ArkValue>); }
 }
 interface ArkObjectState {
   readonly session: BackendSession;
@@ -1701,7 +1677,12 @@ export class ArkCallbackRegistration {
   readonly callbackId: number;
   constructor(callbackType: number, callbackId: number) { this.callbackType = callbackType; this.callbackId = callbackId; }
 }
-export class ArkCallbackFrame { readonly registrations: Array<ArkCallbackRegistration> = new Array<ArkCallbackRegistration>(); }
+export class ArkCallbackFrame {
+  readonly registrations: Array<ArkCallbackRegistration> = new Array<ArkCallbackRegistration>();
+  readonly inputStreams: Array<number> = new Array<number>();
+  ended: boolean = false;
+  cleanup: Promise<void> | undefined = undefined;
+}
 export class BackendSession {
   readonly backend: ArkBackend;
   readonly host: Host;
@@ -1839,7 +1820,19 @@ export class BackendSession {
   releaseCallback(callbackType: number, callbackId: number): void { this.callbacks.release(callbackType, callbackId); }
   beginCallFrame(): ArkCallbackFrame { const frame: ArkCallbackFrame = new ArkCallbackFrame(); this.frames.push(frame); return frame; }
   leaveCallFrame(frame: ArkCallbackFrame): void { const index: number = this.frames.indexOf(frame); if (index >= 0) this.frames.splice(index, 1); }
-  endCallFrame(frame: ArkCallbackFrame): void { this.leaveCallFrame(frame); for (const registration of frame.registrations) this.callbacks.frameRelease(registration.callbackType, registration.callbackId); }
+  endCallFrame(frame: ArkCallbackFrame): Promise<void> | undefined {
+    if (frame.ended) return frame.cleanup;
+    frame.ended = true;
+    this.leaveCallFrame(frame);
+    for (const registration of frame.registrations) this.callbacks.frameRelease(registration.callbackType, registration.callbackId);
+    if (frame.inputStreams.length > 0) {
+      const pending: Array<Promise<void>> = frame.inputStreams.map((handle: number): Promise<void> => this.cancelInputStream(handle).finally((): Promise<void> => this.releaseInputStream(handle)));
+      const errors: Array<Error> = [];
+      frame.cleanup = this.trackCallResult(Promise.all(pending.map((task: Promise<void>): Promise<void> => task.catch((error: Error): void => { errors.push(error); }))).then((): void => { if (errors.length > 0) throw errors[0]; }));
+      frame.cleanup.catch((): void => undefined);
+    }
+    return frame.cleanup;
+  }
   trackObject(object: ObjectLease): void { this.objects.push(object); }
   untrackObject(object: ObjectLease): void { const index: number = this.objects.indexOf(object); if (index >= 0) this.objects.splice(index, 1); }
   releaseObject(handle: ArkValue): void { if (this.isDetached()) return; try { this.backend.releaseObject(handle); } catch (_) {} }
@@ -1849,18 +1842,36 @@ export class BackendSession {
     else if (existing.ownerTypeId !== factory.ownerTypeId) throw new UniffiError("UniffiObjectFactory", "owner type ID has multiple factories");
   }
   liftObject<T extends ObjectLease>(typeId: number, handle: ArkValue): T { const factory: ArkObjectFactory | undefined = this.factories.get(typeId); if (factory === undefined) throw new UniffiError("UniffiObjectFactory", "missing owner object factory"); if (factory.ownerTypeId !== typeId) throw new UniffiError("UniffiObjectFactory", "owner factory type mismatch"); return factory.create(this, handle) as T; }
-  createInputStream<T>(source: UniFfiInputStream<T>, lower: (value: T) => ArkValue): number { this.ensureOpen(); return this.inputRegistry.register(source, lower); }
-  createInputView<T>(handle: ArkValue, lift: (value: ArkValue) => T): UniFfiInputStream<T> { return new ArkInputView<T>(this, handle, lift); }
-  pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>> {
+  createInputStream<T>(source: UniFfiStream<T>, lower: (value: T) => ArkValue, lowerError: (error: UniffiError) => ArkValue): number {
+    this.ensureOpen();
+    const handle: number = this.inputRegistry.register(source, lower, lowerError);
+    const frame: ArkCallbackFrame | undefined = this.frames[this.frames.length - 1];
+    if (frame !== undefined) frame.inputStreams.push(handle);
+    return handle;
+  }
+  createInputView<T>(handle: ArkValue, lift: (value: ArkValue) => T, liftError: (value: ArkValue) => UniffiError): UniFfiInputStream<T> { return new ArkInputView<T>(this, handle, lift, liftError); }
+  pullInputStream(handle: ArkValue): Promise<ArkHostStreamStep> {
     if (this.isDetached()) return Promise.resolve(new ArkDoneStep());
     const generation: number = this.currentGeneration;
-    const guarded: Promise<ArkStreamStep<ArkValue> | __ArkDetachedMarker> = this.guardPromise(this.host.pullInputStream(handle), generation);
-    const result: Promise<ArkStreamStep<ArkValue>> = guarded.then((step: ArkStreamStep<ArkValue> | __ArkDetachedMarker): ArkStreamStep<ArkValue> => step === __DETACHED ? new ArkDoneStep() : step as ArkStreamStep<ArkValue>);
+    const guarded: Promise<ArkHostStreamStep | __ArkDetachedMarker> = this.guardPromise(this.host.pullInputStream(handle), generation);
+    const result: Promise<ArkHostStreamStep> = guarded.then((step: ArkHostStreamStep | __ArkDetachedMarker): ArkHostStreamStep => step === __DETACHED ? new ArkDoneStep() : step as ArkHostStreamStep);
     result.catch((): void => undefined);
     return result;
   }
-  async cancelInputStream(handle: ArkValue): Promise<void> { if (this.isDetached()) return; try { const result: void | __ArkDetachedMarker = await this.guardPromise(this.host.cancelInputStream(handle), this.currentGeneration); void result; } catch (_) {} }
-  releaseInputStream(handle: ArkValue): void { if (this.isDetached()) return; this.host.releaseInputStream(handle); }
+  async cancelInputStream(handle: ArkValue): Promise<void> {
+    if (this.isDetached()) throw __environmentDestroyed();
+    const result: void | __ArkDetachedMarker = await this.guardPromise(this.host.cancelInputStream(handle));
+    if (result === __DETACHED) throw __environmentDestroyed();
+  }
+  releaseInputStream(handle: ArkValue): Promise<void> { if (this.isDetached()) return Promise.reject(__environmentDestroyed()); return this.host.releaseInputStream(handle); }
+  async confirmOutputStreamClose(handle: ArkValue): Promise<void> {
+    const carrier: __ArkStreamHandle = handle as __ArkStreamHandle;
+    const raw: number = (Number.isSafeInteger(handle as number) ? handle : carrier?.handle) as number;
+    if (!Number.isSafeInteger(raw) || raw <= 0) throw new UniffiError("UniffiStreamHandle", "invalid output stream handle");
+    const acknowledged: ArkValue = await this.invokeCleanupAsync(this.callControl.create + 3, __singleArgument(raw));
+    if (acknowledged !== 1) throw new UniffiError("UniffiCleanupFailed", "stream cleanup failed");
+  }
+  untrackOutputStream(stream: UniFfiStream<ArkValue>): void { const index: number = this.streams.indexOf(stream); if (index >= 0) this.streams.splice(index, 1); }
   releaseOutputStream(handle: ArkValue): void { if (this.isDetached()) return; try { this.backend.releaseOutputStream(handle); } catch (_) {} }
   createOutputStream<T>(spec: ArkOutputSpec<T>): UniFfiStream<T> { this.ensureOpen(); const stream: ArkOutputStream<T> = new ArkOutputStream<T>(this, spec); this.streams.push(stream as UniFfiStream<ArkValue>); return stream; }
   close(): Promise<void> {
@@ -1951,16 +1962,18 @@ export declare class ArkItemStep<T> { readonly kind: "item"; readonly value: T; 
 export declare class ArkDoneStep { readonly kind: "done"; }
 export declare class ArkErrorStep { readonly kind: "error"; readonly error: UniffiError; constructor(error: UniffiError); }
 export type ArkStreamStep<T> = ArkItemStep<T> | ArkDoneStep | ArkErrorStep;
-export interface UniFfiStream<T> { next(): Promise<ArkStreamStep<T>>; cancel(): Promise<void>; }
-export interface UniFfiInputStream<T> { next(): Promise<ArkStreamStep<T>>; cancel(): Promise<void>; release(): void; }
+export declare class ArkHostErrorStep { readonly kind: "error"; readonly error: ArkValue; constructor(error: ArkValue); }
+export type ArkHostStreamStep = ArkItemStep<ArkValue> | ArkDoneStep | ArkHostErrorStep;
+export interface UniFfiStream<T> { next(): Promise<ArkStreamStep<T>>; cancel(): Promise<void>; release?(): Promise<void>; }
+export interface UniFfiInputStream<T> { next(): Promise<ArkStreamStep<T>>; cancel(): Promise<void>; release(): Promise<void>; }
 export interface ArkCallbackAdapter { invokeSync(methodId: number, args: Array<ArkValue>): ArkValue; invokeAsync(methodId: number, invocationId: number, args: Array<ArkValue>): Promise<ArkValue>; }
 export interface ArkCallbackContract { readonly retention: "scoped" | "retained"; readonly threading: "callingThread" | "mayCrossThread"; readonly reentrancy: "forbidden" | "allowed"; }
 export declare class ArkCallbackLease { release(): void; }
 export declare class CallbackRegistry { register(callbackType: number, callback: ArkCallbackAdapter, contract: ArkCallbackContract): number; retain(callbackType: number, callbackId: number): ArkCallbackLease; release(callbackType: number, callbackId: number): void; invokeSync(callbackType: number, callbackId: number, methodId: number, args: Array<ArkValue>): ArkValue; invokeAsync(callbackType: number, callbackId: number, methodId: number, invocationId: number, args: Array<ArkValue>): Promise<ArkValue>; }
-export declare class Host { retainCallback(callbackType: number, callbackId: number): void; releaseCallback(callbackType: number, callbackId: number): void; invokeCallbackSync(callbackType: number, callbackId: number, methodId: number, args?: Array<ArkValue>): ArkValue; invokeCallbackAsync(callbackType: number, callbackId: number, methodId: number, invocationId: number, args?: Array<ArkValue>): Promise<ArkValue>; invokeCallbackSyncResult(callbackType: number, callbackId: number, methodId: number, args?: Array<ArkValue>): ArkCallbackResult; invokeCallbackAsyncResult(callbackType: number, callbackId: number, methodId: number, invocationId: number, args?: Array<ArkValue>): Promise<ArkCallbackResult>; pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>>; cancelInputStream(handle: ArkValue): Promise<void>; releaseInputStream(handle: ArkValue): void; }
+export declare class Host { retainCallback(callbackType: number, callbackId: number): void; releaseCallback(callbackType: number, callbackId: number): void; invokeCallbackSync(callbackType: number, callbackId: number, methodId: number, args?: Array<ArkValue>): ArkValue; invokeCallbackAsync(callbackType: number, callbackId: number, methodId: number, invocationId: number, args?: Array<ArkValue>): Promise<ArkValue>; invokeCallbackSyncResult(callbackType: number, callbackId: number, methodId: number, args?: Array<ArkValue>): ArkCallbackResult; invokeCallbackAsyncResult(callbackType: number, callbackId: number, methodId: number, invocationId: number, args?: Array<ArkValue>): Promise<ArkCallbackResult>; pullInputStream(handle: ArkValue): Promise<ArkHostStreamStep>; cancelInputStream(handle: ArkValue): Promise<void>; releaseInputStream(handle: ArkValue): Promise<void>; }
 export declare class ArkCallbackRegistration { readonly callbackType: number; readonly callbackId: number; }
 export declare class ArkCallbackFrame { readonly registrations: Array<ArkCallbackRegistration>; }
-export declare class BackendSession { readonly backend: ArkBackend; readonly host: Host; readonly callbacks: CallbackRegistry; constructor(backend: ArkBackend, host: Host | undefined, options: BackendSessionOptions); invokeSync(operationId: number, args: Array<ArkValue>): ArkValue; invokeAsync(operationId: number, args: Array<ArkValue>, options?: CallOptions): Promise<ArkValue>; registerCallback(callbackType: number, callback: ArkCallbackAdapter, contract: ArkCallbackContract): number; retainCallback(callbackType: number, callbackId: number): ArkCallbackLease; releaseCallback(callbackType: number, callbackId: number): void; beginCallFrame(): ArkCallbackFrame; leaveCallFrame(frame: ArkCallbackFrame): void; endCallFrame(frame: ArkCallbackFrame): void; createInputStream<T>(source: UniFfiInputStream<T>, lower: (value: T) => ArkValue): number; createInputView<T>(handle: ArkValue, lift: (value: ArkValue) => T): UniFfiInputStream<T>; pullInputStream(handle: ArkValue): Promise<ArkStreamStep<ArkValue>>; cancelInputStream(handle: ArkValue): Promise<void>; releaseInputStream(handle: ArkValue): void; releaseOutputStream(handle: ArkValue): void; close(): Promise<void>; environmentDestroyed(): void; }
+export declare class BackendSession { readonly backend: ArkBackend; readonly host: Host; readonly callbacks: CallbackRegistry; constructor(backend: ArkBackend, host: Host | undefined, options: BackendSessionOptions); invokeSync(operationId: number, args: Array<ArkValue>): ArkValue; invokeAsync(operationId: number, args: Array<ArkValue>, options?: CallOptions): Promise<ArkValue>; registerCallback(callbackType: number, callback: ArkCallbackAdapter, contract: ArkCallbackContract): number; retainCallback(callbackType: number, callbackId: number): ArkCallbackLease; releaseCallback(callbackType: number, callbackId: number): void; beginCallFrame(): ArkCallbackFrame; leaveCallFrame(frame: ArkCallbackFrame): void; endCallFrame(frame: ArkCallbackFrame): Promise<void> | undefined; createInputStream<T>(source: UniFfiStream<T>, lower: (value: T) => ArkValue, lowerError: (error: UniffiError) => ArkValue): number; createInputView<T>(handle: ArkValue, lift: (value: ArkValue) => T, liftError: (value: ArkValue) => UniffiError): UniFfiInputStream<T>; pullInputStream(handle: ArkValue): Promise<ArkHostStreamStep>; cancelInputStream(handle: ArkValue): Promise<void>; releaseInputStream(handle: ArkValue): Promise<void>; releaseOutputStream(handle: ArkValue): void; close(): Promise<void>; environmentDestroyed(): void; }
 export declare class ObjectLease { dispose(): void; isDisposed(): boolean; }
 export function createBackendSession(factory: (host: Host) => ArkBackend, host: Host | undefined, options: BackendSessionOptions): BackendSession;
 "#
@@ -2332,9 +2345,14 @@ fn render_operation_helpers(
         normalize_error
     );
     out.push_str(&format!(
-        "function {function_name}({signature}): {return_type} {{\n"
+        "{}function {function_name}({signature}): {return_type} {{\n",
+        if operation.async_kind == AsyncKind::Async {
+            "async "
+        } else {
+            ""
+        }
     ));
-    out.push_str("  const __frame: ArkCallbackFrame = session.beginCallFrame();\n  let __frameEnded: boolean = false;\n  const __endFrame: () => void = (): void => { if (__frameEnded) return; __frameEnded = true; session.endCallFrame(__frame); };\n  const __args: Array<ArkValue> = new Array<ArkValue>();\n  let __omitted: boolean = false;\n  try {\n");
+    out.push_str("  const __frame: ArkCallbackFrame = session.beginCallFrame();\n  const __endFrame: () => Promise<void> | undefined = (): Promise<void> | undefined => session.endCallFrame(__frame);\n  const __endSync: () => void = (): void => { if (__endFrame() !== undefined) throw new UniffiError(\"UniffiAsyncCleanup\", \"synchronous call requires asynchronous resource cleanup\"); };\n  const __args: Array<ArkValue> = new Array<ArkValue>();\n  try {\n");
     for (argument, lower_name) in operation.arguments.iter().zip(lower_names.iter()) {
         let value = &argument.name;
         let default = argument
@@ -2343,18 +2361,18 @@ fn render_operation_helpers(
             .map(|default| render_default_for_type(default, &argument.ty));
         if matches!(argument.default, Some(DefaultValue::Unspecified)) {
             out.push_str(&format!(
-                "  if ({value} === undefined) {{ __omitted = true; }} else {{ if (__omitted) throw new UniffiError(\"UniffiArgumentCount\", \"argument follows omitted default\"); __args.push({lower_name}({value} as {}, session)); }}\n",
+                "  if ({value} === undefined) {{ __args.length += 1; }} else {{ __args.push({lower_name}({value} as {}, session)); }}\n",
                 render_type_name(model, &argument.ty)
             ));
         } else if let Some(default) = default {
             out.push_str(&format!(
-                "  if (__omitted) throw new UniffiError(\"UniffiArgumentCount\", \"argument follows omitted default\"); if ({value} === undefined) __args.push({lower_name}({default} as {}, session)); else __args.push({lower_name}({value} as {}, session));\n",
+                "  if ({value} === undefined) __args.push({lower_name}({default} as {}, session)); else __args.push({lower_name}({value} as {}, session));\n",
                 render_type_name(model, &argument.ty),
                 render_type_name(model, &argument.ty)
             ));
         } else {
             out.push_str(&format!(
-                "  if (__omitted || {value} === undefined) throw new UniffiError(\"UniffiUndefined\", \"undefined is not a UniFFI value\"); __args.push({lower_name}({value} as {}, session));\n",
+                "  if ({value} === undefined) throw new UniffiError(\"UniffiUndefined\", \"undefined is not a UniFFI value\"); __args.push({lower_name}({value} as {}, session));\n",
                 render_type_name(model, &argument.ty)
             ));
         }
@@ -2384,7 +2402,14 @@ fn render_operation_helpers(
             operation.arguments.len() + receiver_count
         ));
     }
-    out.push_str("    session.leaveCallFrame(__frame);\n  } catch (error) { __endFrame(); throw error as Error; }\n");
+    out.push_str(&format!(
+        "    session.leaveCallFrame(__frame);\n  }} catch (error) {{ {} throw error as Error; }}\n",
+        if operation.async_kind == AsyncKind::Async {
+            "await __endFrame();"
+        } else {
+            "__endSync();"
+        }
+    ));
 
     if is_output_stream_return(operation) {
         let item = match operation.return_type.as_ref() {
@@ -2450,25 +2475,25 @@ fn render_operation_helpers(
         let cancel = format!("(handle: ArkValue): Promise<void> => session.invokeCleanupAsync({}, __singleArgument(handle)).then((): void => undefined)", cancel_id.index());
         let start = if operation.async_kind == AsyncKind::Async {
             out.push_str(&format!(
-                "  return session.trackCallResult(session.invokeAsync({}, __args{call_options}).then(async (handle: ArkValue): Promise<UniFfiStream<{}>> => {{\n    if (!session.isOpen()) {{ try {{ await session.invokeCleanupAsync({}, __singleArgument(handle)); }} finally {{ session.releaseOutputStream(handle); __endFrame(); }} throw new UniffiError(\"UniffiSessionClosed\", \"backend session is closed\"); }}\n",
+                "  return session.trackCallResult(session.invokeAsync({}, __args{call_options}).then(async (handle: ArkValue): Promise<UniFfiStream<{}>> => {{\n    if (!session.isOpen()) {{ try {{ await session.invokeCleanupAsync({}, __singleArgument(handle)); }} finally {{ try {{ await session.confirmOutputStreamClose(handle); }} finally {{ session.releaseOutputStream(handle); await __endFrame(); }} }} throw new UniffiError(\"UniffiSessionClosed\", \"backend session is closed\"); }}\n",
                 start_id.index(), render_type_name(model, item), cancel_id.index()
             ));
             "start: (): ArkValue => handle, handle: handle".to_owned()
         } else {
             format!(
-                "start: (): ArkValue => session.invokeSync({}, __args)",
+                "start: (): ArkValue => {{ try {{ return session.invokeSync({}, __args); }} catch (error) {{ {propagate_error} }} }}",
                 start_id.index()
             )
         };
         out.push_str(&format!(
-            "  const __outputSpec: ArkOutputSpec<{}> = {{ {start}, next: (handle: ArkValue): Promise<ArkCallResult> => session.invokeAsync({}, __singleArgument(handle)).then((value: ArkValue): ArkCallResult => new ArkValueResult(value)), cancel: {cancel}, lift: (value: ArkValue): {} => {item_lift}(value, session), error: {error_decoder}, release: (handle: ArkValue): void => session.releaseOutputStream(handle), onClose: (): void => __endFrame() }};\n  return session.createOutputStream(__outputSpec);\n",
+            "  const __outputSpec: ArkOutputSpec<{}> = {{ {start}, next: (handle: ArkValue): Promise<ArkCallResult> => session.invokeAsync({}, __singleArgument(handle)).then((value: ArkValue): ArkCallResult => new ArkValueResult(value)), cancel: {cancel}, lift: (value: ArkValue): {} => {item_lift}(value, session), error: {error_decoder}, release: (handle: ArkValue): void => session.releaseOutputStream(handle), onClose: (): Promise<void> | undefined => __endFrame() }};\n  return session.createOutputStream(__outputSpec);\n",
             render_type_name(model, item),
             next_id.index(),
             render_type_name(model, item)
         ));
         if operation.async_kind == AsyncKind::Async {
             out.push_str(&format!(
-                "  }}).catch((error: Error): UniFfiStream<{}> => {{ __endFrame(); {} }}));\n",
+                "  }}).catch(async (error: Error): Promise<UniFfiStream<{}>> => {{ await __endFrame(); {} }}));\n",
                 render_type_name(model, item),
                 propagate_error
             ));
@@ -2488,7 +2513,7 @@ fn render_operation_helpers(
             .map(|name| format!("{name}(value, session)"))
             .unwrap_or_else(|| "__arkLiftVoid(value)".to_owned());
         out.push_str(&format!(
-            "  return session.trackCallResult(session.invokeAsync({}, __args{call_options}).then((value: ArkValue): {} => {{ __endFrame(); return {}; }}).catch((error: Error): {} => {{ __endFrame(); {} }}));\n",
+            "  return session.trackCallResult(session.invokeAsync({}, __args{call_options}).then(async (value: ArkValue): Promise<{}> => {{ await __endFrame(); return {}; }}).catch(async (error: Error): Promise<{}> => {{ await __endFrame(); {} }}));\n",
             operation.id.index(),
             resolved_return,
             lift_call,
@@ -2498,7 +2523,7 @@ fn render_operation_helpers(
     } else {
         if operation.return_type.is_some() {
             out.push_str(&format!(
-                "  try {{ const __value: ArkValue = session.invokeSync({}, __args); const __result: {} = {}(__value, session); __endFrame(); return __result; }} catch (error) {{ __endFrame(); {} }}\n",
+                "  try {{ const __value: ArkValue = session.invokeSync({}, __args); const __result: {} = {}(__value, session); __endSync(); return __result; }} catch (error) {{ __endSync(); {} }}\n",
                 operation.id.index(),
                 return_type,
                 lift_name.as_deref().unwrap_or("__arkLiftVoid"),
@@ -2506,7 +2531,7 @@ fn render_operation_helpers(
             ));
         } else {
             out.push_str(&format!(
-                "  try {{ session.invokeSync({}, __args); __endFrame(); return; }} catch (error) {{ __endFrame(); {} }}\n",
+                "  try {{ session.invokeSync({}, __args); __endSync(); return; }} catch (error) {{ __endSync(); {} }}\n",
                 operation.id.index(),
                 propagate_error
             ));
@@ -2518,7 +2543,6 @@ fn render_operation_helpers(
 
 fn is_output_stream_return(operation: &AstOperation) -> bool {
     matches!(operation.return_type, Some(ValueType::OutputStream { .. }))
-        && operation.kind == OperationKind::OutputStreamStart
 }
 
 fn lower_helper(
@@ -2609,7 +2633,12 @@ fn lower_body(
                 item_type = render_type_name(model, inner)
             )
         }
-        ValueType::InputStream { item: inner, .. } => {
+        ValueType::InputStream {
+            item: inner, error, ..
+        }
+        | ValueType::OutputStream {
+            item: inner, error, ..
+        } => {
             let nested = lower_nested_call(
                 model,
                 helpers,
@@ -2618,12 +2647,22 @@ fn lower_body(
                 &format!("{path}.item"),
                 operation_id,
             );
+            let lower_error = match error.as_deref() {
+                Some(error) => lower_nested_call(
+                    model,
+                    helpers,
+                    error,
+                    &format!("error as {}", render_type_name(model, error)),
+                    &format!("{path}.error"),
+                    operation_id,
+                ),
+                None => "__arkInfallibleInputError(error)".into(),
+            };
             format!(
-                "return session.createInputStream<{item_type}>({expression}, (item: {item_type}): ArkValue => {nested}) as ArkValue;",
+                "return session.createInputStream<{item_type}>({expression}, (item: {item_type}): ArkValue => {nested}, (error: UniffiError): ArkValue => {lower_error}) as ArkValue;",
                 item_type = render_type_name(model, inner)
             )
         }
-        ValueType::OutputStream { .. } => format!("return {expression} as ArkValue;"),
         ValueType::Named(key) => {
             let named = model.ty_for(key);
             let Some(named) = named else {
@@ -2900,7 +2939,9 @@ fn lift_body(
             );
             format!("const source: Set<ArkValue> = {expression} as Set<ArkValue>; const result: Set<{}> = new Set<{}>(); source.forEach((item: ArkValue): void => result.add({nested})); return result;", render_type_name(model, inner), render_type_name(model, inner))
         }
-        ValueType::InputStream { item: inner, .. } => {
+        ValueType::InputStream {
+            item: inner, error, ..
+        } => {
             let nested = lift_nested_call(
                 model,
                 helpers,
@@ -2909,7 +2950,18 @@ fn lift_body(
                 &format!("{path}.item"),
                 operation_id,
             );
-            format!("return session.createInputView<{}>({expression}, (item: ArkValue): {} => {nested});", render_type_name(model, inner), render_type_name(model, inner))
+            let lift_error = match error.as_deref() {
+                Some(error) => lift_nested_call(
+                    model,
+                    helpers,
+                    error,
+                    "error",
+                    &format!("{path}.error"),
+                    operation_id,
+                ),
+                None => "__arkInfallibleInputError(error)".into(),
+            };
+            format!("return session.createInputView<{}>({expression}, (item: ArkValue): {} => {nested}, (error: ArkValue): UniffiError => {lift_error});", render_type_name(model, inner), render_type_name(model, inner))
         }
         ValueType::OutputStream {
             item: inner,

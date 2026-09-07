@@ -1,4 +1,4 @@
-//! Opt-in real native/WASM/Chrome unified-async fixture. No mock backend.
+//! Opt-in real NAPI/WASM/Chrome/Electron and SDK-compiled Ark unified async.
 //!
 //! See support/unified_async/README.md for coordinated build/run commands.
 
@@ -16,6 +16,23 @@ use uniffi_bindgen_javascript::host_crates::composite_host_lib_target;
 
 const PACKAGE: &str = "unified-async-fixture";
 const SOURCES: &[(&str, &str)] = &[
+    ("ark.cjs", include_str!("support/unified_async/ark.cjs")),
+    (
+        "ark-contract.cjs",
+        include_str!("support/unified_async/ark-contract.cjs"),
+    ),
+    (
+        "electron.html",
+        "<!doctype html><title>UniFFI S06 Electron</title>",
+    ),
+    (
+        "electron.mjs",
+        include_str!("support/unified_async/electron.mjs"),
+    ),
+    (
+        "electron-main.cjs",
+        include_str!("support/unified_async/electron-main.cjs"),
+    ),
     (
         "contract.mjs",
         include_str!("support/unified_async/contract.mjs"),
@@ -143,14 +160,14 @@ fn build(manifest: &Utf8PathBuf, target: &Utf8PathBuf, wasm: bool, logs: &Path, 
 }
 
 #[test]
-#[ignore = "builds real NAPI/WASM hosts and runs installed Chrome; coordinate shared Cargo locks"]
+#[ignore = "requires installed Chrome, Electron, TypeScript and DevEco Ark SDK; builds native/WASM hosts"]
 fn unified_async_real_cross_end() {
     // Allow independent WASM diagnostics while another writer repairs NAPI.
     // A partial run produces its own marker and cannot certify the full matrix.
     let wasm_only = std::env::var("UNIFFI_ASYNC_WASM_ONLY").as_deref() == Ok("1");
     let node = locate_node_with_strip_types();
     let log_root = std::env::var("UNIFFI_ASYNC_ARTIFACTS")
-        .expect("set UNIFFI_ASYNC_ARTIFACTS to the S01 artifacts directory");
+        .expect("set UNIFFI_ASYNC_ARTIFACTS to a retained fixture artifacts directory");
     let logs = Path::new(&log_root);
     fs::create_dir_all(logs).unwrap();
     let success_path = logs.join(if wasm_only {
@@ -247,7 +264,12 @@ resolver = "3"
                 host_crates_dir: generated.join("native/hosts"),
                 logical_host_crates_dir: None,
             },
-            flavors: vec![FlavorTarget::Napi, FlavorTarget::Wasm],
+            flavors: vec![
+                FlavorTarget::Napi,
+                FlavorTarget::Wasm,
+                FlavorTarget::Electron,
+                FlavorTarget::Harmony,
+            ],
         },
     )
     .expect("generate unified async package from compiled metadata");
@@ -258,7 +280,7 @@ resolver = "3"
     .unwrap();
     fs::write(generated.join("tsconfig.strict.json"), r#"{
       "compilerOptions": { "strict": true, "noEmit": true, "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext", "skipLibCheck": false },
-      "include": ["declarations.mts", "shared/**/*.d.ts", "components/**/*.d.ts", "node/**/*.d.ts", "browser/**/*.d.ts"]
+      "include": ["declarations.mts", "shared/**/*.d.ts", "components/**/*.d.ts", "node/**/*.d.ts", "browser/**/*.d.ts", "electron/**/*.d.ts"]
     }"#).unwrap();
     run(
         Command::new(required_typescript_compiler())
@@ -295,6 +317,27 @@ resolver = "3"
             logs,
             "node-napi",
             75,
+            &mut runtime_failures,
+        );
+    }
+
+    if !wasm_only {
+        run_realm(
+            Command::new(&node)
+                .arg(root.join("ark.cjs"))
+                .current_dir(&root),
+            logs,
+            "ark",
+            90,
+            &mut runtime_failures,
+        );
+        run_realm(
+            Command::new(&node)
+                .arg(root.join("electron.mjs"))
+                .current_dir(&root),
+            logs,
+            "electron",
+            90,
             &mut runtime_failures,
         );
     }
@@ -355,7 +398,13 @@ resolver = "3"
     let realms = if wasm_only {
         vec!["node-wasm", "chrome-window", "chrome-worker"]
     } else {
-        vec!["node-napi", "node-wasm", "chrome-window", "chrome-worker"]
+        vec![
+            "node-napi",
+            "node-wasm",
+            "chrome-window",
+            "chrome-worker",
+            "electron-renderer",
+        ]
     };
     fs::write(
         success_path,
@@ -363,12 +412,15 @@ resolver = "3"
             "run": root,
             "realms": realms,
             "status": "passed",
-            "declarations": "S03 direct Future/Stream and factory signatures, strict DTS, all Rust builds locked and deny warnings",
+            "declarations": "strict TypeScript and SDK ArkTS; all real Rust compilations locked and deny warnings",
             "baseline_cases_per_realm": 21,
-            "added_cases_per_realm": 19,
+            "added_cases_per_realm": 23,
             "declaration_cases_per_realm": 13,
             "review_p1_cases_per_realm": 4,
-            "actor_cases_per_realm": 6
+            "actor_cases_per_realm": 6,
+            "cases_per_javascript_realm": 44,
+            "ark_native_cases": if wasm_only { 0 } else { 17 },
+            "ohos_builds": "run.py builds both architectures from this package before fixture-summary.json"
         }))
         .unwrap(),
     )
