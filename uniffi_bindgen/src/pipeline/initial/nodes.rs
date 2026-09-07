@@ -62,6 +62,7 @@ pub struct Function {
     pub name: String,
     pub module_path: String,
     pub is_async: bool,
+    pub rust_async: bool,
     pub rust_return_is_result: bool,
     pub rust_stream_item_is_result: bool,
     pub inputs: Vec<Argument>,
@@ -83,12 +84,14 @@ pub enum TypeDefinition {
 #[derive(Debug, Clone, PartialEq, Eq, Node, MapNode)]
 #[map_node(from(uniffi_meta::ConstructorMetadata))]
 pub struct Constructor {
+    pub module_path: String,
     #[map_node(self.orig_name.unwrap_or_else(|| self.name.clone()))]
     pub orig_name: String,
     #[map_node(context.new_callable_id())]
     pub id: u64,
     pub name: String,
     pub is_async: bool,
+    pub rust_async: bool,
     pub rust_return_is_result: bool,
     pub rust_stream_item_is_result: bool,
     pub inputs: Vec<Argument>,
@@ -101,12 +104,14 @@ pub struct Constructor {
 #[map_node(from(uniffi_meta::MethodMetadata))]
 #[map_node(from(uniffi_meta::TraitMethodMetadata))]
 pub struct Method {
+    pub module_path: String,
     #[map_node(self.orig_name.unwrap_or_else(|| self.name.clone()))]
     pub orig_name: String,
     #[map_node(context.new_callable_id())]
     pub id: u64,
     pub name: String,
     pub is_async: bool,
+    pub rust_async: bool,
     pub rust_return_is_result: bool,
     pub rust_stream_item_is_result: bool,
     pub takes_self_by_arc: bool,
@@ -120,6 +125,7 @@ pub struct Method {
 #[derive(Debug, Clone, PartialEq, Eq, Node, MapNode)]
 #[map_node(from(uniffi_meta::TraitMethodMetadata))]
 pub struct TraitMethod {
+    pub module_path: String,
     pub trait_name: String,
     // Note: the position of `index` is important since it causes callback interface methods to be
     // ordered correctly in MetadataGroup.items
@@ -128,6 +134,7 @@ pub struct TraitMethod {
     pub orig_name: String,
     pub name: String,
     pub is_async: bool,
+    pub rust_async: bool,
     pub rust_return_is_result: bool,
     pub rust_stream_item_is_result: bool,
     pub inputs: Vec<Argument>,

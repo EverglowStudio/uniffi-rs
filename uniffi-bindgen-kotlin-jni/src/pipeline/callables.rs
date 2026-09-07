@@ -89,6 +89,15 @@ pub fn map_callable(
     fully_qualified_name_rs: String,
     context: &Context,
 ) -> Result<Callable> {
+    let runtime_adapter_rs = if input.async_data.is_some() {
+        Some(format!(
+            "{}::{}_runtime",
+            context.normalize_rust_module_path(&input.module_path)?,
+            input.ffi_func.0,
+        ))
+    } else {
+        None
+    };
     let kind = input.kind.map_node(context)?;
     let return_type = input.return_type.ty.map_node(context)?;
     let throws_type = input.throws_type.ty.map_node(context)?;
@@ -112,7 +121,12 @@ pub fn map_callable(
         } => Some(Argument {
             ty: self_type.clone(),
             by_ref: !takes_self_by_arc,
-            ffi: argument_ffi(self_type, !takes_self_by_arc, true, &mut allocator),
+            ffi: argument_ffi(
+                self_type,
+                !takes_self_by_arc && input.async_data.is_none(),
+                true,
+                &mut allocator,
+            ),
             index: allocator.next_arg_index(),
             name: "".into(),
             orig_name: "".into(),
@@ -136,12 +150,21 @@ pub fn map_callable(
         _ => None,
     };
 
-    let arguments = map_arguments(input.arguments, &mut allocator, context)?;
+    let arguments = map_arguments(
+        input.arguments,
+        &mut allocator,
+        context,
+        input.async_data.is_some(),
+    )?;
 
     Ok(Callable {
         fully_qualified_name_rs,
+        runtime_adapter_rs,
         kind,
         is_async: input.async_data.is_some(),
+        rust_async: input.rust_async,
+        rust_return_is_result: input.rust_return_is_result,
+        rust_stream_item_is_result: input.rust_stream_item_is_result,
         name: input.name,
         orig_name: input.orig_name,
         receiver,
@@ -158,6 +181,7 @@ fn map_arguments(
     input: Vec<general::Argument>,
     allocator: &mut ArgAllocator,
     context: &Context,
+    is_async: bool,
 ) -> Result<Vec<Argument>> {
     input
         .into_iter()
@@ -169,7 +193,7 @@ fn map_arguments(
                 orig_name: arg.orig_name,
                 index: allocator.next_arg_index(),
                 optional: arg.optional,
-                ffi: argument_ffi(&ty, arg.by_ref, false, allocator),
+                ffi: argument_ffi(&ty, arg.by_ref && !is_async, false, allocator),
                 ty,
                 by_ref: arg.by_ref,
                 default: arg.default.map_node(context)?,
@@ -240,6 +264,130 @@ fn argument_ffi(
 }
 
 impl Callable {
+    pub fn input_stream_arguments(&self) -> impl Iterator<Item = &Argument> {
+        self.arguments
+            .iter()
+            .filter(|a| matches!(a.ty.ty, Type::InputStream { .. }))
+    }
+    pub fn has_input_stream_arguments(&self) -> bool {
+        self.input_stream_arguments().next().is_some()
+    }
+    pub fn returns_stream(&self) -> bool {
+        self.return_type()
+            .is_some_and(|ty| matches!(ty.ty, Type::Stream { .. }))
+    }
+
+    pub fn callback_output_rs(&self) -> String {
+        let mut output = self.result.return_type_rs();
+        if let Some(ty) = self.return_type() {
+            if let Type::Stream { .. } = ty.ty {
+                if !self.rust_stream_item_is_result {
+                    let plain = ty
+                        .type_rs
+                        .strip_prefix("uniffi::UniFfiStream<")
+                        .unwrap()
+                        .strip_suffix(", ::std::convert::Infallible>")
+                        .unwrap();
+                    output = output.replace(&ty.type_rs, &format!("::std::pin::Pin<Box<dyn uniffi::deps::futures_core::Stream<Item = {plain}> + Send>>"));
+                }
+            }
+        }
+        if self.rust_return_is_result && self.throws_type().is_none() {
+            output = format!("Result<{output}, ::std::convert::Infallible>");
+        }
+        output
+    }
+    pub fn callback_return_rs(&self) -> String {
+        let output = self.callback_output_rs();
+        if self.is_async && !self.rust_async {
+            format!(
+                "::std::pin::Pin<Box<dyn std::future::Future<Output = {output}> + Send + 'static>>"
+            )
+        } else {
+            output
+        }
+    }
+    pub fn callback_value_rs(&self) -> String {
+        let mut value = "v".to_string();
+        if self
+            .return_type()
+            .is_some_and(|t| matches!(t.ty, Type::Stream { .. }))
+            && !self.rust_stream_item_is_result
+        {
+            value = "Box::pin(uniffi::deps::futures_util::StreamExt::map(v, |item| match item { Ok(value) => value, Err(never) => match never {} }))".into();
+            if self.throws_type().is_some() {
+                let ty = &self.return_type().unwrap().type_rs;
+                let item = ty
+                    .strip_prefix("uniffi::UniFfiStream<")
+                    .unwrap()
+                    .strip_suffix(", ::std::convert::Infallible>")
+                    .unwrap();
+                value = format!("v.map(|v| -> ::std::pin::Pin<Box<dyn uniffi::deps::futures_core::Stream<Item = {item}> + Send>> {{ {value} }})");
+            }
+        }
+        if self.rust_return_is_result && self.throws_type().is_none() {
+            value = format!("Ok({value})");
+        }
+        value
+    }
+    pub fn is_local(&self) -> bool {
+        self.receiver
+            .as_ref()
+            .is_some_and(|r| matches!(&r.ty.ty, Type::Interface { imp, .. } if imp.is_local()))
+    }
+
+    pub fn rust_call(&self) -> String {
+        let args = self
+            .arguments
+            .iter()
+            .map(|a| a.pass_to_rust_fn(format!("uniffi_arg_lifted_{}", a.index)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut call = if self.is_local() {
+            let path = self.fully_qualified_name_rs.rsplit_once("::").unwrap().0;
+            format!("{path}::__uniffi_local_{}(uniffi_arg_lifted_0, {args}).await.map_err(|error| uniffi::LiftArgsError {{ arg_name: \"local owner\", error: error.into() }})?", self.orig_name)
+        } else {
+            let call = if self.has_receiver() {
+                format!("uniffi_arg_lifted_0.{}({args})", self.name_rs())
+            } else {
+                format!("{}({args})", self.fully_qualified_name_rs)
+            };
+            if self.is_async {
+                format!("{call}.await")
+            } else {
+                call
+            }
+        };
+        if let Some(ty) = self.return_type() {
+            if matches!(ty.ty, Type::Stream { .. }) && !self.is_local() {
+                let stream = if self.rust_stream_item_is_result {
+                    "Box::pin(stream)".to_string()
+                } else {
+                    "Box::pin(uniffi::deps::futures_util::StreamExt::map(stream, Ok))".to_string()
+                };
+                call = if self.rust_return_is_result {
+                    format!("({call}).map(|stream| -> {} {{ {stream} }})", ty.type_rs)
+                } else {
+                    format!(
+                        "{{ let stream = {call}; let stream: {} = {stream}; stream }}",
+                        ty.type_rs
+                    )
+                };
+            }
+        }
+        if self.is_constructor() && self.is_async {
+            call = if self.rust_return_is_result {
+                format!("({call}).map(uniffi::ArcOrOwned::into_arc)")
+            } else {
+                format!("uniffi::ArcOrOwned::into_arc({call})")
+            };
+        }
+        if self.rust_return_is_result && self.throws_type().is_none() {
+            call = format!("match {call} {{ Ok(value) => value, Err(never) => match never {{}} }}");
+        }
+        call
+    }
+
     pub fn name_rs(&self) -> String {
         names::escape_rust(&self.orig_name)
     }
@@ -371,6 +519,10 @@ impl CallableResult {
         format!("rustFuturePoll{}", self.id())
     }
 
+    pub fn async_complete_fn(&self) -> String {
+        format!("rustFutureComplete{}", self.id())
+    }
+
     pub fn async_cancel_fn(&self) -> String {
         format!("rustFutureCancel{}", self.id())
     }
@@ -468,7 +620,9 @@ impl Argument {
     pub fn pass_to_rust_fn(&self, name: String) -> String {
         match (self.by_ref, &self.ty.ty) {
             (true, Type::Interface { imp, .. }) => {
-                if !imp.has_callback_interface() {
+                if matches!(self.ffi, ArgumentFfi::Standard { .. }) {
+                    format!("&*{name}")
+                } else if !imp.has_callback_interface() {
                     // For non-callback trait interfaces, we have an optimized lift_ref
                     // implementation that already gives us a ref, no need to do anything here
                     name
@@ -478,7 +632,13 @@ impl Argument {
                 }
             }
             // Bytes references are also special-cased and don't need an extra reference.
-            (true, Type::Bytes) => name,
+            (true, Type::Bytes) => {
+                if matches!(self.ffi, ArgumentFfi::Standard { .. }) {
+                    format!("&{name}")
+                } else {
+                    name
+                }
+            }
             // All other refs just need `&`
             (true, _) => format!("&{name}"),
             _ => name,

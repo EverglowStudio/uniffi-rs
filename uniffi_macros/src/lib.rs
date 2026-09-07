@@ -179,7 +179,14 @@ pub fn derive_object(input: TokenStream) -> TokenStream {
     use util::AttributeSliceExt;
     let input: syn::DeriveInput = parse_macro_input!(input);
     match input.attrs.parse_uniffi_attr_args::<object::ObjectAttr>() {
-        Ok(attrs) if attrs.local.is_some() => export::gen_local_close_helper(&input.ident).into(),
+        Ok(attrs) if attrs.local.is_some() => {
+            let name = attrs
+                .name
+                .unwrap_or_else(|| util::ident_to_string(&input.ident));
+            export::gen_local_close_without_scaffolding(&input.ident, &name)
+                .unwrap_or_else(syn::Error::into_compile_error)
+                .into()
+        }
         Ok(_) => TokenStream::default(),
         Err(error) => error.into_compile_error().into(),
     }

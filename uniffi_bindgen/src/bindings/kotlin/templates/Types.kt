@@ -80,7 +80,7 @@ object NoHandle
 {%- include "CallbackInterfaceRuntime.kt" %}
 {%- endif %}
 
-{%- if ci.has_object_definitions() %}
+{%- if ci.has_object_definitions() || ci.has_stream_fns() %}
 {%- include "ObjectCleanerHelper.kt" %}
 {%- endif %}
 
@@ -166,6 +166,11 @@ object NoHandle
 {%- when Type::Set { inner_type } %}
 {% include "SetTemplate.kt" %}
 
+{%- when Type::Stream { item_type, error_type, is_send } %}
+{%- if self.has_callback_streams() %}
+{% include "InputStreamTemplate.kt" %}
+{%- endif %}
+
 {%- when Type::InputStream { item_type, error_type, is_send } %}
 {% include "InputStreamTemplate.kt" %}
 
@@ -195,13 +200,17 @@ object NoHandle
 {% include "ExternalTypeTemplate.kt" %}
 {%- endfor %}
 
-{%- if ci.has_async_fns() %}
+{%- if ci.has_async_fns() || ci.has_stream_fns() %}
 {# Import types needed for async support #}
-{{ self.add_import("kotlin.coroutines.resume") }}
+{{ self.add_import("kotlinx.coroutines.CompletableDeferred") }}
+{{ self.add_import("kotlinx.coroutines.NonCancellable") }}
+{{ self.add_import("kotlinx.coroutines.withContext") }}
+{{ self.add_import("kotlinx.coroutines.currentCoroutineContext") }}
+{{ self.add_import("kotlinx.coroutines.ensureActive") }}
+{{ self.add_import("kotlinx.coroutines.CancellationException") }}
+{{ self.add_import("kotlinx.coroutines.CoroutineScope") }}
+{{ self.add_import("kotlinx.coroutines.CoroutineStart") }}
+{{ self.add_import("kotlinx.coroutines.Dispatchers") }}
 {{ self.add_import("kotlinx.coroutines.launch") }}
-{{ self.add_import("kotlinx.coroutines.suspendCancellableCoroutine") }}
-{{ self.add_import("kotlinx.coroutines.CancellableContinuation") }}
-{{ self.add_import("kotlinx.coroutines.DelicateCoroutinesApi") }}
 {{ self.add_import("kotlinx.coroutines.Job") }}
-{{ self.add_import("kotlinx.coroutines.GlobalScope") }}
 {%- endif %}

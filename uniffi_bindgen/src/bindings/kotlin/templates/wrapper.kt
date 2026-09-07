@@ -47,12 +47,12 @@ import java.util.concurrent.ConcurrentHashMap
 {% include "NamespaceLibraryTemplate.kt" %}
 
 // Async support
-{%- if ci.has_async_fns() %}
+{%- if ci.has_async_fns() || ci.has_stream_fns() %}
 {% include "Async.kt" %}
 {%- endif %}
 
 // Foreign input stream support
-{%- if ci.has_input_stream_fns() %}
+{%- if ci.has_input_stream_fns() || self.has_callback_streams() %}
 {% include "InputStreamRuntime.kt" %}
 {%- endif %}
 

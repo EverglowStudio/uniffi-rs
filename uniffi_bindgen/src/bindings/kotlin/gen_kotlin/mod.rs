@@ -16,6 +16,9 @@ use crate::{
     Result,
 };
 
+#[cfg(test)]
+mod async_tests;
+
 mod callback_interface;
 mod compounds;
 mod custom;
@@ -230,8 +233,22 @@ pub fn generate_bindings(config: &Config, ci: &ComponentInterface) -> Result<Str
         .context("failed to render kotlin bindings")
 }
 
+fn has_callback_streams(ci: &ComponentInterface) -> bool {
+    ci.callback_interface_definitions()
+        .iter()
+        .any(|c| c.methods().iter().any(|m| m.is_stream()))
+        || ci
+            .object_definitions()
+            .iter()
+            .any(|o| o.has_callback_interface() && o.methods().iter().any(|m| m.is_stream()))
+}
+
 fn ensure_input_streams_supported(ci: &ComponentInterface) -> Result<()> {
-    for func in ci.function_definitions() {
+    for func in ci.iter_callables().chain(
+        ci.callback_interface_definitions()
+            .iter()
+            .flat_map(|c| c.methods().into_iter().map(|m| m as &dyn Callable)),
+    ) {
         if func.return_type().is_some_and(type_contains_input_stream) {
             bail!("input stream values are only supported as direct function arguments");
         }
@@ -245,7 +262,10 @@ fn ensure_input_streams_supported(ci: &ComponentInterface) -> Result<()> {
                 ..
             } = arg.as_type()
             {
-                if type_contains_input_stream(&item_type) || error_type.as_deref().is_some_and(type_contains_input_stream)
+                if type_contains_input_stream(&item_type)
+                    || error_type
+                        .as_deref()
+                        .is_some_and(type_contains_input_stream)
                 {
                     bail!("nested input stream types are not supported");
                 }
@@ -259,31 +279,6 @@ fn ensure_input_streams_supported(ci: &ComponentInterface) -> Result<()> {
             }
         }
     }
-    for obj in ci.object_definitions() {
-        for constructor in obj.constructors() {
-            if callable_contains_input_stream(constructor) {
-                bail!(
-                    "input stream parameters are currently only supported for top-level functions"
-                );
-            }
-        }
-        for method in obj.methods() {
-            if callable_contains_input_stream(method) {
-                bail!(
-                    "input stream parameters are currently only supported for top-level functions"
-                );
-            }
-        }
-    }
-    for callback in ci.callback_interface_definitions() {
-        for method in callback.methods() {
-            if callable_contains_input_stream(method) {
-                bail!(
-                    "input stream parameters are currently only supported for top-level functions"
-                );
-            }
-        }
-    }
     Ok(())
 }
 
@@ -293,19 +288,6 @@ fn ensure_input_stream_error_type_supported(ci: &ComponentInterface, ty: &Type) 
     } else {
         bail!("Kotlin input stream error types must be UniFFI error enum types");
     }
-}
-
-fn callable_contains_input_stream(callable: &impl Callable) -> bool {
-    callable
-        .arguments()
-        .into_iter()
-        .any(|arg| type_contains_input_stream(&arg.as_type()))
-        || callable
-            .return_type()
-            .is_some_and(type_contains_input_stream)
-        || callable
-            .throws_type()
-            .is_some_and(type_contains_input_stream)
 }
 
 fn type_contains_input_stream(ty: &Type) -> bool {
@@ -368,6 +350,10 @@ pub struct TypeRenderer<'a> {
 }
 
 impl<'a> TypeRenderer<'a> {
+    fn has_callback_streams(&self) -> bool {
+        has_callback_streams(self.ci)
+    }
+
     fn new(config: &'a Config, ci: &'a ComponentInterface) -> Self {
         Self {
             config,
@@ -419,6 +405,10 @@ pub struct KotlinWrapper<'a> {
 }
 
 impl<'a> KotlinWrapper<'a> {
+    fn has_callback_streams(&self) -> bool {
+        has_callback_streams(self.ci)
+    }
+
     pub fn new(config: Config, ci: &'a ComponentInterface) -> Result<Self> {
         let type_renderer = TypeRenderer::new(&config, ci);
         let type_helper_code = type_renderer.render()?;
@@ -441,10 +431,11 @@ impl<'a> KotlinWrapper<'a> {
                 .map(|fn_name| format!("{fn_name}(this)")),
         );
 
-        let input_stream_init_fns = self.ci.function_definitions().iter().flat_map(|func| {
-            func.input_stream_arguments()
-                .into_iter()
-                .map(|arg| format!("{}(this)", func.input_stream_initialization_fn_name(arg)))
+        let input_stream_init_fns = self.ci.iter_callables().flat_map(|func| {
+            func.input_stream_arguments().into_iter().map(move |arg| format!(
+                "this.{}(uniffiInputStreamNextCallbackImpl, uniffiInputStreamCancelCallbackImpl, uniffiInputStreamCloseCallbackImpl)",
+                func.ffi_input_stream_init_func(arg),
+            ))
         });
 
         // Also call global initialization function for any external type we use.
@@ -484,15 +475,20 @@ impl<'a> KotlinWrapper<'a> {
                 name: "java.util.concurrent.atomic.AtomicBoolean".to_owned(),
             });
         }
-        if self.ci.has_input_stream_fns() {
+        if self.ci.has_input_stream_fns() || self.has_callback_streams() {
             for name in [
                 "kotlinx.coroutines.CancellationException",
+                "kotlinx.coroutines.CompletableDeferred",
+                "kotlinx.coroutines.CoroutineStart",
+                "kotlinx.coroutines.NonCancellable",
+                "kotlinx.coroutines.withContext",
                 "kotlinx.coroutines.CoroutineScope",
                 "kotlinx.coroutines.Dispatchers",
                 "kotlinx.coroutines.Job",
                 "kotlinx.coroutines.SupervisorJob",
                 "kotlinx.coroutines.channels.Channel",
                 "kotlinx.coroutines.flow.collect",
+                "kotlinx.coroutines.flow.FlowCollector",
                 "kotlinx.coroutines.launch",
             ] {
                 imports.insert(ImportRequirement::Import {
@@ -769,12 +765,24 @@ impl<T: AsType> AsCodeType for T {
                 value_type,
             } => Box::new(compounds::MapCodeType::new(*key_type, *value_type)),
             Type::Set { inner_type } => Box::new(compounds::SetCodeType::new(*inner_type)),
-            Type::Stream { item_type, .. } => Box::new(compounds::StreamCodeType::new(*item_type)),
+            Type::Stream {
+                item_type,
+                error_type,
+                is_send,
+            } => Box::new(compounds::StreamCodeType::new(
+                *item_type,
+                error_type.map(|error| *error),
+                is_send,
+            )),
             Type::InputStream {
                 item_type,
                 error_type,
-                ..
-            } => Box::new(compounds::InputStreamCodeType::new(*item_type, error_type.map(|error| *error))),
+                is_send,
+            } => Box::new(compounds::InputStreamCodeType::new(
+                *item_type,
+                error_type.map(|error| *error),
+                is_send,
+            )),
             Type::Custom { name, builtin, .. } => {
                 Box::new(custom::CustomCodeType::new(name, builtin.as_codetype()))
             }
@@ -1140,6 +1148,33 @@ mod filters {
     }
 
     #[askama::filter_fn]
+    pub fn has_close_method(obj: &Object, _: &dyn askama::Values) -> Result<bool, askama::Error> {
+        Ok(obj.methods().iter().any(|method| method.name() == "close"))
+    }
+
+    #[askama::filter_fn]
+    pub fn is_input_stream_arg(
+        arg: &Argument,
+        _: &dyn askama::Values,
+    ) -> Result<bool, askama::Error> {
+        Ok(matches!(arg.as_type(), Type::InputStream { .. }))
+    }
+
+    #[askama::filter_fn]
+    pub fn callback_type_name(
+        ty: &Type,
+        _: &dyn askama::Values,
+        ci: &ComponentInterface,
+    ) -> Result<String, askama::Error> {
+        Ok(match ty {
+            Type::Stream { item_type, .. } => {
+                format!("Flow<{}>", KotlinCodeOracle.find(item_type).type_label(ci))
+            }
+            _ => KotlinCodeOracle.find(ty).type_label(ci),
+        })
+    }
+
+    #[askama::filter_fn]
     pub fn async_poll(
         callable: impl Callable,
         _: &dyn askama::Values,
@@ -1149,6 +1184,16 @@ mod filters {
         Ok(format!(
             "{{ future, callback, continuation -> UniffiLib.{ffi_func}(future, callback, continuation) }}"
         ))
+    }
+
+    #[askama::filter_fn]
+    pub fn async_cancel(
+        callable: impl Callable,
+        _: &dyn askama::Values,
+        ci: &ComponentInterface,
+    ) -> Result<String, askama::Error> {
+        let ffi_func = callable.ffi_rust_future_cancel(ci);
+        Ok(format!("{{ future -> UniffiLib.{ffi_func}(future) }}"))
     }
 
     #[askama::filter_fn]
@@ -1698,14 +1743,14 @@ mod test {
         assert!(!kotlin.contains(") : Flow<StreamEvent>"));
         assert!(!kotlin.contains("fun `countEvents`(`count`: kotlin.UInt) : ULong"));
         let stream_wrapper = kotlin
-            .find("return UniFfiStream {")
-            .expect("output stream must return the explicit lazy wrapper");
+            .find("return UniFfiStream(")
+            .expect("output stream must return an owned subscription");
         let stream_start = kotlin
             .find("UniffiLib.uniffi_stream_core_fn_func_count_events(")
             .expect("output stream must start natively");
         assert!(
-            stream_wrapper < stream_start,
-            "native start must be captured inside the lazy UniFfiStream body:\n{kotlin}"
+            stream_start < stream_wrapper,
+            "native factory must create its subscription before returning:\n{kotlin}"
         );
         assert!(kotlin.contains(
             "throw InternalException(\"UniFFI output streams may only be consumed once\")"
@@ -1717,24 +1762,24 @@ mod test {
             "UniffiLib.uniffi_stream_core_fn_func_count_events_stream_next(__streamHandle)"
         ));
         assert!(kotlin.contains(
-            "UniffiLib.uniffi_stream_core_fn_func_count_events_stream_cancel(__streamHandle)"
+            "UniffiLib.uniffi_stream_core_fn_func_count_events_stream_close(__streamHandle)"
         ));
-        assert!(kotlin.contains("val __streamNext = uniffiRustCallAsync("));
+        assert!(kotlin.contains("uniffiRustCallAsync("));
         assert!(kotlin.contains("__uniffiLiftStreamNext("));
         assert!(kotlin.contains("{ buffer -> FfiConverterTypeStreamEvent.read(buffer) }"));
         assert!(kotlin.contains("{ buffer -> FfiConverterTypeStreamError.read(buffer) }"));
         assert!(kotlin.contains("UniffiNullRustCallStatusErrorHandler"));
-        assert!(kotlin.contains("is __UniffiStreamNext.Item -> emit(__streamNext.value)"));
+        assert!(kotlin.contains("is __UniffiStreamNext.Item -> collector.emit(step.value)"));
         assert!(kotlin.contains("__UniffiStreamNext.Done -> break"));
-        assert!(kotlin.contains("is __UniffiStreamNext.Error -> throw __streamNext.error"));
+        assert!(kotlin.contains("is __UniffiStreamNext.Error -> throw step.error"));
         assert!(!kotlin.contains("if (__streamNext == null)"));
         assert!(!kotlin.contains("emit(__streamNext)"));
         assert!(kotlin.contains("fun `optionalEvents`() : UniFfiStream<kotlin.UInt?>"));
         assert!(kotlin.contains("FfiConverterOptionalUInt.read(buffer)"));
         assert!(kotlin.contains("} finally {"));
-        assert!(kotlin.contains("var __streamFailure: Throwable? = null"));
-        assert!(kotlin.contains("__streamOriginalError.addSuppressed(__streamCleanupError)"));
-        assert!(kotlin.contains("continuation.invokeOnCancellation"));
+        assert!(kotlin.contains("var failure: Throwable? = null"));
+        assert!(kotlin.contains("originalError.addSuppressed(cleanupError)"));
+        assert!(kotlin.contains("cancelFunc(rustFuture)"));
         assert!(kotlin.contains("originalError.addSuppressed(cleanupError)"));
         assert!(kotlin.contains("class Detailed("));
         assert!(kotlin.contains("override val `message`: kotlin.String"));
@@ -1854,9 +1899,8 @@ mod test {
         assert!(kotlin.contains("FfiConverterTypeCounterEvent.write(value, bbuf)"));
         assert!(kotlin.contains("if (error is StreamException)"));
         assert!(kotlin.contains("FfiConverterTypeStreamError.lower(error)"));
-        assert!(kotlin.contains("private fun uniffiInitInputStreamSumEventsEvents(lib: UniffiLib)"));
         assert!(
-            kotlin.contains("lib.uniffi_stream_core_fn_func_sum_events_input_stream_events_init(")
+            kotlin.contains("this.uniffi_stream_core_fn_func_sum_events_input_stream_events_init(")
         );
         assert!(kotlin.contains("uniffiInputStreamNextCallbackImpl"));
         assert!(kotlin.contains("uniffiInputStreamCancelCallbackImpl"));
@@ -1873,7 +1917,8 @@ mod test {
             eprintln!("SKIP kotlin_input_stream_wrapper_compiles_when_kotlinc_available: kotlinc unavailable");
             return;
         }
-        let classpath = std::env::var("CLASSPATH").expect("Kotlin gate requires JNA/coroutines CLASSPATH");
+        let classpath =
+            std::env::var("CLASSPATH").expect("Kotlin gate requires JNA/coroutines CLASSPATH");
         let kotlin = generate_bindings(
             &Config {
                 package_name: Some("uniffi.stream_core".to_owned()),
@@ -1925,22 +1970,18 @@ mod test {
         assert!(!kotlin.contains(") : Flow<CounterEvent>"));
         assert!(kotlin
             .contains("FfiConverterInputStreamTypeCounterEventTypeStreamError.lower(`events`)"));
-        assert!(
-            kotlin.contains("private fun uniffiInitInputStreamRunningSumEvents(lib: UniffiLib)")
-        );
-        assert!(
-            kotlin.contains("lib.uniffi_stream_core_fn_func_running_sum_input_stream_events_init(")
-        );
+        assert!(kotlin
+            .contains("this.uniffi_stream_core_fn_func_running_sum_input_stream_events_init("));
         assert!(kotlin.contains("UniffiLib.uniffi_stream_core_fn_func_running_sum("));
         let stream_wrapper = kotlin
-            .find("return UniFfiStream {")
-            .expect("output stream must return the explicit lazy wrapper");
+            .find("return UniFfiStream(")
+            .expect("output stream must return an owned subscription");
         let stream_start = kotlin
             .find("UniffiLib.uniffi_stream_core_fn_func_running_sum(")
             .expect("output stream must start natively");
         assert!(
-            stream_wrapper < stream_start,
-            "native start must be captured inside the lazy UniFfiStream body:\n{kotlin}"
+            stream_start < stream_wrapper,
+            "native factory must create its subscription before returning:\n{kotlin}"
         );
         assert!(kotlin.contains(
             "throw InternalException(\"UniFFI output streams may only be consumed once\")"
@@ -1949,15 +1990,15 @@ mod test {
             "UniffiLib.uniffi_stream_core_fn_func_running_sum_stream_next(__streamHandle)"
         ));
         assert!(kotlin.contains(
-            "UniffiLib.uniffi_stream_core_fn_func_running_sum_stream_cancel(__streamHandle)"
+            "UniffiLib.uniffi_stream_core_fn_func_running_sum_stream_close(__streamHandle)"
         ));
         assert!(kotlin.contains("UniffiNullRustCallStatusErrorHandler"));
         assert!(kotlin.contains("__uniffiLiftStreamNext("));
         assert!(kotlin.contains("{ buffer -> FfiConverterTypeCounterEvent.read(buffer) }"));
         assert!(kotlin.contains("{ buffer -> FfiConverterTypeStreamError.read(buffer) }"));
-        assert!(kotlin.contains("is __UniffiStreamNext.Item -> emit(__streamNext.value)"));
+        assert!(kotlin.contains("is __UniffiStreamNext.Item -> collector.emit(step.value)"));
         assert!(kotlin.contains("__UniffiStreamNext.Done -> break"));
-        assert!(kotlin.contains("is __UniffiStreamNext.Error -> throw __streamNext.error"));
+        assert!(kotlin.contains("is __UniffiStreamNext.Error -> throw step.error"));
         assert!(!kotlin.contains("emit(__streamNext)"));
     }
 }

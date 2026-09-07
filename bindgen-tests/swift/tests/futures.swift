@@ -5,11 +5,11 @@
 import Foundation
 import uniffi_bindgen_tests
 
-var dispatchGroup = DispatchGroup()
+let dispatchGroup = DispatchGroup()
 
 // Primitive types
 dispatchGroup.enter()
-Task {
+Task.detached {
     let returnedU8 = try! await asyncRoundtripU8(v: 42)
     assert(returnedU8 == 42)
 
@@ -55,7 +55,7 @@ dispatchGroup.wait()
 
 // Errors
 dispatchGroup.enter()
-Task {
+Task.detached {
     do {
         try await asyncThrowError()
         fatalError("expected asyncThrowError to throw")
@@ -70,7 +70,7 @@ dispatchGroup.wait()
 
 // Interfaces/methods
 dispatchGroup.enter()
-Task {
+Task.detached {
     let obj = AsyncInterface(name: "Alice")
     let objName = try! await obj.name()
     assert(objName == "Alice")
@@ -88,27 +88,27 @@ Task {
 dispatchGroup.wait()
 
 // Callback interfaces
-var asyncCallbackRefCount = 0
+let asyncCallbackRefCount = TestLocked(0)
 class AsyncCallbackImpl: TestAsyncCallbackInterface, @unchecked Sendable {
-    var value: UInt32;
+    let value: TestLocked<UInt32>;
 
     init(value: UInt32) {
-        self.value = value;
-        asyncCallbackRefCount += 1
+        self.value = TestLocked(value);
+        asyncCallbackRefCount.update { $0 += 1 }
     }
 
     deinit {
-        asyncCallbackRefCount -= 1
+        asyncCallbackRefCount.update { $0 -= 1 }
     }
 
     func noop() async throws { }
 
     func getValue() async throws -> UInt32 {
-        return self.value;
+        return self.value.read();
     }
 
     func setValue(value: UInt32) async throws {
-        self.value = value;
+        self.value.update { $0 = value };
     }
 
     func throwIfEqual(numbers: CallbackInterfaceNumbers) async throws -> CallbackInterfaceNumbers {
@@ -120,7 +120,7 @@ class AsyncCallbackImpl: TestAsyncCallbackInterface, @unchecked Sendable {
 }
 
 dispatchGroup.enter()
-Task {
+Task.detached {
     let cbi = AsyncCallbackImpl(value: 42);
     try! await invokeTestAsyncCallbackInterfaceNoop(cbi: cbi);
 

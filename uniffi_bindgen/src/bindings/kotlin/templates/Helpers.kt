@@ -72,8 +72,10 @@ private fun<E: kotlin.Exception> uniffiCheckCallStatus(errorHandler: UniffiRustC
         } else {
             throw InternalException("Rust panic")
         }
+    } else if (status.code == 3.toByte()) {
+        throw java.util.concurrent.CancellationException("Rust operation cancelled")
     } else {
-        throw InternalException("Unknown rust call status: $status.code")
+        throw InternalException("Unknown rust call status: ${status.code}")
     }
 }
 

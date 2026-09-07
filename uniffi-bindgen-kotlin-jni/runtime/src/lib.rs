@@ -10,6 +10,7 @@ mod attach;
 mod caching;
 mod calls;
 mod errors;
+mod future;
 mod lift_lower;
 mod strings;
 
@@ -17,6 +18,7 @@ pub use attach::*;
 pub use caching::*;
 pub use calls::*;
 pub use errors::*;
+pub use future::*;
 pub use jni_sys::*;
 pub use lift_lower::*;
 pub use strings::*;

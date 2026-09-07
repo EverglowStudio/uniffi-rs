@@ -107,9 +107,9 @@
 
 {%- call kt::docstring(obj, 0) %}{% endcall %}
 {% if (is_error) %}
-open class {{ impl_class_name }} : kotlin.Exception, Disposable, AutoCloseable, {{ interface_name }} {
+open class {{ impl_class_name }} : kotlin.Exception, Disposable, {% if !(obj|has_close_method) %}AutoCloseable, {% endif %}{{ interface_name }} {
 {% else -%}
-open class {{ impl_class_name }}: Disposable, AutoCloseable, {{ interface_name }}
+open class {{ impl_class_name }}: Disposable, {% if !(obj|has_close_method) %}AutoCloseable, {% endif %}{{ interface_name }}
 {%- for t in obj.trait_impls() %}
 , {{ self::trait_interface_name(ci, t.trait_ty)? }}
 {% endfor %}
@@ -169,10 +169,12 @@ open class {{ impl_class_name }}: Disposable, AutoCloseable, {{ interface_name }
         }
     }
 
+    {%- if !(obj|has_close_method) %}
     @Synchronized
     override fun close() {
         this.destroy()
     }
+    {%- endif %}
 
     internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
         // Check and increment the call counter, to keep the object alive.

@@ -157,6 +157,7 @@ impl UniFFITestHelper {
 
 fn get_cargo_metadata() -> Metadata {
     MetadataCommand::new()
+        .other_options(vec!["--locked".to_string()])
         .exec()
         .expect("error running cargo metadata")
 }
@@ -170,6 +171,7 @@ fn get_cargo_build_messages() -> Vec<Message> {
 
     let mut child = Command::new(env!("CARGO"))
         .arg("test")
+        .arg("--locked")
         .arg("--release")
         .arg(features_arg)
         .arg("--no-run")
@@ -181,7 +183,8 @@ fn get_cargo_build_messages() -> Vec<Message> {
     let result = Message::parse_stream(output)
         .map(|m| m.expect("Error parsing cargo build messages"))
         .collect();
-    child.wait().expect("failed to wait for child");
+    let status = child.wait().expect("failed to wait for child");
+    assert!(status.success(), "cargo test --no-run failed: {status}");
     result
 }
 

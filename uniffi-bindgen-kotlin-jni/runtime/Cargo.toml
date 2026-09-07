@@ -13,7 +13,11 @@ keywords = ["ffi", "bindgen"]
 anyhow = "1"
 jni-sys = "0.4.1"
 simd_cesu8 = "1.1.1"
-uniffi = { path = "../../uniffi", default-features = false }
+uniffi = { path = "../../uniffi", default-features = false, features = ["async-runtime"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "time"] }
+uniffi = { path = "../../uniffi", default-features = false, features = ["async-runtime", "tokio"] }
 
 [package.metadata.uniffi]
 skip_parsing = true

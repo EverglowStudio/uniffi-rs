@@ -1,108 +1,69 @@
-const UNIFFI_RUST_FUTURE_PENDING: i32 = 0;
 const UNIFFI_RUST_FUTURE_CANCELLED: i32 = 1;
 const UNIFFI_RUST_FUTURE_COMPLETE: i32 = 2;
 
-/// Stores a future and scheduler for a Kotlin -> Rust call
-struct UniffiRustFuture<T> {
-    scheduler: ::std::sync::Mutex<uniffi::Scheduler<UniffiRustFutureContinutation>>,
-    future: ::std::sync::Mutex<::std::pin::Pin<::std::boxed::Box<dyn std::future::Future<Output = T> + ::std::marker::Send>>>,
-}
+static UNIFFI_JNI_RESUME: uniffi_jni::CachedStaticMethod = uniffi_jni::CachedStaticMethod::new(
+        c"uniffi/UniffiKt", c"uniffiContinuationResume", c"(Lkotlin/coroutines/Continuation;Z)V",
+);
 
-impl<T> UniffiRustFuture<T> {
-    fn new(future: impl ::std::future::Future<Output = T> + std::marker::Send + 'static) -> ::std::sync::Arc<Self> {
-        ::std::sync::Arc::new(Self {
-            scheduler: ::std::sync::Mutex::new(uniffi::Scheduler::new()),
-            future: ::std::sync::Mutex::new(::std::boxed::Box::pin(future)),
-        })
-    }
-
-    fn into_handle(self: ::std::sync::Arc<Self>) -> i64 {
-        ::std::sync::Arc::into_raw(self).expose_provenance() as i64
-    }
-}
-
-impl<T> ::std::task::Wake for UniffiRustFuture<T> {
-    fn wake(self: ::std::sync::Arc<Self>) {
-        self.scheduler.lock().unwrap().wake();
-    }
-
-    fn wake_by_ref(self: &::std::sync::Arc<Self>) {
-        self.scheduler.lock().unwrap().wake();
-    }
-}
-
-struct UniffiRustFutureContinutation {
-    continuation: uniffi_jni::jobject,
-}
-
-// Safety:
-// It's safe to pass `jobject` pointers to another thread
-unsafe impl ::std::marker::Send for UniffiRustFutureContinutation {}
-
-impl uniffi::RustFutureCallback for UniffiRustFutureContinutation {
-    fn invoke(self, _poll: uniffi::RustFuturePoll) {
-        // Note: we ignore the `poll` value.  These bindings don't use it, instead they check the
-        // return value of the poll function to know when the future is ready.
-        static UNIFFI_CONTINUATION_RESUME: uniffi_jni::CachedStaticMethod = uniffi_jni::CachedStaticMethod::new(
-            c"uniffi/UniffiKt",
-            c"uniffiContinuationResume",
-            c"(Lkotlin/coroutines/Continuation;)V",
-        );
-        unsafe {
-            uniffi_jni::attach_current_thread(uniffi_get_global_jvm(), |env| {
-                UNIFFI_CONTINUATION_RESUME.call_void(env, [
-                    uniffi_jni::jvalue {
-                        l: self.continuation,
-                    },
-                ]).warn_on_exception(env, "uniffiContinuationResume");
-                ((**env).v1_2.DeleteGlobalRef)(env, self.continuation);
-            });
-        }
+extern "C" fn uniffi_jni_future_continuation(data: u64, poll: uniffi::RustFuturePoll) {
+    // SAFETY: each poll transfers one global reference to core's exactly-once
+    // continuation. Delete it before Java can resume/reenter and free the owner.
+    unsafe {
+        uniffi_jni::attach_current_thread(uniffi_get_global_jvm(), |env| {
+            let global = std::ptr::with_exposed_provenance_mut(data as usize);
+            let local = ((**env).v1_2.NewLocalRef)(env, global);
+            ((**env).v1_2.DeleteGlobalRef)(env, global);
+            UNIFFI_JNI_RESUME.call_void(env, [
+                uniffi_jni::jvalue { l: local },
+                uniffi_jni::jvalue { z: poll == uniffi::RustFuturePoll::Ready },
+            ]).warn_on_exception(env, "uniffiContinuationResume");
+        });
     }
 }
 
 {%- for rust_result in root.rust_async_callable_results() %}
 #[unsafe(no_mangle)]
 unsafe extern "system" fn Java_uniffi_Scaffolding_{{ rust_result.async_poll_fn() }}(
-    uniffi_env: *mut uniffi_jni::JNIEnv,
-    _: *mut uniffi_jni::jclass,
-    uniffi_future_handle: i64,
+    env: *mut uniffi_jni::JNIEnv,
+    _: uniffi_jni::jclass,
+    handle: i64,
     continuation: uniffi_jni::jobject,
+) {
+    uniffi_jni::rust_call_with_env(env, |env| {
+        UNIFFI_JNI_RESUME.get(env);
+        let continuation = ((**env).v1_2.NewGlobalRef)(env, continuation);
+        if continuation.is_null() { uniffi::deps::anyhow::bail!("NewGlobalRef failed"); }
+        uniffi_jni::future_poll::<{{ rust_result.return_type_rs() }}>(
+            uniffi::Handle::from_raw_unchecked(handle as u64), uniffi_jni_future_continuation,
+            continuation.expose_provenance() as u64,
+        );
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "system" fn Java_uniffi_Scaffolding_{{ rust_result.async_complete_fn() }}(
+    uniffi_env: *mut uniffi_jni::JNIEnv,
+    _: uniffi_jni::jclass,
+    handle: i64,
     {%- if rust_result.return_type.is_some() %}
-    completion: uniffi_jni::jobject
+    completion: uniffi_jni::jobject,
     {%- endif %}
 ) -> i32 {
-    uniffi::trace!("RustFuture::poll: {uniffi_future_handle:x}");
     {%- if let Some(return_type) = rust_result.return_type %}
     static UNIFFI_COMPLETE_METHOD: uniffi_jni::CachedMethod = uniffi_jni::CachedMethod::new(
-        c"uniffi/{{ rust_result.async_complete_class() }}",
-        c"complete",
+        c"uniffi/{{ rust_result.async_complete_class() }}", c"complete",
         c"({% for ffi_type in return_type.ffi_types %}{{ ffi_type.jni_signature() }}{% endfor %})V",
     );
     {%- endif %}
-    unsafe {
-        uniffi_jni::rust_call_with_env(uniffi_env, |uniffi_env| {
-            // Safety:
-            // We assume the Kotlin side of the FFI sent us a future handle
-            let uniffi_future: ::std::sync::Arc::<UniffiRustFuture<{{ rust_result.return_type_rs() }}>> = unsafe {
-                // Increment the strong count since we're creating a new `Arc`.
-                let ptr = ::std::ptr::with_exposed_provenance::<UniffiRustFuture<{{ rust_result.return_type_rs() }}>>(uniffi_future_handle as usize);
-                ::std::sync::Arc::increment_strong_count(ptr);
-                ::std::sync::Arc::from_raw(ptr)
-            };
-
-            if uniffi_future.scheduler.lock().unwrap().is_cancelled() {
-                uniffi::trace!("RustFuture::poll: cancelled");
-                return Ok(UNIFFI_RUST_FUTURE_CANCELLED);
-            }
-
-            let mut locked = uniffi_future.future.lock().unwrap();
-            let waker = ::std::task::Waker::from(::std::sync::Arc::clone(&uniffi_future));
-            let pinned: std::pin::Pin<&mut dyn ::std::future::Future<Output = {{ rust_result.return_type_rs() }}>> = locked.as_mut();
-            match pinned.poll(&mut ::std::task::Context::from_waker(&waker)) {
-                ::std::task::Poll::Ready(uniffi_return) => {
-                    uniffi::trace!("RustFuture::poll: ready");
-
+    uniffi_jni::rust_call_with_env(uniffi_env, |uniffi_env| {
+        let uniffi_return = match uniffi_jni::future_complete::<{{ rust_result.return_type_rs() }}>(
+            uniffi::Handle::from_raw_unchecked(handle as u64),
+        ) {
+            Ok(value) => value,
+            Err(error) if uniffi_jni::is_cancelled(&error) => return Ok(UNIFFI_RUST_FUTURE_CANCELLED),
+            Err(error) => return Err(error),
+        };
                     {%- if let Some(throws_type) = rust_result.throws_type %}
                     let uniffi_return = match uniffi_return {
                         Ok(v) => v,
@@ -144,48 +105,24 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_{{ rust_result.async_poll_fn()
                     ).to_anyhow_result(uniffi_env, "{{ rust_result.async_complete_class() }}.complete")?;
                     {%- endif %}
 
-                    Ok(UNIFFI_RUST_FUTURE_COMPLETE)
-                }
-                ::std::task::Poll::Pending => {
-                    let continuation = UniffiRustFutureContinutation {
-                        continuation: ((**uniffi_env).v1_2.NewGlobalRef)(uniffi_env, continuation),
-                    };
-                    uniffi_future.scheduler.lock().unwrap().store(continuation);
-                    Ok(UNIFFI_RUST_FUTURE_PENDING)
-                }
-            }
-        })
-    }
+
+        Ok(UNIFFI_RUST_FUTURE_COMPLETE)
+    })
 }
 
 #[unsafe(no_mangle)]
 unsafe extern "system" fn Java_uniffi_Scaffolding_{{ rust_result.async_cancel_fn() }}(
-    _: *mut uniffi_jni::JNIEnv,
-    _: *mut uniffi_jni::jclass,
-    uniffi_future_handle: i64,
+    _: *mut uniffi_jni::JNIEnv, _: uniffi_jni::jclass, handle: i64,
 ) {
-    uniffi::trace!("RustFuture::cancel: {uniffi_future_handle:x}");
-    // Safety:
-    // We assume the Kotlin side of the FFI sent us a future handle
-    unsafe {
-        let ptr = ::std::ptr::with_exposed_provenance::<UniffiRustFuture<{{ rust_result.return_type_rs() }}>>(uniffi_future_handle as usize);
-        (*ptr).scheduler.lock().unwrap().cancel();
-    };
+    uniffi_jni::future_cancel::<{{ rust_result.return_type_rs() }}>(
+        uniffi::Handle::from_raw_unchecked(handle as u64));
 }
-
 #[unsafe(no_mangle)]
 unsafe extern "system" fn Java_uniffi_Scaffolding_{{ rust_result.async_free_fn() }}(
-    _: *mut uniffi_jni::JNIEnv,
-    _: *mut uniffi_jni::jclass,
-    uniffi_future_handle: i64,
+    _: *mut uniffi_jni::JNIEnv, _: uniffi_jni::jclass, handle: i64,
 ) {
-    uniffi::trace!("RustFuture::free: {uniffi_future_handle:x}");
-    // Safety:
-    // We assume the Kotlin side of the FFI sent us a future handle
-    unsafe {
-        let ptr = ::std::ptr::with_exposed_provenance::<UniffiRustFuture<{{ rust_result.return_type_rs() }}>>(uniffi_future_handle as usize);
-        ::std::sync::Arc::decrement_strong_count(ptr);
-    };
+    uniffi_jni::future_free::<{{ rust_result.return_type_rs() }}>(
+        uniffi::Handle::from_raw_unchecked(handle as u64));
 }
 {%- endfor %}
 
@@ -278,3 +215,72 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_{{ callback_result.async_compl
     sender.send(uniffi::Result::Err(uniffi::deps::anyhow::anyhow!("Unexpected callback error")));
 }
 {%- endfor %}
+
+struct UniffiKotlinCall<T: Send + 'static> {
+    receiver: Option<uniffi::oneshot::Receiver<uniffi::Result<T>>>,
+    key: i64,
+    done: Option<uniffi::oneshot::Receiver<()>>,
+}
+impl<T: Send + 'static> Drop for UniffiKotlinCall<T> {
+    fn drop(&mut self) {
+        let Some(done) = self.done.take() else { return; };
+        let receiver = self.receiver.take();
+        static CANCEL: uniffi_jni::CachedStaticMethod = uniffi_jni::CachedStaticMethod::new(
+            c"uniffi/UniffiKt", c"uniffiCancelCallback", c"(J)V",
+        );
+        unsafe {
+            uniffi_jni::attach_current_thread(uniffi_get_global_jvm(), |env| {
+                CANCEL.call_void(env, [uniffi_jni::jvalue { j: self.key }])
+                    .warn_on_exception(env, "uniffiCancelCallback");
+            });
+        }
+        if let Some(context) = uniffi::async_runtime::current_context() {
+            context.defer_cleanup(async move {
+                if let Some(receiver) = receiver { drop(receiver.await); }
+                done.await;
+            }).expect("callback cleanup owner closed");
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "system" fn Java_uniffi_Scaffolding_kotlinCallbackReleased(
+    _: *mut uniffi_jni::JNIEnv, _: uniffi_jni::jclass, handle: i64,
+) {
+    // Kotlin removes its Job and all captures before acknowledging release.
+    let sender = uniffi::oneshot::Sender::<()>::from_raw(std::ptr::with_exposed_provenance(handle as usize));
+    sender.send(());
+}
+
+async fn uniffi_kotlin_call<T: Send + 'static>(
+    start: impl FnOnce(i64, i64) -> uniffi::Result<()> + Send,
+) -> uniffi::Result<T> {
+    let (sender, receiver) = uniffi::oneshot::channel::<uniffi::Result<T>>();
+    let (released, done) = uniffi::oneshot::channel::<()>();
+    let key = sender.into_raw().expose_provenance() as i64;
+    let released = released.into_raw().expose_provenance() as i64;
+    let mut owner = UniffiKotlinCall { key, receiver: Some(receiver), done: Some(done) };
+    if let Err(error) = start(key, released) {
+        // Dispatch either throws before registration, or transfers both senders
+        // to the Kotlin Job. Generated dispatch does not throw after transfer.
+        owner.done = None;
+        unsafe {
+            drop(uniffi::oneshot::Sender::<uniffi::Result<T>>::from_raw(std::ptr::with_exposed_provenance(key as usize)));
+            drop(uniffi::oneshot::Sender::<()>::from_raw(std::ptr::with_exposed_provenance(released as usize)));
+        }
+        return Err(error);
+    }
+    let result = owner.receiver.as_mut().unwrap().await;
+    owner.receiver = None;
+    owner.done.as_mut().unwrap().await;
+    owner.done = None;
+    result
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "system" fn Java_uniffi_Scaffolding_inputCloseFinished(
+    _: *mut uniffi_jni::JNIEnv, _: uniffi_jni::jclass, key: i64, success: bool,
+) {
+    let sender = uniffi::oneshot::Sender::<uniffi::Result<()>>::from_raw(std::ptr::with_exposed_provenance(key as usize));
+    sender.send(if success { Ok(()) } else { Err(uniffi::deps::anyhow::anyhow!("input cleanup failed")) });
+}

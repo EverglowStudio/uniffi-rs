@@ -79,3 +79,33 @@ impl BoxedType {
         format!("boxFromFfiValues{}", self.self_type.id)
     }
 }
+
+impl StreamType {
+    pub fn future_types(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "Next",
+                format!(
+                    "uniffi::UniFfiStreamStep<{}, {}>",
+                    self.item.type_rs,
+                    self.error_rs()
+                ),
+            ),
+            ("Close", "()".into()),
+        ]
+    }
+    pub fn input_completions(&self) -> Vec<(&'static str, Option<&TypeNode>)> {
+        let mut types = vec![("Item", Some(&self.item)), ("Done", None)];
+        if let Some(error) = &self.error {
+            types.push(("Error", Some(error)));
+        }
+        types
+    }
+
+    pub fn error_rs(&self) -> &str {
+        self.error
+            .as_ref()
+            .map(|e| e.type_rs.as_str())
+            .unwrap_or("::std::convert::Infallible")
+    }
+}

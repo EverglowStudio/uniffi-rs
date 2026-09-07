@@ -1,11 +1,11 @@
-fileprivate protocol UniffiInputStreamProtocol: AnyObject {
+fileprivate protocol UniffiInputStreamProtocol: AnyObject, Sendable {
     func next(
         callback: @escaping UniffiForeignFutureCompleteRustBuffer,
         callbackData: UInt64,
         droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
     )
     func cancel()
-    func close() async
+    func close() async throws
 }
 
 fileprivate final class UniffiInputStreamNextTaskBox: @unchecked Sendable {
@@ -57,7 +57,7 @@ fileprivate final class UniffiInputStreamNextTaskBox: @unchecked Sendable {
 fileprivate let UNIFFI_INPUT_STREAM_HANDLE_MAP = UniffiHandleMap<UniffiInputStreamProtocol>()
 fileprivate let UNIFFI_INPUT_STREAM_NEXT_TASK_HANDLE_MAP = UniffiHandleMap<UniffiInputStreamNextTaskBox>()
 
-fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: UniffiInputStreamProtocol, @unchecked Sendable {
+fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence & Sendable>: UniffiInputStreamProtocol, @unchecked Sendable {
     private enum NextStart {
         case start
         case done
@@ -69,7 +69,8 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
     private var pendingTask: UniffiInputStreamNextTaskBox?
     // Each accepted next joins its predecessor, including its completion callback.
     private var lastTask: UniffiInputStreamNextTaskBox?
-    private var closeTask: Task<Void, Never>?
+    private var closeTask: Task<Void, Error>?
+    private let closeSequence: (@Sendable () async throws -> Void)?
     private var cancelled = false
     private let lowerNext: (S.Element?) -> RustBuffer
     private let lowerError: (Swift.Error) -> RustBuffer?
@@ -82,6 +83,11 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
         self.iterator = sequence.makeAsyncIterator()
         self.lowerNext = lowerNext
         self.lowerError = lowerError
+        if let sequence = sequence as? any UniffiAsyncSequenceClose {
+            closeSequence = { try await sequence.close() }
+        } else {
+            closeSequence = nil
+        }
     }
 
     func next(
@@ -123,7 +129,9 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
                 free: uniffiInputStreamNextDroppedCallback
             )
             let predecessor = previousTask
-            taskBox.set(task: Task {
+            // C function pointers can be captured by a Sendable Task closure;
+            // the accepted Task owns this callback/data pair's one completion.
+            taskBox.set(task: Task { @Sendable in
                 await self.runNext(
                     callback: callback,
                     callbackData: callbackData,
@@ -142,7 +150,7 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
         task?.cancel()
     }
 
-    func close() async {
+    func close() async throws {
         cancel()
         let task = lock.withLock {
             if let task = closeTask {
@@ -152,11 +160,12 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
             let task = Task {
                 await last?.wait()
                 self.releaseIterator()
+                try await self.closeSequence?()
             }
             closeTask = task
             return task
         }
-        await task.value
+        try await task.value
     }
 
     private func releaseIterator() {
@@ -190,9 +199,17 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
         }
 
         do {
-            let value = try await nextIterator.next()
-            finishNext(iterator: value == nil ? nil : nextIterator)
-            completeSuccess(value, callback: callback, callbackData: callbackData)
+            var value = try await nextIterator.next()
+            if Task.isCancelled {
+                // No raw handles may be lowered into a result whose Rust waiter
+                // has cancelled. Close still joins this Task and its iterator.
+                value = nil
+                finishNext(iterator: nil)
+                completeCancelled(callback: callback, callbackData: callbackData)
+            } else {
+                finishNext(iterator: value == nil ? nil : nextIterator)
+                completeSuccess(value, callback: callback, callbackData: callbackData)
+            }
         } catch {
             finishNext(iterator: nil)
             completeError(error, callback: callback, callbackData: callbackData)
@@ -228,7 +245,9 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
         callback: UniffiForeignFutureCompleteRustBuffer,
         callbackData: UInt64
     ) {
-        if let errorBuf = lowerError(error) {
+        if Task.isCancelled || error is CancellationError {
+            completeCancelled(callback: callback, callbackData: callbackData)
+        } else if let errorBuf = lowerError(error) {
             callback(
                 callbackData,
                 UniffiForeignFutureResultRustBuffer(
@@ -244,9 +263,19 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
             )
         }
     }
+
+    private func completeCancelled(
+        callback: UniffiForeignFutureCompleteRustBuffer,
+        callbackData: UInt64
+    ) {
+        callback(callbackData, UniffiForeignFutureResultRustBuffer(
+            returnValue: RustBuffer.empty(),
+            callStatus: RustCallStatus(code: CALL_CANCELLED, errorBuf: RustBuffer.empty())
+        ))
+    }
 }
 
-fileprivate func uniffiCreateInputStream<S: AsyncSequence>(
+fileprivate func uniffiCreateInputStream<S: AsyncSequence & Sendable>(
     _ sequence: S,
     lowerNext: @escaping (S.Element?) -> RustBuffer,
     lowerError: @escaping (Swift.Error) -> RustBuffer?
@@ -305,11 +334,21 @@ fileprivate func uniffiInputStreamCloseCallback(
         )))
         return
     }
-    Task {
-        await stream.close()
-        _ = try? UNIFFI_INPUT_STREAM_HANDLE_MAP.remove(handle: handle)
-        // This also consumes the Rust completion sender when its waiter was dropped.
-        callback(callbackData, UniffiForeignFutureResultVoid(callStatus: RustCallStatus()))
+    // The Sendable Task closure captures the C function pointer and completes
+    // exactly once after the joined cleanup, independently of waiter lifetime.
+    Task { @Sendable in
+        do {
+            try await stream.close()
+            _ = try? UNIFFI_INPUT_STREAM_HANDLE_MAP.remove(handle: handle)
+            // Consume the sender even when the Rust waiter has been dropped.
+            callback(callbackData, UniffiForeignFutureResultVoid(callStatus: RustCallStatus()))
+        } catch {
+            _ = try? UNIFFI_INPUT_STREAM_HANDLE_MAP.remove(handle: handle)
+            callback(callbackData, UniffiForeignFutureResultVoid(callStatus: RustCallStatus(
+                code: CALL_UNEXPECTED_ERROR,
+                errorBuf: {{ Type::String.borrow()|lower_fn }}(String(describing: error))
+            )))
+        }
     }
 }
 
@@ -339,4 +378,43 @@ private func completeUnexpected(
 // For testing
 public func uniffiInputStreamHandleCount{{ ci.namespace()|class_name }}() -> Int {
     UNIFFI_INPUT_STREAM_HANDLE_MAP.count
+}
+
+// The RustBuffer has one owner, transferred from the C completion to its waiter.
+fileprivate struct UniffiInputStreamCompletion: @unchecked Sendable {
+    let result: UniffiForeignFutureResultRustBuffer
+}
+fileprivate let UNIFFI_INPUT_STREAM_COMPLETIONS = UniffiHandleMap<CheckedContinuation<UniffiInputStreamCompletion, Never>>()
+
+fileprivate func uniffiLiftInputStream<T: Sendable>(
+    _ handle: UInt64,
+    liftNext: @escaping @Sendable (RustBuffer) throws -> T?,
+    errorHandler: (@Sendable (RustBuffer) throws -> Swift.Error)?
+) throws -> UniFfiStream<T> {
+    let stream = try UNIFFI_INPUT_STREAM_HANDLE_MAP.get(handle: handle)
+    return UniFfiStream(
+        handle: handle,
+        next: { _ in
+            let completion = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    let data = UNIFFI_INPUT_STREAM_COMPLETIONS.insert(obj: continuation)
+                    var dropped = UniffiForeignFutureDroppedCallbackStruct(handle: 0, free: { _ in })
+                    stream.next(callback: { data, result in
+                        let continuation = try! UNIFFI_INPUT_STREAM_COMPLETIONS.remove(handle: data)
+                        continuation.resume(returning: UniffiInputStreamCompletion(result: result))
+                    }, callbackData: data, droppedCallback: &dropped)
+                }
+            } onCancel: {
+                stream.cancel()
+            }
+            let value = try liftNext(makeRustCall({ status in
+                status.pointee = completion.result.callStatus
+                return completion.result.returnValue
+            }, errorHandler: errorHandler))
+            if let value { return .item(value) }
+            return .done
+        },
+        cancel: { _ in stream.cancel() },
+        close: { _ in try await stream.close() }
+    )
 }

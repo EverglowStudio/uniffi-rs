@@ -190,8 +190,8 @@ fn test_cancel() {
     let continuation_result = poll(&rust_future);
     assert_eq!(continuation_result.get(), None);
     rust_future.cancel();
-    // Cancellation should immediately invoke the callback with RustFuturePoll::Ready
-    assert_eq!(continuation_result.get(), Some(&RustFuturePoll::Ready));
+    // Cancellation requests another poll; only that poll can confirm cleanup.
+    assert_eq!(continuation_result.get(), Some(&RustFuturePoll::Wake));
 
     // Future polls should immediately invoke the callback with RustFuturePoll::Ready
     let continuation_result = poll(&rust_future);
@@ -265,4 +265,274 @@ fn test_wake_during_poll() {
         <String as Lift<crate::UniFfiTag>>::try_lift(return_buf).unwrap(),
         "All done"
     );
+}
+
+#[cfg(feature = "async-runtime")]
+mod lifecycle {
+    use super::*;
+    use crate::async_runtime::current_context;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CleanupGuard {
+        dropped: Arc<AtomicUsize>,
+        cleaned: Arc<AtomicUsize>,
+        gate: Option<futures::channel::oneshot::Receiver<()>>,
+    }
+
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.take().unwrap();
+            let cleaned = self.cleaned.clone();
+            if let Some(context) = current_context() {
+                context
+                    .defer_cleanup(async move {
+                        let _ = gate.await;
+                        cleaned.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    fn guard() -> (CleanupGuard, futures::channel::oneshot::Sender<()>) {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        (
+            CleanupGuard {
+                dropped: Arc::new(AtomicUsize::new(0)),
+                cleaned: Arc::new(AtomicUsize::new(0)),
+                gate: Some(receiver),
+            },
+            sender,
+        )
+    }
+
+    fn observe<T>(future: &Arc<RustFuture<T>>) -> Arc<OnceCell<RustFuturePoll>> {
+        let cell = Arc::new(OnceCell::new());
+        future.clone().poll(RustFutureContinuationBoundCallback {
+            callback: poll_continuation,
+            data: Arc::into_raw(cell.clone()) as u64,
+        });
+        cell
+    }
+
+    fn observe_pending<T>(future: &Arc<RustFuture<T>>) -> Arc<OnceCell<RustFuturePoll>> {
+        // Inserting cleanup into FuturesUnordered may schedule an extra poll.
+        // Such Wake notifications are not terminal acknowledgements.
+        for _ in 0..8 {
+            let result = observe(future);
+            if result.get() != Some(&RustFuturePoll::Wake) {
+                return result;
+            }
+        }
+        panic!("cleanup did not quiesce at its closed gate");
+    }
+
+    #[test]
+    fn cancellation_waits_for_business_drop_and_cleanup() {
+        let (resource, gate) = guard();
+        let dropped = resource.dropped.clone();
+        let cleaned = resource.cleaned.clone();
+        let future = Arc::new(RustFuture::<u32>::new(
+            async move {
+                let _resource = resource;
+                std::future::pending::<()>().await;
+                Ok(7u32)
+            },
+            crate::UniFfiTag,
+        ));
+        let waiting = observe(&future);
+        assert_eq!(waiting.get(), None);
+        future.cancel();
+        assert_eq!(waiting.get(), Some(&RustFuturePoll::Wake));
+        let cleaning = observe_pending(&future);
+        assert_eq!(
+            cleaning.get(),
+            None,
+            "cancel is not a cleanup acknowledgement"
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(cleaned.load(Ordering::SeqCst), 0);
+        gate.send(()).unwrap();
+        assert_eq!(cleaning.get(), Some(&RustFuturePoll::Wake));
+        assert_eq!(observe(&future).get(), Some(&RustFuturePoll::Ready));
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+        let mut status = RustCallStatus::default();
+        assert_eq!(future.complete(&mut status), 0);
+        assert_eq!(status.code, RustCallStatusCode::Cancelled);
+        future.free();
+    }
+
+    #[test]
+    fn cancellation_before_first_poll_drops_captures_in_context() {
+        let (resource, gate) = guard();
+        let cleaned = resource.cleaned.clone();
+        let polled = Arc::new(AtomicUsize::new(0));
+        let business_polled = polled.clone();
+        let future = Arc::new(RustFuture::<u32>::new(
+            async move {
+                let _resource = resource;
+                business_polled.fetch_add(1, Ordering::SeqCst);
+                Ok(7u32)
+            },
+            crate::UniFfiTag,
+        ));
+        future.cancel();
+        let cleaning = observe_pending(&future);
+        assert_ne!(cleaning.get(), Some(&RustFuturePoll::Ready));
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
+        gate.send(()).unwrap();
+        assert_eq!(observe(&future).get(), Some(&RustFuturePoll::Ready));
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+        future.free();
+    }
+
+    struct Output {
+        lowered: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+    impl Drop for Output {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    // This test type lowers to an owned scalar; counters observe when the
+    // conversion consumes the Rust value, without creating an FFI allocation.
+    unsafe impl LowerReturn<crate::UniFfiTag> for Output {
+        type ReturnType = u32;
+        fn lower_return(value: Self) -> Result<u32, crate::RustCallError> {
+            value.lowered.fetch_add(1, Ordering::SeqCst);
+            Ok(7)
+        }
+    }
+
+    #[test]
+    fn ready_keeps_rust_output_until_complete_and_late_cancel_loses() {
+        let lowered = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let output = Output {
+            lowered: lowered.clone(),
+            dropped: dropped.clone(),
+        };
+        let future = Arc::new(RustFuture::<u32>::new(
+            async move { Ok(output) },
+            crate::UniFfiTag,
+        ));
+        assert_eq!(observe(&future).get(), Some(&RustFuturePoll::Ready));
+        assert_eq!(
+            lowered.load(Ordering::SeqCst),
+            0,
+            "poll must not transfer Rust ownership to FFI"
+        );
+        future.cancel();
+        let mut status = RustCallStatus::default();
+        assert_eq!(future.complete(&mut status), 7);
+        assert_eq!(status.code, RustCallStatusCode::Success);
+        assert_eq!(lowered.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        future.free();
+    }
+
+    #[test]
+    fn ready_output_is_dropped_without_lowering_when_handle_is_freed() {
+        let lowered = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let output = Output {
+            lowered: lowered.clone(),
+            dropped: dropped.clone(),
+        };
+        let future = Arc::new(RustFuture::<u32>::new(
+            async move { Ok(output) },
+            crate::UniFfiTag,
+        ));
+        assert_eq!(observe(&future).get(), Some(&RustFuturePoll::Ready));
+        future.free();
+        assert_eq!(lowered.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    struct CleanupOutput {
+        _resource: CleanupGuard,
+    }
+
+    // No owning ABI value is created: the test observes the cleanup registered
+    // by dropping a Rust output that was never delivered to foreign code.
+    unsafe impl LowerReturn<crate::UniFfiTag> for CleanupOutput {
+        type ReturnType = u32;
+        fn lower_return(_value: Self) -> Result<u32, crate::RustCallError> {
+            panic!("an abandoned output must not be lowered")
+        }
+    }
+
+    #[test]
+    fn nested_free_waits_for_unpolled_captures_and_undelivered_output_cleanup() {
+        use crate::async_runtime::{CallContext, CancellationToken};
+
+        for poll_before_free in [false, true] {
+            let (resource, gate) = guard();
+            let dropped = resource.dropped.clone();
+            let cleaned = resource.cleaned.clone();
+            let future = Arc::new(RustFuture::<u32>::new(
+                async move {
+                    Ok(CleanupOutput {
+                        _resource: resource,
+                    })
+                },
+                crate::UniFfiTag,
+            ));
+            if poll_before_free {
+                assert_eq!(observe(&future).get(), Some(&RustFuturePoll::Ready));
+            }
+            let parent = CallContext::new(CancellationToken::new());
+            let mut releasing = Box::pin(parent.run(async move { future.free() }));
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(releasing.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(cleaned.load(Ordering::SeqCst), 0);
+            assert!(releasing.as_mut().poll(&mut cx).is_pending());
+            gate.send(()).unwrap();
+            assert_eq!(releasing.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+            assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_runtime_covers_registered_cleanup_after_business_returns() {
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let seen = cleaned.clone();
+        let future = Arc::new(RustFuture::<u32>::new_tokio(
+            async move {
+                current_context()
+                    .unwrap()
+                    .defer_cleanup(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .unwrap();
+                Ok(7u32)
+            },
+            crate::UniFfiTag,
+        ));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let next = observe(&future);
+            while next.get().is_none() {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "Tokio cleanup did not wake the host"
+                );
+                std::thread::yield_now();
+            }
+            if next.get() == Some(&RustFuturePoll::Ready) {
+                break;
+            }
+        }
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+        let mut status = RustCallStatus::default();
+        assert_eq!(future.complete(&mut status), 7);
+        assert_eq!(status.code, RustCallStatusCode::Success);
+        future.free();
+    }
 }

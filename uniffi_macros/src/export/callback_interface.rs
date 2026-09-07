@@ -60,8 +60,11 @@ pub(super) fn trait_impl(
         let ident = &sig.ident;
         let param_names = sig.scaffolding_param_names();
         let param_types = sig.scaffolding_param_types();
-        let callback_return = callback_return_type(sig);
-        let lift_return_type = ffiops::lift_return_type(&callback_return);
+        let lift_return_type = if sig.stream_return.is_some() {
+            quote! { ::uniffi::Handle }
+        } else {
+            ffiops::lift_return_type(&sig.return_ty)
+        };
         let method = if !sig.is_async {
             quote! {
                 pub #ident: extern "C" fn(
@@ -215,19 +218,19 @@ pub fn ffi_converter_callback_interface_impl(
     }
 }
 
-/// Generate a single method for [trait_impl].  This implements a trait method by invoking a
-/// foreign-supplied callback.
-fn callback_return_type(sig: &FnSignature) -> TokenStream {
-    if sig.stream_return.is_none() {
-        return sig.return_ty.clone();
-    }
-    match &sig.factory_error_ty {
-        Some(error) => quote! { ::std::result::Result<::uniffi::ForeignStreamReturn, #error> },
-        None => quote! { ::uniffi::ForeignStreamReturn },
-    }
-}
-
+/// Generate a single method that invokes a foreign-supplied callback.
 fn gen_method_impl(sig: &FnSignature, vtable_cell: &Ident) -> syn::Result<TokenStream> {
+    // Generated locals must not shadow parameters from the business signature.
+    let stream_return = Ident::new("UniffiCallbackStreamReturn", Span::mixed_site());
+    let stream_handle = Ident::new("handle", Span::mixed_site());
+    let vtable = Ident::new("vtable", Span::mixed_site());
+    let receiver = Ident::new("uniffi_receiver", Span::mixed_site());
+    let result = Ident::new("uniffi_result", Span::mixed_site());
+    let return_value = Ident::new("value", Span::mixed_site());
+    let status = Ident::new("status", Span::mixed_site());
+    let callback = Ident::new("callback", Span::mixed_site());
+    let callback_data = Ident::new("callback_data", Span::mixed_site());
+    let dropped = Ident::new("dropped", Span::mixed_site());
     let mut variants = Vec::new();
     for &wasm in super::async_types::variants() {
         let signature = super::async_types::normalize_signature(&sig.original_signature, wasm)?;
@@ -235,12 +238,40 @@ fn gen_method_impl(sig: &FnSignature, vtable_cell: &Ident) -> syn::Result<TokenS
         let target = super::async_types::target_attribute(wasm);
         let explicit_future = sig.is_async && sig.original_signature.asyncness.is_none();
         let receiver_handle = if explicit_future {
-            quote! { uniffi_receiver.handle }
+            quote! { #receiver.handle }
         } else {
             quote! { self.handle }
         };
         let ident = &sig.ident;
-        let callback_return = callback_return_type(sig);
+        let (callback_return, stream_converter) = if let Some(stream) = &sig.stream_return {
+            let item = &stream.item_ty;
+            let error = &stream.error_ty;
+            let next = format_ident!("{}_stream_next", ident);
+            let cancel = format_ident!("{}_stream_cancel", ident);
+            let close = format_ident!("{}_stream_close", ident);
+            let converter = quote! {
+                struct #stream_return(::uniffi::UniFfiInputStream<#item, #error>);
+                // SAFETY: the successful ABI result owns one handle belonging
+                // to this method's typed producer vtable. Bind its disposer
+                // during lift, including when a cancelled call discards it.
+                unsafe impl ::uniffi::LiftReturn<crate::UniFfiTag> for #stream_return {
+                    type ReturnType = ::uniffi::Handle;
+                    fn try_lift_successful_return(handle: Self::ReturnType) -> ::uniffi::deps::anyhow::Result<Self> {
+                        let vtable = #vtable_cell.get();
+                        Ok(Self(::uniffi::UniFfiInputStream::from_foreign_callbacks::<crate::UniFfiTag>(
+                            handle, vtable.#next, vtable.#cancel, vtable.#close,
+                        )))
+                    }
+                }
+            };
+            let ty = match &sig.factory_error_ty {
+                Some(error) => quote! { ::std::result::Result<#stream_return, #error> },
+                None => quote! { #stream_return },
+            };
+            (ty, Some(converter))
+        } else {
+            (sig.return_ty.clone(), None)
+        };
         let lift_return_type = ffiops::lift_return_type(&callback_return);
         let lift = ffiops::lift_foreign_return(&callback_return);
         let input_arguments: Vec<_> = sig
@@ -251,12 +282,12 @@ fn gen_method_impl(sig: &FnSignature, vtable_cell: &Ident) -> syn::Result<TokenS
             .collect();
         let input_handles: Vec<_> = input_arguments
             .iter()
-            .map(|ident| format_ident!("__uniffi_input_{}", ident))
+            .map(|ident| format_ident!("__uniffi_input_{}", ident, span = Span::mixed_site()))
             .collect();
         let lower_exprs = sig.args.iter().map(|arg| {
             let ident = &arg.ident;
             if arg.input_stream.is_some() {
-                let handle = format_ident!("__uniffi_input_{}", ident);
+                let handle = format_ident!("__uniffi_input_{}", ident, span = Span::mixed_site());
                 quote! { #handle }
             } else {
                 let lower = ffiops::lower(&arg.ty);
@@ -265,29 +296,26 @@ fn gen_method_impl(sig: &FnSignature, vtable_cell: &Ident) -> syn::Result<TokenS
         });
         let call = if !sig.is_async {
             quote! {
-                let mut status = ::uniffi::RustCallStatus::default();
-                let mut value: #lift_return_type = ::uniffi::FfiDefault::ffi_default();
-                (vtable.#ident)(#receiver_handle, #(#lower_exprs,)* &mut value, &mut status);
-                #lift(value, status)
+                let mut #status = ::uniffi::RustCallStatus::default();
+                let mut #return_value: #lift_return_type = ::uniffi::FfiDefault::ffi_default();
+                (#vtable.#ident)(#receiver_handle, #(#lower_exprs,)* &mut #return_value, &mut #status);
+                #lift(#return_value, #status)
             }
         } else {
             quote! {
                 ::uniffi::foreign_async_call::<_, #callback_return, crate::UniFfiTag>(
-                    move |callback, callback_data, dropped| {
-                        (vtable.#ident)(#receiver_handle, #(#lower_exprs,)* callback, callback_data, dropped);
+                    move |#callback, #callback_data, #dropped| {
+                        (#vtable.#ident)(#receiver_handle, #(#lower_exprs,)* #callback, #callback_data, #dropped);
                     }
                 ).await
             }
         };
         let converted = if let Some(stream) = &sig.stream_return {
-            let next = format_ident!("{}_stream_next", ident);
-            let cancel = format_ident!("{}_stream_cancel", ident);
-            let close = format_ident!("{}_stream_close", ident);
-            let item = &stream.item_ty;
-            let error = &stream.error_ty;
-            let stream_value = quote! { ::uniffi::UniFfiInputStream::<#item, #error>::from_foreign_callbacks::<crate::UniFfiTag>(
-                handle.0, vtable.#next, vtable.#cancel, vtable.#close,
-            ) };
+            let stream_value = if input_arguments.is_empty() {
+                quote! { #stream_handle.0 }
+            } else {
+                quote! { #stream_handle.0.retain_until_close((#(#input_arguments,)*)) }
+            };
             let stream_value = if stream.is_fallible {
                 stream_value
             } else {
@@ -297,22 +325,27 @@ fn gen_method_impl(sig: &FnSignature, vtable_cell: &Ident) -> syn::Result<TokenS
             };
             // The expected trait return type performs the dyn coercion here.
             if sig.factory_error_ty.is_some() {
-                quote! { match uniffi_result { Ok(handle) => Ok(::std::boxed::Box::pin(#stream_value)), Err(error) => Err(error) } }
+                quote! { match #result { Ok(#stream_handle) => Ok(::std::boxed::Box::pin(#stream_value)), Err(error) => Err(error) } }
             } else {
-                quote! {{ let handle = uniffi_result; ::std::boxed::Box::pin(#stream_value) }}
+                quote! {{ let #stream_handle = #result; ::std::boxed::Box::pin(#stream_value) }}
             }
         } else {
-            quote! { uniffi_result }
+            quote! { #result }
         };
-        let release_receiver =
-            explicit_future.then(|| quote! { ::std::mem::drop(uniffi_receiver); });
+        let release_receiver = explicit_future.then(|| quote! { ::std::mem::drop(#receiver); });
+        let release_inputs = sig.stream_return.is_none().then(|| {
+            quote! {
+                ::std::mem::drop((#(#input_arguments,)*));
+            }
+        });
         let body = quote! {
-            let vtable = #vtable_cell.get();
+            #stream_converter
+            let #vtable = #vtable_cell.get();
             #(let #input_handles = #input_arguments.handle();)*
-            let uniffi_result = { #call };
-            // Keep the foreign producer proxy alive through callback completion.
-            // Cancellation drops it inside the surrounding call cleanup scope.
-            ::std::mem::drop((#(#input_arguments,)*));
+            let #result = { #call };
+            // Ordinary callbacks release input frames after completion. A
+            // returned stream instead owns them through its close acknowledgement.
+            #release_inputs
             #release_receiver
             let uniffi_output: #output_type = #converted;
             uniffi_output
@@ -321,7 +354,7 @@ fn gen_method_impl(sig: &FnSignature, vtable_cell: &Ident) -> syn::Result<TokenS
             quote! {
                 // A returned 'static Future can outlive this handler. Keep an
                 // owned foreign lease until completion or Future destruction.
-                let uniffi_receiver = Self::new((#vtable_cell.get().uniffi_clone)(self.handle));
+                let #receiver = Self::new((#vtable_cell.get().uniffi_clone)(self.handle));
                 ::std::boxed::Box::pin(async move { #body })
             }
         } else {

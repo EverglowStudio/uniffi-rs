@@ -60,7 +60,7 @@ pub fn build_library(tempdir: &Utf8Path, package_name: &str, opt: LibraryOptions
     }
 
     let status = Command::new("cargo")
-        .args(["build", "-p", package_name])
+        .args(["build", "--locked", "-p", package_name])
         .args(extra_args)
         .status()
         .unwrap();

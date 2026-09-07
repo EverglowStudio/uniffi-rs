@@ -98,7 +98,7 @@ impl CallbackInterface {
     }
 
     pub fn has_async_method(&self) -> bool {
-        self.methods.iter().any(|m| m.callable.is_async)
+        self.methods.iter().any(|m| m.callable.rust_async)
     }
 
     pub fn free_fn_kt(&self) -> String {
@@ -123,6 +123,7 @@ impl CallbackMethod {
         }
         if self.callable.is_async {
             args.push('J'); // oneshot handle
+            args.push('J'); // release acknowledgement
         }
         args.extend(
             self.callable
@@ -156,6 +157,9 @@ impl CallbackMethod {
     }
 
     pub fn jni_method_call_name(&self) -> &'static str {
+        if self.callable.is_async {
+            return "call_void";
+        }
         match self.callable.return_type() {
             Some(t) => match t.ffi_types.as_slice() {
                 [FfiType::Int8] | [FfiType::Boolean] => "call_byte",

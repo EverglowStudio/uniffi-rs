@@ -8,6 +8,7 @@ use super::*;
 
 #[derive(Default, Clone)]
 pub struct Context {
+    pub type_nodes: HashMap<Type, general::TypeNode>,
     pub scaffolding_crate_name: Option<String>,
     pub current_crate_name: Option<String>,
     pub current_namespace_name: Option<String>,
@@ -25,6 +26,9 @@ pub struct Context {
 
 impl Context {
     pub fn update_from_root(&mut self, root: &general::Root) -> Result<()> {
+        root.visit(|node: &general::TypeNode| {
+            self.type_nodes.insert(node.ty.clone(), node.clone());
+        });
         self.populate_type_module_path_map(root);
         self.populate_fields_from_type_definitions(root)?;
         self.populate_types_used_as_error(root);

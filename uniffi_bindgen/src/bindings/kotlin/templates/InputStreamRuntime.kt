@@ -12,6 +12,7 @@ private interface UniffiInputStreamProtocol {
 
     fun cancel()
     suspend fun close()
+    fun asFlow(): Flow<*>
 }
 
 private class UniffiInputStreamNextJobBox {
@@ -40,6 +41,26 @@ private class UniffiInputStreamNextJobBox {
 private val uniffiInputStreamHandleMap = UniffiHandleMap<UniffiInputStreamProtocol>()
 private val uniffiInputStreamNextJobHandleMap = UniffiHandleMap<UniffiInputStreamNextJobBox>()
 
+// Preserve close ownership when an input travels through a foreign callback
+// without ever being collected. An ordinary cold Flow has no close operation.
+private class UniffiInputStreamFlow<T>(
+    private val owner: UniffiInputStreamProtocol,
+    private val source: Flow<T>,
+): Flow<T> {
+    suspend fun close() = owner.close()
+
+    @OptIn(kotlinx.coroutines.InternalCoroutinesApi::class)
+    override suspend fun collect(collector: FlowCollector<T>) = source.collect(collector)
+}
+
+private fun uniffiStreamCloseAction(source: Flow<*>): (suspend () -> Unit)? = when (source) {
+    {%- if ci.has_stream_fns() %}
+    is UniFfiStream<*> -> source::close
+    {%- endif %}
+    is UniffiInputStreamFlow<*> -> source::close
+    else -> null
+}
+
 private class UniffiFlowInputStream<T>(
     flow: Flow<T>,
     private val lowerNext: (UniffiInputStreamNext<T>) -> RustBuffer.ByValue,
@@ -47,172 +68,192 @@ private class UniffiFlowInputStream<T>(
 ): UniffiInputStreamProtocol {
     private val lock = Any()
     private var flow: Flow<T>? = flow
+    private val closeSource = uniffiStreamCloseAction(flow)
     private val channel = Channel<T>(Channel.RENDEZVOUS)
+    // Returning from emit would let a Flow compute another value. Keep emit
+    // suspended until the next pull explicitly authorizes that work.
+    private val demand = Channel<Unit>(1)
+    private var needsDemand = false
     private val scopeJob = SupervisorJob()
     private val scope = CoroutineScope(scopeJob + Dispatchers.Default)
     private var producerJob: Job? = null
-    private var pendingJob: UniffiInputStreamNextJobBox? = null
-    private val nextCompletions = mutableSetOf<kotlinx.coroutines.CompletableDeferred<Unit>>()
+    private val rustConsumer = Any()
+    private var consumer: Any? = null
+    private var pending = false
+    private val nextCompletions = mutableSetOf<CompletableDeferred<Unit>>()
     private var done = false
     private var cancelled = false
+
+    private fun reserveLocked(owner: Any): CompletableDeferred<Unit> {
+        if (consumer == null) consumer = owner
+        if (consumer !== owner) throw InternalException("UniFFI input streams may only be consumed once")
+        if (pending) throw InternalException("UniFFI input stream received a concurrent next() request")
+        pending = true
+        return CompletableDeferred<Unit>().also { nextCompletions.add(it) }
+    }
+
+    private fun release(completion: CompletableDeferred<Unit>) {
+        synchronized(lock) { nextCompletions.remove(completion) }
+        // Resuming an Unconfined waiter can synchronously reenter foreign code.
+        completion.complete(Unit)
+    }
 
     override fun next(
         callback: UniffiForeignFutureCompleteRustBuffer,
         callbackData: Long,
         droppedCallback: UniffiForeignFutureDroppedCallbackStruct,
     ) {
-        // Register every child before close can cancel and join the scope.
-        synchronized(lock) {
-            if (cancelled || done) {
-                uniffiCompleteInputStreamSuccess(
-                    UniffiInputStreamNext.Done, lowerNext, callback, callbackData,
-                )
-                return
-            }
-            if (pendingJob != null) {
-                uniffiCompleteInputStreamUnexpected(
-                    "UniFFI input stream received a concurrent next() request", callback, callbackData,
-                )
-                return
-            }
-            val nextJob = UniffiInputStreamNextJobBox()
-            pendingJob = nextJob
-            val nextJobHandle = uniffiInputStreamNextJobHandleMap.insert(nextJob)
-            droppedCallback.uniffiSetValue(UniffiForeignFutureDroppedCallbackStruct(
-                nextJobHandle, uniffiInputStreamNextDroppedCallbackImpl,
-            ))
-            val completion = kotlinx.coroutines.CompletableDeferred<Unit>()
-            nextCompletions.add(completion)
-            val completed = java.util.concurrent.atomic.AtomicBoolean(false)
-            val completeOnce = object: UniffiForeignFutureCompleteRustBuffer {
-                override fun callback(callbackData: Long, result: UniffiForeignFutureResultRustBuffer.UniffiByValue) {
-                    completed.set(true)
-                    callback.callback(callbackData, result)
+        val job: Job
+        val completion: CompletableDeferred<Unit>
+        val nextJobHandle: Long
+        var result: Result<UniffiInputStreamNext<T>>? = null
+        try {
+            synchronized(lock) {
+                completion = reserveLocked(rustConsumer)
+                val nextJob = UniffiInputStreamNextJobBox()
+                nextJobHandle = uniffiInputStreamNextJobHandleMap.insert(nextJob)
+                droppedCallback.uniffiSetValue(UniffiForeignFutureDroppedCallbackStruct(
+                    nextJobHandle, uniffiInputStreamNextDroppedCallbackImpl,
+                ))
+                job = scope.launch(start = CoroutineStart.LAZY) {
+                    result = runCatching { pull() }
                 }
+                nextJob.set(job)
             }
-            val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
-                runNext(completeOnce, callbackData)
-            }
-            nextJob.set(job)
-            job.invokeOnCompletion { cause ->
-                try {
-                    synchronized(lock) {
-                        if (pendingJob === nextJob) pendingJob = null
-                    }
-                    try {
-                        uniffiInputStreamNextJobHandleMap.remove(nextJobHandle)
-                    } catch (_: InternalException) {
-                    }
-                    // A lazy child can be cancelled before runNext's body starts.
-                    if (completed.compareAndSet(false, true)) {
-                        if (cause is CancellationException) {
-                            uniffiCompleteInputStream(
-                                RustBuffer.ByValue(),
-                                UniffiRustCallStatus.create(3.toByte(), RustBuffer.ByValue()),
-                                callback, callbackData,
-                            )
-                        } else {
-                            uniffiCompleteInputStreamUnexpected(
-                                cause ?: InternalException("UniFFI input stream next ended without a result"),
-                                callback, callbackData,
-                            )
-                        }
-                    }
-                } finally {
-                    synchronized(lock) {
-                        completion.complete(Unit)
-                        nextCompletions.remove(completion)
-                    }
-                }
-            }
-            ensureProducerStartedLocked()
-            job.start()
+        } catch (error: InternalException) {
+            uniffiCompleteInputStreamUnexpected(error, callback, callbackData)
+            return
         }
+        job.invokeOnCompletion { cause ->
+            synchronized(lock) { pending = false }
+            try {
+                try {
+                    uniffiInputStreamNextJobHandleMap.remove(nextJobHandle)
+                } catch (_: InternalException) {
+                    // Rust already dropped its next waiter.
+                }
+                val completed = result
+                val failure = cause ?: completed?.exceptionOrNull()
+                when {
+                    failure is CancellationException -> uniffiCompleteInputStream(
+                        RustBuffer.ByValue(),
+                        UniffiRustCallStatus.create(3.toByte(), RustBuffer.ByValue()),
+                        callback, callbackData,
+                    )
+                    failure != null -> uniffiCompleteInputStreamError(failure, lowerError, callback, callbackData)
+                    completed != null -> uniffiCompleteInputStreamSuccess(completed.getOrThrow(), lowerNext, callback, callbackData)
+                    else -> uniffiCompleteInputStreamUnexpected("Input stream next ended without a result", callback, callbackData)
+                }
+            } finally {
+                release(completion)
+            }
+        }
+        // No registry/state lock is held when starting work or calling foreign code.
+        job.start()
     }
+
+    override fun asFlow(): Flow<T> = UniffiInputStreamFlow(this, kotlinx.coroutines.flow.flow {
+        val owner = Any()
+        var claimed = false
+        try {
+            while (true) {
+                val completion = synchronized(lock) { reserveLocked(owner) }
+                claimed = true
+                val step = try {
+                    pull()
+                } finally {
+                    synchronized(lock) { pending = false }
+                    release(completion)
+                }
+                when (step) {
+                    is UniffiInputStreamNext.Item -> emit(step.value)
+                    UniffiInputStreamNext.Done -> break
+                }
+            }
+        } finally {
+            if (claimed) close()
+        }
+    })
 
     override fun cancel() {
         synchronized(lock) {
             cancelled = true
-            done = true
-            pendingJob?.cancel()
-            scopeJob.cancel()
-            channel.cancel()
+            flow = null
         }
+        // Cancelling Jobs can run completion callbacks, including reentrant FFI.
+        scopeJob.cancel()
+        channel.cancel()
+        demand.cancel()
     }
 
     override suspend fun close() {
-        cancel()
-        scopeJob.join()
-        // Job completion handlers can still be delivering the final FFI callback.
-        val completions = synchronized(lock) { nextCompletions.toList() }
-        for (completion in completions) completion.await()
+        withContext(NonCancellable) {
+            this@UniffiFlowInputStream.cancel()
+            scopeJob.join()
+            val completions = synchronized(lock) { nextCompletions.toList() }
+            for (completion in completions) completion.await()
+            synchronized(lock) { producerJob = null }
+            closeSource?.invoke()
+        }
+    }
+
+    private suspend fun pull(): UniffiInputStreamNext<T> {
+        val producer: Job
         synchronized(lock) {
-            flow = null
-            producerJob = null
-            pendingJob = null
+            if (cancelled) throw CancellationException("UniFFI input stream is closed")
+            if (done) return UniffiInputStreamNext.Done
+            producer = producerJob ?: run {
+                val source = flow ?: throw InternalException("UniFFI input stream is closed")
+                scope.launch(start = CoroutineStart.LAZY) {
+                    try {
+                        source.collect { value ->
+                            channel.send(value)
+                            demand.receive()
+                        }
+                        channel.close()
+                    } catch (error: Throwable) {
+                        channel.close(error)
+                    }
+                }.also { producerJob = it }
+            }
+            if (needsDemand) {
+                needsDemand = false
+                check(demand.trySend(Unit).isSuccess)
+            }
         }
+        producer.start()
+        val result = channel.receiveCatching()
+        if (result.isSuccess) {
+            synchronized(lock) { needsDemand = true }
+            return UniffiInputStreamNext.Item(result.getOrThrow())
+        }
+        synchronized(lock) { done = true }
+        result.exceptionOrNull()?.let { throw it }
+        return UniffiInputStreamNext.Done
     }
+}
 
-    private fun ensureProducerStartedLocked() {
-        if (producerJob != null) {
-            return
-        }
-        producerJob = scope.launch {
-            try {
-                flow!!.collect { value ->
-                    channel.send(value)
-                }
-                channel.close()
-            } catch (e: Throwable) {
-                channel.close(e)
-            }
-        }
+@Suppress("UNCHECKED_CAST") // The generated converter fixes the item type for this opaque handle.
+private fun<T> uniffiLiftInputStream(handle: Long): Flow<T> =
+    uniffiInputStreamHandleMap.get(handle).asFlow() as Flow<T>
+
+// Argument lowering can fail before FFI takes ownership. These producers have
+// never been published to Rust or started, so abandoning them needs no await.
+private class UniffiInputStreamArguments {
+    private val handles = mutableListOf<Long>()
+    fun add(handle: Long) { handles.add(handle) }
+    fun transfer() { handles.clear() }
+    fun discard() {
+        for (handle in handles) uniffiInputStreamHandleMap.remove(handle).cancel()
     }
+}
 
-    private suspend fun runNext(
-        callback: UniffiForeignFutureCompleteRustBuffer,
-        callbackData: Long,
-    ) {
-        try {
-            val result = channel.receiveCatching()
-            if (result.isSuccess) {
-                finishNext(done = false)
-                uniffiCompleteInputStreamSuccess(
-                    UniffiInputStreamNext.Item(result.getOrThrow()),
-                    lowerNext,
-                    callback,
-                    callbackData,
-                )
-                return
-            }
-
-            finishNext(done = true)
-            val error = result.exceptionOrNull()
-            if (error == null) {
-                uniffiCompleteInputStreamSuccess(
-                    UniffiInputStreamNext.Done,
-                    lowerNext,
-                    callback,
-                    callbackData,
-                )
-            } else {
-                uniffiCompleteInputStreamError(error, lowerError, callback, callbackData)
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Throwable) {
-            finishNext(done = true)
-            uniffiCompleteInputStreamError(e, lowerError, callback, callbackData)
-        }
-    }
-
-    private fun finishNext(done: Boolean) {
-        synchronized(lock) {
-            pendingJob = null
-            if (done) {
-                this.done = true
-            }
-        }
+private inline fun<R> uniffiWithInputStreamArguments(block: (UniffiInputStreamArguments) -> R): R {
+    val arguments = UniffiInputStreamArguments()
+    try {
+        return block(arguments)
+    } finally {
+        arguments.discard()
     }
 }
 

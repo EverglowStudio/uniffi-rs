@@ -13,7 +13,7 @@ use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::ffi::OsStr;
 use std::fs::{read_to_string, File};
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use uniffi_testing::UniFFITestHelper;
 
 /// Run Swift tests for a UniFFI test fixture
@@ -45,7 +45,7 @@ pub fn run_script(
         GeneratedSources::new(test_helper.crate_name(), &cdylib_path, &out_dir)?;
 
     // We need something better than this env var, but it's a reasonable start.
-    let swift_version = std::env::var("UNIFFI_TEST_SWIFT_VERSION").unwrap_or("5".to_string());
+    let swift_version = std::env::var("UNIFFI_TEST_SWIFT_VERSION").unwrap_or("6".to_string());
 
     // Compile the generated sources together to create a single swift module
     compile_swift_module(
@@ -99,8 +99,7 @@ fn compile_swift_module<T: AsRef<OsStr>>(
     command
         .current_dir(out_dir)
         .arg("-emit-module")
-        // TODO(2279): Fix concurrency issues and uncomment this
-        //.arg("-strict-concurrency=complete")
+        .arg("-strict-concurrency=complete")
         .arg("-module-name")
         .arg(module_name)
         .arg("-o")
@@ -188,15 +187,9 @@ impl GeneratedSources {
     }
 }
 
-fn create_command(program: &str, options: &RunScriptOptions) -> Command {
+fn create_command(program: &str, _options: &RunScriptOptions) -> Command {
     let mut command = Command::new(program);
-    if !options.show_compiler_messages {
-        // This prevents most compiler messages, but not remarks
-        command.arg("-suppress-warnings");
-        // This gets the remarks.  Note: swift will eventually get a `-suppress-remarks` argument,
-        // maybe we can eventually move to that
-        command.stderr(Stdio::null());
-    }
+    command.arg("-warnings-as-errors");
     command
 }
 

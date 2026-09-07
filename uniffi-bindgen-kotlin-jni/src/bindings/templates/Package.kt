@@ -24,6 +24,7 @@ import {{ import }}
 {%- when TypeDefinition::Set(_) %}
 {%- when TypeDefinition::Duration(_) %}
 {%- when TypeDefinition::Timestamp(_) %}
+{%- when TypeDefinition::Stream(_) %}
 {%- endmatch %}
 {%- endfor %}
 

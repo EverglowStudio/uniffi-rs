@@ -4,28 +4,28 @@
 
 import uniffi_bindgen_tests
 
-var callbackRefCount = 0;
+let callbackRefCount = TestLocked(0);
 
 final class Callback: TestCallbackInterface, @unchecked Sendable {
-    var value: UInt32;
+    let value: TestLocked<UInt32>;
 
     init(value: UInt32) {
-        self.value = value;
-        callbackRefCount += 1
+        self.value = TestLocked(value);
+        callbackRefCount.update { $0 += 1 }
     }
 
     deinit {
-        callbackRefCount -= 1
+        callbackRefCount.update { $0 -= 1 }
     }
 
     func noop() {}
 
     func getValue() -> UInt32 {
-        return self.value;
+        return self.value.read();
     }
 
     func setValue(value: UInt32) {
-        self.value = value;
+        self.value.update { $0 = value };
     }
 
     func throwIfEqual(numbers: CallbackInterfaceNumbers) throws  -> CallbackInterfaceNumbers {
@@ -52,4 +52,4 @@ assert(invokeTestCallbackInterfaceEcho(cbi: cbi, s: "test-string") == "test-stri
 
 // The previcalls created a bunch of callback interface references.  Make sure they've been cleaned
 // up and the only remaining reference is for our `cbi` variable.
-assert(callbackRefCount == 1)
+assert(callbackRefCount.read() == 1)

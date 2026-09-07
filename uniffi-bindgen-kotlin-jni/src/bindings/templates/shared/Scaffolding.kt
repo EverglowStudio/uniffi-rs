@@ -1,4 +1,5 @@
 object Scaffolding {
+    @JvmStatic external fun kotlinCallbackReleased(handle: Long)
     @JvmStatic external fun ffiBufferCheckSupport()
     @JvmStatic external fun ffiBufferAlloc(capacity: kotlin.Int): java.nio.ByteBuffer
     @JvmStatic external fun ffiBufferFree(buf: java.nio.ByteBuffer)
@@ -64,6 +65,9 @@ object Scaffolding {
     @JvmStatic external fun {{ rust_result.async_poll_fn() }}(
         rustFuture: kotlin.Long,
         continuation: kotlin.coroutines.Continuation<kotlin.Boolean>,
+    )
+    @JvmStatic external fun {{ rust_result.async_complete_fn() }}(
+        rustFuture: kotlin.Long,
         {%- if rust_result.return_type.is_some() %}
         completion: {{ rust_result.async_complete_class() }},
         {%- endif %}
@@ -93,7 +97,27 @@ object Scaffolding {
         oneshotHandle: kotlin.Long,
     )
     {%- endfor %}
-    @JvmStatic external fun uniffiKotlinFutureComplete(kotlinFuture: kotlin.Long, resultCode: kotlin.Int)
+
+    @JvmStatic external fun inputCloseFinished(key: Long, success: Boolean)
+    {% for stream in root.streams() %}
+    {% let id = stream.self_type.id %}
+    @JvmStatic external fun streamDiscard{{ id }}(handle: Long)
+    @JvmStatic external fun streamNext{{ id }}(handle: Long): Long
+    @JvmStatic external fun streamClose{{ id }}(handle: Long): Long
+    {% for suffix in ["Next", "Close"] %}
+    @JvmStatic external fun stream{{ suffix }}Poll{{ id }}(handle: Long, continuation: kotlin.coroutines.Continuation<Boolean>)
+    @JvmStatic external fun stream{{ suffix }}Cancel{{ id }}(handle: Long)
+    @JvmStatic external fun stream{{ suffix }}Free{{ id }}(handle: Long)
+    {% endfor %}
+    @JvmStatic external fun streamNextComplete{{ id }}(handle: Long, completion: StreamComplete{{ id }}): Int
+    @JvmStatic external fun streamCloseComplete{{ id }}(handle: Long)
+    @JvmStatic external fun inputItem{{ id }}(key: Long, {% for ffi in stream.item.ffi_types %}v{{ loop.index0 }}: {{ ffi.type_kt() }},{% endfor %})
+    {% if let Some(error) = stream.error %}
+    @JvmStatic external fun inputError{{ id }}(key: Long, {% for ffi in error.ffi_types %}v{{ loop.index0 }}: {{ ffi.type_kt() }},{% endfor %})
+    {% endif %}
+    @JvmStatic external fun inputDone{{ id }}(key: Long)
+    @JvmStatic external fun inputFailed{{ id }}(key: Long)
+    {% endfor %}
 
     init {
         System.loadLibrary("{{ cdylib }}")

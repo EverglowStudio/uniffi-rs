@@ -2245,6 +2245,7 @@ dependencies = [
  "anyhow",
  "jni-sys",
  "simd_cesu8",
+ "tokio",
  "uniffi",
 ]
 
@@ -2268,6 +2269,7 @@ dependencies = [
  "camino",
  "glob",
  "thiserror",
+ "tokio",
  "uniffi",
  "uniffi-bindgen-tests-external-types-source",
  "url",

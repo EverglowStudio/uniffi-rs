@@ -5,11 +5,23 @@ struct {{ cbi.impl_struct_rs() }} {
     handle: i64,
 }
 
+impl Clone for {{ cbi.impl_struct_rs() }} {
+    fn clone(&self) -> Self {
+        static CLONE: uniffi_jni::CachedStaticMethod = uniffi_jni::CachedStaticMethod::new(
+            c"uniffi/UniffiKt", c"callbackInterfaceClone{{ cbi.self_type.id }}", c"(J)J",
+        );
+        let handle = unsafe { uniffi_jni::attach_current_thread(uniffi_get_global_jvm(), |env| {
+            CLONE.call_long(env, [uniffi_jni::jvalue { j: self.handle }]).to_anyhow_result(env, "callback clone")
+        }) }.expect("callback handle clone failed");
+        Self { handle }
+    }
+}
+
 {%- if cbi.has_async_method() %}#[uniffi::deps::async_trait::async_trait]{% endif %}
 impl {{ trait_name }} for {{ cbi.impl_struct_rs() }} {
     {%- for meth in cbi.methods %}
     {%- let receiver = meth.callable.receiver.as_ref().expect("Callback interface receiver not set") %}
-    {% if meth.callable.is_async %}async {% endif %}fn {{ meth.callable.name_rs() }}(
+    {% if meth.callable.rust_async %}async {% endif %}fn {{ meth.callable.name_rs() }}(
         {%- if receiver.by_ref %}
         &self,
         {%- else %}
@@ -18,16 +30,23 @@ impl {{ trait_name }} for {{ cbi.impl_struct_rs() }} {
         {%- for a in meth.callable.arguments %}
         {{ a.name_rs() }}: {{ a.ty.type_rs }},
         {%- endfor %}
-    ) -> {{ meth.callable.result.return_type_rs() }} {
+    ) -> {{ meth.callable.callback_return_rs() }} {
+        let uniffi_handle = self.handle;
+        {%- if meth.callable.is_async && !meth.callable.rust_async %}
+        let uniffi_owner = {% if receiver.by_ref %}Clone::clone(self){% else %}self{% endif %};
+        Box::pin(async move {
+        let uniffi_handle = uniffi_owner.handle;
+        let _owner = uniffi_owner;
+        {%- endif %}
         unsafe {
             let uniffi_result = {{ meth.dispatch_fn_rs }}(
-                self.handle,
+                uniffi_handle,
                 {%- for a in meth.callable.arguments %}
                 {{ a.name_rs() }},
                 {%- endfor %}
             ){% if meth.callable.is_async %}.await{% endif %};
             match uniffi_result {
-                Ok(v) => v,
+                Ok(v) => {{ meth.callable.callback_value_rs() }},
                 Err(e) => {
                     {%- if let Some(throws_type) = meth.callable.throws_type() %}
                     {%- if throws_type.has_from_unexpected_callback_error_impl %}
@@ -45,6 +64,9 @@ impl {{ trait_name }} for {{ cbi.impl_struct_rs() }} {
                 }
             }
         }
+        {%- if meth.callable.is_async && !meth.callable.rust_async %}
+        })
+        {%- endif %}
     }
     {%- endfor %}
 }
@@ -147,7 +169,7 @@ async unsafe fn {{ meth.dispatch_fn_rs }}(
         c"{{ meth.jni_signature() }}",
     );
 
-    let (uniffi_sender, uniffi_receiver) = uniffi::oneshot::channel::<uniffi::Result<{{ meth.callable.result.return_type_rs() }}>>();
+    uniffi_kotlin_call(|key, released| {
     uniffi_jni::attach_current_thread(uniffi_get_global_jvm(), |uniffi_env| -> uniffi::Result<()> {
         {%- for arg in meth.callable.arguments %}
         let uniffi_arg_lowered_{{ arg.index }} = {{ arg.ty.lower_fn_rs() }}(uniffi_env, {{ arg.name_rs() }})?;
@@ -158,7 +180,10 @@ async unsafe fn {{ meth.dispatch_fn_rs }}(
                 j: uniffi_handle,
             },
             uniffi_jni::jvalue {
-                j: uniffi_sender.into_raw().expose_provenance() as ::std::primitive::i64,
+                j: key,
+            },
+            uniffi_jni::jvalue {
+                j: released,
             },
             {%- for arg in meth.callable.arguments %}
             {%- for (var, ffi_type) in arg.ty.ffi_values_rs(format!("uniffi_arg_lowered_{}", arg.index)) %}
@@ -169,8 +194,8 @@ async unsafe fn {{ meth.dispatch_fn_rs }}(
             {%- endfor %}
         ]).to_anyhow_result(uniffi_env, "{{ meth.jni_method_call_name() }}")?;
         uniffi::Result::Ok(())
-    })?;
-    uniffi_receiver.await
+    })
+    }).await
 }
 {% endif %}
 {% endfor %}

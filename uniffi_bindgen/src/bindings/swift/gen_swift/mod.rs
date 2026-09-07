@@ -520,7 +520,11 @@ fn trait_protocol_name(ci: &ComponentInterface, trait_ty: &Type) -> Result<Strin
 /// Generate UniFFI component bindings for Swift, as strings in memory.
 #[cfg(test)]
 pub fn generate_bindings(config: &Config, ci: &ComponentInterface) -> Result<Bindings> {
-    generate_bindings_with_stream_runtime(config, ci, ci.has_stream_fns())
+    generate_bindings_with_stream_runtime(
+        config,
+        ci,
+        ci.has_stream_fns() || ci.has_input_stream_fns(),
+    )
 }
 
 /// Generate UniFFI component bindings, optionally including the module-wide output stream runtime.
@@ -576,62 +580,23 @@ pub(super) fn generate_swift_with_stream_runtime(
         .context("failed to render Swift library")
 }
 
+pub fn has_input_stream_runtime(ci: &ComponentInterface) -> bool {
+    ci.ffi_definitions().any(|definition| {
+        matches!(definition, FfiDefinition::CallbackFunction(callback) if callback.name() == "InputStreamNextCallback")
+    })
+}
+
 fn ensure_input_streams_supported(ci: &ComponentInterface) -> Result<()> {
-    for func in ci.function_definitions() {
-        if func.return_type().is_some_and(type_contains_input_stream) {
-            bail!("input stream values are only supported as direct function arguments");
-        }
-        if func.throws_type().is_some_and(type_contains_input_stream) {
-            bail!("input stream values are only supported as direct function arguments");
-        }
-        for arg in func.arguments() {
-            if matches!(arg.as_type(), Type::InputStream { .. }) {
-                continue;
-            }
-            if type_contains_input_stream(&arg.as_type()) {
+    for callable in ci.iter_callables() {
+        for arg in callable.arguments() {
+            if !matches!(arg.as_type(), Type::InputStream { .. })
+                && type_contains_input_stream(&arg.as_type())
+            {
                 bail!("nested input stream types are not supported");
             }
         }
     }
-    for obj in ci.object_definitions() {
-        for constructor in obj.constructors() {
-            if callable_contains_input_stream(constructor) {
-                bail!(
-                    "input stream parameters are currently only supported for top-level functions"
-                );
-            }
-        }
-        for method in obj.methods() {
-            if callable_contains_input_stream(method) {
-                bail!(
-                    "input stream parameters are currently only supported for top-level functions"
-                );
-            }
-        }
-    }
-    for callback in ci.callback_interface_definitions() {
-        for method in callback.methods() {
-            if callable_contains_input_stream(method) {
-                bail!(
-                    "input stream parameters are currently only supported for top-level functions"
-                );
-            }
-        }
-    }
     Ok(())
-}
-
-fn callable_contains_input_stream(callable: &impl Callable) -> bool {
-    callable
-        .arguments()
-        .into_iter()
-        .any(|arg| type_contains_input_stream(&arg.as_type()))
-        || callable
-            .return_type()
-            .is_some_and(type_contains_input_stream)
-        || callable
-            .throws_type()
-            .is_some_and(type_contains_input_stream)
 }
 
 fn type_contains_input_stream(ty: &Type) -> bool {
@@ -794,10 +759,10 @@ impl<'a> SwiftWrapper<'a> {
             // Collect into a btree set to de-dup and order
             .collect::<BTreeSet<_>>();
 
-        let input_stream_init_fns = self.ci.function_definitions().iter().flat_map(|func| {
+        let input_stream_init_fns = self.ci.iter_callables().flat_map(|func| {
             func.input_stream_arguments()
                 .into_iter()
-                .map(|arg| func.input_stream_initialization_fn_name(arg))
+                .map(|arg| format!("{}_swift_init", func.ffi_input_stream_init_func(arg)))
         });
 
         init_fns
@@ -855,12 +820,24 @@ impl SwiftCodeOracle {
                 value_type,
             } => Box::new(compounds::MapCodeType::new(*key_type, *value_type)),
             Type::Set { inner_type } => Box::new(compounds::SetCodeType::new(*inner_type)),
-            Type::Stream { item_type, .. } => Box::new(compounds::StreamCodeType::new(*item_type)),
+            Type::Stream {
+                item_type,
+                error_type,
+                is_send,
+            } => Box::new(compounds::StreamCodeType::new(
+                *item_type,
+                error_type.map(|error| *error),
+                is_send,
+            )),
             Type::InputStream {
                 item_type,
                 error_type,
-                ..
-            } => Box::new(compounds::InputStreamCodeType::new(*item_type, error_type.map(|error| *error))),
+                is_send,
+            } => Box::new(compounds::InputStreamCodeType::new(
+                *item_type,
+                error_type.map(|error| *error),
+                is_send,
+            )),
             Type::Custom { name, builtin, .. } => Box::new(custom::CustomCodeType::new(
                 name,
                 self.create_code_type(*builtin),
@@ -1042,7 +1019,7 @@ pub mod filters {
             .enumerate()
             .filter_map(|(i, arg)| match arg.as_type() {
                 Type::InputStream { item_type, .. } => Some(format!(
-                    "S{i}: AsyncSequence, S{i}.Element == {}",
+                    "S{i}: AsyncSequence & Sendable, S{i}.Element == {}",
                     oracle().find(&item_type).type_label()
                 )),
                 _ => None,
@@ -1117,18 +1094,6 @@ pub mod filters {
             Some(_) => format!("{}_lower", ffi_converter_name),
             None => format!("{}.lower", ffi_converter_name),
         })
-    }
-
-    #[askama::filter_fn]
-    pub fn optional_lower_fn(
-        as_type: &impl AsType,
-        _: &dyn askama::Values,
-    ) -> Result<String, askama::Error> {
-        let ty = Type::Optional {
-            inner_type: Box::new(as_type.as_type()),
-        };
-        let ffi_converter_name = oracle().find(&ty).ffi_converter_name();
-        Ok(format!("{}.lower", ffi_converter_name))
     }
 
     #[askama::filter_fn]
@@ -1251,7 +1216,7 @@ pub mod filters {
 
     /// Get the idiomatic Swift rendering of a function name.
     #[askama::filter_fn]
-    pub fn fn_name(nm: &str, _: &dyn askama::Values) -> Result<String, askama::Error> {
+    pub fn fn_name<S: AsRef<str>>(nm: S, _: &dyn askama::Values) -> Result<String, askama::Error> {
         Ok(quote_general_keyword(oracle().fn_name(nm)))
     }
 
@@ -1634,9 +1599,9 @@ mod tests {
         );
         assert!(!swift.contains("public func countEvents(count: UInt32) -> UInt64"));
         assert!(!swift.contains("AsyncThrowingStream<StreamEvent, Error>"));
-        assert!(!swift.contains("let __streamHandle ="));
+        assert!(swift.contains("let __streamHandle: UInt64 ="));
         assert!(swift.contains("return UniFfiStream("));
-        assert!(swift.contains("start: {"));
+        assert!(swift.contains("handle: __streamHandle"));
         assert!(swift.contains("uniffi_stream_core_fn_func_count_events("));
         assert!(
             swift.contains("uniffi_stream_core_fn_func_count_events_stream_next(__streamHandle)")
@@ -1656,7 +1621,7 @@ mod tests {
         assert!(swift.contains("public func optionalEvents() -> UniFfiStream<UInt32?>"));
         assert!(swift.contains("try FfiConverterOptionUInt32.read(from: &reader)"));
         assert!(swift.contains("errorHandler: nil"));
-        assert!(swift.contains("public struct UniFfiStream<Element>: AsyncSequence"));
+        assert!(swift.contains("public struct UniFfiStream<Element: Sendable>: AsyncSequence"));
         assert!(swift.contains("public mutating func next() async throws -> Element?"));
         assert!(swift.contains("public func cancel()"));
         assert!(swift.contains("throw UniffiInternalError.concurrentStreamNext"));
@@ -1687,7 +1652,7 @@ mod tests {
             .contains("public func readyValue()async throws  -> UInt32"));
         assert!(!bindings
             .library
-            .contains("public struct UniFfiStream<Element>: AsyncSequence"));
+            .contains("public struct UniFfiStream<Element: Sendable>: AsyncSequence"));
     }
 
     #[test]
@@ -1704,20 +1669,22 @@ mod tests {
         let header = bindings.header;
 
         assert!(swift.contains(
-            "public func sumEvents<S0>(events: S0)async throws  -> UInt64 where S0: AsyncSequence, S0.Element == CounterEvent"
+            "public func sumEvents<S0>(events: S0)async throws  -> UInt64 where S0: AsyncSequence & Sendable, S0.Element == CounterEvent"
         ), "{swift}");
         assert!(swift
             .contains("fileprivate struct FfiConverterInputStreamTypeCounterEventTypeStreamError"));
         assert!(swift.contains(
-            "static func lower<S>(_ sequence: S) -> UInt64 where S: AsyncSequence, S.Element == CounterEvent"
+            "static func lower<S>(_ sequence: S) -> UInt64 where S: AsyncSequence & Sendable, S.Element == CounterEvent"
         ));
         assert!(swift.contains("uniffiCreateInputStream("));
-        assert!(swift.contains("lowerNext: FfiConverterOptionTypeCounterEvent.lower"));
+        assert!(swift.contains(
+            "lowerNext: FfiConverterInputStreamTypeCounterEventTypeStreamErrorNext.lower"
+        ));
         assert!(swift.contains("if let typedError = error as? StreamError"));
         assert!(swift.contains("return FfiConverterTypeStreamError_lower(typedError)"));
         assert!(swift.contains("errorHandler: FfiConverterTypeStreamError_lift"));
         assert!(swift.contains("cancelFunc: ffi_stream_core_rust_future_cancel_u64"));
-        assert!(swift.contains("private func uniffiInitInputStreamSumEventsEvents()"));
+        assert!(swift.contains("private func uniffi_stream_core_fn_func_sum_events_input_stream_events_init_swift_init()"));
         assert!(swift.contains("uniffi_stream_core_fn_func_sum_events_input_stream_events_init("));
         assert!(swift.contains("uniffiInputStreamNextCallback"));
         assert!(swift.contains("uniffiInputStreamCancelCallback"));
@@ -1746,11 +1713,11 @@ mod tests {
 
         assert!(
             swift.contains(
-                "public func runningSum<S0>(events: S0) -> UniFfiStream<CounterEvent> where S0: AsyncSequence, S0.Element == CounterEvent"
+                "public func runningSum<S0>(events: S0) -> UniFfiStream<CounterEvent> where S0: AsyncSequence & Sendable, S0.Element == CounterEvent"
             ),
             "{swift}"
         );
-        assert!(swift.contains("private func uniffiInitInputStreamRunningSumEvents()"));
+        assert!(swift.contains("private func uniffi_stream_core_fn_func_running_sum_input_stream_events_init_swift_init()"));
         assert!(swift.contains("uniffi_stream_core_fn_func_running_sum_input_stream_events_init("));
         assert!(
             swift.contains("FfiConverterInputStreamTypeCounterEventTypeStreamError.lower(events)")
@@ -1797,10 +1764,14 @@ mod tests {
         fs::write(&modulemap_path, bindings.modulemap.unwrap()).unwrap();
 
         let output = Command::new("swiftc")
-            .arg("-typecheck")
-            .arg("-warnings-as-errors")
+            .arg("-emit-sil")
+            .arg("-parse-as-library")
+            .arg("-o")
+            .arg(tmp.path().join("bindings.sil"))
             .arg("-swift-version")
-            .arg("5")
+            .arg("6")
+            .arg("-strict-concurrency=complete")
+            .arg("-warnings-as-errors")
             .arg("-I")
             .arg(tmp.path())
             .arg("-Xcc")
@@ -1810,7 +1781,7 @@ mod tests {
             .unwrap();
         assert!(
             output.status.success(),
-            "swiftc -typecheck failed\nstdout:\n{}\nstderr:\n{}",
+            "swiftc -emit-sil failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1835,9 +1806,14 @@ mod tests {
         fs::write(&modulemap_path, bindings.modulemap.unwrap()).unwrap();
 
         let output = Command::new("swiftc")
-            .arg("-typecheck")
+            .arg("-emit-sil")
+            .arg("-parse-as-library")
+            .arg("-o")
+            .arg(tmp.path().join("bindings.sil"))
             .arg("-swift-version")
-            .arg("5")
+            .arg("6")
+            .arg("-strict-concurrency=complete")
+            .arg("-warnings-as-errors")
             .arg("-I")
             .arg(tmp.path())
             .arg("-Xcc")
@@ -1847,7 +1823,7 @@ mod tests {
             .unwrap();
         assert!(
             output.status.success(),
-            "swiftc -typecheck failed\nstdout:\n{}\nstderr:\n{}",
+            "swiftc -emit-sil failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1861,495 +1837,20 @@ mod tests {
             );
             return;
         }
-
-        let swift = stream_bindings().library;
-        let future_runtime_start = swift
-            .find("fileprivate let uniffiContinuationHandleMap")
-            .unwrap();
-        let stream_runtime_start = swift
-            .find("// Output streams use a pull-based custom AsyncSequence")
-            .unwrap();
-        let callback_start = swift
-            .find("// Callback handlers for an async calls.")
-            .unwrap();
-        let future_runtime = &swift[future_runtime_start..stream_runtime_start];
-        let stream_runtime = &swift[stream_runtime_start..callback_start];
-
-        let fixture = [
-            r#"
-import Foundation
-
-fileprivate extension NSLock {
-    func withLock<T>(f: () throws -> T) rethrows -> T {
-        lock()
-        defer { unlock() }
-        return try f()
-    }
-}
-
-fileprivate enum UniffiInternalError: Error {
-    case unexpectedStaleHandle
-    case streamConsumed
-    case concurrentStreamNext
-}
-
-enum __UniffiStreamNext<T> {
-    case item(T)
-    case done
-    case error(Swift.Error)
-}
-
-private struct RustBuffer {}
-private struct RustCallStatus {}
-private typealias UniffiRustFutureContinuationCallback = (UInt64, Int8) -> ()
-private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
-
-private final class UniffiHandleMap<T>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var entries: [UInt64: T] = [:]
-    private var nextHandle: UInt64 = 1
-
-    func insert(obj: T) -> UInt64 {
-        lock.withLock {
-            let handle = nextHandle
-            nextHandle += 2
-            entries[handle] = obj
-            return handle
-        }
-    }
-
-    func remove(handle: UInt64) throws -> T {
-        try lock.withLock {
-            guard let value = entries.removeValue(forKey: handle) else {
-                throw UniffiInternalError.unexpectedStaleHandle
-            }
-            return value
-        }
-    }
-}
-
-private func uniffiEnsureStreamCoreInitialized() {}
-
-private func makeRustCall<T>(
-    _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
-    errorHandler: ((RustBuffer) throws -> Swift.Error)?
-) throws -> T {
-    var status = RustCallStatus()
-    return callback(&status)
-}
-"#,
-            future_runtime,
-            stream_runtime,
-            r#"
-private func uniffiFutureContinuationCallback(handle: UInt64, pollResult: Int8) {
-    if let continuation = try? uniffiContinuationHandleMap.remove(handle: handle) {
-        continuation.resume(returning: pollResult)
-    }
-}
-
-private final class Counter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = 0
-
-    func increment() {
-        lock.withLock { value += 1 }
-    }
-
-    func get() -> Int {
-        lock.withLock { value }
-    }
-}
-
-private final class Results: @unchecked Sendable {
-    private let lock = NSLock()
-    private var values: [__UniffiStreamNext<Int?>]
-    private var count = 0
-
-    init(_ values: [__UniffiStreamNext<Int?>]) {
-        self.values = values
-    }
-
-    func next() -> __UniffiStreamNext<Int?> {
-        lock.withLock {
-            count += 1
-            return values.removeFirst()
-        }
-    }
-
-    func nextCount() -> Int {
-        lock.withLock { count }
-    }
-}
-
-private final class FutureProbe: @unchecked Sendable {
-    private let lock = NSLock()
-    private var callback: ((UInt64, Int8) -> ())?
-    private var callbackData: UInt64 = 0
-
-    func install(_ callback: @escaping (UInt64, Int8) -> (), data: UInt64) {
-        lock.withLock {
-            self.callback = callback
-            callbackData = data
-        }
-    }
-
-    func installed() -> Bool {
-        lock.withLock { callback != nil }
-    }
-
-    func resumeReady() {
-        let callback = lock.withLock { () -> ((UInt64, Int8) -> ())? in
-            let callback = self.callback
-            self.callback = nil
-            return callback
-        }
-        callback?(callbackData, 0)
-    }
-}
-
-private final class PendingStreamNext: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<__UniffiStreamNext<Int>, Never>?
-
-    func next() async -> __UniffiStreamNext<Int> {
-        await withCheckedContinuation { continuation in
-            lock.withLock {
-                self.continuation = continuation
-            }
-        }
-    }
-
-    func started() -> Bool {
-        lock.withLock { continuation != nil }
-    }
-
-    func resume(_ value: __UniffiStreamNext<Int>) {
-        let continuation = lock.withLock { () -> CheckedContinuation<__UniffiStreamNext<Int>, Never>? in
-            let continuation = self.continuation
-            self.continuation = nil
-            return continuation
-        }
-        continuation?.resume(returning: value)
-    }
-}
-
-private enum FixtureError: Error {
-    case boom
-}
-
-private func waitUntil(_ condition: @escaping () -> Bool) async {
-    for _ in 0..<10_000 {
-        if condition() {
-            return
-        }
-        await Task.yield()
-    }
-    fatalError("timed out waiting for fixture state")
-}
-
-private func consumeOneAndDrop(_ stream: UniFfiStream<Int>) async throws {
-    var iterator = stream.makeAsyncIterator()
-    guard try await iterator.next() == 1 else {
-        fatalError("expected stream item")
-    }
-}
-
-@main
-private struct StreamRuntimeFixture {
-    static func main() async {
-        // Returning a stream and waiting for a slow consumer must not pull anything.
-        let values = Results([.item(1), .item(nil), .item(2), .done])
-        let normalStart = Counter()
-        let normalCancel = Counter()
-        let stream = UniFfiStream<Int?>(
-            start: {
-                normalStart.increment()
-                return 1
-            },
-            next: { _ in values.next() },
-            cancel: { _ in normalCancel.increment() }
-        )
-        precondition(normalStart.get() == 0)
-        precondition(values.nextCount() == 0)
-        await Task.yield()
-        precondition(normalStart.get() == 0)
-        precondition(values.nextCount() == 0)
-
-        var iterator = stream.makeAsyncIterator()
-        precondition(normalStart.get() == 0)
-        let first = try! await iterator.next()
-        guard case let .some(firstValue) = first, firstValue == 1 else {
-            fatalError("expected Item(Some(1))")
-        }
-        precondition(normalStart.get() == 1)
-        precondition(values.nextCount() == 1)
-        await Task.yield()
-        precondition(values.nextCount() == 1)
-
-        let second = try! await iterator.next()
-        guard case .some(.none) = second else {
-            fatalError("expected Item(None), not Done")
-        }
-        let third = try! await iterator.next()
-        guard case let .some(thirdValue) = third, thirdValue == 2 else {
-            fatalError("expected Item(Some(2))")
-        }
-        let done = try! await iterator.next()
-        precondition(done == nil)
-        precondition(values.nextCount() == 4)
-        let doneAgain = try! await iterator.next()
-        precondition(doneAgain == nil)
-        precondition(values.nextCount() == 4)
-        precondition(normalCancel.get() == 0)
-
-        // A stream accepts only one independently-created iterator. Rejection
-        // must happen before a native pull or cancellation is attempted.
-        let consumedStart = Counter()
-        let consumedNext = Counter()
-        let consumedCancel = Counter()
-        do {
-            let consumedStream = UniFfiStream<Int>(
-                start: {
-                    consumedStart.increment()
-                    return 2
-                },
-                next: { _ in
-                    consumedNext.increment()
-                    return .item(1)
-                },
-                cancel: { _ in consumedCancel.increment() }
-            )
-            var acceptedIterator = consumedStream.makeAsyncIterator()
-            var rejectedIterator = consumedStream.makeAsyncIterator()
-            do {
-                _ = try await rejectedIterator.next()
-                fatalError("expected second iterator to be rejected")
-            } catch UniffiInternalError.streamConsumed {}
-            catch {
-                fatalError("unexpected second iterator error: \(error)")
-            }
-            precondition(consumedStart.get() == 0)
-            precondition(consumedNext.get() == 0)
-            precondition(consumedCancel.get() == 0)
-            _ = acceptedIterator
-        }
-        precondition(consumedCancel.get() == 0)
-
-        // An unconsumed sequence never owns a native stream handle, so dropping it
-        // is local-only.
-        let neverConsumedStart = Counter()
-        let neverConsumedCancel = Counter()
-        do {
-            let neverConsumed = UniFfiStream<Int>(
-                start: {
-                    neverConsumedStart.increment()
-                    return 3
-                },
-                next: { _ in .done },
-                cancel: { _ in neverConsumedCancel.increment() }
-            )
-            withExtendedLifetime(neverConsumed) {}
-        }
-        precondition(neverConsumedStart.get() == 0)
-        precondition(neverConsumedCancel.get() == 0)
-
-        // A typed Error transition is terminal and never issues an extra cancel.
-        let errorStart = Counter()
-        let errorCancel = Counter()
-        let errorStream = UniFfiStream<Int>(
-            start: {
-                errorStart.increment()
-                return 4
-            },
-            next: { _ in .error(FixtureError.boom) },
-            cancel: { _ in errorCancel.increment() }
-        )
-        var errorIterator = errorStream.makeAsyncIterator()
-        do {
-            _ = try await errorIterator.next()
-            fatalError("expected stream error")
-        } catch FixtureError.boom {}
-        catch {
-            fatalError("unexpected stream error: \(error)")
-        }
-        precondition(errorStart.get() == 1)
-        let errorDone = try! await errorIterator.next()
-        precondition(errorDone == nil)
-        precondition(errorCancel.get() == 0)
-
-        // Dropping an unfinished iterator after an early break performs one cancel.
-        let earlyStart = Counter()
-        let earlyCancel = Counter()
-        let earlyStream = UniFfiStream<Int>(
-            start: {
-                earlyStart.increment()
-                return 5
-            },
-            next: { _ in .item(1) },
-            cancel: { _ in earlyCancel.increment() }
-        )
-        try! await consumeOneAndDrop(earlyStream)
-        await Task.yield()
-        precondition(earlyStart.get() == 1)
-        precondition(earlyCancel.get() == 1)
-
-        // A pending next observes task cancellation, cancels its stream once, and
-        // never returns a late item after the pending operation is released.
-        let pending = PendingStreamNext()
-        let cancellationStart = Counter()
-        let cancellationCount = Counter()
-        let cancellationStream = UniFfiStream<Int>(
-            start: {
-                cancellationStart.increment()
-                return 6
-            },
-            next: { _ in await pending.next() },
-            cancel: { _ in cancellationCount.increment() }
-        )
-        var cancellationIterator = cancellationStream.makeAsyncIterator()
-        let cancellationTask = Task { () throws -> Int? in
-            try await cancellationIterator.next()
-        }
-        await waitUntil { pending.started() }
-        precondition(cancellationStart.get() == 1)
-        cancellationTask.cancel()
-        await waitUntil { cancellationCount.get() == 1 }
-        pending.resume(.done)
-        do {
-            _ = try await cancellationTask.value
-            fatalError("cancelled next() unexpectedly succeeded")
-        } catch is CancellationError {}
-        catch {
-            fatalError("unexpected cancellation error: \(error)")
-        }
-        precondition(cancellationCount.get() == 1)
-
-        // Two copies of an iterator share the same state; a second pending next is
-        // rejected before it reaches the native pull closure.
-        let concurrentPending = PendingStreamNext()
-        let concurrentStart = Counter()
-        let concurrentStream = UniFfiStream<Int>(
-            start: {
-                concurrentStart.increment()
-                return 7
-            },
-            next: { _ in await concurrentPending.next() },
-            cancel: { _ in }
-        )
-        var firstConcurrentIterator = concurrentStream.makeAsyncIterator()
-        var secondConcurrentIterator = firstConcurrentIterator
-        let firstConcurrentTask = Task { () throws -> Int? in
-            try await firstConcurrentIterator.next()
-        }
-        await waitUntil { concurrentPending.started() }
-        precondition(concurrentStart.get() == 1)
-        do {
-            _ = try await secondConcurrentIterator.next()
-            fatalError("expected concurrent next() to fail")
-        } catch UniffiInternalError.concurrentStreamNext {}
-        catch {
-            fatalError("unexpected concurrent next() error: \(error)")
-        }
-        concurrentPending.resume(.done)
-        let concurrentDone = try! await firstConcurrentTask.value
-        precondition(concurrentDone == nil)
-
-        // A Rust future cancellation handler must invoke cancel before free. The
-        // blocked cancel closure makes a premature free observable.
-        let lifecycleCancel = Counter()
-        let lifecycleFree = Counter()
-        let cancelEntered = DispatchSemaphore(value: 0)
-        let allowCancel = DispatchSemaphore(value: 0)
-        let cancelFinished = DispatchSemaphore(value: 0)
-        let freeFinished = DispatchSemaphore(value: 0)
-        let lifecycle = UniffiRustFutureHandle(
-            handle: 1,
-            cancelFunc: { _ in
-                lifecycleCancel.increment()
-                cancelEntered.signal()
-                _ = allowCancel.wait(timeout: .now() + 1)
-            },
-            freeFunc: { _ in lifecycleFree.increment() }
-        )
-        DispatchQueue.global().async {
-            lifecycle.cancel()
-            cancelFinished.signal()
-        }
-        precondition(cancelEntered.wait(timeout: .now() + 1) == .success)
-        DispatchQueue.global().async {
-            lifecycle.free()
-            freeFinished.signal()
-        }
-        usleep(50_000)
-        precondition(lifecycleFree.get() == 0)
-        allowCancel.signal()
-        precondition(cancelFinished.wait(timeout: .now() + 1) == .success)
-        precondition(freeFinished.wait(timeout: .now() + 1) == .success)
-        lifecycle.cancel()
-        lifecycle.free()
-        precondition(lifecycleCancel.get() == 1)
-        precondition(lifecycleFree.get() == 1)
-
-        // Execute the actual generated async helper under task cancellation and
-        // verify its Rust future cancel and final free callbacks are each single-use.
-        let futureProbe = FutureProbe()
-        let futureCancel = Counter()
-        let futureFree = Counter()
-        let futureTask = Task { () throws -> Int in
-            try await uniffiRustCallAsync(
-                rustFutureFunc: { 7 },
-                pollFunc: { _, callback, callbackData in
-                    futureProbe.install(callback, data: callbackData)
-                },
-                cancelFunc: { _ in
-                    futureCancel.increment()
-                    futureProbe.resumeReady()
-                },
-                completeFunc: { _, _ in 42 },
-                freeFunc: { _ in futureFree.increment() },
-                liftFunc: { $0 },
-                errorHandler: nil
-            )
-        }
-        await waitUntil { futureProbe.installed() }
-        futureTask.cancel()
-        let futureValue = try! await futureTask.value
-        precondition(futureValue == 42)
-        precondition(futureCancel.get() == 1)
-        precondition(futureFree.get() == 1)
-    }
-}
-"#,
-        ]
-        .join("\n");
-
         let tmp = tempfile::tempdir().unwrap();
-        let swift_path = tmp.path().join("StreamRuntimeFixture.swift");
-        let executable_path = tmp.path().join("StreamRuntimeFixture");
-        fs::write(&swift_path, &fixture).unwrap();
-
-        let compile = Command::new("swiftc")
-            .arg("-swift-version")
-            .arg("5")
-            .arg("-parse-as-library")
-            .arg(&swift_path)
-            .arg("-o")
-            .arg(&executable_path)
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../bindgen-tests/swift/tests/support/s04/run-gate.py");
+        let output = Command::new("python3")
+            .arg(runner)
+            .arg("--output")
+            .arg(tmp.path())
             .output()
             .unwrap();
         assert!(
-            compile.status.success(),
-            "swiftc fixture compile failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&compile.stdout),
-            String::from_utf8_lossy(&compile.stderr)
-        );
-
-        let run = Command::new(&executable_path).output().unwrap();
-        assert!(
-            run.status.success(),
-            "Swift stream runtime fixture failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
+            output.status.success(),
+            "Swift6 runtime gate failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -2379,10 +1880,14 @@ private struct StreamRuntimeFixture {
         fs::write(&modulemap_path, bindings.modulemap.unwrap()).unwrap();
 
         let output = Command::new("swiftc")
-            .arg("-typecheck")
-            .arg("-warnings-as-errors")
+            .arg("-emit-sil")
+            .arg("-parse-as-library")
+            .arg("-o")
+            .arg(tmp.path().join("bindings.sil"))
             .arg("-swift-version")
-            .arg("5")
+            .arg("6")
+            .arg("-strict-concurrency=complete")
+            .arg("-warnings-as-errors")
             .arg("-I")
             .arg(tmp.path())
             .arg("-Xcc")
@@ -2392,7 +1897,7 @@ private struct StreamRuntimeFixture {
             .unwrap();
         assert!(
             output.status.success(),
-            "swiftc -typecheck failed\nstdout:\n{}\nstderr:\n{}",
+            "swiftc -emit-sil failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

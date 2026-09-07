@@ -69,6 +69,38 @@ pub fn map_type_definitions(
                 mapped.push(TypeDefinition::Box(inner.map_node(context)?));
             }
             general::TypeDefinition::Simple(inner) => match &inner.ty {
+                Type::Stream {
+                    item_type,
+                    error_type,
+                    ..
+                }
+                | Type::InputStream {
+                    item_type,
+                    error_type,
+                    ..
+                } => {
+                    mapped.push(TypeDefinition::Stream(StreamType {
+                        item: context
+                            .type_nodes
+                            .get(&**item_type)
+                            .ok_or_else(|| anyhow!("missing stream item type"))?
+                            .clone()
+                            .map_node(context)?,
+                        error: error_type
+                            .as_ref()
+                            .map(|ty| {
+                                context
+                                    .type_nodes
+                                    .get(&**ty)
+                                    .ok_or_else(|| anyhow!("missing stream error type"))?
+                                    .clone()
+                                    .map_node(context)
+                            })
+                            .transpose()?,
+                        input: matches!(inner.ty, Type::InputStream { .. }),
+                        self_type: inner.map_node(context)?,
+                    }));
+                }
                 Type::Duration => mapped.push(TypeDefinition::Duration(inner.map_node(context)?)),
                 Type::Timestamp => mapped.push(TypeDefinition::Timestamp(inner.map_node(context)?)),
                 _ => (),

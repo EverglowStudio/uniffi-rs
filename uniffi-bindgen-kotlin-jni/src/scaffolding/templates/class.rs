@@ -5,7 +5,7 @@
 {%- let lift_object_receiver_ref = "lift_object_receiver_ref_{}"|format(cls.self_type.id) %}
 
 {%- match cls.imp %}
-{%- when ObjectImpl::Struct %}
+{%- when ObjectImpl::Struct | ObjectImpl::LocalStruct %}
 unsafe fn {{ arc_into_handle }}(
     value: impl uniffi::ArcOrOwned<{{ cls.inner_type_name() }}>,
 ) -> ::std::primitive::i64 {

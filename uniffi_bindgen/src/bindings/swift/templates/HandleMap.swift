@@ -53,7 +53,7 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 
     var count: Int {
         get {
-            map.count
+            lock.withLock { map.count }
         }
     }
 }

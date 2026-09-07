@@ -5,29 +5,29 @@
 import Foundation
 import uniffi_bindgen_tests
 
-var dispatchGroup = DispatchGroup()
-var traitRefCount = 0;
+let dispatchGroup = DispatchGroup()
+let traitRefCount = TestLocked(0);
 
 class TraitImpl: TestTraitInterface, @unchecked Sendable {
-    var value: UInt32;
+    let value: TestLocked<UInt32>;
 
     init(value: UInt32) {
-        self.value = value;
-        traitRefCount += 1
+        self.value = TestLocked(value);
+        traitRefCount.update { $0 += 1 }
     }
 
     deinit {
-        traitRefCount -= 1
+        traitRefCount.update { $0 -= 1 }
     }
 
     func noop() { }
 
     func getValue() -> UInt32 {
-        return self.value;
+        return self.value.read();
     }
 
     func setValue(value: UInt32) {
-        self.value = value;
+        self.value.update { $0 = value };
     }
 
     func throwIfEqual(numbers: CallbackInterfaceNumbers) throws -> CallbackInterfaceNumbers {
@@ -111,28 +111,28 @@ testSwiftImpl(traitImpl: TraitImpl(value: 42))
 testSwiftImpl(traitImpl: roundtripTestTraitInterface(interface: TraitImpl(value: 42)))
 testSwiftImpl(traitImpl: roundtripTestTraitInterfaceList(interfaces: [TraitImpl(value: 42)])[0])
 
-var asyncTraitRefCount = 0;
+let asyncTraitRefCount = TestLocked(0);
 
 class AsyncTraitImpl: AsyncTestTraitInterface, @unchecked Sendable {
-    var value: UInt32;
+    let value: TestLocked<UInt32>;
 
     init(value: UInt32) {
-        self.value = value;
-        asyncTraitRefCount += 1
+        self.value = TestLocked(value);
+        asyncTraitRefCount.update { $0 += 1 }
     }
 
     deinit {
-        asyncTraitRefCount -= 1
+        asyncTraitRefCount.update { $0 -= 1 }
     }
 
     func noop() async throws { }
 
     func getValue() async throws -> UInt32 {
-        return self.value;
+        return self.value.read();
     }
 
     func setValue(value: UInt32) async throws {
-        self.value = value;
+        self.value.update { $0 = value };
     }
 
     func throwIfEqual(numbers: CallbackInterfaceNumbers) async throws -> CallbackInterfaceNumbers {
@@ -164,7 +164,7 @@ func testAsyncRustImpl(traitImpl: AsyncTestTraitInterface) async {
 }
 
 dispatchGroup.enter()
-Task {
+Task.detached {
     await testAsyncRustImpl(traitImpl: createAsyncTestTraitInterface(value: 42))
     await testAsyncRustImpl(traitImpl: roundtripAsyncTestTraitInterface(interface: createAsyncTestTraitInterface(value: 42)))
     await testAsyncRustImpl(traitImpl: roundtripAsyncTestTraitInterfaceList(interfaces: [createAsyncTestTraitInterface(value: 42)])[0])
@@ -199,7 +199,7 @@ func testAsyncSwiftImpl(traitImpl: AsyncTestTraitInterface) async {
 }
 
 dispatchGroup.enter()
-Task {
+Task.detached {
     await testAsyncSwiftImpl(traitImpl: AsyncTraitImpl(value: 42))
     await testAsyncSwiftImpl(traitImpl: roundtripAsyncTestTraitInterface(interface: AsyncTraitImpl(value: 42)))
     await testAsyncSwiftImpl(traitImpl: roundtripAsyncTestTraitInterfaceList(interfaces: [AsyncTraitImpl(value: 42)])[0])
@@ -209,8 +209,8 @@ dispatchGroup.wait()
 
 // The previous calls created and destroyed a ton of references to the Swift-implemented trait
 // interfaces, check that the refcounts have gone back to 0.
-assert(traitRefCount == 0)
-assert(asyncTraitRefCount == 0)
+assert(traitRefCount.read() == 0)
+assert(asyncTraitRefCount.read() == 0)
 
 // Rust-only trait: smoke-test for the #[uniffi::export(rust)] codegen path
 func testRustOnlyImpl(impl: TestRustOnlyTraitInterface) {
