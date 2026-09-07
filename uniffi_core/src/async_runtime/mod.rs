@@ -10,6 +10,7 @@
 //! the context and await [`CallContext::wait_closed`] to drive remaining cleanup.
 //! Arbitrary Rust destructors cannot perform asynchronous cleanup automatically.
 
+pub mod actor;
 mod context;
 mod local;
 mod task;

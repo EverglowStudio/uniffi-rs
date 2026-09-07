@@ -164,6 +164,11 @@ resolver = "3"
         include_str!("support/unified_async/local.rs"),
     )
     .unwrap();
+    fs::write(
+        crate_dir.join("src/actor.rs"),
+        include_str!("support/unified_async/actor.rs"),
+    )
+    .unwrap();
     for (name, source) in SOURCES {
         fs::write(root.join(name), source).unwrap();
     }

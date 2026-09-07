@@ -2,6 +2,7 @@
 """Run the opt-in unified async fixture with retained logs."""
 import argparse
 import json
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -53,6 +54,31 @@ def main():
     )
     with (logs / "fixture-harness.stdout.log").open("w") as stdout, (logs / "fixture-harness.stderr.log").open("w") as stderr:
         result = subprocess.run(command, cwd=workspace, env=env, stdout=stdout, stderr=stderr, timeout=3600)
+    if result.returncode == 0:
+        realms = {}
+        for name in ["fixture-node-napi.stdout.log", "fixture-node-wasm.stdout.log", "fixture-chrome.stdout.log"]:
+            path = logs / name
+            if not path.exists():
+                continue
+            for line in path.read_text().splitlines():
+                try:
+                    row = json.loads(line[line.index("{"):])
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                if "realm" in row and "cases" in row:
+                    realms[row["realm"]] = row["cases"]
+        expected = {"node-wasm", "chrome-window", "chrome-worker"}
+        if env.get("UNIFFI_ASYNC_WASM_ONLY") != "1":
+            expected.add("node-napi")
+        if set(realms) != expected or any(len(cases) != 27 or sum(c.startswith("actor-") for c in cases) != 6 for cases in realms.values()):
+            raise RuntimeError(f"incomplete S02 + S05 matrix: {realms}")
+        (logs / "fixture-summary.json").write_text(json.dumps({
+            "status": "passed", "realms": realms,
+            "legacy_cases_per_realm": 21, "actor_cases_per_realm": 6,
+            "assertions": sum(map(len, realms.values())),
+            "env_file": str(args.env_file) if args.env_file else None,
+            "env_sha256": hashlib.sha256(args.env_file.read_bytes()).hexdigest() if args.env_file else None,
+        }, indent=2) + "\n")
     print(f"fixture harness exit: {result.returncode}; logs: {logs}")
     return result.returncode
 

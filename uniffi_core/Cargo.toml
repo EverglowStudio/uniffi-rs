@@ -61,3 +61,12 @@ rustdoc-args = ["--generate-link-to-definition"]
 [[example]]
 name = "local_cost"
 required-features = ["async-runtime"]
+
+[[example]]
+name = "actor_wasm_smoke"
+crate-type = ["cdylib"]
+required-features = ["async-runtime"]
+
+[[example]]
+name = "actor_cost"
+required-features = ["async-runtime"]
