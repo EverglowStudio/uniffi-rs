@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+mod attachment;
+
 include!(concat!(
     env!("OUT_DIR"),
     "/uniffi_bindgen_kotlin_jni.uniffi.rs"
@@ -64,6 +66,11 @@ mod test {
     }
 
     #[test]
+    fn test_unified_async() {
+        run_tests(test_dir(), "tests/unified_async.kts");
+    }
+
+    #[test]
     fn test_futures() {
         run_tests(test_dir(), "tests/futures.kts");
     }
@@ -116,7 +123,7 @@ mod test {
     fn test_dir() -> &'static Utf8Path {
         static TEST_TEMPDIR: OnceLock<Utf8PathBuf> = OnceLock::new();
         TEST_TEMPDIR.get_or_init(|| {
-            let temp_dir = uniffi_bindgen::test_util::setup_test_dir("kotlin");
+            let temp_dir = uniffi_bindgen::test_util::setup_test_dir("kotlin-jni-s04");
             uniffi_bindgen::test_util::build_library(
                 &temp_dir,
                 "uniffi-bindgen-kotlin-jni-tests",
@@ -124,6 +131,11 @@ mod test {
             );
             uniffi_bindgen::test_util::copy_test_sources(&temp_dir, "tests/*.kts");
             uniffi_bindgen_kotlin_jni::test_util::generate_bindings(&temp_dir);
+            std::fs::copy(
+                "tests/JniRuntimeProbe.kt",
+                temp_dir.join("uniffi/JniRuntimeProbe.kt"),
+            )
+            .expect("copy JNI runtime probe");
             uniffi_bindgen_kotlin_jni::test_util::build_jar(
                 &temp_dir,
                 "uniffi_bindgen_tests.jar",

@@ -5,9 +5,7 @@
  */
 @Suppress("UNUSED_PARAMETER")
 public object {{ ffi_converter_name }}: FfiConverter<Flow<{{ item_type_name }}>, Long> {
-    override fun lift(value: Long): Flow<{{ item_type_name }}> {
-        throw InternalException("Input stream values are only supported as direct function arguments")
-    }
+    override fun lift(value: Long): Flow<{{ item_type_name }}> = uniffiLiftInputStream(value)
 
     override fun lower(value: Flow<{{ item_type_name }}>): Long =
         uniffiCreateInputStream(

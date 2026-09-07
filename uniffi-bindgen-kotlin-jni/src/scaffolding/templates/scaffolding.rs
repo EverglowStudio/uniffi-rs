@@ -11,6 +11,9 @@ mod uniffi_bindgen_kotlin_jni_scaffolding {
     use ::uniffi_bindgen_kotlin_jni_runtime as uniffi_jni;
     use ::uniffi_bindgen_kotlin_jni_runtime::uniffi;
     use ::uniffi_bindgen_kotlin_jni_runtime::JniResultExt;
+    {% for trait_name in root.trait_imports %}
+    use {{ trait_name }} as _;
+    {% endfor %}
 
     {%- filter indent(4) %}{% include "async.rs" %}{% endfilter %}
     {%- filter indent(4) %}{% include "callback_interface_shared.rs" %}{% endfilter %}
@@ -51,6 +54,8 @@ mod uniffi_bindgen_kotlin_jni_scaffolding {
     {%- filter indent(4) %}{% include "timestamp.rs" %}{% endfilter %}
     {%- when TypeDefinition::Duration(type_node) %}
     {%- filter indent(4) %}{% include "duration.rs" %}{% endfilter %}
+    {%- when TypeDefinition::Stream(stream) %}
+    {%- filter indent(4) %}{% include "stream.rs" %}{% endfilter %}
     {%- when TypeDefinition::Interface(_) %}
     {%- endmatch %}
     {%- endfor %}

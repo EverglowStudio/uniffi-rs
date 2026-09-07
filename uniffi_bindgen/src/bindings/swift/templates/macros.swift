@@ -47,6 +47,9 @@
 
 // eg, `public func foo_bar() { body }`
 {%- macro func_decl(func_decl, callable, indent) %}
+{%- if callable.is_stream() %}
+{%- call stream_func_decl(func_decl, callable, indent) %}{% endcall %}
+{%- else %}
 {%- call docstring(callable, indent) %}{% endcall %}
 {{ func_decl }} {{ callable.name()|fn_name }}{{ callable|input_stream_generics }}(
     {%- call arg_list_decl(callable) %}{% endcall -%})
@@ -56,56 +59,62 @@
     {{ callable|input_stream_where_clause }} {
     {%- call call_body(callable) %}{% endcall %}
 }
+{%- endif %}
 {%- endmacro %}
 
-// eg, `public func events() -> UniFfiStream<Event> { body }`
+// Stream factories settle before the subscription is exposed; next remains pull-only.
 {%- macro stream_func_decl(func_decl, callable, indent) %}
 {%- call docstring(callable, indent) %}{% endcall %}
-{%- if let Some(stream_item_type) = callable.stream_item_type() %}
-{%- if let Some(stream_error_type) = callable.stream_error_type() %}
-{%- if let Some(stream_next_ffi_return_type) = callable.stream_next_ffi_return_type() %}
+{%- let stream_item_type = callable.stream_item_type().unwrap() %}
 {{ func_decl }} {{ callable.name()|fn_name }}{{ callable|input_stream_generics }}(
-    {%- call arg_list_decl(callable) %}{% endcall -%}) -> {{ callable.return_type().unwrap()|type_name }}{{ callable|input_stream_where_clause }} {
+    {%- call arg_list_decl(callable) %}{% endcall -%})
+    {%- call is_async(callable) %}{% endcall %}
+    {%- call throws(callable) %}{% endcall %} -> {{ callable.return_type().unwrap()|type_name }}{{ callable|input_stream_where_clause }} {
+    let __streamHandle: UInt64 = {% if callable.is_async() %}{% call call_async(callable, true) %}{% endcall %}{% else %}{% call to_ffi_call(callable) %}{% endcall %}{% endif %}
     return UniFfiStream(
-        start: {
-            {% call to_ffi_call(callable) %}{% endcall %}
-        },
+        handle: __streamHandle,
         next: { __streamHandle in
             try await uniffiRustCallAsync(
-                rustFutureFunc: {
-                    {{ callable.ffi_stream_next_func() }}(__streamHandle)
-                },
+                rustFutureFunc: { {{ callable.ffi_stream_next_func() }}(__streamHandle) },
                 pollFunc: {{ callable.ffi_stream_next_rust_future_poll(ci) }},
                 cancelFunc: {{ callable.ffi_stream_next_rust_future_cancel(ci) }},
                 completeFunc: {{ callable.ffi_stream_next_rust_future_complete(ci) }},
                 freeFunc: {{ callable.ffi_stream_next_rust_future_free(ci) }},
                 liftFunc: { try __uniffiLiftStreamNext(
                     $0,
-                    readItem: { reader in
-                        try {{ stream_item_type|read_fn }}(from: &reader)
-                    },
+                    readItem: { reader in try {{ stream_item_type|read_fn }}(from: &reader) },
                     readError: { reader in
-                        try {{ stream_error_type|read_fn }}(from: &reader)
+                        {%- if let Some(error_type) = callable.stream_error_type() %}
+                        try {{ error_type|read_fn }}(from: &reader)
+                        {%- else %}
+                        throw UniffiInternalError.unexpectedStreamStepTag
+                        {%- endif %}
                     }
                 ) },
                 errorHandler: nil
             )
         },
-        cancel: { __streamHandle in
-            {{ callable.ffi_stream_cancel_func() }}(__streamHandle)
+        cancel: { __streamHandle in {{ callable.ffi_stream_cancel_func() }}(__streamHandle) },
+        close: { __streamHandle in
+            try await uniffiRustCallAsync(
+                rustFutureFunc: { {{ callable.ffi_stream_close_func() }}(__streamHandle) },
+                pollFunc: {{ callable.ffi_stream_close_rust_future_poll(ci) }},
+                cancelFunc: {{ callable.ffi_stream_close_rust_future_cancel(ci) }},
+                completeFunc: {{ callable.ffi_stream_close_rust_future_complete(ci) }},
+                freeFunc: {{ callable.ffi_stream_close_rust_future_free(ci) }},
+                liftFunc: { $0 },
+                errorHandler: nil
+            )
         }
     )
 }
-{%- endif %}
-{%- endif %}
-{%- endif %}
 {%- endmacro %}
 
 // primary ctor - no name, no return-type.
 {%- macro ctor_decl(callable, indent) %}
 {%- call docstring(callable, indent) %}{% endcall %}
-public convenience init(
-    {%- call arg_list_decl(callable) %}{% endcall -%}) {%- call is_async(callable) %}{% endcall %} {%- call throws(callable) %}{% endcall %} {
+public convenience init{{ callable|input_stream_generics }}(
+    {%- call arg_list_decl(callable) %}{% endcall -%}) {%- call is_async(callable) %}{% endcall %} {%- call throws(callable) %}{% endcall %}{{ callable|input_stream_where_clause }} {
     {%- if callable.is_async() %}
     let handle =
         {%- call call_async(callable) %}{% endcall %}
@@ -136,7 +145,7 @@ public convenience init(
 
 {%- endmacro %}
 
-{%- macro call_async(callable) %}
+{%- macro call_async(callable, stream_handle=false) %}
         try await uniffiRustCallAsync(
             rustFutureFunc: {
                 {{ callable.ffi_func().name() }}(
@@ -156,12 +165,16 @@ public convenience init(
             cancelFunc: {{ callable.ffi_rust_future_cancel(ci) }},
             completeFunc: {{ callable.ffi_rust_future_complete(ci) }},
             freeFunc: {{ callable.ffi_rust_future_free(ci) }},
+            {%- if stream_handle %}
+            liftFunc: { $0 },
+            {%- else %}
             {%- match callable.return_type() %}
             {%- when Some(return_type) %}
             liftFunc: {{ return_type|lift_fn }},
             {%- when None %}
             liftFunc: { $0 },
             {%- endmatch %}
+            {%- endif %}
             {%- match callable.throws_type() %}
             {%- when Some with (e) %}
             errorHandler: {{ e|ffi_error_converter_name }}_lift
@@ -224,7 +237,7 @@ v{{- field_num -}}
 
 {% macro arg_list_protocol(func) %}
     {%- for arg in func.arguments() -%}
-        {% if config.omit_argument_labels() %}_ {% endif %}{{ arg.name()|var_name }}: {{ arg|type_name -}}
+        {% if config.omit_argument_labels() %}_ {% endif %}{{ arg.name()|var_name }}: {{ arg|arg_type_name(loop.index0) -}}
         {%- if !loop.last %}, {% endif -%}
     {%- endfor %}
 {%- endmacro %}

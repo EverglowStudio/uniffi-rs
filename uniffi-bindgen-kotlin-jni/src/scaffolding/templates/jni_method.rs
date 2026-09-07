@@ -26,18 +26,8 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_{{ jni_method_name }}(
             {%- endfor %}
 
             {%- match jni_method_kind %}
-            {%- when JniMethodKind::Function %}
-            let uniffi_return = {{ callable.fully_qualified_name_rs }}(
-                {%- for arg in callable.arguments %}
-                {{ arg.pass_to_rust_fn(format!("uniffi_arg_lifted_{}", arg.index)) }},
-                {%- endfor %}
-            );
-            {%- when JniMethodKind::Method %}
-            let uniffi_return = uniffi_arg_lifted_0.{{ callable.name_rs() }}(
-                {%- for arg in callable.arguments %}
-                {{ arg.pass_to_rust_fn(format!("uniffi_arg_lifted_{}", arg.index)) }},
-                {%- endfor %}
-            );
+            {%- when JniMethodKind::Function | JniMethodKind::Method %}
+            let uniffi_return = {{ callable.rust_call() }};
             {%- when JniMethodKind::TraitMethodDisplayFmt %}
             {%- let self_type = callable.receiver.as_ref().unwrap().ty.type_rs %}
             uniffi::deps::static_assertions::assert_impl_all!({{ self_type }}: ::std::fmt::Display);
@@ -135,21 +125,13 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_{{ jni_method_name }}(
             {%- endfor %}
 
             let uniffi_future = async move {
-                {%- if !callable.has_receiver() %}
-                {{ callable.fully_qualified_name_rs }}(
-                    {%- for arg in callable.arguments %}
-                    uniffi_arg_lifted_{{ arg.index }},
-                    {%- endfor %}
-                ).await
-                {%- else %}
-                uniffi_arg_lifted_0.{{ callable.name_rs() }}(
-                    {%- for arg in callable.arguments %}
-                    uniffi_arg_lifted_{{ arg.index }},
-                    {%- endfor %}
-                ).await
-                {%- endif %}
+                let result = {{ callable.rust_call() }};
+                Ok(result)
             };
-            Ok(UniffiRustFuture::<{{ callable.result.return_type_rs() }}>::new(uniffi_future).into_handle())
+            Ok(uniffi_jni::future_new_with_runtime::<{{ callable.result.return_type_rs() }}, _, _>(
+                uniffi_future,
+                {{ callable.runtime_adapter_rs.as_ref().expect("Rust async callable has no runtime adapter") }},
+            ).as_raw() as i64)
         })
     }
 }

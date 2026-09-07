@@ -21,16 +21,26 @@ import {{ config.ffi_module_name() }}
 {% include "RustBufferTemplate.swift" %}
 {% include "Helpers.swift" %}
 {% include "HandleMap.swift" %}
-{%- if ci.has_input_stream_fns() %}
+{%- if self::has_input_stream_runtime(ci) %}
 {% include "InputStreamRuntime.swift" %}
 {%- endif %}
 
 // Public interface members begin here.
 {{ type_helper_code }}
 
-{%- if ci.has_async_fns() %}
+{%- if ci.has_async_fns() || ci.has_stream_fns() || self::has_input_stream_runtime(ci) %}
 {% include "Async.swift" %}
 {%- endif %}
+
+{%- for callable in ci.iter_callables() %}
+{%- for arg in callable.input_stream_arguments() %}
+private func {{ callable.ffi_input_stream_init_func(arg) }}_swift_init() {
+    {{ callable.ffi_input_stream_init_func(arg) }}(
+        uniffiInputStreamNextCallback, uniffiInputStreamCancelCallback, uniffiInputStreamCloseCallback
+    )
+}
+{%- endfor %}
+{%- endfor %}
 
 {%- for func in ci.function_definitions() %}
 {%- include "TopLevelFunctionTemplate.swift" %}

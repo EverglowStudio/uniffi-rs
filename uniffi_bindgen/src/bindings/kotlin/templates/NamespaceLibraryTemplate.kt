@@ -89,7 +89,7 @@ internal object IntegrityCheckingUniffiLib {
 }
 
 internal object UniffiLib {
-    {% if ci.contains_object_types() %}
+    {% if ci.contains_object_types() || ci.has_stream_fns() %}
     // The Cleaner for the whole library
     internal val CLEANER: UniffiCleaner by lazy {
         UniffiCleaner.create()

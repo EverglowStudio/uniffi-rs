@@ -49,6 +49,10 @@ pub struct RustFutureContinuationBoundCallback {
 pub trait UniffiCompatibleFuture<T>: Future<Output = T> + Send {}
 
 #[doc(hidden)]
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded")))]
+pub trait FutureLowerReturn<UT>: LowerReturn<UT> + Send {}
+#[doc(hidden)]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded"))]
 pub trait FutureLowerReturn<UT>: LowerReturn<UT> {}
 
 /// The `Send` bound is required because the Foreign code may call the
@@ -111,7 +115,7 @@ impl<UT, LR> FutureLowerReturn<UT> for LR where LR: LowerReturn<UT> {}
 ///
 /// For each exported async function, UniFFI will create a scaffolding function that uses this to
 /// create the [Handle] to pass to the foreign code.
-pub fn rust_future_new<F, T, UT>(future: F, tag: UT) -> Handle
+pub fn rust_future_new<F, T, UT: 'static>(future: F, tag: UT) -> Handle
 where
     F: UniffiCompatibleFuture<Result<T, LiftArgsError>> + 'static,
     T: FutureLowerReturn<UT> + 'static,
@@ -121,6 +125,20 @@ where
     ));
     let handle = Handle::from_arc(rust_future);
     trace_and_return!(handle, "rust_future_new: {handle:?}")
+}
+
+/// Create an explicitly Tokio-backed call. The runtime covers business poll,
+/// Drop, and registered cleanup, while retaining the same direct polling ABI.
+#[doc(hidden)]
+#[cfg(feature = "tokio")]
+pub fn rust_future_new_tokio<F, T, UT: 'static>(future: F, tag: UT) -> Handle
+where
+    F: UniffiCompatibleFuture<Result<T, LiftArgsError>> + 'static,
+    T: FutureLowerReturn<UT> + 'static,
+{
+    Handle::from_arc(Arc::new(
+        RustFuture::<_, RustFutureContinuationBoundCallback>::new_tokio(future, tag),
+    ))
 }
 
 /// Poll a Rust future
@@ -147,10 +165,9 @@ pub unsafe fn rust_future_poll<FfiType>(
 
 /// Cancel a Rust future
 ///
-/// Any current and future continuations will be immediately called with RustFuturePoll::Ready.
-///
-/// This is needed for languages like Swift, which continuation to wait for the continuation to be
-/// called when tasks are cancelled.
+/// Wake the current continuation and keep polling until RustFuturePoll::Ready.
+/// Ready confirms business Drop and registered cleanup, even after cancellation.
+/// A result committed before cancellation is preserved.
 ///
 /// # Safety
 ///
@@ -168,6 +185,7 @@ pub unsafe fn rust_future_cancel<FfiType>(handle: Handle) {
 /// # Safety
 ///
 /// - The [Handle] must not previously have been passed to [rust_future_free]
+/// - Polling must have reported [RustFuturePoll::Ready], including after cancellation.
 /// - The `T` param must correctly correspond to the [rust_future_new] call.  It must
 ///   be `<Output as LowerReturn<UT>>::ReturnType`
 pub unsafe fn rust_future_complete<FfiType>(

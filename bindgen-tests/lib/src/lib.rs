@@ -31,6 +31,9 @@ pub mod external_types;
 #[cfg(feature = "futures")]
 pub mod futures;
 
+#[cfg(feature = "unified-async")]
+pub mod unified_async;
+
 #[cfg(feature = "interfaces")]
 pub mod interfaces;
 

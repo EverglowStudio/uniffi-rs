@@ -5,9 +5,8 @@
 import Foundation
 import swift_mock_objects
 
-// Swift version 6 gives a warning that we must restate `@unchecked Sendable`, however earlier
-// versions of Swift fail if we add that.  Let's leave it out and accept the warning for now.
-public class TestObjectMock: TestObject {
+// This mock adds no state to the Sendable Rust proxy.
+public class TestObjectMock: TestObject, @unchecked Sendable {
 
     required public init(unsafeFromHandle handle: UInt64) {
         fatalError("Not supported")

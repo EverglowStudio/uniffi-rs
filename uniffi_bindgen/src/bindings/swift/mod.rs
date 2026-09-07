@@ -162,7 +162,7 @@ fn stream_runtime_emitter_index(
     crate_filter: Option<&str>,
 ) -> Option<usize> {
     components.iter().position(|component| {
-        component.ci.has_stream_fns()
+        (component.ci.has_stream_fns() || component.ci.has_input_stream_fns())
             && crate_filter.map_or(true, |crate_filter| {
                 component.ci.crate_name() == crate_filter
             })
@@ -416,7 +416,7 @@ mod tests {
             sources
                 .iter()
                 .map(|source| source
-                    .matches("public struct UniFfiStream<Element>: AsyncSequence")
+                    .matches("public struct UniFfiStream<Element: Sendable>: AsyncSequence")
                     .count())
                 .sum::<usize>(),
             1,
@@ -425,7 +425,7 @@ mod tests {
             sources
                 .iter()
                 .map(|source| source
-                    .matches("final class UniFfiStreamState<Element>")
+                    .matches("final class UniFfiStreamState<Element: Sendable>")
                     .count())
                 .sum::<usize>(),
             1,
@@ -434,7 +434,9 @@ mod tests {
         assert!(second_source.contains("public func secondStream() -> UniFfiStream<UInt32>"));
         assert!(first_source.contains("return UniFfiStream("));
         assert!(second_source.contains("return UniFfiStream("));
-        assert!(!second_source.contains("public struct UniFfiStream<Element>: AsyncSequence"));
+        assert!(
+            !second_source.contains("public struct UniFfiStream<Element: Sendable>: AsyncSequence")
+        );
 
         let swiftc_version = Command::new("swiftc")
             .arg("--version")
@@ -472,11 +474,17 @@ private func useBothStreamComponents() {
         .unwrap();
 
         let output = Command::new("swiftc")
-            .arg("-typecheck")
+            .arg("-emit-sil")
+            .arg("-parse-as-library")
+            .arg("-whole-module-optimization")
+            .arg("-o")
+            .arg(out_dir.join("bindings.sil"))
             .arg("-module-name")
             .arg("CombinedStreams")
             .arg("-swift-version")
-            .arg("5")
+            .arg("6")
+            .arg("-strict-concurrency=complete")
+            .arg("-warnings-as-errors")
             .arg("-I")
             .arg(&out_dir)
             .arg("-Xcc")

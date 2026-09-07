@@ -3,8 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use crate::{
-    rust_stream_new, Handle, LiftReturn, LowerReturn, MetadataBuffer, RustCallError,
-    RustStreamRegistry, TypeId, UniFfiStream, UniffiCompatibleStreamValue,
+    rust_stream_new, Handle, LowerReturn, MetadataBuffer, RustCallError, RustStreamRegistry,
+    TypeId, UniFfiStream, UniffiCompatibleStreamValue,
 };
 
 /// A stream awaiting delivery through a generated return converter.
@@ -42,17 +42,4 @@ where
     UniFfiStream<T, E>: TypeId<UT>,
 {
     const TYPE_ID_META: MetadataBuffer = <UniFfiStream<T, E> as TypeId<UT>>::TYPE_ID_META;
-}
-
-/// A callback's stream handle before the generated method attaches its vtable.
-#[doc(hidden)]
-pub struct ForeignStreamReturn(pub Handle);
-
-// SAFETY: this converter only transfers the opaque handle. The generated caller
-// immediately binds it to the matching next/cancel/close callbacks for its type.
-unsafe impl<UT> LiftReturn<UT> for ForeignStreamReturn {
-    type ReturnType = Handle;
-    fn try_lift_successful_return(handle: Handle) -> crate::Result<Self> {
-        Ok(Self(handle))
-    }
 }

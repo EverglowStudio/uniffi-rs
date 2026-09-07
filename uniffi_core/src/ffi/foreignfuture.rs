@@ -17,7 +17,11 @@
 //!     Future is dropped in Rust.  For languages that support it, this can be hooked up to
 //!     cancelling the async task for the method.
 
-use crate::{oneshot, LiftReturn, RustCallStatus};
+use crate::{oneshot, LiftReturn, RustCallStatus, RustCallStatusCode, UniffiCompatibleStreamValue};
+use std::{
+    mem::ManuallyDrop,
+    panic::{catch_unwind, AssertUnwindSafe},
+};
 
 /// Callback that's passed to a foreign async functions.
 ///
@@ -73,13 +77,91 @@ impl Drop for ForeignFutureDroppedCallbackStruct {
 
 unsafe impl Send for ForeignFutureDroppedCallbackStruct {}
 
+// The channel owns the returned FFI value until Rust consumes it. In
+// particular, a late successful callback after cancellation must not leak an
+// object handle or RustBuffer merely because the business receiver was dropped.
+struct OwnedForeignResult<FfiType> {
+    value: Option<ForeignFutureResult<FfiType>>,
+    discard: fn(ForeignFutureResult<FfiType>),
+}
+
+impl<FfiType> OwnedForeignResult<FfiType> {
+    fn take(mut self) -> ForeignFutureResult<FfiType> {
+        self.value.take().unwrap()
+    }
+    #[cfg(feature = "async-runtime")]
+    fn discard(mut self) {
+        (self.discard)(self.value.take().unwrap());
+    }
+}
+
+impl<FfiType> Drop for OwnedForeignResult<FfiType> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            // An abandoned standalone receiver may be released by the C
+            // callback itself. Never unwind through that foreign boundary.
+            let _ = catch_unwind(AssertUnwindSafe(|| (self.discard)(value)));
+        }
+    }
+}
+
+fn discard_foreign_result<T: LiftReturn<UT>, UT>(result: ForeignFutureResult<T::ReturnType>) {
+    let ForeignFutureResult {
+        return_value,
+        call_status,
+    } = result;
+    match call_status.code {
+        RustCallStatusCode::Success => {
+            drop(
+                T::try_lift_successful_return(return_value)
+                    .expect("discarded callback result must have valid ABI ownership"),
+            );
+            ManuallyDrop::into_inner(call_status.error_buf).destroy();
+        }
+        RustCallStatusCode::Error => {
+            drop(T::lift_error(ManuallyDrop::into_inner(
+                call_status.error_buf,
+            )));
+        }
+        RustCallStatusCode::UnexpectedError | RustCallStatusCode::Cancelled => {
+            ManuallyDrop::into_inner(call_status.error_buf).destroy();
+        }
+    }
+}
+
+struct ForeignCallGuard<FfiType: UniffiCompatibleStreamValue> {
+    receiver: Option<oneshot::Receiver<OwnedForeignResult<FfiType>>>,
+    dropped: Option<ForeignFutureDroppedCallbackStruct>,
+}
+
+impl<FfiType: UniffiCompatibleStreamValue> Drop for ForeignCallGuard<FfiType> {
+    fn drop(&mut self) {
+        // Request cancellation before waiting for the producer's original
+        // completion callback, which is its acknowledgement after finally.
+        drop(self.dropped.take());
+        if let Some(receiver) = self.receiver.take() {
+            #[cfg(feature = "async-runtime")]
+            if let Some(context) = crate::async_runtime::current_context() {
+                context
+                    .defer_cleanup(async move {
+                        receiver.await.discard();
+                    })
+                    .expect("current call accepts foreign callback cleanup");
+            }
+            #[cfg(not(feature = "async-runtime"))]
+            drop(receiver);
+        }
+    }
+}
+
 pub async fn foreign_async_call<F, T, UT>(call_scaffolding_function: F) -> T
 where
     F: FnOnce(ForeignFutureCallback<T::ReturnType>, u64, &mut ForeignFutureDroppedCallbackStruct),
     T: LiftReturn<UT>,
+    T::ReturnType: UniffiCompatibleStreamValue,
 {
     // Create a oneshot channel that will receive the result of the callback method
-    let (sender, receiver) = oneshot::channel::<ForeignFutureResult<T::ReturnType>>();
+    let (sender, receiver) = oneshot::channel::<OwnedForeignResult<T::ReturnType>>();
     // Create complete callback/data from the oneshot channel
     let complete_callback = foreign_future_complete::<T, UT>;
     let complete_callback_data = sender.into_raw() as u64;
@@ -87,15 +169,20 @@ where
     // Since this is owned by the `Future` that we're generating, when the future is dropped it
     // will be dropped to.
     // future is.
-    let mut foreign_future_dropped_callback = ForeignFutureDroppedCallbackStruct::default();
+    let mut call = ForeignCallGuard {
+        receiver: Some(receiver),
+        dropped: Some(ForeignFutureDroppedCallbackStruct::default()),
+    };
     // Call the async method
     call_scaffolding_function(
         complete_callback,
         complete_callback_data,
-        &mut foreign_future_dropped_callback,
+        call.dropped.as_mut().unwrap(),
     );
     // Await the result and use it to return a value
-    let result = receiver.await;
+    let result = call.receiver.as_mut().unwrap().await;
+    call.receiver = None;
+    let result = result.take();
     T::lift_foreign_return(result.return_value, result.call_status)
 }
 
@@ -104,7 +191,10 @@ pub extern "C" fn foreign_future_complete<T: LiftReturn<UT>, UT>(
     result: ForeignFutureResult<T::ReturnType>,
 ) {
     let channel = unsafe { oneshot::Sender::from_raw(oneshot_handle as *mut ()) };
-    channel.send(result);
+    channel.send(OwnedForeignResult {
+        value: Some(result),
+        discard: discard_foreign_result::<T, UT>,
+    });
 }
 
 #[cfg(test)]
@@ -254,5 +344,45 @@ mod test {
         assert_eq!(mock_foreign_future.free_count(), 0);
         mock_foreign_future.drop_future();
         assert_eq!(mock_foreign_future.free_count(), 1);
+    }
+
+    #[cfg(feature = "async-runtime")]
+    #[test]
+    fn cancelled_call_waits_for_foreign_completion_acknowledgement() {
+        use crate::async_runtime::{CallContext, CancellationToken, Cancelled};
+        let mut host = MockForeignFuture::new();
+        let context = CallContext::new(CancellationToken::new());
+        let mut call = Box::pin(context.run(host.rust_future.take().unwrap()));
+        let waker = Arc::new(NoopWaker).into();
+        let mut cx = Context::from_waker(&waker);
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        context.cancel();
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(host.free_count(), 1, "Drop requests host cancellation");
+        assert!(
+            call.as_mut().poll(&mut cx).is_pending(),
+            "request is not an acknowledgement"
+        );
+        host.complete_error("cancelled after host finally".into());
+        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Err(Cancelled)));
+        assert_eq!(host.free_count(), 1);
+        assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
+    }
+
+    #[cfg(feature = "async-runtime")]
+    #[test]
+    fn cancelled_call_discards_late_success_after_host_acknowledgement() {
+        use crate::async_runtime::{CallContext, CancellationToken, Cancelled};
+        let mut host = MockForeignFuture::new();
+        let context = CallContext::new(CancellationToken::new());
+        let mut call = Box::pin(context.run(host.rust_future.take().unwrap()));
+        let waker = Arc::new(NoopWaker).into();
+        let mut cx = Context::from_waker(&waker);
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        context.cancel();
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        host.complete_success("owned late output".into());
+        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Err(Cancelled)));
+        assert_eq!(host.free_count(), 1);
     }
 }

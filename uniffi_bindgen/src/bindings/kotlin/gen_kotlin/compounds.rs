@@ -25,10 +25,14 @@ impl OptionalCodeType {
 
 impl CodeType for OptionalCodeType {
     fn type_label(&self, ci: &ComponentInterface) -> String {
-        format!(
-            "{}?",
-            super::KotlinCodeOracle.find(self.inner()).type_label(ci)
-        )
+        let inner = super::KotlinCodeOracle.find(self.inner()).type_label(ci);
+        // Kotlin nullability is idempotent. Stream EOF uses its own tagged step,
+        // so the synthetic Option<Item> must not introduce a redundant `??`.
+        if matches!(self.inner(), Type::Optional { .. }) {
+            inner
+        } else {
+            format!("{inner}?")
+        }
     }
 
     fn canonical_name(&self) -> String {
@@ -178,11 +182,17 @@ impl CodeType for SetCodeType {
 #[derive(Debug)]
 pub struct StreamCodeType {
     item: Type,
+    error: Option<Type>,
+    is_send: bool,
 }
 
 impl StreamCodeType {
-    pub fn new(item: Type) -> Self {
-        Self { item }
+    pub fn new(item: Type, error: Option<Type>, is_send: bool) -> Self {
+        Self {
+            item,
+            error,
+            is_send,
+        }
     }
 
     fn item(&self) -> &Type {
@@ -200,8 +210,13 @@ impl CodeType for StreamCodeType {
 
     fn canonical_name(&self) -> String {
         format!(
-            "Stream{}",
-            super::KotlinCodeOracle.find(self.item()).canonical_name()
+            "Stream{}{}{}",
+            super::KotlinCodeOracle.find(self.item()).canonical_name(),
+            self.error
+                .as_ref()
+                .map(|error| super::KotlinCodeOracle.find(error).canonical_name())
+                .unwrap_or_else(|| "Infallible".into()),
+            if self.is_send { "" } else { "Local" },
         )
     }
 }
@@ -210,11 +225,16 @@ impl CodeType for StreamCodeType {
 pub struct InputStreamCodeType {
     item: Type,
     error: Option<Type>,
+    is_send: bool,
 }
 
 impl InputStreamCodeType {
-    pub fn new(item: Type, error: Option<Type>) -> Self {
-        Self { item, error }
+    pub fn new(item: Type, error: Option<Type>, is_send: bool) -> Self {
+        Self {
+            item,
+            error,
+            is_send,
+        }
     }
 
     fn item(&self) -> &Type {
@@ -236,9 +256,12 @@ impl CodeType for InputStreamCodeType {
 
     fn canonical_name(&self) -> String {
         format!(
-            "InputStream{}{}",
+            "InputStream{}{}{}",
             super::KotlinCodeOracle.find(self.item()).canonical_name(),
-            self.error().map(|error| super::KotlinCodeOracle.find(error).canonical_name()).unwrap_or_else(|| "Infallible".into())
+            self.error()
+                .map(|error| super::KotlinCodeOracle.find(error).canonical_name())
+                .unwrap_or_else(|| "Infallible".into()),
+            if self.is_send { "" } else { "Local" },
         )
     }
 }

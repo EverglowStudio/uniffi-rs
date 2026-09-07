@@ -18,6 +18,7 @@ uniffi_pipeline::use_prev_node!(general::Type);
 pub struct Root {
     pub cdylib: Option<String>,
     pub packages: Vec<Package>,
+    pub trait_imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Node, MapNode)]
@@ -48,6 +49,7 @@ pub enum TypeDefinition {
     Set(SetType),
     Timestamp(TypeNode),
     Duration(TypeNode),
+    Stream(StreamType),
 }
 
 #[derive(Debug, Clone, Node, MapNode)]
@@ -222,7 +224,12 @@ pub struct Callable {
     pub name: String,
     pub orig_name: String,
     pub is_async: bool,
+    pub rust_async: bool,
+    pub rust_return_is_result: bool,
+    pub rust_stream_item_is_result: bool,
     pub fully_qualified_name_rs: String,
+    /// Runtime helper in the declaration/impl module, named by the FFI symbol.
+    pub runtime_adapter_rs: Option<String>,
     pub receiver: Option<Argument>,
     pub arguments: Vec<Argument>,
     pub result: CallableResult,
@@ -467,4 +474,12 @@ pub struct UniffiTraitMethods {
     pub eq_ne: Option<Method>,
     pub hash_hash: Option<Method>,
     pub ord_cmp: Option<Method>,
+}
+
+#[derive(Debug, Clone, Node)]
+pub struct StreamType {
+    pub self_type: TypeNode,
+    pub item: TypeNode,
+    pub error: Option<TypeNode>,
+    pub input: bool,
 }

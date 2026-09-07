@@ -94,11 +94,17 @@ impl MapCodeType {
 #[derive(Debug)]
 pub struct StreamCodeType {
     item: Type,
+    error: Option<Type>,
+    is_send: bool,
 }
 
 impl StreamCodeType {
-    pub fn new(item: Type) -> Self {
-        Self { item }
+    pub fn new(item: Type, error: Option<Type>, is_send: bool) -> Self {
+        Self {
+            item,
+            error,
+            is_send,
+        }
     }
 }
 
@@ -112,8 +118,13 @@ impl CodeType for StreamCodeType {
 
     fn canonical_name(&self) -> String {
         format!(
-            "Stream{}",
-            super::SwiftCodeOracle.find(&self.item).canonical_name()
+            "Stream{}{}{}",
+            super::SwiftCodeOracle.find(&self.item).canonical_name(),
+            self.error
+                .as_ref()
+                .map(|error| super::SwiftCodeOracle.find(error).canonical_name())
+                .unwrap_or_else(|| "Infallible".into()),
+            if self.is_send { "" } else { "Local" },
         )
     }
 }
@@ -122,27 +133,36 @@ impl CodeType for StreamCodeType {
 pub struct InputStreamCodeType {
     item: Type,
     error: Option<Type>,
+    is_send: bool,
 }
 
 impl InputStreamCodeType {
-    pub fn new(item: Type, error: Option<Type>) -> Self {
-        Self { item, error }
+    pub fn new(item: Type, error: Option<Type>, is_send: bool) -> Self {
+        Self {
+            item,
+            error,
+            is_send,
+        }
     }
 }
 
 impl CodeType for InputStreamCodeType {
     fn type_label(&self) -> String {
         format!(
-            "AsyncThrowingStream<{}, Error>",
+            "UniFfiStream<{}>",
             super::SwiftCodeOracle.find(&self.item).type_label()
         )
     }
 
     fn canonical_name(&self) -> String {
         format!(
-            "InputStream{}{}",
+            "InputStream{}{}{}",
             super::SwiftCodeOracle.find(&self.item).canonical_name(),
-            self.error.as_ref().map(|error| super::SwiftCodeOracle.find(error).canonical_name()).unwrap_or_else(|| "Infallible".into())
+            self.error
+                .as_ref()
+                .map(|error| super::SwiftCodeOracle.find(error).canonical_name())
+                .unwrap_or_else(|| "Infallible".into()),
+            if self.is_send { "" } else { "Local" },
         )
     }
 }

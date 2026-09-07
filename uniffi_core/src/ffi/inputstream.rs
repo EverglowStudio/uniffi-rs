@@ -96,6 +96,8 @@ impl<T: 'static, E: 'static> ForeignInputStreamInner<T, E> {
 pub struct ForeignInputStream<T: 'static, E: 'static> {
     inner: Arc<ForeignInputStreamInner<T, E>>,
     pending_next: Option<ForeignInputStreamNextFuture<T, E>>,
+    #[cfg(not(feature = "async-runtime"))]
+    retained: Vec<Box<dyn crate::UniffiCompatibleStreamValue>>,
     done: bool,
 }
 
@@ -126,6 +128,8 @@ impl<T: 'static, E: 'static> ForeignInputStream<T, E> {
                 closed,
             }),
             pending_next: None,
+            #[cfg(not(feature = "async-runtime"))]
+            retained: Vec::new(),
             done: false,
         }
     }
@@ -154,6 +158,32 @@ impl<T: 'static, E: 'static> ForeignInputStream<T, E> {
         )
     }
 
+    /// Keep arguments moved into a returned foreign producer until that
+    /// producer acknowledges close, then release them in the same call scope.
+    #[doc(hidden)]
+    pub fn retain_until_close<R: crate::UniffiCompatibleStreamValue>(
+        mut self,
+        resources: R,
+    ) -> Self {
+        #[cfg(feature = "async-runtime")]
+        {
+            let closed = self.inner.closed.clone();
+            let future: BoxFuture<'static, Result<(), CleanupFailed>> = Box::pin(async move {
+                let result = closed.await;
+                drop(resources);
+                result
+            });
+            // Only this stream owns inner. Confirmation waiters share closed,
+            // and its future owns ops; neither clones the inner allocation.
+            Arc::get_mut(&mut self.inner)
+                .expect("foreign stream has one inner owner")
+                .closed = future.shared();
+        }
+        #[cfg(not(feature = "async-runtime"))]
+        self.retained.push(Box::new(resources));
+        self
+    }
+
     pub fn cancel(&self) {
         self.inner.cancel();
     }
@@ -175,6 +205,8 @@ impl<T: 'static, E: 'static> ForeignInputStream<T, E> {
         self.done = true;
         drop(self.pending_next.take());
         self.inner.cancel();
+        #[cfg(not(feature = "async-runtime"))]
+        self.retained.clear();
         #[cfg(feature = "async-runtime")]
         drop(InputCloseOnDrop(Some(self.inner.closed.clone())));
     }

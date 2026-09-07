@@ -69,21 +69,27 @@ let recName = try! await rec.getName()
 assert(recName == "Bob")
 
 // Callback interfaces
+let asyncCallbackRefCount = TestLocked(0)
 class AsyncCallbackImpl: TestAsyncCallbackInterface, @unchecked Sendable {
-    var value: UInt32;
+    let value: TestLocked<UInt32>;
 
     init(value: UInt32) {
-        self.value = value;
+        self.value = TestLocked(value);
+        asyncCallbackRefCount.update { $0 += 1 }
+    }
+
+    deinit {
+        asyncCallbackRefCount.update { $0 -= 1 }
     }
 
     func noop() async throws { }
 
     func getValue() async throws -> UInt32 {
-        return self.value;
+        return self.value.read();
     }
 
     func setValue(value: UInt32) async throws {
-        self.value = value;
+        self.value.update { $0 = value };
     }
 
     func throwIfEqual(numbers: CallbackInterfaceNumbers) async throws -> CallbackInterfaceNumbers {

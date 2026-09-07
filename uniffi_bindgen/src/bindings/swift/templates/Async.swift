@@ -8,7 +8,7 @@ private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 //
 // This is internal so stream functions emitted by other component sources in the
 // same Swift module can construct the shared UniFfiStream runtime.
-enum __UniffiStreamNext<T> {
+enum __UniffiStreamNext<T: Sendable>: Sendable {
     case item(T)
     case done
     case error(Swift.Error)
@@ -16,7 +16,7 @@ enum __UniffiStreamNext<T> {
 {%- endif %}
 
 {%- if ci.has_stream_fns() %}
-private func __uniffiLiftStreamNext<T>(
+private func __uniffiLiftStreamNext<T: Sendable>(
     _ rustBuffer: RustBuffer,
     readItem: (inout (data: Data, offset: Data.Index)) throws -> T,
     readError: (inout (data: Data, offset: Data.Index)) throws -> Swift.Error
@@ -61,15 +61,15 @@ fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation
 fileprivate final class UniffiRustFutureHandle: @unchecked Sendable {
     private let lock = NSLock()
     private let handle: UInt64
-    private let cancelFunc: (UInt64) -> ()
-    private let freeFunc: (UInt64) -> ()
+    private let cancelFunc: @Sendable (UInt64) -> ()
+    private let freeFunc: @Sendable (UInt64) -> ()
     private var cancelled = false
     private var freed = false
 
     init(
         handle: UInt64,
-        cancelFunc: @escaping (UInt64) -> (),
-        freeFunc: @escaping (UInt64) -> ()
+        cancelFunc: @escaping @Sendable (UInt64) -> (),
+        freeFunc: @escaping @Sendable (UInt64) -> ()
     ) {
         self.handle = handle
         self.cancelFunc = cancelFunc
@@ -100,14 +100,14 @@ fileprivate final class UniffiRustFutureHandle: @unchecked Sendable {
     }
 }
 
-fileprivate func uniffiRustCallAsync<F, T>(
-    rustFutureFunc: () -> UInt64,
-    pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
-    cancelFunc: @escaping (UInt64) -> (),
-    completeFunc: (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
-    freeFunc: @escaping (UInt64) -> (),
-    liftFunc: (F) throws -> T,
-    errorHandler: ((RustBuffer) throws -> Swift.Error)?
+fileprivate func uniffiRustCallAsync<F, T: Sendable>(
+    rustFutureFunc: @Sendable () -> UInt64,
+    pollFunc: @Sendable (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
+    cancelFunc: @escaping @Sendable (UInt64) -> (),
+    completeFunc: @Sendable (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
+    freeFunc: @escaping @Sendable (UInt64) -> (),
+    liftFunc: @Sendable (F) throws -> T,
+    errorHandler: (@Sendable (RustBuffer) throws -> Swift.Error)?
 ) async throws -> T {
     // Make sure to call the ensure init function since future creation doesn't have a
     // RustCallStatus param, so doesn't use makeRustCall()
@@ -145,15 +145,16 @@ fileprivate func uniffiRustCallAsync<F, T>(
 }
 
 {%- if include_stream_runtime %}
-// Output streams use a pull-based custom AsyncSequence rather than a
-// continuation-backed producer. Creating the public stream only captures the native
-// start closure; it invokes neither Rust start nor `stream_next`. The first
-// Iterator.next() starts Rust and creates one native `stream_next` future, so a slow
-// Swift consumer cannot cause background prefetch.
-public struct UniFfiStream<Element>: AsyncSequence {
-    public struct Iterator: AsyncIteratorProtocol {
-        fileprivate let lifetime: UniFfiStreamIteratorLifetime<Element>
+// Output streams use a pull-based custom AsyncSequence.
+// Shared by Rust stream handles and Swift AsyncSequence producers. Every next is
+// owned by the subscription; close joins it before acknowledging cleanup.
+protocol UniffiAsyncSequenceClose: Sendable {
+    func close() async throws
+}
 
+public struct UniFfiStream<Element: Sendable>: AsyncSequence, Sendable, UniffiAsyncSequenceClose {
+    public struct Iterator: AsyncIteratorProtocol, Sendable {
+        fileprivate let lifetime: UniFfiStreamIteratorLifetime<Element>
         public mutating func next() async throws -> Element? {
             try await lifetime.next()
         }
@@ -162,25 +163,70 @@ public struct UniFfiStream<Element>: AsyncSequence {
     fileprivate let state: UniFfiStreamState<Element>
 
     init(
-        start: @escaping () throws -> UInt64,
-        next: @escaping (UInt64) async throws -> __UniffiStreamNext<Element>,
-        cancel: @escaping (UInt64) -> ()
+        handle: UInt64,
+        next: @escaping @Sendable (UInt64) async throws -> __UniffiStreamNext<Element>,
+        cancel: @escaping @Sendable (UInt64) -> Void,
+        close: @escaping @Sendable (UInt64) async throws -> Void
     ) {
-        state = UniFfiStreamState(start: start, next: next, cancel: cancel)
+        state = UniFfiStreamState(handle: handle, next: next, cancel: cancel, close: close)
+    }
+
+    /// Type erase a single-consumer Swift producer without prefetching.
+    public init<S: AsyncSequence & Sendable>(_ sequence: S) where S.Element == Element {
+        let source = UniFfiSequenceSource(sequence)
+        self.init(
+            handle: 0,
+            next: { _ in try await source.next() },
+            cancel: { _ in },
+            close: { _ in try await source.close() }
+        )
     }
 
     public func makeAsyncIterator() -> Iterator {
         Iterator(lifetime: UniFfiStreamIteratorLifetime(state: state))
     }
 
-    /// Cancel the stream. Cancelling before its first `next()` is local-only; an
-    /// active native stream is cancelled at most once.
-    public func cancel() {
-        state.cancel()
+    /// Request cancellation. Use close() to await producer and callback cleanup.
+    public func cancel() { state.cancel() }
+
+    public func close() async throws { try await state.close() }
+}
+
+// Access to the iterator is serialized by UniFfiStreamState, including close.
+fileprivate final class UniFfiSequenceSource<S: AsyncSequence & Sendable>: @unchecked Sendable where S.Element: Sendable {
+    private var iterator: S.AsyncIterator?
+    private let closeSequence: (@Sendable () async throws -> Void)?
+
+    init(_ sequence: S) {
+        iterator = sequence.makeAsyncIterator()
+        if let sequence = sequence as? any UniffiAsyncSequenceClose {
+            closeSequence = { try await sequence.close() }
+        } else {
+            closeSequence = nil
+        }
+    }
+
+    func next() async throws -> __UniffiStreamNext<S.Element> {
+        guard var iterator = iterator else { return .done }
+        self.iterator = nil
+        do {
+            if let value = try await iterator.next() {
+                self.iterator = iterator
+                return .item(value)
+            }
+            return .done
+        } catch {
+            throw error
+        }
+    }
+
+    func close() async throws {
+        iterator = nil
+        try await closeSequence?()
     }
 }
 
-fileprivate final class UniFfiStreamIteratorLifetime<Element> {
+fileprivate final class UniFfiStreamIteratorLifetime<Element: Sendable>: Sendable {
     private let state: UniFfiStreamState<Element>
     private let accepted: Bool
 
@@ -190,62 +236,43 @@ fileprivate final class UniFfiStreamIteratorLifetime<Element> {
     }
 
     deinit {
-        if accepted {
-            state.cancel()
-        }
+        if accepted { state.cancel() }
     }
 
     func next() async throws -> Element? {
-        guard accepted else {
-            throw UniffiInternalError.streamConsumed
-        }
+        guard accepted else { throw UniffiInternalError.streamConsumed }
         return try await state.next()
     }
 }
 
-fileprivate final class UniFfiStreamState<Element>: @unchecked Sendable {
-    private enum Lifecycle {
-        case idle
-        case starting
-        case active(UInt64)
-        case done
-        case failed
-        case cancelled
-    }
-
-    private enum NextStart {
-        case next(UInt64)
-        case done
-        case concurrent
-    }
-
+fileprivate final class UniFfiStreamState<Element: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
-    private let startFunc: () throws -> UInt64
-    private let nextFunc: (UInt64) async throws -> __UniffiStreamNext<Element>
-    private let cancelFunc: (UInt64) -> ()
+    private let nextFunc: @Sendable (UInt64) async throws -> __UniffiStreamNext<Element>
+    private let cancelFunc: @Sendable (UInt64) -> Void
+    private let closeFunc: @Sendable (UInt64) async throws -> Void
     private var iteratorClaimed = false
-    private var nextInFlight = false
-    private var lifecycle = Lifecycle.idle
+    private let handle: UInt64
+    private var stopped = false
+    private var nextTask: Task<__UniffiStreamNext<Element>, Error>?
+    private var closeTask: Task<Void, Error>?
 
     init(
-        start: @escaping () throws -> UInt64,
-        next: @escaping (UInt64) async throws -> __UniffiStreamNext<Element>,
-        cancel: @escaping (UInt64) -> ()
+        handle: UInt64,
+        next: @escaping @Sendable (UInt64) async throws -> __UniffiStreamNext<Element>,
+        cancel: @escaping @Sendable (UInt64) -> Void,
+        close: @escaping @Sendable (UInt64) async throws -> Void
     ) {
-        startFunc = start
+        self.handle = handle
         nextFunc = next
         cancelFunc = cancel
+        closeFunc = close
     }
 
-    deinit {
-        cancel()
-    }
+    deinit { cancel() }
 
     func claimIterator() -> Bool {
         lock.withLock {
-            guard !iteratorClaimed else {
-                return false
-            }
+            guard !iteratorClaimed else { return false }
             iteratorClaimed = true
             return true
         }
@@ -253,135 +280,79 @@ fileprivate final class UniFfiStreamState<Element>: @unchecked Sendable {
 
     func next() async throws -> Element? {
         if Task.isCancelled {
-            cancel()
+            try await close()
             throw CancellationError()
         }
-
-        let start = try beginNext()
-
-        switch start {
-        case .done:
+        let task = try lock.withLock { () throws -> Task<__UniffiStreamNext<Element>, Error>? in
+            if stopped { return nil }
+            if nextTask != nil { throw UniffiInternalError.concurrentStreamNext }
+            let handle = handle
+            let next = nextFunc
+            let task = Task { try await next(handle) }
+            nextTask = task
+            return task
+        }
+        guard let task else {
+            try await close()
             return nil
-        case .concurrent:
-            throw UniffiInternalError.concurrentStreamNext
-        case let .next(handle):
-            do {
-                let result = try await withTaskCancellationHandler(operation: {
-                    try await nextFunc(handle)
-                }, onCancel: {
-                    self.cancel()
-                })
-                if Task.isCancelled {
-                    finishCancelledNext()
-                    throw CancellationError()
+        }
+        do {
+            let result = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                self.cancel()
+            }
+            let cancelled = lock.withLock {
+                nextTask = nil
+                if stopped { return true }
+                switch result {
+                case .item: break
+                case .done, .error: stopped = true
                 }
-                return try finish(result)
-            } catch is CancellationError {
-                finishCancelledNext()
+                return false
+            }
+            if cancelled || Task.isCancelled {
+                try await close()
                 throw CancellationError()
-            } catch {
-                finishFailedNext()
+            }
+            switch result {
+            case let .item(value): return .some(value)
+            case .done:
+                try await close()
+                return nil
+            case let .error(error):
+                try await close()
                 throw error
             }
+        } catch {
+            lock.withLock { nextTask = nil; stopped = true }
+            try await close()
+            throw error
         }
     }
 
-    private func beginNext() throws -> NextStart {
-        try lock.withLock { () throws -> NextStart in
-            switch lifecycle {
-            case .done, .failed, .cancelled:
-                return .done
-            case .idle:
-                if nextInFlight {
-                    return .concurrent
-                }
-                nextInFlight = true
-                lifecycle = .starting
-                do {
-                    // Keep start and the active handle transition under the same
-                    // lock: cancellation observes either an idle stream or a fully
-                    // initialized native handle, never a half-started stream.
-                    let handle = try startFunc()
-                    lifecycle = .active(handle)
-                    return .next(handle)
-                } catch {
-                    nextInFlight = false
-                    lifecycle = .failed
-                    throw error
-                }
-            case .starting:
-                return .concurrent
-            case let .active(handle):
-                if nextInFlight {
-                    return .concurrent
-                }
-                nextInFlight = true
-                return .next(handle)
+    private func startClose() -> Task<Void, Error> {
+        lock.withLock {
+            if let task = closeTask { return task }
+            stopped = true
+            let pending = nextTask
+            let handle = handle
+            let cancel = cancelFunc
+            let close = closeFunc
+            // This task owns cleanup independently of any caller's cancellation.
+            let task = Task {
+                pending?.cancel()
+                cancel(handle)
+                _ = try? await pending?.value
+                try await close(handle)
             }
+            closeTask = task
+            return task
         }
     }
 
-    private func finish(_ result: __UniffiStreamNext<Element>) throws -> Element? {
-        return try lock.withLock { () throws -> Element? in
-            nextInFlight = false
-            switch lifecycle {
-            case .cancelled, .done, .failed:
-                return nil
-            case .idle, .starting:
-                throw UniffiInternalError.unexpectedStaleHandle
-            case .active:
-                switch result {
-                case .done:
-                    lifecycle = .done
-                    return nil
-                case let .error(error):
-                    lifecycle = .failed
-                    throw error
-                case let .item(item):
-                    // `Element?` adds an outer optional here. In particular, when
-                    // Element is Optional<T>, this returns `.some(nil)` for Item(None).
-                    return .some(item)
-                }
-            }
-        }
-    }
-
-    private func finishFailedNext() {
-        let handle = lock.withLock { () -> UInt64? in
-            nextInFlight = false
-            guard case let .active(activeHandle) = lifecycle else {
-                return nil
-            }
-            lifecycle = .failed
-            return activeHandle
-        }
-        if let handle {
-            cancelFunc(handle)
-        }
-    }
-
-    private func finishCancelledNext() {
-        cancel()
-    }
-
-    func cancel() {
-        let handle = lock.withLock { () -> UInt64? in
-            nextInFlight = false
-            switch lifecycle {
-            case .idle, .starting:
-                lifecycle = .cancelled
-                return nil
-            case let .active(activeHandle):
-                lifecycle = .cancelled
-                return activeHandle
-            case .done, .failed, .cancelled:
-                return nil
-            }
-        }
-        if let handle {
-            cancelFunc(handle)
-        }
-    }
+    func cancel() { _ = startClose() }
+    func close() async throws { try await startClose().value }
 }
 {%- endif %}
 
@@ -396,29 +367,45 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
 }
 
 {%- if ci.has_async_callback_interface_definition() %}
-private func uniffiTraitInterfaceCallAsync<T>(
+private func uniffiTraitInterfaceCallAsync<T: Sendable>(
     makeCall: @escaping @Sendable () async throws -> T,
     handleSuccess: @escaping @Sendable (T) -> (),
     handleError: @escaping @Sendable (Int8, RustBuffer) -> (),
-    droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+    droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>,
+    lowerError: (@Sendable (Swift.Error) -> RustBuffer?)? = nil,
+    discardResult: (@Sendable (T) async -> Void)? = nil
 ) {
     let task = Task {
-        // Note: it's important we call either `handleSuccess` or `handleError` exactly once.  Each
-        // call consumes an Arc reference, which means there should be no possibility of a double
-        // call.  The following code is structured so that will will never call both `handleSuccess`
-        // and `handleError`, even in the face of weird errors.
-        //
-        // On platforms that need extra machinery to make C-ABI calls, like JNA or ctypes, it's
-        // possible that we fail to make either call.  However, it doesn't seem like this is
-        // possible on Swift since swift can just make the C call directly.
-        var callResult: T
+        // Never race a cancellation acknowledgement against makeCall. Its async
+        // frame (including defer) must return before the one FFI completion.
+        var outcome: Result<T, Swift.Error>?
         do {
-            callResult = try await makeCall()
+            outcome = .success(try await makeCall())
         } catch {
-            handleError(CALL_UNEXPECTED_ERROR, {{ Type::String.borrow()|lower_fn }}(String(describing: error)))
+            outcome = .failure(error)
+        }
+        if Task.isCancelled {
+            if case let .success(value) = outcome {
+                await discardResult?(value)
+            }
+            // Release an unclaimed host object/stream before acknowledging cancel;
+            // do not lower it into a new foreign handle that nobody can consume.
+            outcome = nil
+            handleError(CALL_CANCELLED, RustBuffer.empty())
             return
         }
-        handleSuccess(callResult)
+        switch outcome! {
+        case let .success(value):
+            handleSuccess(value)
+        case .failure(is CancellationError):
+            handleError(CALL_CANCELLED, RustBuffer.empty())
+        case let .failure(error):
+            if let buffer = lowerError?(error) {
+                handleError(CALL_ERROR, buffer)
+            } else {
+                handleError(CALL_UNEXPECTED_ERROR, {{ Type::String.borrow()|lower_fn }}(String(describing: error)))
+            }
+        }
     }
     let handle = UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.insert(obj: task)
     droppedCallback.pointee = UniffiForeignFutureDroppedCallbackStruct(
@@ -427,32 +414,24 @@ private func uniffiTraitInterfaceCallAsync<T>(
     )
 }
 
-private func uniffiTraitInterfaceCallAsyncWithError<T, E>(
+private func uniffiTraitInterfaceCallAsyncWithError<T: Sendable, E>(
     makeCall: @escaping @Sendable () async throws -> T,
     handleSuccess: @escaping @Sendable (T) -> (),
     handleError: @escaping @Sendable (Int8, RustBuffer) -> (),
     lowerError: @escaping @Sendable (E) -> RustBuffer,
-    droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+    droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>,
+    discardResult: (@Sendable (T) async -> Void)? = nil
 ) {
-    let task = Task {
-        // See the note in uniffiTraitInterfaceCallAsync for details on `handleSuccess` and
-        // `handleError`.
-        var callResult: T
-        do {
-            callResult = try await makeCall()
-        } catch let error as E {
-            handleError(CALL_ERROR, lowerError(error))
-            return
-        } catch {
-            handleError(CALL_UNEXPECTED_ERROR, {{ Type::String.borrow()|lower_fn }}(String(describing: error)))
-            return
-        }
-        handleSuccess(callResult)
-    }
-    let handle = UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.insert(obj: task)
-    droppedCallback.pointee = UniffiForeignFutureDroppedCallbackStruct(
-        handle: handle,
-        free: uniffiForeignFutureDroppedCallback
+    uniffiTraitInterfaceCallAsync(
+        makeCall: makeCall,
+        handleSuccess: handleSuccess,
+        handleError: handleError,
+        droppedCallback: droppedCallback,
+        lowerError: { error in
+            guard let error = error as? E else { return nil }
+            return lowerError(error)
+        },
+        discardResult: discardResult
     )
 }
 

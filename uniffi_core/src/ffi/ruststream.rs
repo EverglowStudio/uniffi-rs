@@ -2,9 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#[cfg(not(all(feature = "tokio", not(target_arch = "wasm32"))))]
+use crate::rust_future_new;
 use crate::{
-    check_remaining, rust_future_new, FutureLowerReturn, Handle, Lift, LiftArgsError, Lower,
-    LowerReturn, RustBuffer, RustCallError,
+    check_remaining, FutureLowerReturn, Handle, Lift, LiftArgsError, Lower, LowerReturn,
+    RustBuffer, RustCallError,
 };
 use anyhow::{anyhow, bail};
 use bytes::{Buf, BufMut};
@@ -28,6 +30,20 @@ pub type UniFfiStream<T, E> = Pin<Box<dyn Stream<Item = Result<T, E>> + Send + '
 /// Single-threaded wasm stream type reserved for the JavaScript wasm backend.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-unstable-single-threaded"))]
 pub type UniFfiStream<T, E> = Pin<Box<dyn Stream<Item = Result<T, E>> + 'static>>;
+
+/// Apply the same runtime scope as native C ABI stream next/close drivers.
+/// Backends with their own value converters pass the whole CallContext Run.
+#[doc(hidden)]
+pub fn rust_stream_runtime<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+    {
+        async_compat::Compat::new(future)
+    }
+    #[cfg(not(all(feature = "tokio", not(target_arch = "wasm32"))))]
+    {
+        future
+    }
+}
 
 /// One native output-stream transition.
 ///
@@ -598,7 +614,7 @@ where
     handle
 }
 
-pub fn rust_stream_next<T, E, UT>(
+pub fn rust_stream_next<T, E, UT: 'static>(
     registry: &'static RustStreamRegistry<T, E>,
     handle: Handle,
     tag: UT,
@@ -610,7 +626,34 @@ where
 {
     let future = registry_next(registry, handle);
     #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-    let future = async_compat::Compat::new(future);
+    return crate::rust_future_new_tokio(future, tag);
+    #[cfg(not(all(feature = "tokio", not(target_arch = "wasm32"))))]
+    rust_future_new(future, tag)
+}
+
+/// Create the native close-acknowledgement future using the same runtime as
+/// stream next. Cancellation of one waiter does not cancel subscription cleanup.
+#[doc(hidden)]
+#[cfg(feature = "async-runtime")]
+pub fn rust_stream_close<T, E, UT: 'static>(
+    registry: &'static RustStreamRegistry<T, E>,
+    handle: Handle,
+    tag: UT,
+) -> Handle
+where
+    T: UniffiCompatibleStreamValue,
+    E: UniffiCompatibleStreamValue,
+{
+    let future = async move {
+        Ok(crate::InternalCallResult(
+            rust_stream_close_async(registry, handle)
+                .await
+                .map_err(|_| RustCallError::InternalError("stream cleanup failed".into())),
+        ))
+    };
+    #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+    return crate::rust_future_new_tokio(future, tag);
+    #[cfg(not(all(feature = "tokio", not(target_arch = "wasm32"))))]
     rust_future_new(future, tag)
 }
 
@@ -685,27 +728,34 @@ where
     T: UniffiCompatibleStreamValue,
     E: UniffiCompatibleStreamValue,
 {
-    #[cfg(feature = "async-runtime")]
-    {
-        let stream = with_registry(registry, |map| map.get(&handle.as_raw()).cloned());
-        if let Some(stream) = stream {
-            if ACTIVE_STREAM.with(|slot| slot.get() == Some(stream.key)) {
+    // Cancellation can destroy an unpolled stream immediately. Keep both that
+    // destruction and the close waiter's handoff in the stream runtime scope.
+    let mut cancel = std::pin::pin!(rust_stream_runtime(async move {
+        #[cfg(feature = "async-runtime")]
+        {
+            let stream = with_registry(registry, |map| map.get(&handle.as_raw()).cloned());
+            if let Some(stream) = stream {
+                if ACTIVE_STREAM.with(|slot| slot.get() == Some(stream.key)) {
+                    stream.cancel();
+                    return;
+                }
+            }
+            // Settle synchronous destruction immediately; hand off remaining work.
+            let mut close = Box::pin(rust_stream_close_async(registry, handle));
+            let waker = Waker::noop();
+            let _ = close.as_mut().poll(&mut Context::from_waker(waker));
+        }
+        #[cfg(not(feature = "async-runtime"))]
+        {
+            let stream = with_registry(registry, |map| map.remove(&handle.as_raw()));
+            if let Some(stream) = stream {
                 stream.cancel();
-                return;
             }
         }
-        // Settle synchronous destruction immediately; hand off remaining work.
-        let mut close = Box::pin(rust_stream_close_async(registry, handle));
-        let waker = Waker::noop();
-        let _ = close.as_mut().poll(&mut Context::from_waker(waker));
-    }
-    #[cfg(not(feature = "async-runtime"))]
-    {
-        let stream = with_registry(registry, |map| map.remove(&handle.as_raw()));
-        if let Some(stream) = stream {
-            stream.cancel();
-        }
-    }
+    }));
+    let _ = cancel
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()));
 }
 
 #[cfg(feature = "async-runtime")]

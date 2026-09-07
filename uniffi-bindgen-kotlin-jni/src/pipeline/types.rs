@@ -64,7 +64,12 @@ pub fn type_rs(ty: &Type, context: &Context) -> Result<String> {
             format!("{}::{orig_name}", context.rust_module_path_for_type(ty)?)
         }
         Type::Interface { orig_name, imp, .. } => {
-            if !imp.is_trait_interface() {
+            if imp.is_local() {
+                format!(
+                    "::std::sync::Arc<uniffi::async_runtime::LocalObject<{}::{orig_name}>>",
+                    context.rust_module_path_for_type(ty)?
+                )
+            } else if !imp.is_trait_interface() {
                 format!(
                     "::std::sync::Arc<{}::{orig_name}>",
                     context.rust_module_path_for_type(ty)?
@@ -88,9 +93,29 @@ pub fn type_rs(ty: &Type, context: &Context) -> Result<String> {
         Type::Duration => "::std::time::Duration".into(),
         Type::Timestamp => "::std::time::SystemTime".into(),
         Type::Bytes => "::std::vec::Vec<::std::primitive::u8>".into(),
-        Type::Stream { .. } => bail!("Kotlin JNI bindings do not support stream types yet"),
-        Type::InputStream { .. } => {
-            bail!("Kotlin JNI bindings do not support input stream types yet")
+        Type::Stream {
+            item_type,
+            error_type,
+            ..
+        }
+        | Type::InputStream {
+            item_type,
+            error_type,
+            ..
+        } => {
+            let adapter = if matches!(ty, Type::Stream { .. }) {
+                "UniFfiStream"
+            } else {
+                "UniFfiInputStream"
+            };
+            let error = match error_type {
+                Some(error) => type_rs(error, context)?,
+                None => "::std::convert::Infallible".into(),
+            };
+            format!(
+                "uniffi::{adapter}<{}, {error}>",
+                type_rs(item_type, context)?
+            )
         }
     })
 }
@@ -151,10 +176,14 @@ pub fn type_kt(ty: &Type, context: &Context) -> Result<String> {
         Type::Duration => "java.time.Duration".into(),
         Type::Timestamp => "java.time.Instant".into(),
         Type::Bytes => "kotlin.ByteArray".into(),
-        Type::Stream { .. } => bail!("Kotlin JNI bindings do not support stream types yet"),
-        Type::InputStream { .. } => {
-            bail!("Kotlin JNI bindings do not support input stream types yet")
-        }
+        Type::Stream { item_type, .. } => format!(
+            "kotlinx.coroutines.flow.Flow<{}>",
+            type_kt(item_type, context)?
+        ),
+        Type::InputStream { item_type, .. } => format!(
+            "kotlinx.coroutines.flow.Flow<{}>",
+            type_kt(item_type, context)?
+        ),
     })
 }
 
@@ -561,6 +590,9 @@ impl TypeNode {
             t if t.starts_with("kotlin.collections.List") => "Ljava/util/List;".into(),
             t if t.starts_with("kotlin.collections.Map") => "Ljava/util/Map;".into(),
             t if t.starts_with("kotlin.collections.Set") => "Ljava/util/Set;".into(),
+            t if t.starts_with("kotlinx.coroutines.flow.Flow<") => {
+                "Lkotlinx/coroutines/flow/Flow;".into()
+            }
             type_name => format!("L{};", type_name.replace(".", "/").replace("`", "")),
         }
     }

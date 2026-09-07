@@ -97,6 +97,21 @@ pub trait Provider: Send + Sync {
     ) -> BoxFuture<'_, Result<u32, Failure>>;
 }
 
+// Compiling the generated callback implementations checks that internal local
+// variables cannot shadow parameters from the original business signature.
+#[uniffi::export(with_foreign)]
+pub trait HygienicCallback: Send + Sync {
+    fn convert(&self, value: String, status: u32, vtable: bool) -> String;
+    fn boxed(&self, uniffi_receiver: String) -> BoxFuture<'_, String>;
+    async fn receive(
+        &self,
+        uniffi_result: uniffi::UniFfiInputStream<u32, Failure>,
+        callback: String,
+        callback_data: u32,
+        dropped: bool,
+    ) -> u32;
+}
+
 #[derive(uniffi::Object)]
 pub struct RustProvider;
 #[uniffi::export]

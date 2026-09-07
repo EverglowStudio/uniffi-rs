@@ -59,6 +59,57 @@ mod test {
     }
 
     #[test]
+    fn test_unified_async() {
+        run_tests(test_dir(), "tests/unified_async.kts");
+    }
+
+    #[test]
+    fn test_unified_async_ownership() {
+        run_tests(test_dir(), "tests/unified_async_ownership.kts");
+    }
+
+    #[test]
+    fn test_unified_async_ready_result() {
+        let temp_dir = test_dir();
+        let jar = temp_dir.join("ready_result.jar");
+        let sources = glob::glob(temp_dir.join("uniffi/**/*.kt").as_str())
+            .unwrap()
+            .map(|path| path.unwrap())
+            .collect::<Vec<_>>();
+        // Internal driver access requires the same Kotlin module. All poll,
+        // complete and close operations still use the real native library.
+        let output = Command::new("kotlinc")
+            .arg("-Werror")
+            .arg("-classpath")
+            .arg(calc_classpath(vec![]))
+            .args(sources)
+            .arg("tests/support/ready_result.kt")
+            .arg("-d")
+            .arg(&jar)
+            .output()
+            .expect("compile Ready ownership regression");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new("kotlin")
+            .arg("-J-ea")
+            .arg("-classpath")
+            .arg(calc_classpath(vec![&jar, temp_dir]))
+            .arg("Ready_resultKt")
+            .output()
+            .expect("run Ready ownership regression");
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn test_futures() {
         run_tests(test_dir(), "tests/futures.kts");
     }

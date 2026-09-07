@@ -150,10 +150,12 @@ open class {{ cls.name_kt() }} : {{ cls.base_classes|join(", ") }} {
         }
     }
 
+    {%- if !cls.imp.is_local() && !cls.has_close_method() %}
     @Synchronized
     override fun close() {
         this.destroy()
     }
+    {%- endif %}
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.

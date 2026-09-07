@@ -26,6 +26,11 @@
     {%- else %}
     uniffiRustCall()
     {%- endmatch %} { _status ->
+    {%- if !func.input_stream_arguments().is_empty() %}
+    uniffiWithInputStreamArguments { __inputArguments ->
+        {% call prepare_input_arguments(func) %}{% endcall %}
+    {%- endif %}
+    {% call transfer_input_arguments(func) %}{% endcall %}
     UniffiLib.{{ func.ffi_func().name() }}(
     {%- match func.self_type() %}
     {%- when Some(Type::Object { .. }) %}
@@ -34,8 +39,11 @@
         {{- t|lower_fn }}(this),
     {%- when None %}
     {% endmatch %}
-        {% call arg_list_lowered(func) %}{% endcall -%}
+        {% call prepared_arg_list(func) %}{% endcall -%}
         _status)
+    {%- if !func.input_stream_arguments().is_empty() %}
+    }
+    {%- endif %}
 }
 {%- endmacro -%}
 
@@ -47,8 +55,9 @@
     @Throws({{ throwable|type_name(ci) }}::class)
     {%-     else -%}
     {%- endmatch -%}
-    {%- if callable.is_async() %}
-    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    {%- if callable.is_stream() %}
+    {%- call stream_func_decl(func_decl, callable, indent) %}{% endcall %}
+    {%- else if callable.is_async() %}
     {{ func_decl }} suspend fun {{ callable.name()|fn_name }}(
         {%- call arg_list(callable, callable.self_type().is_none()) %}{% endcall -%}
     ){% match callable.return_type() %}{% when Some(return_type) %} : {{ return_type|type_name(ci) }}{% when None %}{%- endmatch %} {
@@ -69,87 +78,97 @@
 {% endmacro %}
 
 {%- macro stream_func_decl(func_decl, callable, indent) %}
-    {%- call docstring(callable, indent) %}{% endcall %}
-
-    {%- if let Some(stream_item_type) = callable.stream_item_type() %}
-    {%- if let Some(stream_error_type) = callable.stream_error_type() %}
-    {%- if let Some(stream_next_ffi_return_type) = callable.stream_next_ffi_return_type() %}
-    {{ func_decl }} fun {{ callable.name()|fn_name }}(
+    {{ func_decl }} {% if callable.is_async() %}suspend {% endif %}fun {{ callable.name()|fn_name }}(
         {%- call arg_list(callable, callable.self_type().is_none()) %}{% endcall -%}
     ) : {{ callable.return_type().unwrap()|type_name(ci) }} {
-        return UniFfiStream {
-            val __streamHandle = {% call to_ffi_call(callable) %}{% endcall %}
-            var __streamFailure: Throwable? = null
-            try {
-                while (true) {
-                    val __streamNext = uniffiRustCallAsync(
-                        UniffiLib.{{ callable.ffi_stream_next_func() }}(__streamHandle),
-                        { future, callback, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_poll(ci) }}(future, callback, continuation) },
-                        { future, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_complete(ci) }}(future, continuation) },
-                        { future -> UniffiLib.{{ callable.ffi_stream_next_rust_future_free(ci) }}(future) },
-                        { __uniffiLiftStreamNext(
-                            it,
-                            { buffer -> {{ stream_item_type|read_fn }}(buffer) },
-                            { buffer -> {{ stream_error_type|read_fn }}(buffer) },
-                        ) },
-                        UniffiNullRustCallStatusErrorHandler,
-                    )
-                    when (__streamNext) {
-                        is __UniffiStreamNext.Item -> emit(__streamNext.value)
-                        __UniffiStreamNext.Done -> break
-                        is __UniffiStreamNext.Error -> throw __streamNext.error
-                    }
-                }
-            } catch (__streamError: Throwable) {
-                __streamFailure = __streamError
-                throw __streamError
-            } finally {
-                try {
-                    UniffiLib.{{ callable.ffi_stream_cancel_func() }}(__streamHandle)
-                } catch (__streamCleanupError: Throwable) {
-                    val __streamOriginalError = __streamFailure
-                    if (__streamOriginalError == null) {
-                        throw __streamCleanupError
-                    }
-                    __streamOriginalError.addSuppressed(__streamCleanupError)
-                }
-            }
-        }
+        {%- if callable.is_async() %}
+        return {% call call_async(callable) %}{% endcall %}
+        {%- else %}
+        val __streamHandle = {% call to_ffi_call(callable) %}{% endcall %}
+        return {% call lift_stream(callable, "__streamHandle") %}{% endcall %}
+        {%- endif %}
     }
-    {%- endif %}
-    {%- endif %}
-    {%- endif %}
 {% endmacro %}
+
+{%- macro lift_stream(callable, handle) -%}
+    UniFfiStream(
+        next = {
+            uniffiRustCallAsync(
+                UniffiLib.{{ callable.ffi_stream_next_func() }}({{ handle }}),
+                { future, callback, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_poll(ci) }}(future, callback, continuation) },
+                { future -> UniffiLib.{{ callable.ffi_stream_next_rust_future_cancel(ci) }}(future) },
+                { future, status -> UniffiLib.{{ callable.ffi_stream_next_rust_future_complete(ci) }}(future, status) },
+                { future -> UniffiLib.{{ callable.ffi_stream_next_rust_future_free(ci) }}(future) },
+                { __uniffiLiftStreamNext(
+                    it,
+                    { buffer -> {{ callable.stream_item_type().unwrap()|read_fn }}(buffer) },
+                    {%- if let Some(error_type) = callable.stream_error_type() %}
+                    { buffer -> {{ error_type|read_fn }}(buffer) },
+                    {%- else %}
+                    { _ -> throw InternalException("infallible stream returned a business error") },
+                    {%- endif %}
+                ) },
+                UniffiNullRustCallStatusErrorHandler,
+            )
+        },
+        closeSubscription = {
+            uniffiRustCallAsync(
+                UniffiLib.{{ callable.ffi_stream_close_func() }}({{ handle }}),
+                { future, callback, continuation -> UniffiLib.{{ callable.ffi_stream_close_rust_future_poll(ci) }}(future, callback, continuation) },
+                { future -> UniffiLib.{{ callable.ffi_stream_close_rust_future_cancel(ci) }}(future) },
+                { future, status -> UniffiLib.{{ callable.ffi_stream_close_rust_future_complete(ci) }}(future, status) },
+                { future -> UniffiLib.{{ callable.ffi_stream_close_rust_future_free(ci) }}(future) },
+                {},
+                UniffiNullRustCallStatusErrorHandler,
+            )
+        },
+    )
+{%- endmacro %}
 
 {%- macro call_async(callable) -%}
     uniffiRustCallAsync(
 
-{%- match callable.self_type() %}
-{%- when Some(Type::Object { .. }) %}
+        {%- if !callable.input_stream_arguments().is_empty() %}
+        uniffiWithInputStreamArguments { __inputArguments ->
+            {% call prepare_input_arguments(callable) %}{% endcall %}
+        {%- endif %}
+        {%- match callable.self_type() %}
+        {%- when Some(Type::Object { .. }) %}
         callWithHandle { uniffiHandle ->
+            {% call transfer_input_arguments(callable) %}{% endcall %}
             UniffiLib.{{ callable.ffi_func().name() }}(
                 uniffiHandle,
-                {% call arg_list_lowered(callable) %}{% endcall %}
+                {% call prepared_arg_list(callable) %}{% endcall %}
             )
-        },
-{%- when Some(t) %}
+        }
+        {%- when Some(t) %}
+        {% call transfer_input_arguments(callable) %}{% endcall %}
         UniffiLib.{{ callable.ffi_func().name() }}(
             {{- t|lower_fn }}(this),
-            {% call arg_list_lowered(callable) %}{% endcall %}
-        ),
-{%- else %}
-        UniffiLib.{{ callable.ffi_func().name() }}({% call arg_list_lowered(callable) %}{% endcall %}),
-{%- endmatch %}
+            {% call prepared_arg_list(callable) %}{% endcall %}
+        )
+        {%- else %}
+        {% call transfer_input_arguments(callable) %}{% endcall %}
+        UniffiLib.{{ callable.ffi_func().name() }}({% call prepared_arg_list(callable) %}{% endcall %})
+        {%- endmatch %}
+        {%- if !callable.input_stream_arguments().is_empty() %}
+        }
+        {%- endif %},
         {{ callable|async_poll(ci) }},
+        {{ callable|async_cancel(ci) }},
         {{ callable|async_complete(ci) }},
         {{ callable|async_free(ci) }},
-        // lift function
+        // Lift only after Rust commits completion; a cancelled factory owns its result.
+        {%- if callable.is_stream() %}
+        { __streamHandle -> {% call lift_stream(callable, "__streamHandle") %}{% endcall %} },
+        {%- else %}
         {%- match callable.return_type() %}
         {%- when Some(return_type) %}
         { {{ return_type|lift_fn }}(it) },
         {%- when None %}
         { },
         {% endmatch %}
+        {%- endif %}
         // Error FFI converter
         {%- match callable.throws_type() %}
         {%- when Some(e) %}
@@ -161,7 +180,32 @@
         {%- when None %}
         UniffiNullRustCallStatusErrorHandler,
         {%- endmatch %}
+        {%- if callable.is_stream() %}
+        discardResult = { it.close() },
+        {%- endif %}
     )
+{%- endmacro %}
+
+{%- macro transfer_input_arguments(func) %}
+    {%- if !func.input_stream_arguments().is_empty() %}
+    __inputArguments.transfer()
+    {%- endif %}
+{%- endmacro %}
+
+{%- macro prepare_input_arguments(func) %}
+    {%- for arg in func.arguments() %}
+    val __uniffiArg{{ loop.index }} = {{ arg|lower_fn_for_arg }}({{ arg.name()|var_name }}){% if arg|is_input_stream_arg %}.also { __inputArguments.add(it) }{% endif %}
+    {%- endfor %}
+{%- endmacro %}
+
+{%- macro prepared_arg_list(func) %}
+    {%- if func.input_stream_arguments().is_empty() %}
+    {% call arg_list_lowered(func) %}{% endcall %}
+    {%- else %}
+    {%- for arg in func.arguments() %}
+    __uniffiArg{{ loop.index }},
+    {%- endfor %}
+    {%- endif %}
 {%- endmacro %}
 
 {%- macro arg_list_lowered(func) %}

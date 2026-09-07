@@ -31,8 +31,10 @@ pub fn function_callable(func: &initial::Function, context: &Context) -> Result<
 
     let callable = Callable {
         id: func.id,
+        module_path: func.module_path.clone(),
         name,
         orig_name: func.orig_name.clone(),
+        rust_async: func.rust_async,
         rust_return_is_result: func.rust_return_is_result,
         rust_stream_item_is_result: func.rust_stream_item_is_result,
         async_data: function_async_data(func, context)?,
@@ -85,8 +87,10 @@ pub fn method_callable_with_kind(
 
     let callable = Callable {
         id: meth.id,
+        module_path: meth.module_path.clone(),
         name,
         orig_name: meth.orig_name.clone(),
+        rust_async: meth.rust_async,
         rust_return_is_result: meth.rust_return_is_result,
         rust_stream_item_is_result: meth.rust_stream_item_is_result,
         arguments,
@@ -129,8 +133,10 @@ pub fn constructor_callable(cons: &initial::Constructor, context: &Context) -> R
 
     let callable = Callable {
         id: cons.id,
+        module_path: cons.module_path.clone(),
         name,
         orig_name: cons.orig_name.clone(),
+        rust_async: cons.rust_async,
         rust_return_is_result: cons.rust_return_is_result,
         rust_stream_item_is_result: cons.rust_stream_item_is_result,
         async_data: constructor_async_data(cons, interface_name, imp, context)?,

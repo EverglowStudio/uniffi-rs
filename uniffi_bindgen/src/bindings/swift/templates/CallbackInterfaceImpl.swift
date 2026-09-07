@@ -55,7 +55,7 @@ fileprivate struct {{ trait_impl }} {
 
             {% match meth.return_type() %}
             {%- when Some(t) %}
-            let writeReturn = { uniffiOutReturn.pointee = {{ t|lower_fn }}($0) }
+            let writeReturn: ({{ t|type_name }}) -> Void = { uniffiOutReturn.pointee = {{ t|lower_fn }}($0) }
             {%- when None %}
             let writeReturn = { () }
             {%- endmatch %}
@@ -106,7 +106,8 @@ fileprivate struct {{ trait_impl }} {
                 makeCall: makeCall,
                 handleSuccess: uniffiHandleSuccess,
                 handleError: uniffiHandleError,
-                droppedCallback: uniffiOutDroppedCallback
+                droppedCallback: uniffiOutDroppedCallback{% if meth.is_stream() %},
+                discardResult: { try? await $0.close() }{% endif %}
             )
             {%- when Some(error_type) %}
             uniffiTraitInterfaceCallAsyncWithError(
@@ -114,11 +115,15 @@ fileprivate struct {{ trait_impl }} {
                 handleSuccess: uniffiHandleSuccess,
                 handleError: uniffiHandleError,
                 lowerError: {{ error_type|lower_fn }},
-                droppedCallback: uniffiOutDroppedCallback
+                droppedCallback: uniffiOutDroppedCallback{% if meth.is_stream() %},
+                discardResult: { try? await $0.close() }{% endif %}
             )
             {%- endmatch %}
             {%- endif %}
-        }{% if !loop.last %},{% endif %}
+        }{% if meth.is_stream() %},
+        {{ format!("{}_stream_next", meth.name())|fn_name }}: uniffiInputStreamNextCallback,
+        {{ format!("{}_stream_cancel", meth.name())|fn_name }}: uniffiInputStreamCancelCallback,
+        {{ format!("{}_stream_close", meth.name())|fn_name }}: uniffiInputStreamCloseCallback{% endif %}{% if !loop.last %},{% endif %}
         {%- endfor %}
     )
 

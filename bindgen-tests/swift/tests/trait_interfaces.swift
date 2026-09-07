@@ -5,37 +5,28 @@
 import Foundation
 import uniffi_bindgen_tests
 
-// We want to mutate traitRefCount from async swift code.
-// The simplest way to do that seems to be to mark it `nonisolated(unsafe)`.
-nonisolated(unsafe) var traitRefCount = 0;
-// Let's use this lock whenever we mutate traitRefCount, just to make sure that everything is
-// thread-safe.
-nonisolated(unsafe) var traitRefCountLock = NSLock()
+let traitRefCount = TestLocked(0);
 
 class TraitImpl: TestTraitInterface, @unchecked Sendable {
-    var value: UInt32;
+    let value: TestLocked<UInt32>;
 
     init(value: UInt32) {
-        self.value = value;
-        traitRefCountLock.withLock {
-            traitRefCount += 1
-        }
+        self.value = TestLocked(value);
+        traitRefCount.update { $0 += 1 }
     }
 
     deinit {
-        traitRefCountLock.withLock {
-            traitRefCount -= 1
-        }
+        traitRefCount.update { $0 -= 1 }
     }
 
     func noop() { }
 
     func getValue() -> UInt32 {
-        return self.value;
+        return self.value.read();
     }
 
     func setValue(value: UInt32) {
-        self.value = value;
+        self.value.update { $0 = value };
     }
 
     func throwIfEqual(numbers: CallbackInterfaceNumbers) throws -> CallbackInterfaceNumbers {
@@ -119,37 +110,28 @@ testSwiftImpl(traitImpl: TraitImpl(value: 42))
 testSwiftImpl(traitImpl: roundtripTestTraitInterface(interface: TraitImpl(value: 42)))
 testSwiftImpl(traitImpl: roundtripTestTraitInterfaceList(interfaces: [TraitImpl(value: 42)])[0])
 
-// We want to mutate asyncTraitRefCount from async swift code.
-// The simplest way to do that seems to be to mark it `nonisolated(unsafe)`.
-nonisolated(unsafe) var asyncTraitRefCount = 0;
-// Let's use this lock whenever we mutate asyncTraitRefCount, just to make sure that everything is
-// thread-safe.
-nonisolated(unsafe) var asyncTraitRefCountLock = NSLock()
+let asyncTraitRefCount = TestLocked(0);
 
 class AsyncTraitImpl: AsyncTestTraitInterface, @unchecked Sendable {
-    var value: UInt32;
+    let value: TestLocked<UInt32>;
 
     init(value: UInt32) {
-        self.value = value;
-        asyncTraitRefCountLock.withLock {
-            asyncTraitRefCount += 1
-        }
+        self.value = TestLocked(value);
+        asyncTraitRefCount.update { $0 += 1 }
     }
 
     deinit {
-        asyncTraitRefCountLock.withLock {
-            asyncTraitRefCount -= 1
-        }
+        asyncTraitRefCount.update { $0 -= 1 }
     }
 
     func noop() async throws { }
 
     func getValue() async throws -> UInt32 {
-        return self.value;
+        return self.value.read();
     }
 
     func setValue(value: UInt32) async throws {
-        self.value = value;
+        self.value.update { $0 = value };
     }
 
     func throwIfEqual(numbers: CallbackInterfaceNumbers) async throws -> CallbackInterfaceNumbers {
@@ -216,12 +198,8 @@ await testAsyncSwiftImpl(traitImpl: roundtripAsyncTestTraitInterfaceList(interfa
 
 // The previous calls created and destroyed a ton of references to the Swift-implemented trait
 // interfaces, check that the refcounts have gone back to 0.
-traitRefCountLock.withLock {
-    assert(traitRefCount == 0)
-}
-asyncTraitRefCountLock.withLock {
-    assert(asyncTraitRefCount == 0)
-}
+assert(traitRefCount.read() == 0)
+assert(asyncTraitRefCount.read() == 0)
 
 // Rust-only trait: smoke-test for the #[uniffi::export(rust)] codegen path
 func testRustOnlyImpl(impl: TestRustOnlyTraitInterface) {

@@ -3,13 +3,32 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use super::*;
+use anyhow::Context as _;
 
 pub fn map_root(input: general::Root, context: &Context) -> Result<Root> {
     let mut context = context.clone();
     context.update_from_root(&input)?;
 
+    let mut trait_types = IndexSet::new();
+    input.visit(|interface: &general::Interface| {
+        if interface.imp.is_trait_interface() {
+            trait_types.insert(interface.self_type.ty.clone());
+        }
+    });
+    let trait_imports = trait_types
+        .iter()
+        .map(|ty| {
+            Ok(format!(
+                "{}::{}",
+                context.rust_module_path_for_type(ty)?,
+                names::escape_rust(ty.orig_name().context("implemented trait has no name")?)
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(Root {
         cdylib: input.cdylib,
+        trait_imports,
         packages: Vec::from_iter(input.namespaces.map_node(&context)?.into_values()),
     })
 }
@@ -59,6 +78,7 @@ impl Root {
                     TypeDefinition::Timestamp(type_node) | TypeDefinition::Duration(type_node) => {
                         type_node.id
                     }
+                    TypeDefinition::Stream(s) => s.self_type.id,
                     TypeDefinition::Interface(_) => return false,
                 })
             })
@@ -121,6 +141,13 @@ impl Root {
 
     pub fn classes(&self) -> impl Iterator<Item = &Class> {
         self.packages.iter().flat_map(Package::classes)
+    }
+
+    pub fn streams(&self) -> impl Iterator<Item = &StreamType> {
+        self.ffi_type_definitions().filter_map(|d| match d {
+            TypeDefinition::Stream(s) => Some(s),
+            _ => None,
+        })
     }
 
     pub fn boxes(&self) -> impl Iterator<Item = &BoxedType> {

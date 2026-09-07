@@ -70,6 +70,11 @@ mod test {
     }
 
     #[test]
+    fn test_unified_async() {
+        run_tests(test_dir(), "tests/unified_async.swift");
+    }
+
+    #[test]
     fn test_trait_interfaces() {
         run_tests(test_dir(), "tests/trait_interfaces.swift");
     }
@@ -138,7 +143,7 @@ mod test {
 
     // We need something better than this env var, but it's a reasonable start.
     fn swift_version() -> String {
-        std::env::var("UNIFFI_TEST_SWIFT_VERSION").unwrap_or("5".to_string())
+        std::env::var("UNIFFI_TEST_SWIFT_VERSION").unwrap_or("6".to_string())
     }
 
     // uniffi-bindgen creates a separate modulemap for each Rust crate.
@@ -166,8 +171,8 @@ mod test {
             .arg("uniffi_bindgen_tests")
             .arg("-emit-module")
             .arg("-parse-as-library")
-            // TODO(2279): Fix concurrency issues and uncomment this
-            //.arg("-strict-concurrency=complete")
+            .arg("-strict-concurrency=complete")
+            .arg("-warnings-as-errors")
             .arg("-o")
             .arg(format!("{DLL_PREFIX}test_library{DLL_SUFFIX}"))
             .arg("-emit-library")
@@ -178,6 +183,7 @@ mod test {
             .arg("-L")
             .arg(tempdir)
             .arg("-luniffi_bindgen_tests_swift")
+            .arg("tests/locked.swift")
             .arg("uniffi_bindgen_tests.swift")
             .arg("uniffi_bindgen_tests_external_types_source.swift");
         let status = command
@@ -207,6 +213,8 @@ mod test {
             .arg("-luniffi_bindgen_tests_swift")
             .arg("-swift-version")
             .arg(swift_version())
+            .arg("-strict-concurrency=complete")
+            .arg("-warnings-as-errors")
             .arg("-Xcc")
             .arg(format!("-fmodule-map-file={tempdir}/combined.modulemap"))
             .arg(script_filename)
@@ -214,13 +222,13 @@ mod test {
             .expect("Failed to spawn `swiftc` when running test script");
         // The `output()` call above sets up pipes to print stdout/stderr.  This allows it to be
         // integrated with the Rust test harness's output handling.
+        print!("{}", String::from_utf8_lossy(&output.stdout));
         if !output.stderr.is_empty() {
             println!("---------------------------------------- STDERR ----------------------------------------");
             print!("{}", String::from_utf8_lossy(&output.stderr));
             println!("----------------------------------------------------------------------------------------");
             panic!("swift outputed standard error");
         }
-        print!("{}", String::from_utf8_lossy(&output.stdout));
         if !output.status.success() {
             panic!("running `swift` to run test script failed ({:?})", command)
         }

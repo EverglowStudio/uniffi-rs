@@ -124,10 +124,13 @@ pub struct Method {
 /// Common data from Function/Method/Constructor
 #[derive(Debug, Clone, Node, MapNode)]
 pub struct Callable {
+    /// Module containing the export declaration, which may differ from its type's module.
+    pub module_path: String,
     pub id: u64,
     pub name: String,
     pub orig_name: String,
     pub async_data: Option<AsyncData>,
+    pub rust_async: bool,
     pub rust_return_is_result: bool,
     pub rust_stream_item_is_result: bool,
     pub kind: CallableKind,

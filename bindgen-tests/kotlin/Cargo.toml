@@ -11,4 +11,4 @@ camino = "1"
 glob = "0.3"
 uniffi = { path = "../../uniffi", features = ["bindgen"] }
 uniffi_bindgen = { path = "../../uniffi_bindgen", features = ["test-util"] }
-uniffi-bindgen-tests = { path = "../lib" }
+uniffi-bindgen-tests = { path = "../lib", features = ["unified-async"] }

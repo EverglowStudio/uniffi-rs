@@ -12,31 +12,64 @@ use crate::{
     fnsig::{FnKind, FnSignature, ReceiverArg},
 };
 
-fn wrap_async_future_expr(rust_fn_call: TokenStream, ar: Option<&AsyncRuntime>) -> TokenStream {
+fn future_constructor(output: &TokenStream, ar: Option<&AsyncRuntime>) -> TokenStream {
     match ar {
-        Some(AsyncRuntime::Tokio(_)) => {
-            quote! { ::uniffi::deps::async_compat::Compat::new(#rust_fn_call) }
-        }
+        Some(AsyncRuntime::Tokio(_)) => quote! { ::uniffi::rust_future_new_tokio::<_, #output, _> },
         None => {
             #[cfg(feature = "default-async-runtime-tokio")]
             {
                 quote! {{
                     #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        ::uniffi::deps::async_compat::Compat::new(#rust_fn_call)
-                    }
+                    { ::uniffi::rust_future_new_tokio::<_, #output, _> }
                     #[cfg(target_arch = "wasm32")]
-                    {
-                        #rust_fn_call
-                    }
+                    { ::uniffi::rust_future_new::<_, #output, _> }
                 }}
             }
             #[cfg(not(feature = "default-async-runtime-tokio"))]
             {
-                rust_fn_call
+                quote! { ::uniffi::rust_future_new::<_, #output, _> }
             }
         }
     }
+}
+
+/// Other Rust scaffolding backends pass the complete call driver here. The
+/// source macro knows the resolved export attribute and convenience feature;
+/// metadata consumers need not reconstruct either from a business signature.
+pub(super) fn gen_async_runtime_helper(
+    sig: &FnSignature,
+    ar: Option<&AsyncRuntime>,
+) -> syn::Result<TokenStream> {
+    if !sig.is_async {
+        return Ok(TokenStream::new());
+    }
+    let ident = format_ident!("{}_runtime", sig.scaffolding_fn_ident()?);
+    let body = match ar {
+        Some(AsyncRuntime::Tokio(_)) => {
+            quote! { ::uniffi::deps::async_compat::Compat::new(future) }
+        }
+        None => {
+            #[cfg(feature = "default-async-runtime-tokio")]
+            {
+                quote! {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    { ::uniffi::deps::async_compat::Compat::new(future) }
+                    #[cfg(target_arch = "wasm32")]
+                    { future }
+                }
+            }
+            #[cfg(not(feature = "default-async-runtime-tokio"))]
+            {
+                quote! { future }
+            }
+        }
+    };
+    Ok(quote! {
+        #[doc(hidden)]
+        pub fn #ident<F: ::std::future::Future>(future: F) -> impl ::std::future::Future<Output = F::Output> {
+            #body
+        }
+    })
 }
 
 pub(super) fn gen_fn_scaffolding(
@@ -97,6 +130,7 @@ pub(super) fn gen_method_scaffolding(
     udl_mode: bool,
     use_trait: Option<&syn::Path>,
 ) -> syn::Result<TokenStream> {
+    let ar = sig.async_runtime.as_ref().or(ar);
     let local_helper = if sig.is_local {
         gen_local_method(&sig, use_trait)?
     } else {
@@ -228,6 +262,23 @@ pub(crate) fn gen_local_close_helper(self_ident: &Ident) -> TokenStream {
             }
         }
     }
+}
+
+#[cfg(not(feature = "scaffolding"))]
+pub(crate) fn gen_local_close_without_scaffolding(
+    self_ident: &Ident,
+    foreign_name: &str,
+) -> syn::Result<TokenStream> {
+    let sig = FnSignature::new_method(
+        self_ident.clone(),
+        Ident::new(foreign_name, self_ident.span()),
+        syn::parse_quote! { async fn close(&self) },
+        super::attributes::ExportFnArgs::default(),
+        String::new(),
+    )?;
+    let helper = gen_local_close_helper(self_ident);
+    let runtime = gen_async_runtime_helper(&sig, None)?;
+    Ok(quote! { #helper #runtime })
 }
 
 // Pieces of code for the scaffolding function
@@ -367,6 +418,7 @@ pub(super) fn gen_ffi_function(
     udl_mode: bool,
     use_trait: Option<&syn::Path>,
 ) -> syn::Result<TokenStream> {
+    let runtime_adapter = gen_async_runtime_helper(sig, ar)?;
     let ScaffoldingBits {
         param_names,
         param_types,
@@ -395,7 +447,7 @@ pub(super) fn gen_ffi_function(
         .map(|tr| quote! { use #tr; });
     let input_stream_callback_registrations = gen_input_stream_callback_registrations(sig);
     if sig.stream_return.is_some() {
-        return gen_stream_ffi_function(
+        let stream_scaffolding = gen_stream_ffi_function(
             sig,
             ar,
             use_trait,
@@ -406,13 +458,14 @@ pub(super) fn gen_ffi_function(
                 rust_fn_call,
                 convert_result,
             },
-        );
+        )?;
+        return Ok(quote! { #runtime_adapter #stream_scaffolding });
     }
     let ffi_return_ty = ffiops::lower_return_type(return_ty);
     let lower_return = ffiops::lower_return(return_ty);
     let handle_failed_lift = ffiops::lower_return_handle_failed_lift(return_ty);
 
-    Ok(if !sig.is_async {
+    let scaffolding = if !sig.is_async {
         let scaffolding_fn_ffi_buffer_version =
             ffi_buffer_scaffolding_fn(&ffi_ident, &ffi_return_ty, &param_types, true);
         let uniffi_args_binding = if sig.has_mut_ref_bytes() {
@@ -454,12 +507,13 @@ pub(super) fn gen_ffi_function(
             #scaffolding_fn_ffi_buffer_version
         }
     } else {
-        let future_expr = wrap_async_future_expr(rust_fn_call, ar);
+        let future_expr = rust_fn_call;
         let future_output = if sig.is_local {
             quote! { ::uniffi::InternalCallResult<#return_ty> }
         } else {
             quote! { #return_ty }
         };
+        let new_future = future_constructor(&future_output, ar);
         let async_result = if sig.is_local {
             quote! {
                 ::uniffi::InternalCallResult(
@@ -481,7 +535,7 @@ pub(super) fn gen_ffi_function(
             pub extern "C" fn #ffi_ident(#(#param_names: #param_types,)*) -> ::uniffi::Handle {
                 ::uniffi::deps::trace!("calling: {}", #name);
                 let uniffi_lifted_args = (#lift_closure)();
-                ::uniffi::rust_future_new::<_, #future_output, _>(
+                (#new_future)(
                     async move {
                         match uniffi_lifted_args {
                             ::std::result::Result::Ok(uniffi_args) => {
@@ -499,7 +553,8 @@ pub(super) fn gen_ffi_function(
 
             #scaffolding_fn_ffi_buffer_version
         }
-    })
+    };
+    Ok(quote! { #runtime_adapter #scaffolding })
 }
 
 fn gen_stream_ffi_function(
@@ -554,7 +609,8 @@ fn gen_stream_ffi_function(
     };
     let input_registrations = gen_input_stream_callback_registrations(sig);
     let function = if sig.is_async {
-        let future = wrap_async_future_expr(rust_fn_call, ar);
+        let future = rust_fn_call;
+        let new_future = future_constructor(&output, ar);
         let buffer = ffi_buffer_scaffolding_fn(
             &ffi_ident,
             &quote! { ::uniffi::Handle },
@@ -567,7 +623,7 @@ fn gen_stream_ffi_function(
             pub extern "C" fn #ffi_ident(#(#param_names: #param_types,)*) -> ::uniffi::Handle {
                 #use_trait
                 let args = (#lift_closure)();
-                ::uniffi::rust_future_new::<_, #output, _>(async move {
+                (#new_future)(async move {
                     match args {
                         Ok(uniffi_args) => {
                             let uniffi_result = #future.await;
@@ -623,12 +679,7 @@ fn gen_stream_ffi_function(
         #[doc(hidden)]
         #[unsafe(no_mangle)]
         pub extern "C" fn #close(handle: ::uniffi::Handle) -> ::uniffi::Handle {
-            ::uniffi::rust_future_new::<_, ::uniffi::InternalCallResult<()>, _>(async move {
-                Ok(::uniffi::InternalCallResult(
-                    ::uniffi::rust_stream_close_async(&#registry, handle).await
-                        .map_err(|_| ::uniffi::RustCallError::InternalError("stream cleanup failed".into()))
-                ))
-            }, crate::UniFfiTag)
+            ::uniffi::rust_stream_close::<#item, #error, _>(&#registry, handle, crate::UniFfiTag)
         }
     })
 }
@@ -663,7 +714,7 @@ fn gen_input_stream_callback_registrations(sig: &FnSignature) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{gen_ffi_function, wrap_async_future_expr};
+    use super::{future_constructor, gen_ffi_function};
     use crate::{
         export::{AsyncRuntime, ExportFnArgs},
         fnsig::{FnKind, FnSignature},
@@ -673,30 +724,32 @@ mod tests {
     use syn::LitStr;
 
     #[test]
-    fn explicit_tokio_async_runtime_wraps_future() {
+    fn explicit_tokio_async_runtime_wraps_entire_call() {
         let runtime = AsyncRuntime::Tokio(LitStr::new("tokio", Span::call_site()));
-        let tokens = wrap_async_future_expr(quote! { call_me() }, Some(&runtime)).to_string();
-        assert!(tokens.contains("async_compat"));
-        assert!(tokens.contains("Compat"));
-        assert!(tokens.contains("call_me"));
+        let tokens = future_constructor(&quote! { u32 }, Some(&runtime)).to_string();
+        assert!(tokens.contains("rust_future_new_tokio"));
+        assert!(tokens.contains("u32"));
     }
 
     #[cfg(feature = "default-async-runtime-tokio")]
     #[test]
-    fn default_tokio_feature_wraps_non_wasm_only() {
-        let tokens = wrap_async_future_expr(quote! { call_me() }, None).to_string();
-        assert!(tokens.contains("async_compat"));
+    fn default_tokio_feature_selects_non_wasm_only() {
+        let tokens = future_constructor(&quote! { u32 }, None).to_string();
+        assert!(tokens.contains("rust_future_new_tokio"));
         assert!(tokens.contains("target_arch"));
         assert!(tokens.contains("wasm32"));
-        assert!(tokens.contains("call_me"));
+        assert!(tokens.contains("u32"));
     }
 
     #[cfg(not(feature = "default-async-runtime-tokio"))]
     #[test]
     fn without_feature_default_async_runtime_is_unchanged() {
-        let tokens = wrap_async_future_expr(quote! { call_me() }, None).to_string();
-        assert!(!tokens.contains("async_compat"));
-        assert_eq!(tokens, quote! { call_me() }.to_string());
+        let tokens = future_constructor(&quote! { u32 }, None).to_string();
+        assert!(!tokens.contains("rust_future_new_tokio"));
+        assert_eq!(
+            tokens,
+            quote! { ::uniffi::rust_future_new::<_, u32, _> }.to_string()
+        );
     }
 
     #[test]

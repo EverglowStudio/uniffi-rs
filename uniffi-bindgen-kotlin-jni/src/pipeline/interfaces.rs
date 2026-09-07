@@ -5,11 +5,10 @@
 use super::*;
 
 pub fn map_class(int: general::Interface, context: &Context) -> Result<Class> {
-    let mut base_classes = vec![
-        interface_name(&int),
-        "uniffi.Disposable".to_string(),
-        "AutoCloseable".to_string(),
-    ];
+    let mut base_classes = vec![interface_name(&int), "uniffi.Disposable".to_string()];
+    if !int.imp.is_local() && !int.methods.iter().any(|m| m.callable.name == "close") {
+        base_classes.push("AutoCloseable".into());
+    }
     let callback_interface = int
         .imp
         .has_callback_interface()
@@ -77,8 +76,17 @@ impl Class {
         names::escape_rust(&self.orig_name)
     }
 
+    pub fn has_close_method(&self) -> bool {
+        self.methods.iter().any(|m| m.callable.name == "close")
+    }
+
     pub fn inner_type_name(&self) -> String {
-        format!("{}::{}", self.module_path, self.name_rs())
+        let name = format!("{}::{}", self.module_path, self.name_rs());
+        if self.imp.is_local() {
+            format!("uniffi::async_runtime::LocalObject<{name}>")
+        } else {
+            name
+        }
     }
 
     pub fn jni_free_name(&self) -> String {

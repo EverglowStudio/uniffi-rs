@@ -25,7 +25,7 @@ pub(crate) use attributes::{AsyncRuntime, CallbackContractArg, DefaultMap, Expor
 pub use callback_interface::ffi_converter_callback_interface_impl;
 pub(crate) use scaffolding::gen_local_close;
 #[cfg(not(feature = "scaffolding"))]
-pub(crate) use scaffolding::gen_local_close_helper;
+pub(crate) use scaffolding::gen_local_close_without_scaffolding;
 pub use trait_interface::alter_trait;
 
 // TODO(jplatte): Ensure no generics, …
@@ -298,14 +298,46 @@ pub(crate) fn without_scaffolding(
     let export = ExportItem::new(item, args)?;
     let diagnostics = foreign_async_diagnostics(&export);
     let mut helpers = Vec::new();
-    if let ExportItem::Impl { items, trait_, .. } = export {
-        for item in items {
-            if let ImplItem::Method(sig) = item {
-                if sig.is_local {
-                    helpers.push(scaffolding::gen_local_method(&sig, trait_.as_ref())?);
+    match export {
+        ExportItem::Function { sig, args } => {
+            helpers.push(scaffolding::gen_async_runtime_helper(
+                &sig,
+                args.async_runtime.as_ref(),
+            )?);
+        }
+        ExportItem::Impl {
+            items,
+            trait_,
+            args,
+            ..
+        } => {
+            for item in items {
+                let sig = match item {
+                    ImplItem::Method(sig) => {
+                        if sig.is_local {
+                            helpers.push(scaffolding::gen_local_method(&sig, trait_.as_ref())?);
+                        }
+                        sig
+                    }
+                    ImplItem::Constructor(sig) => sig,
+                };
+                helpers.push(scaffolding::gen_async_runtime_helper(
+                    &sig,
+                    sig.async_runtime.as_ref().or(args.async_runtime.as_ref()),
+                )?);
+            }
+        }
+        ExportItem::Trait { items, args, .. } => {
+            for item in items {
+                if let ImplItem::Method(sig) = item {
+                    helpers.push(scaffolding::gen_async_runtime_helper(
+                        &sig,
+                        sig.async_runtime.as_ref().or(args.async_runtime.as_ref()),
+                    )?);
                 }
             }
         }
+        _ => {}
     }
     Ok(quote! { #diagnostics #original #(#helpers)* })
 }

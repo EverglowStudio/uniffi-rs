@@ -5,10 +5,12 @@ package uniffi
 // However, we do need to import extension methods
 // since there's no other way to call them.
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collect
 
 class InternalException(message: kotlin.String) : Exception(message)
 
 {% include "Async.kt" %}
+{% include "StreamRuntime.kt" %}
 {% include "FfiBuffer.kt" %}
 {% include "LiftLower.kt" %}
 {% include "Scaffolding.kt" %}
@@ -44,6 +46,8 @@ class InternalException(message: kotlin.String) : Exception(message)
 {% include "TimestampFfi.kt" %}
 {%- when TypeDefinition::Duration(type_node) %}
 {% include "DurationFfi.kt" %}
+{%- when TypeDefinition::Stream(stream) %}
+{% include "StreamFfi.kt" %}
 {%- when TypeDefinition::Interface(_) %}
 {%- endmatch %}
 {%- endfor %}

@@ -103,7 +103,7 @@ pub use ffi_converter_traits::{
 #[cfg(feature = "async-runtime")]
 pub use local_object::LocalObjectType;
 pub use metadata::*;
-pub use stream_output::{ForeignStreamReturn, RustStreamOutput};
+pub use stream_output::RustStreamOutput;
 
 // Re-export the libs that we use in the generated code,
 // so the consumer doesn't have to depend on them directly.
