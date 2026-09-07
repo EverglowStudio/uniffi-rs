@@ -8,4 +8,4 @@
 mod rust;
 
 pub(crate) use rust::wasm_source::{post_link as wasm_post_link, render as wasm_source};
-pub(crate) use rust::{napi_source, ohos_source};
+pub(crate) use rust::{electron_lease_paths, napi_source, ohos_source};

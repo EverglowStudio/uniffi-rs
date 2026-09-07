@@ -552,6 +552,7 @@ fn render_host_crate(
         "ohos" => (
             format!(
                 "{dependency_text}{uniffi_dep}async-trait = \"0.1\"\n\
+                 futures-channel = \"0.3\"\n\
                  napi-ohos = {{ git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"{OHOS_REV}\", package = \"napi-ohos\", default-features = false, features = [\"napi8\", \"tokio_rt\"] }}\n\
                  napi-derive-ohos = {{ git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"{OHOS_REV}\", package = \"napi-derive-ohos\", features = [\"strict\", \"type-def\"] }}\n\
                  napi-ohos-uniffi-engine = {{ git = \"https://github.com/EverglowStudio/ohos-rs.git\", rev = \"{OHOS_REV}\" }}\n"
