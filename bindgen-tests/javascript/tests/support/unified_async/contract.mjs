@@ -287,6 +287,132 @@ export async function runContract(root, realm) {
       await component.close(); counter.dispose(); component.dispose();
     });
   }
+  // S05: ordinary business methods backed by public Rust actor APIs. Each case
+  // runs with Send(!Sync) state and native owner-local Rc state in all four realms.
+  async function actorAccount(local, value = 0) {
+    const id = nextId();
+    const account = await api.ActorAccount.new(local, id, value);
+    return { id, account };
+  }
+  async function closeAccount({ id, account }) {
+    open(id, 8);
+    await account.close();
+    assert(counts(id).dropped === 1 && counts(id).cleaned === 1, 'actor body released before close');
+    account.dispose();
+  }
+  function actorError(result, label, variant = null, kind = null) {
+    assert(!result.ok && result.error instanceof api.ActorFixtureError, `${label}: typed business/lifecycle failure`);
+    if (variant !== null) assert(result.error.variant === variant, `${label}: preserves error variant ${variant}`);
+    if (kind !== null) assert(result.error.data?.kind === kind, `${label}: preserves runtime failure ${kind}`);
+  }
+  await test('actor-send-local-fifo-and-business-error', async () => {
+    for (const local of [false, true]) {
+      const ledger = await actorAccount(local, 10), { account } = ledger;
+      assert(await account.value() === 10, 'actor normal ask');
+      const first = nextId(), second = nextId(), third = nextId();
+      const a = observe(account.write(first, 1, 2, false));
+      await until(() => counts(first).started === 1, 'first actor handler started');
+      const b = observe(account.write(second, 2, 0, false));
+      await until(() => counts(second).produced === 1, 'second ask admission attempted with available capacity');
+      const c = observe(account.write(third, 3, 0, false));
+      await until(() => counts(third).produced === 1, 'third ask admitted behind second');
+      assert(counts(second).started === 0 && counts(third).started === 0, 'awaiting actor handler never reenters');
+      open(first, 1);
+      assert((await a.result).value === 11 && (await b.result).value === 13 && (await c.result).value === 16, 'accepted writes execute FIFO');
+      actorError(await observe(account.write(nextId(), 100, 1, false)).result, 'business rejection', 'Rejected');
+      assert(await account.write(nextId(), 4, 0, false) === 20, 'business error does not stop actor');
+      await closeAccount(ledger);
+    }
+  });
+  await test('actor-abort-started-ask-waits-cooperative-recovery-and-cleanup', async () => {
+    for (const local of [false, true]) {
+      const ledger = await actorAccount(local, 5), { account } = ledger;
+      const id = nextId(), controller = new AbortController();
+      const call = observe(account.write(id, 3, 3, true, { signal: controller.signal }), () => counts(id));
+      await until(() => counts(id).started === 1, 'actor handler started before abort');
+      controller.abort(); controller.abort();
+      await until(() => counts(id).polls === 1, 'handler observes cooperative request cancellation');
+      assert(!call.settled && counts(id).dropped === 0, 'framework has not dropped mutable handler');
+      open(id, 1);
+      await until(() => counts(id).cleaning === 1, 'recovery ended and async cleanup entered');
+      assert(counts(id).nested === 1 && !call.settled, 'recovery precedes cleanup and settlement');
+      await delay(20); assert(!call.settled, 'Promise waits for Rust cleanup gate');
+      open(id, 2); cancelled(await call.result, 'actor ask aborted');
+      assert(call.atSettlement.cleaned === 1 && counts(id).dropped === 1 && counts(id).ownerDropped === 1, 'actor request release before Promise rejection');
+      assert(await account.value() === 8, 'state recovery completed and actor remains usable');
+      await closeAccount(ledger);
+    }
+  });
+  await test('actor-queued-abort-releases-owner-without-executing', async () => {
+    for (const local of [false, true]) {
+      const ledger = await actorAccount(local), { account } = ledger;
+      const active = nextId(), id = nextId();
+      const first = observe(account.write(active, 1, 2, false));
+      await until(() => counts(active).started === 1, 'active handler blocks queue');
+      const controller = new AbortController();
+      const queued = observe(account.write(id, 99, 0, true, { signal: controller.signal }), () => counts(id));
+      await until(() => counts(id).produced === 1, 'one queued ask with free mailbox capacity');
+      controller.abort();
+      await until(() => counts(id).cleaning === 1, 'queued payload cleanup while handler still blocked');
+      assert(counts(id).started === 0 && counts(id).ownerDropped === 1 && !first.settled && !queued.settled, 'owner releases queued payload without running its handler');
+      open(id, 2); cancelled(await queued.result, 'queued actor abort');
+      assert(queued.atSettlement.cleaned === 1 && counts(id).dropped === 1, 'queued confirmation follows cleanup once');
+      open(active, 1); assert((await first.result).value === 1 && await account.value() === 1, 'withdrawn write never changes ledger');
+      await closeAccount(ledger);
+    }
+  });
+  await test('actor-drain-tracks-necessary-result-return', async () => {
+    for (const local of [false, true]) {
+      const ledger = await actorAccount(local, 10), { id, account } = ledger, work = nextId();
+      await account.schedule(work, 7);
+      await until(() => counts(work).started === 1, 'managed work started');
+      const drain = observe(account.drain(), () => counts(id));
+      await delay(20);
+      assert(!drain.settled && counts(id).dropped === 0, 'empty mailbox does not end tracked drain');
+      actorError(await observe(account.value()).result, 'drain closes external admission', 'Runtime', 'Closed');
+      open(work, 1);
+      await until(() => counts(id).cleaning === 1, 'necessary result applied and body release begins');
+      assert(counts(work).nested === 1 && counts(id).produced === 17 && !drain.settled, 'drain includes necessary completion message');
+      open(id, 8); assert((await drain.result).ok && drain.atSettlement.cleaned === 1, 'drain awaits body cleanup');
+      await account.close(); account.dispose();
+    }
+  });
+  await test('actor-close-cancelled-waiter-keeps-shared-confirmation', async () => {
+    for (const local of [false, true]) {
+      const ledger = await actorAccount(local), { id, account } = ledger, callId = nextId(), work = nextId();
+      await account.schedule(work, 20);
+      await until(() => counts(work).started === 1, 'close owns managed work');
+      const call = observe(account.write(callId, 2, 3, true));
+      await until(() => counts(callId).started === 1, 'close target handler started');
+      const controller = new AbortController();
+      const first = observe(account.close({ signal: controller.signal }), () => counts(id));
+      await until(() => counts(callId).polls === 1 && counts(work).cleaned === 1, 'close cancels handler and managed work');
+      controller.abort();
+      const second = observe(account.close(), () => counts(id));
+      assert(!first.settled && !second.settled, 'cancelled close still waits for handler recovery');
+      open(callId, 1);
+      await until(() => counts(callId).cleaning === 1, 'close waits request cleanup');
+      assert(!first.settled && !second.settled, 'both close waiters retain request cleanup');
+      open(callId, 2); actorError(await call.result, 'actor close cancels request without outer abort', 'Runtime', 'Cancelled');
+      await until(() => counts(id).cleaning === 1, 'actor body cleanup started');
+      await delay(20); assert(!first.settled && !second.settled, 'body cleanup gate holds both waiters');
+      open(id, 8); cancelled(await first.result, 'cancelled close waiter');
+      assert((await second.result).ok && first.atSettlement.cleaned === 1 && second.atSettlement.cleaned === 1, 'shared close is confirmed before either settlement');
+      await account.close(); account.dispose();
+    }
+  });
+  await test('actor-lifecycle-failure-is-not-masked-by-close', async () => {
+    for (const local of [false, true]) {
+      const { id, account } = await actorAccount(local);
+      open(id, 8);
+      actorError(await observe(account.fail()).result, 'run-level failure reaches active ask', 'Runtime', 'StartFailed');
+      const first = await observe(account.close()).result, second = await observe(account.close()).result;
+      actorError(first, 'failed owner close', 'Runtime', 'StartFailed'); actorError(second, 'repeated failed owner close', 'Runtime', 'StartFailed');
+      assert(counts(id).dropped === 1 && counts(id).cleaned === 1, 'failed lifecycle still cleans once');
+      actorError(await observe(account.value()).result, 'failed actor stays closed', 'Runtime', 'Closed');
+      account.dispose();
+    }
+  });
   await test('stream-none-eof-and-factory-adapter', async () => {
     for (const factory of [(id) => api.events(id, 0), api.factoryEvents]) {
       const id = nextId();

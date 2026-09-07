@@ -2,6 +2,7 @@
 #![deny(warnings)]
 
 pub mod local;
+pub mod actor;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ pub struct Snapshot {
     pub nested: u32,
     pub cleaned: u32,
     pub produced: u32,
+    pub owner_dropped: u32,
 }
 
 #[derive(Default)]
