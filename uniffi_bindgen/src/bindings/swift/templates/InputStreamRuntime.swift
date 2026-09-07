@@ -5,22 +5,52 @@ fileprivate protocol UniffiInputStreamProtocol: AnyObject {
         droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
     )
     func cancel()
+    func close() async
 }
 
 fileprivate final class UniffiInputStreamNextTaskBox: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Void, Never>?
+    private var cancelled = false
+    private var taskWaiters: [CheckedContinuation<Task<Void, Never>, Never>] = []
 
     func set(task: Task<Void, Never>) {
-        lock.withLock {
+        let (cancelled, waiters) = lock.withLock {
             self.task = task
+            let waiters = taskWaiters
+            taskWaiters.removeAll()
+            return (self.cancelled, waiters)
+        }
+        if cancelled {
+            task.cancel()
+        }
+        for waiter in waiters {
+            waiter.resume(returning: task)
         }
     }
 
     func cancel() {
-        lock.withLock {
-            task?.cancel()
+        let task = lock.withLock {
+            cancelled = true
+            return self.task
         }
+        task?.cancel()
+    }
+
+    func wait() async {
+        let task: Task<Void, Never> = await withCheckedContinuation { continuation in
+            let task = lock.withLock { () -> Task<Void, Never>? in
+                if let task = self.task {
+                    return task
+                }
+                taskWaiters.append(continuation)
+                return nil
+            }
+            if let task = task {
+                continuation.resume(returning: task)
+            }
+        }
+        await task.value
     }
 }
 
@@ -37,6 +67,9 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
     private let lock = NSLock()
     private var iterator: S.AsyncIterator?
     private var pendingTask: UniffiInputStreamNextTaskBox?
+    // Each accepted next joins its predecessor, including its completion callback.
+    private var lastTask: UniffiInputStreamNextTaskBox?
+    private var closeTask: Task<Void, Never>?
     private var cancelled = false
     private let lowerNext: (S.Element?) -> RustBuffer
     private let lowerError: (Swift.Error) -> RustBuffer?
@@ -57,13 +90,19 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
         droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
     ) {
         let taskBox = UniffiInputStreamNextTaskBox()
+        var previousTask: UniffiInputStreamNextTaskBox?
         let start = lock.withLock {
-            if cancelled || iterator == nil {
+            if cancelled {
                 return NextStart.done
             }
             if pendingTask != nil {
                 return NextStart.concurrent
             }
+            if iterator == nil {
+                return NextStart.done
+            }
+            previousTask = lastTask
+            lastTask = taskBox
             pendingTask = taskBox
             return NextStart.start
         }
@@ -83,26 +122,53 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
                 handle: taskHandle,
                 free: uniffiInputStreamNextDroppedCallback
             )
+            let predecessor = previousTask
             taskBox.set(task: Task {
                 await self.runNext(
                     callback: callback,
                     callbackData: callbackData,
                     taskHandle: taskHandle
                 )
+                await predecessor?.wait()
             })
         }
     }
 
     func cancel() {
-        lock.withLock {
-            if cancelled {
-                return
-            }
+        let task = lock.withLock {
             cancelled = true
-            iterator = nil
-            pendingTask?.cancel()
-            pendingTask = nil
+            return pendingTask
         }
+        task?.cancel()
+    }
+
+    func close() async {
+        cancel()
+        let task = lock.withLock {
+            if let task = closeTask {
+                return task
+            }
+            let last = lastTask
+            let task = Task {
+                await last?.wait()
+                self.releaseIterator()
+            }
+            closeTask = task
+            return task
+        }
+        await task.value
+    }
+
+    private func releaseIterator() {
+        // runNext has returned, including its local iterator and completion callback.
+        // Release the idle iterator outside the lock (deinit may run user code).
+        let iterator = lock.withLock {
+            let iterator = self.iterator
+            self.iterator = nil
+            lastTask = nil
+            return iterator
+        }
+        withExtendedLifetime(iterator) {}
     }
 
     private func runNext(
@@ -119,7 +185,7 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
         guard var nextIterator = nextIterator else {
             finishNext(iterator: nil)
             completeSuccess(nil, callback: callback, callbackData: callbackData)
-            try? UNIFFI_INPUT_STREAM_NEXT_TASK_HANDLE_MAP.remove(handle: taskHandle)
+            _ = try? UNIFFI_INPUT_STREAM_NEXT_TASK_HANDLE_MAP.remove(handle: taskHandle)
             return
         }
 
@@ -131,7 +197,7 @@ fileprivate final class UniffiAsyncSequenceInputStream<S: AsyncSequence>: Uniffi
             finishNext(iterator: nil)
             completeError(error, callback: callback, callbackData: callbackData)
         }
-        try? UNIFFI_INPUT_STREAM_NEXT_TASK_HANDLE_MAP.remove(handle: taskHandle)
+        _ = try? UNIFFI_INPUT_STREAM_NEXT_TASK_HANDLE_MAP.remove(handle: taskHandle)
     }
 
     private func finishNext(iterator: S.AsyncIterator?) {
@@ -216,8 +282,34 @@ fileprivate func uniffiInputStreamNextCallback(
 }
 
 fileprivate func uniffiInputStreamCancelCallback(handle: UInt64) {
-    if let stream = try? UNIFFI_INPUT_STREAM_HANDLE_MAP.remove(handle: handle) {
+    if let stream = try? UNIFFI_INPUT_STREAM_HANDLE_MAP.get(handle: handle) {
         stream.cancel()
+    }
+}
+
+fileprivate func uniffiInputStreamCloseCallback(
+    handle: UInt64,
+    callback: @escaping UniffiForeignFutureCompleteVoid,
+    callbackData: UInt64,
+    droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+) {
+    // Dropping the Rust waiter requests cancellation but cannot cancel cleanup.
+    droppedCallback.pointee = UniffiForeignFutureDroppedCallbackStruct(
+        handle: handle,
+        free: uniffiInputStreamCancelCallback
+    )
+    guard let stream = try? UNIFFI_INPUT_STREAM_HANDLE_MAP.get(handle: handle) else {
+        callback(callbackData, UniffiForeignFutureResultVoid(callStatus: RustCallStatus(
+            code: CALL_UNEXPECTED_ERROR,
+            errorBuf: {{ Type::String.borrow()|lower_fn }}("UniFFI input stream handle is no longer registered")
+        )))
+        return
+    }
+    Task {
+        await stream.close()
+        _ = try? UNIFFI_INPUT_STREAM_HANDLE_MAP.remove(handle: handle)
+        // This also consumes the Rust completion sender when its waiter was dropped.
+        callback(callbackData, UniffiForeignFutureResultVoid(callStatus: RustCallStatus()))
     }
 }
 

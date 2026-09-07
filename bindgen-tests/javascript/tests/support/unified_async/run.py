@@ -70,11 +70,13 @@ def main():
         expected = {"node-wasm", "chrome-window", "chrome-worker"}
         if env.get("UNIFFI_ASYNC_WASM_ONLY") != "1":
             expected.add("node-napi")
-        if set(realms) != expected or any(len(cases) != 27 or sum(c.startswith("actor-") for c in cases) != 6 for cases in realms.values()):
-            raise RuntimeError(f"incomplete S02 + S05 matrix: {realms}")
+        if set(realms) != expected or any(len(cases) != 44 or sum(c.startswith("actor-") for c in cases) != 6 or sum(c.startswith("s03-") for c in cases) != 13 or sum(c.startswith("r1-") for c in cases) != 4 for cases in realms.values()):
+            raise RuntimeError(f"incomplete S01/S02/S03/S05 matrix: {realms}")
         (logs / "fixture-summary.json").write_text(json.dumps({
             "status": "passed", "realms": realms,
             "legacy_cases_per_realm": 21, "actor_cases_per_realm": 6,
+            "declaration_cases_per_realm": 13,
+            "review_p1_cases_per_realm": 4,
             "assertions": sum(map(len, realms.values())),
             "env_file": str(args.env_file) if args.env_file else None,
             "env_sha256": hashlib.sha256(args.env_file.read_bytes()).hexdigest() if args.env_file else None,

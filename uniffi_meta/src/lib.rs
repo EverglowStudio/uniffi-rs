@@ -3,6 +3,9 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::{collections::BTreeMap, hash::Hasher};
+
+#[cfg(feature = "syntax")]
+pub mod async_signature;
 pub use uniffi_internal_macros::Checksum;
 pub use uniffi_pipeline::{MapNode, Node};
 
@@ -25,7 +28,7 @@ pub use metadata::codes;
 // `docs/uniffi-versioning.md` for details.
 //
 // Once we get to 1.0, then we'll need to update the scheme to something like 100 + major_version
-pub const UNIFFI_CONTRACT_VERSION: u32 = 30;
+pub const UNIFFI_CONTRACT_VERSION: u32 = 31;
 
 /// Similar to std::hash::Hash.
 ///
@@ -143,6 +146,12 @@ pub struct FnMetadata {
     // Original name, if this was renamed
     pub orig_name: Option<String>,
     pub is_async: bool,
+    /// Whether the original Rust declaration is an async fn (rather than returning a Future).
+    pub rust_async: bool,
+    /// Original Rust Result shape after awaiting a Future, including Infallible; independent of throws.
+    pub rust_return_is_result: bool,
+    /// Original Rust Result Item shape, independent of error_type; includes Infallible, false for non-streams.
+    pub rust_stream_item_is_result: bool,
     pub inputs: Vec<FnParamMetadata>,
     pub return_type: Option<Type>,
     pub throws: Option<Type>,
@@ -169,6 +178,12 @@ pub struct ConstructorMetadata {
     // Original name, if this was renamed
     pub orig_name: Option<String>,
     pub is_async: bool,
+    /// Whether the original Rust declaration is an async fn (rather than returning a Future).
+    pub rust_async: bool,
+    /// Original Rust Result shape after awaiting a Future, including Infallible; independent of throws.
+    pub rust_return_is_result: bool,
+    /// Original Rust Result Item shape, independent of error_type; includes Infallible, false for non-streams.
+    pub rust_stream_item_is_result: bool,
     pub inputs: Vec<FnParamMetadata>,
     pub throws: Option<Type>,
     pub checksum: Option<u16>,
@@ -197,6 +212,12 @@ pub struct MethodMetadata {
     // Original name, if this was renamed
     pub orig_name: Option<String>,
     pub is_async: bool,
+    /// Whether the original Rust declaration is an async fn (rather than returning a Future).
+    pub rust_async: bool,
+    /// Original Rust Result shape after awaiting a Future, including Infallible; independent of throws.
+    pub rust_return_is_result: bool,
+    /// Original Rust Result Item shape, independent of error_type; includes Infallible, false for non-streams.
+    pub rust_stream_item_is_result: bool,
     pub inputs: Vec<FnParamMetadata>,
     pub return_type: Option<Type>,
     pub throws: Option<Type>,
@@ -226,6 +247,12 @@ pub struct TraitMethodMetadata {
     // Original name, if this was renamed
     pub orig_name: Option<String>,
     pub is_async: bool,
+    /// Whether the original Rust declaration is an async fn (rather than returning a Future).
+    pub rust_async: bool,
+    /// Original Rust Result shape after awaiting a Future, including Infallible; independent of throws.
+    pub rust_return_is_result: bool,
+    /// Original Rust Result Item shape, independent of error_type; includes Infallible, false for non-streams.
+    pub rust_stream_item_is_result: bool,
     pub inputs: Vec<FnParamMetadata>,
     pub return_type: Option<Type>,
     pub throws: Option<Type>,
@@ -252,6 +279,9 @@ impl From<TraitMethodMetadata> for MethodMetadata {
             name: meta.name,
             orig_name: meta.orig_name,
             is_async: meta.is_async,
+            rust_async: meta.rust_async,
+            rust_return_is_result: meta.rust_return_is_result,
+            rust_stream_item_is_result: meta.rust_stream_item_is_result,
             inputs: meta.inputs,
             return_type: meta.return_type,
             throws: meta.throws,

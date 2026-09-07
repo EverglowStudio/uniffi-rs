@@ -1,6 +1,7 @@
 
 import {
   BackendSession,
+  UniffiError,
   Host,
   createFacade,
   invokeOperation,
@@ -198,6 +199,152 @@ async function assertPending(promise, label) {
   assert.equal(settled, false, label);
 }
 const cancelledEnvelope = () => ({kind:"error", error:{domain:"internal",errorName:"UniffiCancelled",message:"call cancelled"}});
+{
+  const cleanup=deferred();let cancelled=0,released=0,pulls=0;
+  const session=makeSession({invokeAsync:async(id)=>{
+    if(id===5) { pulls++;return {kind:"item",value:9}; }
+    if(id===6) { cancelled++;await cleanup.promise;return null; }
+  },close() {}});
+  session.releaseInputStream=async()=>{released++;};
+  const type={kind:"inputStream",inner:scalar("I32")};
+  const operation={streamArgumentPath:"argument[0]",streamResources:[{direction:"Input",path:"argument[0]",item:scalar("I32"),error:null,slots:{InputStreamPull:5,InputStreamCancel:6}}]};
+  const stream=liftValue(7,type,session,null,operation);
+  const consuming=(async()=>{for await(const item of stream) { assert.equal(item,9);break; }})();
+  await assertPending(consuming,"for await break waits producer close");
+  assert.equal(pulls,1);assert.equal(cancelled,1);assert.equal(released,0);
+  const close=stream.cancel();assert.equal(close,stream.cancel());
+  cleanup.resolve();await consuming;await close;
+  assert.equal(released,1);await session.close();
+}
+{
+  class FactoryError extends UniffiError {
+    constructor(message,variant,data) { super({message,variant,data,errorName:"FactoryError"}); }
+  }
+  const session=makeSession({invokeSync:()=>({kind:"error",error:{errorName:"FactoryError",variant:"Failed",data:null,message:"factory failed"}}),close() {}});
+  const descriptor={name:"syncFactory",id:0,args:[],kind:"OutputStreamStart",async:false,
+    returnType:{kind:"outputStream",inner:scalar("I32")},throws:{typeId:71,name:"FactoryError"},
+    context:{types:{71:{kind:"enum",variants:{Failed:{fields:{}}}}},errorClasses:{71:FactoryError}},
+    streamResources:[{direction:"Output",path:"return",item:scalar("I32"),error:null,slots:{OutputStreamNext:5,OutputStreamCancel:6}}]};
+  const stream=invokeOperation(session,descriptor,[]);
+  await assert.rejects(stream.next(),e=>e instanceof FactoryError && e.variant==="Failed");
+  await session.close();
+}
+// An object's stream factory can move its input into the returned subscription.
+// The call frame then belongs to that subscription, even for a sync method.
+for (const asyncMethod of [false, true]) {
+  const cleanup = deferred();
+  let inputHandle, pulls = 0, returns = 0, factoryCalls = 0;
+  const factory = (args) => {
+    assert.equal(args[0], 901, "stream method preserves receiver dispatch");
+    inputHandle = args[1];
+    factoryCalls++;
+    return {kind:"value", value:{handle:71}};
+  };
+  const session = makeSession({
+    invokeSync(id, args) { assert.equal(id, 0); return factory(args); },
+    async invokeAsync(id, args) {
+      if (id === 0) return factory(args);
+      assert.deepEqual(args, [{handle:71}]);
+      if (id === 5) return session.pullInputStream(inputHandle);
+      assert.equal(id, 6);
+      return null;
+    },
+    releaseOutputStream() {}, close() {},
+  });
+  const descriptor = {name:"echo", id:0, kind:"Method", receiver:true,
+    async:asyncMethod, args:[{name:"input", type:{kind:"inputStream",inner:scalar("I32")}}],
+    returnType:{kind:"outputStream",inner:scalar("I32")},
+    streamResources:[{direction:"Output",path:"return",item:scalar("I32"),error:null,
+      slots:{OutputStreamNext:5,OutputStreamCancel:6}}]};
+  const producer = { [Symbol.asyncIterator]() { return {
+    next() { pulls++; return {done:false,value:pulls}; },
+    async return() { returns++; await cleanup.promise; return {done:true}; },
+  }; } };
+  let result;
+  try {
+    result = invokeOperation(session, descriptor, [901, producer]);
+    let delivered = !asyncMethod;
+    if (asyncMethod) result.then(() => { delivered = true; }, () => {});
+    await turn();
+    assert.equal(returns, 0, "factory completion must not cancel its moved input");
+    assert.equal(delivered, true, "stream delivery must not wait for input cleanup");
+    assert.equal(pulls, 0, "factory does not prefetch input");
+    const stream = await result;
+    assert.deepEqual(await stream.next(), {done:false,value:1});
+    assert.deepEqual(await stream.next(), {done:false,value:2});
+    assert.equal(factoryCalls, 1);
+    const closing = stream.return();
+    await assertPending(closing, "method stream close waits for producer return");
+    assert.equal(returns, 1);
+    cleanup.resolve();
+    await closing;
+    assert.equal(session.inputStreams.size, 0);
+    await stream.return();
+    assert.equal(returns, 1, "repeated close shares producer cleanup");
+  } finally {
+    cleanup.resolve();
+    await Promise.resolve(result).catch(() => {});
+    await session.close();
+  }
+}
+for (const asyncMethod of [false, true]) {
+  const cleanup = deferred();
+  let returns = 0;
+  const failure = {kind:"error",error:{errorName:"MethodFactoryError",message:"factory failed"}};
+  const session = makeSession({invokeSync:() => failure, invokeAsync:async() => failure, close() {}});
+  const descriptor = {name:"failingEcho",id:0,kind:"Method",receiver:true,async:asyncMethod,
+    args:[{name:"input",type:{kind:"inputStream",inner:scalar("I32")}}],
+    returnType:{kind:"outputStream",inner:scalar("I32")},
+    streamResources:[{direction:"Output",path:"return",item:scalar("I32"),error:null,
+      slots:{OutputStreamNext:5,OutputStreamCancel:6}}]};
+  const producer = {next() { throw Error("failed factory must not pull input"); },
+    async cancel() { returns++; await cleanup.promise; }};
+  const result = invokeOperation(session, descriptor, [901, producer]);
+  const failing = asyncMethod ? result : result.next();
+  await assertPending(failing, "method factory failure waits for its input cleanup");
+  assert.equal(returns, 1);
+  cleanup.resolve();
+  await assert.rejects(failing, error => error.errorName === "MethodFactoryError");
+  assert.equal(session.inputStreams.size, 0);
+  assert.equal(session.outputStreams.size, 0);
+  await session.close();
+}
+{
+  const cleanup = deferred();
+  let returns = 0, factoryCalls = 0;
+  const session = makeSession({invokeSync() { factoryCalls++; return {kind:"value",value:71}; },close() {}});
+  const descriptor = {name:"unconsumedEcho",id:0,kind:"Method",receiver:true,async:false,
+    args:[{name:"input",type:{kind:"inputStream",inner:scalar("I32")}}],
+    returnType:{kind:"outputStream",inner:scalar("I32")},
+    streamResources:[{direction:"Output",path:"return",item:scalar("I32"),error:null,
+      slots:{OutputStreamNext:5,OutputStreamCancel:6}}]};
+  const producer = {next() { throw Error("unconsumed method must not pull input"); },
+    async cancel() { returns++; await cleanup.promise; }};
+  const stream = invokeOperation(session, descriptor, [901, producer]);
+  const closing = stream.return();
+  await assertPending(closing, "unstarted method stream still owns input cleanup");
+  assert.equal(factoryCalls, 0);
+  assert.equal(returns, 1);
+  cleanup.resolve();
+  await closing;
+  assert.equal(session.inputStreams.size, 0);
+  await session.close();
+}
+for (const carrier of [71, {handle:71}]) {
+  const seen=[];
+  const session=makeSession({
+    invokeAsync:async(id,args)=>{seen.push([id,args[0]]);return {kind:"item",value:4};},
+    cancelOutputStream:()=>{},releaseOutputStream:()=>{},close() {},
+  });
+  const descriptor={kind:"outputStream",inner:scalar("I32")};
+  const operation={returnType:descriptor,streamResources:[{direction:"Output",path:"return",item:scalar("I32"),error:null,slots:{OutputStreamNext:5,OutputStreamCancel:6}}]};
+  const stream=liftValue(carrier,descriptor,session,null,operation);
+  assert.deepEqual(await stream.next(),{done:false,value:4});
+  await stream.return();
+  assert.equal(seen[0][1],carrier,"next retains the backend lease carrier");
+  assert.equal(seen[1][1],carrier,"cancel retains the backend lease carrier");
+  await session.close();
+}
 function controlled(invoke, managed = [0, 1]) {
   const events = [];
   const calls = new Map();
@@ -388,12 +535,14 @@ assert.throws(() => new BackendSession({},new Host(),{callControl:{create:8,canc
   },[]);
   const stream=session.createOutputStream({handle:71,next:(handle)=>session.invokeAsync(5,[handle]),cancel:(handle)=>session._invokeCleanupAsync(6,[handle])});
   await turn();assert.equal(pulls,0,"no prefetch");
-  const pending=stream.next();await turn();assert.equal(pulls,1);
+  const pending=stream.next();pending.catch(()=>{});await turn();assert.equal(pulls,1);
   await assert.rejects(stream.next(),e=>e.errorName==="UniffiStreamConcurrentNext");
   const close=stream.cancel();assert.equal(close,stream.cancel());
   await assertPending(close,"stream close must await native cancel cleanup");
+  await assertPending(pending,"interrupted next must await native cancel cleanup");
   assert.equal(cancels,1);assert.equal(events.some(e=>e[0]==="stream-release"),false);
-  cleanup.resolve();await close;assert.deepEqual(await pending,{done:true,value:undefined});
+  cleanup.resolve();await close;await assert.rejects(pending,e=>e.errorName==="UniffiCancelled");
+  assert.deepEqual(await stream.next(),{done:true,value:undefined});
   assert.equal(events.filter(e=>e[0]==="stream-release").length,1);
   assert.equal(events.some(e=>e[0]==="create"),false);
   await session.close();

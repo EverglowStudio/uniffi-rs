@@ -275,7 +275,7 @@ impl Object {
 
     /// For trait interfaces, FfiCallbacks to define for our methods, otherwise an empty vec.
     pub fn ffi_callbacks(&self) -> Vec<FfiCallbackFunction> {
-        if self.is_trait_interface() {
+        if self.has_callback_interface() {
             callbacks::ffi_callbacks(&self.name, &self.methods)
         } else {
             vec![]
@@ -284,18 +284,21 @@ impl Object {
 
     /// For trait interfaces, the VTable FFI type
     pub fn vtable(&self) -> Option<FfiType> {
-        self.is_trait_interface()
+        self.has_callback_interface()
             .then(|| FfiType::Struct(callbacks::vtable_name(&self.name)))
     }
 
     /// For trait interfaces, the VTable struct to define.  Otherwise None.
     pub fn vtable_definition(&self) -> Option<FfiStruct> {
-        self.is_trait_interface()
+        self.has_callback_interface()
             .then(|| callbacks::vtable_struct(&self.name, &self.methods))
     }
 
     /// Vec of (ffi_callback_name, method) pairs
     pub fn vtable_methods(&self) -> Vec<(FfiCallbackFunction, Method)> {
+        if !self.has_callback_interface() {
+            return vec![];
+        }
         self.methods
             .iter()
             .enumerate()
@@ -373,6 +376,9 @@ pub struct Constructor {
     pub(super) object_name: String,
     pub(super) object_module_path: String,
     pub(super) is_async: bool,
+    pub(super) rust_async: bool,
+    pub(super) rust_return_is_result: bool,
+    pub(super) rust_stream_item_is_result: bool,
     pub(super) arguments: Vec<Argument>,
     // We don't include the FFIFunc in the hash calculation, because:
     //  - it is entirely determined by the other fields,
@@ -408,6 +414,21 @@ impl Constructor {
 
     pub fn is_async(&self) -> bool {
         self.is_async
+    }
+
+    /// Whether the original Rust declaration uses async fn.
+    pub fn rust_async(&self) -> bool {
+        self.rust_async
+    }
+
+    /// Whether the original Rust output is Result, even without a business error.
+    pub fn rust_return_is_result(&self) -> bool {
+        self.rust_return_is_result
+    }
+
+    /// Original Rust Result Item shape, independent of the stream's business error metadata.
+    pub fn rust_stream_item_is_result(&self) -> bool {
+        self.rust_stream_item_is_result
     }
 
     pub fn object_name(&self) -> &str {
@@ -490,6 +511,9 @@ impl From<uniffi_meta::ConstructorMetadata> for Constructor {
             orig_name,
             object_name: meta.self_name,
             is_async: meta.is_async,
+            rust_async: meta.rust_async,
+            rust_return_is_result: meta.rust_return_is_result,
+            rust_stream_item_is_result: meta.rust_stream_item_is_result,
             object_module_path: meta.module_path,
             arguments,
             ffi_func,
@@ -513,6 +537,9 @@ pub struct Method {
     #[checksum_ignore]
     pub(super) orig_name: String,
     pub(super) is_async: bool,
+    pub(super) rust_async: bool,
+    pub(super) rust_return_is_result: bool,
+    pub(super) rust_stream_item_is_result: bool,
     // Ignore `self_type` for the checksum, we never compare the method checksums for methods from
     // different objects.
     #[checksum_ignore]
@@ -552,6 +579,21 @@ impl Method {
 
     pub fn is_async(&self) -> bool {
         self.is_async
+    }
+
+    /// Whether the original Rust declaration uses async fn.
+    pub fn rust_async(&self) -> bool {
+        self.rust_async
+    }
+
+    /// Whether the original Rust output is Result, even without a business error.
+    pub fn rust_return_is_result(&self) -> bool {
+        self.rust_return_is_result
+    }
+
+    /// Original Rust Result Item shape, independent of the stream's business error metadata.
+    pub fn rust_stream_item_is_result(&self) -> bool {
+        self.rust_stream_item_is_result
     }
 
     pub fn object_name(&self) -> &str {
@@ -646,6 +688,9 @@ impl Method {
             orig_name,
             self_type: receiver,
             is_async: meta.is_async,
+            rust_async: meta.rust_async,
+            rust_return_is_result: meta.rust_return_is_result,
+            rust_stream_item_is_result: meta.rust_stream_item_is_result,
             arguments,
             return_type: meta.return_type,
             ffi_func,
@@ -787,6 +832,18 @@ impl Callable for Constructor {
         self.is_async
     }
 
+    fn rust_async(&self) -> bool {
+        self.rust_async
+    }
+
+    fn rust_return_is_result(&self) -> bool {
+        self.rust_return_is_result
+    }
+
+    fn rust_stream_item_is_result(&self) -> bool {
+        self.rust_stream_item_is_result
+    }
+
     fn ffi_func(&self) -> &FfiFunction {
         &self.ffi_func
     }
@@ -819,6 +876,18 @@ impl Callable for Method {
 
     fn is_async(&self) -> bool {
         self.is_async
+    }
+
+    fn rust_async(&self) -> bool {
+        self.rust_async
+    }
+
+    fn rust_return_is_result(&self) -> bool {
+        self.rust_return_is_result
+    }
+
+    fn rust_stream_item_is_result(&self) -> bool {
+        self.rust_stream_item_is_result
     }
 
     fn ffi_func(&self) -> &FfiFunction {
@@ -854,6 +923,9 @@ mod test {
             name: "new".into(),
             orig_name: None,
             is_async: true,
+            rust_async: true,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: false,
             inputs: vec![],
             throws: None,
             checksum: None,
@@ -876,7 +948,7 @@ mod test {
         group.add_item(object.into());
         group.add_item(constructor_metadata(Some(self_type.clone())).into());
         // Both synchronous and asynchronous Rust &self methods arrive as async metadata.
-        for name in ["get", "update"] {
+        for (name, rust_async) in [("get", false), ("update", true)] {
             group.add_item(
                 uniffi_meta::MethodMetadata {
                     module_path: "example::nested::methods".into(),
@@ -884,6 +956,9 @@ mod test {
                     name: name.into(),
                     orig_name: None,
                     is_async: true,
+                    rust_async,
+                    rust_return_is_result: false,
+                    rust_stream_item_is_result: false,
                     inputs: vec![],
                     return_type: Some(Type::Optional {
                         inner_type: Box::new(self_type.clone()),

@@ -399,6 +399,7 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TypeExtra {
+    implemented_traits: Vec<TypeSourceKey>,
     kind: JsTypeKind,
     source_kind: SourceTypeKind,
     rust_path: RustPath,
@@ -503,6 +504,7 @@ fn collect_type_definitions(
             extras.insert(
                 key,
                 TypeExtra {
+                    implemented_traits: Vec::new(),
                     kind: JsTypeKind::Record {
                         fields: fields.iter().map(public_field).collect(),
                     },
@@ -540,6 +542,7 @@ fn collect_type_definitions(
             extras.insert(
                 key,
                 TypeExtra {
+                    implemented_traits: Vec::new(),
                     kind: if component.ci.is_name_used_as_error(enum_.name()) {
                         JsTypeKind::Error {
                             variants: variants.iter().map(public_variant).collect(),
@@ -574,6 +577,13 @@ fn collect_type_definitions(
             extras.insert(
                 key,
                 TypeExtra {
+                    implemented_traits: object
+                        .trait_impls()
+                        .into_iter()
+                        .map(|implementation| {
+                            source_key_for_type(&implementation.trait_ty, crate_owners)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
                     kind: JsTypeKind::Object { kind: object_kind },
                     source_kind: SourceTypeKind::Object {
                         kind: object_kind,
@@ -604,6 +614,7 @@ fn collect_type_definitions(
             extras.insert(
                 key,
                 TypeExtra {
+                    implemented_traits: Vec::new(),
                     kind: JsTypeKind::Callback,
                     source_kind: SourceTypeKind::Callback,
                     rust_path: RustPath::from_module_path(callback.module_path(), callback.name()),
@@ -632,6 +643,7 @@ fn collect_type_definitions(
             extras.insert(
                 key,
                 TypeExtra {
+                    implemented_traits: Vec::new(),
                     kind: JsTypeKind::Custom {
                         builtin: builtin.clone(),
                         config: config.clone(),
@@ -738,6 +750,9 @@ fn abi_object_kind(implementation: &ObjectImpl) -> ObjectKind {
 
 #[derive(Clone)]
 struct OperationExtra {
+    rust_async: bool,
+    rust_return_is_result: bool,
+    rust_stream_item_is_result: bool,
     module_path: RustPath,
     type_path: Option<RustPath>,
     object_kind: Option<RustObjectKind>,
@@ -1101,6 +1116,9 @@ fn operation_definition(
     Ok((
         definition,
         OperationExtra {
+            rust_async: callable.rust_async(),
+            rust_return_is_result: callable.rust_return_is_result(),
+            rust_stream_item_is_result: callable.rust_stream_item_is_result(),
             module_path,
             type_path: type_target.as_ref().map(|(path, _)| path.clone()),
             object_kind: type_target.map(|(_, kind)| kind),
@@ -1640,12 +1658,12 @@ fn build_rust_bridge_plan(
                     item,
                     error,
                     is_send,
-                } => (*item, *error, is_send, StreamDirection::Input),
+                } => (*item, error, is_send, StreamDirection::Input),
                 ValueType::OutputStream {
                     item,
                     error,
                     is_send,
-                } => (*item, *error, is_send, StreamDirection::Output),
+                } => (*item, error, is_send, StreamDirection::Output),
                 _ => {
                     return Err(FrontendError::Contract(format!(
                         "stream path does not resolve to an input/output stream for operation={} path={}",
@@ -1666,8 +1684,8 @@ fn build_rust_bridge_plan(
                 type_extras,
                 callback_role,
             )?;
-            let error = rust_value_binding_for_value_type(
-                &error_type,
+            let error = rust_stream_error_binding(
+                error_type.as_deref(),
                 api,
                 type_ids,
                 type_extras,
@@ -1716,7 +1734,7 @@ fn build_rust_bridge_plan(
             };
             let mut slot_operation_ids = BTreeMap::new();
             if stream.contract.direction == StreamDirection::Output
-                && operation.kind == OperationKind::OutputStreamStart
+                && stream.path.segments() == [ValuePathSegment::Return]
             {
                 slot_operation_ids.insert(OperationKind::OutputStreamStart, operation.id);
             }
@@ -1744,6 +1762,9 @@ fn build_rust_bridge_plan(
                     owner: operation.source_key.owner().clone(),
                     kind,
                     async_kind: AsyncKind::Async,
+                    rust_async: true,
+                    rust_return_is_result: false,
+                    rust_stream_item_is_result: false,
                     callback_method_id: None,
                     call_target: RustCallTarget::StreamHook {
                         parent: operation.id,
@@ -1834,6 +1855,9 @@ fn build_rust_bridge_plan(
             owner: operation.source_key.owner().clone(),
             kind: operation.kind,
             async_kind: operation.async_kind,
+            rust_async: extra.rust_async,
+            rust_return_is_result: extra.rust_return_is_result,
+            rust_stream_item_is_result: extra.rust_stream_item_is_result,
             callback_method_id: operation.callback_method_id,
             call_target,
             receiver,
@@ -1909,6 +1933,16 @@ fn build_named_type_plans(
         plans.push(RustNamedTypePlan {
             id: ty.id,
             rust_path: extra.rust_path.clone(),
+            implemented_traits: extra
+                .implemented_traits
+                .iter()
+                .map(|key| {
+                    type_extras
+                        .get(key)
+                        .map(|extra| extra.rust_path.clone())
+                        .ok_or_else(|| FrontendError::UnknownTypeOwner(key.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             kind,
         });
     }
@@ -2335,6 +2369,25 @@ fn rust_value_binding_for_value_type(
     })
 }
 
+fn rust_stream_error_binding(
+    error: Option<&ValueType>,
+    api: &JsApiIr,
+    type_ids: &BTreeMap<TypeSourceKey, uniffi_js_abi::TypeId>,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+    callback_role: bool,
+) -> Result<RustValueBinding, FrontendError> {
+    match error {
+        Some(error) => {
+            rust_value_binding_for_value_type(error, api, type_ids, type_extras, callback_role)
+        }
+        None => Ok(RustValueBinding {
+            rust_type: RustType::Path(RustPath::new(["std", "convert", "Infallible"])),
+            carrier: RustCarrier::Primitive,
+            conversion: ConversionRecipe::Identity,
+        }),
+    }
+}
+
 fn stream_handle_binding(direction: StreamDirection) -> RustReceiverBinding {
     let (rust_type, carrier, conversion) = match direction {
         StreamDirection::Input => (
@@ -2490,8 +2543,15 @@ fn rust_binding_for_type(
         } => {
             let (rust, _, conversion) =
                 rust_binding_for_type(item, api, type_ids, type_extras, callback_role)?;
-            let (error_rust, _, error_conversion) =
-                rust_binding_for_type(error, api, type_ids, type_extras, callback_role)?;
+            let error_binding = rust_stream_error_binding(
+                error.as_deref(),
+                api,
+                type_ids,
+                type_extras,
+                callback_role,
+            )?;
+            let error_rust = error_binding.rust_type;
+            let error_conversion = error_binding.conversion;
             (
                 RustType::InputStream {
                     item: Box::new(rust),
@@ -2512,8 +2572,15 @@ fn rust_binding_for_type(
         } => {
             let (rust, _, conversion) =
                 rust_binding_for_type(item, api, type_ids, type_extras, callback_role)?;
-            let (error_rust, _, error_conversion) =
-                rust_binding_for_type(error, api, type_ids, type_extras, callback_role)?;
+            let error_binding = rust_stream_error_binding(
+                error.as_deref(),
+                api,
+                type_ids,
+                type_extras,
+                callback_role,
+            )?;
+            let error_rust = error_binding.rust_type;
+            let error_conversion = error_binding.conversion;
             (
                 RustType::Stream {
                     item: Box::new(rust),
@@ -2715,7 +2782,10 @@ fn convert_type(
             is_send,
         } => ValueType::output_stream(
             convert_type(item_type, crate_owners)?,
-            convert_type(error_type, crate_owners)?,
+            error_type
+                .as_deref()
+                .map(|ty| convert_type(ty, crate_owners))
+                .transpose()?,
             *is_send,
         ),
         Type::InputStream {
@@ -2724,7 +2794,10 @@ fn convert_type(
             is_send,
         } => ValueType::input_stream(
             convert_type(item_type, crate_owners)?,
-            convert_type(error_type, crate_owners)?,
+            error_type
+                .as_deref()
+                .map(|ty| convert_type(ty, crate_owners))
+                .transpose()?,
             *is_send,
         ),
     })
@@ -3270,6 +3343,9 @@ mod tests {
                 name: "round_trip".to_owned(),
                 orig_name: Some("rust_round_trip".to_owned()),
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![uniffi_meta::FnParamMetadata::simple(
                     "value",
                     custom.clone(),
@@ -3520,6 +3596,9 @@ mod tests {
                 name: "fetch".to_owned(),
                 orig_name: Some("rust_fetch".to_owned()),
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![uniffi_meta::FnParamMetadata::simple(
                     "record",
                     uniffi_meta::Type::Record {
@@ -3552,6 +3631,9 @@ mod tests {
                 name: "public_method".to_owned(),
                 orig_name: Some("rust_method".to_owned()),
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![],
                 return_type: None,
                 throws: None,
@@ -4041,10 +4123,13 @@ mod tests {
                 name: "events".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: true,
                 inputs: vec![],
                 return_type: Some(uniffi_meta::Type::Stream {
                     item_type: Box::new(uniffi_meta::Type::UInt32),
-                    error_type: Box::new(uniffi_meta::Type::String),
+                    error_type: Some(Box::new(uniffi_meta::Type::String)),
                     is_send: false,
                 }),
                 throws: None,
@@ -4144,10 +4229,13 @@ mod tests {
                 name: "events".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: true,
+                rust_stream_item_is_result: true,
                 inputs: vec![],
                 return_type: Some(uniffi_meta::Type::Stream {
                     item_type: Box::new(uniffi_meta::Type::UInt32),
-                    error_type: Box::new(uniffi_meta::Type::String),
+                    error_type: Some(Box::new(uniffi_meta::Type::String)),
                     is_send: false,
                 }),
                 throws: Some(uniffi_meta::Type::Enum {
@@ -4199,11 +4287,14 @@ mod tests {
                 name: "consume".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![uniffi_meta::FnParamMetadata::simple(
                     "source",
                     uniffi_meta::Type::InputStream {
                         item_type: Box::new(uniffi_meta::Type::UInt32),
-                        error_type: Box::new(uniffi_meta::Type::String),
+                        error_type: Some(Box::new(uniffi_meta::Type::String)),
                         is_send: false,
                     },
                 )],
@@ -4270,12 +4361,12 @@ mod tests {
     fn direct_input_and_bidi_streams_get_typed_async_slots() {
         let stream = |item, error, is_send| uniffi_meta::Type::InputStream {
             item_type: Box::new(item),
-            error_type: Box::new(error),
+            error_type: Some(Box::new(error)),
             is_send,
         };
         let output = |item, error, is_send| uniffi_meta::Type::Stream {
             item_type: Box::new(item),
-            error_type: Box::new(error),
+            error_type: Some(Box::new(error)),
             is_send,
         };
         let mut group = uniffi_meta::MetadataGroup {
@@ -4292,6 +4383,9 @@ mod tests {
                 name: "consume".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![uniffi_meta::FnParamMetadata::simple(
                     "source",
                     stream(uniffi_meta::Type::UInt32, uniffi_meta::Type::String, false),
@@ -4309,6 +4403,9 @@ mod tests {
                 name: "events".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: true,
                 inputs: vec![uniffi_meta::FnParamMetadata::simple(
                     "source",
                     stream(uniffi_meta::Type::UInt32, uniffi_meta::Type::String, false),
@@ -4398,7 +4495,7 @@ mod tests {
     fn named_map_nested_streams_have_complete_resource_groups() {
         let stream_item = |ty| uniffi_meta::Type::InputStream {
             item_type: Box::new(ty),
-            error_type: Box::new(uniffi_meta::Type::String),
+            error_type: Some(Box::new(uniffi_meta::Type::String)),
             is_send: true,
         };
         let mut group = uniffi_meta::MetadataGroup {
@@ -4423,7 +4520,7 @@ mod tests {
                         key_type: Box::new(stream_item(uniffi_meta::Type::UInt32)),
                         value_type: Box::new(uniffi_meta::Type::Stream {
                             item_type: Box::new(uniffi_meta::Type::String),
-                            error_type: Box::new(uniffi_meta::Type::String),
+                            error_type: Some(Box::new(uniffi_meta::Type::String)),
                             is_send: true,
                         }),
                     },
@@ -4440,6 +4537,9 @@ mod tests {
                 name: "consume".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![uniffi_meta::FnParamMetadata::simple(
                     "envelope",
                     uniffi_meta::Type::Record {

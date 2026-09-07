@@ -29,6 +29,23 @@ impl CompileEnv {
         }
     }
 
+    /// Actual target architecture, independent of optional runtime features.
+    pub fn is_wasm(&self) -> bool {
+        matches!(
+            self.target.architecture,
+            target_lexicon::Architecture::Wasm32 | target_lexicon::Architecture::Wasm64
+        )
+    }
+
+    /// Mirrors the canonical stream transport's cfg in uniffi_core.
+    pub fn stream_transport_is_send(&self) -> bool {
+        !(self.target.architecture == target_lexicon::Architecture::Wasm32
+            && self
+                .features
+                .iter()
+                .any(|f| f == "wasm-unstable-single-threaded"))
+    }
+
     pub fn should_parse_module(&self, attrs: &[Attribute]) -> syn::Result<bool> {
         // Use parse_attrs to just evaluate the `cfg` parts and ignore all the attrs.
         self.parse_attrs(attrs).map(|m| m.is_some())

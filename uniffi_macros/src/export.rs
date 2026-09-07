@@ -6,6 +6,7 @@ use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
 use syn::{visit_mut::VisitMut, Item, Type};
 
+mod async_types;
 mod attributes;
 mod callback_interface;
 mod item;
@@ -23,6 +24,8 @@ use crate::util::{create_metadata_items, ident_to_string, mod_path};
 pub(crate) use attributes::{AsyncRuntime, CallbackContractArg, DefaultMap, ExportFnArgs};
 pub use callback_interface::ffi_converter_callback_interface_impl;
 pub(crate) use scaffolding::gen_local_close;
+#[cfg(not(feature = "scaffolding"))]
+pub(crate) use scaffolding::gen_local_close_helper;
 pub use trait_interface::alter_trait;
 
 // TODO(jplatte): Ensure no generics, …
@@ -44,8 +47,9 @@ pub(crate) fn expand_export(
     let include_meta = !udl_mode;
 
     let metadata = ExportItem::new(item, all_args)?;
+    let diagnostics = foreign_async_diagnostics(&metadata);
 
-    match metadata {
+    let generated = match metadata {
         ExportItem::Function { sig, args } => {
             gen_fn_scaffolding(sig, args.async_runtime.as_ref(), udl_mode)
         }
@@ -89,7 +93,7 @@ pub(crate) fn expand_export(
                     }
                 })
                 .collect::<syn::Result<_>>()?;
-            let trait_impl_tokens = trait_.map(|t| {
+            let trait_impl_tokens = trait_.filter(|_| args.local.is_none()).map(|t| {
                 let object_name = ident_to_string(&self_ident);
                 let trait_ident = t.segments
                     .last()
@@ -159,7 +163,37 @@ pub(crate) fn expand_export(
             uniffi_traits,
             ..
         } => utrait::expand_uniffi_trait_export(self_ident, uniffi_traits, include_meta),
+    }?;
+    Ok(quote! { #diagnostics #generated })
+}
+
+fn foreign_async_diagnostics(item: &ExportItem) -> TokenStream {
+    let ExportItem::Trait {
+        items, trait_kind, ..
+    } = item
+    else {
+        return quote! {};
+    };
+    if !trait_kind.has_foreign() {
+        return quote! {};
     }
+    let mut diagnostics = Vec::new();
+    for item in items {
+        let ImplItem::Method(sig) = item else {
+            continue;
+        };
+        for &wasm in async_types::variants() {
+            if let Err(error) = uniffi_meta::async_signature::validate_foreign_async_bounds(
+                &sig.original_signature,
+                wasm,
+            ) {
+                let target = async_types::target_attribute(wasm);
+                let diagnostic = error.into_compile_error();
+                diagnostics.push(quote! { #target #diagnostic });
+            }
+        }
+    }
+    quote! { #(#diagnostics)* }
 }
 
 pub(crate) fn is_trait_interface_with_foreign(
@@ -229,9 +263,40 @@ pub fn rewrite_self_type(item: &mut Item) {
 }
 
 /// Alter the tokens wrapped with the `[uniffi::export]` if needed
-pub fn alter_input(item: &Item) -> TokenStream {
+pub fn alter_input(item: &Item, args: proc_macro::TokenStream) -> TokenStream {
     match item {
         Item::Trait(item_trait) => alter_trait(item_trait),
+        Item::Impl(item_impl) if item_impl.trait_.is_some() => {
+            // A local impl exports owner-bound Object methods. Its business
+            // trait never crosses a dyn FFI boundary, so preserve its Rust form.
+            match syn::parse::<attributes::ExportImplArgs>(args) {
+                Ok(args) if args.local.is_some() => quote! { #item },
+                Ok(_) => trait_interface::alter_impl(item_impl)
+                    .unwrap_or_else(syn::Error::into_compile_error),
+                Err(error) => error.into_compile_error(),
+            }
+        }
         _ => quote! { #item },
     }
+}
+
+pub(crate) fn without_scaffolding(
+    mut item: Item,
+    args: proc_macro::TokenStream,
+) -> syn::Result<TokenStream> {
+    let original = alter_input(&item, args.clone());
+    rewrite_self_type(&mut item);
+    let export = ExportItem::new(item, args)?;
+    let diagnostics = foreign_async_diagnostics(&export);
+    let mut helpers = Vec::new();
+    if let ExportItem::Impl { items, trait_, .. } = export {
+        for item in items {
+            if let ImplItem::Method(sig) = item {
+                if sig.is_local {
+                    helpers.push(scaffolding::gen_local_method(&sig, trait_.as_ref())?);
+                }
+            }
+        }
+    }
+    Ok(quote! { #diagnostics #original #(#helpers)* })
 }

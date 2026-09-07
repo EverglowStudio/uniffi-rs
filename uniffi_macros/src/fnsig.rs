@@ -41,12 +41,14 @@ pub(crate) struct FnSignature {
     pub is_async: bool,
     /// Local methods expose an async owner hop even when the Rust method is synchronous.
     pub is_local: bool,
-    pub is_rust_async: bool,
+    pub rust_await_count: usize,
+    pub original_signature: syn::Signature,
     pub async_runtime: Option<AsyncRuntime>,
     pub receiver: Option<ReceiverArg>,
     pub args: Vec<NamedArg>,
     pub return_ty: TokenStream,
     pub stream_return: Option<StreamReturnType>,
+    pub factory_error_ty: Option<TokenStream>,
     // Does this the return type look like a result?
     // Only use this in UDL mode.
     // In general, it's not reliable because it fails for type aliases.
@@ -121,28 +123,27 @@ impl FnSignature {
         mut export_fn_args: ExportFnArgs,
         docstring: String,
     ) -> syn::Result<Self> {
+        let declaration = uniffi_meta::async_signature::classify_signature(&sig)?;
+        let original_signature = sig.clone();
         let span = sig.span();
         let ident = sig.ident;
-        let looks_like_result = looks_like_result(&sig.output);
-        let stream_return = stream_return_type(&sig.output)?;
-        if stream_return.is_some() && !matches!(&kind, FnKind::Function) {
-            return Err(syn::Error::new(
-                span,
-                "native stream returns are currently only supported for top-level functions",
-            ));
-        }
-        if stream_return.is_some() && sig.asyncness.is_some() {
-            return Err(syn::Error::new(
-                span,
-                "native stream-returning functions must be synchronous; the stream itself is asynchronous",
-            ));
-        }
-
-        let output = match sig.output {
-            ReturnType::Default => quote! { () },
-            ReturnType::Type(_, ty) => quote! { #ty },
+        let looks_like_result = declaration.throws.is_some();
+        let stream_return = declaration
+            .stream
+            .as_ref()
+            .map(StreamReturnType::from_signature);
+        let factory_error_ty = declaration.throws.as_ref().map(|ty| quote! { #ty });
+        let output = if let Some(stream) = &stream_return {
+            let ty = stream.canonical_type();
+            match &factory_error_ty {
+                Some(error) => quote! { ::std::result::Result<#ty, #error> },
+                None => ty,
+            }
+        } else {
+            let output = &declaration.output;
+            quote! { #output }
         };
-        let is_async = sig.asyncness.is_some();
+        let is_async = declaration.is_async();
 
         let mut input_iter = sig
             .inputs
@@ -169,13 +170,6 @@ impl FnSignature {
                 })
             })
             .collect::<syn::Result<Vec<_>>>()?;
-        let has_input_stream_arg = args.iter().any(|arg| arg.input_stream.is_some());
-        if has_input_stream_arg && !matches!(&kind, FnKind::Function) {
-            return Err(syn::Error::new(
-                span,
-                "input stream parameters are currently only supported for top-level functions",
-            ));
-        }
         if let Some(ident) = export_fn_args.defaults.idents().first() {
             return Err(syn::Error::new(
                 ident.span(),
@@ -203,12 +197,14 @@ impl FnSignature {
             ident,
             is_async,
             is_local: false,
-            is_rust_async: is_async,
+            rust_await_count: declaration.await_count,
+            original_signature,
             async_runtime: export_fn_args.async_runtime,
             receiver,
             args,
             return_ty: output,
             stream_return,
+            factory_error_ty,
             looks_like_result,
             docstring,
             callback_contracts,
@@ -236,7 +232,7 @@ impl FnSignature {
                                 ::uniffi::deps::anyhow::anyhow!("input stream handle was null")
                             ));
                         }
-                        let (uniffi_input_stream_next, uniffi_input_stream_cancel) =
+                        let (uniffi_input_stream_next, uniffi_input_stream_cancel, uniffi_input_stream_close) =
                             match #cell_ident.get() {
                                 ::std::option::Option::Some(callbacks) => *callbacks,
                                 ::std::option::Option::None => {
@@ -252,6 +248,7 @@ impl FnSignature {
                             #ident,
                             uniffi_input_stream_next,
                             uniffi_input_stream_cancel,
+                            uniffi_input_stream_close,
                         )
                     }
                 }
@@ -276,7 +273,7 @@ impl FnSignature {
     }
 
     pub(crate) fn input_stream_callback_cell_ident(&self, arg: &NamedArg) -> Ident {
-        let ffi_name = uniffi_meta::fn_symbol_name(&self.mod_path, &self.name);
+        let ffi_name = self.scaffolding_fn_ident().expect("valid callable name");
         Ident::new(
             &format!("UNIFFI_INPUT_STREAM_CALLBACKS_{}_{}", ffi_name, arg.name)
                 .to_ascii_uppercase(),
@@ -286,7 +283,11 @@ impl FnSignature {
 
     pub(crate) fn input_stream_init_fn_ident(&self, arg: &NamedArg) -> Ident {
         Ident::new(
-            &uniffi_meta::fn_input_stream_init_symbol_name(&self.mod_path, &self.name, &arg.name),
+            &format!(
+                "{}_input_stream_{}_init",
+                self.scaffolding_fn_ident().expect("valid callable name"),
+                arg.name
+            ),
             Span::call_site(),
         )
     }
@@ -308,7 +309,7 @@ impl FnSignature {
     ) -> TokenStream {
         let next_ty = Self::input_stream_next_callback_type(input_stream);
         quote! {
-            (#next_ty, ::uniffi::ForeignInputStreamCancelCallback)
+            (#next_ty, ::uniffi::ForeignInputStreamCancelCallback, ::uniffi::ForeignInputStreamCloseCallback)
         }
     }
 
@@ -403,6 +404,9 @@ impl FnSignature {
         let type_id_meta = ffiops::type_id_meta(return_ty);
 
         let orig_name = orig_name_metadata(*name_from_attrs, &self.ident);
+        let rust_async = self.original_signature.asyncness.is_some();
+        // This is the original classifier's Result Item shape, not the presence of a business error.
+        let rust_stream_item_is_result = self.stream_return.as_ref().is_some_and(|s| s.is_fallible);
         match &self.kind {
             FnKind::Function => Ok(quote! {
                 ::uniffi::MetadataBuffer::from_code(::uniffi::metadata::codes::FUNC)
@@ -410,6 +414,8 @@ impl FnSignature {
                     .concat_str(#name)
                     #orig_name
                     .concat_bool(#is_async)
+                    .concat_bool(#rust_async)
+                    .concat_bool(#rust_stream_item_is_result)
                     .concat_value(#args_len)
                     #(#arg_metadata_calls)*
                     .concat(#type_id_meta)
@@ -427,6 +433,8 @@ impl FnSignature {
                         .concat_str(#name)
                         #orig_name
                         .concat_bool(#is_async)
+                    .concat_bool(#rust_async)
+                    .concat_bool(#rust_stream_item_is_result)
                         .concat_value(#args_len)
                         #(#arg_metadata_calls)*
                         .concat(#type_id_meta)
@@ -444,6 +452,8 @@ impl FnSignature {
                         .concat_str(#name)
                         #orig_name
                         .concat_bool(#is_async)
+                    .concat_bool(#rust_async)
+                    .concat_bool(#rust_stream_item_is_result)
                         .concat_value(#args_len)
                         #(#arg_metadata_calls)*
                         .concat(#type_id_meta)
@@ -462,6 +472,8 @@ impl FnSignature {
                         .concat_str(#name)
                         #orig_name
                         .concat_bool(#is_async)
+                    .concat_bool(#rust_async)
+                    .concat_bool(#rust_stream_item_is_result)
                         .concat_value(#args_len)
                         #(#arg_metadata_calls)*
                         .concat(#type_id_meta)
@@ -766,7 +778,39 @@ fn callback_contract_value(
 pub(crate) struct StreamReturnType {
     pub(crate) item_ty: TokenStream,
     pub(crate) error_ty: TokenStream,
-    pub(crate) is_send: bool,
+    pub(crate) is_fallible: bool,
+}
+
+impl StreamReturnType {
+    fn from_signature(stream: &uniffi_meta::async_signature::StreamSignature) -> Self {
+        let item = &stream.item;
+        let error_ty = stream
+            .error
+            .as_ref()
+            .map(|error| quote! { #error })
+            .unwrap_or_else(|| quote! { ::std::convert::Infallible });
+        Self {
+            item_ty: quote! { #item },
+            error_ty,
+            is_fallible: stream.error.is_some(),
+        }
+    }
+
+    pub(crate) fn canonical_type(&self) -> TokenStream {
+        let item = &self.item_ty;
+        let error = &self.error_ty;
+        quote! { ::uniffi::UniFfiStream<#item, #error> }
+    }
+
+    pub(crate) fn box_stream(&self, value: TokenStream) -> TokenStream {
+        if self.is_fallible {
+            quote! { ::std::boxed::Box::pin(#value) }
+        } else {
+            quote! { ::std::boxed::Box::pin(::uniffi::deps::futures_util::StreamExt::map(
+                #value, ::std::result::Result::<_, ::std::convert::Infallible>::Ok,
+            )) }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -948,112 +992,12 @@ fn type_contains_stream_path(ty: &Type) -> bool {
 }
 
 fn stream_return_type(return_type: &ReturnType) -> syn::Result<Option<StreamReturnType>> {
-    let ReturnType::Type(_, ty) = return_type else {
-        return Ok(None);
-    };
-    if let Some((item_ty, error_ty)) = uniffi_stream_alias_args(ty)? {
-        return Ok(Some(StreamReturnType {
-            item_ty: quote! { #item_ty },
-            error_ty: quote! { #error_ty },
-            is_send: true,
-        }));
-    }
-    if !type_contains_stream_path(ty) {
-        return Ok(None);
-    }
-
-    let pin_inner = single_type_arg(ty, "Pin")?;
-    let box_inner = single_type_arg(pin_inner, "Box")?;
-    let Type::TraitObject(trait_object) = strip_grouped_type(box_inner) else {
-        return Err(syn::Error::new_spanned(
-            box_inner,
-            "stream returns must use Pin<Box<dyn futures_core::Stream<Item = Result<T, E>> + Send + 'static>>",
-        ));
-    };
-
-    let has_static = trait_object.bounds.iter().any(|bound| match bound {
-        syn::TypeParamBound::Lifetime(lifetime) => lifetime.ident == "static",
-        _ => false,
-    });
-    let has_send = trait_object.bounds.iter().any(|bound| match bound {
-        syn::TypeParamBound::Trait(trait_bound) => trait_bound
-            .path
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "Send"),
-        _ => false,
-    });
-    if !has_static || !has_send {
-        return Err(syn::Error::new_spanned(
-            trait_object,
-            "stream returns must be Send + 'static in the native ABI slice",
-        ));
-    }
-
-    let item_assoc = trait_object.bounds.iter().find_map(|bound| {
-        let syn::TypeParamBound::Trait(trait_bound) = bound else {
-            return None;
-        };
-        let stream_segment = trait_bound
-            .path
-            .segments
-            .iter()
-            .find(|segment| segment.ident == "Stream")?;
-        let syn::PathArguments::AngleBracketed(args) = &stream_segment.arguments else {
-            return None;
-        };
-        args.args.iter().find_map(|arg| match arg {
-            syn::GenericArgument::AssocType(assoc) if assoc.ident == "Item" => Some(&assoc.ty),
-            _ => None,
-        })
-    });
-    let item_assoc = item_assoc.ok_or_else(|| {
-        syn::Error::new_spanned(
-            trait_object,
-            "stream returns must specify Stream<Item = Result<T, E>>",
-        )
-    })?;
-    let (item_ty, error_ty) = result_type_args(item_assoc)?;
-    Ok(Some(StreamReturnType {
-        item_ty: quote! { #item_ty },
-        error_ty: quote! { #error_ty },
-        is_send: true,
-    }))
-}
-
-fn uniffi_stream_alias_args(ty: &Type) -> syn::Result<Option<(&Type, &Type)>> {
-    let Type::Path(path) = strip_grouped_type(ty) else {
-        return Ok(None);
-    };
-    let Some(segment) = path.path.segments.last() else {
-        return Ok(None);
-    };
-    if segment.ident != "UniFfiStream" {
-        return Ok(None);
-    }
-    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "UniFfiStream returns must use UniFfiStream<T, E>",
-        ));
-    };
-    let mut type_args = args.args.iter().filter_map(|arg| match arg {
-        syn::GenericArgument::Type(ty) => Some(ty),
-        _ => None,
-    });
-    let item_ty = type_args.next().ok_or_else(|| {
-        syn::Error::new_spanned(ty, "UniFfiStream returns must use UniFfiStream<T, E>")
-    })?;
-    let error_ty = type_args.next().ok_or_else(|| {
-        syn::Error::new_spanned(ty, "UniFfiStream returns must use UniFfiStream<T, E>")
-    })?;
-    if type_args.next().is_some() {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "UniFfiStream returns must have exactly two type arguments",
-        ));
-    }
-    Ok(Some((item_ty, error_ty)))
+    Ok(
+        uniffi_meta::async_signature::classify_return(return_type, false)?
+            .stream
+            .as_ref()
+            .map(StreamReturnType::from_signature),
+    )
 }
 
 fn input_stream_arg_type(ty: &Type) -> syn::Result<Option<InputStreamArgType>> {
@@ -1222,6 +1166,54 @@ mod tests {
     use syn::parse_quote;
 
     #[test]
+    fn metadata_header_preserves_original_stream_result_item_shape() {
+        for (source, expected) in [
+            ("fn run() -> u32", [false, false, false]),
+            ("fn run() -> Result<u32, std::convert::Infallible>", [false, false, false]),
+            ("fn run() -> impl Stream<Item = u32>", [false, false, false]),
+            ("fn run() -> impl Stream<Item = Result<u32, std::convert::Infallible>>", [false, false, true]),
+            ("fn run() -> uniffi::UniFfiStream<u32, std::convert::Infallible>", [false, false, true]),
+            ("async fn run() -> Result<BoxStream<'static, u32>, std::convert::Infallible>", [true, true, false]),
+            ("fn run() -> BoxFuture<'static, Result<BoxStream<'static, Result<u32, std::convert::Infallible>>, Error>>", [true, false, true]),
+        ] {
+            for kind in [
+                FnKind::Function,
+                FnKind::Method { self_ident: parse_quote!(Object), foreign_self_ident: parse_quote!(Object) },
+                FnKind::TraitMethod { self_ident: parse_quote!(Trait), index: 0 },
+            ] {
+                let mut sig: syn::Signature = syn::parse_str(source).unwrap();
+                if !matches!(&kind, FnKind::Function) { sig.inputs.insert(0, parse_quote!(&self)); }
+                let parsed = FnSignature::new(kind, sig, ExportFnArgs::default(), String::new()).unwrap();
+                assert_eq!(metadata_header_bools(&parsed), expected, "{source}");
+            }
+        }
+        let constructor = FnSignature::new_constructor(
+            parse_quote!(Object), parse_quote!(Object),
+            parse_quote!(async fn new() -> Result<Arc<Self>, std::convert::Infallible>),
+            ExportFnArgs::default(), String::new(),
+        ).unwrap();
+        assert_eq!(metadata_header_bools(&constructor), [true, true, false]);
+    }
+
+    fn metadata_header_bools(sig: &FnSignature) -> Vec<bool> {
+        let mut expr: syn::Expr = syn::parse2(sig.metadata_expr().unwrap()).unwrap();
+        let mut values = vec![];
+        while let syn::Expr::MethodCall(call) = expr {
+            if call.method == "concat_bool" {
+                let Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(value), .. })) = call.args.first() else {
+                    panic!("expected a literal metadata header bool");
+                };
+                values.push(value.value);
+            }
+            expr = *call.receiver;
+        }
+        values.reverse();
+        // The optional original-name presence flag precedes the three callable shape flags.
+        assert_eq!(values.remove(0), false);
+        values
+    }
+
+    #[test]
     fn parses_send_static_result_stream_return() {
         let return_type: syn::ReturnType = parse_quote! {
             -> std::pin::Pin<
@@ -1233,7 +1225,7 @@ mod tests {
         let stream = stream_return_type(&return_type).unwrap().unwrap();
         assert_eq!(stream.item_ty.to_string(), quote! { u32 }.to_string());
         assert_eq!(stream.error_ty.to_string(), quote! { MyError }.to_string());
-        assert!(stream.is_send);
+        assert!(stream.is_fallible);
     }
 
     #[test]
@@ -1244,7 +1236,7 @@ mod tests {
         let stream = stream_return_type(&return_type).unwrap().unwrap();
         assert_eq!(stream.item_ty.to_string(), quote! { MyEvent }.to_string());
         assert_eq!(stream.error_ty.to_string(), quote! { MyError }.to_string());
-        assert!(stream.is_send);
+        assert!(stream.is_fallible);
     }
 
     #[test]
@@ -1255,7 +1247,7 @@ mod tests {
         let stream = stream_return_type(&return_type).unwrap().unwrap();
         assert_eq!(stream.item_ty.to_string(), quote! { u32 }.to_string());
         assert_eq!(stream.error_ty.to_string(), quote! { MyError }.to_string());
-        assert!(stream.is_send);
+        assert!(stream.is_fallible);
     }
 
     #[test]
@@ -1269,11 +1261,11 @@ mod tests {
             stream.error_ty.to_string(),
             quote! { crate :: MyError }.to_string()
         );
-        assert!(stream.is_send);
+        assert!(stream.is_fallible);
     }
 
     #[test]
-    fn rejects_infallible_stream_return() {
+    fn accepts_infallible_stream_return() {
         let return_type: syn::ReturnType = parse_quote! {
             -> std::pin::Pin<
                 Box<
@@ -1281,26 +1273,27 @@ mod tests {
                 >
             >
         };
-        let error = stream_return_type(&return_type).unwrap_err().to_string();
-        assert!(error.contains("Stream<Item = T> is not supported"));
+        let stream = stream_return_type(&return_type).unwrap().unwrap();
+        assert!(!stream.is_fallible);
+        assert!(stream.error_ty.to_string().contains("Infallible"));
     }
 
     #[test]
-    fn rejects_stream_return_without_static() {
+    fn accepts_boxed_stream_with_implicit_static() {
         let return_type: syn::ReturnType = parse_quote! {
             -> Pin<Box<dyn Stream<Item = Result<u32, MyError>> + Send>>
         };
-        let error = stream_return_type(&return_type).unwrap_err().to_string();
-        assert!(error.contains("Send + 'static"));
+        let stream = stream_return_type(&return_type).unwrap().unwrap();
+        assert!(stream.is_fallible);
     }
 
     #[test]
-    fn rejects_stream_return_without_send() {
+    fn accepts_local_stream_without_send() {
         let return_type: syn::ReturnType = parse_quote! {
             -> Pin<Box<dyn Stream<Item = Result<u32, MyError>> + 'static>>
         };
-        let error = stream_return_type(&return_type).unwrap_err().to_string();
-        assert!(error.contains("Send + 'static"));
+        let stream = stream_return_type(&return_type).unwrap().unwrap();
+        assert!(stream.is_fallible);
     }
 
     #[test]
@@ -1363,11 +1356,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_method_input_stream_parameters() {
+    fn accepts_method_input_stream_parameters() {
         let sig: syn::Signature = parse_quote! {
             fn consume(&self, events: uniffi::UniFfiInputStream<u32, MyError>)
         };
-        let err = match FnSignature::new(
+        let parsed = FnSignature::new(
             FnKind::Method {
                 self_ident: parse_quote! { MyObject },
                 foreign_self_ident: parse_quote! { MyObject },
@@ -1375,13 +1368,9 @@ mod tests {
             sig,
             ExportFnArgs::default(),
             String::new(),
-        ) {
-            Ok(_) => panic!("expected method input stream parameter rejection"),
-            Err(err) => err,
-        };
-        assert!(err
-            .to_string()
-            .contains("only supported for top-level functions"));
+        )
+        .unwrap();
+        assert!(parsed.args[0].input_stream.is_some());
     }
 
     #[test]
@@ -1404,11 +1393,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_method_stream_returns() {
+    fn accepts_method_stream_returns() {
         let sig: syn::Signature = parse_quote! {
             fn events(&self) -> Pin<Box<dyn Stream<Item = Result<u32, MyError>> + Send + 'static>>
         };
-        let err = match FnSignature::new(
+        let parsed = FnSignature::new(
             FnKind::Method {
                 self_ident: parse_quote! { MyObject },
                 foreign_self_ident: parse_quote! { MyObject },
@@ -1416,13 +1405,9 @@ mod tests {
             sig,
             ExportFnArgs::default(),
             String::new(),
-        ) {
-            Ok(_) => panic!("expected method stream return rejection"),
-            Err(err) => err,
-        };
-        assert!(err
-            .to_string()
-            .contains("only supported for top-level functions"));
+        )
+        .unwrap();
+        assert!(parsed.stream_return.is_some());
     }
 
     #[test]

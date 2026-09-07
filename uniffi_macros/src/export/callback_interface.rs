@@ -5,7 +5,7 @@
 use crate::{
     export::ImplItem,
     ffiops,
-    fnsig::{FnKind, FnSignature, ReceiverArg},
+    fnsig::FnSignature,
     util::{
         async_trait_annotation, create_metadata_items, derive_ffi_traits, ident_to_string,
         tagged_impl_header, wasm_single_threaded_annotation,
@@ -60,8 +60,9 @@ pub(super) fn trait_impl(
         let ident = &sig.ident;
         let param_names = sig.scaffolding_param_names();
         let param_types = sig.scaffolding_param_types();
-        let lift_return_type = ffiops::lift_return_type(&sig.return_ty);
-        if !sig.is_async {
+        let callback_return = callback_return_type(sig);
+        let lift_return_type = ffiops::lift_return_type(&callback_return);
+        let method = if !sig.is_async {
             quote! {
                 pub #ident: extern "C" fn(
                     uniffi_handle: u64,
@@ -80,7 +81,23 @@ pub(super) fn trait_impl(
                     uniffi_out_dropped_callback: &mut ::uniffi::ForeignFutureDroppedCallbackStruct,
                 ),
             }
-        }
+        };
+        let stream_fields = sig.stream_return.as_ref().map(|stream| {
+            let next = format_ident!("{}_stream_next", sig.ident);
+            let cancel = format_ident!("{}_stream_cancel", sig.ident);
+            let close = format_ident!("{}_stream_close", sig.ident);
+            let item = &stream.item_ty;
+            let error = &stream.error_ty;
+            let input_return = ffiops::lift_return_type(
+                quote! { ::std::result::Result<::std::option::Option<#item>, #error> },
+            );
+            quote! {
+                pub #next: ::uniffi::ForeignInputStreamNextCallback<#input_return>,
+                pub #cancel: ::uniffi::ForeignInputStreamCancelCallback,
+                pub #close: ::uniffi::ForeignInputStreamCloseCallback,
+            }
+        });
+        quote! { #method #stream_fields }
     });
 
     let trait_impl_methods = methods
@@ -96,6 +113,7 @@ pub(super) fn trait_impl(
 
     Ok(quote! {
         #[allow(missing_docs)]
+        #[repr(C)]
         pub struct #vtable_type {
             pub uniffi_free: extern "C" fn(handle: u64),
             pub uniffi_clone: extern "C" fn(handle: u64) -> u64,
@@ -199,75 +217,119 @@ pub fn ffi_converter_callback_interface_impl(
 
 /// Generate a single method for [trait_impl].  This implements a trait method by invoking a
 /// foreign-supplied callback.
+fn callback_return_type(sig: &FnSignature) -> TokenStream {
+    if sig.stream_return.is_none() {
+        return sig.return_ty.clone();
+    }
+    match &sig.factory_error_ty {
+        Some(error) => quote! { ::std::result::Result<::uniffi::ForeignStreamReturn, #error> },
+        None => quote! { ::uniffi::ForeignStreamReturn },
+    }
+}
+
 fn gen_method_impl(sig: &FnSignature, vtable_cell: &Ident) -> syn::Result<TokenStream> {
-    let FnSignature {
-        ident,
-        is_async,
-        return_ty,
-        kind,
-        receiver,
-        name,
-        span,
-        ..
-    } = sig;
-
-    if !matches!(kind, FnKind::TraitMethod { .. }) {
-        return Err(syn::Error::new(
-            *span,
-            format!(
-                "Internal UniFFI error: Unexpected function kind for callback interface {name}: {kind:?}",
-            ),
-        ));
-    }
-
-    let self_param = match receiver {
-        Some(ReceiverArg::Ref) => quote! { &self },
-        Some(ReceiverArg::Arc) => quote! { self: Arc<Self> },
-        None => {
-            return Err(syn::Error::new(
-                *span,
-                "callback interface methods must take &self as their first argument",
-            ));
-        }
-    };
-
-    let params = sig.params();
-    let lower_exprs = sig.args.iter().map(|a| {
-        let lower = ffiops::lower(&a.ty);
-        let ident = &a.ident;
-        quote! { #lower(#ident) }
-    });
-
-    let lift_return_type = ffiops::lift_return_type(&sig.return_ty);
-    let lift_foreign_return = ffiops::lift_foreign_return(&sig.return_ty);
-
-    if !is_async {
-        Ok(quote! {
-            fn #ident(#self_param, #(#params),*) -> #return_ty {
-                let vtable = #vtable_cell.get();
-                let mut uniffi_call_status: ::uniffi::RustCallStatus = ::std::default::Default::default();
-                let mut uniffi_return_value: #lift_return_type = ::uniffi::FfiDefault::ffi_default();
-                (vtable.#ident)(self.handle, #(#lower_exprs,)* &mut uniffi_return_value, &mut uniffi_call_status);
-                #lift_foreign_return(uniffi_return_value, uniffi_call_status)
+    let mut variants = Vec::new();
+    for &wasm in super::async_types::variants() {
+        let signature = super::async_types::normalize_signature(&sig.original_signature, wasm)?;
+        let output_type = super::async_types::normalized_output(&sig.original_signature, wasm)?;
+        let target = super::async_types::target_attribute(wasm);
+        let explicit_future = sig.is_async && sig.original_signature.asyncness.is_none();
+        let receiver_handle = if explicit_future {
+            quote! { uniffi_receiver.handle }
+        } else {
+            quote! { self.handle }
+        };
+        let ident = &sig.ident;
+        let callback_return = callback_return_type(sig);
+        let lift_return_type = ffiops::lift_return_type(&callback_return);
+        let lift = ffiops::lift_foreign_return(&callback_return);
+        let input_arguments: Vec<_> = sig
+            .args
+            .iter()
+            .filter(|arg| arg.input_stream.is_some())
+            .map(|arg| &arg.ident)
+            .collect();
+        let input_handles: Vec<_> = input_arguments
+            .iter()
+            .map(|ident| format_ident!("__uniffi_input_{}", ident))
+            .collect();
+        let lower_exprs = sig.args.iter().map(|arg| {
+            let ident = &arg.ident;
+            if arg.input_stream.is_some() {
+                let handle = format_ident!("__uniffi_input_{}", ident);
+                quote! { #handle }
+            } else {
+                let lower = ffiops::lower(&arg.ty);
+                quote! { #lower(#ident) }
             }
-        })
-    } else {
-        Ok(quote! {
-            async fn #ident(#self_param, #(#params),*) -> #return_ty {
-                let vtable = #vtable_cell.get();
-                ::uniffi::foreign_async_call::<_, #return_ty, crate::UniFfiTag>(
-                    move |uniffi_future_callback, uniffi_future_callback_data, uniffi_foreign_future_dropped_callback| {
-                        (vtable.#ident)(
-                            self.handle,
-                            #(#lower_exprs,)*
-                            uniffi_future_callback,
-                            uniffi_future_callback_data,
-                            uniffi_foreign_future_dropped_callback
-                        );
-                }).await
+        });
+        let call = if !sig.is_async {
+            quote! {
+                let mut status = ::uniffi::RustCallStatus::default();
+                let mut value: #lift_return_type = ::uniffi::FfiDefault::ffi_default();
+                (vtable.#ident)(#receiver_handle, #(#lower_exprs,)* &mut value, &mut status);
+                #lift(value, status)
             }
-        })
+        } else {
+            quote! {
+                ::uniffi::foreign_async_call::<_, #callback_return, crate::UniFfiTag>(
+                    move |callback, callback_data, dropped| {
+                        (vtable.#ident)(#receiver_handle, #(#lower_exprs,)* callback, callback_data, dropped);
+                    }
+                ).await
+            }
+        };
+        let converted = if let Some(stream) = &sig.stream_return {
+            let next = format_ident!("{}_stream_next", ident);
+            let cancel = format_ident!("{}_stream_cancel", ident);
+            let close = format_ident!("{}_stream_close", ident);
+            let item = &stream.item_ty;
+            let error = &stream.error_ty;
+            let stream_value = quote! { ::uniffi::UniFfiInputStream::<#item, #error>::from_foreign_callbacks::<crate::UniFfiTag>(
+                handle.0, vtable.#next, vtable.#cancel, vtable.#close,
+            ) };
+            let stream_value = if stream.is_fallible {
+                stream_value
+            } else {
+                quote! { ::uniffi::deps::futures_util::StreamExt::map(#stream_value, |item| match item {
+                    Ok(value) => value, Err(never) => match never {},
+                }) }
+            };
+            // The expected trait return type performs the dyn coercion here.
+            if sig.factory_error_ty.is_some() {
+                quote! { match uniffi_result { Ok(handle) => Ok(::std::boxed::Box::pin(#stream_value)), Err(error) => Err(error) } }
+            } else {
+                quote! {{ let handle = uniffi_result; ::std::boxed::Box::pin(#stream_value) }}
+            }
+        } else {
+            quote! { uniffi_result }
+        };
+        let release_receiver =
+            explicit_future.then(|| quote! { ::std::mem::drop(uniffi_receiver); });
+        let body = quote! {
+            let vtable = #vtable_cell.get();
+            #(let #input_handles = #input_arguments.handle();)*
+            let uniffi_result = { #call };
+            // Keep the foreign producer proxy alive through callback completion.
+            // Cancellation drops it inside the surrounding call cleanup scope.
+            ::std::mem::drop((#(#input_arguments,)*));
+            #release_receiver
+            let uniffi_output: #output_type = #converted;
+            uniffi_output
+        };
+        let body = if explicit_future {
+            quote! {
+                // A returned 'static Future can outlive this handler. Keep an
+                // owned foreign lease until completion or Future destruction.
+                let uniffi_receiver = Self::new((#vtable_cell.get().uniffi_clone)(self.handle));
+                ::std::boxed::Box::pin(async move { #body })
+            }
+        } else {
+            body
+        };
+        variants.push(quote! { #target #signature { #body } });
     }
+    Ok(quote! { #(#variants)* })
 }
 
 pub(super) fn metadata_items(

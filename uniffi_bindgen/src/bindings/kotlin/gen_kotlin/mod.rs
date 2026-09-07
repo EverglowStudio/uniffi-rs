@@ -245,11 +245,13 @@ fn ensure_input_streams_supported(ci: &ComponentInterface) -> Result<()> {
                 ..
             } = arg.as_type()
             {
-                if type_contains_input_stream(&item_type) || type_contains_input_stream(&error_type)
+                if type_contains_input_stream(&item_type) || error_type.as_deref().is_some_and(type_contains_input_stream)
                 {
                     bail!("nested input stream types are not supported");
                 }
-                ensure_input_stream_error_type_supported(ci, &error_type)?;
+                if let Some(error_type) = error_type {
+                    ensure_input_stream_error_type_supported(ci, &error_type)?;
+                }
                 continue;
             }
             if type_contains_input_stream(&arg.as_type()) {
@@ -772,7 +774,7 @@ impl<T: AsType> AsCodeType for T {
                 item_type,
                 error_type,
                 ..
-            } => Box::new(compounds::InputStreamCodeType::new(*item_type, *error_type)),
+            } => Box::new(compounds::InputStreamCodeType::new(*item_type, error_type.map(|error| *error))),
             Type::Custom { name, builtin, .. } => {
                 Box::new(custom::CustomCodeType::new(name, builtin.as_codetype()))
             }
@@ -1413,6 +1415,9 @@ mod test {
             name: "count_events".to_owned(),
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: true,
             inputs: vec![FnParamMetadata {
                 name: "count".to_owned(),
                 ty: Type::UInt32,
@@ -1422,7 +1427,7 @@ mod test {
             }],
             return_type: Some(Type::Stream {
                 item_type: Box::new(stream_event_type),
-                error_type: Box::new(stream_error_type.clone()),
+                error_type: Some(Box::new(stream_error_type.clone())),
                 is_send: true,
             }),
             throws: None,
@@ -1434,12 +1439,15 @@ mod test {
             name: "optional_events".to_owned(),
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: true,
             inputs: vec![],
             return_type: Some(Type::Stream {
                 item_type: Box::new(Type::Optional {
                     inner_type: Box::new(Type::UInt32),
                 }),
-                error_type: Box::new(stream_error_type),
+                error_type: Some(Box::new(stream_error_type)),
                 is_send: true,
             }),
             throws: None,
@@ -1520,11 +1528,14 @@ mod test {
             name: "sum_events".to_owned(),
             orig_name: None,
             is_async: true,
+            rust_async: true,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: false,
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),
                 ty: Type::InputStream {
                     item_type: Box::new(counter_event_type.clone()),
-                    error_type: Box::new(stream_error_type.clone()),
+                    error_type: Some(Box::new(stream_error_type.clone())),
                     is_send: true,
                 },
                 by_ref: false,
@@ -1541,11 +1552,14 @@ mod test {
             name: "running_sum".to_owned(),
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: true,
             inputs: vec![FnParamMetadata {
                 name: "events".to_owned(),
                 ty: Type::InputStream {
                     item_type: Box::new(counter_event_type.clone()),
-                    error_type: Box::new(stream_error_type.clone()),
+                    error_type: Some(Box::new(stream_error_type.clone())),
                     is_send: true,
                 },
                 by_ref: false,
@@ -1554,7 +1568,7 @@ mod test {
             }],
             return_type: Some(Type::Stream {
                 item_type: Box::new(counter_event_type),
-                error_type: Box::new(stream_error_type),
+                error_type: Some(Box::new(stream_error_type)),
                 is_send: true,
             }),
             throws: None,
@@ -1846,9 +1860,47 @@ mod test {
         );
         assert!(kotlin.contains("uniffiInputStreamNextCallbackImpl"));
         assert!(kotlin.contains("uniffiInputStreamCancelCallbackImpl"));
+        assert!(kotlin.contains("uniffiInputStreamCloseCallbackImpl"));
         assert!(kotlin.contains("private val uniffiInputStreamHandleMap"));
         assert!(kotlin.contains("public fun uniffiInputStreamHandleCountStreamCore()"));
         assert!(!kotlin.contains("input stream parameters are not supported"));
+    }
+
+    #[test]
+    fn kotlin_input_stream_wrapper_compiles_when_kotlinc_available() {
+        use std::process::Command;
+        if Command::new("kotlinc").arg("-version").output().is_err() {
+            eprintln!("SKIP kotlin_input_stream_wrapper_compiles_when_kotlinc_available: kotlinc unavailable");
+            return;
+        }
+        let classpath = std::env::var("CLASSPATH").expect("Kotlin gate requires JNA/coroutines CLASSPATH");
+        let kotlin = generate_bindings(
+            &Config {
+                package_name: Some("uniffi.stream_core".to_owned()),
+                cdylib_name: Some("stream_core".to_owned()),
+                ..Config::default()
+            },
+            &input_stream_component_interface(),
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("StreamCore.kt");
+        std::fs::write(&source, kotlin).unwrap();
+        let output = Command::new("kotlinc")
+            .arg("-Werror")
+            .arg(&source)
+            .arg("-classpath")
+            .arg(classpath)
+            .arg("-d")
+            .arg(tmp.path().join("stream-core.jar"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "kotlinc failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

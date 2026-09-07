@@ -3,6 +3,7 @@
 
 pub mod local;
 pub mod actor;
+pub mod declarations;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -257,6 +258,7 @@ pub async fn detach_spawn(id: u32) {
 #[derive(Clone, Debug, uniffi::Error)]
 pub enum FixtureError {
     Boom,
+    Factory,
 }
 impl std::fmt::Display for FixtureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -264,6 +266,9 @@ impl std::fmt::Display for FixtureError {
     }
 }
 impl std::error::Error for FixtureError {}
+impl From<uniffi::UnexpectedUniFFICallbackError> for FixtureError {
+    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> Self { Self::Boom }
+}
 
 struct ProbeStream {
     id: u32,

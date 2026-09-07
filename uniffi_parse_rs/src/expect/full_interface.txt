@@ -5,6 +5,9 @@
             name: "bytes_fn",
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: false,
             inputs: [
                 FnParamMetadata {
                     name: "a",
@@ -35,6 +38,9 @@
                 "func",
             ),
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: false,
             inputs: [
                 FnParamMetadata {
                     name: "a",
@@ -93,6 +99,9 @@
             name: "trait_fn",
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: false,
             inputs: [
                 FnParamMetadata {
                     name: "a",
@@ -483,6 +492,9 @@
                 "constructor_with_default",
             ),
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             inputs: [
                 FnParamMetadata {
                     name: "a",
@@ -522,6 +534,9 @@
             name: "failible_constructor",
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             inputs: [
                 FnParamMetadata {
                     name: "a",
@@ -555,6 +570,9 @@
             name: "new",
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: false,
             inputs: [],
             throws: None,
             checksum: None,
@@ -570,6 +588,9 @@
             name: "meth1",
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             inputs: [],
             return_type: Some(
                 String,
@@ -596,6 +617,9 @@
                 "meth2",
             ),
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             inputs: [
                 FnParamMetadata {
                     name: "a",
@@ -634,6 +658,9 @@
             name: "meth3",
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             inputs: [
                 FnParamMetadata {
                     name: "s",
@@ -665,6 +692,9 @@
             name: "method",
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             inputs: [
                 FnParamMetadata {
                     name: "a",
@@ -700,6 +730,9 @@
             name: "method",
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             inputs: [],
             return_type: Some(
                 UInt8,
@@ -723,6 +756,9 @@
             name: "method",
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: false,
             inputs: [
                 FnParamMetadata {
                     name: "a",
@@ -765,6 +801,9 @@
                 name: "uniffi_trait_debug",
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: [],
                 return_type: Some(
                     String,
@@ -784,6 +823,9 @@
                 name: "uniffi_trait_display",
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: [],
                 return_type: Some(
                     String,
@@ -803,6 +845,9 @@
                 name: "uniffi_trait_eq_eq",
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: [
                     FnParamMetadata {
                         name: "other",
@@ -830,6 +875,9 @@
                 name: "uniffi_trait_eq_ne",
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: [
                     FnParamMetadata {
                         name: "other",
@@ -861,6 +909,9 @@
                 name: "uniffi_trait_hash",
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: [],
                 return_type: Some(
                     UInt64,
@@ -880,6 +931,9 @@
                 name: "uniffi_trait_ord_cmp",
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: [
                     FnParamMetadata {
                         name: "other",

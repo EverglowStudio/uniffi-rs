@@ -73,12 +73,6 @@ impl ExportItem {
 
     pub fn from_impl(item: syn::ItemImpl, attr_args: TokenStream) -> syn::Result<Self> {
         let args: ExportImplArgs = syn::parse(attr_args)?;
-        if args.local.is_some() && item.trait_.is_some() {
-            return Err(syn::Error::new_spanned(
-                &item.self_ty,
-                "local exports currently require inherent methods on a local Object",
-            ));
-        }
         if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
             return Err(syn::Error::new_spanned(
                 &item.generics,

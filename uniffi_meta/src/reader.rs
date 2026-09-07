@@ -219,12 +219,12 @@ impl<'a> MetadataReader<'a> {
             },
             codes::TYPE_STREAM => Type::Stream {
                 item_type: Box::new(self.read_type()?),
-                error_type: Box::new(self.read_type()?),
+                error_type: self.read_optional_type()?.map(Box::new),
                 is_send: self.read_bool()?,
             },
             codes::TYPE_INPUT_STREAM => Type::InputStream {
                 item_type: Box::new(self.read_type()?),
-                error_type: Box::new(self.read_type()?),
+                error_type: self.read_optional_type()?.map(Box::new),
                 is_send: self.read_bool()?,
             },
             codes::TYPE_UNIT => bail!("Unexpected TYPE_UNIT"),
@@ -243,17 +243,17 @@ impl<'a> MetadataReader<'a> {
         })
     }
 
-    fn read_return_type(&mut self) -> Result<(Option<Type>, Option<Type>)> {
+    fn read_return_type(&mut self) -> Result<(Option<Type>, Option<Type>, bool)> {
         Ok(match self.peek_u8()? {
             codes::TYPE_UNIT => {
                 _ = self.read_u8();
-                (None, None)
+                (None, None, false)
             }
             codes::TYPE_RESULT => {
                 _ = self.read_u8();
-                (self.read_optional_type()?, self.read_optional_type()?)
+                (self.read_optional_type()?, self.read_optional_type()?, true)
             }
-            _ => (Some(self.read_type()?), None),
+            _ => (Some(self.read_type()?), None, false),
         })
     }
 
@@ -262,14 +262,19 @@ impl<'a> MetadataReader<'a> {
         let name = self.read_string()?;
         let orig_name = self.read_optional_string()?;
         let is_async = self.read_bool()?;
+        let rust_async = self.read_bool()?;
+        let rust_stream_item_is_result = self.read_bool()?;
         let inputs = self.read_inputs()?;
-        let (return_type, throws) = self.read_return_type()?;
+        let (return_type, throws, rust_return_is_result) = self.read_return_type()?;
         let docstring = self.read_optional_long_string()?;
         Ok(FnMetadata {
             module_path,
             name,
             orig_name,
             is_async,
+            rust_async,
+            rust_return_is_result,
+            rust_stream_item_is_result,
             inputs,
             return_type,
             throws,
@@ -284,8 +289,10 @@ impl<'a> MetadataReader<'a> {
         let name = self.read_string()?;
         let orig_name = self.read_optional_string()?;
         let is_async = self.read_bool()?;
+        let rust_async = self.read_bool()?;
+        let rust_stream_item_is_result = self.read_bool()?;
         let inputs = self.read_inputs()?;
-        let (return_type, throws) = self.read_return_type()?;
+        let (return_type, throws, rust_return_is_result) = self.read_return_type()?;
         let docstring = self.read_optional_long_string()?;
 
         let self_type = return_type
@@ -313,6 +320,9 @@ impl<'a> MetadataReader<'a> {
             self_name,
             self_type: Some(self_type),
             is_async,
+            rust_async,
+            rust_return_is_result,
+            rust_stream_item_is_result,
             name,
             orig_name,
             inputs,
@@ -328,8 +338,10 @@ impl<'a> MetadataReader<'a> {
         let name = self.read_string()?;
         let orig_name = self.read_optional_string()?;
         let is_async = self.read_bool()?;
+        let rust_async = self.read_bool()?;
+        let rust_stream_item_is_result = self.read_bool()?;
         let inputs = self.read_inputs()?;
-        let (return_type, throws) = self.read_return_type()?;
+        let (return_type, throws, rust_return_is_result) = self.read_return_type()?;
         let docstring = self.read_optional_long_string()?;
         Ok(MethodMetadata {
             module_path: self_module_path,
@@ -337,6 +349,9 @@ impl<'a> MetadataReader<'a> {
             name,
             orig_name,
             is_async,
+            rust_async,
+            rust_return_is_result,
+            rust_stream_item_is_result,
             inputs,
             return_type,
             throws,
@@ -498,8 +513,10 @@ impl<'a> MetadataReader<'a> {
         let name = self.read_string()?;
         let orig_name = self.read_optional_string()?;
         let is_async = self.read_bool()?;
+        let rust_async = self.read_bool()?;
+        let rust_stream_item_is_result = self.read_bool()?;
         let inputs = self.read_inputs()?;
-        let (return_type, throws) = self.read_return_type()?;
+        let (return_type, throws, rust_return_is_result) = self.read_return_type()?;
         let docstring = self.read_optional_long_string()?;
         Ok(TraitMethodMetadata {
             module_path,
@@ -508,6 +525,9 @@ impl<'a> MetadataReader<'a> {
             name,
             orig_name,
             is_async,
+            rust_async,
+            rust_return_is_result,
+            rust_stream_item_is_result,
             inputs,
             return_type,
             throws,
@@ -735,7 +755,7 @@ mod tests {
         push_string(&mut bytes, "example::nested::constructors");
         push_string(&mut bytes, "Counter");
         push_string(&mut bytes, "new");
-        bytes.extend_from_slice(&[0, 1, 0]); // no rename, async, no inputs
+        bytes.extend_from_slice(&[0, 1, 1, 0, 0]); // no rename, host async, Rust async fn, non-stream, no inputs
         if fallible {
             bytes.push(codes::TYPE_RESULT);
         }
@@ -778,6 +798,90 @@ mod tests {
                 inner_type: Box::new(ty)
             }
         );
+    }
+
+    #[test]
+    fn callable_result_shapes_preserve_unit_error_metadata() {
+        for code in [
+            codes::FUNC,
+            codes::METHOD,
+            codes::TRAIT_METHOD,
+            codes::CONSTRUCTOR,
+        ] {
+            let outputs = if code == codes::CONSTRUCTOR {
+                vec![(
+                    object_type_metadata(codes::TYPE_INTERFACE, "Counter"),
+                    false,
+                )]
+            } else {
+                vec![
+                    (vec![codes::TYPE_UNIT], false),
+                    (vec![codes::TYPE_U32], false),
+                    (
+                        vec![codes::TYPE_STREAM, codes::TYPE_U32, codes::TYPE_UNIT, 1],
+                        false,
+                    ),
+                    (
+                        vec![codes::TYPE_STREAM, codes::TYPE_U32, codes::TYPE_UNIT, 1],
+                        true,
+                    ),
+                ]
+            };
+            for (output, item_is_result) in outputs {
+                for return_is_result in [false, true] {
+                    let mut bytes = vec![code];
+                    push_string(&mut bytes, "example");
+                    if code != codes::FUNC {
+                        push_string(&mut bytes, "Counter");
+                    }
+                    if code == codes::TRAIT_METHOD {
+                        bytes.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                    push_string(&mut bytes, "run");
+                    bytes.extend_from_slice(&[0, 1, 0, u8::from(item_is_result), 0]);
+                    if return_is_result {
+                        bytes.push(codes::TYPE_RESULT);
+                    }
+                    bytes.extend_from_slice(&output);
+                    if return_is_result {
+                        bytes.push(codes::TYPE_UNIT);
+                    }
+                    bytes.extend_from_slice(&[0, 0]);
+                    let (shape, is_async, rust_async, throws) = match read_metadata(&bytes).unwrap()
+                    {
+                        Metadata::Func(f) => (
+                            (f.rust_return_is_result, f.rust_stream_item_is_result),
+                            f.is_async,
+                            f.rust_async,
+                            f.throws,
+                        ),
+                        Metadata::Method(m) => (
+                            (m.rust_return_is_result, m.rust_stream_item_is_result),
+                            m.is_async,
+                            m.rust_async,
+                            m.throws,
+                        ),
+                        Metadata::TraitMethod(m) => (
+                            (m.rust_return_is_result, m.rust_stream_item_is_result),
+                            m.is_async,
+                            m.rust_async,
+                            m.throws,
+                        ),
+                        Metadata::Constructor(c) => (
+                            (c.rust_return_is_result, c.rust_stream_item_is_result),
+                            c.is_async,
+                            c.rust_async,
+                            c.throws,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(shape, (return_is_result, item_is_result));
+                    assert!(is_async);
+                    assert!(!rust_async);
+                    assert_eq!(throws, None);
+                }
+            }
+        }
     }
 
     #[test]
@@ -835,7 +939,7 @@ mod tests {
             read_metadata_type(&bytes).unwrap(),
             Type::Stream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             }
         );
@@ -853,10 +957,41 @@ mod tests {
             read_metadata_type(&bytes).unwrap(),
             Type::InputStream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             }
         );
+    }
+
+    #[test]
+    fn infallible_streams_keep_item_none_separate_from_end() {
+        for code in [codes::TYPE_STREAM, codes::TYPE_INPUT_STREAM] {
+            let bytes = [
+                code,
+                codes::TYPE_OPTION,
+                codes::TYPE_U32,
+                codes::TYPE_UNIT,
+                0,
+            ];
+            let item_type = Box::new(Type::Optional {
+                inner_type: Box::new(Type::UInt32),
+            });
+            let expected = if code == codes::TYPE_STREAM {
+                Type::Stream {
+                    item_type,
+                    error_type: None,
+                    is_send: false,
+                }
+            } else {
+                Type::InputStream {
+                    item_type,
+                    error_type: None,
+                    is_send: false,
+                }
+            };
+            assert_eq!(read_metadata_type(&bytes).unwrap(), expected);
+            assert_eq!(expected.iter_nested_types().count(), 2);
+        }
     }
 
     #[test]

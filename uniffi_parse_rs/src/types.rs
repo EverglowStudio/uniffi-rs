@@ -29,6 +29,8 @@ pub struct ArgType {
 pub struct ReturnType {
     pub ok: Option<uniffi_meta::Type>,
     pub err: Option<uniffi_meta::Type>,
+    pub rust_return_is_result: bool,
+    pub rust_stream_item_is_result: bool,
 }
 
 pub struct SelfType {
@@ -42,6 +44,8 @@ pub struct SelfType {
 pub enum Type {
     // Primitive types.
     Unit,
+    // Only represents the standard uninhabited error type, never a user error with this name.
+    Infallible,
     UInt8,
     Int8,
     UInt16,
@@ -70,7 +74,9 @@ pub enum Type {
     Object {
         module_path: String,
         name: String,
+        imp: ObjectImpl,
     },
+    LocalObject(Box<Type>),
     /// Exported trait
     Trait {
         module_path: String,
@@ -86,8 +92,8 @@ pub enum Type {
     HashMap(Box<Type>, Box<Type>),
     HashSet(Box<Type>),
     Result(Box<Type>, Box<Type>),
-    Stream(Box<Type>, Box<Type>),
-    InputStream(Box<Type>, Box<Type>),
+    Stream(Box<Type>, Option<Box<Type>>, bool),
+    InputStream(Box<Type>, Option<Box<Type>>, bool),
     // Custom type on the scaffolding side
     Custom {
         module_path: String,
@@ -109,6 +115,28 @@ impl Type {
     }
 
     pub fn try_into_uniffi_meta(
+        self,
+        source: FileId,
+        span: Span,
+        self_ty: Option<&uniffi_meta::Type>,
+    ) -> Result<uniffi_meta::Type> {
+        let ty = self.into_uniffi_meta_inner(source, span, self_ty)?;
+        if ty.iter_nested_types().any(|ty| {
+            matches!(
+                ty,
+                uniffi_meta::Type::Stream { .. } | uniffi_meta::Type::InputStream { .. }
+            )
+        }) {
+            return Err(Error::new(
+                source,
+                span,
+                SynError("nested streams in UniFFI data are not supported".into()),
+            ));
+        }
+        Ok(ty)
+    }
+
+    fn into_uniffi_meta_inner(
         self,
         source: FileId,
         span: Span,
@@ -148,26 +176,61 @@ impl Type {
             Type::HashSet(key) => Ok(uniffi_meta::Type::Set {
                 inner_type: Box::new((*key).try_into_uniffi_meta(source, span, self_ty)?),
             }),
-            Type::Stream(item, error) => Ok(uniffi_meta::Type::Stream {
+            Type::Stream(item, error, is_send) => Ok(uniffi_meta::Type::Stream {
                 item_type: Box::new((*item).try_into_uniffi_meta(source, span, self_ty)?),
-                error_type: Box::new((*error).try_into_uniffi_meta(source, span, self_ty)?),
-                is_send: true,
+                error_type: error
+                    .filter(|error| !matches!(**error, Type::Infallible))
+                    .map(|error| {
+                        error
+                            .try_into_uniffi_meta(source, span, self_ty)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
+                is_send,
             }),
-            Type::InputStream(item, error) => Ok(uniffi_meta::Type::InputStream {
+            Type::InputStream(item, error, is_send) => Ok(uniffi_meta::Type::InputStream {
                 item_type: Box::new((*item).try_into_uniffi_meta(source, span, self_ty)?),
-                error_type: Box::new((*error).try_into_uniffi_meta(source, span, self_ty)?),
-                is_send: true,
+                error_type: error
+                    .filter(|error| !matches!(**error, Type::Infallible))
+                    .map(|error| {
+                        error
+                            .try_into_uniffi_meta(source, span, self_ty)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
+                is_send,
             }),
-            Type::Object { module_path, name } => Ok(uniffi_meta::Type::Object {
+            Type::Object {
                 module_path,
                 name,
-                imp: uniffi_meta::ObjectImpl::Struct,
+                imp,
+            } => Ok(uniffi_meta::Type::Object {
+                module_path,
+                name,
+                imp,
             }),
+            Type::LocalObject(inner) => {
+                let ty = inner.try_into_uniffi_meta(source, span, self_ty)?;
+                match ty {
+                    uniffi_meta::Type::Object {
+                        imp: ObjectImpl::LocalStruct,
+                        ..
+                    } => Ok(ty),
+                    _ => Err(Error::new(source, span, InvalidType)),
+                }
+            }
             Type::Arc(inner) => match *inner {
-                Type::Object { module_path, name } => Ok(uniffi_meta::Type::Object {
+                Type::LocalObject(inner) => {
+                    Type::LocalObject(inner).try_into_uniffi_meta(source, span, self_ty)
+                }
+                Type::Object {
                     module_path,
                     name,
-                    imp: uniffi_meta::ObjectImpl::Struct,
+                    imp,
+                } => Ok(uniffi_meta::Type::Object {
+                    module_path,
+                    name,
+                    imp,
                 }),
                 Type::Trait {
                     module_path,
@@ -237,6 +300,41 @@ fn trait_to_uniffi_meta(
 }
 
 impl<'ir> RPath<'ir> {
+    fn stream_transport_is_send(&self, ir: &Ir) -> Result<bool> {
+        let root = self.crate_root_module()?;
+        let env = ir
+            .crate_roots
+            .get(&root.ident)
+            .ok_or_else(|| Error::internal("missing crate compilation environment"))?
+            .compile_env();
+        Ok(env.stream_transport_is_send())
+    }
+
+    pub fn validate_local_constructor(
+        &self,
+        ir: &'ir Ir,
+        cache: &mut LookupCache<'ir>,
+        ty: &syn::Type,
+    ) -> Result<()> {
+        let resolved = self.resolve_type(ir, cache, ty)?;
+        let ok = match &resolved {
+            Type::Result(ok, _) => &**ok,
+            other => other,
+        };
+        if matches!(ok, Type::Arc(inner) if matches!(&**inner, Type::LocalObject(_))) {
+            Ok(())
+        } else {
+            Err(Error::new(
+                self.file_id(),
+                ty.span(),
+                SynError(
+                    "local constructors must return Arc<LocalObject<Self>> from an explicit owner"
+                        .into(),
+                ),
+            ))
+        }
+    }
+
     /// Resolve a `syn::Type` at this path into a `uniffi_meta::Type`
     pub fn resolve_uniffi_meta_type(
         &self,
@@ -266,8 +364,25 @@ impl<'ir> RPath<'ir> {
         syn_ty: &syn::Type,
         self_ty: Option<&uniffi_meta::Type>,
     ) -> Result<ArgType> {
-        Ok(match self.resolve_type(ir, cache, syn_ty)? {
+        let ty = self.resolve_type(ir, cache, syn_ty)?;
+        if matches!(&ty, Type::Stream(..))
+            || matches!(&ty, Type::Ref { ty, .. } if matches!(**ty, Type::Stream(..)))
+        {
+            return Err(Error::new(
+                self.file_id(),
+                syn_ty.span(),
+                SynError("stream parameters must use uniffi::UniFfiInputStream<T, E> directly; nested streams and Pin<Box<dyn Stream<...>>> parameters are not supported".into()),
+            ));
+        }
+        Ok(match ty {
             Type::Ref { ty, .. } => match *ty {
+                Type::InputStream(..) => {
+                    return Err(Error::new(
+                        self.file_id(),
+                        syn_ty.span(),
+                        SynError("input streams must be passed by ownership".into()),
+                    ));
+                }
                 Type::Str => ArgType {
                     ty: uniffi_meta::Type::String,
                     by_ref: true,
@@ -307,26 +422,30 @@ impl<'ir> RPath<'ir> {
         syn_ty: &syn::Type,
         self_ty: Option<&uniffi_meta::Type>,
     ) -> Result<ReturnType> {
-        Ok(match self.resolve_type(ir, cache, syn_ty)? {
-            Type::Unit => ReturnType {
-                ok: None,
-                err: None,
-            },
-            Type::Result(ok, err) => {
-                let ok = match *ok {
-                    Type::Unit => None,
-                    ty => Some(ty.try_into_uniffi_meta(self.file_id(), syn_ty.span(), self_ty)?),
-                };
-                let err = err.try_into_uniffi_meta(self.file_id(), syn_ty.span(), self_ty)?;
-                ReturnType { ok, err: Some(err) }
-            }
+        let (ok, err) = match self.resolve_type(ir, cache, syn_ty)? {
+            Type::Result(ok, err) => (*ok, Some(*err)),
+            ty => (ty, None),
+        };
+        // Capture Rust containers before Infallible is erased from host error metadata.
+        // Type resolution also handles imported names and aliases without guessing their spelling.
+        let rust_return_is_result = err.is_some();
+        let rust_stream_item_is_result = matches!(&ok, Type::Stream(_, Some(_), _));
+        let ok = match ok {
+            Type::Unit => None,
             Type::Ref { .. } => {
                 return Err(Error::new(self.file_id(), syn_ty.span(), InvalidReturnType));
             }
-            ty => ReturnType {
-                ok: Some(ty.try_into_uniffi_meta(self.file_id(), syn_ty.span(), self_ty)?),
-                err: None,
-            },
+            ty => Some(ty.try_into_uniffi_meta(self.file_id(), syn_ty.span(), self_ty)?),
+        };
+        let err = err
+            .filter(|ty| !matches!(ty, Type::Infallible))
+            .map(|ty| ty.try_into_uniffi_meta(self.file_id(), syn_ty.span(), self_ty))
+            .transpose()?;
+        Ok(ReturnType {
+            ok,
+            err,
+            rust_return_is_result,
+            rust_stream_item_is_result,
         })
     }
 
@@ -367,6 +486,52 @@ impl<'ir> RPath<'ir> {
             }
         }
 
+        if let syn::Type::Path(path) = ty {
+            if let Some(ident) = path.path.get_ident() {
+                if let Some(ty) = context.generic_params.get(ident) {
+                    return Ok(ty.clone());
+                }
+            }
+            if path.qself.is_none()
+                && path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "LocalObject")
+            {
+                let generics = GenericArgs::new_with_context_params(
+                    self.file_id(),
+                    &path.path,
+                    context.generic_params.clone(),
+                )?;
+                return Ok(Type::LocalObject(Box::new(
+                    generics.resolve1(ir, cache, self)?,
+                )));
+            }
+        }
+        if let Some(stream) = uniffi_meta::async_signature::classify_stream(ty)
+            .map_err(|e| Error::new_syn(self.file_id(), e))?
+        {
+            let item = self._resolve_type(
+                ir,
+                cache,
+                &stream.item,
+                &mut ResolveTypeContext {
+                    paths_seen: context.paths_seen.clone(),
+                    generic_params: context.generic_params.clone(),
+                },
+            )?;
+            let error = stream
+                .error
+                .as_ref()
+                .map(|e| self._resolve_type(ir, cache, e, context).map(Box::new))
+                .transpose()?;
+            return Ok(Type::Stream(
+                Box::new(item),
+                error,
+                self.stream_transport_is_send(ir)?,
+            ));
+        }
         match ty {
             syn::Type::Reference(ty_ref) => Ok(Type::Ref {
                 mutable: ty_ref.mutability.is_some(),
@@ -409,12 +574,17 @@ impl<'ir> RPath<'ir> {
                             name: names.name,
                         })
                     }
-                    Item::Object(_) => {
+                    Item::Object(object) => {
                         generics.check_empty(self.file_id())?;
                         let names = path_to_type.public_path_to_item(ir, cache)?;
                         Ok(Type::Object {
                             module_path: names.module_path,
                             name: names.name,
+                            imp: if object.attrs.local {
+                                ObjectImpl::LocalStruct
+                            } else {
+                                ObjectImpl::Struct
+                            },
                         })
                     }
                     Item::Type(type_alias) => {
@@ -439,6 +609,7 @@ impl<'ir> RPath<'ir> {
                         }
                         Ok(match item {
                             BuiltinItem::UnitType => Type::Unit,
+                            BuiltinItem::Infallible => Type::Infallible,
                             BuiltinItem::Boolean => Type::Boolean,
                             BuiltinItem::String => Type::String,
                             BuiltinItem::Str => Type::Str,
@@ -487,11 +658,19 @@ impl<'ir> RPath<'ir> {
                             }
                             BuiltinItem::UniFfiStream => {
                                 let (item, error) = generics.resolve2(ir, cache, self)?;
-                                Type::Stream(Box::new(item), Box::new(error))
+                                Type::Stream(
+                                    Box::new(item),
+                                    Some(Box::new(error)),
+                                    self.stream_transport_is_send(ir)?,
+                                )
                             }
                             BuiltinItem::UniFfiInputStream => {
                                 let (item, error) = generics.resolve2(ir, cache, self)?;
-                                Type::InputStream(Box::new(item), Box::new(error))
+                                Type::InputStream(
+                                    Box::new(item),
+                                    Some(Box::new(error)),
+                                    self.stream_transport_is_send(ir)?,
+                                )
                             }
                             _ => return Err(Error::new(self.file_id(), ty.span(), InvalidType)),
                         })
@@ -825,6 +1004,164 @@ pub mod tests {
     }
 
     #[test]
+    fn standard_infallible_uses_builtin_paths_and_preserves_same_named_business_errors() {
+        let ir = Ir::new_for_test(&["async_declarations", "types"]);
+        let mut cache = LookupCache::default();
+        for name in [
+            "std::convert::Infallible",
+            "::std::convert::Infallible",
+            "core::convert::Infallible",
+            "::core::convert::Infallible",
+            "Infallible",
+            "Never",
+            "NoError",
+        ] {
+            assert_eq!(
+                run_resolve_type(&ir, &mut cache, "async_declarations", name),
+                Ok(Type::Infallible),
+                "{name}"
+            );
+            assert_eq!(
+                run_resolve_return_type(
+                    &ir,
+                    &mut cache,
+                    "async_declarations",
+                    &format!("Result<u32, {name}>"),
+                    None
+                ),
+                Ok(ReturnType {
+                    rust_return_is_result: true,
+                    rust_stream_item_is_result: false,
+                    ok: Some(uniffi_meta::Type::UInt32),
+                    err: None
+                }),
+                "{name}"
+            );
+            assert_eq!(
+                run_resolve_uniffi_meta_type(
+                    &ir,
+                    &mut cache,
+                    "async_declarations",
+                    &format!("UniFfiStream<u32, {name}>"),
+                    None
+                ),
+                Ok(uniffi_meta::Type::Stream {
+                    item_type: Box::new(uniffi_meta::Type::UInt32),
+                    error_type: None,
+                    is_send: true
+                }),
+                "{name}"
+            );
+            assert_eq!(
+                run_resolve_arg(
+                    &ir,
+                    &mut cache,
+                    "async_declarations",
+                    &format!("UniFfiInputStream<u32, {name}>"),
+                    None
+                ),
+                Ok(ArgType {
+                    ty: uniffi_meta::Type::InputStream {
+                        item_type: Box::new(uniffi_meta::Type::UInt32),
+                        error_type: None,
+                        is_send: true
+                    },
+                    by_ref: false
+                }),
+                "{name}"
+            );
+        }
+        // Infallible is not in Rust's prelude. An unimported tail name is not a builtin.
+        assert_eq!(
+            run_resolve_type(&ir, &mut cache, "types", "Infallible"),
+            Err(NotFound)
+        );
+        let error = uniffi_meta::Type::Enum {
+            module_path: "async_declarations::business".into(),
+            name: "Infallible".into(),
+        };
+        for (module, name) in [
+            ("async_declarations::business", "Infallible"),
+            ("async_declarations", "business::Infallible"),
+            ("async_declarations", "BusinessError"),
+        ] {
+            assert_eq!(
+                run_resolve_return_type(
+                    &ir,
+                    &mut cache,
+                    module,
+                    &format!("Result<u32, {name}>"),
+                    None
+                ),
+                Ok(ReturnType {
+                    rust_return_is_result: true,
+                    rust_stream_item_is_result: false,
+                    ok: Some(uniffi_meta::Type::UInt32),
+                    err: Some(error.clone())
+                }),
+                "{name}"
+            );
+            assert_eq!(
+                run_resolve_uniffi_meta_type(
+                    &ir,
+                    &mut cache,
+                    module,
+                    &format!("UniFfiStream<u32, {name}>"),
+                    None
+                ),
+                Ok(uniffi_meta::Type::Stream {
+                    item_type: Box::new(uniffi_meta::Type::UInt32),
+                    error_type: Some(Box::new(error.clone())),
+                    is_send: true
+                }),
+                "{name}"
+            );
+            assert_eq!(
+                run_resolve_arg(
+                    &ir,
+                    &mut cache,
+                    module,
+                    &format!("UniFfiInputStream<u32, {name}>"),
+                    None
+                ),
+                Ok(ArgType {
+                    ty: uniffi_meta::Type::InputStream {
+                        item_type: Box::new(uniffi_meta::Type::UInt32),
+                        error_type: Some(Box::new(error.clone())),
+                        is_send: true
+                    },
+                    by_ref: false
+                }),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn infallible_is_only_an_error_sentinel_and_stream_aliases_require_two_types() {
+        let ir = Ir::new_for_test(&["async_declarations"]);
+        let mut cache = LookupCache::default();
+        for ty in [
+            "Infallible",
+            "Option<Infallible>",
+            "UniFfiStream<Infallible, Infallible>",
+            "UniFfiInputStream<Infallible, Infallible>",
+        ] {
+            assert_eq!(
+                run_resolve_uniffi_meta_type(&ir, &mut cache, "async_declarations", ty, None),
+                Err(InvalidType),
+                "{ty}"
+            );
+        }
+        for ty in ["UniFfiStream<u32>", "UniFfiInputStream<u32>"] {
+            assert!(
+                run_resolve_type(&ir, &mut cache, "async_declarations", ty).is_err(),
+                "{ty}"
+            );
+        }
+    }
+
+    #[test]
     fn test_resolve_builtin_types() {
         let ir = Ir::new_for_test(&["types"]);
         let mut cache = LookupCache::default();
@@ -959,6 +1296,7 @@ pub mod tests {
             Ok(Type::Object {
                 module_path: "types".into(),
                 name: "TestInterface".into(),
+                imp: ObjectImpl::Struct,
             })
         );
         // Generics are invalid for user types
@@ -1122,7 +1460,7 @@ pub mod tests {
             ),
             Ok(uniffi_meta::Type::Stream {
                 item_type: Box::new(uniffi_meta::Type::UInt32),
-                error_type: Box::new(error.clone()),
+                error_type: Some(Box::new(error.clone())),
                 is_send: true,
             })
         );
@@ -1136,7 +1474,7 @@ pub mod tests {
             ),
             Ok(uniffi_meta::Type::InputStream {
                 item_type: Box::new(uniffi_meta::Type::String),
-                error_type: Box::new(error),
+                error_type: Some(Box::new(error)),
                 is_send: true,
             })
         );
@@ -1542,6 +1880,8 @@ pub mod tests {
         assert_eq!(
             run_resolve_return_type(&ir, &mut cache, "udl_types", "Result<(), UdlRecord>", None),
             Ok(ReturnType {
+                rust_return_is_result: true,
+                rust_stream_item_is_result: false,
                 ok: None,
                 err: Some(uniffi_meta::Type::Record {
                     module_path: "udl_types".into(),
@@ -1558,6 +1898,8 @@ pub mod tests {
                 None
             ),
             Ok(ReturnType {
+                rust_return_is_result: true,
+                rust_stream_item_is_result: false,
                 ok: None,
                 err: Some(uniffi_meta::Type::Object {
                     module_path: "udl_types".into(),
@@ -1575,6 +1917,8 @@ pub mod tests {
                 None
             ),
             Ok(ReturnType {
+                rust_return_is_result: true,
+                rust_stream_item_is_result: false,
                 ok: None,
                 err: Some(uniffi_meta::Type::Object {
                     module_path: "udl_types".into(),
@@ -1592,6 +1936,8 @@ pub mod tests {
                 None
             ),
             Ok(ReturnType {
+                rust_return_is_result: true,
+                rust_stream_item_is_result: false,
                 ok: None,
                 err: Some(uniffi_meta::Type::CallbackInterface {
                     module_path: "udl_types".into(),

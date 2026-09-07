@@ -31,6 +31,7 @@ pub struct Variant {
 
 impl Enum {
     pub fn parse(env: &CompileEnv, attrs: EnumAttributes, e: syn::ItemEnum) -> syn::Result<Self> {
+        uniffi_meta::async_signature::validate_generics(&e.generics)?;
         let mut variants = vec![];
         for v in e.variants {
             if let Some(variant_attrs) = VariantAttributes::parse(env, &v.attrs)? {

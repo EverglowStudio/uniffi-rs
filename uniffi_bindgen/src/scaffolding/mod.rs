@@ -96,7 +96,7 @@ mod filters {
             } => format!(
                 "::uniffi::UniFfiStream<{}, {}>",
                 type_rs_inner(item_type)?,
-                type_rs_inner(error_type)?
+                error_type.as_ref().map(|error| type_rs_inner(error)).transpose()?.unwrap_or_else(|| "::std::convert::Infallible".into())
             ),
             Type::InputStream {
                 item_type,
@@ -105,7 +105,7 @@ mod filters {
             } => format!(
                 "::uniffi::UniFfiInputStream<{}, {}>",
                 type_rs_inner(item_type)?,
-                type_rs_inner(error_type)?
+                error_type.as_ref().map(|error| type_rs_inner(error)).transpose()?.unwrap_or_else(|| "::std::convert::Infallible".into())
             ),
             Type::Custom { name, .. } => format!("r#{name}"),
         })

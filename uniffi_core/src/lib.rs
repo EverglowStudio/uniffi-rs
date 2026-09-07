@@ -88,6 +88,7 @@ mod ffi_converter_traits;
 mod local_object;
 pub mod metadata;
 pub mod oneshot;
+mod stream_output;
 
 pub use arc_or_owned::ArcOrOwned;
 pub use custom_types::CustomType;
@@ -102,6 +103,7 @@ pub use ffi_converter_traits::{
 #[cfg(feature = "async-runtime")]
 pub use local_object::LocalObjectType;
 pub use metadata::*;
+pub use stream_output::{ForeignStreamReturn, RustStreamOutput};
 
 // Re-export the libs that we use in the generated code,
 // so the consumer doesn't have to depend on them directly.
@@ -113,6 +115,7 @@ pub mod deps {
     pub use async_trait;
     pub use bytes;
     pub use futures_core;
+    pub use futures_util;
     pub use once_cell;
     pub use static_assertions;
 }

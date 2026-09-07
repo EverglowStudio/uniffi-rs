@@ -1,0 +1,5 @@
+error: nested Future/Stream in UniFFI data is not supported
+ --> tests/async-ui/nested_stream.rs:2:63
+  |
+2 | fn nested() -> impl uniffi::deps::futures_core::Stream<Item = uniffi::UniFfiStream<u32, String>> {
+  |                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

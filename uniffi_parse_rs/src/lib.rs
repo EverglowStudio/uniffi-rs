@@ -8,6 +8,8 @@ use camino::Utf8Path;
 pub use target_lexicon::Triple;
 pub use uniffi_meta::MetadataGroup;
 
+#[cfg(test)]
+mod async_tests;
 mod attrs;
 mod compile_env;
 mod custom_types;

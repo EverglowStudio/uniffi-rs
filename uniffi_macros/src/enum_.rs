@@ -30,6 +30,7 @@ pub struct EnumItem {
 
 impl EnumItem {
     pub fn new(input: DeriveInput) -> syn::Result<Self> {
+        uniffi_meta::async_signature::validate_generics(&input.generics)?;
         let enum_ = match input.data {
             Data::Enum(e) => e,
             _ => {
@@ -39,6 +40,9 @@ impl EnumItem {
                 ))
             }
         };
+        for field in enum_.variants.iter().flat_map(|variant| &variant.fields) {
+            uniffi_meta::async_signature::validate_value_type(&field.ty)?;
+        }
         Ok(Self {
             enum_,
             ident: input.ident,

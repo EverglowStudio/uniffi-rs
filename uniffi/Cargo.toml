@@ -44,7 +44,7 @@ trybuild = "1"
 
 [features]
 async-runtime = ["uniffi_core/async-runtime"]
-default = ["cargo-metadata", "macro-scaffolding"]
+default = ["cargo-metadata", "macro-scaffolding", "async-runtime"]
 # Printout tracing information on FFI calls.  Useful for debugging issues with the bindings code.
 ffi-trace = ["uniffi_core/ffi-trace", "uniffi_bindgen?/ffi-trace"]
 # Support for features needed by the `build.rs` script. Enable this in your

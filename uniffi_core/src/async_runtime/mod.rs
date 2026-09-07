@@ -13,6 +13,7 @@
 pub mod actor;
 mod context;
 mod local;
+mod local_stream;
 mod task;
 mod time;
 
@@ -22,6 +23,7 @@ pub use context::{
 pub use local::{
     defer_local_cleanup, spawn_local, LocalBoxFuture, LocalError, LocalExecutor, LocalObject,
 };
+pub use local_stream::local_stream;
 pub use task::{spawn, TaskError, TaskHandle};
 pub use time::{sleep, timeout, Elapsed};
 

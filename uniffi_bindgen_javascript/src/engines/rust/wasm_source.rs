@@ -61,6 +61,7 @@ pub(crate) fn render(
     {
         source.push_str(&super::async_calls::local_error_helper(None).to_string());
     }
+    source.push_str(&super::rust_trait_imports(package)?);
     write_temporal_helpers(&mut source);
     source.push_str(&render_callback_helpers(package)?);
     source.push_str(&render_named_helpers(package)?);
@@ -679,7 +680,7 @@ fn render_callback_helpers(package: &NormalizedPackage) -> Result<String> {
 
         let has_async = callback_operations
             .iter()
-            .any(|operation| matches!(operation.async_kind, uniffi_js_abi::AsyncKind::Async));
+            .any(|operation| operation.rust_async);
         let async_attr = has_async.then(|| quote!(#[async_trait::async_trait(?Send)]));
         let mut methods = TokenStream::new();
         for operation in callback_operations {
@@ -753,18 +754,26 @@ fn render_callback_method(
             conversion: binding.conversion.clone(),
         });
     let ret_ty = match &ret_binding {
-        Some(binding) => core_type(package, binding)?,
+        Some(binding) => callback_source_type(package, operation, binding)?,
         None => syn::parse_quote!(()),
     };
     let error_binding = operation
         .throws
         .map(|id| callback_error_binding(package, id))
         .transpose()?;
-    let output_ty = if let Some(error) = &error_binding {
+    let result_ty = if let Some(error) = &error_binding {
         let error_ty = core_type(package, error)?;
         quote!(Result<#ret_ty, #error_ty>)
     } else {
         quote!(#ret_ty)
+    };
+    let (output_ty, returned) = if operation.rust_return_is_result && operation.throws.is_none() {
+        (
+            quote!(Result<#result_ty, ::std::convert::Infallible>),
+            quote!(Ok(result)),
+        )
+    } else {
+        (result_ty.clone(), quote!(result))
     };
     let method_call_name = if operation.throws.is_some() {
         if matches!(operation.async_kind, uniffi_js_abi::AsyncKind::Async) {
@@ -831,7 +840,7 @@ fn render_callback_method(
     };
     let result = if let Some(error_binding) = error_binding {
         let success = if let Some(binding) = ret_binding {
-            let lower = lower_js_expr(package, &binding, quote!(raw_value))?;
+            let lower = lower_callback_result(package, operation, &binding, quote!(raw_value))?;
             quote! {
                 let raw_value = js_sys::Reflect::get(&envelope, &JsValue::from_str("value"))?;
                 Ok(Ok((#lower)?))
@@ -853,7 +862,7 @@ fn render_callback_method(
             }
         }
     } else if let Some(binding) = ret_binding {
-        let lower = lower_js_expr(package, &binding, quote!(value))?;
+        let lower = lower_callback_result(package, operation, &binding, quote!(value))?;
         // Keep nested lowerers (records/containers/custom types) inside an
         // explicit Result closure.  The callback method itself returns the
         // core value, while `callback_result` below owns the JsValue error
@@ -865,28 +874,112 @@ fn render_callback_method(
             Ok(())
         })
     };
-    let async_method = matches!(operation.async_kind, uniffi_js_abi::AsyncKind::Async);
-    Ok(if async_method {
+    let release_inputs = operation
+        .arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, binding)| matches!(binding.conversion, ConversionRecipe::InputStream { .. }))
+        .map(|(index, _)| {
+            let name = rust_ident(&format!("arg{index}"));
+            quote!(drop(#name);)
+        })
+        .collect::<Vec<_>>();
+    let body = quote! {
+        let args_array = js_sys::Array::new();
+        #(#lifts)*
+        #method_call
+        let callback_result: Result<#result_ty, JsValue> = (|| { #result })();
+        let result = callback_result.unwrap_or_else(|error| panic!("callback result lowering failed: {:?}", error));
+        #(#release_inputs)*
+        #returned
+    };
+    Ok(if operation.rust_async {
         quote! {
-            async fn #item(&self, #(#args),*) -> #output_ty {
-                let args_array = js_sys::Array::new();
-                #(#lifts)*
-                #method_call
-                let callback_result: Result<#output_ty, JsValue> = (|| { #result })();
-                callback_result.unwrap_or_else(|error| panic!("callback result lowering failed: {:?}", error))
+            async fn #item(&self, #(#args),*) -> #output_ty { #body }
+        }
+    } else if matches!(operation.async_kind, uniffi_js_abi::AsyncKind::Async) {
+        let body = super::own_callback_receiver(body)?;
+        quote! {
+            fn #item(&self, #(#args),*)
+                -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = #output_ty> + 'static>> {
+                let __uniffi_owned_receiver = Self { handle: self.handle, host: self.host.clone() };
+                Box::pin(async move #body)
             }
         }
     } else {
         quote! {
-            fn #item(&self, #(#args),*) -> #output_ty {
-                let args_array = js_sys::Array::new();
-                #(#lifts)*
-                #method_call
-                let callback_result: Result<#output_ty, JsValue> = (|| { #result })();
-                callback_result.unwrap_or_else(|error| panic!("callback result lowering failed: {:?}", error))
-            }
+            fn #item(&self, #(#args),*) -> #output_ty { #body }
         }
     })
+}
+
+fn as_input_stream_binding(binding: &RustValueBinding) -> RustValueBinding {
+    match (&binding.rust_type, &binding.conversion) {
+        (
+            RustType::Stream {
+                item,
+                error,
+                is_send,
+            },
+            ConversionRecipe::OutputStream {
+                item: item_conversion,
+                error: error_conversion,
+            },
+        ) => RustValueBinding {
+            rust_type: RustType::InputStream {
+                item: item.clone(),
+                error: error.clone(),
+                is_send: *is_send,
+            },
+            carrier: RustCarrier::InputStream,
+            conversion: ConversionRecipe::InputStream {
+                item: item_conversion.clone(),
+                error: error_conversion.clone(),
+            },
+        },
+        _ => binding.clone(),
+    }
+}
+
+fn callback_source_type(
+    package: &NormalizedPackage,
+    operation: &RustOperationPlan,
+    binding: &RustValueBinding,
+) -> Result<syn::Type> {
+    if let RustType::Stream { .. } = &binding.rust_type {
+        if !operation.rust_stream_item_is_result {
+            let (item, _) = stream_child_bindings(binding).expect("stream children");
+            let item = core_type(package, &item)?;
+            return Ok(
+                syn::parse_quote!(::std::pin::Pin<Box<dyn ::uniffi::deps::futures_util::Stream<Item = #item> + 'static>>),
+            );
+        }
+    }
+    core_type(package, binding)
+}
+
+fn lower_callback_result(
+    package: &NormalizedPackage,
+    operation: &RustOperationPlan,
+    binding: &RustValueBinding,
+    expression: TokenStream,
+) -> Result<TokenStream> {
+    if !matches!(binding.conversion, ConversionRecipe::OutputStream { .. }) {
+        return lower_js_expr(package, binding, expression);
+    }
+    let input = as_input_stream_binding(binding);
+    let make = nested_input_make_ident(&input);
+    let core = callback_source_type(package, operation, binding)?;
+    let stream = super::source_stream(
+        operation,
+        binding,
+        quote!(Box::pin(#make(self.host.clone(), raw as u32))),
+    );
+    Ok(quote!({
+        let raw = #expression.as_f64().ok_or_else(|| JsValue::from_str("callback stream handle must be a number"))?;
+        if !raw.is_finite() || raw.fract() != 0.0 || raw < 0.0 || raw > u32::MAX as f64 { return Err(JsValue::from_str("invalid callback stream handle")); }
+        Ok::<#core, JsValue>(#stream)
+    }))
 }
 
 #[derive(Default)]
@@ -1547,6 +1640,13 @@ fn lower_js_expr(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if super::is_infallible(&binding.rust_type) {
+        return Ok(
+            quote!({ let _ = #expression; Err::<::std::convert::Infallible, JsValue>(
+            JsValue::from_str("infallible stream received a business error")
+        ) }),
+        );
+    }
     let output = match &binding.conversion {
         ConversionRecipe::Identity => match &binding.rust_type {
             RustType::Scalar(uniffi_js_abi::ScalarType::Bool) => {
@@ -1719,6 +1819,9 @@ fn lift_js_expr(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if super::is_infallible(&binding.rust_type) {
+        return Ok(quote!(Ok::<JsValue, JsValue>(match #expression {})));
+    }
     let output = match &binding.conversion {
         ConversionRecipe::Identity => match &binding.rust_type {
             RustType::Scalar(uniffi_js_abi::ScalarType::Bool) => {
@@ -1804,9 +1907,7 @@ fn lift_js_expr(
             quote!(#helper(#expression))
         }
         ConversionRecipe::InputStream { .. } => {
-            return Err(anyhow!(
-                "input stream lifting is not a valid canonical Wasm value path"
-            ));
+            quote!(Ok::<JsValue, JsValue>(JsValue::from_f64(#expression.handle().as_raw() as f64)))
         }
         ConversionRecipe::OutputStream { .. } => {
             let lift = nested_output_lift_ident(binding);
@@ -1848,6 +1949,13 @@ fn lower_expr(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if super::is_infallible(&binding.rust_type) {
+        return Ok(
+            quote!({ let _ = #expression; Err::<::std::convert::Infallible, JsValue>(
+            JsValue::from_str("infallible stream received a business error")
+        ) }),
+        );
+    }
     let conversion = &binding.conversion;
     let output = match conversion {
         ConversionRecipe::Identity | ConversionRecipe::BigInt | ConversionRecipe::Bytes => {
@@ -1957,6 +2065,9 @@ fn lift_expr(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if super::is_infallible(&binding.rust_type) {
+        return Ok(quote!(Ok::<JsValue, JsValue>(match #expression {})));
+    }
     let conversion = &binding.conversion;
     let output = match conversion {
         ConversionRecipe::Identity | ConversionRecipe::BigInt | ConversionRecipe::Bytes => {
@@ -2034,9 +2145,7 @@ fn lift_expr(
             quote!(#helper(#expression))
         }
         ConversionRecipe::InputStream { .. } => {
-            return Err(anyhow!(
-                "input stream lifting is not a valid canonical Wasm value path"
-            ));
+            quote!(Ok::<JsValue, JsValue>(JsValue::from_f64(#expression.handle().as_raw() as f64)))
         }
         ConversionRecipe::OutputStream { .. } => {
             let lift = nested_output_lift_ident(binding);
@@ -2357,6 +2466,19 @@ fn render_nested_stream_adapter(
             let lower = nested_input_lower_ident(binding);
             let lower_item = lower_js_expr(package, &item_binding, quote!(value))?;
             let lower_error = lower_js_expr(package, &error_binding, quote!(value))?;
+            let error_step = if super::is_infallible(&error_binding.rust_type) {
+                quote!(panic!("infallible input stream received a business error"))
+            } else {
+                quote! {
+
+                let value = js_sys::Reflect::get(&object, &JsValue::from_str("error"))
+                    .expect("wasm input stream envelope missing error");
+                __uniffi_set_call_host(Some(host.clone()));
+                let lowered = (#lower_error).expect("wasm input stream error lowering failed");
+                __uniffi_set_call_host(None);
+                Err(lowered)
+                        }
+            };
             Ok(quote! {
                 struct #ops { host: JsValue }
                 impl ::uniffi::ForeignInputStreamOps<#item, #error> for #ops {
@@ -2367,7 +2489,7 @@ fn render_nested_stream_adapter(
                                 .expect("wasm input stream host is missing pullInputStream")
                                 .dyn_into::<js_sys::Function>()
                                 .expect("wasm input stream pullInputStream is not callable");
-                            let raw = pull.call1(&JsValue::NULL, &JsValue::from_f64(handle.as_raw() as f64))
+                            let raw = pull.call1(&host, &JsValue::from_f64(handle.as_raw() as f64))
                                 .expect("wasm input stream pullInputStream threw");
                             let promise = if raw.is_instance_of::<js_sys::Promise>() {
                                 raw.dyn_into::<js_sys::Promise>().expect("invalid input stream promise")
@@ -2391,16 +2513,21 @@ fn render_nested_stream_adapter(
                                     __uniffi_set_call_host(None);
                                     Ok(Some(lowered))
                                 }
-                                "error" => {
-                                    let value = js_sys::Reflect::get(&object, &JsValue::from_str("error"))
-                                        .expect("wasm input stream envelope missing error");
-                                    __uniffi_set_call_host(Some(host.clone()));
-                                    let lowered = (#lower_error).expect("wasm input stream error lowering failed");
-                                    __uniffi_set_call_host(None);
-                                    Err(lowered)
-                                }
+                                "error" => { #error_step }
                                 other => panic!("wasm input stream envelope has an unknown kind: {other}"),
                             }
+                        })
+                    }
+                    fn close(&self, handle: ::uniffi::Handle) -> ::uniffi::ForeignInputStreamCloseFuture {
+                        let host = self.host.clone();
+                        Box::pin(async move {
+                            let close = js_sys::Reflect::get(&host, &JsValue::from_str("releaseInputStream"))
+                                .expect("input stream host missing releaseInputStream")
+                                .dyn_into::<js_sys::Function>().expect("releaseInputStream is not callable");
+                            let promise = close.call1(&host, &JsValue::from_f64(handle.as_raw() as f64))
+                                .expect("input stream close threw");
+                            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&promise)).await
+                                .expect("input stream producer close failed");
                         })
                     }
                     fn cancel(&self, handle: ::uniffi::Handle) {
@@ -2432,9 +2559,7 @@ fn render_nested_stream_adapter(
             let close = nested_output_close_ident(binding);
             Ok(quote! {
                 static #registry: ::uniffi::RustStreamRegistry<#item, #error> =
-                    ::uniffi::deps::once_cell::sync::Lazy::new(|| {
-                        ::std::sync::Mutex::new(::std::collections::HashMap::new())
-                    });
+                    ::uniffi::deps::once_cell::sync::Lazy::new(Default::default);
                 fn #lift(value: ::uniffi::UniFfiStream<#item, #error>) -> Result<JsValue, JsValue> {
                     let handle = ::uniffi::rust_stream_new(&#registry, value);
                     Ok(JsValue::from_f64(handle.as_raw() as f64))
@@ -2454,12 +2579,49 @@ fn render_nested_stream_adapter(
 fn render_stream_helpers(package: &NormalizedPackage) -> Result<String> {
     let mut tokens = TokenStream::new();
     let mut output_closers = Vec::new();
+    let mut stream_closers = Vec::new();
     let nested_bindings = collect_stream_bindings(package)?;
     for binding in &nested_bindings {
         tokens.extend(render_nested_stream_adapter(package, binding)?);
         if matches!(&binding.conversion, ConversionRecipe::OutputStream { .. }) {
+            let input = as_input_stream_binding(binding);
+            if !nested_bindings.contains(&input) {
+                tokens.extend(render_nested_stream_adapter(package, &input)?);
+            }
+        }
+        if matches!(&binding.conversion, ConversionRecipe::OutputStream { .. }) {
+            let registry = rust_ident(&format!(
+                "__UNIFFI_WASM_NESTED_OUTPUT_REGISTRY_{}",
+                stream_adapter_suffix(binding).to_ascii_uppercase()
+            ));
+            stream_closers.push(quote! {
+                if ::uniffi::rust_stream_close_async(&#registry, handle.clone()).await.is_err() { success = false; }
+            });
             let close = nested_output_close_ident(binding);
             output_closers.push(quote!(#close(handle);));
+        }
+    }
+    let mut callback_inputs = std::collections::BTreeSet::new();
+    for operation in &package.rust.engines[&EngineKind::WasmBindgen].operations {
+        if operation.kind != uniffi_js_abi::OperationKind::CallbackMethod {
+            continue;
+        }
+        if let Some(binding) = &operation.return_value {
+            if matches!(binding.conversion, ConversionRecipe::OutputStream { .. }) {
+                let input = as_input_stream_binding(&RustValueBinding {
+                    rust_type: binding.rust_type.clone(),
+                    carrier: binding.carrier,
+                    conversion: binding.conversion.clone(),
+                });
+                let generated = nested_bindings.iter().any(|binding| {
+                    binding == &input
+                        || matches!(binding.conversion, ConversionRecipe::OutputStream { .. })
+                            && as_input_stream_binding(binding) == input
+                });
+                if !generated && callback_inputs.insert(stream_adapter_suffix(&input)) {
+                    tokens.extend(render_nested_stream_adapter(package, &input)?);
+                }
+            }
         }
     }
     for operation in &package.rust.engines[&EngineKind::WasmBindgen].operations {
@@ -2471,11 +2633,12 @@ fn render_stream_helpers(package: &NormalizedPackage) -> Result<String> {
             let close = rust_ident(&format!("__uniffi_close_output_stream_{suffix}"));
             if group.direction == uniffi_js_engine_schema::StreamDirection::Output {
                 output_closers.push(quote!(#close(handle);));
+                stream_closers.push(quote! {
+                    if ::uniffi::rust_stream_close_async(&#registry, handle.clone()).await.is_err() { success = false; }
+                });
                 tokens.extend(quote! {
                     static #registry: ::uniffi::RustStreamRegistry<#item, #error> =
-                        ::uniffi::deps::once_cell::sync::Lazy::new(|| {
-                            ::std::sync::Mutex::new(::std::collections::HashMap::new())
-                        });
+                        ::uniffi::deps::once_cell::sync::Lazy::new(Default::default);
                     fn #close(handle: u32) {
                         ::uniffi::rust_stream_cancel::<#item, #error>(
                             &#registry,
@@ -2484,7 +2647,9 @@ fn render_stream_helpers(package: &NormalizedPackage) -> Result<String> {
                     }
                 });
             }
-            if group.direction == uniffi_js_engine_schema::StreamDirection::Input {
+            if group.direction == uniffi_js_engine_schema::StreamDirection::Input
+                && operation.kind != uniffi_js_abi::OperationKind::CallbackMethod
+            {
                 let ops = rust_ident(&format!(
                     "UniffiWasmInputOps{}{}",
                     operation.operation_id.index(),
@@ -2493,6 +2658,19 @@ fn render_stream_helpers(package: &NormalizedPackage) -> Result<String> {
                 let make = rust_ident(&format!("__uniffi_make_input_stream_{suffix}"));
                 let lower_item = lower_js_expr(package, &group.item, quote!(value))?;
                 let lower_error = lower_js_expr(package, &group.error, quote!(value))?;
+                let error_step = if super::is_infallible(&group.error.rust_type) {
+                    quote!(panic!("infallible input stream received a business error"))
+                } else {
+                    quote! {
+
+                    let value = js_sys::Reflect::get(&object, &JsValue::from_str("error"))
+                        .expect("wasm input stream envelope missing error");
+                    __uniffi_set_call_host(Some(host.clone()));
+                    let lowered = (#lower_error).expect("wasm input stream error lowering failed");
+                    __uniffi_set_call_host(None);
+                    Err(lowered)
+                            }
+                };
                 tokens.extend(quote! {
                     struct #ops { host: JsValue }
                     impl ::uniffi::ForeignInputStreamOps<#item, #error> for #ops {
@@ -2503,7 +2681,7 @@ fn render_stream_helpers(package: &NormalizedPackage) -> Result<String> {
                                     .expect("wasm input stream host is missing pullInputStream")
                                     .dyn_into::<js_sys::Function>()
                                     .expect("wasm input stream pullInputStream is not callable");
-                                let raw = pull.call1(&JsValue::NULL, &JsValue::from_f64(handle.as_raw() as f64))
+                                let raw = pull.call1(&host, &JsValue::from_f64(handle.as_raw() as f64))
                                     .expect("wasm input stream pullInputStream threw");
                                 let promise = if raw.is_instance_of::<js_sys::Promise>() {
                                     raw.dyn_into::<js_sys::Promise>().expect("invalid input stream promise")
@@ -2535,21 +2713,26 @@ fn render_stream_helpers(package: &NormalizedPackage) -> Result<String> {
                                         __uniffi_set_call_host(None);
                                         Ok(Some(lowered))
                                     }
-                                    "error" => {
-                                        let value = js_sys::Reflect::get(&object, &JsValue::from_str("error"))
-                                            .expect("wasm input stream envelope missing error");
-                                        __uniffi_set_call_host(Some(host.clone()));
-                                        let lowered = (#lower_error).expect("wasm input stream error lowering failed");
-                                        __uniffi_set_call_host(None);
-                                        Err(lowered)
-                                    }
+                                    "error" => { #error_step }
                                     other => panic!(
                                         "wasm input stream envelope has an unknown kind: {other}"
                                     ),
                                 }
                             })
                         }
-                        fn cancel(&self, handle: ::uniffi::Handle) {
+                        fn close(&self, handle: ::uniffi::Handle) -> ::uniffi::ForeignInputStreamCloseFuture {
+                        let host = self.host.clone();
+                        Box::pin(async move {
+                            let close = js_sys::Reflect::get(&host, &JsValue::from_str("releaseInputStream"))
+                                .expect("input stream host missing releaseInputStream")
+                                .dyn_into::<js_sys::Function>().expect("releaseInputStream is not callable");
+                            let promise = close.call1(&host, &JsValue::from_f64(handle.as_raw() as f64))
+                                .expect("input stream close threw");
+                            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&promise)).await
+                                .expect("input stream producer close failed");
+                        })
+                    }
+                    fn cancel(&self, handle: ::uniffi::Handle) {
                             let value = js_sys::Reflect::get(
                                 &self.host,
                                 &JsValue::from_str("cancelInputStream"),
@@ -2577,10 +2760,20 @@ fn render_stream_helpers(package: &NormalizedPackage) -> Result<String> {
         }
     }
     tokens.extend(quote! {
+        async fn __uniffi_close_stream(raw: f64) -> f64 {
+            if !raw.is_finite() || raw.fract() != 0.0 || raw < 0.0 || raw > u32::MAX as f64 { return 0.0; }
+            let handle = ::uniffi::Handle::from_raw_unchecked(raw as u64);
+            let mut success = true;
+            #(#stream_closers)*
+            if success { 1.0 } else { 0.0 }
+        }
         #[doc(hidden)]
-        fn __uniffi_wasm_close_output_stream_impl(handle: u32) -> Result<(), JsValue> {
+        async fn __uniffi_wasm_close_output_stream_impl(handle: u32) -> Result<(), JsValue> {
             let _ = handle;
             #(#output_closers)*
+            if __uniffi_close_stream(handle as f64).await != 1.0 {
+                return Err(JsValue::from_str("stream cleanup failed"));
+            }
             // Output streams and objects live in independent registries and
             // may legitimately receive the same numeric handle. Releasing an
             // object here would therefore dispose an unrelated live object.
@@ -2640,6 +2833,23 @@ fn managed_call(lowered: Vec<TokenStream>, call: TokenStream) -> TokenStream {
     }
 }
 
+fn lower_default_argument(
+    package: &NormalizedPackage,
+    binding: &RustValueBinding,
+    arg: TokenStream,
+    default: bool,
+) -> Result<TokenStream> {
+    if !default {
+        return lower_expr(package, binding, arg);
+    }
+    let ty = core_type(package, binding)?;
+    let lower = lower_js_expr(package, binding, arg.clone())?;
+    Ok(quote! {
+        if #arg.is_undefined() { Ok::<#ty, JsValue>(::std::default::Default::default()) }
+        else { #lower }
+    })
+}
+
 fn render_operations(package: &NormalizedPackage) -> Result<String> {
     let mut tokens = TokenStream::new();
     for operation in &package.rust.engines[&EngineKind::WasmBindgen].operations {
@@ -2652,7 +2862,9 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
         if is_host_dispatched_operation(operation) {
             continue;
         }
-        if operation.kind == uniffi_js_abi::OperationKind::OutputStreamStart {
+        if operation.return_value.as_ref().is_some_and(|binding| {
+            matches!(binding.conversion, ConversionRecipe::OutputStream { .. })
+        }) {
             tokens.extend(render_output_stream_start(package, operation)?);
             continue;
         }
@@ -2699,7 +2911,12 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
                 conversion: argument.conversion.clone(),
             };
             let arg = rust_ident(&format!("arg{index}"));
-            let ty = wasm_param_type(&binding);
+            let default = super::rust_default_argument(package, operation, index);
+            let ty = if default {
+                quote!(JsValue)
+            } else {
+                wasm_param_type(&binding)
+            };
             params.push(quote!(#arg: #ty));
             let core_arg = rust_ident(&format!("__uniffi_arg_{index}"));
             let input_group = operation.stream_resources.iter().find(|group| {
@@ -2717,7 +2934,7 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
                     let #core_arg = #make(host.clone(), #arg);
                 ));
             } else {
-                let lowered = lower_expr(package, &binding, quote!(#arg))?;
+                let lowered = lower_default_argument(package, &binding, quote!(#arg), default)?;
                 let lowered = lower_operation_value(lowered, fallible, "argument");
                 lowered_arguments.push(quote!(let #core_arg = #lowered;));
             }
@@ -2787,6 +3004,7 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
         } else {
             call
         };
+        let call = super::canonical_return(operation, call);
         let call = if operation.throws.is_some() {
             let error_lift = declared_error_lift
                 .as_ref()
@@ -2895,9 +3113,14 @@ fn render_output_stream_start(
             conversion: argument.conversion.clone(),
         };
         let arg = rust_ident(&format!("arg{index}"));
-        let ty = wasm_param_type(&binding);
+        let default = super::rust_default_argument(package, operation, index);
+        let ty = if default {
+            quote!(JsValue)
+        } else {
+            wasm_param_type(&binding)
+        };
         params.push(quote!(#arg: #ty));
-        let value = lower_expr(package, &binding, quote!(#arg))?;
+        let value = lower_default_argument(package, &binding, quote!(#arg), default)?;
         let core = rust_ident(&format!("__uniffi_arg_{index}"));
         let input_group = operation.stream_resources.iter().find(|group| {
             group.direction == uniffi_js_engine_schema::StreamDirection::Input
@@ -2914,7 +3137,11 @@ fn render_output_stream_start(
             let value = lower_operation_value(value, fallible, "argument");
             lowered.push(quote!(let #core = #value;));
         }
-        arguments.push(rust_call_argument(quote!(#core), argument.ownership));
+        arguments.push(if super::async_calls::local_method(operation) {
+            quote!(#core)
+        } else {
+            rust_call_argument(quote!(#core), argument.ownership)
+        });
     }
     if needs_host && !managed {
         lowered.push(quote!(__uniffi_set_call_host(None);));
@@ -2930,6 +3157,13 @@ fn render_output_stream_start(
     } else {
         call
     };
+    let call = if super::async_calls::local_method(operation) {
+        quote!((#call).map_err(__uniffi_local_error)?)
+    } else {
+        call
+    };
+    let call = super::canonical_return(operation, call);
+    let normalized = super::canonical_stream(operation, quote!(stream));
     let item = core_type(package, &group.item)?;
     let error = core_type(package, &group.error)?;
     let declared_error_lift = match operation.throws {
@@ -2949,10 +3183,11 @@ fn render_output_stream_start(
             .as_ref()
             .expect("declared stream start error has a lift expression");
         quote! {
-            let stream: ::uniffi::UniFfiStream<#item, #error> = match #call {
+            let stream = match #call {
                 Ok(stream) => stream,
                 Err(error) => return Err((#error_lift)?),
             };
+            let stream: ::uniffi::UniFfiStream<#item, #error> = #normalized;
             let handle = ::uniffi::rust_stream_new(&#registry, stream);
             Ok(handle.as_raw() as u32)
         }
@@ -2963,7 +3198,8 @@ fn render_output_stream_start(
             quote!(handle.as_raw() as u32)
         };
         quote! {
-            let stream: ::uniffi::UniFfiStream<#item, #error> = #call;
+            let stream = #call;
+            let stream: ::uniffi::UniFfiStream<#item, #error> = #normalized;
             let handle = ::uniffi::rust_stream_new(&#registry, stream);
             #result
         }
@@ -3055,11 +3291,32 @@ fn render_stream_hook_operation(
             let error = core_type(package, error_binding)?;
             let item_lift = lift_js_expr(package, item_binding, quote!(value))?;
             let error_lift = lift_js_expr(package, error_binding, quote!(error))?;
+            let error_arm = if super::is_infallible(&error_binding.rust_type) {
+                quote!(match error {})
+            } else {
+                quote! {
+
+                let object = js_sys::Object::new();
+                js_sys::Reflect::set(&object, &JsValue::from_str("kind"), &JsValue::from_str("error"))
+                    .expect("wasm output stream error envelope kind write failed");
+                let lifted = (#error_lift)
+                    .expect("wasm output stream error lifting failed");
+                js_sys::Reflect::set(&object, &JsValue::from_str("error"), &lifted)
+                    .expect("wasm output stream error envelope value write failed");
+                Ok(object.into())
+                        }
+            };
             Ok(quote! {
                 #[doc(hidden)]
-                async fn #wrapper(#receiver) -> JsValue {
+                async fn #wrapper(#receiver) -> Result<JsValue, JsValue> {
                     match ::uniffi::rust_stream_next_async::<#item, #error>(&#registry, #handle).await
-                        .unwrap_or_else(|error| panic!("wasm output stream next failed: {error:?}")) {
+                        .map_err(|error| {
+                            let value = js_sys::Error::new(&format!("output stream next failed: {error:?}"));
+                            let name = if error.error.is::<::uniffi::StreamCancelled>() { "UniffiCancelled" } else { "UniffiStreamProtocol" };
+                            value.set_name(name);
+                            let _ = js_sys::Reflect::set(&value, &JsValue::from_str("errorName"), &JsValue::from_str(name));
+                            JsValue::from(value)
+                        })? {
                         ::uniffi::UniFfiStreamStep::Item(value) => {
                             let object = js_sys::Object::new();
                             js_sys::Reflect::set(&object, &JsValue::from_str("kind"), &JsValue::from_str("item"))
@@ -3068,24 +3325,15 @@ fn render_stream_hook_operation(
                                 .expect("wasm output stream item lifting failed");
                             js_sys::Reflect::set(&object, &JsValue::from_str("value"), &lifted)
                                 .expect("wasm output stream item envelope value write failed");
-                            object.into()
+                            Ok(object.into())
                         }
                         ::uniffi::UniFfiStreamStep::Done => {
                             let object = js_sys::Object::new();
                             js_sys::Reflect::set(&object, &JsValue::from_str("kind"), &JsValue::from_str("done"))
                                 .expect("wasm output stream done envelope write failed");
-                            object.into()
+                            Ok(object.into())
                         }
-                        ::uniffi::UniFfiStreamStep::Error(error) => {
-                            let object = js_sys::Object::new();
-                            js_sys::Reflect::set(&object, &JsValue::from_str("kind"), &JsValue::from_str("error"))
-                                .expect("wasm output stream error envelope kind write failed");
-                            let lifted = (#error_lift)
-                                .expect("wasm output stream error lifting failed");
-                            js_sys::Reflect::set(&object, &JsValue::from_str("error"), &lifted)
-                                .expect("wasm output stream error envelope value write failed");
-                            object.into()
-                        }
+                        ::uniffi::UniFfiStreamStep::Error(error) => { #error_arm }
                     }
                 }
             })
@@ -3406,6 +3654,134 @@ namespace async_results {
     }
 
     #[test]
+    fn stream_methods_and_factories_normalize_after_raw_result_commit() {
+        for is_async in [false, true] {
+            for fallible_items in [false, true] {
+                let package = super::super::tests::stream_declaration_package(
+                    is_async,
+                    fallible_items,
+                    fallible_items,
+                );
+                engine_plan(&package).unwrap();
+                let wrappers = typed_wrappers(&package);
+                for operation in package.rust.engines[&EngineKind::WasmBindgen]
+                    .operations
+                    .iter()
+                    .filter(|operation| {
+                        operation.return_value.as_ref().is_some_and(|binding| {
+                            matches!(binding.conversion, ConversionRecipe::OutputStream { .. })
+                        })
+                    })
+                {
+                    let name = format!(
+                        "__uniffi_typed_wasm_operation_{}",
+                        operation.operation_id.index()
+                    );
+                    let source = compact(
+                        wrappers
+                            .iter()
+                            .find(|wrapper| wrapper.sig.ident == name)
+                            .unwrap(),
+                    );
+                    assert_eq!(source.contains("StreamExt::map"), !fallible_items);
+                    if is_async {
+                        let business = business_future(&source);
+                        assert!(!business.contains("rust_stream_new"));
+                        assert!(!business.contains("StreamExt::map"));
+                    }
+                    assert!(source.contains("rust_stream_new"));
+                }
+                let helpers = render_stream_helpers(&package).unwrap();
+                assert!(helpers.contains("ForeignInputStreamCloseFuture"));
+                assert!(helpers.contains("releaseInputStream"));
+                assert!(helpers.contains("rust_stream_close_async"));
+            }
+        }
+    }
+
+    #[test]
+    fn wasm_infallible_result_value_and_unit_keep_original_shape() {
+        let package = super::super::tests::infallible_result_value_package();
+        for wrapper in typed_wrappers(&package) {
+            let source = compact(&wrapper);
+            assert!(
+                source.contains("Err(never)=>matchnever{}"),
+                "original Result value/unit must be unwrapped: {source}"
+            );
+        }
+        let mut local = super::super::tests::local_object_package();
+        let operation = local.rust.engines.get_mut(&EngineKind::WasmBindgen).unwrap().operations.iter_mut()
+            .find(|op| matches!(&op.call_target, RustCallTarget::Method { item, .. } if item == "read_sync")).unwrap();
+        operation.rust_return_is_result = true;
+        let name = format!(
+            "__uniffi_typed_wasm_operation_{}",
+            operation.operation_id.index()
+        );
+        let wrapper = typed_wrappers(&local)
+            .into_iter()
+            .find(|item| item.sig.ident == name)
+            .unwrap();
+        let source = compact(&wrapper.block);
+        assert!(
+            source.find("map_err(__uniffi_local_error)?").unwrap()
+                < source.find("Err(never)=>matchnever{}").unwrap()
+        );
+    }
+
+    #[test]
+    fn wasm_infallible_callback_preserves_result_and_item_shapes_independently() {
+        for rust_async in [false, true] {
+            for outer in [false, true] {
+                for item in [false, true] {
+                    let package =
+                        super::super::tests::stream_callback_shape_package(rust_async, outer, item);
+                    let operation = package.rust.engines[&EngineKind::WasmBindgen]
+                        .operations
+                        .iter()
+                        .find(|operation| {
+                            matches!(operation.call_target, RustCallTarget::CallbackMethod { .. })
+                        })
+                        .unwrap();
+                    let method: syn::ImplItemFn =
+                        syn::parse2(render_callback_method(&package, operation).unwrap()).unwrap();
+                    assert_eq!(compact(&method.sig.output).contains("Result<"), outer);
+                    assert_eq!(
+                        compact(&method.block).contains("Err(never)=>matchnever{}"),
+                        !item
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wasm_host_stream_callback_keeps_input_until_promise_settles() {
+        for rust_async in [false, true] {
+            let package = super::super::tests::stream_callback_package(rust_async);
+            engine_plan(&package).unwrap();
+            let helpers = render_callback_helpers(&package).unwrap();
+            let source = compact(syn::parse_file(&helpers).unwrap());
+            assert!(
+                source.find("JsFuture::from(promise)").unwrap()
+                    < source.find("drop(arg0)").unwrap()
+            );
+            assert!(source.contains("Box::pin(__uniffi_make_nested_input_stream_"));
+            assert!(source.contains(".handle().as_raw()"));
+            assert_eq!(source.contains("asyncfnevents("), rust_async);
+            assert_eq!(source.contains("Future<Output="), !rust_async);
+            if !rust_async {
+                assert!(source.contains("+'static>>"));
+                assert!(
+                    source.find("self.host.clone()").unwrap()
+                        < source.find("Box::pin(asyncmove").unwrap()
+                );
+                assert!(source.contains("__uniffi_owned_receiver.host"));
+            }
+            assert!(source.contains("Err(never)=>matchnever{}"));
+        }
+    }
+
+    #[test]
     fn async_stream_factory_commits_before_registering_stream() {
         for is_async in [false, true] {
             let mut group = uniffi_meta::MetadataGroup {
@@ -3422,10 +3798,13 @@ namespace async_results {
                     name: "events".into(),
                     orig_name: None,
                     is_async,
+                    rust_async: is_async,
+                    rust_return_is_result: false,
+                    rust_stream_item_is_result: true,
                     inputs: vec![],
                     return_type: Some(uniffi_meta::Type::Stream {
                         item_type: Box::new(uniffi_meta::Type::UInt32),
-                        error_type: Box::new(uniffi_meta::Type::String),
+                        error_type: Some(Box::new(uniffi_meta::Type::String)),
                         is_send: false,
                     }),
                     throws: None,
@@ -3597,6 +3976,9 @@ namespace host_dispatch_fixture {
                 name: "distance_to".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![uniffi_meta::FnParamMetadata {
                     name: "other".to_owned(),
                     ty: uniffi_meta::Type::Record {
@@ -3621,6 +4003,9 @@ namespace host_dispatch_fixture {
                 name: "consume".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![uniffi_meta::FnParamMetadata::simple(
                     "point",
                     uniffi_meta::Type::Record {
@@ -3699,7 +4084,7 @@ namespace host_dispatch_fixture {
         };
         let input_stream = |item| uniffi_meta::Type::InputStream {
             item_type: Box::new(item),
-            error_type: Box::new(uniffi_meta::Type::String),
+            error_type: Some(Box::new(uniffi_meta::Type::String)),
             is_send: true,
         };
         // Input streams are foreign-owned and therefore appear nested in an
@@ -3742,7 +4127,7 @@ namespace host_dispatch_fixture {
                         key_type: Box::new(uniffi_meta::Type::String),
                         value_type: Box::new(uniffi_meta::Type::Stream {
                             item_type: Box::new(uniffi_meta::Type::String),
-                            error_type: Box::new(uniffi_meta::Type::String),
+                            error_type: Some(Box::new(uniffi_meta::Type::String)),
                             is_send: true,
                         }),
                     },
@@ -3759,6 +4144,9 @@ namespace host_dispatch_fixture {
                 name: "consume".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![uniffi_meta::FnParamMetadata::simple(
                     "envelope",
                     uniffi_meta::Type::Record {
@@ -3779,6 +4167,9 @@ namespace host_dispatch_fixture {
                 name: "produce".to_owned(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![],
                 return_type: Some(uniffi_meta::Type::Record {
                     module_path: "wasm_nested_streams".to_owned(),

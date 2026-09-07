@@ -98,7 +98,7 @@ pub(super) fn gen_method_scaffolding(
     use_trait: Option<&syn::Path>,
 ) -> syn::Result<TokenStream> {
     let local_helper = if sig.is_local {
-        gen_local_method(&sig)?
+        gen_local_method(&sig, use_trait)?
     } else {
         TokenStream::new()
     };
@@ -123,7 +123,10 @@ pub(super) fn gen_method_scaffolding(
 }
 
 /// The helper takes owned arguments; any Rust borrows are made inside the owner.
-fn gen_local_method(sig: &FnSignature) -> syn::Result<TokenStream> {
+pub(super) fn gen_local_method(
+    sig: &FnSignature,
+    use_trait: Option<&syn::Path>,
+) -> syn::Result<TokenStream> {
     if !matches!(sig.require_receiver()?, ReceiverArg::Ref) {
         return Err(syn::Error::new(
             sig.span,
@@ -144,11 +147,28 @@ fn gen_local_method(sig: &FnSignature) -> syn::Result<TokenStream> {
         .collect();
     let types = sig.args.iter().map(|arg| &arg.ty);
     let args = sig.rust_call_params(false);
-    let call = if sig.is_rust_async {
-        quote! { __uniffi_body.#method(#args).await }
-    } else {
-        quote! { __uniffi_body.#method(#args) }
+    let mut call = match use_trait {
+        Some(trait_path) => quote! { <#self_ident as #trait_path>::#method(__uniffi_body, #args) },
+        None => quote! { __uniffi_body.#method(#args) },
     };
+    for _ in 0..sig.rust_await_count {
+        call = quote! { (#call).await };
+    }
+    let flatten = sig.stream_return.is_some().then(|| quote! { ? });
+    if let Some(stream) = &sig.stream_return {
+        let boxed = stream.box_stream(quote! { uniffi_stream });
+        let local = quote! { ::uniffi::async_runtime::local_stream(#boxed) };
+        call = if sig.factory_error_ty.is_some() {
+            quote! {
+                match #call {
+                    Ok(uniffi_stream) => #local.map(Ok),
+                    Err(error) => Ok(Err(error)),
+                }
+            }
+        } else {
+            quote! {{ let uniffi_stream = #call; #local }}
+        };
+    }
     Ok(quote! {
         impl #self_ident {
             #[doc(hidden)]
@@ -159,7 +179,7 @@ fn gen_local_method(sig: &FnSignature) -> syn::Result<TokenStream> {
                 let uniffi_args = (#(#names,)*);
                 __uniffi_proxy.call(move |__uniffi_body| ::std::boxed::Box::pin(async move {
                     #call
-                })).await
+                })).await #flatten
             }
         }
     })
@@ -189,7 +209,16 @@ pub(crate) fn gen_local_close(
     sig.is_local = true;
     let scaffolding = gen_ffi_function(&sig, None, udl_mode, None)?;
     let metadata = (!udl_mode).then(|| sig.metadata_items()).transpose()?;
+    let helper = gen_local_close_helper(self_ident);
     Ok(quote! {
+        #helper
+        #scaffolding
+        #metadata
+    })
+}
+
+pub(crate) fn gen_local_close_helper(self_ident: &Ident) -> TokenStream {
+    quote! {
         impl #self_ident {
             #[doc(hidden)]
             pub async fn __uniffi_local_close(
@@ -198,9 +227,7 @@ pub(crate) fn gen_local_close(
                 proxy.close().await
             }
         }
-        #scaffolding
-        #metadata
-    })
+    }
 }
 
 // Pieces of code for the scaffolding function
@@ -363,81 +390,23 @@ pub(super) fn gen_ffi_function(
     let ffi_fn_name = ffi_ident.to_string();
     let name = &sig.name;
     let return_ty = &sig.return_ty;
-    let use_trait = use_trait.map(|tr| quote! { use #tr; });
+    let use_trait = use_trait
+        .filter(|_| !sig.is_local)
+        .map(|tr| quote! { use #tr; });
     let input_stream_callback_registrations = gen_input_stream_callback_registrations(sig);
-    if let Some(stream_return) = &sig.stream_return {
-        let item_ty = &stream_return.item_ty;
-        let error_ty = &stream_return.error_ty;
-        let stream_next_ident = Ident::new(
-            &uniffi_meta::fn_stream_next_symbol_name(&sig.mod_path, &sig.name),
-            proc_macro2::Span::call_site(),
+    if sig.stream_return.is_some() {
+        return gen_stream_ffi_function(
+            sig,
+            ar,
+            use_trait,
+            ScaffoldingBits {
+                param_names,
+                param_types,
+                lift_closure,
+                rust_fn_call,
+                convert_result,
+            },
         );
-        let stream_cancel_ident = Ident::new(
-            &uniffi_meta::fn_stream_cancel_symbol_name(&sig.mod_path, &sig.name),
-            proc_macro2::Span::call_site(),
-        );
-        let registry_ident = Ident::new(
-            &format!("__UNIFFI_STREAM_REGISTRY_{}", ffi_fn_name).to_ascii_uppercase(),
-            proc_macro2::Span::call_site(),
-        );
-        let scaffolding_fn_ffi_buffer_version =
-            ffi_buffer_scaffolding_fn(&ffi_ident, &quote! { ::uniffi::Handle }, &param_types, true);
-
-        return Ok(quote! {
-            #input_stream_callback_registrations
-
-            #[doc(hidden)]
-            static #registry_ident: ::uniffi::RustStreamRegistry<#item_ty, #error_ty> =
-                ::uniffi::deps::once_cell::sync::Lazy::new(::std::default::Default::default);
-
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            pub extern "C" fn #ffi_ident(
-                #(#param_names: #param_types,)*
-                call_status: &mut ::uniffi::RustCallStatus,
-            ) -> ::uniffi::Handle {
-                #use_trait
-                ::uniffi::deps::trace!("calling: {}", #ffi_fn_name);
-                let uniffi_lift_args = #lift_closure;
-                ::uniffi::rust_call(call_status, || {
-                    let uniffi_lifted_args: ::std::result::Result<_, (&'static str, ::uniffi::deps::anyhow::Error)> =
-                        uniffi_lift_args();
-                    match uniffi_lifted_args {
-                        ::std::result::Result::Ok(uniffi_args) => {
-                            ::uniffi::deps::trace!("lift_args success: {}", #ffi_fn_name);
-                            let uniffi_result = #rust_fn_call;
-                            ::uniffi::deps::trace!("call success: {}", #ffi_fn_name);
-                            let uniffi_result = #convert_result;
-                            ::std::result::Result::Ok(::uniffi::rust_stream_new(&#registry_ident, uniffi_result))
-                        }
-                        ::std::result::Result::Err((arg_name, error)) => {
-                            ::uniffi::deps::trace!("lift_args error: {}", #ffi_fn_name);
-                            ::std::result::Result::Err(::uniffi::RustCallError::InternalError(
-                                ::std::format!("Failed to convert arg '{arg_name}':\n{error:?}")
-                            ))
-                        },
-                    }
-                })
-            }
-
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            pub extern "C" fn #stream_next_ident(handle: ::uniffi::Handle) -> ::uniffi::Handle {
-                ::uniffi::rust_stream_next::<#item_ty, #error_ty, crate::UniFfiTag>(
-                    &#registry_ident,
-                    handle,
-                    crate::UniFfiTag,
-                )
-            }
-
-            #[doc(hidden)]
-            #[unsafe(no_mangle)]
-            pub extern "C" fn #stream_cancel_ident(handle: ::uniffi::Handle) {
-                ::uniffi::rust_stream_cancel::<#item_ty, #error_ty>(&#registry_ident, handle)
-            }
-
-            #scaffolding_fn_ffi_buffer_version
-        });
     }
     let ffi_return_ty = ffiops::lower_return_type(return_ty);
     let lower_return = ffiops::lower_return(return_ty);
@@ -528,6 +497,137 @@ pub(super) fn gen_ffi_function(
     })
 }
 
+fn gen_stream_ffi_function(
+    sig: &FnSignature,
+    ar: Option<&AsyncRuntime>,
+    use_trait: Option<TokenStream>,
+    bits: ScaffoldingBits,
+) -> syn::Result<TokenStream> {
+    let stream = sig.stream_return.as_ref().unwrap();
+    let item = &stream.item_ty;
+    let error = &stream.error_ty;
+    let ffi_ident = sig.scaffolding_fn_ident()?;
+    let ffi_name = ffi_ident.to_string();
+    let next = format_ident!("{}_stream_next", ffi_name);
+    let cancel = format_ident!("{}_stream_cancel", ffi_name);
+    let close = format_ident!("{}_stream_close", ffi_name);
+    let registry = format_ident!("__UNIFFI_STREAM_REGISTRY_{}", ffi_name.to_ascii_uppercase());
+    let ScaffoldingBits {
+        param_names,
+        param_types,
+        lift_closure,
+        rust_fn_call,
+        convert_result,
+    } = bits;
+    let output = quote! { ::uniffi::RustStreamOutput<#item, #error> };
+    let output = match &sig.factory_error_ty {
+        Some(factory_error) => quote! { ::std::result::Result<#output, #factory_error> },
+        None => output,
+    };
+    // A local helper has already converted its stream on owner before transfer.
+    let stream_value = if sig.is_local {
+        quote! { uniffi_stream }
+    } else {
+        stream.box_stream(quote! { uniffi_stream })
+    };
+    let converted = quote! { ::uniffi::RustStreamOutput::new(&#registry, #stream_value) };
+    let converted = if sig.factory_error_ty.is_some() {
+        quote! { uniffi_result.map(|uniffi_stream| #converted) }
+    } else {
+        quote! {{ let uniffi_stream = uniffi_result; #converted }}
+    };
+    let (output, converted) = if sig.is_local {
+        (
+            quote! { ::uniffi::InternalCallResult<#output> },
+            quote! {
+                ::uniffi::InternalCallResult(uniffi_result.map(|uniffi_result| #converted)
+                    .map_err(::uniffi::RustCallError::from))
+            },
+        )
+    } else {
+        (output, converted)
+    };
+    let input_registrations = gen_input_stream_callback_registrations(sig);
+    let function = if sig.is_async {
+        let future = wrap_async_future_expr(rust_fn_call, ar);
+        let buffer = ffi_buffer_scaffolding_fn(
+            &ffi_ident,
+            &quote! { ::uniffi::Handle },
+            &param_types,
+            false,
+        );
+        quote! {
+            #[doc(hidden)]
+            #[unsafe(no_mangle)]
+            pub extern "C" fn #ffi_ident(#(#param_names: #param_types,)*) -> ::uniffi::Handle {
+                #use_trait
+                let args = (#lift_closure)();
+                ::uniffi::rust_future_new::<_, #output, _>(async move {
+                    match args {
+                        Ok(uniffi_args) => {
+                            let uniffi_result = #future.await;
+                            let uniffi_result = #convert_result;
+                            Ok(#converted)
+                        }
+                        Err((arg_name, error)) => Err(::uniffi::LiftArgsError { arg_name, error }),
+                    }
+                }, crate::UniFfiTag)
+            }
+            #buffer
+        }
+    } else {
+        let lower = ffiops::lower_return(&output);
+        let failed_lift = ffiops::lower_return_handle_failed_lift(&output);
+        let buffer =
+            ffi_buffer_scaffolding_fn(&ffi_ident, &quote! { ::uniffi::Handle }, &param_types, true);
+        quote! {
+            #[doc(hidden)]
+            #[unsafe(no_mangle)]
+            pub extern "C" fn #ffi_ident(#(#param_names: #param_types,)* call_status: &mut ::uniffi::RustCallStatus) -> ::uniffi::Handle {
+                #use_trait
+                ::uniffi::rust_call(call_status, || {
+                    match (#lift_closure)() {
+                        Ok(uniffi_args) => {
+                            let uniffi_result = #rust_fn_call;
+                            let uniffi_result = #convert_result;
+                            #lower(#converted)
+                        }
+                        Err((arg_name, error)) => #failed_lift(::uniffi::LiftArgsError { arg_name, error }),
+                    }
+                })
+            }
+            #buffer
+        }
+    };
+    Ok(quote! {
+        #input_registrations
+        #[doc(hidden)]
+        static #registry: ::uniffi::RustStreamRegistry<#item, #error> =
+            ::uniffi::deps::once_cell::sync::Lazy::new(::std::default::Default::default);
+        #function
+        #[doc(hidden)]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn #next(handle: ::uniffi::Handle) -> ::uniffi::Handle {
+            ::uniffi::rust_stream_next::<#item, #error, crate::UniFfiTag>(&#registry, handle, crate::UniFfiTag)
+        }
+        #[doc(hidden)]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn #cancel(handle: ::uniffi::Handle) {
+            ::uniffi::rust_stream_cancel::<#item, #error>(&#registry, handle)
+        }
+        #[doc(hidden)]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn #close(handle: ::uniffi::Handle) -> ::uniffi::Handle {
+            ::uniffi::rust_future_new::<_, ::uniffi::InternalCallResult<()>, _>(async move {
+                Ok(::uniffi::InternalCallResult(
+                    ::uniffi::rust_stream_close_async(&#registry, handle).await
+                        .map_err(|_| ::uniffi::RustCallError::InternalError("stream cleanup failed".into()))
+                ))
+            }, crate::UniFfiTag)
+        }
+    })
+}
+
 fn gen_input_stream_callback_registrations(sig: &FnSignature) -> TokenStream {
     let registrations = sig.args.iter().filter_map(|arg| {
         let input_stream = arg.input_stream.as_ref()?;
@@ -545,8 +645,9 @@ fn gen_input_stream_callback_registrations(sig: &FnSignature) -> TokenStream {
             pub extern "C" fn #init_ident(
                 next: #next_ty,
                 cancel: ::uniffi::ForeignInputStreamCancelCallback,
+                close: ::uniffi::ForeignInputStreamCloseCallback,
             ) {
-                let _ = #cell_ident.set((next, cancel));
+                let _ = #cell_ident.set((next, cancel, close));
             }
         })
     });

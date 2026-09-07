@@ -1,0 +1,5 @@
+error: nested Future returns are not supported; await the inner future in Rust
+ --> tests/async-ui/nested_future.rs:2:22
+  |
+2 | async fn nested() -> impl std::future::Future<Output = u32> { async { 1 } }
+  |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

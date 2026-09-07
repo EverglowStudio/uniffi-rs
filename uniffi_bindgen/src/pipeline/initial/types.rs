@@ -203,7 +203,7 @@ mod tests {
         };
         let ty = uniffi_meta::Type::Stream {
             item_type: Box::new(uniffi_meta::Type::UInt32),
-            error_type: Box::new(uniffi_meta::Type::String),
+            error_type: Some(Box::new(uniffi_meta::Type::String)),
             is_send: true,
         };
 
@@ -211,7 +211,7 @@ mod tests {
             map_type(ty, &context).unwrap(),
             Type::Stream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             }
         );
@@ -231,7 +231,7 @@ mod tests {
         };
         let ty = uniffi_meta::Type::InputStream {
             item_type: Box::new(uniffi_meta::Type::UInt32),
-            error_type: Box::new(uniffi_meta::Type::String),
+            error_type: Some(Box::new(uniffi_meta::Type::String)),
             is_send: true,
         };
 
@@ -239,7 +239,7 @@ mod tests {
             map_type(ty, &context).unwrap(),
             Type::InputStream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             }
         );

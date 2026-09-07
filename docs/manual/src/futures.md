@@ -6,6 +6,114 @@ Check out the [examples](https://github.com/mozilla/uniffi-rs/tree/main/examples
 
 We've also [documentation on the internals of how this works](internals/async-overview.md).
 
+## Shared Rust async runtime
+
+This fork enables `uniffi/async-runtime` by default. It provides task spawning,
+local executors, cancellation contexts, timers and demand-driven streams through
+`uniffi::async_runtime`. A build with `default-features = false` must explicitly
+enable `async-runtime` when exporting local objects or the complete stream API.
+The lower-level `uniffi_core` crate can still be built without the runtime.
+
+Free functions and inherent methods keep their original Rust signatures. The
+exported result is obtained from one `async fn` or one explicitly returned Future:
+
+```rust
+use uniffi::async_runtime::{BoxFuture, BoxStream};
+
+#[uniffi::export]
+pub fn next_value(value: u32) -> BoxFuture<'static, u32> {
+    Box::pin(async move { value + 1 })
+}
+
+#[uniffi::export]
+pub fn optional_values() -> BoxStream<'static, Option<u32>> {
+    Box::pin(uniffi::deps::futures_util::stream::iter([None, Some(7)]))
+}
+```
+
+Supported declarations include `impl Future<Output = T>`,
+`Pin<Box<dyn Future<Output = T> + ...>>`, `BoxFuture` and `LocalBoxFuture`;
+streams accept the corresponding `impl Stream`, pinned boxed stream,
+`BoxStream`, `LocalBoxStream` and `UniFfiStream<T, E>` forms. The classifier
+recognizes these common names; it does not resolve arbitrary user-defined aliases.
+The selected execution boundary must satisfy the actual Rust bounds. Native
+shared execution requires `Send`, but never requires the Future to be `Sync`.
+
+`uniffi::async_runtime::BoxFuture` and `BoxStream` include `Send` on native
+platforms and omit it on WASM. Use `SendOutsideWasm` and `SyncOutsideWasm` for
+portable native-only bounds. WASM tasks and streams remain in their Window or
+Dedicated Worker instance; these markers do not transfer a JS value between
+realms or create a worker pool.
+
+### Streams and factories
+
+Stream arguments use `UniFfiInputStream<T, E>` for host-produced input on
+functions, object methods and callbacks. The `impl` and boxed forms above
+describe returned streams; an arbitrary Rust stream argument is not a host
+producer handle. Use `std::convert::Infallible` as `E` when an input or
+`UniFfiStream` has no business item error.
+
+A stream item can be either `T` or `Result<T, E>`. An `Option<T>` item remains
+an item: `None` is distinct from the end of the stream. The first business error
+ends the subscription. `Result<Stream, FactoryError>` and an async factory retain
+a separate factory error, independently of the stream's item error.
+`Result<T, Infallible>` values, factories and stream items keep their original
+Rust types while exposing only successful values to the host. An object method
+can move its input producer into a returned stream; that subscription then
+keeps the producer alive until it ends or closes.
+
+Each subscription has one consumer and allows at most one pending `next()`.
+There is no prefetch or unbounded bridge queue. Closing requests cancellation
+and waits for stream destruction and registered asynchronous cleanup. An
+interrupted pending pull reports framework cancellation; it is not a business
+error or a normally produced end marker. In JavaScript, await `stream.return()`
+to confirm closure. Creating a stream does not start polling it.
+
+### Local objects
+
+A `LocalExecutor` runs native `!Send` state and futures on their owning thread.
+Create the value there and pass its `LocalObject<T>` proxy across threads:
+
+```rust
+use std::cell::Cell;
+use uniffi::async_runtime::LocalExecutor;
+
+# async fn example() -> Result<(), uniffi::async_runtime::LocalError> {
+let executor = LocalExecutor::new(8)?;
+let counter = executor.create(|| async { Cell::new(0u32) }).await?;
+let value = counter.call(|counter| Box::pin(async move {
+    counter.set(counter.get() + 1);
+    counter.get()
+})).await?;
+assert_eq!(value, 1);
+counter.close().await?;
+executor.close().await?;
+# Ok(())
+# }
+```
+
+For bindings, mark the body with `#[uniffi(local)]` on a derived Object and
+its methods with `#[uniffi::export(local)]`. Methods become asynchronous owner
+calls, including methods whose Rust body is synchronous. The generated `close`
+method waits for cleanup. A local method can construct and return a `!Send`
+stream; its body stays on the owner while the subscription proxy travels.
+`#[uniffi::export(local)] impl BusinessTrait for Body` exports those methods on
+the local Object and preserves the ordinary Rust business trait.
+
+A shared exported trait is a different boundary: its opaque Future/Stream
+returns are boxed for dynamic dispatch, preserving `Output`, `Item`, factory
+errors and explicit bounds. Use `#[uniffi::export(rust, foreign)]` for host
+implementations. Host Future/Stream implementations cannot promise `Sync`;
+on WASM they also cannot promise an explicit `Send` bound. These declarations
+produce a diagnostic at the bound instead of weakening it. Portable boxed
+aliases and `SendOutsideWasm` avoid an unintended WASM `Send` requirement.
+
+Borrowed output values, generic exported data/functions, nested Future returns
+and Future/Stream values inside records or containers are rejected at the
+unsupported declaration. Await a nested Future in Rust and export its value.
+Streams are passed through their dedicated subscription API, not serialized as
+data fields.
+
 ## Example
 
 This is a short "async sleep()" example:
@@ -109,12 +217,22 @@ Unlike Python and Swift, Ruby has no native async/await. When Rust calls an asyn
 method, UniFFI spawns a new OS thread for each invocation. There is no event loop requirement,
 though a Fiber scheduler is supported for the Ruby -> Rust polling direction.
 
-## Cancelling async code.
+## Cancelling async code
 
-We don't directly support cancellation in UniFFI even when the underlying platforms do.
-You should build your cancellation in a separate, library specific channel; for example, exposing a `cancel()` method that sets a flag that the library checks periodically.
+The shared runtime distinguishes cancellation from a business `Result` error.
+`CancellationToken::cancel()` requests cancellation. A `CallContext` waits for
+the business Future to be dropped and for cleanup explicitly registered with
+`defer_cleanup`; `defer_local_cleanup` retains a `!Send` cleanup future on its
+owner. Ordinary Rust `Drop` implementations cannot await work automatically.
+Side effects that have already happened are not rolled back.
 
-Cancellation can then be exposed in the API and be mapped to one of the error variants, or None/empty-vec/whatever makes sense.
-There's no builtin way to cancel a future, nor to cause/raise a platform native async cancellation error (eg, a swift `CancellationError`).
+JavaScript asynchronous calls accept a final `{ signal: AbortSignal }` option.
+Their promises settle after Rust and bridge cleanup is confirmed. Cancelling a
+subscription stops that subscription, rather than an independently owned
+account or background task. A session's `close()` also waits for its active
+calls and resources.
 
-See also [this github PR](https://github.com/mozilla/uniffi-rs/pull/1768).
+Native language cancellation integration is documented with each binding.
+A plain Rust task handle detaches on Drop; explicitly cancel and await it when
+you own its lifetime. Local object calls and registered foreign calls use the
+stronger cancellation-and-cleanup boundary described above.

@@ -237,6 +237,9 @@ mod tests {
             name: "old_function".to_string(),
             orig_name: None,
             is_async: false,
+            rust_async: false,
+            rust_return_is_result: false,
+            rust_stream_item_is_result: false,
             inputs: vec![FnParamMetadata {
                 name: "arg".to_string(),
                 ty: Type::Optional {

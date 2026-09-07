@@ -191,6 +191,98 @@ pub(super) fn rust_call_argument(expression: TokenStream, ownership: Ownership) 
     }
 }
 
+/// Move callback receiver access into an owned, static Future.
+pub(super) fn own_callback_receiver(body: TokenStream) -> Result<TokenStream> {
+    use syn::visit_mut::{self, VisitMut};
+    struct OwnedReceiver;
+    impl VisitMut for OwnedReceiver {
+        fn visit_expr_path_mut(&mut self, expression: &mut syn::ExprPath) {
+            if expression.qself.is_none() && expression.path.is_ident("self") {
+                expression.path = syn::parse_quote!(__uniffi_owned_receiver);
+            } else {
+                visit_mut::visit_expr_path_mut(self, expression);
+            }
+        }
+    }
+    let mut body: syn::Block = syn::parse2(quote!({ #body }))?;
+    OwnedReceiver.visit_block_mut(&mut body);
+    Ok(quote!(#body))
+}
+
+/// Undo the canonical infallible boundary for an original trait Item=T.
+pub(super) fn source_stream(
+    operation: &RustOperationPlan,
+    binding: &RustValueBinding,
+    value: TokenStream,
+) -> TokenStream {
+    if matches!(&binding.rust_type, RustType::Stream { .. })
+        && !operation.rust_stream_item_is_result
+    {
+        quote!(Box::pin(::uniffi::deps::futures_util::StreamExt::map(#value, |item| match item {
+            Ok(value) => value,
+            Err(never) => match never {},
+        })))
+    } else {
+        value
+    }
+}
+
+fn output_pull(operation: &RustOperationPlan) -> bool {
+    matches!(
+        operation.call_target,
+        RustCallTarget::StreamHook {
+            hook: RustResourceHook::PullOutputStream,
+            ..
+        }
+    )
+}
+
+pub(super) fn rust_default_argument(
+    package: &NormalizedPackage,
+    operation: &RustOperationPlan,
+    index: usize,
+) -> bool {
+    package
+        .api
+        .operations
+        .iter()
+        .find(|op| op.id == operation.operation_id)
+        .and_then(|op| op.arguments.get(index))
+        .is_some_and(|arg| matches!(arg.default, Some(uniffi_js_abi::DefaultValue::Unspecified)))
+}
+
+pub(super) fn is_infallible(ty: &RustType) -> bool {
+    matches!(ty, RustType::Path(path) if path.segments == ["std", "convert", "Infallible"])
+}
+
+/// Remove only the original business Result whose error cannot occur. The
+/// caller keeps framework Results (including LocalError) outside this value.
+pub(super) fn canonical_return(operation: &RustOperationPlan, value: TokenStream) -> TokenStream {
+    if operation.rust_return_is_result && operation.throws.is_none() {
+        quote!(match #value { Ok(value) => value, Err(never) => match never {} })
+    } else {
+        value
+    }
+}
+
+pub(super) fn canonical_stream(operation: &RustOperationPlan, value: TokenStream) -> TokenStream {
+    if async_calls::local_method(operation) {
+        return value;
+    }
+    let Some(binding) = operation.return_value.as_ref() else {
+        return value;
+    };
+    let RustType::Stream { .. } = &binding.rust_type else {
+        return value;
+    };
+    let value = if !operation.rust_stream_item_is_result {
+        quote!(::uniffi::deps::futures_util::StreamExt::map(#value, Ok::<_, ::std::convert::Infallible>))
+    } else {
+        value
+    };
+    quote!(Box::pin(#value) as ::uniffi::UniFfiStream<_, _>)
+}
+
 fn syn_type(ty: &RustType, engine: &str) -> Result<Type> {
     let text = match ty {
         RustType::Unit => "()".to_owned(),
@@ -346,6 +438,9 @@ fn napi_carrier_type_for(
         named_types: &[uniffi_js_engine_schema::RustNamedTypePlan],
         flavor: NativeFlavor,
     ) -> Result<Type> {
+        if is_infallible(ty) {
+            return Ok(syn::parse_quote!(String));
+        }
         let type_for_id = |id: uniffi_js_abi::TypeId| {
             if named_types.iter().any(|entry| entry.id == id) {
                 Ok::<Type, anyhow::Error>(syn::parse_str(&format!(
@@ -1169,7 +1264,7 @@ fn family_operations(
         FamilyFlavor::Ohos => EngineKind::OhosNapi,
     };
     let operations = package.rust.engines[&engine].operations.as_slice();
-    operations
+    let mut result = operations
         .iter()
         .map(|operation| -> Result<FamilyOperation> {
             let dispatch = operation_dispatch(operation);
@@ -1178,7 +1273,9 @@ fn family_operations(
                 id: operation.operation_id.index(),
                 kind: family_kind(operation.kind),
                 async_kind: family_async(operation.async_kind),
-                fallible: operation.throws.is_some() || async_calls::managed(operation),
+                fallible: operation.throws.is_some()
+                    || async_calls::managed(operation)
+                    || output_pull(operation),
                 argument_count: operation.arguments.len()
                     + usize::from(async_calls::managed(operation)),
                 dispatch,
@@ -1202,13 +1299,47 @@ fn family_operations(
                 callbacks: native
                     .then(|| callbacks_for(bridge, operation.operation_id.index()))
                     .unwrap_or_default(),
-                streams: native
-                    .then(|| streams_for(bridge, operation))
-                    .unwrap_or_default(),
-                stream_slot: operation_stream_slot(operations, operation),
+                streams: if native {
+                    streams_for(bridge, operation)
+                } else {
+                    Vec::new()
+                }
+                .into_iter()
+                .filter(|stream| {
+                    stream.direction == napi_uniffi_engine::napi_family_core::StreamDirection::Input
+                })
+                .collect(),
+                stream_slot: operation_stream_slot(operations, operation).filter(|slot| {
+                    matches!(
+                        slot.kind,
+                        FamilyKind::InputStreamPull | FamilyKind::InputStreamCancel
+                    )
+                }),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let ids = result
+        .iter()
+        .flat_map(|operation| operation.streams.iter().map(|stream| stream.use_site_id))
+        .collect::<BTreeSet<_>>();
+    let ids = ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| (id, index as u32))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for operation in &mut result {
+        for stream in &mut operation.streams {
+            stream.use_site_id = ids[&stream.use_site_id];
+            for slot in &mut stream.slots {
+                slot.use_site_id = stream.use_site_id;
+            }
+        }
+        operation.stream_slot = operation.stream_slot.take().and_then(|mut slot| {
+            slot.use_site_id = *ids.get(&slot.use_site_id)?;
+            Some(slot)
+        });
+    }
+    Ok(result)
 }
 
 fn family_plan(package: &NormalizedPackage, flavor: FamilyFlavor) -> Result<FamilyPlan> {
@@ -1232,6 +1363,11 @@ fn lower_expr(
 ) -> Result<TokenStream> {
     let engine_crate = engine_crate_path(flavor);
     let error_descriptor = flavor.error_descriptor();
+    if is_infallible(&binding.rust_type) {
+        return Ok(
+            quote!(return Err(#error_descriptor::validation("infallible stream received a business error"))),
+        );
+    }
     let value = match &binding.conversion {
         ConversionRecipe::Bytes if flavor.is_ohos() => quote!(#expression.as_ref().to_vec()),
         ConversionRecipe::Identity => match binding.rust_type {
@@ -1378,9 +1514,15 @@ fn lift_expr(
 ) -> Result<TokenStream> {
     let napi = napi_crate_path(flavor);
     let error_descriptor = flavor.error_descriptor();
+    if is_infallible(&binding.rust_type) {
+        return Ok(quote!(match #expression {}));
+    }
     // Struct/enum bridge values implement `From<core>` and the reverse.  The
     // recursive container cases preserve the exact named-type boundaries.
     match &binding.conversion {
+        ConversionRecipe::InputStream { .. } => Ok(
+            quote!(u32::try_from(#expression.handle().as_raw()).expect("input stream handle exceeds u32")),
+        ),
         ConversionRecipe::Bytes if flavor.is_ohos() => {
             Ok(quote!(#napi::bindgen_prelude::Uint8Array::from(#expression)))
         }
@@ -1527,7 +1669,7 @@ fn render_named_type_helpers_for(
                 let bridge_fields = fields
                     .iter()
                     .map(|field| {
-                        let ident = rust_ident(&field.public_name);
+                        let ident = rust_ident(&field.rust_name);
                         let ty = napi_carrier_type_for(
                             &field.binding,
                             package.rust.named_types(),
@@ -1544,9 +1686,9 @@ fn render_named_type_helpers_for(
                     .iter()
                     .map(|field| {
                         let rust_name = rust_ident(&field.rust_name);
-                        let public_name = rust_ident(&field.public_name);
+                        let bridge_name = rust_ident(&field.rust_name);
                         let expression =
-                            lower_expr(&field.binding, quote!(value.#public_name), flavor)?;
+                            lower_expr(&field.binding, quote!(value.#bridge_name), flavor)?;
                         Ok::<_, anyhow::Error>(quote!(#rust_name: #expression))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1554,10 +1696,10 @@ fn render_named_type_helpers_for(
                     .iter()
                     .map(|field| {
                         let rust_name = rust_ident(&field.rust_name);
-                        let public_name = rust_ident(&field.public_name);
+                        let bridge_name = rust_ident(&field.rust_name);
                         let expression =
                             lift_expr(&field.binding, quote!(value.#rust_name), flavor)?;
-                        Ok::<_, anyhow::Error>(quote!(#public_name: #expression))
+                        Ok::<_, anyhow::Error>(quote!(#bridge_name: #expression))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let lower_name = rust_ident(&format!("__uniffi_lower_type_{type_id}"));
@@ -1609,7 +1751,7 @@ fn render_named_type_helpers_for(
                                 let fields = fields
                                     .iter()
                                     .map(|field| {
-                                        let ident = rust_ident(&field.public_name);
+                                        let ident = rust_ident(&field.rust_name);
                                         let ty = napi_carrier_type_for(
                                             &field.binding,
                                             package.rust.named_types(),
@@ -1660,7 +1802,7 @@ fn render_named_type_helpers_for(
                             uniffi_js_engine_schema::RustVariantPayload::Named(fields) => {
                                 let bindings = fields
                                     .iter()
-                                    .map(|field| rust_ident(&field.public_name))
+                                    .map(|field| rust_ident(&field.rust_name))
                                     .collect::<Vec<_>>();
                                 let lowered = fields
                                     .iter()
@@ -1712,7 +1854,7 @@ fn render_named_type_helpers_for(
                                     .iter()
                                     .zip(&bindings)
                                     .map(|(field, ident)| {
-                                        let public_name = rust_ident(&field.public_name);
+                                        let public_name = rust_ident(&field.rust_name);
                                         let expression = lift_expr(&field.binding, quote!(#ident), flavor)?;
                                         Ok::<_, anyhow::Error>(quote!(#public_name: #expression))
                                     })
@@ -1930,7 +2072,9 @@ fn render_resource_registry(flavor: NativeFlavor) -> String {
         }
 
         async fn __uniffi_cancel_output_stream_impl(handle: u32) -> ::std::result::Result<(), #error_descriptor> {
-            __uniffi_close_output_stream_dispatch(handle)
+            __uniffi_close_output_stream_dispatch(handle)?;
+            if __uniffi_close_stream(handle as f64).await == 1.0 { Ok(()) }
+            else { Err(#error_descriptor::backend("stream cleanup failed")) }
         }
 
         fn __uniffi_release_output_stream_impl(handle: u32) -> ::std::result::Result<(), #error_descriptor> {
@@ -2476,20 +2620,54 @@ fn render_callback_proxy_helpers(
                     )
                 })
                 .transpose()?;
-            let return_core_type = return_type.clone().unwrap_or_else(|| syn::parse_quote!(()));
-            let return_carrier = if let Some(binding) = &callback_operation.return_value {
-                napi_carrier_type_for(
+            let return_core_type = if let Some(binding) =
+                callback_operation.return_value.as_ref().filter(|binding| {
+                    matches!(&binding.rust_type, RustType::Stream { .. })
+                        && !callback_operation.rust_stream_item_is_result
+                }) {
+                let RustType::Stream { item, .. } = &binding.rust_type else {
+                    unreachable!()
+                };
+                let ConversionRecipe::OutputStream {
+                    item: conversion, ..
+                } = &binding.conversion
+                else {
+                    unreachable!()
+                };
+                let item = core_type_for_binding(
+                    package,
                     &RustValueBinding {
-                        rust_type: binding.rust_type.clone(),
-                        carrier: binding.carrier,
-                        conversion: binding.conversion.clone(),
+                        rust_type: *item.clone(),
+                        carrier: RustCarrier::LocalAdapter,
+                        conversion: *conversion.clone(),
                     },
-                    package.rust.named_types(),
-                    flavor,
-                )?
+                )?;
+                syn::parse_quote!(::std::pin::Pin<Box<dyn ::uniffi::deps::futures_util::Stream<Item = #item> + Send + 'static>>)
             } else {
-                syn::parse_quote!(())
+                return_type.clone().unwrap_or_else(|| syn::parse_quote!(()))
             };
+            let return_carrier =
+                if callback_operation
+                    .return_value
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        matches!(binding.conversion, ConversionRecipe::OutputStream { .. })
+                    })
+                {
+                    syn::parse_quote!(u32)
+                } else if let Some(binding) = &callback_operation.return_value {
+                    napi_carrier_type_for(
+                        &RustValueBinding {
+                            rust_type: binding.rust_type.clone(),
+                            carrier: binding.carrier,
+                            conversion: binding.conversion.clone(),
+                        },
+                        package.rust.named_types(),
+                        flavor,
+                    )?
+                } else {
+                    syn::parse_quote!(())
+                };
             let error_carrier: Type = if let Some(throws) = callback_operation.throws {
                 package
                     .rust
@@ -2505,14 +2683,18 @@ fn render_callback_proxy_helpers(
                 .iter()
                 .map(|binding| {
                     let ident = rust_ident(&binding.rust_name);
-                    let ty = core_type_for_binding(
-                        package,
-                        &RustValueBinding {
-                            rust_type: binding.rust_type.clone(),
-                            carrier: binding.carrier,
-                            conversion: binding.conversion.clone(),
-                        },
-                    )?;
+                    let ty = if matches!(binding.conversion, ConversionRecipe::InputStream { .. }) {
+                        syn::parse_quote!(u32)
+                    } else {
+                        core_type_for_binding(
+                            package,
+                            &RustValueBinding {
+                                rust_type: binding.rust_type.clone(),
+                                carrier: binding.carrier,
+                                conversion: binding.conversion.clone(),
+                            },
+                        )?
+                    };
                     Ok::<_, anyhow::Error>(quote!(#ident: #ty))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -2521,9 +2703,13 @@ fn render_callback_proxy_helpers(
                 .iter()
                 .map(|binding| {
                     let ident = rust_ident(&binding.rust_name);
-                    quote!(#ident: #ident)
+                    if matches!(binding.conversion, ConversionRecipe::InputStream { .. }) {
+                        quote!(#ident: u32::try_from(#ident.handle().as_raw()).expect("input stream handle exceeds u32"))
+                    } else { quote!(#ident: #ident) }
                 })
                 .collect::<Vec<_>>();
+            let payload_invocation = (callback_operation.async_kind == AsyncKind::Async)
+                .then(|| quote!(invocation_id: u32,));
             let callback_array_helper = if result_structs.is_empty() {
                 quote! {
                     fn #callback_array_helper_name(
@@ -2573,7 +2759,7 @@ fn render_callback_proxy_helpers(
                     callback_type: u32,
                     callback_id: u32,
                     method_id: u32,
-                    invocation_id: u32,
+                    #payload_invocation
                     #(#payload_fields),*
                 }
                 struct #sync_call_args_name {
@@ -2615,42 +2801,51 @@ fn render_callback_proxy_helpers(
                     }
                 }
             });
-            let async_result_type = if callback_operation
-                .return_value
-                .as_ref()
-                .is_some_and(|binding| matches!(binding.conversion, ConversionRecipe::Callback(_)))
-            {
-                // Callback-return async methods retain/lower the returned
-                // callback from the owning JavaScript thread.  PromiseRaw is
-                // deliberately used here so the worker future never tries
-                // to lift a JS value or hold an Env-bound Promise.
-                quote!(#napi::bindgen_prelude::PromiseRaw<'static, #result_name>)
-            } else {
-                quote!(#napi::bindgen_prelude::Promise<#result_name>)
-            };
-            let sync_cross_field_decl = if cross_thread {
-                quote! {
-                    #sync_cross_field: #napi::threadsafe_function::ThreadsafeFunction<
+            let async_result_type =
+                if callback_operation
+                    .return_value
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        matches!(
+                            binding.conversion,
+                            ConversionRecipe::Callback(_) | ConversionRecipe::OutputStream { .. }
+                        )
+                    })
+                {
+                    // Callback-return async methods retain/lower the returned
+                    // callback from the owning JavaScript thread.  PromiseRaw is
+                    // deliberately used here so the worker future never tries
+                    // to lift a JS value or hold an Env-bound Promise.
+                    quote!(#napi::bindgen_prelude::PromiseRaw<'static, #result_name>)
+                } else {
+                    quote!(#napi::bindgen_prelude::Promise<#result_name>)
+                };
+            let sync_cross_field_decl =
+                if cross_thread && callback_operation.async_kind == AsyncKind::Sync {
+                    quote! {
+                        #sync_cross_field: #napi::threadsafe_function::ThreadsafeFunction<
+                            #payload_name,
+                            #result_name,
+                            #sync_call_args_name,
+                            #napi::Status,
+                            false,
+                        >,
+                    }
+                } else {
+                    quote! {}
+                };
+            inner_fields.push(sync_cross_field_decl);
+            if callback_operation.async_kind == AsyncKind::Async {
+                inner_fields.push(quote! {
+                    #async_field: #napi::threadsafe_function::ThreadsafeFunction<
                         #payload_name,
-                        #result_name,
-                        #sync_call_args_name,
+                        #async_result_type,
+                        #async_call_args_name,
                         #napi::Status,
                         false,
                     >,
-                }
-            } else {
-                quote! {}
-            };
-            inner_fields.push(quote! {
-                #sync_cross_field_decl
-                #async_field: #napi::threadsafe_function::ThreadsafeFunction<
-                    #payload_name,
-                    #async_result_type,
-                    #async_call_args_name,
-                    #napi::Status,
-                    false,
-                >,
-            });
+                });
+            }
             let async_arg_lifts = callback_operation
                 .arguments
                 .iter()
@@ -2661,7 +2856,12 @@ fn render_callback_proxy_helpers(
                         carrier: binding.carrier,
                         conversion: binding.conversion.clone(),
                     };
-                    let lifted = lift_expr(&value_binding, quote!(context.value.#ident), flavor)?;
+                    let lifted =
+                        if matches!(binding.conversion, ConversionRecipe::InputStream { .. }) {
+                            quote!(context.value.#ident)
+                        } else {
+                            lift_expr(&value_binding, quote!(context.value.#ident), flavor)?
+                        };
                     Ok::<_, anyhow::Error>(quote! {
                         let __uniffi_value = (|| -> ::std::result::Result<_, #error_descriptor> {
                             Ok(#lifted)
@@ -2680,7 +2880,9 @@ fn render_callback_proxy_helpers(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let sync_cross_init = if cross_thread {
+            let sync_cross_init = if cross_thread
+                && callback_operation.async_kind == AsyncKind::Sync
+            {
                 quote! {
                     #sync_cross_field: host
                         .get_named_property::<#napi::bindgen_prelude::Function<#host_sync_args, #result_name>>("invokeCallbackSyncResult")
@@ -2708,8 +2910,9 @@ fn render_callback_proxy_helpers(
             } else {
                 quote! {}
             };
-            inner_init.push(quote! {
-                #sync_cross_init
+            inner_init.push(sync_cross_init);
+            if callback_operation.async_kind == AsyncKind::Async {
+                inner_init.push(quote! {
                 #async_field: host
                     .get_named_property::<#napi::bindgen_prelude::Function<#host_async_args, #async_result_type>>("invokeCallbackAsyncResult")
                     .map_err(|error| #error_descriptor::backend(error.to_string()))?
@@ -2732,6 +2935,7 @@ fn render_callback_proxy_helpers(
                     })
                     .map_err(|error| #error_descriptor::backend(error.to_string()))?,
             });
+            }
             let sync_arg_lifts = callback_operation
                 .arguments
                 .iter()
@@ -2768,6 +2972,20 @@ fn render_callback_proxy_helpers(
                 syn::parse_quote!(::std::result::Result<#return_core_type, #error_path>)
             } else {
                 return_core_type.clone()
+            };
+            let source_return: Type = if callback_operation.rust_return_is_result
+                && callback_operation.throws.is_none()
+            {
+                syn::parse_quote!(::std::result::Result<#result_return, ::std::convert::Infallible>)
+            } else {
+                result_return.clone()
+            };
+            let returned = if callback_operation.rust_return_is_result
+                && callback_operation.throws.is_none()
+            {
+                quote!(Ok(result))
+            } else {
+                quote!(result)
             };
             // Keep the callback error path available to both the synchronous
             // result parser and the owning-JS-thread async callback-return
@@ -2852,6 +3070,37 @@ fn render_callback_proxy_helpers(
                         returned_callback_type_id,
                         contract_expr,
                     ))
+                } else if matches!(binding.conversion, ConversionRecipe::OutputStream { .. }) {
+                    let resource = callback_operation
+                        .stream_resources
+                        .iter()
+                        .find(|resource| resource.path.segments() == [ValuePathSegment::Return])
+                        .ok_or_else(|| anyhow!("callback output stream has no resource group"))?;
+                    let build = input_stream_helper_ident(
+                        callback_operation.operation_id.index(),
+                        resource.id.index(),
+                    );
+                    let return_helper = ident_for_helper(
+                        operation.operation_id.index(),
+                        &format!("{use_label}_return_{method_id}"),
+                        "stream",
+                    );
+                    let raw_stream = source_stream(
+                        callback_operation,
+                        &RustValueBinding {
+                            rust_type: binding.rust_type.clone(),
+                            carrier: binding.carrier,
+                            conversion: binding.conversion.clone(),
+                        },
+                        quote!(Box::pin(#build(host, handle)?)),
+                    );
+                    result_structs.push(quote! {
+                        fn #return_helper(host: &#napi::bindgen_prelude::Object<'static>, _: u32, handle: u32, _: (), _: #invoker_type)
+                            -> ::std::result::Result<#return_core_type, #error_descriptor> {
+                            Ok(#raw_stream)
+                        }
+                    });
+                    Some((return_helper, callback_type, 0, quote!(())))
                 } else {
                     None
                 }
@@ -3059,7 +3308,6 @@ fn render_callback_proxy_helpers(
                                 callback_type: self.__uniffi_inner.callback_type,
                                 callback_id: self.__uniffi_inner.callback_id,
                                 method_id: #method_id,
-                                invocation_id: 0,
                                 #(#payload_values),*
                             },
                             #napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
@@ -3203,7 +3451,8 @@ fn render_callback_proxy_helpers(
                         Err(__uniffi_error) => {
                             __uniffi_send_error(format!("callback invocation allocation failed: {}", __uniffi_error));
                             let __uniffi_result = __uniffi_receiver.await.unwrap_or_else(|_| panic!("callback async result channel closed"));
-                            return __uniffi_result.unwrap_or_else(|__uniffi_error| panic!("{}", __uniffi_error));
+                            let result = __uniffi_result.unwrap_or_else(|__uniffi_error| panic!("{}", __uniffi_error));
+                            return #returned;
                         }
                     };
                     let __uniffi_sender_callback = __uniffi_sender.clone();
@@ -3325,25 +3574,52 @@ fn render_callback_proxy_helpers(
                     #direct_sync_body
                 }
             };
+            let release_inputs = callback_operation
+                .arguments
+                .iter()
+                .filter(|binding| {
+                    matches!(binding.conversion, ConversionRecipe::InputStream { .. })
+                })
+                .map(|binding| {
+                    let name = rust_ident(&binding.rust_name);
+                    quote!(drop(#name);)
+                })
+                .collect::<Vec<_>>();
             let method_body = if callback_operation.async_kind == AsyncKind::Async {
-                if let Some(async_return_call) = async_return_call {
+                let body = if let Some(async_return_call) = async_return_call {
                     quote! {
-                        async fn #method_ident(&self, #(#arg_declarations),*) -> #result_return {
-                            #async_return_call
-                        }
+                        let result = { #async_return_call };
+                        #(#release_inputs)*
+                        #returned
                     }
                 } else {
                     quote! {
-                    async fn #method_ident(&self, #(#arg_declarations),*) -> #result_return {
                         #async_call
-                        if __uniffi_result.ok { #success_branch } else { #parse_error }
+                        let result = if __uniffi_result.ok { #success_branch } else { #parse_error };
+                        #(#release_inputs)*
+                        #returned
                     }
+                };
+                if callback_operation.rust_async {
+                    quote! {
+                        async fn #method_ident(&self, #(#arg_declarations),*) -> #source_return { #body }
+                    }
+                } else {
+                    let body = own_callback_receiver(body)?;
+                    quote! {
+                        fn #method_ident(&self, #(#arg_declarations),*)
+                            -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = #source_return> + Send + 'static>> {
+                            let __uniffi_owned_receiver = Self { __uniffi_inner: self.__uniffi_inner.clone() };
+                            Box::pin(async move #body)
+                        }
                     }
                 }
             } else {
                 quote! {
-                    fn #method_ident(&self, #(#arg_declarations),*) -> #result_return {
-                        #sync_method_body
+                    fn #method_ident(&self, #(#arg_declarations),*) -> #source_return {
+                        let result = { #sync_method_body };
+                        #(#release_inputs)*
+                        #returned
                     }
                 }
             };
@@ -3682,6 +3958,7 @@ fn render_operation_helpers_for(
     engine: EngineKind,
 ) -> Result<String> {
     let mut source = TokenStream::new();
+    let mut stream_closers = Vec::new();
     let error_descriptor = flavor.error_descriptor();
     let operations = &package.rust.engines[&engine].operations;
     for operation in operations {
@@ -3770,6 +4047,34 @@ fn render_operation_helpers_for(
             }
         }
         for (index, binding) in operation.arguments.iter().enumerate() {
+            if rust_default_argument(package, operation, index) {
+                let value_binding = RustValueBinding {
+                    rust_type: binding.rust_type.clone(),
+                    carrier: binding.carrier,
+                    conversion: binding.conversion.clone(),
+                };
+                if conversion_requires_host(&binding.conversion) {
+                    bail!("Rust Default for a host resource requires an explicit source default: {} argument {}", operation.source_key, index);
+                }
+                let core = core_type_for_binding(package, &value_binding)?;
+                let carrier =
+                    napi_carrier_type_for(&value_binding, package.rust.named_types(), flavor)?;
+                let expression = lower_expr(&value_binding, quote!(value), flavor)?;
+                let helper = ident_for_helper(
+                    operation.operation_id.index(),
+                    &index.to_string(),
+                    "default",
+                );
+                source.extend(quote! {
+                    fn #helper(value: Option<#carrier>) -> ::std::result::Result<#core, #error_descriptor> {
+                        match value {
+                            None => Ok(::std::default::Default::default()),
+                            Some(value) => Ok(#expression),
+                        }
+                    }
+                });
+            }
+
             if let ConversionRecipe::Object(_) = binding.conversion {
                 let value_binding = RustValueBinding {
                     rust_type: binding.rust_type.clone(),
@@ -3845,6 +4150,9 @@ fn render_operation_helpers_for(
                 output_stream_registry_ident(operation.operation_id.index(), resource.id.index());
             let close =
                 output_stream_close_ident(operation.operation_id.index(), resource.id.index());
+            stream_closers.push(quote! {
+                if ::uniffi::rust_stream_close_async(&#registry, handle.clone()).await.is_err() { success = false; }
+            });
             source.extend(quote! {
                 #[doc(hidden)]
                 static #registry: ::uniffi::RustStreamRegistry<#item, #error> =
@@ -3906,6 +4214,11 @@ fn render_operation_helpers_for(
                 let error_lift = lift_expr(&error_binding, quote!(value), flavor)?;
                 let core: Type = syn::parse_quote!(::uniffi::UniFfiStreamStep<#item_ty, #error_ty>);
                 let carrier = stream_step_carrier_type(operation.operation_id.index());
+                let error_arm = if is_infallible(&error_binding.rust_type) {
+                    quote!(match value {})
+                } else {
+                    quote!(Ok(#carrier::Error { error: { #error_lift } }))
+                };
                 let name = ident_for_helper(operation.operation_id.index(), "return", "lift");
                 source.extend(quote! {
                     #[napi(discriminant = "kind", discriminant_case = "lowercase", use_nullable = true)]
@@ -3922,9 +4235,7 @@ fn render_operation_helpers_for(
                                 value: { #item_lift },
                             }),
                             ::uniffi::UniFfiStreamStep::Done => Ok(#carrier::Done),
-                            ::uniffi::UniFfiStreamStep::Error(value) => Ok(#carrier::Error {
-                                error: { #error_lift },
-                            }),
+                            ::uniffi::UniFfiStreamStep::Error(value) => #error_arm,
                         }
                     }
                 });
@@ -4042,6 +4353,17 @@ fn render_operation_helpers_for(
             }
         }
     }
+    source.extend(quote! {
+        // A normal private async op, allocated after the three S01 controls.
+        // The engine-facing cancel slot remains a request-only operation.
+        async fn __uniffi_close_stream(raw: f64) -> f64 {
+            if !raw.is_finite() || raw.fract() != 0.0 || raw < 0.0 || raw > u32::MAX as f64 { return 0.0; }
+            let handle = ::uniffi::Handle::from_raw_unchecked(raw as u64);
+            let mut success = true;
+            #(#stream_closers)*
+            if success { 1.0 } else { 0.0 }
+        }
+    });
     Ok(source.to_string())
 }
 
@@ -4060,22 +4382,15 @@ fn render_input_stream_helpers(
     let operations = &package.rust.engines[&engine].operations;
     for operation in operations {
         for resource in &operation.stream_resources {
-            if resource.direction != uniffi_js_engine_schema::StreamDirection::Input {
+            let callback_output =
+                matches!(operation.call_target, RustCallTarget::CallbackMethod { .. })
+                    && resource.direction == uniffi_js_engine_schema::StreamDirection::Output
+                    && resource.path.segments() == [ValuePathSegment::Return];
+            if resource.direction != uniffi_js_engine_schema::StreamDirection::Input
+                && !callback_output
+            {
                 continue;
             }
-            let Some(ValuePathSegment::Argument(argument_index)) = resource.path.segments().first()
-            else {
-                continue;
-            };
-            let argument_index = *argument_index as usize;
-            let Some(_argument) = operation.arguments.get(argument_index) else {
-                bail!(
-                    "input stream resource {} references missing argument {} on operation {}",
-                    resource.id.index(),
-                    argument_index,
-                    operation.operation_id.index()
-                );
-            };
             let item = core_type_for_binding(package, &resource.item)?;
             let error = core_type_for_binding(package, &resource.error)?;
             let item_carrier =
@@ -4104,11 +4419,21 @@ fn render_input_stream_helpers(
             let cancel_type = quote! {
                 ::std::sync::Arc<#napi::threadsafe_function::ThreadsafeFunction<
                     u32,
-                    #napi::bindgen_prelude::Promise<#napi::bindgen_prelude::Unknown<'static>>,
+                    #napi::bindgen_prelude::Promise<()>,
                     u32,
                     #napi::Status,
                     false,
                 >>
+            };
+            let error_step = if is_infallible(&resource.error.rust_type) {
+                quote!(panic!("infallible input stream received a business error"))
+            } else {
+                quote! {
+                    let value = step.error.unwrap_or_else(|| panic!("input stream error envelope missing error"));
+                    let value = (|| -> ::std::result::Result<#error, #error_descriptor> { Ok(#lower_error) })()
+                        .unwrap_or_else(|error| panic!("input stream error lowering failed: {error:?}"));
+                    Err(value)
+                }
             };
             source.extend(quote! {
                 #[napi(object)]
@@ -4122,6 +4447,7 @@ fn render_input_stream_helpers(
                 struct #ops {
                     pull: #pull_type,
                     cancel: #cancel_type,
+                    close: #cancel_type,
                 }
 
                 impl ::uniffi::ForeignInputStreamOps<#item, #error> for #ops {
@@ -4149,18 +4475,18 @@ fn render_input_stream_helpers(
                                         .unwrap_or_else(|error| panic!("input stream item lowering failed: {error:?}"));
                                     Ok(Some(value))
                                 }
-                                "error" => {
-                                    let value = step
-                                        .error
-                                        .unwrap_or_else(|| panic!("input stream error envelope missing error"));
-                                    let value = (|| -> ::std::result::Result<#error, #error_descriptor> {
-                                        Ok(#lower_error)
-                                    })()
-                                        .unwrap_or_else(|error| panic!("input stream error lowering failed: {error:?}"));
-                                    Err(value)
-                                }
+                                "error" => { #error_step },
                                 other => panic!("input stream envelope has unknown kind: {other}"),
                             }
+                        })
+                    }
+
+                    fn close(&self, handle: ::uniffi::Handle) -> ::uniffi::ForeignInputStreamCloseFuture {
+                        let close = self.close.clone();
+                        Box::pin(async move {
+                            let raw = u32::try_from(handle.as_raw()).expect("input stream handle exceeds u32");
+                            close.call_async(raw).await.expect("input stream close dispatch failed")
+                                .await.expect("input stream producer close failed");
                         })
                     }
 
@@ -4191,7 +4517,7 @@ fn render_input_stream_helpers(
                         .map_err(|error| #error_descriptor::backend(error.to_string()))?;
                     let pull = ::std::sync::Arc::new(pull);
                     let cancel = host
-                        .get_named_property::<#napi::bindgen_prelude::Function<u32, #napi::bindgen_prelude::Promise<#napi::bindgen_prelude::Unknown<'static>>>>("cancelInputStream")
+                        .get_named_property::<#napi::bindgen_prelude::Function<u32, #napi::bindgen_prelude::Promise<()>>>("cancelInputStream")
                         .map_err(|error| #error_descriptor::backend(error.to_string()))?
                         // See `pullInputStream` above: this method reads the
                         // Host's input registry through `this` as well.
@@ -4202,9 +4528,21 @@ fn render_input_stream_helpers(
                         .build_callback(|context| Ok(context.value))
                         .map_err(|error| #error_descriptor::backend(error.to_string()))?;
                     let cancel = ::std::sync::Arc::new(cancel);
+                    let close = host
+                        .get_named_property::<#napi::bindgen_prelude::Function<u32, #napi::bindgen_prelude::Promise<()>>>("releaseInputStream")
+                        .map_err(|error| #error_descriptor::backend(error.to_string()))?
+                        // See `pullInputStream` above: this method reads the
+                        // Host's input registry through `this` as well.
+                        .bind(host)
+                        .map_err(|error| #error_descriptor::backend(error.to_string()))?
+                        .build_threadsafe_function::<u32>()
+                        .callee_handled::<false>()
+                        .build_callback(|context| Ok(context.value))
+                        .map_err(|error| #error_descriptor::backend(error.to_string()))?;
+                    let close = ::std::sync::Arc::new(close);
                     Ok(::uniffi::UniFfiInputStream::from_handle_and_ops(
                         ::uniffi::Handle::from_raw_unchecked(handle as u64),
-                        ::std::sync::Arc::new(#ops { pull, cancel }),
+                        ::std::sync::Arc::new(#ops { pull, cancel, close }),
                     ))
                 }
             });
@@ -4499,6 +4837,13 @@ fn render_native_operation_wrappers(
     package: &NormalizedPackage,
     engine: EngineKind,
 ) -> Result<String> {
+    let flavor = match engine {
+        EngineKind::Napi => NativeFlavor::Node,
+        #[cfg(feature = "ohos")]
+        EngineKind::OhosNapi => NativeFlavor::Ohos,
+        _ => bail!("native wrapper requires a NAPI engine"),
+    };
+    let descriptor = flavor.error_descriptor();
     let mut source = TokenStream::new();
     for operation in &package.rust.engines[&engine].operations {
         if let RustCallTarget::StreamHook {
@@ -4541,10 +4886,13 @@ fn render_native_operation_wrappers(
                 RustResourceHook::PullOutputStream => {
                     source.extend(quote! {
                         #[doc(hidden)]
-                        async fn #wrapper(#receiver_name: ::uniffi::Handle) -> ::uniffi::UniFfiStreamStep<#item_ty, #error_ty> {
+                        async fn #wrapper(#receiver_name: ::uniffi::Handle) -> ::std::result::Result<::uniffi::UniFfiStreamStep<#item_ty, #error_ty>, #descriptor> {
                             ::uniffi::rust_stream_next_async::<#item_ty, #error_ty>(&#registry, #receiver_name)
-                                .await
-                                .unwrap_or_else(|error| panic!("output stream next failed: {error:?}"))
+                                .await.map_err(|error| {
+                                    if error.error.is::<::uniffi::StreamCancelled>() {
+                                        __uniffi_cancelled_error(::uniffi::async_runtime::Cancelled)
+                                    } else { #descriptor::backend(format!("output stream next failed: {error:?}")) }
+                                })
                         }
                     });
                 }
@@ -4662,6 +5010,29 @@ fn render_native_operation_wrappers(
         } else {
             call_expression
         };
+        let call_expression = if async_calls::local_method(operation) {
+            if operation.rust_return_is_result && operation.throws.is_none() {
+                let value = canonical_return(operation, quote!(value));
+                quote!((#call_expression).map(|value| #value))
+            } else {
+                call_expression
+            }
+        } else {
+            canonical_return(operation, call_expression)
+        };
+        let call_expression = if operation.return_value.as_ref().is_some_and(|binding| {
+            matches!(binding.conversion, ConversionRecipe::OutputStream { .. })
+        }) && !async_calls::local_method(operation)
+        {
+            if operation.throws.is_some() {
+                let stream = canonical_stream(operation, quote!(stream));
+                quote!((#call_expression).map(|stream| #stream))
+            } else {
+                canonical_stream(operation, call_expression)
+            }
+        } else {
+            call_expression
+        };
         let (return_type, return_expression) = match &operation.return_value {
             None => (syn::parse_quote!(()), call_expression),
             Some(binding) if matches!(binding.conversion, ConversionRecipe::Object(_)) => (
@@ -4749,6 +5120,19 @@ fn napi_argument(
     } else {
         napi_carrier_type(&value_binding, package.rust.named_types())?
     };
+    if !receiver && rust_default_argument(package, operation, index) {
+        return Ok(napi_uniffi_engine::RustArgumentPlan {
+            name,
+            binding: napi_uniffi_engine::ArgumentBinding::LowerWith {
+                carrier_type: syn::parse_quote!(Option<#syn>),
+                lower: path_for_helper(
+                    operation.operation_id.index(),
+                    &index.to_string(),
+                    "default",
+                ),
+            },
+        });
+    }
     let type_helper = match &binding.conversion {
         ConversionRecipe::Record(id)
         | ConversionRecipe::Enum(id)
@@ -5052,7 +5436,7 @@ fn napi_operation(
             },
         }
     };
-    let error_binding = if async_calls::managed(operation) {
+    let error_binding = if async_calls::managed(operation) || output_pull(operation) {
         napi_uniffi_engine::ErrorBinding::Descriptor {
             map: syn::parse_quote!(crate::__uniffi_call_error),
         }
@@ -5078,6 +5462,91 @@ fn napi_operation(
         return_binding,
         error_binding,
     })
+}
+
+/// The pinned engine expands napi-derive into source. Remove redundant syntax
+/// in that expansion without changing unsafe scopes or suppressing diagnostics.
+fn clean_napi_expansion(source: &str) -> Result<String> {
+    use syn::visit_mut::{self, VisitMut};
+    #[derive(Default)]
+    struct Clean {
+        unsafe_depth: usize,
+    }
+    impl VisitMut for Clean {
+        fn visit_item_mut(&mut self, item: &mut syn::Item) {
+            let depth = std::mem::replace(&mut self.unsafe_depth, 0);
+            visit_mut::visit_item_mut(self, item);
+            self.unsafe_depth = depth;
+        }
+        fn visit_item_fn_mut(&mut self, item: &mut syn::ItemFn) {
+            // Zero-argument napi callbacks still receive ABI callback_info.
+            if item.sig.abi.is_some() && item.sig.inputs.iter().any(|arg| matches!(arg,
+                syn::FnArg::Typed(arg) if matches!(&*arg.pat, syn::Pat::Ident(pat) if pat.ident == "cb"))) {
+                item.block.stmts.insert(0, syn::parse_quote!(let _ = cb;));
+            }
+            visit_mut::visit_item_fn_mut(self, item);
+        }
+        fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
+            use syn::parse::Parser;
+            if let Ok(mut args) =
+                syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+                    .parse2(mac.tokens.clone())
+            {
+                for arg in &mut args {
+                    self.visit_expr_mut(arg);
+                }
+                mac.tokens = quote!(#args);
+            }
+        }
+        fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+            if let syn::Expr::Unsafe(block) = expr {
+                let nested = self.unsafe_depth > 0;
+                self.unsafe_depth += 1;
+                visit_mut::visit_block_mut(self, &mut block.block);
+                self.unsafe_depth -= 1;
+                if nested {
+                    *expr = syn::Expr::Block(syn::ExprBlock {
+                        attrs: block.attrs.clone(),
+                        label: None,
+                        block: block.block.clone(),
+                    });
+                }
+                return;
+            }
+            visit_mut::visit_expr_mut(self, expr);
+            if let syn::Expr::Call(call) = expr {
+                for arg in &mut call.args {
+                    if let syn::Expr::Block(block) = arg {
+                        if block.attrs.is_empty()
+                            && block.label.is_none()
+                            && block.block.stmts.len() == 1
+                        {
+                            if let syn::Stmt::Expr(value, None) = &block.block.stmts[0] {
+                                *arg = value.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut file = syn::parse_file(source)?;
+    Clean::default().visit_file_mut(&mut file);
+    Ok(prettyplease::unparse(&file))
+}
+
+pub(super) fn rust_trait_imports(package: &NormalizedPackage) -> Result<String> {
+    let mut imports = TokenStream::new();
+    let mut paths = std::collections::BTreeSet::new();
+    for named in package.rust.named_types() {
+        for implemented in &named.implemented_traits {
+            if paths.insert(implemented.segments.clone()) {
+                let path = rust_path(implemented)?;
+                imports.extend(quote!(use #path as _;));
+            }
+        }
+    }
+    Ok(imports.to_string())
 }
 
 pub(crate) fn napi_source(package: &NormalizedPackage) -> Result<String> {
@@ -5142,10 +5611,14 @@ pub(crate) fn napi_source(package: &NormalizedPackage) -> Result<String> {
             .iter()
             .any(async_calls::managed),
     );
-    let derive_import = format!("use {};\n", NativeFlavor::Node.derive_import());
+    let derive_import = format!(
+        "use {};\n{}",
+        NativeFlavor::Node.derive_import(),
+        rust_trait_imports(package)?
+    );
     Ok(format!(
         "{derive_import}{registry}\n{async_helpers}\n{temporal}\n{helpers}\n{operation_helpers}\n{nested_input_helpers}\n{input_stream_helpers}\n{callback_helpers}\n{wrappers}\n{}",
-        module.source()
+        clean_napi_expansion(&module.source().to_string())?
     ))
 }
 
@@ -5179,6 +5652,19 @@ fn ohos_argument(
             NativeFlavor::Ohos,
         )?
     };
+    if !receiver && rust_default_argument(package, operation, index) {
+        return Ok(napi_ohos_uniffi_engine::OhosArgumentPlan {
+            name,
+            binding: napi_ohos_uniffi_engine::OhosArgumentBinding::LowerWith {
+                carrier_type: syn::parse_quote!(Option<#syn>),
+                lower: path_for_helper(
+                    operation.operation_id.index(),
+                    &index.to_string(),
+                    "default",
+                ),
+            },
+        });
+    }
     let type_helper = match &binding.conversion {
         ConversionRecipe::Record(id)
         | ConversionRecipe::Enum(id)
@@ -5449,7 +5935,7 @@ fn ohos_operation(
             },
         }
     };
-    let error_binding = if async_calls::managed(operation) {
+    let error_binding = if async_calls::managed(operation) || output_pull(operation) {
         napi_ohos_uniffi_engine::OhosErrorBinding::Descriptor {
             map: syn::parse_quote!(crate::__uniffi_call_error),
         }
@@ -6444,6 +6930,11 @@ fn wasm_operation_plan(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    for (index, argument) in arguments.iter_mut().enumerate() {
+        if rust_default_argument(package, operation, index) {
+            argument.abi_carrier = wasm_bindgen_uniffi_engine::WasmCarrier::JsValue;
+        }
+    }
     if async_calls::managed(operation) {
         arguments.push(async_calls::wasm_call_argument());
     }
@@ -6540,10 +7031,9 @@ fn wasm_operation_plan(
         // This engine projects `throws` solely to Result ABI fallibility. The
         // private framework error identity keeps transport cancellation separate
         // from the component's declared business error type table.
-        throws: operation
-            .throws
-            .map(TypeId::index)
-            .or_else(|| async_calls::managed(operation).then_some(u32::MAX)),
+        throws: operation.throws.map(TypeId::index).or_else(|| {
+            (async_calls::managed(operation) || output_pull(operation)).then_some(u32::MAX)
+        }),
         callback_use_sites,
         resource_use_sites: wasm_resource_use_sites(package, operation),
         resource_hooks: operation
@@ -6574,7 +7064,7 @@ fn wasm_resource_hooks() -> Result<wasm_bindgen_uniffi_engine::WasmEngineResourc
                 "crate".to_owned(),
                 "__uniffi_wasm_close_output_stream_impl".to_owned(),
             ]))?,
-            async_kind: WasmAsyncKind::Sync,
+            async_kind: WasmAsyncKind::Async,
             fallible: true,
         }),
     })
@@ -6648,6 +7138,9 @@ mod tests {
                 name: "new".into(),
                 orig_name: None,
                 is_async: true,
+                rust_async: true,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![],
                 throws: None,
                 checksum: None,
@@ -6685,6 +7178,9 @@ mod tests {
                     name: name.into(),
                     orig_name: Some(original.into()),
                     is_async: true,
+                    rust_async: true,
+                    rust_return_is_result: throws.is_some(),
+                    rust_stream_item_is_result: false,
                     inputs,
                     return_type,
                     throws,
@@ -6700,6 +7196,485 @@ mod tests {
             config: JsConfig::default(),
         }]))
         .unwrap()
+    }
+
+    pub(super) fn stream_declaration_package(
+        is_async: bool,
+        fallible_items: bool,
+        result_items: bool,
+    ) -> NormalizedPackage {
+        use uniffi_meta::*;
+        let module = "stream_declarations";
+        let output = Type::Stream {
+            item_type: Box::new(Type::Optional {
+                inner_type: Box::new(Type::UInt32),
+            }),
+            error_type: fallible_items.then(|| Box::new(Type::String)),
+            is_send: true,
+        };
+        let input = Type::InputStream {
+            item_type: Box::new(Type::UInt32),
+            error_type: None,
+            is_send: true,
+        };
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module.into(),
+                name: module.into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            ObjectMetadata {
+                module_path: module.into(),
+                name: "Source".into(),
+                orig_name: None,
+                remote: false,
+                imp: ObjectImpl::Struct,
+                docstring: None,
+            }
+            .into(),
+        );
+        let mut count = FnParamMetadata::simple("count", Type::UInt32);
+        count.default = Some(DefaultValueMetadata::Default);
+        group.add_item(
+            FnMetadata {
+                module_path: module.into(),
+                name: "events".into(),
+                orig_name: None,
+                is_async,
+                rust_async: is_async,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: result_items,
+                inputs: vec![count],
+                return_type: Some(output.clone()),
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            MethodMetadata {
+                module_path: module.into(),
+                self_name: "Source".into(),
+                name: "events".into(),
+                orig_name: None,
+                is_async,
+                rust_async: is_async,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: result_items,
+                inputs: vec![FnParamMetadata::simple("source", input)],
+                return_type: Some(output),
+                throws: None,
+                takes_self_by_arc: false,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        normalize(BindingInput::new(&[Component {
+            ci: ComponentInterface::from_metadata(group).unwrap(),
+            config: JsConfig::default(),
+        }]))
+        .unwrap()
+    }
+
+    #[test]
+    fn infallible_result_items_keep_the_original_result_shape() {
+        // A canonical UniFfiStream<T, Infallible> and an original
+        // Stream<Item=Result<T, Infallible>> both have no host item error.
+        let package = stream_declaration_package(false, false, true);
+        let operation = &package.rust.engines[&EngineKind::Napi].operations[0];
+        assert!(operation.rust_stream_item_is_result);
+        let canonical = compact_local(canonical_stream(operation, quote!(source)));
+        assert!(
+            !canonical.contains("StreamExt::map"),
+            "already-Result items must not be wrapped again: {canonical}"
+        );
+    }
+
+    pub(super) fn infallible_result_value_package() -> NormalizedPackage {
+        use uniffi_meta::{FnMetadata, MetadataGroup, NamespaceMetadata, Type};
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: "result_shapes".into(),
+                name: "result_shapes".into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        for (name, is_async, return_type) in [
+            ("value", false, Some(Type::UInt32)),
+            ("unit", false, None),
+            ("async_value", true, Some(Type::UInt32)),
+            ("async_unit", true, None),
+        ] {
+            group.add_item(
+                FnMetadata {
+                    module_path: "result_shapes".into(),
+                    name: name.into(),
+                    orig_name: None,
+                    is_async,
+                    rust_async: is_async,
+                    rust_return_is_result: true,
+                    rust_stream_item_is_result: false,
+                    inputs: vec![],
+                    return_type,
+                    throws: None,
+                    checksum: None,
+                    docstring: None,
+                }
+                .into(),
+            );
+        }
+        normalize(BindingInput::new(&[Component {
+            ci: ComponentInterface::from_metadata(group).unwrap(),
+            config: JsConfig::default(),
+        }]))
+        .unwrap()
+    }
+
+    #[test]
+    fn infallible_result_value_and_unit_keep_host_infallibility() {
+        let package = infallible_result_value_package();
+        let source = render_native_operation_wrappers(&package, EngineKind::Napi).unwrap();
+        let parsed = syn::parse_file(&source).unwrap();
+        for item in parsed.items {
+            let syn::Item::Fn(wrapper) = item else {
+                continue;
+            };
+            let source = compact_local(&wrapper);
+            assert!(!compact_local(&wrapper.sig.output).contains("Result<"));
+            assert!(
+                source.contains("Err(never)=>matchnever{}"),
+                "original Result must be unwrapped even for unit: {source}"
+            );
+        }
+        let mut local = local_object_package();
+        let operation = local.rust.engines.get_mut(&EngineKind::Napi).unwrap().operations.iter_mut()
+            .find(|op| matches!(&op.call_target, RustCallTarget::Method { item, .. } if item == "read_sync")).unwrap();
+        operation.rust_return_is_result = true;
+        let name = format!(
+            "__uniffi_native_operation_{}",
+            operation.operation_id.index()
+        );
+        let source = render_native_operation_wrappers(&local, EngineKind::Napi).unwrap();
+        let wrapper = syn::parse_file(&source)
+            .unwrap()
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(item) if item.sig.ident == name => Some(item),
+                _ => None,
+            })
+            .unwrap();
+        assert!(compact_local(&wrapper.sig.output).contains("LocalError"));
+        assert!(compact_local(&wrapper.block)
+            .contains(".map(|value|matchvalue{Ok(value)=>value,Err(never)=>matchnever{}})"));
+    }
+
+    #[test]
+    fn napi_expansion_cleanup_preserves_function_unsafe_boundaries() {
+        let source = r#"
+            unsafe fn operation() {}
+            fn outer() {
+                unsafe {
+                    unsafe { operation(); }
+                    fn nested() { unsafe { operation(); } }
+                    check_status!(unsafe { operation() }, "checked");
+                }
+            }
+            extern "C" fn callback(cb: usize) { let _result = consume({ match cb { value => value } }); }
+        "#;
+        let cleaned = clean_napi_expansion(source).unwrap();
+        let cleaned = compact_local(syn::parse_file(&cleaned).unwrap());
+        assert!(
+            cleaned.contains("fnnested(){unsafe{operation();}}"),
+            "a nested function has its own unsafe boundary"
+        );
+        assert!(!cleaned.contains("unsafe{unsafe{"));
+        assert!(!cleaned.contains("check_status!(unsafe"));
+        assert!(cleaned.contains("callback(cb:usize){let_=cb;"));
+        assert!(cleaned.contains("consume(matchcb{"));
+    }
+
+    #[test]
+    fn stream_methods_keep_optional_error_and_executable_engine_resources() {
+        for is_async in [false, true] {
+            for fallible_items in [false, true] {
+                let package = stream_declaration_package(is_async, fallible_items, fallible_items);
+                for operation in &package.api.operations {
+                    let Some(uniffi_js_abi::ValueType::OutputStream { error, .. }) =
+                        &operation.return_type
+                    else {
+                        continue;
+                    };
+                    assert_eq!(error.is_some(), fallible_items);
+                    let plan = package.rust.engines[&EngineKind::Napi]
+                        .operations
+                        .iter()
+                        .find(|plan| plan.operation_id == operation.id)
+                        .unwrap();
+                    let group = plan
+                        .stream_resources
+                        .iter()
+                        .find(|group| {
+                            group.direction == uniffi_js_engine_schema::StreamDirection::Output
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        group.slot_operation_ids[&OperationKind::OutputStreamStart],
+                        operation.id
+                    );
+                    assert!(group
+                        .slot_operation_ids
+                        .contains_key(&OperationKind::OutputStreamNext));
+                    assert!(group
+                        .slot_operation_ids
+                        .contains_key(&OperationKind::OutputStreamCancel));
+                    assert_eq!(is_infallible(&group.error.rust_type), !fallible_items);
+                }
+                family_plan(&package, FamilyFlavor::Node).unwrap();
+                syn::parse_file(&napi_source(&package).unwrap()).unwrap();
+                let source = render_native_operation_wrappers(&package, EngineKind::Napi).unwrap();
+                assert_eq!(source.contains("StreamExt :: map"), !fallible_items);
+                assert!(source.contains("Box :: pin"));
+                assert!(source.contains("StreamCancelled"));
+            }
+        }
+    }
+
+    #[test]
+    fn rust_unspecified_default_is_lowered_by_rust_type_default() {
+        let package = stream_declaration_package(true, false, false);
+        let operation = package.rust.engines[&EngineKind::Napi]
+            .operations
+            .iter()
+            .find(|operation| matches!(operation.call_target, RustCallTarget::FreeFunction { .. }))
+            .unwrap();
+        let argument =
+            napi_argument(&package, operation, 0, &operation.arguments[0], false).unwrap();
+        let napi_uniffi_engine::ArgumentBinding::LowerWith { carrier_type, .. } = argument.binding
+        else {
+            panic!("missing default lowering")
+        };
+        assert_eq!(compact_local(carrier_type), "Option<u32>");
+        let helper =
+            render_operation_helpers_for(&package, NativeFlavor::Node, EngineKind::Napi).unwrap();
+        assert!(helper.contains("None => Ok (:: std :: default :: Default :: default ())"));
+        let controls = async_calls::family_controls(20).unwrap();
+        assert_eq!(
+            controls
+                .iter()
+                .map(|control| control.id)
+                .collect::<Vec<_>>(),
+            [20, 21, 22, 23]
+        );
+        assert_eq!(controls[3].async_kind, FamilyAsync::Async);
+        assert_eq!(controls[3].argument_count, 1);
+    }
+
+    pub(super) fn stream_callback_package(rust_async: bool) -> NormalizedPackage {
+        stream_callback_shape_package(rust_async, false, false)
+    }
+
+    pub(super) fn stream_callback_shape_package(
+        rust_async: bool,
+        return_is_result: bool,
+        item_is_result: bool,
+    ) -> NormalizedPackage {
+        use uniffi_meta::*;
+        let module = "stream_callbacks";
+        let output = Type::Stream {
+            item_type: Box::new(Type::UInt32),
+            error_type: None,
+            is_send: true,
+        };
+        let input = Type::InputStream {
+            item_type: Box::new(Type::UInt32),
+            error_type: None,
+            is_send: true,
+        };
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: module.into(),
+                name: module.into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        group.add_item(
+            ObjectMetadata {
+                module_path: module.into(),
+                name: "Provider".into(),
+                orig_name: None,
+                remote: false,
+                imp: ObjectImpl::Trait(TraitKind::Both),
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            TraitMethodMetadata {
+                module_path: module.into(),
+                trait_name: "Provider".into(),
+                index: 0,
+                name: "events".into(),
+                orig_name: None,
+                is_async: true,
+                rust_async,
+                rust_return_is_result: return_is_result,
+                rust_stream_item_is_result: item_is_result,
+                inputs: vec![FnParamMetadata::simple("source", input)],
+                return_type: Some(output),
+                throws: None,
+                takes_self_by_arc: false,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            FnMetadata {
+                module_path: module.into(),
+                name: "use_provider".into(),
+                orig_name: None,
+                is_async: true,
+                rust_async: true,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
+                inputs: vec![FnParamMetadata::simple(
+                    "provider",
+                    Type::Object {
+                        module_path: module.into(),
+                        name: "Provider".into(),
+                        imp: ObjectImpl::Trait(TraitKind::Both),
+                    },
+                )],
+                return_type: None,
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(
+            CallbackUseSiteMetadata {
+                module_path: module.into(),
+                operation_kind: CallbackOperationKind::Function,
+                owner: None,
+                operation_name: "use_provider".into(),
+                path: CallbackValuePath::argument(0),
+                contract: CallbackContract {
+                    retention: CallbackRetention::Retained,
+                    threading: CallbackThreading::MayCrossThread,
+                    reentrancy: CallbackReentrancy::Allowed,
+                },
+            }
+            .into(),
+        );
+        normalize(BindingInput::new(&[Component {
+            ci: ComponentInterface::from_metadata(group).unwrap(),
+            config: JsConfig::default(),
+        }]))
+        .unwrap()
+    }
+
+    #[test]
+    fn infallible_callback_preserves_result_and_item_shapes_independently() {
+        for rust_async in [false, true] {
+            for outer in [false, true] {
+                for item in [false, true] {
+                    let package = stream_callback_shape_package(rust_async, outer, item);
+                    let source = render_callback_proxy_helpers(
+                        &package,
+                        NativeFlavor::Node,
+                        EngineKind::Napi,
+                    )
+                    .unwrap();
+                    let parsed = syn::parse_file(&source).unwrap();
+                    let signature = parsed
+                        .items
+                        .iter()
+                        .filter_map(|item| match item {
+                            syn::Item::Impl(item) => Some(&item.items),
+                            _ => None,
+                        })
+                        .flatten()
+                        .find_map(|item| match item {
+                            syn::ImplItem::Fn(item) if item.sig.ident == "events" => {
+                                Some(compact_local(&item.sig.output))
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(signature.contains("Result<"), outer, "{signature}");
+                    if outer {
+                        assert!(
+                            compact_local(&parsed).contains("returnOk(result)"),
+                            "allocation failure exits through the original Result shape"
+                        );
+                    }
+                    assert_eq!(
+                        compact_local(parsed).contains("Err(never)=>matchnever{}"),
+                        !item
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_stream_callback_retains_input_through_async_return_and_closes_producer() {
+        for rust_async in [false, true] {
+            let package = stream_callback_package(rust_async);
+            let source = napi_source(&package).unwrap();
+            syn::parse_file(&source).unwrap();
+            let proxy =
+                render_callback_proxy_helpers(&package, NativeFlavor::Node, EngineKind::Napi)
+                    .unwrap();
+            let proxy = compact_local(syn::parse_file(&proxy).unwrap());
+            assert!(
+                proxy.contains("source:u32"),
+                "TSFN payload carries a handle only"
+            );
+            assert!(
+                proxy.contains("source:uniffi::UniFfiInputStream<u32,std::convert::Infallible>")
+            );
+            assert!(
+                proxy.contains("PromiseRaw<'static"),
+                "stream construction runs on the JS owner thread"
+            );
+            assert!(
+                proxy.find("__uniffi_receiver.await").unwrap()
+                    < proxy.find("drop(source)").unwrap()
+            );
+            assert_eq!(proxy.contains("asyncfnevents("), rust_async);
+            assert_eq!(proxy.contains("Future<Output="), !rust_async);
+            if !rust_async {
+                assert!(proxy.contains("+Send+'static>>"));
+                assert!(
+                    proxy.find("self.__uniffi_inner.clone()").unwrap()
+                        < proxy.find("Box::pin(asyncmove").unwrap()
+                );
+                assert!(proxy.contains("__uniffi_owned_receiver.__uniffi_inner"));
+            }
+            assert!(proxy.contains("Err(never)=>matchnever{}"));
+            let callback = package.rust.engines[&EngineKind::Napi]
+                .operations
+                .iter()
+                .find(|op| op.kind == OperationKind::CallbackMethod)
+                .unwrap();
+            assert_eq!(callback.rust_async, rust_async);
+            assert_eq!(callback.async_kind, AsyncKind::Async);
+            let input_helpers =
+                render_input_stream_helpers(&package, NativeFlavor::Node, EngineKind::Napi)
+                    .unwrap();
+            assert!(input_helpers.contains("releaseInputStream"));
+            assert!(input_helpers.contains("input stream producer close failed"));
+        }
     }
 
     fn compact_local(tokens: impl quote::ToTokens) -> String {
@@ -6818,6 +7793,56 @@ mod tests {
         assert!(error.contains("LocalError{error:?}"));
         #[cfg(feature = "ohos")]
         syn::parse_file(&ohos_source(&package).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn native_carrier_fields_keep_rust_names_and_explicit_js_names() {
+        let ci = ComponentInterface::from_webidl(
+            r#"
+            dictionary Snapshot { u32 owner_dropped; };
+            [Enum] interface Event { Count(u32 item_count); };
+            namespace carrier_names {
+                Snapshot echo(Snapshot value);
+                Event echo_event(Event value);
+            };
+            "#,
+            "carrier_names",
+        )
+        .unwrap();
+        let mut component = Component {
+            ci,
+            config: JsConfig::default(),
+        };
+        component.ci.derive_ffi_funcs().unwrap();
+        let package = normalize(BindingInput::new(&[component])).unwrap();
+        let source = render_named_type_helpers_for(&package, NativeFlavor::Node).unwrap();
+        let file = syn::parse_file(&source).unwrap();
+        let mut fields = Vec::new();
+        for item in &file.items {
+            match item {
+                syn::Item::Struct(item) => fields.extend(item.fields.iter()),
+                syn::Item::Enum(item) => {
+                    for variant in &item.variants {
+                        fields.extend(variant.fields.iter());
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (rust_name, public_name) in [
+            ("owner_dropped", "ownerDropped"),
+            ("item_count", "itemCount"),
+        ] {
+            let field = fields
+                .iter()
+                .find(|field| field.ident.as_ref().is_some_and(|ident| ident == rust_name))
+                .unwrap();
+            assert!(field
+                .attrs
+                .iter()
+                .any(|attr| attr.to_token_stream().to_string().contains(public_name)));
+            assert!(!source.contains(&format!("value . {public_name}")));
+        }
     }
 
     fn fixture() -> (NormalizedPackage, RustOperationPlan, uniffi_js_abi::TypeId) {

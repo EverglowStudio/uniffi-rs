@@ -249,11 +249,28 @@ pub fn vtable_struct(trait_name: &str, methods: &[Method]) -> FfiStruct {
             ),
         ]
         .into_iter()
-        .chain(methods.iter().enumerate().map(|(i, method)| {
-            FfiField::new(
+        .chain(methods.iter().enumerate().flat_map(|(i, method)| {
+            let mut fields = vec![FfiField::new(
                 method.name(),
-                FfiType::Callback(format!("CallbackInterface{trait_name}Method{i}")),
-            )
+                FfiType::Callback(method_ffi_callback_name(trait_name, i)),
+            )];
+            if method.is_stream() {
+                fields.extend([
+                    FfiField::new(
+                        format!("{}_stream_next", method.name()),
+                        FfiType::Callback("InputStreamNextCallback".into()),
+                    ),
+                    FfiField::new(
+                        format!("{}_stream_cancel", method.name()),
+                        FfiType::Callback("InputStreamCancelCallback".into()),
+                    ),
+                    FfiField::new(
+                        format!("{}_stream_close", method.name()),
+                        FfiType::Callback("InputStreamCloseCallback".into()),
+                    ),
+                ]);
+            }
+            fields
         }))
         .collect(),
     }

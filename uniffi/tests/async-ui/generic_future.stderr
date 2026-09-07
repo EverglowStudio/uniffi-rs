@@ -1,0 +1,5 @@
+error: type and const generic UniFFI declarations are not supported
+ --> tests/async-ui/generic_future.rs:2:12
+  |
+2 | fn generic<T: Default + 'static>() -> impl std::future::Future<Output = T> {
+  |            ^^^^^^^^^^^^^^^^^^^^

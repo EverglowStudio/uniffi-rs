@@ -298,6 +298,7 @@ impl ComponentInterface {
         // Unconditionally add the String type, which is used by the panic handling
         self.types.add_known_type(&Type::String)?;
         crate::macro_metadata::add_group_to_ci(self, group)?;
+        self.add_stream_callback_types()?;
         self.infer_recursive_types();
         Ok(())
     }
@@ -407,7 +408,7 @@ impl ComponentInterface {
     }
 
     fn input_stream_callback_definitions(&self) -> Vec<FfiCallbackFunction> {
-        if !self.has_input_stream_fns() {
+        if !self.has_input_stream_fns() && !self.callback_methods().any(Callable::is_stream) {
             return Vec::new();
         }
         vec![
@@ -432,6 +433,24 @@ impl ComponentInterface {
             FfiCallbackFunction {
                 name: "InputStreamCancelCallback".to_owned(),
                 arguments: vec![FfiArgument::new("handle", FfiType::UInt64)],
+                return_type: None,
+                has_rust_call_status_arg: false,
+            },
+            FfiCallbackFunction {
+                name: "InputStreamCloseCallback".to_owned(),
+                arguments: vec![
+                    FfiArgument::new("handle", FfiType::UInt64),
+                    FfiArgument::new(
+                        "callback",
+                        FfiType::Callback("ForeignFutureCompleteVoid".to_owned()),
+                    ),
+                    FfiArgument::new("callback_data", FfiType::UInt64),
+                    FfiArgument::new(
+                        "dropped_callback",
+                        FfiType::Struct("ForeignFutureDroppedCallbackStruct".to_owned())
+                            .mut_reference(),
+                    ),
+                ],
                 return_type: None,
                 has_rust_call_status_arg: false,
             },
@@ -474,13 +493,8 @@ impl ComponentInterface {
 
     /// Get the definitions for every Callback Interface type in the interface.
     pub fn has_async_callback_interface_definition(&self) -> bool {
-        self.callback_interfaces
-            .iter()
-            .any(|cbi| cbi.has_async_method())
-            || self
-                .objects
-                .iter()
-                .any(|o| o.has_callback_interface() && o.has_async_method())
+        self.callback_methods()
+            .any(|m| m.is_async() || m.is_stream())
     }
 
     pub fn has_callback_definitions(&self) -> bool {
@@ -491,7 +505,8 @@ impl ComponentInterface {
                 .any(|o| o.has_callback_interface())
     }
 
-    /// Get the definitions for every Method type in the interface.
+    /// Rust-exported callables. Pure callback interfaces only supply vtables.
+    /// Arc trait interfaces (including ForeignOnly) have method exports in the macro.
     pub fn iter_callables(&self) -> impl Iterator<Item = &dyn Callable> {
         // Each of the `as &dyn Callable` casts is a trivial cast, but it seems like the clearest
         // way to express the logic in the current Rust
@@ -505,6 +520,31 @@ impl ComponentInterface {
                     .map(|c| c as &dyn Callable)
                     .chain(o.methods().into_iter().map(|m| m as &dyn Callable))
             }))
+            .chain(self.records.iter().flat_map(|r| {
+                r.constructors()
+                    .iter()
+                    .map(|c| c as &dyn Callable)
+                    .chain(r.methods().iter().map(|m| m as &dyn Callable))
+            }))
+            .chain(self.enums.iter().flat_map(|e| {
+                e.constructors()
+                    .iter()
+                    .map(|c| c as &dyn Callable)
+                    .chain(e.methods().iter().map(|m| m as &dyn Callable))
+            }))
+    }
+
+    /// Methods whose implementation can be supplied by the host.
+    fn callback_methods(&self) -> impl Iterator<Item = &Method> {
+        self.callback_interfaces
+            .iter()
+            .flat_map(|c| c.methods.iter())
+            .chain(
+                self.objects
+                    .iter()
+                    .filter(|o| o.has_callback_interface())
+                    .flat_map(|o| o.methods.iter()),
+            )
     }
 
     /// Should we generate read (and lift) functions for errors?
@@ -833,20 +873,17 @@ impl ComponentInterface {
     /// Does this interface contain async functions?
     pub fn has_async_fns(&self) -> bool {
         self.iter_ffi_function_definitions().any(|f| f.is_async())
-            || self
-                .callback_interfaces
-                .iter()
-                .any(CallbackInterface::has_async_method)
+            || self.has_async_callback_interface_definition()
     }
 
-    /// Does this interface contain top-level functions returning native Rust streams?
+    /// Does any Rust or host callable return a stream (including async factories)?
     pub fn has_stream_fns(&self) -> bool {
-        self.functions.iter().any(Function::is_stream)
+        self.iter_callables().any(|f| f.is_stream())
+            || self.callback_methods().any(Callable::is_stream)
     }
 
     pub fn has_input_stream_fns(&self) -> bool {
-        self.functions
-            .iter()
+        self.iter_callables()
             .any(|func| !func.input_stream_arguments().is_empty())
     }
 
@@ -1033,9 +1070,9 @@ impl ComponentInterface {
             .chain(self.functions.iter().map(|f| &f.ffi_func))
     }
 
-    /// List synthetic FFI function definitions for Rust streams returned by top-level functions.
+    /// Stream operations belong to the complete Rust export symbol of each callable.
     fn iter_stream_ffi_function_definitions(&self) -> impl Iterator<Item = FfiFunction> + '_ {
-        self.functions.iter().flat_map(|func| {
+        self.iter_callables().flat_map(|func| {
             let Some(Type::Stream { .. }) = func.return_type() else {
                 return Vec::new();
             };
@@ -1062,12 +1099,20 @@ impl ComponentInterface {
                     has_rust_call_status_arg: false,
                     is_object_free_function: false,
                 },
+                FfiFunction {
+                    name: func.ffi_stream_close_func(),
+                    is_async: true,
+                    arguments: vec![FfiArgument::new("handle", FfiType::Handle)],
+                    return_type: Some(FfiType::Handle),
+                    has_rust_call_status_arg: false,
+                    is_object_free_function: false,
+                },
             ]
         })
     }
 
     fn iter_input_stream_ffi_function_definitions(&self) -> impl Iterator<Item = FfiFunction> + '_ {
-        self.functions.iter().flat_map(|func| {
+        self.iter_callables().flat_map(|func| {
             func.input_stream_arguments()
                 .into_iter()
                 .map(|arg| FfiFunction {
@@ -1082,6 +1127,10 @@ impl ComponentInterface {
                             name: "cancel".to_owned(),
                             type_: FfiType::Callback("InputStreamCancelCallback".to_owned()),
                         },
+                        FfiArgument::new(
+                            "close",
+                            FfiType::Callback("InputStreamCloseCallback".to_owned()),
+                        ),
                     ],
                     return_type: None,
                     has_rust_call_status_arg: false,
@@ -1249,18 +1298,6 @@ impl ComponentInterface {
         self.types
             .add_known_types(defn.iter_types())
             .with_context(|| format!("adding function {defn:?}"))?;
-        for arg in defn.input_stream_arguments() {
-            let Type::InputStream { item_type, .. } = arg.as_type() else {
-                continue;
-            };
-            self.types
-                .add_known_type(&Type::Optional {
-                    inner_type: item_type,
-                })
-                .with_context(|| {
-                    format!("adding input stream next optional item type for function {defn:?}")
-                })?;
-        }
         defn.throws_name()
             .map(|n| self.errors.insert(n.to_string()));
         self.functions.push(defn);
@@ -1473,6 +1510,30 @@ impl ComponentInterface {
             if self.types.get_type_definition(f.name()).is_some() {
                 bail!("Conflicting type definition for \"{}\"", f.name());
             }
+        }
+        Ok(())
+    }
+
+    fn add_stream_callback_types(&mut self) -> Result<()> {
+        // Host next callbacks return Option<Item>; Rust output next uses a tagged step.
+        let input_items = self
+            .iter_callables()
+            .flat_map(|c| c.input_stream_arguments())
+            .filter_map(|arg| match arg.as_type() {
+                Type::InputStream { item_type, .. } => Some(*item_type),
+                _ => None,
+            });
+        let host_items = self
+            .callback_methods()
+            .filter_map(|m| m.stream_item_type().cloned());
+        let optional_items = input_items
+            .chain(host_items)
+            .map(|item| Type::Optional {
+                inner_type: Box::new(item),
+            })
+            .collect::<Vec<_>>();
+        for ty in optional_items {
+            self.types.add_known_type(&ty)?;
         }
         Ok(())
     }
@@ -1948,10 +2009,13 @@ new definition: Enum {
                 name: "events".to_string(),
                 orig_name: None,
                 is_async: false,
+                rust_async: false,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: true,
                 inputs: vec![],
                 return_type: Some(Type::Stream {
                     item_type: Box::new(Type::UInt32),
-                    error_type: Box::new(Type::String),
+                    error_type: Some(Box::new(Type::String)),
                     is_send: true,
                 }),
                 throws: None,
@@ -1967,7 +2031,7 @@ new definition: Enum {
             func.return_type(),
             Some(&Type::Stream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             })
         );
@@ -1999,11 +2063,14 @@ new definition: Enum {
                 name: "sum_events".to_string(),
                 orig_name: None,
                 is_async: true,
+                rust_async: true,
+                rust_return_is_result: false,
+                rust_stream_item_is_result: false,
                 inputs: vec![uniffi_meta::FnParamMetadata {
                     name: "events".to_string(),
                     ty: Type::InputStream {
                         item_type: Box::new(Type::UInt32),
-                        error_type: Box::new(Type::String),
+                        error_type: Some(Box::new(Type::String)),
                         is_send: true,
                     },
                     by_ref: false,
@@ -2024,7 +2091,7 @@ new definition: Enum {
             func.arguments()[0].as_type(),
             Type::InputStream {
                 item_type: Box::new(Type::UInt32),
-                error_type: Box::new(Type::String),
+                error_type: Some(Box::new(Type::String)),
                 is_send: true,
             }
         );
@@ -2337,5 +2404,667 @@ new definition: Enum {
                 docstring: None,
             })
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod stream_abi_tests {
+    use super::*;
+    use uniffi_meta::{
+        FnMetadata, FnParamMetadata, MetadataGroup, MethodMetadata, TraitMethodMetadata,
+    };
+
+    const MODULE: &str = "stream_abi::nested";
+
+    fn error(name: &str) -> Type {
+        Type::Enum {
+            module_path: MODULE.into(),
+            name: name.into(),
+        }
+    }
+
+    fn group() -> MetadataGroup {
+        let mut group = MetadataGroup {
+            namespace: NamespaceMetadata {
+                crate_name: "stream_abi".into(),
+                name: "stream_abi".into(),
+            },
+            namespace_docstring: None,
+            items: Default::default(),
+        };
+        for name in ["FactoryError", "ItemError"] {
+            group.add_item(
+                uniffi_meta::EnumMetadata {
+                    module_path: MODULE.into(),
+                    name: name.into(),
+                    orig_name: None,
+                    rust_path: None,
+                    shape: EnumShape::Error { flat: false },
+                    remote: false,
+                    variants: vec![],
+                    discr_type: None,
+                    non_exhaustive: false,
+                    docstring: None,
+                }
+                .into(),
+            );
+        }
+        group
+    }
+
+    fn stream(fallible: bool) -> Type {
+        Type::Stream {
+            item_type: Box::new(Type::UInt32),
+            error_type: fallible.then(|| Box::new(error("ItemError"))),
+            is_send: true,
+        }
+    }
+
+    fn input() -> FnParamMetadata {
+        FnParamMetadata {
+            name: "events".into(),
+            ty: Type::InputStream {
+                item_type: Box::new(Type::UInt32),
+                error_type: None,
+                is_send: true,
+            },
+            by_ref: false,
+            optional: false,
+            default: None,
+        }
+    }
+
+    fn function(name: &str, is_async: bool, inputs: Vec<FnParamMetadata>) -> FnMetadata {
+        FnMetadata {
+            module_path: MODULE.into(),
+            name: name.into(),
+            orig_name: None,
+            is_async,
+            rust_async: is_async,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: true,
+            inputs,
+            return_type: Some(stream(true)),
+            throws: Some(error("FactoryError")),
+            checksum: None,
+            docstring: None,
+        }
+    }
+
+    fn method(
+        owner: &str,
+        name: &str,
+        is_async: bool,
+        inputs: Vec<FnParamMetadata>,
+    ) -> MethodMetadata {
+        MethodMetadata {
+            module_path: MODULE.into(),
+            self_name: owner.into(),
+            name: name.into(),
+            orig_name: None,
+            is_async,
+            rust_async: is_async,
+            rust_return_is_result: true,
+            rust_stream_item_is_result: true,
+            inputs,
+            return_type: Some(stream(true)),
+            throws: Some(error("FactoryError")),
+            takes_self_by_arc: false,
+            checksum: None,
+            docstring: None,
+        }
+    }
+
+    fn trait_method(owner: &str, name: &str, index: u32, is_async: bool) -> TraitMethodMetadata {
+        let method = method(owner, name, is_async, vec![]);
+        TraitMethodMetadata {
+            module_path: method.module_path,
+            trait_name: owner.into(),
+            index,
+            name: method.name,
+            orig_name: None,
+            is_async,
+            rust_async: is_async,
+            rust_return_is_result: method.rust_return_is_result,
+            rust_stream_item_is_result: method.rust_stream_item_is_result,
+            inputs: vec![],
+            return_type: method.return_type,
+            throws: method.throws,
+            takes_self_by_arc: false,
+            checksum: None,
+            docstring: None,
+        }
+    }
+
+    fn object(group: &mut MetadataGroup, name: &str, imp: ObjectImpl) {
+        group.add_item(
+            ObjectMetadata {
+                module_path: MODULE.into(),
+                name: name.into(),
+                orig_name: None,
+                remote: false,
+                imp,
+                docstring: None,
+            }
+            .into(),
+        );
+    }
+
+    fn ffi<'a>(functions: &'a [FfiFunction], name: &str) -> &'a FfiFunction {
+        functions
+            .iter()
+            .find(|f| f.name() == name)
+            .unwrap_or_else(|| panic!("missing FFI symbol {name}"))
+    }
+
+    #[test]
+    fn all_rust_callable_streams_have_next_cancel_and_unit_close() {
+        let mut group = group();
+        let mut names = vec![];
+        for (name, is_async) in [("sync_factory", false), ("async_factory", true)] {
+            let meta = function(name, is_async, vec![]);
+            names.push((meta.ffi_symbol_name(), is_async));
+            group.add_item(meta.into());
+        }
+        for (name, imp, is_async) in [
+            ("Shared", ObjectImpl::Struct, false),
+            ("Local", ObjectImpl::LocalStruct, true),
+            ("RustTrait", ObjectImpl::Trait(TraitKind::RustOnly), true),
+            ("BothTrait", ObjectImpl::Trait(TraitKind::Both), false),
+            (
+                "ForeignArcTrait",
+                ObjectImpl::Trait(TraitKind::ForeignOnly),
+                true,
+            ),
+        ] {
+            object(&mut group, name, imp);
+            let meta = method(name, "events", is_async, vec![]);
+            names.push((meta.ffi_symbol_name(), is_async));
+            group.add_item(meta.into());
+        }
+        let mut ci = ComponentInterface::from_metadata(group).unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        assert!(ci.has_stream_fns());
+        let functions = ci.iter_ffi_function_definitions().collect::<Vec<_>>();
+        for (base, is_async) in names {
+            let factory = ffi(&functions, &base);
+            assert_eq!(factory.is_async(), is_async);
+            assert_eq!(factory.return_type(), Some(&FfiType::Handle));
+            assert_eq!(factory.has_rust_call_status_arg(), !is_async);
+            for (suffix, is_async, returns) in [
+                ("next", true, Some(FfiType::Handle)),
+                ("cancel", false, None),
+                ("close", true, Some(FfiType::Handle)),
+            ] {
+                let operation = ffi(&functions, &format!("{base}_stream_{suffix}"));
+                assert_eq!(operation.is_async(), is_async);
+                assert_eq!(operation.return_type(), returns.as_ref());
+                assert!(!operation.has_rust_call_status_arg());
+                assert_eq!(operation.arguments().len(), 1);
+                assert_eq!(operation.arguments()[0].type_(), FfiType::Handle);
+            }
+        }
+        for callable in ci.iter_callables() {
+            assert_eq!(callable.throws_type(), Some(&error("FactoryError")));
+            assert_eq!(callable.stream_error_type(), Some(&error("ItemError")));
+            assert_eq!(
+                callable.ffi_stream_close_rust_future_complete(&ci),
+                "ffi_stream_abi_rust_future_complete_void"
+            );
+            assert_eq!(
+                ffi(
+                    &functions,
+                    &callable.ffi_stream_close_rust_future_complete(&ci)
+                )
+                .return_type(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn input_initializers_use_complete_symbols_and_three_callbacks() {
+        let mut group = group();
+        group.add_item(function("top", true, vec![input()]).into());
+        for (owner, imp) in [
+            ("Shared", ObjectImpl::Struct),
+            ("Local", ObjectImpl::LocalStruct),
+            ("Both", ObjectImpl::Trait(TraitKind::Both)),
+        ] {
+            object(&mut group, owner, imp);
+            group.add_item(method(owner, "consume", true, vec![input()]).into());
+        }
+        let mut ci = ComponentInterface::from_metadata(group).unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        // Language-facing renames cannot change the ABI registration symbol.
+        ci.functions[0].rename("RenamedTop".into());
+        let functions = ci.iter_ffi_function_definitions().collect::<Vec<_>>();
+        for callable in ci.iter_callables() {
+            let arg = callable.input_stream_arguments()[0];
+            let name = format!("{}_input_stream_events_init", callable.ffi_func().name());
+            assert_eq!(callable.ffi_input_stream_init_func(arg), name);
+            let init = ffi(&functions, &name);
+            assert!(!init.is_async());
+            assert_eq!(init.return_type(), None);
+            assert!(!init.has_rust_call_status_arg());
+            assert_eq!(
+                init.arguments()
+                    .iter()
+                    .map(|a| a.name())
+                    .collect::<Vec<_>>(),
+                ["next", "cancel", "close"]
+            );
+            assert_eq!(
+                init.arguments()
+                    .iter()
+                    .map(|a| a.type_())
+                    .collect::<Vec<_>>(),
+                [
+                    FfiType::Callback("InputStreamNextCallback".into()),
+                    FfiType::Callback("InputStreamCancelCallback".into()),
+                    FfiType::Callback("InputStreamCloseCallback".into()),
+                ]
+            );
+        }
+        assert!(ci.types.contains(&Type::Optional {
+            inner_type: Box::new(Type::UInt32)
+        }));
+    }
+
+    #[test]
+    fn callback_only_streams_define_dependencies_without_inventing_exports() {
+        for is_async in [false, true] {
+            let mut group = group();
+            group.add_item(
+                uniffi_meta::CallbackInterfaceMetadata {
+                    module_path: MODULE.into(),
+                    name: "Producer".into(),
+                    docstring: None,
+                }
+                .into(),
+            );
+            let meta = trait_method("Producer", "events", 0, is_async);
+            let nonexistent_export = meta.ffi_symbol_name();
+            group.add_item(meta.into());
+            let mut ci = ComponentInterface::from_metadata(group).unwrap();
+            ci.derive_ffi_funcs().unwrap();
+            assert!(ci.has_stream_fns());
+            assert!(ci.has_async_fns());
+            assert!(ci.has_async_callback_interface_definition());
+            assert!(!ci.has_input_stream_fns());
+            assert_eq!(ci.iter_callables().count(), 0);
+            let definitions = ci.ffi_definitions().collect::<Vec<_>>();
+            for required in [
+                "InputStreamNextCallback",
+                "InputStreamCancelCallback",
+                "InputStreamCloseCallback",
+                "ForeignFutureCompleteVoid",
+                "ForeignFutureCompleteRustBuffer",
+                "ForeignFutureDroppedCallbackStruct",
+            ] {
+                assert_eq!(
+                    definitions.iter().filter(|d| d.name() == required).count(),
+                    1,
+                    "{required}"
+                );
+            }
+            assert!(!definitions
+                .iter()
+                .any(|d| matches!(d, FfiDefinition::Function(_))
+                    && d.name().starts_with(&nonexistent_export)));
+            let callback_pos = definitions
+                .iter()
+                .position(|d| d.name() == "InputStreamCloseCallback")
+                .unwrap();
+            for dependency in [
+                "ForeignFutureCompleteVoid",
+                "ForeignFutureDroppedCallbackStruct",
+            ] {
+                assert!(
+                    definitions
+                        .iter()
+                        .position(|d| d.name() == dependency)
+                        .unwrap()
+                        < callback_pos
+                );
+            }
+            let close = ci
+                .input_stream_callback_definitions()
+                .into_iter()
+                .find(|f| f.name() == "InputStreamCloseCallback")
+                .unwrap();
+            assert_eq!(
+                close
+                    .arguments()
+                    .iter()
+                    .map(|a| a.type_())
+                    .collect::<Vec<_>>(),
+                [
+                    FfiType::UInt64,
+                    FfiType::Callback("ForeignFutureCompleteVoid".into()),
+                    FfiType::UInt64,
+                    FfiType::Struct("ForeignFutureDroppedCallbackStruct".into()).mut_reference(),
+                ]
+            );
+            assert_eq!(close.return_type(), None);
+            assert!(!close.has_rust_call_status_arg());
+            assert!(ci.types.contains(&Type::Optional {
+                inner_type: Box::new(Type::UInt32)
+            }));
+        }
+    }
+
+    #[test]
+    fn trait_vtables_match_macro_order_and_direction() {
+        let mut group = group();
+        for (name, kind) in [
+            ("Rust", TraitKind::RustOnly),
+            ("Both", TraitKind::Both),
+            ("Foreign", TraitKind::ForeignOnly),
+        ] {
+            object(&mut group, name, ObjectImpl::Trait(kind));
+            group.add_item(trait_method(name, "events", 0, true).into());
+            let mut ordinary = trait_method(name, "ordinary", 1, false);
+            ordinary.return_type = None;
+            ordinary.throws = None;
+            group.add_item(ordinary.into());
+            let mut infallible = trait_method(name, "plain_events", 2, false);
+            infallible.return_type = Some(stream(false));
+            infallible.throws = None;
+            group.add_item(infallible.into());
+        }
+        let mut ci = ComponentInterface::from_metadata(group).unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        for object in ci.object_definitions() {
+            if object.name() == "Rust" {
+                assert!(object.vtable_definition().is_none());
+                assert!(object.ffi_callbacks().is_empty());
+                assert!(object.vtable_methods().is_empty());
+                continue;
+            }
+            let vtable = object.vtable_definition().unwrap();
+            assert_eq!(
+                vtable.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+                [
+                    "uniffi_free",
+                    "uniffi_clone",
+                    "events",
+                    "events_stream_next",
+                    "events_stream_cancel",
+                    "events_stream_close",
+                    "ordinary",
+                    "plain_events",
+                    "plain_events_stream_next",
+                    "plain_events_stream_cancel",
+                    "plain_events_stream_close",
+                ]
+            );
+            assert_eq!(
+                vtable.fields()[3].type_(),
+                FfiType::Callback("InputStreamNextCallback".into())
+            );
+            assert_eq!(
+                vtable.fields()[4].type_(),
+                FfiType::Callback("InputStreamCancelCallback".into())
+            );
+            assert_eq!(
+                vtable.fields()[5].type_(),
+                FfiType::Callback("InputStreamCloseCallback".into())
+            );
+            assert!(object
+                .get_method("plain_events")
+                .stream_error_type()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn data_methods_receive_stream_exports_too() {
+        let mut group = group();
+        group.add_item(
+            uniffi_meta::RecordMetadata {
+                module_path: MODULE.into(),
+                name: "Record".into(),
+                orig_name: None,
+                rust_path: None,
+                remote: false,
+                fields: vec![],
+                docstring: None,
+            }
+            .into(),
+        );
+        group.add_item(method("Record", "events", true, vec![input()]).into());
+        group.add_item(method("FactoryError", "events", false, vec![]).into());
+        let mut ci = ComponentInterface::from_metadata(group).unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        let functions = ci.iter_ffi_function_definitions().collect::<Vec<_>>();
+        assert_eq!(ci.iter_callables().count(), 2);
+        for callable in ci.iter_callables() {
+            ffi(&functions, &callable.ffi_stream_close_func());
+        }
+    }
+
+    #[test]
+    fn rust_async_survives_metadata_for_functions_methods_and_constructors() {
+        let mut group = group();
+        object(&mut group, "Local", ObjectImpl::LocalStruct);
+        object(&mut group, "Both", ObjectImpl::Trait(TraitKind::Both));
+        for (name, rust_async) in [("async_fn", true), ("boxed_future", false)] {
+            let mut f = function(name, true, vec![]);
+            f.rust_async = rust_async;
+            group.add_item(f.into());
+            let mut m = method("Local", name, true, vec![]);
+            m.rust_async = rust_async;
+            group.add_item(m.into());
+            let mut m = trait_method("Both", name, u32::from(!rust_async), true);
+            m.rust_async = rust_async;
+            group.add_item(m.into());
+            group.add_item(
+                ConstructorMetadata {
+                    module_path: MODULE.into(),
+                    self_name: "Local".into(),
+                    self_type: Some(Type::Object {
+                        module_path: MODULE.into(),
+                        name: "Local".into(),
+                        imp: ObjectImpl::LocalStruct,
+                    }),
+                    name: name.into(),
+                    orig_name: None,
+                    is_async: true,
+                    rust_async,
+                    rust_return_is_result: false,
+                    rust_stream_item_is_result: false,
+                    inputs: vec![],
+                    throws: None,
+                    checksum: None,
+                    docstring: None,
+                }
+                .into(),
+            );
+        }
+        let mut ci = ComponentInterface::from_metadata(group).unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        for callable in ci.iter_callables() {
+            assert!(callable.is_async());
+            assert_eq!(callable.rust_async(), callable.rust_name() == "async_fn");
+        }
+        assert!(ci.get_function_definition("async_fn").unwrap().rust_async());
+        assert!(!ci
+            .get_function_definition("boxed_future")
+            .unwrap()
+            .rust_async());
+        for obj in ci.object_definitions() {
+            for method in obj.methods() {
+                assert_eq!(method.rust_async(), method.name() == "async_fn");
+            }
+            for constructor in obj.constructors() {
+                assert_eq!(constructor.rust_async(), constructor.name() == "async_fn");
+            }
+        }
+    }
+
+    #[test]
+    fn udl_uses_is_async_as_its_rust_syntax_default() {
+        let ci = ComponentInterface::from_webidl(
+            r#"
+            namespace udl_async {
+                [Async] u32 async_value();
+                u32 value();
+            };
+            interface Thing {
+                constructor();
+                [Async] u32 async_method();
+                u32 method();
+            };
+        "#,
+            "udl_async",
+        )
+        .unwrap();
+        assert_eq!(ci.iter_callables().count(), 5);
+        for callable in ci.iter_callables() {
+            assert_eq!(callable.rust_async(), callable.is_async());
+        }
+    }
+
+    #[test]
+    fn rust_result_shapes_survive_ci_and_shared_ir_without_business_errors() {
+        use crate::pipeline::{general, initial};
+
+        let mut group = group();
+        object(&mut group, "Object", ObjectImpl::Struct);
+        object(&mut group, "Trait", ObjectImpl::Trait(TraitKind::Both));
+        let cases = [
+            ("plain", false, false),
+            ("result_item", false, true),
+            ("result_factory", true, true),
+            ("result_plain_factory", true, false),
+        ];
+        for (index, &(name, result, item)) in cases.iter().enumerate() {
+            let mut f = function(name, true, vec![]);
+            f.return_type = Some(stream(false));
+            f.throws = None;
+            f.rust_return_is_result = result;
+            f.rust_stream_item_is_result = item;
+            group.add_item(f.into());
+            let mut m = method("Object", name, true, vec![]);
+            m.return_type = Some(stream(false));
+            m.throws = None;
+            m.rust_return_is_result = result;
+            m.rust_stream_item_is_result = item;
+            group.add_item(m.into());
+            let mut t = trait_method("Trait", name, index as u32, true);
+            t.return_type = Some(stream(false));
+            t.throws = None;
+            t.rust_return_is_result = result;
+            t.rust_stream_item_is_result = item;
+            group.add_item(t.into());
+        }
+        group.add_item(
+            ConstructorMetadata {
+                module_path: MODULE.into(),
+                self_name: "Object".into(),
+                self_type: None,
+                name: "new".into(),
+                orig_name: None,
+                is_async: false,
+                rust_async: false,
+                rust_return_is_result: true,
+                rust_stream_item_is_result: false,
+                inputs: vec![],
+                throws: None,
+                checksum: None,
+                docstring: None,
+            }
+            .into(),
+        );
+        let expected = |name: &str| {
+            if name == "new" {
+                return (true, false);
+            }
+            let &(_, result, item) = cases.iter().find(|(n, _, _)| *n == name).unwrap();
+            (result, item)
+        };
+        let ci = ComponentInterface::from_metadata(MetadataGroup {
+            namespace: group.namespace.clone(),
+            namespace_docstring: group.namespace_docstring.clone(),
+            items: group.items.clone(),
+        }).unwrap();
+        assert_eq!(ci.iter_callables().count(), 13);
+        for callable in ci.iter_callables() {
+            assert_eq!(
+                (
+                    callable.rust_return_is_result(),
+                    callable.rust_stream_item_is_result()
+                ),
+                expected(callable.rust_name())
+            );
+            assert!(callable.throws_type().is_none());
+        }
+        let mut converter = initial::UniffiMetaConverter::default();
+        converter.add_metadata_item(group.namespace.into()).unwrap();
+        for item in group.items {
+            converter.add_metadata_item(item).unwrap();
+        }
+        let initial = converter.try_into_initial_ir().unwrap();
+        for namespace in initial.namespaces.values() {
+            for f in &namespace.functions {
+                assert_eq!(
+                    (f.rust_return_is_result, f.rust_stream_item_is_result),
+                    expected(&f.orig_name)
+                );
+            }
+        }
+        let general = general::pipeline("test").execute(initial).unwrap();
+        let check = |callable: &general::Callable| {
+            assert_eq!(
+                (
+                    callable.rust_return_is_result,
+                    callable.rust_stream_item_is_result
+                ),
+                expected(&callable.orig_name)
+            );
+            assert!(callable.throws_type.ty.is_none());
+        };
+        for namespace in general.namespaces.values() {
+            for f in &namespace.functions {
+                check(&f.callable);
+            }
+            for ty in &namespace.type_definitions {
+                if let general::TypeDefinition::Interface(object) = ty {
+                    for method in &object.methods {
+                        check(&method.callable);
+                    }
+                    for constructor in &object.constructors {
+                        check(&constructor.callable);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn udl_rust_result_shape_follows_throws_for_all_callable_kinds() {
+        let ci = ComponentInterface::from_webidl(r#"
+            namespace udl_shape { u32 plain(); [Throws=Oops] u32 result(); };
+            [Error] enum Oops { "Failed" };
+            interface Object { [Throws=Oops] constructor(); u32 plain(); [Throws=Oops] u32 result(); };
+            callback interface Callback { u32 plain(); [Throws=Oops] u32 result(); };
+        "#, "udl_shape").unwrap();
+        for callable in ci.iter_callables() {
+            assert_eq!(
+                callable.rust_return_is_result(),
+                callable.throws_type().is_some()
+            );
+            assert!(!callable.rust_stream_item_is_result());
+        }
+        for callback in ci.callback_interface_definitions() {
+            for method in callback.methods() {
+                assert_eq!(
+                    method.rust_return_is_result(),
+                    method.throws_type().is_some()
+                );
+                assert!(!method.rust_stream_item_is_result());
+            }
+        }
     }
 }

@@ -1,0 +1,5 @@
+error: borrowed or pointer return/data types are not supported across UniFFI
+ --> tests/async-ui/borrowed_output.rs:2:35
+  |
+2 | async fn borrowed(value: &str) -> &str { value }
+  |                                   ^^^^

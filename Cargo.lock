@@ -2996,7 +2996,9 @@ name = "uniffi_meta"
 version = "0.32.0"
 dependencies = [
  "anyhow",
+ "quote",
  "siphasher",
+ "syn",
  "uniffi_internal_macros",
  "uniffi_pipeline",
 ]

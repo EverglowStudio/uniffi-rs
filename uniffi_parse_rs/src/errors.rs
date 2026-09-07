@@ -244,6 +244,29 @@ mod tests {
     use crate::Ir;
 
     #[test]
+    fn noncanonical_stream_argument_diagnostics_point_to_the_argument_type() {
+        use syn::spanned::Spanned;
+
+        let ir = Ir::new_for_test(&["async_declarations"]);
+        let path = crate::paths::tests::path_for_module(&ir, "async_declarations");
+        for source in [
+            "input: impl Stream<Item = u32>",
+            "input: Pin<Box<dyn Stream<Item = u32> + Send>>",
+            "input: BoxStream<'static, u32>",
+            "input: HiddenStream",
+        ] {
+            let arg = crate::Argument::parse(syn::parse_str(source).unwrap()).unwrap();
+            let err = path
+                .resolve_arg(&ir, &mut Default::default(), &arg.ty, None)
+                .unwrap_err();
+            let (file, span) = err.location.unwrap();
+            assert_eq!(file.0, path.file_id().0);
+            assert_eq!(span.byte_range(), arg.ty.span().byte_range(), "{source}");
+            assert_eq!(span.start().column, "input: ".len(), "{source}");
+        }
+    }
+
+    #[test]
     fn test_invalid_type() {
         let ir = Ir::new_for_test(&["invalid_type"]);
         let expected = expect_test::expect_file!["./expect/invalid_type.txt"];

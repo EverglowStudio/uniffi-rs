@@ -65,6 +65,7 @@ struct RecordItem {
 
 impl RecordItem {
     fn new(input: DeriveInput) -> syn::Result<Self> {
+        uniffi_meta::async_signature::validate_generics(&input.generics)?;
         let record = match input.data {
             Data::Struct(s) => s,
             _ => {
@@ -74,6 +75,9 @@ impl RecordItem {
                 ));
             }
         };
+        for field in &record.fields {
+            uniffi_meta::async_signature::validate_value_type(&field.ty)?;
+        }
         let attr = input.attrs.parse_uniffi_attr_args::<RecordAttr>()?;
         Ok(Self {
             ident: input.ident,
