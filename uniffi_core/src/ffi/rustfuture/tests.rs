@@ -267,6 +267,189 @@ fn test_wake_during_poll() {
     );
 }
 
+mod consuming {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn ready_handle<T>(future: RustFuture<T>) -> (Handle, std::sync::Weak<RustFuture<T>>) {
+        let future = Arc::new(future);
+        let shell = Arc::downgrade(&future);
+        let result = Arc::new(OnceCell::new());
+        future.clone().poll(RustFutureContinuationBoundCallback {
+            callback: poll_continuation,
+            data: Arc::into_raw(result.clone()) as u64,
+        });
+        assert_eq!(result.get(), Some(&RustFuturePoll::Ready));
+        (Handle::from_arc(future), shell)
+    }
+
+    fn consume<T: FfiDefault>(future: RustFuture<T>) -> (T, RustCallStatus) {
+        let (handle, shell) = ready_handle(future);
+        let mut status = RustCallStatus::default();
+        // SAFETY: ready_handle creates the correctly typed handle, exclusively owned here.
+        let value = unsafe { rust_future_complete_and_free::<T>(handle, &mut status) };
+        assert!(
+            shell.upgrade().is_none(),
+            "terminal must release the future shell"
+        );
+        (value, status)
+    }
+
+    #[test]
+    fn scalar_and_unit_consume_their_handles() {
+        let (value, status) = consume(RustFuture::new(async { Ok(42u32) }, crate::UniFfiTag));
+        assert_eq!(value, 42);
+        assert_eq!(status.code, RustCallStatusCode::Success);
+        let ((), status) = consume(RustFuture::new(async { Ok(()) }, crate::UniFfiTag));
+        assert_eq!(status.code, RustCallStatusCode::Success);
+    }
+
+    #[test]
+    fn returned_buffer_outlives_the_future_shell() {
+        let (buffer, status) = consume(RustFuture::new(
+            async { Ok("owned after completion".to_owned()) },
+            crate::UniFfiTag,
+        ));
+        assert_eq!(status.code, RustCallStatusCode::Success);
+        assert_eq!(
+            <String as Lift<crate::UniFfiTag>>::try_lift(buffer).unwrap(),
+            "owned after completion"
+        );
+    }
+
+    #[test]
+    fn error_buffers_outlive_the_future_shell() {
+        let (buffer, status) = consume(RustFuture::new(
+            async { Ok(Err::<String, TestError>("declared failure".into())) },
+            crate::UniFfiTag,
+        ));
+        buffer.destroy();
+        assert_eq!(status.code, RustCallStatusCode::Error);
+        assert_eq!(
+            <TestError as Lift<crate::UniFfiTag>>::try_lift_from_rust_buffer(
+                ManuallyDrop::into_inner(status.error_buf)
+            )
+            .unwrap(),
+            TestError::from("declared failure")
+        );
+
+        let (buffer, status) = consume(RustFuture::new(
+            async {
+                Err::<String, _>(LiftArgsError {
+                    arg_name: "value",
+                    error: anyhow::anyhow!("invalid argument"),
+                })
+            },
+            crate::UniFfiTag,
+        ));
+        buffer.destroy();
+        assert_eq!(status.code, RustCallStatusCode::UnexpectedError);
+        assert_eq!(
+            <String as Lift<crate::UniFfiTag>>::try_lift(ManuallyDrop::into_inner(
+                status.error_buf
+            ))
+            .unwrap(),
+            "Failed to convert arg 'value':\ninvalid argument"
+        );
+    }
+
+    struct Payload(Arc<AtomicUsize>);
+
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct OwnedOutput(Arc<Payload>);
+
+    // SAFETY: The scalar carrier transfers one Arc reference. The test consumes it once as Payload.
+    unsafe impl LowerReturn<crate::UniFfiTag> for OwnedOutput {
+        type ReturnType = u64;
+        fn lower_return(value: Self) -> Result<u64, crate::RustCallError> {
+            Ok(Handle::from_arc(value.0).as_raw())
+        }
+    }
+
+    #[test]
+    fn returned_object_has_independent_ownership() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let object = Arc::new(Payload(dropped.clone()));
+        let object_weak = Arc::downgrade(&object);
+        let (raw, status) = consume(RustFuture::new(
+            async move { Ok(OwnedOutput(object)) },
+            crate::UniFfiTag,
+        ));
+        assert_eq!(status.code, RustCallStatusCode::Success);
+        assert_eq!(object_weak.strong_count(), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        // SAFETY: OwnedOutput transferred exactly one Payload Arc into this carrier.
+        let delivered = unsafe { Handle::from_raw(raw).unwrap().into_arc::<Payload>() };
+        assert_eq!(Arc::strong_count(&delivered), 1);
+        drop(delivered);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(object_weak.upgrade().is_none());
+    }
+
+    struct PanickingLower(Payload);
+
+    // SAFETY: This conversion unwinds without creating an owning FFI carrier.
+    unsafe impl LowerReturn<crate::UniFfiTag> for PanickingLower {
+        type ReturnType = u32;
+        fn lower_return(value: Self) -> Result<u32, crate::RustCallError> {
+            let _resource = value.0;
+            panic!("lower failed")
+        }
+    }
+
+    #[test]
+    fn business_and_lower_panics_still_consume_the_handle() {
+        let (_, status) = consume(RustFuture::<u32>::new(
+            std::future::poll_fn::<Result<u32, LiftArgsError>, _>(|_| panic!("business failed")),
+            crate::UniFfiTag,
+        ));
+        assert_eq!(status.code, RustCallStatusCode::UnexpectedError);
+        assert_eq!(
+            <String as Lift<crate::UniFfiTag>>::try_lift(ManuallyDrop::into_inner(
+                status.error_buf
+            ))
+            .unwrap(),
+            "business failed"
+        );
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let resource = PanickingLower(Payload(dropped.clone()));
+        let (_, status) = consume(RustFuture::new(
+            async move { Ok(resource) },
+            crate::UniFfiTag,
+        ));
+        assert_eq!(status.code, RustCallStatusCode::UnexpectedError);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            <String as Lift<crate::UniFfiTag>>::try_lift(ManuallyDrop::into_inner(
+                status.error_buf
+            ))
+            .unwrap(),
+            "lower failed"
+        );
+    }
+
+    #[test]
+    fn borrowed_completion_does_not_consume_the_handle() {
+        let (handle, shell) = ready_handle(RustFuture::new(async { Ok(42u32) }, crate::UniFfiTag));
+        let mut status = RustCallStatus::default();
+        // SAFETY: The ready handle is exclusively owned here; completion only borrows it.
+        assert_eq!(
+            unsafe { rust_future_complete::<u32>(handle.clone(), &mut status) },
+            42
+        );
+        assert_eq!(status.code, RustCallStatusCode::Success);
+        assert_eq!(shell.strong_count(), 1);
+        // SAFETY: The borrowed completion has not consumed the handle.
+        unsafe { rust_future_free::<u32>(handle) };
+        assert!(shell.upgrade().is_none());
+    }
+}
+
 #[cfg(feature = "async-runtime")]
 mod lifecycle {
     use super::*;
@@ -385,6 +568,103 @@ mod lifecycle {
         assert_eq!(observe(&future).get(), Some(&RustFuturePoll::Ready));
         assert_eq!(cleaned.load(Ordering::SeqCst), 1);
         future.free();
+    }
+
+    #[test]
+    fn consuming_terminal_waits_for_cancel_cleanup_and_preserves_commit() {
+        for cancel in [false, true] {
+            let (resource, gate) = guard();
+            let dropped = resource.dropped.clone();
+            let cleaned = resource.cleaned.clone();
+            let future = Arc::new(RustFuture::<u32>::new(
+                async move {
+                    let _resource = resource;
+                    if cancel {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(7u32)
+                },
+                crate::UniFfiTag,
+            ));
+            if cancel {
+                let business = observe(&future);
+                assert_eq!(business.get(), None);
+                future.cancel();
+                assert_eq!(business.get(), Some(&RustFuturePoll::Wake));
+            }
+            let cleaning = observe_pending(&future);
+            assert_eq!(cleaning.get(), None);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(cleaned.load(Ordering::SeqCst), 0);
+            gate.send(()).unwrap();
+            assert_eq!(cleaning.get(), Some(&RustFuturePoll::Wake));
+            assert_eq!(observe(&future).get(), Some(&RustFuturePoll::Ready));
+            assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+            // Cancellation after successful commitment must not replace the result.
+            future.cancel();
+            let shell = Arc::downgrade(&future);
+            let mut status = RustCallStatus::default();
+            // SAFETY: Ready was observed after cleanup; this is the sole handle owner.
+            let value = unsafe {
+                rust_future_complete_and_free::<u32>(Handle::from_arc(future), &mut status)
+            };
+            assert_eq!(value, if cancel { 0 } else { 7 });
+            assert_eq!(
+                status.code,
+                if cancel {
+                    RustCallStatusCode::Cancelled
+                } else {
+                    RustCallStatusCode::Success
+                }
+            );
+            assert!(shell.upgrade().is_none());
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    struct LowerCleanupOutput(CleanupGuard);
+
+    // SAFETY: The output is an owned scalar; dropping the resource registers caller cleanup.
+    unsafe impl LowerReturn<crate::UniFfiTag> for LowerCleanupOutput {
+        type ReturnType = u32;
+        fn lower_return(value: Self) -> Result<u32, crate::RustCallError> {
+            drop(value.0);
+            Ok(7)
+        }
+    }
+
+    #[test]
+    fn consuming_terminal_keeps_callers_registered_cleanup() {
+        use crate::async_runtime::{CallContext, CancellationToken};
+
+        let (resource, gate) = guard();
+        let dropped = resource.dropped.clone();
+        let cleaned = resource.cleaned.clone();
+        let future = Arc::new(RustFuture::<u32>::new(
+            async move { Ok(LowerCleanupOutput(resource)) },
+            crate::UniFfiTag,
+        ));
+        assert_eq!(observe(&future).get(), Some(&RustFuturePoll::Ready));
+        let shell = Arc::downgrade(&future);
+        let handle = Handle::from_arc(future);
+        let parent = CallContext::new(CancellationToken::new());
+        let mut delivery = Box::pin(parent.run(async move {
+            let mut status = RustCallStatus::default();
+            // SAFETY: This parent owns the live, ready handle; no other access is possible.
+            let value = unsafe { rust_future_complete_and_free::<u32>(handle, &mut status) };
+            assert_eq!(status.code, RustCallStatusCode::Success);
+            value
+        }));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(delivery.as_mut().poll(&mut cx).is_pending());
+        assert!(shell.upgrade().is_none());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(cleaned.load(Ordering::SeqCst), 0);
+        gate.send(()).unwrap();
+        assert_eq!(delivery.as_mut().poll(&mut cx), Poll::Ready(Ok(7)));
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
     }
 
     struct Output {

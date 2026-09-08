@@ -69,6 +69,13 @@ impl BindgenPaths {
             .find_map(|l| l.get_cdylib_name(crate_name))
     }
 
+    /// Get the Rust library target name for a package or crate.
+    pub fn get_library_name(&self, crate_name: &str) -> Option<String> {
+        self.layers
+            .iter()
+            .find_map(|l| l.get_library_name(crate_name))
+    }
+
     /// Get the UDL source for a crate
     pub fn get_udl(&self, crate_name: &str, udl_name: &str) -> Result<String> {
         match self.get_udl_path(crate_name, udl_name) {
@@ -102,6 +109,7 @@ pub struct CargoMetadataOptions {
 
 #[derive(Debug)]
 pub struct SourceCrate {
+    /// Rust library target name, as used by `CARGO_CRATE_NAME` and module paths.
     pub name: String,
     pub src_path: Utf8PathBuf,
     pub features: Vec<String>,
@@ -135,6 +143,11 @@ pub trait BindgenPathsLayer {
 
     /// Get the name of the cdylib for a crate
     fn get_cdylib_name(&self, _source_crate: &str) -> Option<String> {
+        None
+    }
+
+    /// Get the Rust library target name, which can differ from the package name.
+    fn get_library_name(&self, _source_crate: &str) -> Option<String> {
         None
     }
 

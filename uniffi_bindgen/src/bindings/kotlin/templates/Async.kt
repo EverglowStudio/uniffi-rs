@@ -54,6 +54,12 @@ private class UniffiStreamLifetime(private val closeSubscription: suspend () -> 
     val closing = AtomicBoolean(false)
     private val closed = CompletableDeferred<Unit>()
 
+    fun acknowledgeRustTerminal() {
+        // Only a fully returned native Done/Error may supply this acknowledgement.
+        // A close that already owns completion must keep its own result, even failure.
+        if (closing.compareAndSet(false, true)) closed.complete(Unit)
+    }
+
     private suspend fun finishClose() {
         try {
             closeSubscription()
@@ -80,10 +86,23 @@ private class UniffiStreamLifetime(private val closeSubscription: suspend () -> 
 }
 
 /** A Rust subscription. Collection is single-use; close waits for owned cleanup. */
-public class UniFfiStream<T> internal constructor(
+public class UniFfiStream<T> private constructor(
     private val next: suspend () -> __UniffiStreamNext<T>,
     closeSubscription: suspend () -> Unit,
+    private val rustTerminalAcknowledgesClose: Boolean,
 ) : Flow<T> {
+    internal constructor(
+        next: suspend () -> __UniffiStreamNext<T>,
+        closeSubscription: suspend () -> Unit,
+    ) : this(next, closeSubscription, false)
+
+    internal companion object {
+        fun <T> rustSubscription(
+            next: suspend () -> __UniffiStreamNext<T>,
+            closeSubscription: suspend () -> Unit,
+        ): UniFfiStream<T> = UniFfiStream(next, closeSubscription, true)
+    }
+
     private val consumed = AtomicBoolean(false)
     private val lifetime = UniffiStreamLifetime(closeSubscription)
     private val cleanable = UniffiLib.CLEANER.register(this, lifetime)
@@ -109,8 +128,14 @@ public class UniFfiStream<T> internal constructor(
                 if (lifetime.closing.get()) throw CancellationException("UniFFI output stream is closed")
                 when (val step = next()) {
                     is __UniffiStreamNext.Item -> collector.emit(step.value)
-                    __UniffiStreamNext.Done -> break
-                    is __UniffiStreamNext.Error -> throw step.error
+                    __UniffiStreamNext.Done -> {
+                        if (rustTerminalAcknowledgesClose) lifetime.acknowledgeRustTerminal()
+                        break
+                    }
+                    is __UniffiStreamNext.Error -> {
+                        if (rustTerminalAcknowledgesClose) lifetime.acknowledgeRustTerminal()
+                        throw step.error
+                    }
                 }
             }
         } catch (error: Throwable) {
@@ -132,7 +157,38 @@ public class UniFfiStream<T> internal constructor(
 
 // Poll callbacks outlive cancellation of the Kotlin waiter. Keep the outstanding
 // callback registered until Rust invokes it, then continue polling cleanup.
-internal val uniffiContinuationHandleMap = UniffiHandleMap<CompletableDeferred<Byte>>()
+internal val uniffiContinuationHandleMap = UniffiHandleMap<UniffiPollSignal>()
+
+internal class UniffiPollSignal {
+    private var notified = false
+    private var value: Byte = 0
+    private var waiter: CompletableDeferred<Byte>? = null
+
+    fun complete(result: Byte): Boolean {
+        val target = synchronized(this) {
+            if (notified) return false
+            value = result
+            notified = true
+            waiter
+        }
+        // Completing a waiter can resume a coroutine; never do that under the lock.
+        return target?.complete(result) ?: true
+    }
+
+    suspend fun await(): Byte {
+        val target = synchronized(this) {
+            // Once published, this waiter also owns delivery to NonCancellable
+            // drain. A cached notification must not bypass its completion.
+            waiter ?: run {
+                // Like an already completed Deferred.await in coroutines 1.6.4,
+                // this path does not recheck cancellation after Rust's poll.
+                if (notified) return value
+                CompletableDeferred<Byte>().also { waiter = it }
+            }
+        }
+        return target.await()
+    }
+}
 
 internal object uniffiRustFutureContinuationCallbackImpl: UniffiRustFutureContinuationCallback {
     override fun callback(data: Long, pollResult: Byte) {
@@ -144,17 +200,17 @@ internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
     rustFuture: Long,
     pollFunc: (Long, UniffiRustFutureContinuationCallback, Long) -> Unit,
     cancelFunc: (Long) -> Unit,
-    completeFunc: (Long, UniffiRustCallStatus) -> F,
+    completeAndFreeFunc: (Long, UniffiRustCallStatus) -> F,
     freeFunc: (Long) -> Unit,
     liftFunc: (F) -> T,
     errorHandler: UniffiRustCallStatusErrorHandler<E>,
     discardResult: suspend (T) -> Unit = {},
 ): T {
-    var pendingPoll: CompletableDeferred<Byte>? = null
+    var pendingPoll: UniffiPollSignal? = null
     var ready = false
     var pollingFailure: Throwable? = null
-    fun poll(): CompletableDeferred<Byte> {
-        val result = CompletableDeferred<Byte>()
+    fun poll(): UniffiPollSignal {
+        val result = UniffiPollSignal()
         val handle = uniffiContinuationHandleMap.insert(result)
         try {
             pollFunc(rustFuture, uniffiRustFutureContinuationCallbackImpl, handle)
@@ -174,12 +230,28 @@ internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
     } catch (error: Throwable) {
         pollingFailure = error
     }
-    // Cancellation requests a Rust terminal decision; it does not replace one
-    // that Rust already committed. Keep this dispatcher for result delivery:
-    // withContext(NonCancellable) then has no cancellable dispatch back.
-    return withContext(NonCancellable) {
-        var callFailure: Throwable? = null
-        try {
+    var terminalOwnsHandle = false
+    fun complete(status: UniffiRustCallStatus): F {
+        // The native terminal consumes on every status. Publish before entering
+        // the generated lambda: external RustBuffer adaptation may throw after FFI.
+        terminalOwnsHandle = true
+        return completeAndFreeFunc(rustFuture, status)
+    }
+    var callFailure: Throwable? = null
+    try {
+        // Once Ready is observed, completion, lifting and final release cannot
+        // suspend. Deliver Rust's committed result without constructing another
+        // coroutine context or checking the caller's cancellation again.
+        if (ready && pollingFailure == null) {
+            return liftFunc(uniffiRustCallWithError(errorHandler) { status ->
+                complete(status)
+            })
+        }
+        // Cancellation requests a Rust terminal decision; it does not replace
+        // one that Rust already committed. Keep this dispatcher for delivery:
+        // NonCancellable then has no cancellable dispatch back, including when
+        // the caller awaits cleanup or discards an unclaimed result.
+        return withContext(NonCancellable) {
             if (!ready) {
                 cancelFunc(rustFuture)
                 // Do not replace a continuation that Rust still owns.
@@ -189,7 +261,7 @@ internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
                 }
             }
             val value = liftFunc(uniffiRustCallWithError(errorHandler) { status ->
-                completeFunc(rustFuture, status)
+                complete(status)
             })
             val failure = pollingFailure
             if (failure != null && failure !is CancellationException) {
@@ -201,17 +273,19 @@ internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
                 throw failure
             }
             value
-        } catch (error: Throwable) {
-            callFailure = error
-            throw error
-        } finally {
-            try {
-                freeFunc(rustFuture)
-            } catch (cleanupError: Throwable) {
-                val originalError = callFailure
-                if (originalError == null) throw cleanupError
-                originalError.addSuppressed(cleanupError)
-            }
+        }
+    } catch (error: Throwable) {
+        callFailure = error
+        throw error
+    } finally {
+        // Only an untransferred handle is ours to release. Native terminal free
+        // precedes host lift/discard, which still retain their full ownership work.
+        try {
+            if (!terminalOwnsHandle) freeFunc(rustFuture)
+        } catch (cleanupError: Throwable) {
+            val originalError = callFailure
+            if (originalError == null) throw cleanupError
+            originalError.addSuppressed(cleanupError)
         }
     }
 }

@@ -830,6 +830,25 @@ impl ComponentInterface {
         }
     }
 
+    /// Builtin FFI function to complete a ready Rust future and consume its handle.
+    pub fn ffi_rust_future_complete_and_free(
+        &self,
+        return_ffi_type: Option<FfiType>,
+    ) -> FfiFunction {
+        FfiFunction {
+            name: self
+                .rust_future_ffi_fn_name("rust_future_complete_and_free", return_ffi_type.clone()),
+            is_async: false,
+            arguments: vec![FfiArgument {
+                name: "handle".to_owned(),
+                type_: FfiType::Handle,
+            }],
+            return_type: return_ffi_type,
+            has_rust_call_status_arg: true,
+            is_object_free_function: false,
+        }
+    }
+
     /// Builtin FFI function for cancelling a Rust Future
     pub fn ffi_rust_future_cancel(&self, return_ffi_type: Option<FfiType>) -> FfiFunction {
         FfiFunction {
@@ -1180,7 +1199,8 @@ impl ComponentInterface {
                     self.ffi_rust_future_poll(return_type.clone()),
                     self.ffi_rust_future_cancel(return_type.clone()),
                     self.ffi_rust_future_free(return_type.clone()),
-                    self.ffi_rust_future_complete(return_type),
+                    self.ffi_rust_future_complete(return_type.clone()),
+                    self.ffi_rust_future_complete_and_free(return_type),
                 ]
             })
     }
@@ -1788,6 +1808,37 @@ fn type_names_in_type(ty: &Type) -> Vec<String> {
 mod test {
     use super::*;
 
+    #[test]
+    fn consuming_future_terminals_have_all_carriers_and_distinct_ownership() {
+        let ci = ComponentInterface::new("terminal_core");
+        let definitions: Vec<_> = ci.iter_futures_ffi_function_definitions().collect();
+        assert_eq!(definitions.len(), 60);
+        for return_type in ci.all_possible_return_ffi_types() {
+            let terminal = ci.ffi_rust_future_complete_and_free(return_type.clone());
+            let borrowed = ci.ffi_rust_future_complete(return_type.clone());
+            assert_ne!(terminal.name(), borrowed.name());
+            assert_eq!(terminal.return_type(), return_type.as_ref());
+            assert!(!terminal.is_async());
+            assert!(terminal.has_rust_call_status_arg());
+            assert_eq!(terminal.arguments().len(), 1);
+            assert_eq!(terminal.arguments()[0].type_(), FfiType::Handle);
+            assert_eq!(
+                definitions
+                    .iter()
+                    .filter(|f| f.name() == terminal.name())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                definitions
+                    .iter()
+                    .filter(|f| f.name() == borrowed.name())
+                    .count(),
+                1
+            );
+        }
+    }
+
     // Note that much of the functionality of `ComponentInterface` is tested via its interactions
     // with specific member types, in the sub-modules defining those member types.
 
@@ -2038,6 +2089,18 @@ new definition: Enum {
         assert_eq!(
             func.ffi_stream_next_rust_future_complete(&ci),
             "ffi_stream_core_rust_future_complete_rust_buffer"
+        );
+        assert_eq!(
+            func.ffi_rust_future_complete_and_free(&ci),
+            "ffi_stream_core_rust_future_complete_and_free_u64"
+        );
+        assert_eq!(
+            func.ffi_stream_next_rust_future_complete_and_free(&ci),
+            "ffi_stream_core_rust_future_complete_and_free_rust_buffer"
+        );
+        assert_eq!(
+            func.ffi_stream_close_rust_future_complete_and_free(&ci),
+            "ffi_stream_core_rust_future_complete_and_free_void"
         );
         assert!(
             !ci.types.contains(&Type::Optional {
@@ -2988,7 +3051,8 @@ mod stream_abi_tests {
             namespace: group.namespace.clone(),
             namespace_docstring: group.namespace_docstring.clone(),
             items: group.items.clone(),
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(ci.iter_callables().count(), 13);
         for callable in ci.iter_callables() {
             assert_eq!(

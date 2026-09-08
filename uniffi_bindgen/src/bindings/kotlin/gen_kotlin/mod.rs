@@ -1202,7 +1202,7 @@ mod filters {
         _: &dyn askama::Values,
         ci: &ComponentInterface,
     ) -> Result<String, askama::Error> {
-        let ffi_func = callable.ffi_rust_future_complete(ci);
+        let ffi_func = callable.ffi_rust_future_complete_and_free(ci);
         let call = format!("UniffiLib.{ffi_func}(future, continuation)");
         // May need to convert the RustBuffer from our package to the RustBuffer of the external package.
         let call = match callable.return_type() {
@@ -1733,7 +1733,7 @@ mod test {
         assert!(kotlin.contains("import kotlinx.coroutines.flow.FlowCollector"));
         assert!(!kotlin.contains("import kotlinx.coroutines.flow.flow"));
         assert!(kotlin.contains("import java.util.concurrent.atomic.AtomicBoolean"));
-        assert!(kotlin.contains("public class UniFfiStream<T> internal constructor("));
+        assert!(kotlin.contains("public class UniFfiStream<T> private constructor("));
         assert!(kotlin.contains(") : Flow<T> {"));
         assert!(kotlin.contains("private val consumed = AtomicBoolean(false)"));
         assert!(kotlin.contains("override suspend fun collect(collector: FlowCollector<T>)"));
@@ -1743,7 +1743,7 @@ mod test {
         assert!(!kotlin.contains(") : Flow<StreamEvent>"));
         assert!(!kotlin.contains("fun `countEvents`(`count`: kotlin.UInt) : ULong"));
         let stream_wrapper = kotlin
-            .find("return UniFfiStream(")
+            .find("return UniFfiStream.rustSubscription(")
             .expect("output stream must return an owned subscription");
         let stream_start = kotlin
             .find("UniffiLib.uniffi_stream_core_fn_func_count_events(")
@@ -1770,8 +1770,9 @@ mod test {
         assert!(kotlin.contains("{ buffer -> FfiConverterTypeStreamError.read(buffer) }"));
         assert!(kotlin.contains("UniffiNullRustCallStatusErrorHandler"));
         assert!(kotlin.contains("is __UniffiStreamNext.Item -> collector.emit(step.value)"));
-        assert!(kotlin.contains("__UniffiStreamNext.Done -> break"));
-        assert!(kotlin.contains("is __UniffiStreamNext.Error -> throw step.error"));
+        let compact_kotlin = kotlin.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(compact_kotlin.contains("__UniffiStreamNext.Done -> { if (rustTerminalAcknowledgesClose) lifetime.acknowledgeRustTerminal() break }"));
+        assert!(compact_kotlin.contains("is __UniffiStreamNext.Error -> { if (rustTerminalAcknowledgesClose) lifetime.acknowledgeRustTerminal() throw step.error }"));
         assert!(!kotlin.contains("if (__streamNext == null)"));
         assert!(!kotlin.contains("emit(__streamNext)"));
         assert!(kotlin.contains("fun `optionalEvents`() : UniFfiStream<kotlin.UInt?>"));
@@ -1974,7 +1975,7 @@ mod test {
             .contains("this.uniffi_stream_core_fn_func_running_sum_input_stream_events_init("));
         assert!(kotlin.contains("UniffiLib.uniffi_stream_core_fn_func_running_sum("));
         let stream_wrapper = kotlin
-            .find("return UniFfiStream(")
+            .find("return UniFfiStream.rustSubscription(")
             .expect("output stream must return an owned subscription");
         let stream_start = kotlin
             .find("UniffiLib.uniffi_stream_core_fn_func_running_sum(")
@@ -1997,8 +1998,9 @@ mod test {
         assert!(kotlin.contains("{ buffer -> FfiConverterTypeCounterEvent.read(buffer) }"));
         assert!(kotlin.contains("{ buffer -> FfiConverterTypeStreamError.read(buffer) }"));
         assert!(kotlin.contains("is __UniffiStreamNext.Item -> collector.emit(step.value)"));
-        assert!(kotlin.contains("__UniffiStreamNext.Done -> break"));
-        assert!(kotlin.contains("is __UniffiStreamNext.Error -> throw step.error"));
+        let compact_kotlin = kotlin.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(compact_kotlin.contains("__UniffiStreamNext.Done -> { if (rustTerminalAcknowledgesClose) lifetime.acknowledgeRustTerminal() break }"));
+        assert!(compact_kotlin.contains("is __UniffiStreamNext.Error -> { if (rustTerminalAcknowledgesClose) lifetime.acknowledgeRustTerminal() throw step.error }"));
         assert!(!kotlin.contains("emit(__streamNext)"));
     }
 }

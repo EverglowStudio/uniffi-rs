@@ -91,13 +91,13 @@
 {% endmacro %}
 
 {%- macro lift_stream(callable, handle) -%}
-    UniFfiStream(
+    UniFfiStream.rustSubscription(
         next = {
             uniffiRustCallAsync(
                 UniffiLib.{{ callable.ffi_stream_next_func() }}({{ handle }}),
                 { future, callback, continuation -> UniffiLib.{{ callable.ffi_stream_next_rust_future_poll(ci) }}(future, callback, continuation) },
                 { future -> UniffiLib.{{ callable.ffi_stream_next_rust_future_cancel(ci) }}(future) },
-                { future, status -> UniffiLib.{{ callable.ffi_stream_next_rust_future_complete(ci) }}(future, status) },
+                { future, status -> UniffiLib.{{ callable.ffi_stream_next_rust_future_complete_and_free(ci) }}(future, status) },
                 { future -> UniffiLib.{{ callable.ffi_stream_next_rust_future_free(ci) }}(future) },
                 { __uniffiLiftStreamNext(
                     it,
@@ -116,7 +116,7 @@
                 UniffiLib.{{ callable.ffi_stream_close_func() }}({{ handle }}),
                 { future, callback, continuation -> UniffiLib.{{ callable.ffi_stream_close_rust_future_poll(ci) }}(future, callback, continuation) },
                 { future -> UniffiLib.{{ callable.ffi_stream_close_rust_future_cancel(ci) }}(future) },
-                { future, status -> UniffiLib.{{ callable.ffi_stream_close_rust_future_complete(ci) }}(future, status) },
+                { future, status -> UniffiLib.{{ callable.ffi_stream_close_rust_future_complete_and_free(ci) }}(future, status) },
                 { future -> UniffiLib.{{ callable.ffi_stream_close_rust_future_free(ci) }}(future) },
                 {},
                 UniffiNullRustCallStatusErrorHandler,

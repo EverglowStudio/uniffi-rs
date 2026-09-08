@@ -92,14 +92,30 @@ impl BindgenPathsLayer for CrateConfigSupplier {
     }
 
     fn get_cdylib_name(&self, crate_name: &str) -> Option<String> {
-        let pkg = self.get_package(crate_name)?;
+        let pkg = self
+            .get_package(crate_name)
+            .or_else(|| self.get_package_by_library_name(crate_name))?;
         pkg.targets
             .iter()
             .find(|t| t.is_cdylib())
             .map(|t| t.name.clone())
     }
 
+    fn get_library_name(&self, crate_name: &str) -> Option<String> {
+        let package = self
+            .get_package(crate_name)
+            .or_else(|| self.get_package_by_library_name(crate_name))?;
+        find_library_target(package).map(|target| target.name.replace('-', "_"))
+    }
+
     fn get_source_crates(&self, source_crate: &str) -> Option<Vec<SourceCrate>> {
+        // Cargo dependencies/features are keyed by package name. Rust metadata
+        // and generated helper paths use the library target name instead.
+        let source_crate = self
+            .get_package(source_crate)
+            .or_else(|| self.get_package_by_library_name(source_crate))?
+            .name
+            .as_str();
         // Packages to process
         let mut todo_stack = vec![source_crate];
         // Packages we've already processed
@@ -124,8 +140,12 @@ impl BindgenPathsLayer for CrateConfigSupplier {
                 continue;
             };
             if should_parse_package(package) {
-                if let Some(src_path) = find_src_lib(package) {
-                    found.push((package.name.to_string(), src_path.clone()));
+                if let Some(target) = find_library_target(package) {
+                    found.push((
+                        package.name.to_string(),
+                        target.name.replace('-', "_"),
+                        target.src_path.clone(),
+                    ));
                 }
             }
 
@@ -177,13 +197,13 @@ impl BindgenPathsLayer for CrateConfigSupplier {
         Some(
             found
                 .into_iter()
-                .map(|(name, src_path)| {
+                .map(|(package_name, name, src_path)| {
                     let mut features = vec![];
-                    if let Some(f) = feature_map.get(name.as_str()) {
+                    if let Some(f) = feature_map.get(package_name.as_str()) {
                         features.extend(f.iter().map(|s| s.to_string()));
                     }
-                    if enable_default_features.contains(name.as_str()) {
-                        if let Some(f) = default_feature_map.get(name.as_str()) {
+                    if enable_default_features.contains(package_name.as_str()) {
+                        if let Some(f) = default_feature_map.get(package_name.as_str()) {
                             features.extend(f.iter().map(|s| s.to_string()));
                         }
                     }
@@ -209,12 +229,11 @@ fn should_parse_package(package: &Package) -> bool {
     depends_on_uniffi && !skip_parsing
 }
 
-fn find_src_lib(package: &Package) -> Option<Utf8PathBuf> {
+fn find_library_target(package: &Package) -> Option<&cargo_metadata::Target> {
     package
         .targets
         .iter()
         .find(|t| t.is_lib() || t.is_rlib() || t.is_cdylib() || t.is_staticlib())
-        .map(|t| t.src_path.clone())
 }
 
 // Older trait for finding config paths
@@ -244,5 +263,124 @@ impl BindgenCrateConfigSupplier for CrateConfigSupplier {
         } else {
             bail!(format!("No UDL file found at '{path}'"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn package(name: &str, library: &str, kind: &str) -> Package {
+        toml::from_str(&format!(
+            r#"
+            name = "{name}"
+            version = "0.1.0"
+            id = "path+file:///fixture/{name}#0.1.0"
+            manifest_path = "/fixture/{name}/Cargo.toml"
+            [features]
+            default = ["default_api"]
+            default_api = []
+            async_api = []
+            [[targets]]
+            name = "{library}"
+            kind = ["{kind}"]
+            src_path = "/fixture/{name}/src/lib.rs"
+            [[dependencies]]
+            name = "uniffi"
+            req = "*"
+            kind = "normal"
+            optional = false
+            uses_default_features = false
+            features = []
+            "#
+        ))
+        .unwrap()
+    }
+
+    fn supplier(packages: Vec<Package>, options: CargoMetadataOptions) -> CrateConfigSupplier {
+        CrateConfigSupplier {
+            lib_to_package_map: packages
+                .iter()
+                .map(|package| {
+                    (
+                        find_library_target(package).unwrap().name.clone(),
+                        package.clone(),
+                    )
+                })
+                .collect(),
+            package_map: packages
+                .into_iter()
+                .map(|package| (package.name.replace('-', "_"), package))
+                .collect(),
+            options,
+        }
+    }
+
+    #[test]
+    fn source_identity_uses_library_name_and_features_use_package_name() {
+        let mut root = package("widget-package", "widget_core", "cdylib");
+        root.dependencies.push(
+            toml::from_str(
+                r#"
+                name = "helper-package"
+                req = "*"
+                kind = "normal"
+                optional = false
+                uses_default_features = true
+                features = ["async_api"]
+                "#,
+            )
+            .unwrap(),
+        );
+        let supplier = supplier(
+            vec![root, package("helper-package", "helper_core", "lib")],
+            CargoMetadataOptions {
+                no_default_features: true,
+                features: vec!["async_api".into()],
+                ..CargoMetadataOptions::default()
+            },
+        );
+        // Package, normalized package and Rust crate all select the same library.
+        for selector in ["widget-package", "widget_package", "widget_core"] {
+            assert_eq!(
+                supplier.get_library_name(selector).as_deref(),
+                Some("widget_core")
+            );
+            assert_eq!(
+                supplier.get_cdylib_name(selector).as_deref(),
+                Some("widget_core")
+            );
+            let sources = supplier.get_source_crates(selector).unwrap();
+            assert_eq!(sources.len(), 2);
+            let root = sources
+                .iter()
+                .find(|source| source.name == "widget_core")
+                .unwrap();
+            assert_eq!(root.src_path, "/fixture/widget-package/src/lib.rs");
+            assert_eq!(root.features, ["async_api"]);
+            let helper = sources
+                .iter()
+                .find(|source| source.name == "helper_core")
+                .unwrap();
+            let mut features = helper.features.clone();
+            features.sort();
+            assert_eq!(features, ["async_api", "default_api"]);
+        }
+    }
+
+    #[test]
+    fn static_library_name_does_not_require_a_cdylib_target() {
+        let supplier = supplier(
+            vec![package("static-package", "static_core", "staticlib")],
+            CargoMetadataOptions::default(),
+        );
+        assert_eq!(
+            supplier.get_library_name("static-package").as_deref(),
+            Some("static_core")
+        );
+        assert!(supplier.get_cdylib_name("static-package").is_none());
+        let sources = supplier.get_source_crates("static_core").unwrap();
+        assert_eq!(sources[0].name, "static_core");
+        assert_eq!(sources[0].features, ["default_api"]);
     }
 }

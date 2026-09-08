@@ -345,7 +345,7 @@ for (const carrier of [71, {handle:71}]) {
   assert.equal(seen[1][1],carrier,"cancel retains the backend lease carrier");
   await session.close();
 }
-function controlled(invoke, managed = [0, 1]) {
+function controlled(invoke, managed = [0, 1], registration = null) {
   const events = [];
   const calls = new Map();
   let next = 1;
@@ -364,6 +364,7 @@ function controlled(invoke, managed = [0, 1]) {
       events.push(["sync",id,args]); return {kind:"value",value:args[0]};
     },
     async invokeAsync(id,args) {
+      if (registration) await registration;
       events.push(["invoke",id,args]);
       if (!managed.includes(id)) return invoke(id,args,null);
       const callId = args.at(-1);
@@ -384,15 +385,17 @@ assert.throws(() => new BackendSession({},new Host(),{callControl:{create:8,canc
 
 {
   const clean = deferred();
+  const registration = deferred();
   const {session,events,calls} = controlled(async (_id,args,entry) => {
     assert.deepEqual(args.slice(0,-1),["business"]);
     await clean.promise;
     return entry.cancelled ? cancelledEnvelope() : {kind:"value",value:42};
-  });
+  }, [0, 1], registration.promise);
   const controller = new AbortController();
   const pending = session.invokeAsync(0,["business"],{signal:controller.signal});
   controller.abort();
   assert.deepEqual(events.slice(0,2),[["create",1],["cancel",1]]);
+  registration.resolve();
   await assertPending(pending,"cancel waits Rust cleanup");
   clean.resolve();
   await assert.rejects(pending,(e) => e.errorName === "UniffiCancelled" && e.domain === "internal");
@@ -657,4 +660,727 @@ assert.throws(() => new BackendSession({},new Host(),{callControl:{create:8,canc
   assert.equal(events.filter(e=>e[0]==="release").length,1);
   await session.close();
 }
-console.log("S01 runtime protocol: 22 scenarios passed; legacy callback/conversion/stream assertions passed");
+// Backend entry may immediately invoke a host callback which closes the session.
+// Its call promise must already be visible to teardown before that reentry.
+{
+  const cleanup = deferred();
+  let close;
+  const {session, events} = controlled((_id, _args, entry) => {
+    close = session.close();
+    return cleanup.promise.then(() => entry.cancelled ? cancelledEnvelope() : 1);
+  });
+  const pending = session.invokeAsync(0, []);
+  assert.ok(close, "backend entry is immediate and reentrant");
+  assert.equal(session.calls.size, 1);
+  await assertPending(close, "reentrant close retains the active call through cleanup");
+  assert.equal(events.some(event => event[0] === "engine-close"), false);
+  cleanup.resolve();
+  await assert.rejects(pending, error => error.errorName === "UniffiCancelled");
+  await close;
+  assert.equal(session.calls.size, 0);
+  assert.equal(session._waiters.size, 0);
+  assert.equal(events.filter(event => event[0] === "release").length, 1);
+}
+{
+  const {session, backend} = controlled(() => 0);
+  backend.invokeAsync = () => { throw Error("synchronous backend failure"); };
+  for (const operation of [0, 5]) {
+    await assert.rejects(session.invokeAsync(operation, []), error => error.message === "synchronous backend failure");
+    assert.equal(session.calls.size, 0);
+    assert.equal(session._waiters.size, 0);
+  }
+  await session.close();
+}
+for (const destroyAt of ["reserve", "invoke"]) {
+  let session;
+  session = new BackendSession({
+    invokeSync() {
+      if (destroyAt === "reserve") session.environmentDestroyed();
+      return {kind: "value", value: 1};
+    },
+    invokeAsync() {
+      assert.equal(destroyAt, "invoke", "do not enter the backend after destruction");
+      session.environmentDestroyed();
+      return new Promise(() => {});
+    },
+  }, new Host(), {callControl: {create: 8, cancel: 9, release: 10, operations: [0]}});
+  await assert.rejects(session.invokeAsync(0, []), error => error.errorName === "UniffiEnvironmentDestroyed");
+  assert.equal(session.calls.size, 0);
+  assert.equal(session._waiters.size, 0);
+  assert.equal(session._activeGuards, 0);
+}
+const inputLifecycleChecks = await Promise.allSettled([
+  (async () => {
+    const cleanup = deferred();
+    let entered = 0, cleaned = 0, released = 0;
+    const {session} = controlled(() => 0);
+    const source = (async function* () {
+      try { yield 1; yield 2; }
+      finally { entered++; await cleanup.promise; cleaned++; }
+    })();
+    const marker = session.createInputStream(source, {onClose: () => { released++; }});
+    try {
+      assert.deepEqual(await marker.next(), {kind: "item", value: 1});
+      const closing = marker.cancel();
+      await turn();
+      assert.equal(entered, 1, "standard async generator return must enter finally");
+      await assertPending(closing, "generator close must await finally cleanup");
+      assert.equal(cleaned, 0);
+      assert.equal(released, 0);
+      cleanup.resolve();
+      await closing;
+      await marker.cancel();
+      await marker.release();
+      assert.deepEqual([entered, cleaned, released], [1, 1, 1]);
+    } finally {
+      cleanup.resolve();
+      await source.return();
+      await session.close();
+    }
+  })(),
+  (async () => {
+    let cancelled = 0, released = 0;
+    const host = new Host();
+    host.releaseInputStream = () => { released++; };
+    const session = makeSession({close() {}}, host);
+    for (let index = 0; index < 128; index++) {
+      const marker = session.createInputStream({
+        next: () => ({done: false, value: 1}),
+        cancel: () => { cancelled++; },
+      });
+      await marker.next();
+      await marker.cancel();
+      await marker.release();
+      await marker.cancel();
+      await marker.release();
+      await host.cancelInputStream(marker.handle);
+      await host.releaseInputStream(marker.handle);
+    }
+    assert.deepEqual([cancelled, released], [128, 128], "retired input handles never release the producer twice");
+    assert.deepEqual([
+      session.inputStreams.size, session.inputHost.slots.size,
+      session.inputHost.closedHandles.size, session.inputCancelled.size,
+      session.inputReleased.size,
+    ], [0, 0, 0, 0, 0], "completed input subscriptions retain no historical promises");
+    await session.close();
+  })(),
+]);
+for (const result of inputLifecycleChecks) if (result.status === "rejected") console.error(result.reason);
+assert.equal(inputLifecycleChecks.filter(result => result.status === "rejected").length, 0, "input lifecycle checks");
+{
+  const raw = deferred(), cleanup = deferred();
+  let closing, returned = 0, released = 0;
+  const {session} = controlled(() => 0);
+  const marker = session.createInputStream({
+    next() { closing = marker.cancel(); return raw.promise; },
+    async cancel() { returned++; await cleanup.promise; },
+  }, {onClose: () => { released++; }});
+  const reading = marker.next();
+  assert.ok(closing, "input producer enters directly and may reenter cancel");
+  await assertPending(closing, "reentrant input close joins its published raw next");
+  cleanup.resolve();
+  await assertPending(closing, "producer return cannot release an active raw next");
+  assert.equal(released, 0);
+  raw.resolve({done:false,value:1});
+  assert.deepEqual(await reading, {kind:"done"});
+  await closing;
+  assert.deepEqual([returned,released], [1,1]);
+  await session.close();
+}
+{
+  const entered = deferred(), raw = deferred(), cleanup = deferred(), frame = deferred();
+  let closing, cancelled = 0, released = 0, frameEntered = 0;
+  const {session} = controlled(() => 0);
+  const stream = session.createOutputStream({
+    handle: 3,
+    next() { closing = stream.cancel(); entered.resolve(); return raw.promise; },
+    async cancel() { cancelled++; await cleanup.promise; },
+    release() { released++; },
+    async onClose() { frameEntered++; await frame.promise; },
+  });
+  const reading = assert.rejects(stream.next(), error => error.errorName === "UniffiCancelled");
+  await entered.promise;
+  await assertPending(closing, "output backend reentry joins the raw next before release");
+  cleanup.resolve();
+  await assertPending(closing, "output cleanup cannot release an active raw next");
+  assert.deepEqual([released,frameEntered], [0,0]);
+  raw.resolve({kind:"item",value:1});
+  await assertPending(closing, "output close still joins its input call frame");
+  assert.deepEqual([released,frameEntered], [1,1]);
+  frame.resolve();
+  await Promise.all([reading,closing]);
+  assert.equal(cancelled,1);
+  assert.equal(session.outputStreams.size,0);
+  assert.equal(session._waiters.size,0);
+  await session.close();
+}
+const outputEntryChecks = await Promise.allSettled([
+  (async () => {
+    for (const factory of [true, false]) {
+      const raw = deferred(), entered = deferred(), cleanup = deferred();
+      let stream, closing, guardsAtEntry, cancels = 0, releases = 0;
+      const session = makeSession({
+        invokeSync() { return {kind:"value",value:9}; },
+        invokeAsync(id) {
+          if (id === 5) {
+            guardsAtEntry = session._activeGuards;
+            closing = stream.cancel();
+            entered.resolve();
+            return raw.promise;
+          }
+          if (id === 6) { cancels++; return cleanup.promise; }
+          throw Error("unexpected stream operation");
+        },
+        releaseOutputStream() { releases++; }, close() {},
+      });
+      const type = {kind:"outputStream",inner:scalar("I32")};
+      const descriptor = {name:"oneGuard",id:2,args:[],kind:"OutputStreamStart",async:false,
+        returnType:type,streamResources:[{direction:"Output",path:"return",item:scalar("I32"),error:null,
+          slots:{OutputStreamNext:5,OutputStreamCancel:6}}]};
+      stream = factory ? invokeOperation(session,descriptor,[]) : liftValue(9,type,session,null,descriptor);
+      const reading = assert.rejects(stream.next(), error=>error.errorName === "UniffiCancelled");
+      await entered.promise;
+      await assertPending(closing,"generated stream close joins its prepublished raw guard");
+      cleanup.resolve({kind:"value"});
+      await assertPending(closing,"cleanup cannot retire the raw next frame");
+      assert.equal(releases,0);
+      raw.resolve({kind:"value",value:{kind:"item",value:1}});
+      await Promise.all([reading,closing]);
+      assert.equal(cancels,1);
+      assert.equal(releases,1);
+      assert.equal(session._activeGuards,0);
+      assert.equal(session._waiters.size,0);
+      await session.close();
+      assert.equal(guardsAtEntry,1,"a generated raw pull uses one prepublished guard");
+    }
+  })(),
+  (async () => {
+    const raw = deferred(), cleanup = deferred(), frame = deferred();
+    let reentrant, cancels = 0, releases = 0, frameEntered = 0;
+    const session = makeSession({close() {}});
+    const stream = session.createOutputStream({
+      handle:10,next:()=>raw.promise,
+      cancel() { cancels++; reentrant = stream.cancel(); return cleanup.promise; },
+      release() { releases++; },
+      async onClose() { frameEntered++; await frame.promise; },
+    });
+    const reading = assert.rejects(stream.next(),error=>error.errorName === "UniffiCancelled");
+    // Let the existing raw pull enter; the assertion concerns close entry,
+    // independently of lazy start scheduling.
+    while (session._activeGuards === 0) await Promise.resolve();
+    const closing = stream.cancel();
+    const enteredDirectly = cancels;
+    await assertPending(closing,"direct cancellation still waits for Rust cleanup");
+    cleanup.resolve();
+    await assertPending(closing,"direct cancellation still joins raw next");
+    assert.equal(releases,0);
+    raw.resolve({kind:"item",value:1});
+    await assertPending(closing,"direct cancellation still joins onClose");
+    assert.deepEqual([releases,frameEntered],[1,1]);
+    frame.resolve();
+    await Promise.all([reading,closing]);
+    assert.equal(reentrant,closing,"close is published before synchronous backend reentry");
+    assert.equal(cancels,1);
+    await session.close();
+    assert.equal(enteredDirectly,1,"active stream cancellation enters without resolved-start or scheduling hops");
+  })(),
+  (async () => {
+    for (const destroyed of [false,true]) {
+      const cleanup = deferred();
+      let guardsAtEntry, cancels = 0, releases = 0;
+      const failure = Error("raw next failed synchronously");
+      const session = makeSession({
+        invokeAsync(id) {
+          if (id === 5) {
+            guardsAtEntry = session._activeGuards;
+            if (destroyed) { session.environmentDestroyed(); return new Promise(()=>{}); }
+            throw failure;
+          }
+          assert.equal(id,6); cancels++; return cleanup.promise;
+        },
+        releaseOutputStream() { releases++; },close() {},
+      });
+      const type = {kind:"outputStream",inner:scalar("I32")};
+      const descriptor = {returnType:type,streamResources:[{direction:"Output",path:"return",item:scalar("I32"),error:null,
+        slots:{OutputStreamNext:5,OutputStreamCancel:6}}]};
+      const stream = liftValue(21,type,session,null,descriptor);
+      const reading = stream.next();
+      if (!destroyed) {
+        await assertPending(reading,"synchronous next failure still waits for cleanup");
+        assert.equal(cancels,1); assert.equal(releases,0);
+        cleanup.resolve({kind:"value"});
+      }
+      await assert.rejects(reading,error=>destroyed ? error.errorName === "UniffiEnvironmentDestroyed" : error.message === failure.message);
+      assert.equal(guardsAtEntry,1);
+      assert.equal(session._activeGuards,0); assert.equal(session._waiters.size,0);
+      if (!destroyed) { assert.equal(releases,1); await session.close(); }
+    }
+  })(),
+  (async () => {
+    for (const synchronous of [true,false]) {
+      const failure = new UniffiError({errorName:"UniffiCleanupFailed",message:"close failed"});
+      let calls = 0, released = 0, finished = 0;
+      const session = makeSession({close() {}});
+      const stream = session.createOutputStream({
+        handle:31,next:()=>({kind:"item",value:1}),
+        cancel() {calls++; if(synchronous) throw failure; return Promise.reject(failure);},
+        release() {released++;},onClose() {finished++;},
+      });
+      assert.deepEqual(await stream.next(),{done:false,value:1});
+      const closing = stream.cancel();
+      assert.equal(stream.cancel(),closing);
+      await assert.rejects(closing,error=>error === failure);
+      await assert.rejects(stream.cancel(),error=>error === failure);
+      assert.deepEqual([calls,released,finished],[1,1,1]);
+      await session.close();
+    }
+  })(),
+]);
+for (const result of outputEntryChecks) if (result.status === "rejected") console.error(result.reason);
+assert.equal(outputEntryChecks.filter(result=>result.status === "rejected").length,0,"output entry checks");
+const inputFrameChecks = await Promise.allSettled([
+  (async () => {
+    for (const rawFirst of [true, false]) for (const rejectRaw of [true, false]) for (const rejectReturn of [true, false]) {
+      const raw = deferred(), returned = deferred(), onClose = deferred(), onCloseEntered = deferred();
+      const hostRelease = deferred(), hostReleaseEntered = deferred();
+      const failure = new Error("producer return failed");
+      let closing, reentrant, returns = 0, closes = 0, releases = 0;
+      const host = new Host();
+      host.releaseInputStream = () => { releases++; hostReleaseEntered.resolve(); return hostRelease.promise; };
+      const session = makeSession({close() {}}, host);
+      const marker = session.createInputStream({
+        next() { closing = marker.cancel(); return raw.promise; },
+        cancel() {
+          returns++;
+          reentrant = marker.cancel();
+          return returned.promise.then(() => { if (rejectReturn) throw failure; });
+        },
+      }, {onClose() { closes++; onCloseEntered.resolve(); return onClose.promise; }});
+      const reading = marker.next();
+      reading.catch(() => {});
+      try {
+        assert.equal(returns, 1, "published input close enters producer return synchronously");
+        assert.equal(reentrant, closing, "producer reentry sees the already published session close");
+        await assertPending(closing, "close joins producer return and raw next");
+        const finishRaw = () => rejectRaw ? raw.reject(new Error("raw cancelled")) : raw.resolve({done:false,value:1});
+        if (rawFirst) finishRaw(); else returned.resolve();
+        await assertPending(closing, "neither raw next nor return alone acknowledges close");
+        assert.equal(closes, 0);
+        if (rawFirst) returned.resolve(); else finishRaw();
+        await onCloseEntered.promise;
+        await assertPending(closing, "onClose still owns a cleanup gate");
+        assert.equal(releases, 0);
+        onClose.resolve();
+        await hostReleaseEntered.promise;
+        await assertPending(closing, "original Host release remains awaited");
+        hostRelease.resolve();
+        if (rejectReturn) {
+          await assert.rejects(closing, error => error === failure);
+          await assert.rejects(reading, error => error === failure);
+        } else {
+          await closing;
+          assert.deepEqual(await reading, {kind:"done"});
+          await marker.release();
+          assert.equal(session.inputHost.closedHandles.size, 0);
+        }
+        assert.deepEqual([returns, closes, releases], [1, 1, 1]);
+      } finally {
+        raw.resolve({done:true}); returned.resolve(); onClose.resolve(); hostRelease.resolve();
+        await Promise.allSettled([reading, closing, reentrant]);
+        await session.close();
+      }
+    }
+  })(),
+  (async () => {
+    let reentrant, closeReentrant, returns = 0, closes = 0;
+    const session = makeSession({close() {}});
+    const marker = session.createInputStream({
+      next: () => ({done:false,value:1}),
+      cancel() { returns++; reentrant = marker.cancel(); },
+    }, {onClose() { closes++; closeReentrant = marker.cancel(); }});
+    const closing = marker.cancel();
+    try {
+      assert.equal(returns, 1, "idle input close has no empty dispatch before return");
+      assert.equal(closes, 1, "synchronous producer cleanup can enter onClose directly");
+      assert.equal(reentrant, closing);
+      assert.equal(closeReentrant, closing);
+      await closing;
+      await marker.release();
+      assert.deepEqual([returns,closes], [1,1]);
+      assert.deepEqual([session.inputHost.slots.size,session.inputHost.closedHandles.size,
+        session.inputCancelled.size,session.inputReleased.size], [0,0,0,0]);
+    } finally { await closing; await session.close(); }
+  })(),
+  (async () => {
+    for (const mode of ["next-throw", "next-reject", "lower-throw", "error-step"]) {
+      const failure = new Error("bad item"), returned = deferred(), onClose = deferred();
+      const returnEntered = deferred(), closeEntered = deferred();
+      let returns = 0, closes = 0;
+      const session = makeSession({close() {}});
+      const marker = session.createInputStream({
+        next() {
+          if (mode === "next-throw") throw failure;
+          if (mode === "next-reject") return Promise.reject(failure);
+          if (mode === "error-step") return {kind:"error",error:failure};
+          return {done:false,value:1};
+        },
+        cancel() { returns++; returnEntered.resolve(); return returned.promise; },
+      }, {
+        lowerItem() { throw failure; },
+        lowerError(error) { assert.equal(error,failure); return "declared-item-error"; },
+        onClose() { closes++; closeEntered.resolve(); return onClose.promise; },
+      });
+      const reading = marker.next();
+      try {
+        await returnEntered.promise;
+        await assertPending(reading,"item error cannot precede producer cleanup");
+        returned.resolve();
+        await closeEntered.promise;
+        await assertPending(reading,"item error cannot precede onClose");
+        onClose.resolve();
+        assert.deepEqual(await reading,{kind:"error",error:"declared-item-error"});
+        await marker.release();
+        assert.deepEqual([returns,closes],[1,1]);
+      } finally { returned.resolve(); onClose.resolve(); await reading; await session.close(); }
+    }
+  })(),
+  (async () => {
+    const raw = deferred(), cleanup = deferred(), closeEntered = deferred();
+    const failure = new Error("synchronous return failed");
+    let closes = 0;
+    const session = makeSession({close() {}});
+    const marker = session.createInputStream({next: () => raw.promise, cancel() { throw failure; }}, {
+      onClose() { closes++; closeEntered.resolve(); return cleanup.promise; },
+    });
+    const reading = marker.next(), closing = marker.cancel();
+    reading.catch(() => {});
+    try {
+      await assertPending(closing,"synchronous return failure still joins the raw producer");
+      assert.equal(closes,0);
+      raw.resolve({done:false,value:1});
+      await closeEntered.promise;
+      await assertPending(closing,"synchronous return failure still joins onClose");
+      cleanup.resolve();
+      await assert.rejects(closing,error=>error===failure);
+      await assert.rejects(reading,error=>error===failure);
+      assert.equal(closes,1);
+    } finally {
+      raw.resolve({done:true}); cleanup.resolve();
+      await Promise.allSettled([reading,closing]); await session.close();
+    }
+  })(),
+  (async () => {
+    const raw = deferred();
+    let pulls = 0, reentrant;
+    const session = makeSession({close() {}});
+    const marker = session.createInputStream({
+      next() { pulls++; return pulls === 1 ? raw.promise : {done:true}; },
+    }, {lowerItem(value) { reentrant = marker.next(); reentrant.catch(() => {}); return value; }});
+    const reading = marker.next();
+    try {
+      await assert.rejects(marker.next(),error=>error.errorName==="UniffiInputStreamConcurrentNext");
+      raw.resolve({done:false,value:7});
+      assert.deepEqual(await reading,{kind:"item",value:7});
+      await assert.rejects(reentrant,error=>error.errorName==="UniffiInputStreamConcurrentNext");
+      assert.equal(pulls,1,"reservation includes conversion after raw completion");
+      assert.deepEqual(await marker.next(),{kind:"done"});
+      await marker.release();
+      assert.equal(pulls,2);
+    } finally { raw.resolve({done:true}); await reading; await session.close(); }
+  })(),
+]);
+for (const result of inputFrameChecks) if (result.status === "rejected") console.error(result.reason);
+assert.equal(inputFrameChecks.filter(result=>result.status === "rejected").length,0,"input frame checks");
+// S08: an ordinary scalar facade may finish on the managed call's published
+// guard. The final value/frame and the raw terminal error keep their own roles.
+const scalarOperation = {
+  name:"scalarCompletion",id:0,args:[{name:"value",type:scalar("I32")}],
+  returnType:scalar("U64"),async:true,
+};
+for (const [returnType,raw,wanted] of [
+  [scalar("U64"),"18446744073709551615",18446744073709551615n],
+  [scalar("Bool"),true,true],
+  [null,null,undefined],
+]) {
+  let published,ended=0,received;
+  const session=makeSession({invokeAsync(_id,args) {
+    published=[...session.calls.values()][0].promise;
+    received=args;
+    assert.equal(session._activeGuards,1,"guard is published before backend entry");
+    return {kind:"value",value:raw};
+  },close() {}});
+  const originalEnd=session.endCallFrame.bind(session);
+  session.endCallFrame=(frame)=>{ended++;return originalEnd(frame);};
+  const pending=invokeOperation(session,{...scalarOperation,returnType},[7]);
+  assert.equal(pending,published,"scalar facade returns the same final published guard");
+  assert.equal(session.frameCleanups.has(pending),true,"final guard remains tracked");
+  assert.equal(await pending,wanted);
+  assert.deepEqual(received,[7,1]);
+  assert.equal(ended,1);
+  assert.equal(session.frameCleanups.size,0);
+  assert.equal(session.calls.size,0);
+  // Direct BackendSession users still receive the unconverted backend value.
+  assert.equal(await session.invokeAsync(0,[7]),raw);
+  await session.close();
+}
+{
+  const reply=deferred(),frameCleanup=deferred();let ended=0,closed=0;
+  const session=makeSession({invokeAsync:()=>reply.promise,close(){closed++;}});
+  const originalEnd=session.endCallFrame.bind(session);
+  session.endCallFrame=(frame)=>{ended++;originalEnd(frame);return frameCleanup.promise;};
+  const pending=invokeOperation(session,scalarOperation,[7]);
+  const closing=session.close();
+  // Model a Rust result committed before close's cancellation request.
+  reply.resolve({kind:"value",value:"42"});
+  await assertPending(pending,"conversion joins the actual frame cleanup");
+  await assertPending(closing,"session close joins the final scalar guard");
+  assert.equal(ended,1);assert.equal(closed,0);
+  frameCleanup.resolve();assert.equal(await pending,42n);await closing;
+  assert.equal(closed,1);assert.equal(session.frameCleanups.size,0);
+}
+for (const mode of ["lift-error","backend-error","release-error"]) {
+  const reply=deferred();let ended=0;
+  const {session,backend}=controlled(()=>reply.promise);
+  const originalControl=backend.invokeSync;
+  backend.invokeSync=(id,args)=>{
+    if(mode==="release-error"&&id===10) throw new UniffiError({errorName:"ReleaseProbe",message:"release failed"});
+    return originalControl(id,args);
+  };
+  const originalEnd=session.endCallFrame.bind(session);
+  session.endCallFrame=(frame)=>{ended++;return originalEnd(frame);};
+  const pending=invokeOperation(session,{...scalarOperation,returnType:scalar("U8")},[7]);
+  const closing=session.close();
+  reply.resolve(mode==="backend-error"
+    ? {kind:"error",error:{domain:"internal",errorName:"BackendProbe",message:"backend failed"}}
+    : {kind:"value",value:mode==="lift-error"?256:1});
+  const errorName={"lift-error":"UniffiNumericError","backend-error":"BackendProbe","release-error":"ReleaseProbe"}[mode];
+  await assert.rejects(pending,e=>e.errorName===errorName);
+  if(mode==="lift-error") await closing;
+  else await assert.rejects(closing,e=>e.errorName===errorName);
+  assert.equal(ended,1,"even a control release failure ends the call frame");
+  assert.equal(session.calls.size,0);assert.equal(session.frameCleanups.size,0);
+}
+for (const mode of ["pre-abort","argument","admission"]) {
+  let entries=0,ended=0;
+  const session=makeSession({invokeAsync(){entries++;return {kind:"value",value:1};},close(){}});
+  const originalEnd=session.endCallFrame.bind(session);
+  session.endCallFrame=(frame)=>{ended++;return originalEnd(frame);};
+  const controller=new AbortController();
+  if(mode==="pre-abort") controller.abort();
+  if(mode==="admission") session.backend.invokeSync=()=>({kind:"value",value:-1});
+  const pending=invokeOperation(session,scalarOperation,[mode==="argument"?null:7,{signal:controller.signal}]);
+  const errorName={"pre-abort":"UniffiCancelled","argument":"UniffiNumericError","admission":"UniffiCallControl"}[mode];
+  await assert.rejects(pending,e=>e.errorName===errorName);
+  assert.equal(entries,0);assert.equal(ended,1);
+  assert.equal(session.frameCleanups.size,0);assert.equal(session.calls.size,0);
+  await session.close();
+}
+{
+  const registration=deferred(),cleanup=deferred();let ended=0;
+  const {session,events,calls}=controlled(async(_id,_args,entry)=>{
+    await cleanup.promise;assert.equal(entry.cancelled,true);return cancelledEnvelope();
+  },[0],registration.promise);
+  const originalEnd=session.endCallFrame.bind(session);
+  session.endCallFrame=(frame)=>{ended++;return originalEnd(frame);};
+  const controller=new AbortController();
+  const pending=invokeOperation(session,scalarOperation,[7,{signal:controller.signal}]);
+  controller.abort();const closing=session.close();registration.resolve();
+  await assertPending(pending,"pre-registration cancellation joins Rust cleanup");
+  await assertPending(closing,"close cannot bypass the cancelled scalar cleanup");
+  assert.equal(ended,0);cleanup.resolve();
+  await assert.rejects(pending,e=>e.errorName==="UniffiCancelled");await closing;
+  assert.equal(ended,1);assert.equal(calls.size,0);
+  assert.equal(events.filter(e=>e[0]==="cancel").length,1);
+  assert.equal(events.filter(e=>e[0]==="release").length,1);
+}
+for (const mode of ["value","throw","destroy"]) {
+  let published,closing,ended=0;
+  const session=makeSession({invokeAsync() {
+    published=[...session.calls.values()][0].promise;
+    closing=session.close();
+    if(mode==="throw") throw new UniffiError({errorName:"SyncProbe",message:"sync failure"});
+    if(mode==="destroy") session.environmentDestroyed();
+    return {kind:"value",value:"42"};
+  },close(){}});
+  const originalEnd=session.endCallFrame.bind(session);
+  session.endCallFrame=(frame)=>{ended++;return originalEnd(frame);};
+  const pending=invokeOperation(session,scalarOperation,[7]);
+  assert.equal(pending,published,"synchronous reentry shares the published final guard");
+  if(mode==="value") {assert.equal(await pending,42n);await closing;}
+  else {
+    const errorName=mode==="throw"?"SyncProbe":"UniffiEnvironmentDestroyed";
+    await assert.rejects(pending,e=>e.errorName===errorName);
+    await assert.rejects(closing,e=>e.errorName===errorName);
+  }
+  assert.equal(ended,1);assert.equal(session.calls.size,0);assert.equal(session.frameCleanups.size,0);
+}
+{
+  let published,received;
+  const session=makeSession({invokeAsync(_id,args){published=[...session.calls.values()][0].promise;received=args;return {kind:"value",value:"42"};},close(){}});
+  const descriptor={...scalarOperation,receiver:true,ownerSurface:"object"};
+  const carrier={handle:51};
+  const pending=invokeOperation(session,descriptor,[carrier,7]);
+  assert.equal(pending,published);assert.equal(await pending,42n);
+  assert.deepEqual(received,[carrier,7,1],"the engine retains its original receiver carrier");
+  let customLifts=0;
+  const custom={kind:"named",name:"Tagged",typeId:701};
+  const customDescriptor={...scalarOperation,returnType:custom,context:{types:{701:{kind:"custom",builtin:scalar("U64"),intoCustom:value=>{customLifts++;return {value};}}}}};
+  const customResult=invokeOperation(session,customDescriptor,[7]);
+  assert.notEqual(customResult,published,"custom conversion keeps its general facade path");
+  assert.deepEqual(await customResult,{value:42n});assert.equal(customLifts,1);
+  await session.close();
+}
+
+// A hard destruction settles the published call once. A later raw value or
+// rejection must not revive a detached session or run its cleanup hooks again.
+for (const managed of [true, false]) {
+  for (const lateFailure of [false, true]) {
+    const reply = deferred();
+    const {session, events, calls} = controlled(() => reply.promise, managed ? [0] : []);
+    const pending = session.invokeAsync(0, []);
+    const closing = session.close();
+    session.environmentDestroyed();
+    await assert.rejects(pending, error => error.errorName === "UniffiEnvironmentDestroyed");
+    await assert.rejects(closing, error => error.errorName === "UniffiEnvironmentDestroyed");
+    const controls = events.filter(event => ["cancel", "release", "engine-close"].includes(event[0]));
+    if (lateFailure) reply.reject(new UniffiError({errorName: "LateFailure", message: "late raw error"}));
+    else reply.resolve({kind: "value", value: 42});
+    await turn();
+    assert.deepEqual(events.filter(event => ["cancel", "release", "engine-close"].includes(event[0])), controls);
+    assert.equal(session.calls.size, 0);
+    assert.equal(session._waiters.size, 0);
+    assert.equal(session._activeGuards, 0);
+    assert.equal(calls.size, 0);
+  }
+}
+// Release can synchronously initiate close while settlement has already
+// removed the detach waiter. Teardown must retain the call and its raw error
+// until the same scalar promise finishes its actual frame cleanup.
+for (const releaseFailure of [false, true]) {
+  const reply = deferred(), frameCleanup = deferred();
+  const controller = new AbortController();
+  let closing, releases = 0, ended = 0;
+  const {session, backend, events} = controlled(() => reply.promise);
+  const originalControl = backend.invokeSync;
+  backend.invokeSync = (id, args) => {
+    if (id === 10) {
+      releases++;
+      closing = session.close();
+      if (releaseFailure) throw new UniffiError({errorName: "ReleaseReentry", message: "release failed after close entry"});
+    }
+    return originalControl(id, args);
+  };
+  const originalEnd = session.endCallFrame.bind(session);
+  session.endCallFrame = frame => {
+    ended++;
+    originalEnd(frame);
+    return frameCleanup.promise;
+  };
+  const pending = invokeOperation(session, scalarOperation, [7, {signal: controller.signal}]);
+  controller.abort();
+  reply.resolve({kind: "value", value: "42"});
+  await turn();
+  assert.ok(closing, "release entered teardown synchronously");
+  assert.equal(session.calls.size, 0, "the call was removed before its frame acknowledgement");
+  assert.equal(ended, 1);
+  assert.equal(events.some(event => event[0] === "engine-close"), false);
+  await assertPending(pending, "release settlement keeps frame cleanup awaited");
+  await assertPending(closing, "teardown retains the settled call's pending frame and error");
+  frameCleanup.resolve();
+  if (releaseFailure) {
+    await assert.rejects(pending, error => error.errorName === "ReleaseReentry");
+    await assert.rejects(closing, error => error.errorName === "ReleaseReentry");
+  } else {
+    assert.equal(await pending, 42n);
+    await closing;
+  }
+  assert.equal(releases, 1);
+  assert.equal(ended, 1);
+  assert.equal(events.filter(event => event[0] === "engine-close").length, 1);
+  assert.equal(session.frameCleanups.size, 0);
+  assert.equal(session._waiters.size, 0);
+  assert.equal(session._activeGuards, 0);
+}
+
+// Empty frames still leave the active stack, and a failed registration must
+// not leave a placeholder to be cancelled alongside the next valid input.
+{
+  const {session} = controlled(() => 0);
+  const outer = session.beginCallFrame();
+  const empty = session.beginCallFrame();
+  assert.notEqual(outer, empty);
+  assert.equal(session.endCallFrame(empty), undefined);
+  assert.equal(session.endCallFrame(empty), undefined);
+  const id = session.registerCallback(90, () => 7, {retention: "scoped", methods: {0: {name: null}}});
+  assert.equal(session.invokeCallbackSync(90, id, 0, []), 7);
+  const registrationError = new Error("input registration failed");
+  assert.throws(() => session.createInputStream({get next() {throw registrationError;}}), error => error === registrationError);
+  let returned = 0, closed = 0;
+  const marker = session.createInputStream({next: () => ({done: false, value: 1}), cancel: () => {returned++;}}, {onClose: () => {closed++;}});
+  const cancelled = [];
+  const originalCancel = session.cancelInputStream.bind(session);
+  session.cancelInputStream = handle => {assert.equal(handle, marker.handle); cancelled.push(handle); return originalCancel(handle);};
+  await session.endCallFrame(outer);
+  assert.equal(returned, 1);
+  assert.equal(closed, 1);
+  assert.ok(cancelled.length > 0);
+  assert.equal(session.callbacks.callbacks.size, 0);
+  assert.equal(session.inputStreams.size, 0);
+  await session.close();
+}
+// The nonempty input snapshot must survive synchronous onClose splices. A
+// producer can also close its sibling and reenter end before cleanup is stored.
+for (const crossCancel of [false, true]) {
+  const {session} = controlled(() => 0);
+  const frame = session.beginCallFrame(), cleanup = deferred();
+  const returned = [0, 0], closed = [0, 0], released = [];
+  let second, reentrant;
+  session.createInputStream({next: () => ({done: false, value: 1}), cancel: () => {returned[0]++;}}, {onClose: () => {
+    closed[0]++;
+    if (crossCancel) second.cancel();
+    reentrant = session.endCallFrame(frame);
+  }});
+  second = session.createInputStream({next: () => ({done: false, value: 2}), cancel: () => {returned[1]++;}}, {onClose: () => {
+    closed[1]++;
+    return cleanup.promise;
+  }});
+  const originalRelease = session.host.releaseInputStream.bind(session.host);
+  session.host.releaseInputStream = handle => {released.push(handle); return originalRelease(handle);};
+  const closing = session.endCallFrame(frame);
+  assert.deepEqual(returned, [1, 1]);
+  assert.deepEqual(closed, [1, 1]);
+  assert.equal(reentrant, undefined, "collecting end retains its existing reentry timing");
+  assert.equal(session.endCallFrame(frame), closing);
+  await assertPending(closing, "both synchronous splices still retain the sibling cleanup gate");
+  cleanup.resolve();
+  await closing;
+  assert.equal(session.endCallFrame(frame), closing);
+  assert.equal(released.length, 2);
+  assert.equal(new Set(released).size, 2);
+  assert.deepEqual(returned, [1, 1]);
+  assert.deepEqual(closed, [1, 1]);
+  await session.close();
+}
+{
+  const {session} = controlled(() => 0);
+  const frame = session.beginCallFrame(), siblingCleanup = deferred();
+  const failure = new UniffiError({errorName: "FrameCleanup", message: "producer cleanup failed"});
+  const returned = [0, 0], closed = [0, 0], releaseCalls = [];
+  session.createInputStream({next: () => ({done: false, value: 1}), cancel: () => {returned[0]++; throw failure;}}, {onClose: () => {closed[0]++;}});
+  session.createInputStream({next: () => ({done: false, value: 2}), cancel: () => {returned[1]++;}}, {onClose: () => {closed[1]++; return siblingCleanup.promise;}});
+  const originalRelease = session.releaseInputStream.bind(session);
+  session.releaseInputStream = handle => {releaseCalls.push(handle); return originalRelease(handle);};
+  const closing = session.endCallFrame(frame);
+  await assertPending(closing, "failed cleanup cannot skip its sibling");
+  siblingCleanup.resolve();
+  await assert.rejects(closing, error => error === failure);
+  assert.equal(session.endCallFrame(frame), closing);
+  await assert.rejects(session.endCallFrame(frame), error => error === failure);
+  assert.deepEqual(returned, [1, 1]);
+  assert.deepEqual(closed, [1, 1]);
+  assert.equal(releaseCalls.length, 2);
+  assert.equal(new Set(releaseCalls).size, 2);
+  await assert.rejects(session.close(), error => error === failure);
+}
+
+console.log("S01 runtime protocol: 22 scenarios passed; legacy callback/conversion/stream assertions passed; S08 immediate-entry, input lifecycle, raw-next reentry, single-guard, lazy input-frame and scalar completion checks passed; shared-state late delivery and release reentry 6 checks passed; call-frame collection lifecycle 4 checks passed");

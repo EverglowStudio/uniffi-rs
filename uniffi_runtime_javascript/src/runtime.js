@@ -61,6 +61,7 @@ function closedError() {
 }
 
 const DETACHED = Symbol("uniffi-detached");
+const EMPTY_CALL_OPTIONS = Object.freeze({});
 function cancelledError() {
   return new UniffiError({ domain: "internal", errorName: "UniffiCancelled", message: "call cancelled" });
 }
@@ -517,9 +518,10 @@ function installHostRegistries(host) {
     const callerClose = options.onClose;
     return inputHost.add(source, {
       ...options,
-      onClose: async (handle) => {
-        await callerClose?.(handle);
-        if (original.releaseInputStream) await original.releaseInputStream.call(this, handle);
+      onClose: (handle) => {
+        const release = () => original.releaseInputStream?.call(this, handle);
+        const cleanup = callerClose?.(handle);
+        return cleanup === undefined ? release() : Promise.resolve(cleanup).then(release);
       },
     });
   };
@@ -531,6 +533,7 @@ function installHostRegistries(host) {
       return registries.session ? registries.session.trackCallResult(Promise.resolve(result)) : result;
     }
     if (inputHost.closedHandles.has(handle)) return Promise.resolve({ kind: "done" });
+    if (inputHost.ownsHandle(handle)) return inputHost.pullInputStream(handle);
     if (original.pullInputStream) {
       const result = original.pullInputStream.call(this, handle);
       Promise.resolve(result).catch(() => {});
@@ -545,7 +548,7 @@ function installHostRegistries(host) {
       Promise.resolve(result).catch(() => {});
       return registries.session ? registries.session.trackCallResult(Promise.resolve(result)) : result;
     }
-    if (inputHost.closedHandles.has(handle)) return inputHost.cancelInputStream(handle);
+    if (inputHost.ownsHandle(handle)) return inputHost.cancelInputStream(handle);
     if (original.cancelInputStream) {
       const result = original.cancelInputStream.call(this, handle);
       Promise.resolve(result).catch(() => {});
@@ -556,7 +559,7 @@ function installHostRegistries(host) {
   host.releaseInputStream = function releaseInputStream(handle) {
     if (registries.detached) return undefined;
     if (inputHost.slots.has(handle)) return inputHost.releaseInputStream(handle);
-    if (inputHost.closedHandles.has(handle)) return inputHost.releaseInputStream(handle);
+    if (inputHost.ownsHandle(handle)) return inputHost.releaseInputStream(handle);
     if (original.releaseInputStream) return original.releaseInputStream.call(this, handle);
     return undefined;
   };
@@ -571,13 +574,19 @@ class InputStreamHost extends Host {
     this.closedHandles = new Map();
   }
 
+  // Handles are never reused. Retired subscriptions need no stored promise to
+  // distinguish them from resources owned by a supplied Host implementation.
+  ownsHandle(handle) {
+    return Number.isSafeInteger(handle) && handle > 0 && handle < this.nextHandle;
+  }
+
   add(source, options = {}) {
     const isPullSource = source && typeof source.next === "function";
     const isAsyncIterable = source && typeof source[Symbol.asyncIterator] === "function";
     if (!isPullSource && !isAsyncIterable) throw new UniffiError({ errorName: "UniffiInputStreamType", message: "expected a pull source or AsyncIterable for input stream" });
     const handle = this.nextHandle++;
     const iterator = isPullSource
-      ? { next: () => source.next(), return: () => typeof source.cancel === "function" ? source.cancel() : undefined }
+      ? { next: () => source.next(), return: () => typeof source.cancel === "function" ? source.cancel() : source.return?.() }
       : source[Symbol.asyncIterator]();
     this.slots.set(handle, {
       iterator, handle,
@@ -599,18 +608,36 @@ class InputStreamHost extends Host {
   _close(slot, cancel) {
     if (slot.closePromise) return slot.closePromise;
     slot.closed = true;
-    // Defer user callbacks until closePromise is installed, allowing reentry.
-    slot.closePromise = Promise.resolve().then(async () => {
-      const returned = cancel && typeof slot.iterator.return === "function"
-        ? Promise.resolve().then(() => slot.iterator.return()) : Promise.resolve();
-      const results = await Promise.allSettled([returned, slot.pending]);
-      try { if (!slot.detached) await slot.onClose?.(slot.handle); }
+    let resolve, reject;
+    slot.closePromise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    slot.closePromise.then(() => this.closedHandles.delete(slot.handle), () => {});
+    this.closedHandles.set(slot.handle, slot.closePromise);
+    // Publish both close lookups before entering a reentrant producer. Raw
+    // pulls need an extra completion promise only if close actually joins one.
+    const raw = slot.pending;
+    const pending = raw && !raw.settled
+      ? new Promise((done) => { raw.resolve = done; }) : null;
+    (async () => {
+      let returned, failure, failed = false;
+      try {
+        if (cancel && typeof slot.iterator.return === "function") returned = slot.iterator.return();
+      } catch (error) { failure = error; failed = true; }
+      if (pending) {
+        const results = await Promise.allSettled([returned, pending]);
+        if (results[0].status === "rejected") { failure = results[0].reason; failed = true; }
+      } else if (returned !== undefined) {
+        try { await returned; } catch (error) { failure = error; failed = true; }
+      }
+      try {
+        if (!slot.detached) {
+          const cleanup = slot.onClose?.(slot.handle);
+          if (cleanup !== undefined) await cleanup;
+        }
+      }
       finally { this.slots.delete(slot.handle); }
       // A producer's pending next may reject because cancellation was requested.
-      if (results[0].status === "rejected") throw results[0].reason;
-    });
-    slot.closePromise.catch(() => {});
-    this.closedHandles.set(slot.handle, slot.closePromise);
+      if (failed) throw failure;
+    })().then(resolve, reject);
     return slot.closePromise;
   }
 
@@ -618,9 +645,19 @@ class InputStreamHost extends Host {
     const slot = this.slots.get(handle);
     if (!slot || slot.closed) { await this.closedHandles.get(handle); return { kind: "done" }; }
     if (slot.pending) throw new UniffiError({ errorName: "UniffiInputStreamConcurrentNext", message: "concurrent input stream pull" });
-    slot.pending = Promise.resolve().then(() => slot.iterator.next());
+    const raw = { settled: false, resolve: null };
+    slot.pending = raw;
+    // Keep the concurrency reservation through the entire pull. Only the raw
+    // producer settlement is joined by close, which this pull may itself await.
     try {
-      const result = await slot.pending;
+      let result;
+      try { result = await slot.iterator.next(); }
+      finally {
+        raw.settled = true;
+        const resolve = raw.resolve;
+        raw.resolve = null;
+        resolve?.();
+      }
       if (slot.closed) { await slot.closePromise; return { kind: "done" }; }
       if (result?.kind === "done" || result?.done === true) {
         await this._close(slot, false);
@@ -698,41 +735,45 @@ export class BackendSession {
     return generation === this.generation && !this.detached && this.phase !== "closed";
   }
 
-  _guardPromise(promise, generation = this.generation) {
-    let waiter;
+  _createGuard(generation = this.generation, onValue, onError) {
+    let resolve;
+    let reject;
+    const promise = new Promise((success, failure) => { resolve = success; reject = failure; });
     this._activeGuards += 1;
-    const guarded = new Promise((resolve, reject) => {
-      waiter = {
-        settle: () => {
-          if (!this._waiters.delete(waiter)) return;
-          this._activeGuards -= 1;
-          this._notifyIdle();
-          resolve(DETACHED);
-        },
-      };
-      this._waiters.add(waiter);
-      Promise.resolve(promise).then((value) => {
-        if (!this._waiters.delete(waiter)) return;
-        this._activeGuards -= 1;
-        this._notifyIdle();
-        resolve(this._generationActive(generation) ? value : DETACHED);
-      }, (error) => {
-        if (!this._waiters.delete(waiter)) return;
-        this._activeGuards -= 1;
-        this._notifyIdle();
-        if (this._generationActive(generation)) reject(error);
-        else resolve(DETACHED);
-      });
-    });
-    // A caller may intentionally fire-and-forget an operation while close is
-    // detaching.  Mark the guarded promise handled without changing the
-    // promise returned to that caller.
-    guarded.catch(() => {});
-    return guarded;
+    const settle = (value, failed) => {
+      if (!this._waiters.delete(guard)) return;
+      this._activeGuards -= 1;
+      this._notifyIdle();
+      if (!this._generationActive(generation)) { value = DETACHED; failed = false; }
+      try {
+        if (failed) {
+          if (onError) resolve(onError(value));
+          else reject(value);
+        } else resolve(onValue ? onValue(value) : value);
+      } catch (error) { reject(error); }
+    };
+    const guard = {
+      promise,
+      resolve: (value) => settle(value, false),
+      reject: (error) => settle(error, true),
+      settle: () => settle(DETACHED, false),
+    };
+    this._waiters.add(guard);
+    // Install the promise and detach waiter before invoking code that can
+    // synchronously reenter close. Conversion/cleanup shares this settlement.
+    promise.catch(() => {});
+    return guard;
+  }
+
+  _guardPromise(promise, generation = this.generation) {
+    const guard = this._createGuard(generation);
+    if (!this._generationActive(generation)) guard.resolve(DETACHED);
+    Promise.resolve(promise).then(guard.resolve, guard.reject);
+    return guard.promise;
   }
 
   _notifyIdle() {
-    if (this._activeGuards !== 0) return;
+    if (this._activeGuards !== 0 || this._idleWaiters.size === 0) return;
     for (const resolve of [...this._idleWaiters]) {
       this._idleWaiters.delete(resolve);
       resolve();
@@ -769,15 +810,15 @@ export class BackendSession {
     return unwrapEnvelope(raw);
   }
 
-  invokeAsync(operationId, args = [], options = {}) {
+  invokeAsync(operationId, args = [], options = EMPTY_CALL_OPTIONS) {
     return this._invokeAsync(operationId, args, options, false);
   }
 
   _invokeCleanupAsync(operationId, args = []) {
-    return this._invokeAsync(operationId, args, {}, true);
+    return this._invokeAsync(operationId, args, EMPTY_CALL_OPTIONS, true);
   }
 
-  _invokeAsync(operationId, args, options, cleanup) {
+  _invokeAsync(operationId, args, options, cleanup, onValue, onError) {
     let signal;
     let callId;
     try {
@@ -795,55 +836,81 @@ export class BackendSession {
         this.callIdLimit = first + 4095;
       }
       callId = this.nextCallId++;
-    } catch (raw) { return Promise.reject(asUniffiError(raw)); }
-    const state = { cancelled: false, promise: null, controlError: null, cancel: null };
-    state.cancel = () => {
-      if (state.cancelled || this.detached) return;
-      state.cancelled = true;
-      try { this._control("cancel", [callId]); }
-      catch (error) { state.controlError = asUniffiError(error); }
-    };
-    this.calls.set(callId, state);
-    signal?.addEventListener("abort", state.cancel, { once: true });
-    if (signal?.aborted) state.cancel();
-    const call = Promise.resolve().then(() => {
-      if (this.detached) throw environmentDestroyedError();
-      return this.backend.invokeAsync(operationId, [...args, callId]);
-    });
+    } catch (raw) {
+      const error = asUniffiError(raw);
+      if (!onError) return Promise.reject(error);
+      try { return Promise.resolve(onError(error)); }
+      catch (failure) { return Promise.reject(failure); }
+    }
     const finish = () => {
-      signal?.removeEventListener("abort", state.cancel);
+      signal?.removeEventListener("abort", guard.cancel);
       // Rust releases ordinary calls after cleanup. A cancelled call also
       // acknowledges any cancellation that arrived after its Rust lease ended.
-      try { if (!this.detached && state.cancelled) this._control("release", [callId]); }
+      try { if (!this.detached && guard.cancelled) this._control("release", [callId]); }
       finally { this.calls.delete(callId); }
     };
-    const exposed = this._guardPromise(call).then((raw) => {
+    const guard = this._createGuard(this.generation, (raw) => {
+      let value;
       try {
-        if (raw === DETACHED) throw environmentDestroyedError();
-        // Rust owns the terminal decision, including cancellation/completion races.
-        const value = unwrapEnvelope(raw);
-        if (state.controlError) throw state.controlError;
-        return value;
-      } catch (error) { throw asUniffiError(error); }
-      finally { finish(); }
+        try {
+          if (raw === DETACHED) throw environmentDestroyedError();
+          // Rust owns the terminal decision, including cancellation/completion races.
+          value = unwrapEnvelope(raw);
+          if (guard.controlError) throw guard.controlError;
+        } catch (error) { throw asUniffiError(error); }
+        finally { finish(); }
+      } catch (error) {
+        guard.terminalError = error;
+        if (onError) return onError(error);
+        throw error;
+      }
+      return onValue ? onValue(value) : value;
     }, (error) => {
-      try { throw asUniffiError(error); }
-      finally { finish(); }
+      try {
+        try { throw asUniffiError(error); }
+        finally { finish(); }
+      } catch (failure) {
+        guard.terminalError = failure;
+        if (onError) return onError(failure);
+        throw failure;
+      }
     });
-    state.promise = exposed;
-    exposed.catch(() => {});
-    return exposed;
+    // The published guard also owns managed cancellation and terminal state.
+    // Keep those fields after Map removal: teardown may still retain the guard.
+    guard.cancelled = false;
+    guard.controlError = null;
+    guard.terminalError = null;
+    guard.cancel = () => {
+      if (guard.cancelled || this.detached) return;
+      guard.cancelled = true;
+      try { this._control("cancel", [callId]); }
+      catch (error) { guard.controlError = asUniffiError(error); }
+    };
+    this.calls.set(callId, guard);
+    signal?.addEventListener("abort", guard.cancel, { once: true });
+    if (signal?.aborted) guard.cancel();
+    try {
+      if (this.detached) throw environmentDestroyedError();
+      Promise.resolve(this.backend.invokeAsync(operationId, [...args, callId])).then(guard.resolve, guard.reject);
+    } catch (error) { guard.reject(error); }
+    return guard.promise;
   }
 
   // Resource stream slots and host-dispatched operations have their own lifecycle.
   // They are explicitly absent from the generated managed-operation set.
-  _invokeHostAsync(operationId, args = []) {
-    if (this.detached || this.phase === "closed") return Promise.reject(closedError());
-    assertOperationId(operationId);
-    return this._guardPromise(Promise.resolve().then(() => this.backend.invokeAsync(operationId, args))).then((raw) => {
+  _invokeHostAsync(operationId, args = [], publishedGuard = null) {
+    const guard = publishedGuard || this._createGuard(this.generation, (raw) => {
       if (raw === DETACHED) throw environmentDestroyedError();
       return unwrapEnvelope(raw);
     });
+    try {
+      if (this.detached || this.phase === "closed") throw closedError();
+      assertOperationId(operationId);
+      if (typeof this.backend.invokeAsync !== "function") throw new UniffiError({ errorName: "UniffiBackendProtocol", message: "backend does not implement invokeAsync(operationId, args)" });
+      Promise.resolve(this.backend.invokeAsync(operationId, args)).then(guard.resolve, guard.reject);
+    }
+    catch (error) { guard.reject(error); }
+    return guard.promise;
   }
 
   releaseObject(handle) {
@@ -865,7 +932,7 @@ export class BackendSession {
     const frame = frameState?.active[frameState.active.length - 1];
     if (frame) {
       this.callbacks.frameRetain(typeId, id);
-      frame.registrations.push([typeId, id]);
+      (frame.registrations ??= []).push([typeId, id]);
     }
     return id;
   }
@@ -875,12 +942,13 @@ export class BackendSession {
     return promise;
   }
   beginCallFrame() {
-    const frame = { registrations: [], inputStreams: [], ended: false, cleanup: undefined };
+    const frame = { registrations: undefined, inputStreams: undefined, ended: false, cleanup: undefined };
     SESSION_FRAME_STATE.get(this).active.push(frame);
     return frame;
   }
   leaveCallFrame(frame) {
     const active = SESSION_FRAME_STATE.get(this).active;
+    if (active[active.length - 1] === frame) { active.pop(); return; }
     const index = active.indexOf(frame);
     if (index >= 0) active.splice(index, 1);
   }
@@ -888,13 +956,18 @@ export class BackendSession {
     if (!frame || frame.ended) return frame?.cleanup;
     frame.ended = true;
     this.leaveCallFrame(frame);
-    const pending = [];
-    for (const [typeId, id] of frame.registrations) {
-      const waiting = this.callbacks.frameRelease(typeId, id);
-      if (waiting) pending.push(waiting);
+    let pending;
+    if (frame.registrations) {
+      for (const [typeId, id] of frame.registrations) {
+        const waiting = this.callbacks.frameRelease(typeId, id);
+        if (waiting) (pending ??= []).push(waiting);
+      }
     }
-    for (const handle of [...frame.inputStreams]) pending.push(this.cancelInputStream(handle).finally(() => this.releaseInputStream(handle)));
-    if (pending.length) {
+    if (frame.inputStreams?.length) {
+      // onClose may synchronously remove entries or close another input.
+      for (const handle of [...frame.inputStreams]) (pending ??= []).push(this.cancelInputStream(handle).finally(() => this.releaseInputStream(handle)));
+    }
+    if (pending) {
       frame.cleanup = Promise.allSettled(pending).then((results) => {
         const failure = results.find((result) => result.status === "rejected");
         if (failure) throw failure.reason;
@@ -923,7 +996,7 @@ export class BackendSession {
     const streamOptions = { ...options };
     let inputHandle;
     if (frame) {
-      frame.inputStreams.push(null);
+      (frame.inputStreams ??= []).push(null);
       streamOptions.onClose = (handle) => {
         this.inputStreams.delete(inputHandle);
         const index = frame.inputStreams.indexOf(inputHandle);
@@ -971,20 +1044,22 @@ export class BackendSession {
   cancelInputStream(handle) {
     if (this.detached) return Promise.reject(environmentDestroyedError());
     if (this.inputCancelled.has(handle)) return this.inputCancelled.get(handle);
-    const closing = this._guardPromise(Promise.resolve().then(() => this.host.cancelInputStream(handle))).then((result) => {
+    const closing = this._createGuard(this.generation, (result) => {
       if (result === DETACHED) throw environmentDestroyedError();
       this.inputStreams.delete(handle);
+      this.inputCancelled.delete(handle);
     });
-    closing.catch(() => {});
-    this.inputCancelled.set(handle, closing);
-    return closing;
+    this.inputCancelled.set(handle, closing.promise);
+    try { Promise.resolve(this.host.cancelInputStream(handle)).then(closing.resolve, closing.reject); }
+    catch (error) { closing.reject(error); }
+    return closing.promise;
   }
 
   releaseInputStream(handle) {
     if (this.inputReleased.has(handle)) return this.inputReleased.get(handle);
     if (this.detached) return Promise.reject(environmentDestroyedError());
     const released = this.cancelInputStream(handle).then(() => this.host.releaseInputStream(handle));
-    released.catch(() => {});
+    released.then(() => this.inputReleased.delete(handle), () => {});
     this.inputReleased.set(handle, released);
     return released;
   }
@@ -1036,19 +1111,23 @@ export class BackendSession {
     };
     const release = () => {
       if (releasePromise) return releasePromise;
-      releasePromise = Promise.resolve().then(async () => {
+      let resolve, reject;
+      releasePromise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      releasePromise.catch(() => {});
+      // Publish before release/onClose can synchronously reenter this stream.
+      (async () => {
         if (detached) throw environmentDestroyedError();
         try {
           if (handle !== undefined && handle !== null) {
-            if (typeof options.release === "function") await options.release(handle);
-            else await session.releaseOutputStream(handle);
+            const released = typeof options.release === "function" ? options.release(handle) : session.releaseOutputStream(handle);
+            if (released !== undefined) await released;
           }
         } finally {
           session.outputStreams.delete(stream);
-          await options.onClose?.();
+          const cleanup = options.onClose?.();
+          if (cleanup !== undefined) await cleanup;
         }
-      });
-      releasePromise.catch(() => {});
+      })().then(resolve, reject);
       return releasePromise;
     };
     const ensureStarted = () => {
@@ -1066,23 +1145,33 @@ export class BackendSession {
     const cancel = () => {
       if (closePromise) return closePromise;
       if (phase === "done") return release();
+      const starting = phase === "starting" ? startPromise : null;
       phase = "cancelled";
-      closePromise = Promise.resolve().then(async () => {
+      let resolve, reject;
+      closePromise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      closePromise.catch(() => {});
+      // An active subscription already owns its handle. Only an in-flight
+      // factory needs joining before cancellation can enter the backend.
+      (async () => {
         const failures = [];
-        if (startPromise) {
-          try { await startPromise; } catch (error) { if (error.errorName !== "UniffiCancelled") failures.push(error); }
+        if (starting) {
+          try { await starting; } catch (error) { if (error.errorName !== "UniffiCancelled") failures.push(error); }
         }
-        const closing = handle !== undefined && handle !== null
-          ? Promise.resolve().then(() => typeof options.cancel === "function" ? options.cancel(handle) : session.cancelOutputStream(handle))
-          : Promise.resolve();
+        let closing;
+        try {
+          if (handle !== undefined && handle !== null) closing = typeof options.cancel === "function" ? options.cancel(handle) : session.cancelOutputStream(handle);
+        } catch (error) { closing = Promise.reject(error); }
         // Wait for the actual in-flight next, not the iterator wrapper that may
         // itself be waiting here after a transport failure.
-        const outcomes = await Promise.allSettled([closing, nextPromise]);
-        if (outcomes[0].status === "rejected") failures.push(outcomes[0].reason);
+        if (nextPromise) {
+          const outcomes = await Promise.allSettled([closing, nextPromise]);
+          if (outcomes[0].status === "rejected") failures.push(outcomes[0].reason);
+        } else {
+          try { if (closing !== undefined) await closing; } catch (error) { failures.push(error); }
+        }
         await release();
         if (failures.length) throw asUniffiError(failures[0]);
-      });
-      closePromise.catch(() => {});
+      })().then(resolve, reject);
       return closePromise;
     };
     const stream = {
@@ -1092,10 +1181,22 @@ export class BackendSession {
         if (phase === "cancelled" || phase === "done") { if (closePromise) await closePromise; return terminal(); }
         pending = true;
         try {
-          await ensureStarted();
+          if (phase !== "active") await ensureStarted();
           if (phase !== "active") { await closePromise; throw cancelledError(); }
-          if (typeof options.next !== "function") throw streamPlanError("output stream is missing canonical next operation");
-          nextPromise = session._guardPromise(Promise.resolve().then(() => phase === "active" ? options.next(handle) : { kind: "done" }));
+          const operationId = options._nextOperation;
+          if (operationId === undefined && typeof options.next !== "function") throw streamPlanError("output stream is missing canonical next operation");
+          const next = session._createGuard(session.generation, operationId === undefined ? undefined : (raw) => raw === DETACHED ? raw : unwrapEnvelope(raw));
+          nextPromise = next.promise;
+          // close joins this raw pull, so install it before backend reentry.
+          try {
+            if (operationId === undefined) Promise.resolve(options.next(handle)).then(next.resolve, next.reject);
+            else {
+              session._assertOpen();
+              if (session.managedOperations.has(operationId)) throw streamPlanError("stream next cannot be a managed business operation");
+              session._invokeHostAsync(operationId, [handle], next);
+            }
+          }
+          catch (error) { next.reject(error); }
           const raw = await nextPromise;
           if (raw === DETACHED || detached) throw environmentDestroyedError();
           if (phase !== "active") { await closePromise; throw cancelledError(); }
@@ -1148,8 +1249,11 @@ export class BackendSession {
     // Request every cancellation before awaiting any leg, so nested requests
     // can wake and clean up while their owning call is still being awaited.
     for (const state of this.calls.values()) state.cancel();
-    for (const state of this.calls.values()) pending.push(state.promise.catch((error) => {
-      if (error.errorName !== "UniffiCancelled") errors.push(error);
+    for (const state of this.calls.values()) pending.push(state.promise.catch(() => {
+      // A facade may finish conversion on the same guard. Preserve the raw
+      // terminal error's teardown role; a lift failure belongs to its caller.
+      const error = state.terminalError;
+      if (error && error.errorName !== "UniffiCancelled") errors.push(error);
     }));
     for (const stream of [...this.outputStreams]) pending.push(stream.cancel().catch((error) => errors.push(error)));
     for (const handle of [...this.inputStreams]) pending.push(this.cancelInputStream(handle).then(() => this.releaseInputStream(handle)).catch((error) => errors.push(error)));
@@ -1374,16 +1478,22 @@ function lowerCallbackError(raw, methodSpec, context, session) {
   return result;
 }
 
+const INTEGER_BOUNDS = Object.freeze({
+  I8: [-128, 127], U8: [0, 255], I16: [-32768, 32767], U16: [0, 65535],
+  I32: [-2147483648, 2147483647], U32: [0, 4294967295],
+});
+const BIGINT_BOUNDS = Object.freeze({
+  I64: [-(1n << 63n), (1n << 63n) - 1n],
+  U64: [0n, (1n << 64n) - 1n],
+});
+
 function lowerPrimitive(value, name) {
   if (value === undefined) throw new UniffiError({ errorName: "UniffiUndefined", message: "undefined is not a UniFFI value; use null for optional" });
   if (name === "I64" || name === "U64") {
     let result;
     try { result = typeof value === "bigint" ? value : (typeof value === "number" && Number.isSafeInteger(value) ? BigInt(value) : (typeof value === "string" ? BigInt(value) : (() => { throw new Error(); })())); }
     catch (_) { throw new UniffiError({ errorName: "UniffiNumericError", message: `${name} requires a lossless bigint` }); }
-    const bigintBounds = {
-      I64: [-(1n << 63n), (1n << 63n) - 1n],
-      U64: [0n, (1n << 64n) - 1n],
-    }[name];
+    const bigintBounds = BIGINT_BOUNDS[name];
     if (bigintBounds && (result < bigintBounds[0] || result > bigintBounds[1])) throw new UniffiError({ errorName: "UniffiNumericError", message: `${name} is out of range` });
     return result;
   }
@@ -1391,10 +1501,7 @@ function lowerPrimitive(value, name) {
     if (!(value instanceof Uint8Array)) throw new UniffiError({ errorName: "UniffiBytesType", message: "bytes require Uint8Array" });
     return value;
   }
-  const integerBounds = {
-    I8: [-128, 127], U8: [0, 255], I16: [-32768, 32767], U16: [0, 65535],
-    I32: [-2147483648, 2147483647], U32: [0, 4294967295],
-  }[name];
+  const integerBounds = INTEGER_BOUNDS[name];
   if (integerBounds) {
     if (typeof value !== "number" || !Number.isInteger(value) || value < integerBounds[0] || value > integerBounds[1]) throw new UniffiError({ errorName: "UniffiNumericError", message: `${name} requires an in-range integer` });
   } else if (name === "F32" || name === "F64") {
@@ -1412,7 +1519,7 @@ function liftPrimitive(value, name) {
     } catch (_) {
       throw new UniffiError({ errorName: "UniffiNumericError", message: name + " requires a lossless bigint from backend" });
     }
-    const bounds = name === "I64" ? [-(1n << 63n), (1n << 63n) - 1n] : [0n, (1n << 64n) - 1n];
+    const bounds = BIGINT_BOUNDS[name];
     if (result < bounds[0] || result > bounds[1]) throw new UniffiError({ errorName: "UniffiNumericError", message: name + " is out of range" });
     return result;
   }
@@ -1424,10 +1531,7 @@ function liftPrimitive(value, name) {
     }
     throw new UniffiError({ errorName: "UniffiBytesType", message: "backend bytes must be Uint8Array" });
   }
-  const integerBounds = {
-    I8: [-128, 127], U8: [0, 255], I16: [-32768, 32767], U16: [0, 65535],
-    I32: [-2147483648, 2147483647], U32: [0, 4294967295],
-  }[name];
+  const integerBounds = INTEGER_BOUNDS[name];
   if (integerBounds && (typeof value !== "number" || !Number.isInteger(value) || value < integerBounds[0] || value > integerBounds[1])) {
     throw new UniffiError({ errorName: "UniffiNumericError", message: name + " requires an in-range integer from backend" });
   }
@@ -1748,7 +1852,7 @@ export function liftValue(value, descriptor, session = null, context = null, ope
           // Native sessions retain the resource carrier; WASM uses a number.
           // Pass the backend's value intact, as the top-level factory does.
           handle: value,
-          next: (activeHandle, callOptions) => session.invokeAsync(nextId, [activeHandle], callOptions),
+          _nextOperation: nextId,
           cancel: (activeHandle) => session._invokeCleanupAsync(cancelId, [activeHandle]),
           liftItem: (item) => liftValue(item, descriptor.inner, session, context, operation),
           liftError: streamErrorLifter(resource, context, session, operation),
@@ -1798,10 +1902,22 @@ export function liftValue(value, descriptor, session = null, context = null, ope
   }
 }
 
+function isImmediateScalar(descriptor) {
+  return descriptor?.kind === "scalar" && (
+    own(INTEGER_BOUNDS, descriptor.name) || own(BIGINT_BOUNDS, descriptor.name)
+    || descriptor.name === "F32" || descriptor.name === "F64" || descriptor.name === "Bool"
+  );
+}
+
 function makeOperation(session, descriptor) {
+  const businessCount = descriptor.args.length + (descriptor.receiver || descriptor.valueSelf ? 1 : 0);
+  const scalarCompletion = descriptor.async && !descriptor.throws
+    && !descriptor.valueSelf && descriptor.ownerSurface !== "value"
+    && !descriptor.streamResources?.length && !Object.keys(descriptor.callbackContracts || {}).length
+    && descriptor.args.every((argument) => isImmediateScalar(argument.type))
+    && (descriptor.returnType == null || isImmediateScalar(descriptor.returnType));
   return (...args) => {
-    const businessCount = descriptor.args.length + (descriptor.receiver || descriptor.valueSelf ? 1 : 0);
-    const options = descriptor.async ? (args[businessCount] === undefined ? {} : args[businessCount]) : {};
+    const options = descriptor.async && args[businessCount] !== undefined ? args[businessCount] : EMPTY_CALL_OPTIONS;
     if (args.length > businessCount + (descriptor.async ? 1 : 0)) throw new UniffiError({ errorName: "UniffiArgumentCount", message: `too many arguments for ${descriptor.name}` });
     const frame = session.beginCallFrame ? session.beginCallFrame() : null;
     const finishFrame = () => session.endCallFrame?.(frame);
@@ -1854,7 +1970,7 @@ function makeOperation(session, descriptor) {
       const nextId = streamSlot(resource, "OutputStreamNext");
       const cancelId = streamSlot(resource, "OutputStreamCancel");
       const streamOptions = {
-        next: (handle, callOptions) => session.invokeAsync(nextId, [handle], callOptions),
+        _nextOperation: nextId,
         cancel: (handle) => session._invokeCleanupAsync(cancelId, [handle]),
         liftItem: (item) => liftValue(item, descriptor.returnType.inner, session, descriptor.context || descriptor, descriptor),
         liftError: streamErrorLifter(resource, descriptor.context || descriptor, session, descriptor),
@@ -1879,16 +1995,24 @@ function makeOperation(session, descriptor) {
       ? undefined
       : liftValue(value, descriptor.returnType, session, descriptor.context || descriptor, descriptor);
     try {
-      const invoke = descriptor.async ? session.invokeAsync(descriptor.id, nativeArgs, options) : session.invokeSync(descriptor.id, nativeArgs);
-      if (descriptor.async) return track(invoke.then((value) => {
-        const cleanup = finishFrame();
-        return cleanup ? cleanup.then(() => lift(value)) : lift(value);
-      }, (error) => {
-        const cleanup = finishFrame();
-        if (cleanup) return cleanup.then(() => { throw normalizeOperationError(error, descriptor, session); });
-        throw normalizeOperationError(error, descriptor, session);
-      }));
-      const value = lift(invoke);
+      if (descriptor.async) {
+        const onValue = (value) => {
+          const cleanup = finishFrame();
+          return cleanup ? cleanup.then(() => lift(value)) : lift(value);
+        };
+        const onError = (error) => {
+          const cleanup = finishFrame();
+          if (cleanup) return cleanup.then(() => { throw normalizeOperationError(error, descriptor, session); });
+          throw normalizeOperationError(error, descriptor, session);
+        };
+        // These built-in values have no user converters or returned resources.
+        // Finish their frame and lift on the already published managed guard.
+        if (scalarCompletion && session.managedOperations.has(descriptor.id)) {
+          return track(session._invokeAsync(descriptor.id, nativeArgs, options, false, onValue, onError));
+        }
+        return track(session.invokeAsync(descriptor.id, nativeArgs, options).then(onValue, onError));
+      }
+      const value = lift(session.invokeSync(descriptor.id, nativeArgs));
       finishSync();
       return value;
     } catch (error) {

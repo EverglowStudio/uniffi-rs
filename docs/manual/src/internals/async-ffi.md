@@ -17,7 +17,15 @@ pub extern "C" fn ffi_add(a: u32, b: u32) -> uniffi::Handle {
 
 The [bindings](../glossary.md#bindings) then sets up an asynchronous loop that polls the RustFuture until it's complete.
 
-Here's some Python code that shows how this works:
+The C ABI has two terminal ownership operations. `rust_future_complete` borrows
+the handle, which the caller must later free. `rust_future_complete_and_free`
+consumes the handle and returns the result and call status in the same call.
+Both require a prior `Ready` notification. Generated Swift and Kotlin JNA use
+the consuming operation for ordinary calls, stream factories, `next` and `close`.
+Kotlin JNI has its own typed terminal implementation.
+
+The borrowed form is illustrated below in Python. This is protocol pseudocode;
+the unified cancellation integration for Python and Ruby remains deferred.
 
 ```python
 async def add(a, b):
@@ -76,24 +84,44 @@ def get_future_from_handle(handle):
 ### Cancellation
 
 Some languages have builtin cancellation semantics.  For those, you can call the
-`rust_future_cancel` to request that the future be cancelled.  On the Rust side, this causes the
-future to be dropped.
+`rust_future_cancel` to request that the future be cancelled. Keep polling after
+the request: `Ready` confirms that business Drop and registered asynchronous
+cleanup have completed. Cancellation does not replace a result already committed
+by Rust. Requesting cancellation alone is not a cleanup acknowledgement.
 
 ```python
 def cancel_future(future_handle):
-    if rust_future_has_not_been_freed(future_handle):
-        RustScaffoldingLibrary.rust_future_cancel_u32(rust_future_handle)
+    with future_handle_lock:
+        if rust_future_has_not_been_consumed(future_handle):
+            RustScaffoldingLibrary.rust_future_cancel_u32(future_handle)
 ```
 
 ### Managing the RustFuture handle
 
-* The foreign code is responsible for calling the `rust_future_free` function when it's done with the handle.
-  The code must always call `rust_future_free`, regardless of if the future is completed or cancelled.
-  Once that function is called, the handle must not be used again.
-* `rust_future_complete` must only be called once.  Once it's called, `rust_future_poll` should not
-  be called again.
-* If your bindings call `rust_future_cancel` make sure there are no races that allow it to be called
-  after `rust_future_free`.
+* Consume each handle exactly once, using either `rust_future_complete_and_free`
+  after `Ready`, or `rust_future_free`. A borrowed `rust_future_complete` leaves
+  this responsibility with the caller. Never call standalone free after the
+  consuming terminal, including when host result lifting throws.
+* Complete a future only once and stop polling after completion. The consuming
+  terminal also forbids every subsequent use of its handle.
+* Serialize cancellation with the terminal ownership handoff. Swift marks the
+  ready handle consumed under its lifecycle lock, waits for any earlier cancel
+  call to leave that lock, and invokes the terminal outside the lock. Rust lowering
+  and host lifting must not run under that Swift lock.
+
+The consuming operation calls the existing complete implementation, then the
+existing free implementation outside completion's error handling. It releases
+the Future shell and performs free's scheduler and parent-context cleanup
+registration before returning to host lifting. These steps used to follow host
+lifting in the borrowed form; their observable order is different. The result
+commit and business cleanup boundary remain unchanged.
+
+Returned RustBuffers, error buffers, object references and stream subscriptions
+have independent ownership. The host must still decode or release them after
+the Future is gone. Kotlin JNA retains its polling-error precedence and waits for
+undelivered stream disposal. A stream terminal acknowledgement still waits for
+the entire host raw-next frame, buffer release and any discarded value cleanup;
+consuming the Future is not that acknowledgement.
 
 ### FFI definitions
 
@@ -125,7 +153,7 @@ extern "C" fn rust_future_poll_rustbuffer(
 
 type RustFutureContinuationCallback = fn(callback_data: u64, poll_code: u8)
 
-// The future is ready, call `rust_future_complete`
+// Business and registered cleanup are ready; complete with the chosen ownership operation.
 const POLL_CODE_RUST_FUTURE_READY = 0;
 // Wake the future by calling `rust_future_poll` again.
 const POLL_CODE_RUST_FUTURE_WAKE = 1;
@@ -141,18 +169,24 @@ extern "C" fn rust_future_complete_u8(
     *mut RustCallStatus out_status,
 ) -> u8 { } // lowered return value, in this case a `u8`.
 
+/// Complete and consume a ready future whose return type lowers to `u8`.
+/// Do not use or free the handle again, including when lifting the result fails.
+extern "C" fn rust_future_complete_and_free_u8(
+    rust_future_handle: u64,
+    out_status: *mut RustCallStatus,
+) -> u8 { }
+
 /// `rust_future_cancel` for return types that lower to `f32`.
 ///
-/// Languages that support cancellation can call this to cancel the future.  It will cause the
-/// `Future` object to be dropped in Rust.
+/// Requests cancellation. Keep polling until business Drop and cleanup report Ready.
 extern "C" fn rust_future_cancel_f32(
     rust_future_handle: u64,
 ) { }
 
 /// `rust_future_free` for void return types.
 ///
-/// This must be called for each RustFuture you receive and it must be the last call you pass the
-/// RustFuture handle to.
+/// Consumes a handle that has not been passed to complete_and_free or free.
+/// It must be the last call using that handle.
 extern "C" fn rust_future_free_void(
     rust_future_handle: u64,
 ) { }

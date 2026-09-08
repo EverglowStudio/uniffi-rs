@@ -34,20 +34,29 @@ sequenceDiagram
     Rust->>Foreign: call future callback
   end
 
-  Foreign->>+Rust: call RustFuture complete fn
-  Rust-->>-Foreign: return result
-  Foreign->>Rust: call RustFuture free fn
+  alt consuming terminal (Swift / Kotlin JNA)
+    Foreign->>+Rust: call RustFuture complete_and_free fn
+    Rust-->>-Foreign: return result after consuming handle
+  else borrowed terminal
+    Foreign->>+Rust: call RustFuture complete fn
+    Rust-->>-Foreign: return result
+    Foreign->>Rust: call RustFuture free fn
+  end
   Foreign-->>-User: return from async function
 ```
 
-For each async function, UniFFI generates 4 scaffolding functions:
+Each async call uses a constructor and the C ABI's polling and ownership operations:
 
 * A scaffolding function that returns a `RustFuture` handle
 * `rust_future_poll` to poll the future
-* `rust_future_complete` to receive the completed result of a future
-* `rust_future_free` to destroy a future freeing any underlying memory
+* `rust_future_cancel` to request cancellation and wake the polling loop
+* `rust_future_complete` to receive the result while retaining the handle
+* `rust_future_complete_and_free` to receive the result and consume the handle
+* `rust_future_free` to consume a handle without completing it
 
-Technically, the function names are more like `uniffi_[module_prefix]_rust_future_poll`, but this document uses above names make for shorthand.
+The ownership functions are shared per FFI return type within a component. Their
+export names include the module and carrier, for example
+`ffi_example_rust_future_complete_and_free_u32`; this document uses short names.
 
 The UniFFI generated code for an async function performs these steps:
 
@@ -56,9 +65,20 @@ The UniFFI generated code for an async function performs these steps:
    * The `rust_future_poll` function inputs a callback function and a `u64` callback data value to pass to the callback.
    * If the future is pending, then the generated code registers a waker that will call the callback function with `RUST_FUTURE_WAKE`.
    * If the future is ready, then the callback function is immediately called with `RUST_FUTURE_READY` and we move to the next step.
-1. Call `rust_future_complete`, receiving the return value of the future
-1. Call `rust_future_free` (ideally in a `finally` block)
-1. Return the result from `rust_future_complete`
+1. After `Ready`, complete using the binding's ownership operation. Swift and
+   Kotlin JNA call `rust_future_complete_and_free`, then lift the independently
+   owned result or error. Their `finally`/`defer` release runs only for a handle
+   that has not been handed to the consuming terminal.
+1. A caller using borrowed `rust_future_complete` must instead release its handle
+   with `rust_future_free`, including when result lifting fails.
+1. Return the lifted result after the binding's cleanup and delivery work.
+
+Cancellation requests another poll. With the shared runtime, `Ready` waits for
+business Drop and registered asynchronous cleanup, and preserves an already
+committed result. The consuming terminal releases the Future before host lifting;
+that does not close independently returned objects or streams. See
+[terminal ownership and cancellation](async-ffi.md#managing-the-rustfuture-handle)
+for the cancellation handoff and stream acknowledgement rules.
 
 ### Why not have `rust_future_poll` return a boolean?
 

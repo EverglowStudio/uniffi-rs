@@ -89,11 +89,12 @@ bindgen-tests = [ "dep:uniffi_bindgen", "uniffi_bindgen?/bindgen-tests" ]
 # Async exports still opt into Tokio through generated scaffolding or the
 # `default-async-runtime-tokio` convenience feature.
 tokio = ["uniffi_core/tokio"]
-# Generate scaffolding in the UniFFI macros
+# Generate scaffolding in the UniFFI macros. Generated async calls and Stream
+# close acknowledgements use the shared runtime, including when defaults are off.
 #
 # This is a default feature that should always be enabled, except for experimental bindgens like
 # uniffi-bindgen-kotlin-jni which generate the necessary scaffolding
-macro-scaffolding = ["uniffi_macros/scaffolding"]
+macro-scaffolding = ["uniffi_macros/scaffolding", "async-runtime"]
 # Fork-only convenience feature: on non-wasm targets, plain `#[uniffi::export]`
 # on async items defaults to Tokio when `async_runtime` is omitted.
 # This also enables the runtime support needed by that generated scaffolding.

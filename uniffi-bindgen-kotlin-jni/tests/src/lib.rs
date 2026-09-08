@@ -66,6 +66,11 @@ mod test {
     }
 
     #[test]
+    fn test_receiver_runtime() {
+        run_tests(test_dir(), "tests/receiver_runtime.kts");
+    }
+
+    #[test]
     fn test_unified_async() {
         run_tests(test_dir(), "tests/unified_async.kts");
     }
@@ -136,6 +141,11 @@ mod test {
                 temp_dir.join("uniffi/JniRuntimeProbe.kt"),
             )
             .expect("copy JNI runtime probe");
+            std::fs::copy(
+                "tests/receiver_runtime.kt",
+                temp_dir.join("uniffi/receiver_runtime.kt"),
+            )
+            .expect("copy JNI receiver tests");
             uniffi_bindgen_kotlin_jni::test_util::build_jar(
                 &temp_dir,
                 "uniffi_bindgen_tests.jar",

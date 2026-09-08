@@ -1,8 +1,14 @@
+{%- if callable.is_async %}
+return uniffi.{{ callable.result.async_await_future_fn() }} {
+{%- endif %}
 {%- for arg in callable.arguments_including_receiver() %}
 val uniffiArgLowered{{ arg.index }} = uniffi.{{ arg.lower_fn_kt() }}({{ arg.name_kt() }})
 {%- endfor %}
 
-val uniffiReturn = uniffi.Scaffolding.{{ jni_method_name }}(
+{%- if !callable.is_async %}
+val uniffiReturn =
+{%- endif %}
+uniffi.Scaffolding.{{ jni_method_name }}(
     {%- for arg in callable.arguments_including_receiver() %}
     {%- for (var, _) in arg.ty.ffi_values_kt(format!("uniffiArgLowered{}", arg.index)) %}
     {{ var }},
@@ -11,7 +17,7 @@ val uniffiReturn = uniffi.Scaffolding.{{ jni_method_name }}(
 )
 
 {%- if callable.is_async %}
-return uniffi.{{ callable.result.async_await_future_fn() }}(uniffiReturn)
+}
 {%- else %}
 {%- if callable.is_primary_constructor() %}
 this.uniffiHandle = uniffiReturn

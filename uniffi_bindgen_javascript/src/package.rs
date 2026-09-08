@@ -473,43 +473,74 @@ function __withStreamClose(backend) {{
     if (producing.has(id)) {{ const handle = value(result), raw = key(handle); if (typeof raw === "number" && Number.isSafeInteger(raw) && raw > 0) live.set(raw, handle); }}
     return result;
   }};
-  const close = handle => {{
+  const close = (handle, request = false) => {{
     const raw = key(handle);
     if (closing.has(raw)) return closing.get(raw);
     // Only live subscriptions need an acknowledgement. Once acknowledged,
     // absence is the tombstone, including WASM leases already freed by next.
     if (!live.has(raw)) return Promise.resolve();
-    const pending = Promise.resolve().then(() => backend.invokeAsync({close_id}, [raw])).then(result => {{
-      if (value(result) !== 1) {{ const error = new Error("stream cleanup failed"); error.name = error.errorName = "UniffiCleanupFailed"; throw error; }}
-      live.delete(raw);
-      closing.delete(raw);
-    }});
-    pending.catch(() => {{}});
+    let resolve, reject;
+    const pending = new Promise((yes, no) => {{ resolve = yes; reject = no; }});
     closing.set(raw, pending);
+    pending.catch(() => {{}});
+    // Resource cancellation already waits for the Rust close hook and the
+    // engine's active next frame. Publish its acknowledgement before reentry.
+    // Failed next still uses the private ack: its lease may already be gone.
+    try {{
+      const cleanup = request ? backend.cancelOutputStream(live.get(raw)) : backend.invokeAsync({close_id}, [raw]);
+      Promise.resolve(cleanup).then(result => {{
+        try {{
+          if (!request && value(result) !== 1) {{ const error = new Error("stream cleanup failed"); error.name = error.errorName = "UniffiCleanupFailed"; throw error; }}
+          live.delete(raw);
+          closing.delete(raw);
+          resolve();
+        }} catch (error) {{ reject(error); }}
+      }}, reject);
+    }} catch (error) {{ reject(error); }}
     return pending;
   }};
-  return new Proxy(Object.create(null), {{ get(_target, name) {{
-    const target = backend;
-    if (name === "invokeSync") return (id, args) => remember(id, target.invokeSync(id, args));
-    if (name === "invokeAsync") return async (id, args) => {{
-      if (cancelling.has(id) && (closing.has(key(args[0])) || !live.has(key(args[0])))) {{ await close(args[0]); return {{ kind: "value", value: undefined }}; }}
+  const invokeStream = async (id, args) => {{
+      if (cancelling.has(id)) {{ await close(args[0], true); return {{ kind: "value", value: undefined }}; }}
       let result;
-      try {{ result = await target.invokeAsync(id, args); }}
+      try {{ result = await backend.invokeAsync(id, args); }}
       catch (error) {{
         // The engine may already have released its lease on a failed next.
         // Confirm Rust cleanup once, before exposing that terminal error.
         if (pulling.has(id)) await close(args[0]);
         throw error;
       }}
-      if (pulling.has(id) && ["done", "error"].includes(value(result)?.kind)) await close(args[0]);
-      if (cancelling.has(id)) await close(args[0]);
+      if (pulling.has(id)) {{
+        const kind = value(result)?.kind;
+        if (kind === "done" || kind === "error") {{
+          const raw = key(args[0]);
+          // A fully returned typed terminal has awaited Rust subscription
+          // cleanup. A close that already owns the acknowledgement still wins,
+          // including an earlier failure; absence alone never erases it.
+          if (closing.has(raw)) await closing.get(raw);
+          else live.delete(raw);
+        }}
+      }}
       return remember(id, result);
-    }};
-    if (name === "cancelOutputStream") return async handle => {{ if (live.has(key(handle)) && !closing.has(key(handle))) await target.cancelOutputStream(handle); await close(handle); }};
-    if (name === "releaseOutputStream") return async handle => {{ await close(handle); return target.releaseOutputStream(handle); }};
-    if (name === "close") return async (...args) => {{ await Promise.all([...live.values()].map(close)); return target.close(...args); }};
-    const member = target[name];
-    return typeof member === "function" ? member.bind(target) : member;
+  }};
+  const methods = {{
+    invokeSync: (id, args) => remember(id, backend.invokeSync(id, args)),
+    // Ordinary operations already carry their complete managed-call lifecycle.
+    // Only the schema's stream operations need this additional acknowledgement.
+    invokeAsync: (id, args) => pulling.has(id) || cancelling.has(id) || producing.has(id)
+      ? invokeStream(id, args) : backend.invokeAsync(id, args),
+    cancelOutputStream: handle => close(handle, true),
+    releaseOutputStream: handle => {{
+      const raw = key(handle);
+      // Completed subscriptions need no empty asynchronous close operation.
+      if (live.has(raw) || closing.has(raw)) return close(handle).then(() => backend.releaseOutputStream(handle));
+      try {{ return backend.releaseOutputStream(handle); }} catch (error) {{ return Promise.reject(error); }}
+    }},
+    close: async (...args) => {{ await Promise.all([...live.values()].map(handle => close(handle))); return backend.close(...args); }},
+  }};
+  return new Proxy(Object.create(null), {{ get(_target, name) {{
+    if (Object.prototype.hasOwnProperty.call(methods, name)) return methods[name];
+    const member = backend[name];
+    return typeof member === "function" ? member.bind(backend) : member;
   }} }});
 }}
 "#
@@ -1180,6 +1211,10 @@ const backend = {
   releaseOutputStream() {}, close() {},
 };
 const wrapped = vm.runInNewContext(source + '; __withStreamClose(backend)', {backend, Map:ObservedMap, Promise});
+const ordinary = Promise.resolve({kind:'value',value:9});
+const direct = vm.runInNewContext(source + '; __withStreamClose(backend)', {backend:{invokeAsync:()=>ordinary}, Promise});
+assert.equal(direct.invokeAsync(10000, []), ordinary, 'non-stream operation keeps the existing managed-call promise');
+assert.equal(direct.invokeAsync, direct.invokeAsync, 'operation wrappers are stable across lookups');
 (async () => {
   for (let i = 0; i < 1000; i++) {
     const handle = wrapped.invokeSync(factory, []).value;
@@ -1200,6 +1235,225 @@ const wrapped = vm.runInNewContext(source + '; __withStreamClose(backend)', {bac
   assert.equal(acknowledgements,1001); assert.equal(cancellationRequests,0);
   await wrapped.releaseOutputStream(handle); await wrapped.close();
   assert.deepEqual(maps.map(map => map.size), [0,0]);
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"#);
+        let output = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn stream_typed_terminal_reuses_ack_without_overriding_an_existing_close() {
+        let package = stream_control_package();
+        let operations = &package.rust.engines.values().next().unwrap().operations;
+        let id = |kind| {
+            operations
+                .iter()
+                .find(|op| op.kind == kind)
+                .unwrap()
+                .operation_id
+                .index()
+        };
+        let ids = [
+            id(uniffi_js_abi::OperationKind::OutputStreamStart),
+            id(uniffi_js_abi::OperationKind::OutputStreamNext),
+            operations.len() as u32 + 3,
+        ];
+        let mut script = format!(
+            "const [factory, pull, ack] = {}; const source = {};\n",
+            serde_json::to_string(&ids).unwrap(),
+            serde_json::to_string(&render_stream_close_wrapper(&package)).unwrap()
+        );
+        script.push_str(r#"
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => {resolve=yes; reject=no;});
+  return {promise,resolve,reject};
+};
+const tick = () => new Promise(resolve=>setImmediate(resolve));
+(async () => {
+  for (const kind of ['done','error']) {
+    const maps = [];
+    class ObservedMap extends Map { constructor() {super();maps.push(this);} }
+    let handleId=1, acknowledgements=0, cancellations=0, releases=0;
+    const step=kind === 'done' ? {kind} : {kind,error:{variant:'Boom'}};
+    const backend = {
+      invokeSync:()=>({kind:'value',value:{handle:handleId++}}),
+      invokeAsync(id) {
+        if(id === pull) return Promise.resolve({kind:'value',value:step});
+        assert.equal(id,ack); acknowledgements++; return Promise.resolve({kind:'value',value:1});
+      },
+      cancelOutputStream() {cancellations++;},
+      releaseOutputStream() {releases++;},close() {},
+    };
+    const wrapped=vm.runInNewContext(source+'; __withStreamClose(backend)',{backend,Map:ObservedMap,Promise});
+    for(let i=0;i<32;i++) {
+      const handle=wrapped.invokeSync(factory,[]).value;
+      assert.equal((await wrapped.invokeAsync(pull,[handle])).value,step);
+      await wrapped.cancelOutputStream(handle);
+      const releasing = wrapped.releaseOutputStream(handle);
+      assert.equal(releases,i+1,'acknowledged terminal release enters without an empty close hop');
+      await releasing;
+      assert.deepEqual(maps.map(map=>map.size),[0,0]);
+    }
+    await wrapped.close();
+    assert.deepEqual([acknowledgements,cancellations,releases],[0,0,32],
+      'a fully returned typed terminal already acknowledged Rust cleanup');
+
+    for(const failure of [null,Error('retained cleanup failure')]) {
+      for(const alreadySettled of [false,true]) {
+        const raw=deferred(), cleanup=deferred();
+        let attempts=0, extraAcks=0, returned=false;
+        const ownerBackend={
+          invokeSync:()=>({kind:'value',value:{handle:71}}),
+          invokeAsync(id) {
+            if(id === pull) return raw.promise;
+            extraAcks++; return Promise.resolve({kind:'value',value:1});
+          },
+          cancelOutputStream() {attempts++; return cleanup.promise;},
+          releaseOutputStream() {},close() {},
+        };
+        const owner=vm.runInNewContext(source+'; __withStreamClose(backend)',{backend:ownerBackend,Promise});
+        const handle=owner.invokeSync(factory,[]).value;
+        const reading=owner.invokeAsync(pull,[handle]).then(result=>{returned=true;return result;});
+        reading.catch(()=>{});
+        const closing=owner.cancelOutputStream(handle);
+        const settle=()=>failure ? cleanup.reject(failure) : cleanup.resolve();
+        if(alreadySettled) {settle();await tick();}
+        raw.resolve({kind:'value',value:step});
+        if(!alreadySettled) {
+          await tick(); assert.equal(returned,false,'typed terminal waits for the existing close owner');
+          settle();
+        }
+        if(failure) {
+          for(const promise of [reading,closing,owner.cancelOutputStream(handle),owner.close()]) {
+            await assert.rejects(promise,error=>error === failure);
+          }
+        } else {
+          assert.equal((await reading).value,step); await closing; await owner.close();
+        }
+        assert.deepEqual([attempts,extraAcks],[1,0]);
+      }
+    }
+  }
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"#);
+        let output = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn stream_resource_cancel_shares_its_cleanup_ack_before_backend_reentry() {
+        let package = stream_control_package();
+        let operations = &package.rust.engines.values().next().unwrap().operations;
+        let id = |kind| {
+            operations
+                .iter()
+                .find(|op| op.kind == kind)
+                .unwrap()
+                .operation_id
+                .index()
+        };
+        let ids = [
+            id(uniffi_js_abi::OperationKind::OutputStreamStart),
+            id(uniffi_js_abi::OperationKind::OutputStreamNext),
+            id(uniffi_js_abi::OperationKind::OutputStreamCancel),
+            operations.len() as u32 + 3,
+        ];
+        let mut script = format!(
+            "const [factory, pull, cancel, ack] = {}; const source = {};\n",
+            serde_json::to_string(&ids).unwrap(),
+            serde_json::to_string(&render_stream_close_wrapper(&package)).unwrap()
+        );
+        script.push_str(r#"
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return {promise, resolve, reject};
+};
+const tick = () => new Promise(resolve => setImmediate(resolve));
+(async () => {
+  const maps = [];
+  class ObservedMap extends Map { constructor() { super(); maps.push(this); } }
+  const cleanup = deferred(), rawFrame = deferred(), read = deferred();
+  const cancelled = Object.assign(Error('cancelled'), {errorName:'UniffiCancelled'});
+  const carrier = {handle:1};
+  let resourceCancels = 0, extraAcks = 0, requestOnlyCancels = 0, releases = 0, closes = 0;
+  let wrapped, reentrant;
+  const backend = {
+    invokeSync(id) { assert.equal(id,factory); return {kind:'value',value:carrier}; },
+    invokeAsync(id) {
+      if (id === pull) return read.promise;
+      if (id === ack) { extraAcks++; return Promise.resolve({kind:'value',value:1}); }
+      if (id === cancel) { requestOnlyCancels++; return Promise.resolve({kind:'value'}); }
+      throw Error('unexpected operation');
+    },
+    cancelOutputStream(handle) {
+      assert.equal(handle,carrier,'resource hooks receive the original backend lease carrier');
+      resourceCancels++;
+      if (resourceCancels === 1) reentrant = wrapped.cancelOutputStream(carrier);
+      return Promise.all([cleanup.promise,rawFrame.promise]).then(() => { read.reject(cancelled); });
+    },
+    releaseOutputStream(handle) { assert.equal(handle,carrier); releases++; },
+    close() { closes++; },
+  };
+  wrapped = vm.runInNewContext(source + '; __withStreamClose(backend)', {backend, Map:ObservedMap, Promise});
+  const handle = wrapped.invokeSync(factory,[]).value;
+  let readDone=false, cancelDone=false, releaseDone=false, closeDone=false;
+  const reading = assert.rejects(wrapped.invokeAsync(pull,[handle]), {errorName:'UniffiCancelled'}).then(()=>{readDone=true;});
+  const cancelling = wrapped.invokeAsync(cancel,[handle]).then(()=>{cancelDone=true;});
+  const repeated = wrapped.cancelOutputStream(handle);
+  const releasing = wrapped.releaseOutputStream(handle).then(()=>{releaseDone=true;});
+  const closing = wrapped.close().then(()=>{closeDone=true;});
+  await tick();
+  assert.equal(resourceCancels,1,'publish the shared close before synchronous backend reentry');
+  assert.equal(repeated,reentrant,'all resource cancel callers share the same acknowledgement');
+  assert.deepEqual([readDone,cancelDone,releaseDone,closeDone],[false,false,false,false]);
+  cleanup.resolve(); await tick();
+  assert.deepEqual([readDone,cancelDone,releaseDone,closeDone],[false,false,false,false],'cleanup alone is insufficient while the raw next frame is active');
+  rawFrame.resolve();
+  await Promise.all([reading,cancelling,repeated,reentrant,releasing,closing]);
+  assert.deepEqual([resourceCancels,extraAcks,requestOnlyCancels,releases,closes],[1,0,0,1,1]);
+  assert.deepEqual(maps.map(map=>map.size),[0,0]);
+  await wrapped.invokeAsync(cancel,[handle]); await wrapped.cancelOutputStream(handle);
+  assert.equal(resourceCancels,1);
+
+  // Failed acknowledgements remain shared and observable; release/session close
+  // must not claim success or retry a hook whose cleanup result already failed.
+  for (const synchronous of [true,false]) {
+    const failure = Error(synchronous ? 'sync cleanup failure' : 'async cleanup failure');
+    let attempts=0, released=0, closed=0;
+    const failedBackend = {
+      invokeSync:()=>({kind:'value',value:{handle:2}}),
+      invokeAsync:()=>{throw Error('unexpected second acknowledgement');},
+      cancelOutputStream() { attempts++; if (synchronous) throw failure; return Promise.reject(failure); },
+      releaseOutputStream() { released++; }, close() { closed++; },
+    };
+    const failed = vm.runInNewContext(source + '; __withStreamClose(backend)', {backend:failedBackend, Promise});
+    const lease = failed.invokeSync(factory,[]).value;
+    const first = failed.cancelOutputStream(lease), second = failed.cancelOutputStream(lease);
+    assert.equal(first,second);
+    const results = await Promise.allSettled([first,second,failed.invokeAsync(cancel,[lease]),failed.releaseOutputStream(lease),failed.close()]);
+    for (const result of results) { assert.equal(result.status,'rejected'); assert.equal(result.reason,failure); }
+    assert.deepEqual([attempts,released,closed],[1,0,0]);
+  }
 })().catch(error=>{console.error(error);process.exitCode=1;});
 "#);
         let output = std::process::Command::new("node")

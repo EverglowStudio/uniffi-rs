@@ -367,6 +367,12 @@ pub trait Callable {
             .to_owned()
     }
 
+    fn ffi_rust_future_complete_and_free(&self, ci: &ComponentInterface) -> String {
+        ci.ffi_rust_future_complete_and_free(self.return_type().map(Into::into))
+            .name()
+            .to_owned()
+    }
+
     fn input_stream_arguments(&self) -> Vec<&Argument> {
         self.arguments()
             .into_iter()
@@ -428,6 +434,10 @@ pub trait Callable {
         ci.ffi_rust_future_complete(None).name().to_owned()
     }
 
+    fn ffi_stream_close_rust_future_complete_and_free(&self, ci: &ComponentInterface) -> String {
+        ci.ffi_rust_future_complete_and_free(None).name().to_owned()
+    }
+
     fn ffi_stream_close_rust_future_free(&self, ci: &ComponentInterface) -> String {
         ci.ffi_rust_future_free(None).name().to_owned()
     }
@@ -453,6 +463,15 @@ pub trait Callable {
             .stream_next_ffi_return_type()
             .expect("stream_next_ffi_return_type called on a non-stream callable");
         ci.ffi_rust_future_complete(Some(return_type))
+            .name()
+            .to_owned()
+    }
+
+    fn ffi_stream_next_rust_future_complete_and_free(&self, ci: &ComponentInterface) -> String {
+        let return_type = self
+            .stream_next_ffi_return_type()
+            .expect("stream_next_ffi_return_type called on a non-stream callable");
+        ci.ffi_rust_future_complete_and_free(Some(return_type))
             .name()
             .to_owned()
     }

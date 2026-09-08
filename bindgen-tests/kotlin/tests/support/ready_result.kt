@@ -45,7 +45,11 @@ fun main() = runBlocking {
                                 }, data)
                         },
                         { future -> UniffiLib.ffi_uniffi_bindgen_tests_rust_future_cancel_u64(future) },
-                        { future, status -> completes++; UniffiLib.ffi_uniffi_bindgen_tests_rust_future_complete_u64(future, status) },
+                        { future, status ->
+                            completes++
+                            // Count completed protocol consumption, not native internal destructors.
+                            UniffiLib.ffi_uniffi_bindgen_tests_rust_future_complete_and_free_u64(future, status).also { frees++ }
+                        },
                         { future -> frees++; UniffiLib.ffi_uniffi_bindgen_tests_rust_future_free_u64(future) },
                         { handle -> handle },
                         UnifiedException.ErrorHandler,
@@ -57,7 +61,7 @@ fun main() = runBlocking {
                     UniffiLib.uniffi_uniffi_bindgen_tests_fn_func_unified_values_factory_stream_close(handle),
                     { future, callback, data -> UniffiLib.ffi_uniffi_bindgen_tests_rust_future_poll_void(future, callback, data) },
                     { future -> UniffiLib.ffi_uniffi_bindgen_tests_rust_future_cancel_void(future) },
-                    { future, status -> UniffiLib.ffi_uniffi_bindgen_tests_rust_future_complete_void(future, status) },
+                    { future, status -> UniffiLib.ffi_uniffi_bindgen_tests_rust_future_complete_and_free_void(future, status) },
                     { future -> UniffiLib.ffi_uniffi_bindgen_tests_rust_future_free_void(future) },
                     {}, UniffiNullRustCallStatusErrorHandler,
                 )

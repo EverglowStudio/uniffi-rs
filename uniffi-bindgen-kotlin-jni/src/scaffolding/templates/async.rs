@@ -1,24 +1,13 @@
 const UNIFFI_RUST_FUTURE_CANCELLED: i32 = 1;
 const UNIFFI_RUST_FUTURE_COMPLETE: i32 = 2;
 
-static UNIFFI_JNI_RESUME: uniffi_jni::CachedStaticMethod = uniffi_jni::CachedStaticMethod::new(
-        c"uniffi/UniffiKt", c"uniffiContinuationResume", c"(Lkotlin/coroutines/Continuation;Z)V",
-);
-
-extern "C" fn uniffi_jni_future_continuation(data: u64, poll: uniffi::RustFuturePoll) {
-    // SAFETY: each poll transfers one global reference to core's exactly-once
-    // continuation. Delete it before Java can resume/reenter and free the owner.
-    unsafe {
-        uniffi_jni::attach_current_thread(uniffi_get_global_jvm(), |env| {
-            let global = std::ptr::with_exposed_provenance_mut(data as usize);
-            let local = ((**env).v1_2.NewLocalRef)(env, global);
-            ((**env).v1_2.DeleteGlobalRef)(env, global);
-            UNIFFI_JNI_RESUME.call_void(env, [
-                uniffi_jni::jvalue { l: local },
-                uniffi_jni::jvalue { z: poll == uniffi::RustFuturePoll::Ready },
-            ]).warn_on_exception(env, "uniffiContinuationResume");
-        });
-    }
+// The initial nonblocking call resolves this export after Scaffolding has
+// finished initialization and before any native future is admitted.
+#[unsafe(no_mangle)]
+extern "system" fn Java_uniffi_Scaffolding_futureNotificationTake(
+    _: *mut uniffi_jni::JNIEnv, _: uniffi_jni::jclass, wait: bool,
+) -> i64 {
+    uniffi_jni::future_notification_take(wait)
 }
 
 {%- for rust_result in root.rust_async_callable_results() %}
@@ -27,18 +16,14 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_{{ rust_result.async_poll_fn()
     env: *mut uniffi_jni::JNIEnv,
     _: uniffi_jni::jclass,
     handle: i64,
-    continuation: uniffi_jni::jobject,
-) {
-    uniffi_jni::rust_call_with_env(env, |env| {
-        UNIFFI_JNI_RESUME.get(env);
-        let continuation = ((**env).v1_2.NewGlobalRef)(env, continuation);
-        if continuation.is_null() { uniffi::deps::anyhow::bail!("NewGlobalRef failed"); }
-        uniffi_jni::future_poll::<{{ rust_result.return_type_rs() }}>(
-            uniffi::Handle::from_raw_unchecked(handle as u64), uniffi_jni_future_continuation,
-            continuation.expose_provenance() as u64,
-        );
-        Ok(())
-    });
+    notification_id: i64,
+) -> bool {
+    uniffi_jni::rust_call_with_env(env, |_| {
+        Ok(uniffi_jni::future_poll::<{{ rust_result.return_type_rs() }}>(
+            uniffi::Handle::from_raw_unchecked(handle as u64),
+            uniffi_jni::future_notification_enqueue, notification_id as u64,
+        ))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -56,7 +41,7 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_{{ rust_result.async_complete_
         c"({% for ffi_type in return_type.ffi_types %}{{ ffi_type.jni_signature() }}{% endfor %})V",
     );
     {%- endif %}
-    uniffi_jni::rust_call_with_env(uniffi_env, |uniffi_env| {
+    let code = uniffi_jni::rust_call_with_env(uniffi_env, |uniffi_env| {
         let uniffi_return = match uniffi_jni::future_complete::<{{ rust_result.return_type_rs() }}>(
             uniffi::Handle::from_raw_unchecked(handle as u64),
         ) {
@@ -107,7 +92,13 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_{{ rust_result.async_complete_
 
 
         Ok(UNIFFI_RUST_FUTURE_COMPLETE)
-    })
+    });
+    // The generated caller has observed Ready, drained the notification and
+    // closed cancellation under its live lock. Consume its handle exactly once,
+    // after conversion/exception translation, outside the complete panic catch.
+    uniffi_jni::future_free::<{{ rust_result.return_type_rs() }}>(
+        uniffi::Handle::from_raw_unchecked(handle as u64));
+    code
 }
 
 #[unsafe(no_mangle)]

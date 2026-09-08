@@ -46,16 +46,14 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_streamClose{{ id }}(
 {% for (suffix, output) in stream.future_types() %}
 #[unsafe(no_mangle)]
 unsafe extern "system" fn Java_uniffi_Scaffolding_stream{{ suffix }}Poll{{ id }}(
-    env: *mut uniffi_jni::JNIEnv, _: uniffi_jni::jclass, handle: i64, continuation: uniffi_jni::jobject,
-) {
-    uniffi_jni::rust_call_with_env(env, |env| {
-        UNIFFI_JNI_RESUME.get(env);
-        let global = ((**env).v1_2.NewGlobalRef)(env, continuation);
-        if global.is_null() { uniffi::deps::anyhow::bail!("NewGlobalRef failed"); }
-        uniffi_jni::future_poll::<{{ output }}>(uniffi::Handle::from_raw_unchecked(handle as u64),
-            uniffi_jni_future_continuation, global.expose_provenance() as u64);
-        Ok(())
-    });
+    env: *mut uniffi_jni::JNIEnv, _: uniffi_jni::jclass, handle: i64, notification_id: i64,
+) -> bool {
+    uniffi_jni::rust_call_with_env(env, |_| {
+        Ok(uniffi_jni::future_poll::<{{ output }}>(
+            uniffi::Handle::from_raw_unchecked(handle as u64),
+            uniffi_jni::future_notification_enqueue, notification_id as u64,
+        ))
+    })
 }
 #[unsafe(no_mangle)]
 unsafe extern "system" fn Java_uniffi_Scaffolding_stream{{ suffix }}Cancel{{ id }}(
@@ -72,13 +70,15 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_streamCloseComplete{{ id }}(
     env: *mut uniffi_jni::JNIEnv, _: uniffi_jni::jclass, handle: i64,
 ) {
     uniffi_jni::rust_call_with_env(env, |_| uniffi_jni::future_complete::<()>(uniffi::Handle::from_raw_unchecked(handle as u64)));
+    // Same terminal ownership as ordinary async: free outside the panic catch.
+    uniffi_jni::future_free::<()>(uniffi::Handle::from_raw_unchecked(handle as u64));
 }
 
 #[unsafe(no_mangle)]
 unsafe extern "system" fn Java_uniffi_Scaffolding_streamNextComplete{{ id }}(
     env: *mut uniffi_jni::JNIEnv, _: uniffi_jni::jclass, handle: i64, completion: uniffi_jni::jobject,
 ) -> i32 {
-    uniffi_jni::rust_call_with_env(env, |env| {
+    let code = uniffi_jni::rust_call_with_env(env, |env| {
         let step = match uniffi_jni::future_complete::<{{ step_rs }}>(uniffi::Handle::from_raw_unchecked(handle as u64)) {
             Ok(step) => step,
             Err(error) if uniffi_jni::is_cancelled(&error) => return Ok(1),
@@ -109,7 +109,11 @@ unsafe extern "system" fn Java_uniffi_Scaffolding_streamNextComplete{{ id }}(
             }
         }
         Ok(2)
-    })
+    });
+    // The caller has drained this next future and closed cancellation. Preserve
+    // the original conversion/exception boundary before consuming its handle.
+    uniffi_jni::future_free::<{{ step_rs }}>(uniffi::Handle::from_raw_unchecked(handle as u64));
+    code
 }
 
 struct UniffiInputOps{{ id }};

@@ -89,6 +89,15 @@ fileprivate final class UniffiRustFutureHandle: @unchecked Sendable {
         }
     }
 
+    // Ready has committed the result. End cancellation before consuming the handle,
+    // but run Rust lowering/terminal release outside the lifecycle lock.
+    func handoffToTerminal() {
+        lock.withLock {
+            precondition(!freed)
+            freed = true
+        }
+    }
+
     func free() {
         lock.withLock {
             guard !freed else {
@@ -104,7 +113,7 @@ fileprivate func uniffiRustCallAsync<F, T: Sendable>(
     rustFutureFunc: @Sendable () -> UInt64,
     pollFunc: @Sendable (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
     cancelFunc: @escaping @Sendable (UInt64) -> (),
-    completeFunc: @Sendable (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
+    completeAndFreeFunc: @Sendable (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
     freeFunc: @escaping @Sendable (UInt64) -> (),
     liftFunc: @Sendable (F) throws -> T,
     errorHandler: (@Sendable (RustBuffer) throws -> Swift.Error)?
@@ -136,7 +145,10 @@ fileprivate func uniffiRustCallAsync<F, T: Sendable>(
         } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
 
         return try liftFunc(makeRustCall(
-            { completeFunc(rustFuture, $0) },
+            { status in
+                rustFutureHandle.handoffToTerminal()
+                return completeAndFreeFunc(rustFuture, status)
+            },
             errorHandler: errorHandler
         ))
     }, onCancel: {
@@ -168,7 +180,19 @@ public struct UniFfiStream<Element: Sendable>: AsyncSequence, Sendable, UniffiAs
         cancel: @escaping @Sendable (UInt64) -> Void,
         close: @escaping @Sendable (UInt64) async throws -> Void
     ) {
-        state = UniFfiStreamState(handle: handle, next: next, cancel: cancel, close: close)
+        state = UniFfiStreamState(handle: handle, next: next, cancel: cancel, close: close, execution: .hostTask)
+    }
+
+    // Only generated Rust subscriptions provide cancellation independently of
+    // the Swift task executing next. Host AsyncSequence producers still need
+    // an owned, cancellable Task around their iterator.
+    init(
+        rustSubscriptionHandle handle: UInt64,
+        next: @escaping @Sendable (UInt64) async throws -> __UniffiStreamNext<Element>,
+        cancel: @escaping @Sendable (UInt64) -> Void,
+        close: @escaping @Sendable (UInt64) async throws -> Void
+    ) {
+        state = UniFfiStreamState(handle: handle, next: next, cancel: cancel, close: close, execution: .rustSubscription)
     }
 
     /// Type erase a single-consumer Swift producer without prefetching.
@@ -245,27 +269,70 @@ fileprivate final class UniFfiStreamIteratorLifetime<Element: Sendable>: Sendabl
     }
 }
 
+fileprivate enum UniFfiStreamNextExecution {
+    case hostTask
+    case rustSubscription
+}
+
+// Allocated only if close finds a native next in flight. Reuse the state lock;
+// the close Task owns this waiter without retaining a state being deinitialized.
+fileprivate final class UniFfiRustNextCloseWaiter: @unchecked Sendable {
+    private let lock: NSLock
+    private var finished = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    init(lock: NSLock) { self.lock = lock }
+
+    // Called while the stream state lock is held, after the raw next returns.
+    func finishLocked() -> CheckedContinuation<Void, Never>? {
+        precondition(!finished)
+        finished = true
+        let continuation = self.continuation
+        self.continuation = nil
+        return continuation
+    }
+
+    func wait() async {
+        if lock.withLock({ finished }) { return }
+        await withCheckedContinuation { continuation in
+            let finished = lock.withLock {
+                if self.finished { return true }
+                precondition(self.continuation == nil)
+                self.continuation = continuation
+                return false
+            }
+            if finished { continuation.resume() }
+        }
+    }
+}
+
 fileprivate final class UniFfiStreamState<Element: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private let nextFunc: @Sendable (UInt64) async throws -> __UniffiStreamNext<Element>
     private let cancelFunc: @Sendable (UInt64) -> Void
     private let closeFunc: @Sendable (UInt64) async throws -> Void
+    private let execution: UniFfiStreamNextExecution
     private var iteratorClaimed = false
     private let handle: UInt64
     private var stopped = false
     private var nextTask: Task<__UniffiStreamNext<Element>, Error>?
+    private var rustNextInFlight = false
+    private var rustNextCloseWaiter: UniFfiRustNextCloseWaiter?
     private var closeTask: Task<Void, Error>?
+    private var rustTerminalAcknowledged = false
 
     init(
         handle: UInt64,
         next: @escaping @Sendable (UInt64) async throws -> __UniffiStreamNext<Element>,
         cancel: @escaping @Sendable (UInt64) -> Void,
-        close: @escaping @Sendable (UInt64) async throws -> Void
+        close: @escaping @Sendable (UInt64) async throws -> Void,
+        execution: UniFfiStreamNextExecution
     ) {
         self.handle = handle
         nextFunc = next
         cancelFunc = cancel
         closeFunc = close
+        self.execution = execution
     }
 
     deinit { cancel() }
@@ -283,6 +350,7 @@ fileprivate final class UniFfiStreamState<Element: Sendable>: @unchecked Sendabl
             try await close()
             throw CancellationError()
         }
+        if execution == .rustSubscription { return try await nextRust() }
         let task = try lock.withLock { () throws -> Task<__UniffiStreamNext<Element>, Error>? in
             if stopped { return nil }
             if nextTask != nil { throw UniffiInternalError.concurrentStreamNext }
@@ -331,11 +399,105 @@ fileprivate final class UniFfiStreamState<Element: Sendable>: @unchecked Sendabl
         }
     }
 
-    private func startClose() -> Task<Void, Error> {
+    private func nextRust() async throws -> Element? {
+        let started = try lock.withLock {
+            if stopped { return false }
+            if rustNextInFlight { throw UniffiInternalError.concurrentStreamNext }
+            rustNextInFlight = true
+            return true
+        }
+        guard started else {
+            try await close()
+            return nil
+        }
+
+        var outcome: Result<__UniffiStreamNext<Element>, Error>?
+        do {
+            outcome = .success(try await withTaskCancellationHandler {
+                try await nextFunc(handle)
+            } onCancel: {
+                self.cancel()
+            })
+        } catch {
+            outcome = .failure(error)
+        }
+        // The native next closure has now returned, including the Rust driver's
+        // consuming terminal and host lift. Never acknowledge from inside that
+        // driver or from its Ready callback: its frame would still be live.
+        var itemFinished = false
+        var itemContinuation: CheckedContinuation<Void, Never>?
+        let cancelled = lock.withLock {
+            if stopped { return true }
+            switch outcome! {
+            case .success(.item):
+                // Swift 6.2's getter reads the current Task's cancellation bit;
+                // it does not run a cancellation handler or wait for the Task.
+                if Task.isCancelled { return true }
+                itemContinuation = finishRustNextLocked(acknowledgesTerminal: false)
+                itemFinished = true
+            case .success(.done), .success(.error), .failure: stopped = true
+            }
+            return false
+        }
+        if itemFinished {
+            // Delivery was selected before finishing. A later cancellation must
+            // not turn this into an unclaimed value after the frame was acknowledged.
+            itemContinuation?.resume()
+        } else {
+            if cancelled || Task.isCancelled {
+                lock.withLock { stopped = true }
+                // Release an unclaimed result before waking a concurrent closer.
+                outcome = nil
+                finishRustNext(acknowledgesTerminal: false)
+                try await close()
+                throw CancellationError()
+            }
+            let acknowledgesTerminal: Bool
+            switch outcome! {
+            case .success(.done), .success(.error): acknowledgesTerminal = true
+            case .success(.item), .failure: acknowledgesTerminal = false
+            }
+            finishRustNext(acknowledgesTerminal: acknowledgesTerminal)
+        }
+        // Confirm this next before awaiting our own terminal close; otherwise
+        // the close task would wait for the next that is awaiting it.
+        switch outcome! {
+        case let .success(.item(value)): return .some(value)
+        case .success(.done):
+            try await close()
+            return nil
+        case let .success(.error(error)), let .failure(error):
+            try await close()
+            throw error
+        }
+    }
+
+    private func finishRustNext(acknowledgesTerminal: Bool) {
+        let continuation = lock.withLock {
+            finishRustNextLocked(acknowledgesTerminal: acknowledgesTerminal)
+        }
+        continuation?.resume()
+    }
+
+    // Caller holds the state lock; resumption and unclaimed value release stay outside.
+    private func finishRustNextLocked(acknowledgesTerminal: Bool) -> CheckedContinuation<Void, Never>? {
+        precondition(rustNextInFlight)
+        rustNextInFlight = false
+        let continuation = rustNextCloseWaiter?.finishLocked()
+        rustNextCloseWaiter = nil
+        // Preserve any existing close owner's success or failure.
+        if acknowledgesTerminal && closeTask == nil { rustTerminalAcknowledged = true }
+        return continuation
+    }
+
+    private func startClose() -> Task<Void, Error>? {
         lock.withLock {
             if let task = closeTask { return task }
+            if rustTerminalAcknowledged { return nil }
             stopped = true
             let pending = nextTask
+            let pendingRust = rustNextInFlight ? UniFfiRustNextCloseWaiter(lock: lock) : nil
+            rustNextCloseWaiter = pendingRust
             let handle = handle
             let cancel = cancelFunc
             let close = closeFunc
@@ -344,6 +506,7 @@ fileprivate final class UniFfiStreamState<Element: Sendable>: @unchecked Sendabl
                 pending?.cancel()
                 cancel(handle)
                 _ = try? await pending?.value
+                await pendingRust?.wait()
                 try await close(handle)
             }
             closeTask = task
@@ -352,7 +515,9 @@ fileprivate final class UniFfiStreamState<Element: Sendable>: @unchecked Sendabl
     }
 
     func cancel() { _ = startClose() }
-    func close() async throws { try await startClose().value }
+    func close() async throws {
+        if let task = startClose() { try await task.value }
+    }
 }
 {%- endif %}
 

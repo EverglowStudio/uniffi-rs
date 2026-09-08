@@ -70,13 +70,13 @@
     {%- call throws(callable) %}{% endcall %} -> {{ callable.return_type().unwrap()|type_name }}{{ callable|input_stream_where_clause }} {
     let __streamHandle: UInt64 = {% if callable.is_async() %}{% call call_async(callable, true) %}{% endcall %}{% else %}{% call to_ffi_call(callable) %}{% endcall %}{% endif %}
     return UniFfiStream(
-        handle: __streamHandle,
+        rustSubscriptionHandle: __streamHandle,
         next: { __streamHandle in
             try await uniffiRustCallAsync(
                 rustFutureFunc: { {{ callable.ffi_stream_next_func() }}(__streamHandle) },
                 pollFunc: {{ callable.ffi_stream_next_rust_future_poll(ci) }},
                 cancelFunc: {{ callable.ffi_stream_next_rust_future_cancel(ci) }},
-                completeFunc: {{ callable.ffi_stream_next_rust_future_complete(ci) }},
+                completeAndFreeFunc: {{ callable.ffi_stream_next_rust_future_complete_and_free(ci) }},
                 freeFunc: {{ callable.ffi_stream_next_rust_future_free(ci) }},
                 liftFunc: { try __uniffiLiftStreamNext(
                     $0,
@@ -98,7 +98,7 @@
                 rustFutureFunc: { {{ callable.ffi_stream_close_func() }}(__streamHandle) },
                 pollFunc: {{ callable.ffi_stream_close_rust_future_poll(ci) }},
                 cancelFunc: {{ callable.ffi_stream_close_rust_future_cancel(ci) }},
-                completeFunc: {{ callable.ffi_stream_close_rust_future_complete(ci) }},
+                completeAndFreeFunc: {{ callable.ffi_stream_close_rust_future_complete_and_free(ci) }},
                 freeFunc: {{ callable.ffi_stream_close_rust_future_free(ci) }},
                 liftFunc: { $0 },
                 errorHandler: nil
@@ -161,7 +161,7 @@ public convenience init{{ callable|input_stream_generics }}(
             },
             pollFunc: {{ callable.ffi_rust_future_poll(ci) }},
             cancelFunc: {{ callable.ffi_rust_future_cancel(ci) }},
-            completeFunc: {{ callable.ffi_rust_future_complete(ci) }},
+            completeAndFreeFunc: {{ callable.ffi_rust_future_complete_and_free(ci) }},
             freeFunc: {{ callable.ffi_rust_future_free(ci) }},
             {%- if stream_handle %}
             liftFunc: { $0 },

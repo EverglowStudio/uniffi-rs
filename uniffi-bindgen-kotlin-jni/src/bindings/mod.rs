@@ -64,3 +64,6 @@ pub struct UniffiPackage<'a> {
 
 // Defining filters modules to make template errors a bit better
 mod filters {}
+
+#[cfg(test)]
+mod completion_tests;

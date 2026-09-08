@@ -263,10 +263,10 @@ async fn submit<E: Payload>(
     };
     let token = packet.request.token.clone();
     let task_token = task_token.unwrap_or_default();
-    let mut cancelled = Box::pin(token.cancelled());
-    let mut task_cancelled = Box::pin(task_token.cancelled());
-    let mut stopped = Box::pin(stop.cancelled());
-    let mut acquire = Box::pin(control.slots.clone().acquire_owned());
+    let mut cancelled = std::pin::pin!(token.cancelled());
+    let mut task_cancelled = std::pin::pin!(task_token.cancelled());
+    let mut stopped = std::pin::pin!(stop.cancelled());
+    let mut acquire = std::pin::pin!(control.slots.clone().acquire_owned());
     let permit = poll_fn(|cx| {
         if stopped.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err(ActorError::Closed));
