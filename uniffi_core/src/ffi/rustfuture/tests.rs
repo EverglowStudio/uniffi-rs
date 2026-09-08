@@ -778,6 +778,173 @@ mod lifecycle {
     }
 
     #[cfg(feature = "tokio")]
+    mod inline_tokio {
+        use super::*;
+        use std::{
+            cell::{Cell, RefCell},
+            marker::PhantomPinned,
+        };
+
+        type Events = Arc<Mutex<Vec<(&'static str, bool, bool)>>>;
+        fn record(events: &Events, event: &'static str) {
+            events.lock().unwrap().push((
+                event,
+                current_context().is_some(),
+                tokio::runtime::Handle::try_current().is_ok(),
+            ));
+        }
+        struct ScopedOutput(Events);
+        impl Drop for ScopedOutput {
+            fn drop(&mut self) {
+                record(&self.0, "output-drop");
+            }
+        }
+        // SAFETY: The only ABI value is an owned scalar. No pointers or buffers
+        // escape; the event records whether complete actually lowered the value.
+        unsafe impl LowerReturn<crate::UniFfiTag> for ScopedOutput {
+            type ReturnType = u32;
+            fn lower_return(value: Self) -> Result<u32, crate::RustCallError> {
+                record(&value.0, "lower");
+                Ok(7)
+            }
+        }
+        struct PinnedBusiness {
+            output: RefCell<Option<ScopedOutput>>,
+            events: Events,
+            addresses: Arc<Mutex<Vec<usize>>>,
+            polls: Cell<usize>,
+            panic_on_drop: bool,
+            _pin: PhantomPinned,
+        }
+        impl Future for PinnedBusiness {
+            type Output = Result<ScopedOutput, LiftArgsError>;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                self.addresses
+                    .lock()
+                    .unwrap()
+                    .push(self.as_ref().get_ref() as *const Self as usize);
+                record(&self.events, "poll");
+                self.polls.set(self.polls.get() + 1);
+                if self.polls.get() == 1 {
+                    return Poll::Pending;
+                }
+                let events = self.events.clone();
+                let panic_on_cleanup = !self.panic_on_drop;
+                current_context()
+                    .unwrap()
+                    .defer_cleanup(async move {
+                        record(&events, "cleanup");
+                        if panic_on_cleanup {
+                            panic!("inline FFI cleanup panic");
+                        }
+                    })
+                    .unwrap();
+                Poll::Ready(Ok(self.output.borrow_mut().take().unwrap()))
+            }
+        }
+        impl Drop for PinnedBusiness {
+            fn drop(&mut self) {
+                self.addresses
+                    .lock()
+                    .unwrap()
+                    .push(self as *const Self as usize);
+                record(&self.events, "business-drop");
+                if self.panic_on_drop {
+                    panic!("inline FFI business drop panic");
+                }
+            }
+        }
+        fn business(
+            events: &Events,
+            addresses: &Arc<Mutex<Vec<usize>>>,
+            panic_on_drop: bool,
+        ) -> PinnedBusiness {
+            PinnedBusiness {
+                output: RefCell::new(Some(ScopedOutput(events.clone()))),
+                events: events.clone(),
+                addresses: addresses.clone(),
+                polls: Cell::new(0),
+                panic_on_drop,
+                _pin: PhantomPinned,
+            }
+        }
+
+        #[test]
+        fn terminal_panics_drop_inline_business_once_and_scope_undelivered_output() {
+            static_assertions::assert_not_impl_any!(PinnedBusiness: Unpin, Sync);
+            for panic_on_drop in [false, true] {
+                let events = Events::default();
+                let addresses = Arc::new(Mutex::new(Vec::new()));
+                let future = Arc::new(RustFuture::<u32>::new_tokio(
+                    business(&events, &addresses, panic_on_drop),
+                    crate::UniFfiTag,
+                ));
+                assert!(observe_pending(&future).get().is_none());
+                assert_eq!(observe(&future).get(), Some(&RustFuturePoll::Ready));
+                let mut status = RustCallStatus::default();
+                assert_eq!(future.complete(&mut status), 0);
+                assert_eq!(status.code, RustCallStatusCode::UnexpectedError);
+                // The panic buffer was never handed to foreign code.
+                ManuallyDrop::into_inner(status.error_buf).destroy();
+                future.free();
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    vec![
+                        ("poll", true, true),
+                        ("poll", true, true),
+                        ("business-drop", true, true),
+                        ("cleanup", true, true),
+                        ("output-drop", true, true),
+                    ]
+                );
+                let addresses = addresses.lock().unwrap();
+                assert_eq!(addresses.len(), 3);
+                assert!(addresses.iter().all(|address| *address == addresses[0]));
+                assert!(current_context().is_none());
+                assert!(tokio::runtime::Handle::try_current().is_err());
+            }
+        }
+
+        #[test]
+        fn unpolled_free_preserves_resolved_compat_drop_scope() {
+            // Derive the expected runtime scope from the actual locked Compat,
+            // so this gate also describes 0.2.5 without claiming it ran here.
+            struct CompatDrop(Events);
+            impl Drop for CompatDrop {
+                fn drop(&mut self) {
+                    record(&self.0, "compat-drop");
+                }
+            }
+            let expected = Events::default();
+            drop(async_compat::Compat::new(CompatDrop(expected.clone())));
+            let runtime = expected.lock().unwrap()[0].2;
+            for panic_on_drop in [false, true] {
+                let events = Events::default();
+                let addresses = Arc::new(Mutex::new(Vec::new()));
+                let future = RustFuture::<u32>::new_tokio(
+                    business(&events, &addresses, panic_on_drop),
+                    crate::UniFfiTag,
+                );
+                assert_eq!(
+                    panic::catch_unwind(panic::AssertUnwindSafe(|| future.free())).is_err(),
+                    panic_on_drop
+                );
+                drop(future);
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    vec![
+                        ("business-drop", true, runtime),
+                        ("output-drop", true, runtime),
+                    ]
+                );
+                assert_eq!(addresses.lock().unwrap().len(), 1);
+                assert!(current_context().is_none());
+                assert!(tokio::runtime::Handle::try_current().is_err());
+            }
+        }
+    }
+
+    #[cfg(feature = "tokio")]
     #[test]
     fn tokio_runtime_covers_registered_cleanup_after_business_returns() {
         let cleaned = Arc::new(AtomicUsize::new(0));

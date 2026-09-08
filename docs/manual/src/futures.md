@@ -51,6 +51,13 @@ portable native-only bounds. WASM tasks and streams remain in their Window or
 Dedicated Worker instance; these markers do not transfer a JS value between
 realms or create a worker pool.
 
+For Rust calls managed by `CallContext::run`, `Run<F>` stores its business
+Future in place and implements `Unpin` when `F` does. Ordinary `.await` needs
+no additional boxing. If you poll a call manually, pin it first and retain that
+pin for subsequent polls. End the owning scope, or use an owning
+`Pin<Box<Run<_>>>`, when you need to drop the call at an explicit point;
+dropping a `Pin<&mut Run<_>>` reference alone does not destroy the call.
+
 ### Streams and factories
 
 Stream arguments use `UniFfiInputStream<T, E>` for host-produced input on

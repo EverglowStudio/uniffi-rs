@@ -97,41 +97,106 @@ use std::{
 // The one ABI type erasure stores the Rust output, not a lowered pointer or
 // RustBuffer. Only complete transfers ownership to foreign code; abandoning a
 // ready handle can therefore still drop the original Rust value normally.
-trait ErasedFuture<FfiType>: UniffiCompatibleFuture<()> + Unpin {
-    fn complete(&mut self) -> Option<RustCallResult<FfiType>>;
+trait ErasedFuture<FfiType>: UniffiCompatibleFuture<()> {
+    fn complete(self: Pin<&mut Self>) -> Option<RustCallResult<FfiType>>;
     #[cfg(not(feature = "async-runtime"))]
-    fn cancel(&mut self);
+    fn cancel(self: Pin<&mut Self>);
+}
+
+// Compat has no public pinned projection. Borrow the pinned wrapper for each
+// poll so its entire poll (including terminal destruction) keeps the runtime.
+#[cfg(feature = "tokio")]
+pin_project_lite::pin_project! {
+    struct TokioFuture<F> {
+        #[pin]
+        future: Option<F>,
+    }
+    impl<F> PinnedDrop for TokioFuture<F> {
+        fn drop(this: Pin<&mut Self>) {
+            // Delegate the Drop scope to the resolved Compat version too:
+            // 0.2.1 drops directly; 0.2.5 enters Tokio before dropping its inner.
+            struct DropPinned<'a, F>(Pin<&'a mut Option<F>>);
+            impl<F> Drop for DropPinned<'_, F> {
+                fn drop(&mut self) {
+                    self.0.set(None);
+                }
+            }
+            drop(async_compat::Compat::new(DropPinned(this.project().future)));
+        }
+    }
 }
 
 #[cfg(feature = "tokio")]
-impl<F, FfiType> ErasedFuture<FfiType> for async_compat::Compat<F>
+impl<F: Future> Future for TokioFuture<F> {
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let future = self.project().future.as_pin_mut().unwrap();
+        Pin::new(&mut async_compat::Compat::new(future)).poll(cx)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<F, FfiType> ErasedFuture<FfiType> for TokioFuture<F>
 where
     F: ErasedFuture<FfiType>,
 {
-    fn complete(&mut self) -> Option<RustCallResult<FfiType>> {
-        self.get_mut().complete()
+    fn complete(self: Pin<&mut Self>) -> Option<RustCallResult<FfiType>> {
+        self.project().future.as_pin_mut().unwrap().complete()
     }
     #[cfg(not(feature = "async-runtime"))]
-    fn cancel(&mut self) {
-        self.get_mut().cancel();
+    fn cancel(self: Pin<&mut Self>) {
+        self.project().future.as_pin_mut().unwrap().cancel();
     }
 }
 
-struct WrappedFuture<F, T, UT>
-where
-    F: Future<Output = Result<T, LiftArgsError>>,
-{
-    #[cfg(feature = "async-runtime")]
-    future: Option<Run<F>>,
-    #[cfg(not(feature = "async-runtime"))]
-    future: Option<Pin<Box<F>>>,
-    result: Option<RustCallResult<Result<T, LiftArgsError>>>,
-    tag: PhantomData<fn() -> UT>,
-}
+#[cfg(feature = "async-runtime")]
+type BusinessFuture<F> = Run<F>;
+#[cfg(not(feature = "async-runtime"))]
+type BusinessFuture<F> = Pin<Box<F>>;
 
-// Business futures are pinned in Box/Run; returned values are not structurally
-// pinned and are moved only after the business future has reached its terminal.
-impl<F: Future<Output = Result<T, LiftArgsError>>, T, UT> Unpin for WrappedFuture<F, T, UT> {}
+pin_project_lite::pin_project! {
+    struct WrappedFuture<F, T, UT>
+    where
+        F: Future<Output = Result<T, LiftArgsError>>,
+    {
+        #[pin]
+        future: Option<BusinessFuture<F>>,
+        result: Option<RustCallResult<Result<T, LiftArgsError>>>,
+        tag: PhantomData<fn() -> UT>,
+    }
+
+
+    impl<F, T, UT> PinnedDrop for WrappedFuture<F, T, UT>
+    where
+        F: Future<Output = Result<T, LiftArgsError>>,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            if let Some(Err(status)) = this.result.take_if(|result| result.is_err()) {
+                // This status was created here and has never crossed the ABI.
+                ManuallyDrop::into_inner(status.error_buf).destroy();
+            }
+            #[cfg(feature = "async-runtime")]
+            if let Some(Ok(value)) = this.result.take() {
+                let delivery = CallContext::new(CancellationToken::new());
+                let discard = delivery.run(async move {
+                    drop(value);
+                });
+                if let Some(parent) = current_context() {
+                    parent
+                        .defer_cleanup(async move {
+                            delivery
+                                .wait_closed()
+                                .await
+                                .expect("discarded Rust output cleanup failed");
+                        })
+                        .expect("current call accepts undelivered output cleanup");
+                }
+                drop(discard);
+            }
+        }
+    }
+}
 
 impl<F, T, UT> Future for WrappedFuture<F, T, UT>
 where
@@ -139,11 +204,11 @@ where
 {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
+        let mut this = self.project();
         if this.result.is_some() {
             return Poll::Ready(());
         }
-        let Some(future) = this.future.as_mut() else {
+        let Some(mut future) = this.future.as_mut().as_pin_mut() else {
             return Poll::Ready(());
         };
         // Run catches business/destructor panics, drains registered cleanup,
@@ -151,7 +216,7 @@ where
         let polled = try_rust_call(panic::AssertUnwindSafe(|| {
             #[cfg(feature = "async-runtime")]
             {
-                match Pin::new(future).poll(cx) {
+                match future.as_mut().poll(cx) {
                     Poll::Pending => Ok(Poll::Pending),
                     Poll::Ready(Ok(value)) => Ok(Poll::Ready(value)),
                     Poll::Ready(Err(_)) => Err(crate::RustCallError::Cancelled),
@@ -165,12 +230,12 @@ where
         match polled {
             Ok(Poll::Pending) => Poll::Pending,
             result => {
-                this.result = Some(match result {
+                *this.result = Some(match result {
                     Ok(Poll::Ready(value)) => Ok(value),
                     Err(status) => Err(status),
                     Ok(Poll::Pending) => unreachable!(),
                 });
-                this.future = None;
+                this.future.set(None);
                 Poll::Ready(())
             }
         }
@@ -182,8 +247,8 @@ where
     F: UniffiCompatibleFuture<Result<T, LiftArgsError>>,
     T: FutureLowerReturn<UT>,
 {
-    fn complete(&mut self) -> Option<RustCallResult<T::ReturnType>> {
-        self.result.take().map(|result| match result {
+    fn complete(self: Pin<&mut Self>) -> Option<RustCallResult<T::ReturnType>> {
+        self.project().result.take().map(|result| match result {
             Ok(Ok(value)) => try_rust_call(panic::AssertUnwindSafe(|| T::lower_return(value))),
             Ok(Err(error)) => {
                 try_rust_call(panic::AssertUnwindSafe(|| T::handle_failed_lift(error)))
@@ -193,39 +258,13 @@ where
     }
 
     #[cfg(not(feature = "async-runtime"))]
-    fn cancel(&mut self) {
+    fn cancel(self: Pin<&mut Self>) {
         // A ready result has already committed, even if complete has not yet
         // transferred it to the host. Late cancellation cannot replace it.
-        if self.result.is_none() {
-            self.future = None;
-            self.result = Some(Err(RustCallStatus::cancelled()));
-        }
-    }
-}
-
-impl<F: Future<Output = Result<T, LiftArgsError>>, T, UT> Drop for WrappedFuture<F, T, UT> {
-    fn drop(&mut self) {
-        if let Some(Err(status)) = self.result.take_if(|result| result.is_err()) {
-            // This status was created here and has never crossed the ABI.
-            ManuallyDrop::into_inner(status.error_buf).destroy();
-        }
-        #[cfg(feature = "async-runtime")]
-        if let Some(Ok(value)) = self.result.take() {
-            let delivery = CallContext::new(CancellationToken::new());
-            let discard = delivery.run(async move {
-                drop(value);
-            });
-            if let Some(parent) = current_context() {
-                parent
-                    .defer_cleanup(async move {
-                        delivery
-                            .wait_closed()
-                            .await
-                            .expect("discarded Rust output cleanup failed");
-                    })
-                    .expect("current call accepts undelivered output cleanup");
-            }
-            drop(discard);
+        let mut this = self.project();
+        if this.result.is_none() {
+            this.future.set(None);
+            *this.result = Some(Err(RustCallStatus::cancelled()));
         }
     }
 }
@@ -264,7 +303,9 @@ where
         UT: 'static,
     {
         Self::with_wrapper::<F, T, UT>(future, |wrapped| {
-            Box::pin(async_compat::Compat::new(wrapped))
+            Box::pin(TokioFuture {
+                future: Some(wrapped),
+            })
         })
     }
 
@@ -302,7 +343,7 @@ where
             if let Some(future) = locked.as_mut() {
                 #[cfg(not(feature = "async-runtime"))]
                 if self.cancelled.load(Ordering::Acquire) {
-                    future.as_mut().get_mut().cancel();
+                    future.as_mut().cancel();
                 }
                 let waker = Arc::clone(&self).into_waker();
                 future
@@ -337,7 +378,7 @@ where
         // Removing before lowering keeps user conversion/destruction outside
         // the future lock. Correct bindings call complete only after Ready.
         let future = self.future.lock().unwrap().take();
-        let result = future.and_then(|mut future| future.as_mut().get_mut().complete());
+        let result = future.and_then(|mut future| future.as_mut().complete());
         match result {
             Some(Ok(value)) => value,
             Some(Err(status)) => {

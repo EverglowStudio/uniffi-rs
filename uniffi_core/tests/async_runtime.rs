@@ -84,10 +84,10 @@ mod native {
             release: Some(receiver),
             cleaned: cleaned.clone(),
         };
-        let mut call = context.run(async move {
+        let mut call = Box::pin(context.run(async move {
             let _guard = guard;
             panic!("must not poll");
-        });
+        }));
         token.cancel();
         token.cancel();
         assert!(poll_once(&mut call).is_pending());
@@ -114,10 +114,10 @@ mod native {
             release: Some(receiver),
             cleaned: cleaned.clone(),
         };
-        let mut call = context.run(async move {
+        let mut call = Box::pin(context.run(async move {
             let _guard = guard;
             pending::<()>().await;
-        });
+        }));
         assert!(poll_once(&mut call).is_pending());
         drop(call);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -155,7 +155,7 @@ mod native {
                 receiver.await.unwrap();
             })
             .unwrap();
-        let mut call = context.run(async { 23 });
+        let mut call = Box::pin(context.run(async { 23 }));
         assert!(poll_once(&mut call).is_pending());
         token.cancel();
         sender.send(()).unwrap();
@@ -242,9 +242,9 @@ mod native {
                 receiver.await.unwrap();
             })
             .unwrap();
-        let mut call = context.run(async {
+        let mut call = Box::pin(context.run(async {
             panic!("business panic");
-        });
+        }));
         assert!(poll_once(&mut call).is_pending());
         assert!(current_context().is_none());
         sender.send(()).unwrap();
@@ -293,10 +293,10 @@ mod native {
         let context = CallContext::new(CancellationToken::new());
         let (sender, receiver) = oneshot::channel();
         let guard = PanickingDrop(Some(receiver));
-        let mut call = context.run(async move {
+        let mut call = Box::pin(context.run(async move {
             let _guard = guard;
             pending::<()>().await;
-        });
+        }));
         assert!(poll_once(&mut call).is_pending());
         context.cancel();
         assert!(poll_once(&mut call).is_pending());
@@ -338,7 +338,7 @@ mod native {
                 receiver.await.unwrap();
             })
             .unwrap();
-        let mut call = context.run(async { 31 });
+        let mut call = Box::pin(context.run(async { 31 }));
         assert!(poll_once(&mut call).is_pending());
         let closing = context.clone();
         let waiter = std::thread::spawn(move || block_on(closing.wait_closed()));

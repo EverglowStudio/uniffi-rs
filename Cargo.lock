@@ -2938,6 +2938,7 @@ dependencies = [
  "futures-util",
  "gloo-timers",
  "once_cell",
+ "pin-project-lite",
  "static_assertions",
  "tokio",
  "wasm-bindgen-futures",
