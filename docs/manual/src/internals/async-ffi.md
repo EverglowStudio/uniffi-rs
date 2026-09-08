@@ -17,6 +17,13 @@ pub extern "C" fn ffi_add(a: u32, b: u32) -> uniffi::Handle {
 
 The [bindings](../glossary.md#bindings) then sets up an asynchronous loop that polls the RustFuture until it's complete.
 
+With `async-runtime`, the pinned internal wrapper holds `Run<F>` and its
+business Future in place, using the existing box for type erasure. Terminal
+operations project that pin; the returned Rust value is not structurally pinned.
+Business destruction still runs in its call context before cleanup completes.
+Removing the separate business Future box increases the containing frame's
+size, and that storage remains allocated until the frame is released.
+
 The C ABI has two terminal ownership operations. `rust_future_complete` borrows
 the handle, which the caller must later free. `rust_future_complete_and_free`
 consumes the handle and returns the result and call status in the same call.

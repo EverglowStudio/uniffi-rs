@@ -94,7 +94,7 @@ impl CancellationToken {
             return None;
         }
         // Own the token inside the pinned async future: Tokio 1.38 has no
-        // OwnedNotified, and Run remains movable without pinning its fields.
+        // OwnedNotified without making cancellation a structurally pinned field.
         let token = self.clone();
         Some(Box::pin(async move { token.cancelled().await }))
     }
@@ -224,7 +224,7 @@ impl CallContext {
         );
         Run {
             context: self.clone(),
-            future: Some(Box::pin(future)),
+            future: Some(future),
             cancellation: None,
             result: None,
             panic: None,
@@ -482,7 +482,7 @@ mod retention_tests {
     fn ready_call_and_late_waiters_allocate_no_cancellation_waiter_or_close_driver() {
         let token = CancellationToken::new();
         let context = CallContext::new(token.clone());
-        let mut call = context.run(async { 42 });
+        let mut call = Box::pin(context.run(async { 42 }));
         assert!(call.cancellation.is_none());
         assert!(lock(&context.inner.state).notification.is_none());
         assert_eq!(futures::executor::block_on(&mut call), Ok(42));
@@ -503,7 +503,7 @@ mod retention_tests {
         for cancelled in [false, true] {
             let token = CancellationToken::new();
             let context = CallContext::new(token.clone());
-            let mut call = context.run(async { panic!("business must not run") });
+            let mut call = Box::pin(context.run(async { panic!("business must not run") }));
             assert!(call.cancellation.is_none());
             if cancelled {
                 token.cancel();
@@ -658,6 +658,146 @@ mod retention_tests {
         assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
     }
 
+    // Cell deliberately keeps this business future Send but not Sync.
+    struct InlineProbe {
+        expected: CallContext,
+        events: Arc<Mutex<Vec<(usize, bool)>>>,
+        polls: std::cell::Cell<usize>,
+        mode: u8,
+        panic_on_drop: bool,
+        release: Option<oneshot::Receiver<()>>,
+        cleaned: Arc<AtomicUsize>,
+        _pin: std::marker::PhantomPinned,
+    }
+    impl InlineProbe {
+        fn record(&self) {
+            lock(&self.events).push((
+                self as *const Self as usize,
+                current_context().is_some_and(|current| {
+                    ContextRef::ptr_eq(&current.inner, &self.expected.inner)
+                }),
+            ));
+        }
+    }
+    impl Future for InlineProbe {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            self.record();
+            let polls = self.polls.get() + 1;
+            self.polls.set(polls);
+            match (self.mode, polls) {
+                (0, 2) => Poll::Ready(()),
+                (5, 2) => panic!("inline business poll panic"),
+                _ => Poll::Pending,
+            }
+        }
+    }
+    impl Drop for InlineProbe {
+        fn drop(&mut self) {
+            self.record();
+            let release = self.release.take().unwrap();
+            let cleaned = self.cleaned.clone();
+            current_context()
+                .unwrap()
+                .defer_cleanup(async move {
+                    release.await.unwrap();
+                    cleaned.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            if self.panic_on_drop {
+                panic!("inline business drop panic");
+            }
+        }
+    }
+
+    #[test]
+    fn inline_future_keeps_its_address_and_drops_once_in_its_context() {
+        static_assertions::assert_not_impl_any!(InlineProbe: Unpin, Sync);
+        static_assertions::assert_not_impl_any!(Run<InlineProbe>: Unpin);
+        static_assertions::assert_impl_all!(Run<InlineProbe>: Send);
+        // Ready, cancel after Pending, Drop after Pending, unpolled Drop,
+        // pre-cancel, and poll panic; each also exercises destructor unwinding.
+        for mode in 0..6 {
+            for panic_on_drop in [false, true] {
+                let context = CallContext::new(CancellationToken::new());
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let cleaned = Arc::new(AtomicUsize::new(0));
+                let (release, released) = oneshot::channel();
+                let mut call = Box::pin(context.run(InlineProbe {
+                    expected: context.clone(),
+                    events: events.clone(),
+                    polls: std::cell::Cell::new(0),
+                    mode,
+                    panic_on_drop,
+                    release: Some(released),
+                    cleaned: cleaned.clone(),
+                    _pin: std::marker::PhantomPinned,
+                }));
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                if mode == 4 {
+                    context.cancel();
+                } else if mode != 3 {
+                    assert!(call.as_mut().poll(&mut cx).is_pending());
+                    assert!(call.as_mut().poll(&mut cx).is_pending());
+                    if mode == 1 {
+                        context.cancel();
+                    }
+                }
+                if mode == 2 || mode == 3 {
+                    assert_eq!(
+                        catch_unwind(AssertUnwindSafe(|| drop(call))).is_err(),
+                        panic_on_drop
+                    );
+                    assert_eq!(cleaned.load(Ordering::SeqCst), 0);
+                    release.send(()).unwrap();
+                } else {
+                    assert!(call.as_mut().poll(&mut cx).is_pending());
+                    assert_eq!(cleaned.load(Ordering::SeqCst), 0);
+                    release.send(()).unwrap();
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        futures::executor::block_on(call.as_mut())
+                    }));
+                    if panic_on_drop || mode == 5 {
+                        let panic = result.unwrap_err();
+                        let message = panic.downcast_ref::<&str>().unwrap();
+                        assert_eq!(
+                            *message,
+                            if mode == 5 {
+                                "inline business poll panic"
+                            } else {
+                                "inline business drop panic"
+                            }
+                        );
+                    } else {
+                        assert_eq!(
+                            result.unwrap(),
+                            if mode == 0 { Ok(()) } else { Err(Cancelled) }
+                        );
+                    }
+                    drop(call);
+                }
+                assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
+                assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+                let events = lock(&events);
+                assert_eq!(events.len(), if mode == 3 || mode == 4 { 1 } else { 3 });
+                assert!(events.iter().all(|event| *event == (events[0].0, true)));
+                assert!(current_context().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unpin_business_with_non_unpin_output_keeps_run_unpin() {
+        use futures::future::{ready, Ready};
+        use std::marker::PhantomPinned;
+        static_assertions::assert_impl_all!(Run<Ready<PhantomPinned>>: Unpin);
+        let context = CallContext::new(CancellationToken::new());
+        let mut call = context.run(ready(PhantomPinned));
+        let output = futures::executor::block_on(&mut call).unwrap();
+        let _ = output;
+        assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
+    }
+
     #[test]
     fn repeated_completed_timeouts_do_not_retain_children_in_live_parent() {
         futures::executor::block_on(async {
@@ -739,60 +879,92 @@ impl Future for CleanupDriver {
     }
 }
 
-/// A call future. Its business future is always polled and dropped in its context.
-#[must_use = "poll the call, or retain its context and wait_closed after dropping it"]
-pub struct Run<F: Future> {
-    context: CallContext,
-    future: Option<Pin<Box<F>>>,
-    cancellation: Option<CancellationSignal>,
-    result: Option<Result<F::Output, Cancelled>>,
-    panic: Option<Panic>,
-    cleanup: Option<Cleanup>,
-    done: bool,
+pin_project_lite::pin_project! {
+    /// A call future. Its business future is polled and dropped in place in its context.
+    ///
+    /// `Run<F>` is `Unpin` when `F` is `Unpin`; its output is not structurally pinned.
+    #[must_use = "poll the call, or retain its context and wait_closed after dropping it"]
+    #[project = RunProjection]
+    pub struct Run<F: Future> {
+        context: CallContext,
+        #[pin]
+        future: Option<F>,
+        cancellation: Option<CancellationSignal>,
+        result: Option<Result<F::Output, Cancelled>>,
+        panic: Option<Panic>,
+        cleanup: Option<Cleanup>,
+        done: bool,
+    }
+
+    impl<F: Future> PinnedDrop for Run<F> {
+        fn drop(this: Pin<&mut Self>) {
+            let mut this = this.project();
+            // `done` alone is insufficient: cleanup or business Drop can panic
+            // after it is set, leaving a result that must still be dropped in scope.
+            if *this.done && this.future.is_none() && this.result.is_none() && this.panic.is_none() {
+                return;
+            }
+            let _scope = Scope::enter(this.context);
+            if this.future.is_some() {
+                this.drop_business_in_scope();
+                this.context.begin_close();
+            }
+            // A pending result can own resources too. Drop it before leaving scope.
+            drop(this.result.take());
+            // Drop cannot await. wait_closed remains available to the owner. Panics
+            // during business drop are propagated unless we are already unwinding.
+            if !std::thread::panicking() {
+                if let Some(panic) = this.panic.take() {
+                    resume_unwind(panic);
+                }
+            }
+        }
+    }
 }
-// Only boxed futures are pinned; result values are never structurally pinned.
-impl<F: Future> Unpin for Run<F> {}
-impl<F: Future> Run<F> {
+
+impl<F: Future> RunProjection<'_, F> {
     // Both callers (poll through close, and Drop) already hold this context's
     // scope for the entire business/result destruction and panic handling.
     fn drop_business_in_scope(&mut self) {
-        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(self.future.take()))) {
+        // Assignment installs None even when the old destructor unwinds, so
+        // catching that panic cannot leave a future to poll or destroy again.
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.future.set(None))) {
             if self.panic.is_none() {
-                self.panic = Some(panic);
+                *self.panic = Some(panic);
             }
         }
     }
     fn close(&mut self) {
         self.drop_business_in_scope();
-        self.cleanup = self.context.begin_close();
+        *self.cleanup = self.context.begin_close();
     }
 }
 impl<F: Future> Future for Run<F> {
     type Output = Result<F::Output, Cancelled>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        assert!(!this.done, "a completed call cannot be polled again");
-        let _scope = Scope::enter(&this.context);
+        let mut this = self.project();
+        assert!(!*this.done, "a completed call cannot be polled again");
+        let _scope = Scope::enter(this.context);
         if this.future.is_some() {
             if this.context.inner.token.is_cancelled() {
-                this.result = Some(Err(Cancelled));
+                *this.result = Some(Err(Cancelled));
             } else {
                 match catch_unwind(AssertUnwindSafe(|| {
-                    this.future.as_mut().unwrap().as_mut().poll(cx)
+                    this.future.as_mut().as_pin_mut().unwrap().poll(cx)
                 })) {
                     Ok(Poll::Pending) => {
                         // Ready calls never allocate a cancellation waiter. A
                         // Pending call must register before returning to its
                         // executor, with a recheck to cover cancel during poll.
                         if this.cancellation.is_none() {
-                            this.cancellation = this.context.inner.token.signal();
+                            *this.cancellation = this.context.inner.token.signal();
                         }
-                        if let Some(signal) = &mut this.cancellation {
+                        if let Some(signal) = this.cancellation.as_mut() {
                             if Pin::new(signal).poll(cx).is_pending() {
                                 return Poll::Pending;
                             }
                         }
-                        this.result = Some(Err(Cancelled));
+                        *this.result = Some(Err(Cancelled));
                     }
                     Ok(Poll::Ready(value)) => {
                         // This acquire load linearizes result commitment against
@@ -801,14 +973,14 @@ impl<F: Future> Future for Run<F> {
                         let cancelled = this.context.inner.token.is_cancelled();
                         if cancelled {
                             if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
-                                this.panic = Some(panic);
+                                *this.panic = Some(panic);
                             }
-                            this.result = Some(Err(Cancelled));
+                            *this.result = Some(Err(Cancelled));
                         } else {
-                            this.result = Some(Ok(value));
+                            *this.result = Some(Ok(value));
                         }
                     }
-                    Err(panic) => this.panic = Some(panic),
+                    Err(panic) => *this.panic = Some(panic),
                 }
             }
             this.close();
@@ -820,7 +992,7 @@ impl<F: Future> Future for Run<F> {
             },
             None => Ok(()),
         };
-        this.done = true;
+        *this.done = true;
         if let Some(panic) = this.panic.take() {
             resume_unwind(panic);
         }
@@ -828,28 +1000,5 @@ impl<F: Future> Future for Run<F> {
             panic!("a registered call cleanup panicked");
         }
         Poll::Ready(this.result.take().unwrap())
-    }
-}
-impl<F: Future> Drop for Run<F> {
-    fn drop(&mut self) {
-        // `done` alone is insufficient: cleanup or business Drop can panic
-        // after it is set, leaving a result that must still be dropped in scope.
-        if self.done && self.future.is_none() && self.result.is_none() && self.panic.is_none() {
-            return;
-        }
-        let _scope = Scope::enter(&self.context);
-        if self.future.is_some() {
-            self.drop_business_in_scope();
-            self.context.begin_close();
-        }
-        // A pending result can own resources too. Drop it before leaving scope.
-        drop(self.result.take());
-        // Drop cannot await. wait_closed remains available to the owner. Panics
-        // during business drop are propagated unless we are already unwinding.
-        if !std::thread::panicking() {
-            if let Some(panic) = self.panic.take() {
-                resume_unwind(panic);
-            }
-        }
     }
 }
