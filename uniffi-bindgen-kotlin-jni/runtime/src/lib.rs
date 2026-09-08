@@ -12,6 +12,7 @@ mod calls;
 mod errors;
 mod future;
 mod lift_lower;
+mod notification;
 mod strings;
 
 pub use attach::*;
@@ -21,6 +22,7 @@ pub use errors::*;
 pub use future::*;
 pub use jni_sys::*;
 pub use lift_lower::*;
+pub use notification::*;
 pub use strings::*;
 
 // Re-export

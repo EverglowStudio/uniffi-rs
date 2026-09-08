@@ -16,6 +16,7 @@ use std::{
     },
     task::{Context, Poll},
 };
+use tokio::sync::Notify;
 
 #[cfg(target_arch = "wasm32")]
 use std::rc::{Rc as ContextRef, Weak};
@@ -23,6 +24,7 @@ use std::rc::{Rc as ContextRef, Weak};
 use std::sync::{Arc as ContextRef, Weak};
 
 type Signal = Shared<oneshot::Receiver<()>>;
+type CancellationSignal = BoxFuture<'static, ()>;
 type Cleanup = Shared<BoxFuture<'static, Result<(), CleanupFailed>>>;
 type Panic = Box<dyn Any + Send>;
 
@@ -39,7 +41,7 @@ pub struct CancellationToken {
 }
 struct TokenState {
     cancelled: AtomicBool,
-    notification: Mutex<Option<Notification>>,
+    notification: Notify,
 }
 struct Notification {
     sender: Option<oneshot::Sender<()>>,
@@ -64,7 +66,7 @@ impl CancellationToken {
         Self {
             state: Arc::new(TokenState {
                 cancelled: AtomicBool::new(false),
-                notification: Mutex::new(None),
+                notification: Notify::new(),
             }),
         }
     }
@@ -73,40 +75,28 @@ impl CancellationToken {
         if self.state.cancelled.swap(true, Ordering::AcqRel) {
             return;
         }
-        let sender = {
-            let mut notification = lock(&self.state.notification);
-            notification
-                .as_mut()
-                .and_then(|notification| notification.sender.take())
-        };
-        if let Some(sender) = sender {
-            let _ = sender.send(());
-        }
+        self.state.notification.notify_waiters();
     }
     pub fn is_cancelled(&self) -> bool {
         self.state.cancelled.load(Ordering::Acquire)
     }
     pub async fn cancelled(&self) {
-        if let Some(signal) = self.signal() {
-            let _ = signal.await;
+        // Tokio 1.38 records notify_waiters broadcasts from Notified creation,
+        // even before its first poll. Create it before checking the flag so a
+        // concurrent cancel is covered by either the flag or the broadcast.
+        let notified = self.state.notification.notified();
+        if !self.is_cancelled() {
+            notified.await;
         }
     }
-    fn signal(&self) -> Option<Signal> {
+    fn signal(&self) -> Option<CancellationSignal> {
         if self.is_cancelled() {
             return None;
         }
-        let mut notification = lock(&self.state.notification);
-        // cancel publishes the flag before taking this same lock. Either this
-        // waiter sees cancellation or cancel takes and wakes its sender.
-        if self.is_cancelled() {
-            return None;
-        }
-        Some(
-            notification
-                .get_or_insert_with(Notification::new)
-                .signal
-                .clone(),
-        )
+        // Own the token inside the pinned async future: Tokio 1.38 has no
+        // OwnedNotified, and Run remains movable without pinning its fields.
+        let token = self.clone();
+        Some(Box::pin(async move { token.cancelled().await }))
     }
 }
 impl fmt::Debug for CancellationToken {
@@ -144,11 +134,13 @@ pub struct CallContext {
 }
 struct Inner {
     token: CancellationToken,
+    // The single-run gate does not publish cleanup or closed state; those stay
+    // protected by state. Competing run callers only need an atomic winner.
+    started: AtomicBool,
     state: Mutex<CallState>,
     cleanup_waker: AtomicWaker,
 }
 struct CallState {
-    started: bool,
     closed: Option<Result<(), CleanupFailed>>,
     cleanup: Vec<BoxFuture<'static, ()>>,
     closing: Option<Cleanup>,
@@ -160,6 +152,12 @@ thread_local! {
 /// The context of the current business/cleanup poll or destructor, if any.
 pub fn current_context() -> Option<CallContext> {
     CURRENT.with(|slot| slot.borrow().clone())
+}
+// Owner management is outside the caller's business context. Keep this a
+// synchronous scope: the child Run installs its own context for poll and Drop.
+pub(super) fn without_current<T>(f: impl FnOnce() -> T) -> T {
+    let _scope = Scope(CURRENT.with(|slot| slot.replace(None)));
+    f()
 }
 struct Scope(Option<CallContext>);
 impl Scope {
@@ -180,8 +178,8 @@ impl CallContext {
         Self {
             inner: ContextRef::new(Inner {
                 token,
+                started: AtomicBool::new(false),
                 state: Mutex::new(CallState {
-                    started: false,
                     closed: None,
                     cleanup: Vec::new(),
                     closing: None,
@@ -220,11 +218,10 @@ impl CallContext {
     /// Start this context's single call. A second call on the same context panics.
     /// Cancellation before the first poll never polls the business future.
     pub fn run<F: Future>(&self, future: F) -> Run<F> {
-        {
-            let mut state = lock(&self.inner.state);
-            assert!(!state.started, "a CallContext can run only one call");
-            state.started = true;
-        }
+        assert!(
+            !self.inner.started.swap(true, Ordering::AcqRel),
+            "a CallContext can run only one call"
+        );
         Run {
             context: self.clone(),
             future: Some(Box::pin(future)),
@@ -311,17 +308,185 @@ impl CallContext {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod retention_tests {
     use super::*;
+    use std::sync::{atomic::AtomicUsize, Barrier};
 
     #[test]
-    fn ready_call_and_late_waiters_allocate_no_notification_or_driver() {
+    fn concurrent_run_has_one_winner_and_preserves_cleanup() {
+        let context = CallContext::new(CancellationToken::new());
+        let entered = Arc::new(Barrier::new(8));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let cleaned = cleanups.clone();
+        context
+            .defer_cleanup(async move {
+                cleaned.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let context = context.clone();
+                let entered = entered.clone();
+                let polls = polls.clone();
+                std::thread::spawn(move || {
+                    entered.wait();
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        context.run(async move {
+                            polls.fetch_add(1, Ordering::SeqCst);
+                        })
+                    })) {
+                        Ok(call) => {
+                            assert_eq!(futures::executor::block_on(call), Ok(()));
+                            true
+                        }
+                        Err(panic) => {
+                            let message = panic
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+                            assert_eq!(message, Some("a CallContext can run only one call"));
+                            false
+                        }
+                    }
+                })
+            })
+            .collect();
+        let winners = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
+    }
+
+    struct DropContextProbe {
+        expected: CallContext,
+        observed: Arc<Mutex<Vec<bool>>>,
+    }
+    impl Drop for DropContextProbe {
+        fn drop(&mut self) {
+            let in_context = current_context()
+                .is_some_and(|current| ContextRef::ptr_eq(&current.inner, &self.expected.inner));
+            // Assert after catching any surrounding panic, not in a destructor
+            // that might itself already be running during unwinding.
+            lock(&self.observed).push(in_context);
+        }
+    }
+
+    #[test]
+    fn cleanup_panic_keeps_unreturned_result_drop_in_context() {
+        let context = CallContext::new(CancellationToken::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let value = DropContextProbe {
+            expected: context.clone(),
+            observed: observed.clone(),
+        };
+        context
+            .defer_cleanup(async { panic!("cleanup failed") })
+            .unwrap();
+        let mut call = context.run(futures::future::ready(value));
+        let failure = catch_unwind(AssertUnwindSafe(|| futures::executor::block_on(&mut call)));
+        assert!(failure.is_err());
+        assert!(lock(&observed).is_empty());
+        drop(call);
+        assert_eq!(*lock(&observed), vec![true]);
+        assert!(current_context().is_none());
+        assert_eq!(
+            futures::executor::block_on(context.wait_closed()),
+            Err(CleanupFailed)
+        );
+    }
+
+    #[test]
+    fn ready_business_drop_panic_drains_cleanup_and_scopes_unreturned_result() {
+        struct PanicAfterReady {
+            value: Option<DropContextProbe>,
+            _business_drop: DropContextProbe,
+        }
+        impl Future for PanicAfterReady {
+            type Output = DropContextProbe;
+            fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(self.value.take().unwrap())
+            }
+        }
+        impl Drop for PanicAfterReady {
+            fn drop(&mut self) {
+                panic!("business destructor failed after Ready");
+            }
+        }
+
+        let context = CallContext::new(CancellationToken::new());
+        let business_drop = Arc::new(Mutex::new(Vec::new()));
+        let result_drop = Arc::new(Mutex::new(Vec::new()));
+        let (release, released) = oneshot::channel();
+        context
+            .defer_cleanup(async move { released.await.unwrap() })
+            .unwrap();
+        let mut call = context.run(PanicAfterReady {
+            value: Some(DropContextProbe {
+                expected: context.clone(),
+                observed: result_drop.clone(),
+            }),
+            _business_drop: DropContextProbe {
+                expected: context.clone(),
+                observed: business_drop.clone(),
+            },
+        });
+        let waker = futures::task::noop_waker();
+        assert!(Pin::new(&mut call)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        assert_eq!(*lock(&business_drop), vec![true]);
+        assert!(lock(&result_drop).is_empty());
+        assert!(current_context().is_none());
+        release.send(()).unwrap();
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            futures::executor::block_on(&mut call)
+        }))
+        .is_err());
+        drop(call);
+        assert_eq!(*lock(&result_drop), vec![true]);
+        assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
+        assert!(current_context().is_none());
+    }
+
+    #[test]
+    fn completed_run_drop_preserves_outer_context_and_delivered_value() {
+        let inner = CallContext::new(CancellationToken::new());
+        let outer = CallContext::new(CancellationToken::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let value = DropContextProbe {
+            expected: outer.clone(),
+            observed: observed.clone(),
+        };
+        let mut completed = inner.run(futures::future::ready(value));
+        let delivered = futures::executor::block_on(&mut completed).unwrap();
+        let expected_outer = outer.clone();
+        futures::executor::block_on(outer.run(async move {
+            drop(completed);
+            assert!(ContextRef::ptr_eq(
+                &current_context().unwrap().inner,
+                &expected_outer.inner
+            ));
+            assert!(lock(&observed).is_empty());
+            assert_eq!(inner.wait_closed().await, Ok(()));
+            drop(delivered);
+            assert_eq!(*lock(&observed), vec![true]);
+        }))
+        .unwrap();
+        assert!(current_context().is_none());
+    }
+
+    #[test]
+    fn ready_call_and_late_waiters_allocate_no_cancellation_waiter_or_close_driver() {
         let token = CancellationToken::new();
         let context = CallContext::new(token.clone());
-        assert!(lock(&token.state.notification).is_none());
+        let mut call = context.run(async { 42 });
+        assert!(call.cancellation.is_none());
         assert!(lock(&context.inner.state).notification.is_none());
-        assert_eq!(
-            futures::executor::block_on(context.run(async { 42 })),
-            Ok(42)
-        );
+        assert_eq!(futures::executor::block_on(&mut call), Ok(42));
+        assert!(call.cancellation.is_none());
         futures::executor::block_on(async {
             let (one, two) = futures::join!(context.wait_closed(), context.wait_closed());
             assert_eq!((one, two), (Ok(()), Ok(())));
@@ -330,7 +495,7 @@ mod retention_tests {
         assert_eq!(state.closed, Some(Ok(())));
         assert!(state.notification.is_none());
         assert!(state.closing.is_none());
-        assert!(lock(&token.state.notification).is_none());
+        assert_eq!(Arc::strong_count(&token.state), 2);
     }
 
     #[test]
@@ -338,15 +503,16 @@ mod retention_tests {
         for cancelled in [false, true] {
             let token = CancellationToken::new();
             let context = CallContext::new(token.clone());
-            let call = context.run(async { panic!("business must not run") });
+            let mut call = context.run(async { panic!("business must not run") });
+            assert!(call.cancellation.is_none());
             if cancelled {
                 token.cancel();
-                assert_eq!(futures::executor::block_on(call), Err(Cancelled));
-            } else {
-                drop(call);
+                assert_eq!(futures::executor::block_on(&mut call), Err(Cancelled));
+                assert!(call.cancellation.is_none());
             }
+            drop(call);
             assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
-            assert!(lock(&token.state.notification).is_none());
+            assert_eq!(Arc::strong_count(&token.state), 2);
             let state = lock(&context.inner.state);
             assert!(state.notification.is_none());
             assert!(state.closing.is_none());
@@ -388,6 +554,108 @@ mod retention_tests {
             token.cancel();
             assert_eq!(worker.join().unwrap(), Err(Cancelled));
         }
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cancellation_wakes_all_live_waiters_once_and_accepts_late_waiters() {
+        let token = CancellationToken::new();
+        let counts: Vec<_> = (0..8).map(|_| Arc::new(WakeCount::default())).collect();
+        let mut waiters: Vec<_> = counts
+            .iter()
+            .map(|count| {
+                let waker = std::task::Waker::from(count.clone());
+                let mut waiter = Box::pin(token.cancelled());
+                assert!(waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending());
+                waiter
+            })
+            .collect();
+        drop(waiters.remove(3));
+        let unpolled = token.signal().unwrap();
+        token.cancel();
+        token.cancel();
+        for (index, count) in counts.iter().enumerate() {
+            assert_eq!(count.0.load(Ordering::SeqCst), usize::from(index != 3));
+        }
+        let waker = futures::task::noop_waker();
+        for mut waiter in waiters {
+            assert!(waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready());
+        }
+        assert!(Box::pin(unpolled)
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready());
+        assert!(Box::pin(token.cancelled())
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready());
+        assert!(token.signal().is_none());
+    }
+
+    #[test]
+    fn broadcast_between_notified_creation_and_poll_is_remembered() {
+        let token = CancellationToken::new();
+        let notified = token.state.notification.notified();
+        assert!(!token.is_cancelled());
+        token.cancel();
+        let waker = futures::task::noop_waker();
+        assert!(Box::pin(notified)
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready());
+    }
+
+    #[test]
+    fn dropping_owned_cancellation_waiter_releases_token_state() {
+        let token = CancellationToken::new();
+        let weak = Arc::downgrade(&token.state);
+        let mut signal = token.signal().unwrap();
+        let waker = futures::task::noop_waker();
+        assert!(signal
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        drop(token);
+        assert!(weak.upgrade().is_some());
+        drop(signal);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn pending_run_updates_its_cancellation_waker_and_stays_unpin() {
+        fn require_unpin<T: Unpin>(_: &T) {}
+        fn require_send_sync<T: Send + Sync>(_: &T) {}
+        let token = CancellationToken::new();
+        require_send_sync(&token.cancelled());
+        let context = CallContext::new(token.clone());
+        let mut call = context.run(futures::future::pending::<()>());
+        require_unpin(&call);
+        let old = Arc::new(WakeCount::default());
+        let latest = Arc::new(WakeCount::default());
+        for count in [&old, &latest] {
+            let waker = std::task::Waker::from(count.clone());
+            assert!(Pin::new(&mut call)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+        }
+        token.cancel();
+        assert_eq!(old.0.load(Ordering::SeqCst), 0);
+        assert_eq!(latest.0.load(Ordering::SeqCst), 1);
+        assert_eq!(futures::executor::block_on(call), Err(Cancelled));
+        assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
     }
 
     #[test]
@@ -476,7 +744,7 @@ impl Future for CleanupDriver {
 pub struct Run<F: Future> {
     context: CallContext,
     future: Option<Pin<Box<F>>>,
-    cancellation: Option<Signal>,
+    cancellation: Option<CancellationSignal>,
     result: Option<Result<F::Output, Cancelled>>,
     panic: Option<Panic>,
     cleanup: Option<Cleanup>,
@@ -485,8 +753,9 @@ pub struct Run<F: Future> {
 // Only boxed futures are pinned; result values are never structurally pinned.
 impl<F: Future> Unpin for Run<F> {}
 impl<F: Future> Run<F> {
-    fn drop_business(&mut self) {
-        let _scope = Scope::enter(&self.context);
+    // Both callers (poll through close, and Drop) already hold this context's
+    // scope for the entire business/result destruction and panic handling.
+    fn drop_business_in_scope(&mut self) {
         if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(self.future.take()))) {
             if self.panic.is_none() {
                 self.panic = Some(panic);
@@ -494,7 +763,7 @@ impl<F: Future> Run<F> {
         }
     }
     fn close(&mut self) {
-        self.drop_business();
+        self.drop_business_in_scope();
         self.cleanup = self.context.begin_close();
     }
 }
@@ -563,9 +832,14 @@ impl<F: Future> Future for Run<F> {
 }
 impl<F: Future> Drop for Run<F> {
     fn drop(&mut self) {
+        // `done` alone is insufficient: cleanup or business Drop can panic
+        // after it is set, leaving a result that must still be dropped in scope.
+        if self.done && self.future.is_none() && self.result.is_none() && self.panic.is_none() {
+            return;
+        }
         let _scope = Scope::enter(&self.context);
         if self.future.is_some() {
-            self.drop_business();
+            self.drop_business_in_scope();
             self.context.begin_close();
         }
         // A pending result can own resources too. Drop it before leaving scope.

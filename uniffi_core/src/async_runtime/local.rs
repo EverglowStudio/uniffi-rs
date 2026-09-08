@@ -251,6 +251,7 @@ struct Active {
 }
 struct Owner {
     control: Arc<Control>,
+    accepts_root_handoff: Cell<bool>,
     next: Cell<u64>,
     objects: RefCell<HashMap<u64, Entry>>,
     active: RefCell<HashMap<u64, Active>>,
@@ -340,8 +341,188 @@ impl<F: Future> Future for InOwner<F> {
 }
 impl<F: Future> Drop for InOwner<F> {
     fn drop(&mut self) {
+        // A stop request still permits draining. Destruction of the actual
+        // driver does not: a detached root must not create an orphan Rc cycle.
+        self.owner.accepts_root_handoff.set(false);
         let _scope = Scope::enter(&self.owner);
-        drop(self.future.take());
+        let mut panic =
+            std::panic::catch_unwind(AssertUnwindSafe(|| drop(self.future.take()))).err();
+        // Destructors can enqueue local cleanup while dropping the driver.
+        // There is no executor left to poll it; release those captures too.
+        loop {
+            let pending = std::mem::take(&mut *self.owner.pending.borrow_mut());
+            if pending.is_empty() {
+                break;
+            }
+            if let Err(error) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(pending))) {
+                if panic.is_none() {
+                    panic = Some(error);
+                }
+            }
+        }
+        if !std::thread::panicking() {
+            if let Some(error) = panic {
+                std::panic::resume_unwind(error);
+            }
+        }
+    }
+}
+
+// Only Copy status values may use this path. Resource-bearing public spawn
+// results retain Owner::start's independent delivery context and confirmation.
+pub(super) fn run_local_root<F>(future: F) -> Result<LocalRootCall<F::Output>, LocalError>
+where
+    F: Future + 'static,
+    F::Output: Copy + 'static,
+{
+    let owner = CURRENT
+        .with(|slot| slot.borrow().clone())
+        .ok_or(LocalError::NoOwner)?;
+    if !owner.accepts_root_handoff.get() {
+        return Err(LocalError::ExecutorStopped);
+    }
+    if owner.control.stop.is_cancelled() {
+        return Err(LocalError::Closed);
+    }
+    let token = CancellationToken::new();
+    let context = CallContext::new(token.clone());
+    let run = context.run(future);
+    let id = owner.id();
+    let releases = Rc::new(ReleaseRoot {
+        id,
+        pending: RefCell::new(Vec::new()),
+    });
+    owner.releases.borrow_mut().insert(id, releases.clone());
+    owner.active.borrow_mut().insert(
+        id,
+        Active {
+            token,
+            object: None,
+        },
+    );
+    let task_owner = owner.clone();
+    let task_releases = releases.clone();
+    let work = async move {
+        let result = AssertUnwindSafe(run).catch_unwind().await;
+        let cleanup = context.wait_closed().await;
+        let result = match (result, cleanup) {
+            (Ok(Ok(value)), Ok(())) => Ok(value),
+            (Ok(Err(_)), Ok(())) => Err(TaskError::Cancelled),
+            _ => Err(TaskError::Panicked),
+        };
+        task_owner.active.borrow_mut().remove(&id);
+        task_owner.control.changed.notify_one();
+        // This await owns any batch already taken from the root. The entire
+        // pinned work frame, including that batch, survives waiter Drop.
+        if wait_releases(&task_releases).await.is_err() {
+            return Err(TaskError::Panicked);
+        }
+        result
+    };
+    Ok(LocalRootCall(Some(LocalRootFrame {
+        owner,
+        releases: Some(releases),
+        done: None,
+        future: Some(Box::pin(work)),
+    })))
+}
+
+struct LocalRootFrame<T: Copy + 'static> {
+    owner: Rc<Owner>,
+    releases: Option<Releases>,
+    done: Option<Arc<Completion>>,
+    future: Option<LocalBoxFuture<'static, Result<T, TaskError>>>,
+}
+impl<T: Copy + 'static> LocalRootFrame<T> {
+    fn completion(&mut self) -> Arc<Completion> {
+        self.done.get_or_insert_with(Completion::new).clone()
+    }
+    fn abandon(&mut self) {
+        let dropped = std::panic::catch_unwind(AssertUnwindSafe(|| drop(self.future.take())));
+        self.retire(Err(LocalError::ExecutorStopped));
+        if !std::thread::panicking() {
+            if let Err(error) = dropped {
+                std::panic::resume_unwind(error);
+            }
+        }
+    }
+    fn retire(&mut self, result: Result<(), LocalError>) {
+        if let Some(releases) = self.releases.take() {
+            self.owner.active.borrow_mut().remove(&releases.id);
+            self.owner.releases.borrow_mut().remove(&releases.id);
+            if let Some(done) = &self.done {
+                done.finish(result);
+            }
+            self.owner.control.changed.notify_one();
+        }
+    }
+}
+impl<T: Copy + 'static> Future for LocalRootFrame<T> {
+    type Output = Result<T, TaskError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let _owner = Scope::enter(&this.owner);
+        let _root = ReleaseScope::enter(&this.releases);
+        super::context::without_current(|| {
+            if !this.owner.accepts_root_handoff.get() {
+                this.abandon();
+                return Poll::Ready(Err(TaskError::ExecutorStopped));
+            }
+            let result = this
+                .future
+                .as_mut()
+                .expect("root polled after completion")
+                .as_mut()
+                .poll(cx);
+            if let Poll::Ready(result) = result {
+                drop(this.future.take());
+                this.retire(if matches!(result, Err(TaskError::Panicked)) {
+                    Err(LocalError::Panicked)
+                } else {
+                    Ok(())
+                });
+            }
+            result
+        })
+    }
+}
+impl<T: Copy + 'static> Drop for LocalRootFrame<T> {
+    fn drop(&mut self) {
+        let _owner = Scope::enter(&self.owner);
+        let _root = ReleaseScope::enter(&self.releases);
+        super::context::without_current(|| {
+            // Normal completion has already taken the work and retired root.
+            // Executor loss can only release synchronously, never confirm Ok.
+            self.abandon();
+        });
+    }
+}
+pub(super) struct LocalRootCall<T: Copy + 'static>(Option<LocalRootFrame<T>>);
+impl<T: Copy + 'static> Future for LocalRootCall<T> {
+    type Output = Result<T, TaskError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = Pin::new(self.0.as_mut().expect("root call polled after completion")).poll(cx);
+        if result.is_ready() {
+            self.0 = None;
+        }
+        result
+    }
+}
+impl<T: Copy + 'static> Drop for LocalRootCall<T> {
+    fn drop(&mut self) {
+        if let Some(mut frame) = self.0.take() {
+            if frame.owner.accepts_root_handoff.get() {
+                // Capture the caller's root/context before entering H. Never
+                // register H's own completion into its release root.
+                // A directly awaited root has no separate completion waiter.
+                // Publish one before transferring the frame to its owner.
+                defer_release(frame.completion());
+                let owner = frame.owner.clone();
+                owner.push(Box::pin(async move {
+                    let _ = frame.await;
+                }));
+            }
+        }
     }
 }
 impl Owner {
@@ -843,6 +1024,7 @@ where
 async fn drive(control: Arc<Control>, mut receiver: mpsc::Receiver<Packet>) {
     let owner = Rc::new(Owner {
         control: control.clone(),
+        accepts_root_handoff: Cell::new(true),
         next: Cell::new(0),
         objects: RefCell::new(HashMap::new()),
         active: RefCell::new(HashMap::new()),
@@ -853,6 +1035,7 @@ async fn drive(control: Arc<Control>, mut receiver: mpsc::Receiver<Packet>) {
     let driver = async move {
         let mut running = FuturesUnordered::new();
         let mut stopped = false;
+        let mut one_inline_pending_credit = true;
         loop {
             if control.stop.is_cancelled() {
                 stopped = true;
@@ -890,9 +1073,11 @@ async fn drive(control: Arc<Control>, mut receiver: mpsc::Receiver<Packet>) {
                 if changed.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(());
                 }
-                if let Poll::Ready(Some(())) = Pin::new(&mut running).poll_next(cx) {
-                    return Poll::Ready(());
-                }
+                let running_pending = match Pin::new(&mut running).poll_next(cx) {
+                    Poll::Ready(Some(())) => return Poll::Ready(()),
+                    Poll::Ready(None) => false,
+                    Poll::Pending => true,
+                };
                 if !stopped {
                     match receiver.poll_recv(cx) {
                         Poll::Ready(Some(packet)) => {
@@ -906,6 +1091,18 @@ async fn drive(control: Arc<Control>, mut receiver: mpsc::Receiver<Packet>) {
                         Poll::Pending => {}
                     }
                 }
+                // A running task can enqueue owner-local work after this loop's
+                // drain. Advance it once without swallowing every cooperative
+                // Pending from FuturesUnordered. Ready paths retain the credit.
+                if one_inline_pending_credit && running_pending {
+                    let has_pending = !state.pending.borrow().is_empty();
+                    if has_pending && changed.as_mut().poll(cx).is_ready() {
+                        one_inline_pending_credit = false;
+                        return Poll::Ready(());
+                    }
+                }
+                // Only an actual return to our caller restores the allowance.
+                one_inline_pending_credit = true;
                 Poll::Pending
             })
             .await;
@@ -956,4 +1153,378 @@ pub(super) fn store_current_local<T: 'static>(value: T) -> Result<LocalObject<T>
         }),
         marker: PhantomData,
     })
+}
+
+#[cfg(test)]
+mod owner_progress_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod inline_root_tests {
+    use super::*;
+    use futures_util::task::noop_waker;
+
+    struct Probe {
+        owner: Rc<Owner>,
+        call: Option<LocalRootCall<()>>,
+        root: Releases,
+        done: Arc<Completion>,
+        marks: Rc<Cell<usize>>,
+        context: Rc<RefCell<Option<CallContext>>>,
+    }
+    thread_local! { static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) }; }
+    struct BodyDrop {
+        marks: Rc<Cell<usize>>,
+        cleanup: Option<oneshot::Receiver<()>>,
+        root: u64,
+        panic_on_drop: bool,
+    }
+    impl Drop for BodyDrop {
+        fn drop(&mut self) {
+            assert!(current_context().is_some());
+            assert_eq!(
+                RELEASES.with(|r| r.borrow().as_ref().unwrap().id),
+                self.root
+            );
+            self.marks.set(self.marks.get() + 1);
+            if let Some(cleanup) = self.cleanup.take() {
+                let marks = self.marks.clone();
+                let root = self.root;
+                defer_local_cleanup(async move {
+                    assert!(current_context().is_some());
+                    assert_eq!(RELEASES.with(|r| r.borrow().as_ref().unwrap().id), root);
+                    let _ = cleanup.await;
+                    marks.set(marks.get() + 10);
+                })
+                .unwrap();
+            }
+            assert!(
+                !self.panic_on_drop,
+                "injected business Drop panic on executor loss"
+            );
+        }
+    }
+    type Driver = Pin<Box<dyn Future<Output = ()>>>;
+    fn host(
+        mode: u8,
+        body: oneshot::Receiver<()>,
+        cleanup: oneshot::Receiver<()>,
+        release: Arc<Completion>,
+    ) -> (Arc<Control>, mpsc::Sender<Packet>, Driver) {
+        assert!(PROBE.with(|p| p.borrow().is_none()));
+        let control = Arc::new(Control {
+            executor: Mutex::new(std::sync::Weak::new()),
+            stop: CancellationToken::new(),
+            changed: Notify::new(),
+            done: Completion::new(),
+        });
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .try_send(Packet {
+                done: Completion::new(),
+                command: Some(Box::new(move |owner| {
+                    let marks = Rc::new(Cell::new(0));
+                    let context = Rc::new(RefCell::new(None));
+                    let seen = context.clone();
+                    let counts = marks.clone();
+                    let mut call = run_local_root(async move {
+                        *seen.borrow_mut() = current_context();
+                        let root = RELEASES.with(|r| r.borrow().as_ref().unwrap().id);
+                        let _drop = BodyDrop {
+                            marks: counts,
+                            root,
+                            cleanup: (mode != 2).then_some(cleanup),
+                            panic_on_drop: mode == 4,
+                        };
+                        if mode != 2 {
+                            let _ = body.await;
+                        }
+                        if mode == 2 {
+                            defer_release(release);
+                        }
+                    })
+                    .unwrap();
+                    let frame = call.0.as_mut().unwrap();
+                    let root = frame.releases.as_ref().unwrap().clone();
+                    let done = frame.completion();
+                    let call = if mode >= 3 {
+                        owner.push(Box::pin(async move {
+                            let _ = call.await;
+                        }));
+                        None
+                    } else {
+                        Some(call)
+                    };
+                    PROBE.with(|p| {
+                        *p.borrow_mut() = Some(Probe {
+                            owner,
+                            call,
+                            root,
+                            done,
+                            marks,
+                            context,
+                        })
+                    });
+                })),
+            })
+            .unwrap_or_else(|_| panic!("initial packet fits"));
+        (control.clone(), sender, Box::pin(drive(control, receiver)))
+    }
+    fn inspect<T>(f: impl FnOnce(&Probe) -> T) -> T {
+        PROBE.with(|p| f(p.borrow().as_ref().unwrap()))
+    }
+    fn poll_call(cx: &mut Context<'_>) -> Poll<Result<(), TaskError>> {
+        PROBE.with(|p| Pin::new(p.borrow_mut().as_mut().unwrap().call.as_mut().unwrap()).poll(cx))
+    }
+    fn drop_call() {
+        let call = PROBE.with(|p| p.borrow_mut().as_mut().unwrap().call.take());
+        drop(call);
+    }
+    fn close(control: &Control, driver: &mut Driver, cx: &mut Context<'_>) {
+        control.stop.cancel();
+        control.changed.notify_one();
+        for _ in 0..64 {
+            if driver.as_mut().poll(cx).is_ready() {
+                PROBE.with(|p| drop(p.borrow_mut().take()));
+                return;
+            }
+        }
+        panic!("owner must finish after gates released");
+    }
+
+    #[test]
+    fn inline_root_restores_outer_context_and_hands_off_business_without_cancelling() {
+        let (body_tx, body) = oneshot::channel();
+        let (cleanup_tx, cleanup) = oneshot::channel();
+        let (control, _sender, mut driver) = host(0, body, cleanup, Completion::new());
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        let outer = CallContext::new(CancellationToken::new());
+        let parent_root = Rc::new(ReleaseRoot {
+            id: u64::MAX,
+            pending: RefCell::new(Vec::new()),
+        });
+        let mut run = Box::pin(outer.run(async {
+            let _parent = ReleaseScope::enter(&Some(parent_root.clone()));
+            poll_fn(|cx| {
+                assert!(poll_call(cx).is_pending());
+                assert!(CURRENT.with(|o| o.borrow().is_none()));
+                assert_eq!(RELEASES.with(|r| r.borrow().as_ref().unwrap().id), u64::MAX);
+                // Cancel the enclosing context; H's independent token stays live.
+                current_context().unwrap().cancel();
+                assert!(outer.cancellation_token().is_cancelled());
+                assert!(!inspect(|p| p
+                    .context
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .cancellation_token()
+                    .is_cancelled()));
+                drop_call();
+                assert_eq!(parent_root.pending.borrow().len(), 1);
+                assert!(inspect(|p| p.root.pending.borrow().is_empty()));
+                Poll::Ready(())
+            })
+            .await;
+        }));
+        assert!(matches!(run.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        drop(run);
+        assert!(current_context().is_none());
+        assert!(RELEASES.with(|r| r.borrow().is_none()));
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(inspect(|p| p.marks.get()), 0);
+        body_tx.send(()).unwrap();
+        cleanup_tx.send(()).unwrap();
+        for _ in 0..32 {
+            assert!(driver.as_mut().poll(&mut cx).is_pending());
+            if inspect(|p| p.marks.get()) == 11 {
+                break;
+            }
+        }
+        assert_eq!(inspect(|p| p.marks.get()), 11);
+        assert_eq!(
+            futures::executor::block_on(inspect(|p| p.done.clone()).wait()),
+            Ok(())
+        );
+        assert!(!inspect(|p| p
+            .owner
+            .active
+            .borrow()
+            .contains_key(&p.root.id)));
+        assert!(!inspect(|p| p
+            .owner
+            .releases
+            .borrow()
+            .contains_key(&p.root.id)));
+        close(&control, &mut driver, &mut cx);
+    }
+
+    #[test]
+    fn inline_root_drop_during_rc_cleanup_keeps_active_until_cleanup_finishes() {
+        let (body_tx, body) = oneshot::channel();
+        let (cleanup_tx, cleanup) = oneshot::channel();
+        let (control, _sender, mut driver) = host(1, body, cleanup, Completion::new());
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        body_tx.send(()).unwrap();
+        assert!(poll_call(&mut cx).is_pending());
+        assert_eq!(inspect(|p| p.marks.get()), 1);
+        assert!(inspect(|p| p
+            .owner
+            .active
+            .borrow()
+            .contains_key(&p.root.id)));
+        drop_call();
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert!(inspect(|p| p
+            .owner
+            .active
+            .borrow()
+            .contains_key(&p.root.id)));
+        cleanup_tx.send(()).unwrap();
+        for _ in 0..32 {
+            assert!(driver.as_mut().poll(&mut cx).is_pending());
+            if !inspect(|p| p.owner.releases.borrow().contains_key(&p.root.id)) {
+                break;
+            }
+        }
+        assert_eq!(inspect(|p| p.marks.get()), 11);
+        assert_eq!(
+            futures::executor::block_on(inspect(|p| p.done.clone()).wait()),
+            Ok(())
+        );
+        close(&control, &mut driver, &mut cx);
+    }
+
+    #[test]
+    fn inline_root_handoff_preserves_taken_release_batch_and_rechecks_new_batch() {
+        let (_body_tx, body) = oneshot::channel();
+        let (_cleanup_tx, cleanup) = oneshot::channel();
+        let first = Completion::new();
+        let second = Completion::new();
+        let (control, _sender, mut driver) = host(2, body, cleanup, first.clone());
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert!(poll_call(&mut cx).is_pending());
+        assert!(inspect(|p| p.root.pending.borrow().is_empty()));
+        assert!(!inspect(|p| p
+            .owner
+            .active
+            .borrow()
+            .contains_key(&p.root.id)));
+        let done = inspect(|p| p.done.clone());
+        let mut waited = Box::pin(done.wait());
+        drop_call();
+        inspect(|p| p.root.pending.borrow_mut().push(second.clone()));
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert!(waited.as_mut().poll(&mut cx).is_pending());
+        first.finish(Ok(()));
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert!(waited.as_mut().poll(&mut cx).is_pending());
+        second.finish(Err(LocalError::Panicked));
+        for _ in 0..32 {
+            assert!(driver.as_mut().poll(&mut cx).is_pending());
+            if !inspect(|p| p.owner.releases.borrow().contains_key(&p.root.id)) {
+                break;
+            }
+        }
+        assert_eq!(
+            waited.as_mut().poll(&mut cx),
+            Poll::Ready(Err(LocalError::Panicked))
+        );
+        close(&control, &mut driver, &mut cx);
+    }
+
+    #[test]
+    fn actual_owner_driver_drop_disables_handoff_and_reports_loss_without_orphan_pending() {
+        for mode in [3, 4] {
+            let (_body_tx, body) = oneshot::channel();
+            let (_cleanup_tx, cleanup) = oneshot::channel();
+            let (_control, _sender, mut driver) = host(mode, body, cleanup, Completion::new());
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(driver.as_mut().poll(&mut cx).is_pending());
+            let done = inspect(|p| p.done.clone());
+            let weak = inspect(|p| Rc::downgrade(&p.owner));
+            let dropped = std::panic::catch_unwind(AssertUnwindSafe(|| drop(driver)));
+            assert_eq!(dropped.is_err(), mode == 4);
+            assert!(current_context().is_none());
+            assert!(RELEASES.with(|r| r.borrow().is_none()));
+            assert!(!inspect(|p| p.owner.accepts_root_handoff.get()));
+            assert!(inspect(|p| p.owner.pending.borrow().is_empty()));
+            assert!(inspect(|p| p.owner.active.borrow().is_empty()));
+            assert!(inspect(|p| p.owner.releases.borrow().is_empty()));
+            assert_eq!(
+                futures::executor::block_on(done.wait()),
+                Err(LocalError::ExecutorStopped)
+            );
+            assert_eq!(inspect(|p| p.marks.get()), 1);
+            PROBE.with(|p| drop(p.borrow_mut().take()));
+            assert!(weak.upgrade().is_none());
+        }
+    }
+    #[test]
+    fn inline_root_normal_status_retires_without_enqueuing_a_handler_task() {
+        let (_body_tx, body) = oneshot::channel();
+        let (_cleanup_tx, cleanup) = oneshot::channel();
+        let release = Completion::new();
+        release.finish(Ok(()));
+        let (control, _sender, mut driver) = host(2, body, cleanup, release);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert!(inspect(|p| p.owner.pending.borrow().is_empty()));
+        assert_eq!(poll_call(&mut cx), Poll::Ready(Ok(())));
+        assert!(inspect(|p| p.owner.pending.borrow().is_empty()));
+        assert!(inspect(|p| p.owner.active.borrow().is_empty()));
+        assert!(inspect(|p| p.owner.releases.borrow().is_empty()));
+        assert_eq!(inspect(|p| p.marks.get()), 1);
+        assert!(current_context().is_none());
+        assert!(CURRENT.with(|p| p.borrow().is_none()));
+        assert!(RELEASES.with(|p| p.borrow().is_none()));
+        drop_call();
+        close(&control, &mut driver, &mut cx);
+    }
+
+    #[test]
+    fn inline_root_drop_transfers_confirmation_to_outer_context_without_a_root() {
+        for first_poll in [false, true] {
+            let (body_tx, body) = oneshot::channel();
+            let (cleanup_tx, cleanup) = oneshot::channel();
+            let (control, _sender, mut driver) = host(0, body, cleanup, Completion::new());
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(driver.as_mut().poll(&mut cx).is_pending());
+            let outer = CallContext::new(CancellationToken::new());
+            let mut run = Box::pin(outer.run(async {
+                poll_fn(|cx| {
+                    if first_poll {
+                        assert!(poll_call(cx).is_pending());
+                    }
+                    assert!(RELEASES.with(|r| r.borrow().is_none()));
+                    drop_call();
+                    Poll::Ready(())
+                })
+                .await;
+            }));
+            assert!(run.as_mut().poll(&mut cx).is_pending());
+            assert!(current_context().is_none());
+            body_tx.send(()).unwrap();
+            assert!(driver.as_mut().poll(&mut cx).is_pending());
+            assert!(run.as_mut().poll(&mut cx).is_pending());
+            cleanup_tx.send(()).unwrap();
+            for _ in 0..32 {
+                assert!(driver.as_mut().poll(&mut cx).is_pending());
+                if !inspect(|p| p.owner.releases.borrow().contains_key(&p.root.id)) {
+                    break;
+                }
+            }
+            assert_eq!(run.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+            assert_eq!(futures::executor::block_on(outer.wait_closed()), Ok(()));
+            drop(run);
+            close(&control, &mut driver, &mut cx);
+        }
+    }
 }

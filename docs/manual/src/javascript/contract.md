@@ -130,8 +130,43 @@ Callback interfaces accept ordinary JavaScript objects. The `Host` and the
 platform bridge retain callback registrations, route callback method IDs, and
 normalize thrown or rejected declared errors. N-API, Electron, Wasm, and
 Harmony use the same callback contract while adapting their transport-specific
-handles. Callback cancellation and non-string-key map extensions are outside
-the current contract scope.
+handles. Foreign callback futures and input producers participate in the owning
+call's cancellation and cleanup accounting. An ordinary JavaScript promise cannot
+be forcibly stopped: callback code must finish its own work and asynchronous
+cleanup. Use the generated callback signature; the bridge does not inject an
+extra cancellation argument into a host callback. Non-string-key map extensions
+remain a separate scope.
+
+### Call cancellation and ownership
+
+Generated asynchronous functions, methods and constructors accept the final
+optional argument declared by their signature:
+
+```ts
+export interface CallOptions { signal?: AbortSignal; }
+```
+
+For example, the unified async fixture declares
+`ready(value: number, options?: CallOptions): Promise<number>`. This option is
+invocation control, separate from business arguments, including an application's
+own record named `CallOptions`. Synchronous functions and direct stream pulls
+do not acquire an extra options argument.
+
+Each managed call enters its own Rust `CallContext`, even when no signal is
+supplied. Aborting requests cancellation of that call; the promise settles only
+after Rust's terminal decision and registered cleanup. Cancellation is distinct
+from a declared business error, and a value already committed by Rust can win a
+late abort. Cancelled calls do not roll back completed side effects or implicitly
+stop independently owned actors, accounts or background tasks. Pass control
+explicitly when starting another independent call.
+
+A returned stream has its own subscription lifetime. After a stream factory has
+completed, close the stream itself rather than aborting the completed factory's
+signal. `await close()` on the generated platform root closes its session,
+rejects new work and waits for active calls, callbacks and stream cleanup.
+Application service shutdown methods remain separate business operations.
+Close before destroying a Window, Worker or embedding environment; hard
+environment destruction is a failure boundary, not successful cleanup.
 
 ## Streams
 
@@ -139,9 +174,10 @@ Rust output streams are represented by a lazy, pull-based single-consumer
 interface:
 
 ```ts
-export interface UniFfiStream<T> extends AsyncIterable<T> {
+export interface UniFfiStream<T> {
   next(): Promise<IteratorResult<T>>;
   cancel(): Promise<void>;
+  [Symbol.asyncIterator](): AsyncIterator<T>;
 }
 ```
 
@@ -156,10 +192,32 @@ type RawStreamStep<T, E> =
 
 `done` has no payload. An optional item remains a real `item` value and is not
 an end-of-stream sentinel. Direct `next()` calls and async iteration share one
-serialized pull path; overlapping pulls fail. `return()`, `throw()`, and
-explicit `cancel()` share one idempotent cancellation path. A finalizer is only
-best-effort cleanup. Input streams use `AsyncIterable<T>` and the corresponding
-`Host` pull/cancel/release methods; they are not output-stream aliases.
+serialized pull path; overlapping pulls fail. Awaiting `cancel()` confirms
+closure, including any pending pull and registered cleanup. The iterator's
+`return()` uses the same idempotent close path; `for await` invokes it on early
+exit. `throw()` is not implemented. Neither `return()` nor `throw()` is a direct
+member of the public stream declaration, and `next()` takes no `CallOptions`.
+
+```ts
+import { unified_async_fixture as api } from "./generated/node/index.js";
+
+const stream = api.canonicalInfallible();
+const iterator = stream[Symbol.asyncIterator]();
+try {
+  const step = await iterator.next();
+  if (!step.done) console.log(step.value);
+} finally {
+  // AsyncIterator declares return as optional; the generated iterator supplies it.
+  if (iterator.return) await iterator.return();
+}
+```
+
+A finalizer is only best-effort cleanup. JavaScript input arguments use the
+separate `UniFfiInputStream<T>` declaration; async generators provide its
+`next()` and async-iterator shape. The bridge owns their pull/cancel/release
+lifecycle and closes a producer on cancellation. A producer must cooperate with
+shutdown and settle its pending pull; its cleanup cannot be confirmed while it
+remains blocked forever. Use the explicit tagged pull interfaces in ArkTS.
 
 ## Platform initialization
 
@@ -175,7 +233,12 @@ generated loader or environment-selected package layout.
 `electron/preload.cjs` loads the same composite addon and exposes only
 `window.__uniffiBackend`. `electron/index.js` creates a renderer `Host`, binds
 it once to that bridge, and exposes the same namespace API. The native addon
-and its handles never cross into renderer JavaScript.
+and its native resources remain owned by the preload/backend. The context bridge
+copies lease carriers across realms; the generated preload retains the original
+carrier and restores its identity on calls and release. Consumers use generated
+renderer objects and streams, rather than copying or reconstructing native lease
+carriers. This transport does not transfer a Rust object or its thread ownership
+to the renderer.
 
 ### Browser Wasm
 
@@ -209,8 +272,23 @@ Node-only module APIs.
 `BackendSession`, and exports the component namespaces. `Index.d.ets` is the
 public declaration consumed by ArkTS and by the final HAR/HSP package. The
 native declaration at `native/index.d.ts` is consumed only by the OHOS native
-package reader. Streams remain pull-based and preserve typed errors exactly as
-the Node and Wasm contracts do.
+package reader. Streams remain pull-based and preserve typed errors. ArkTS uses a distinct
+public pull shape instead of ECMAScript `AsyncIterable`:
+
+```typescript
+export interface UniFfiStream<T> {
+  next(): Promise<ArkStreamStep<T>>;
+  cancel(): Promise<void>;
+  release?(): Promise<void>;
+}
+```
+
+`ArkStreamStep<T>` has `kind: "item"` with a value, `kind: "done"`, or
+`kind: "error"` with an `UniffiError`. For async call cancellation, import the
+generated `CallController` and pass `{ signal: controller.signal }` as the final
+`CallOptions`; `controller.abort()` requests cancellation. No DOM globals are
+required. Await `stream.cancel()` to close a subscription. See the
+[multi-language examples](../futures.md#calling-the-same-rust-api-from-each-binding).
 
 `artifacts build --target harmony` and `javascript build-ohos` use the same
 prepared source/host package. HAR is the default package kind; HSP additionally

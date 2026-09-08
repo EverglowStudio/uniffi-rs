@@ -38,6 +38,12 @@ fileprivate final class UniffiInputStreamNextTaskBox: @unchecked Sendable {
     }
 
     func wait() async {
+        // Accepted next calls usually observe an already-published predecessor.
+        // Joining that Task needs no continuation for the publication itself.
+        if let task = lock.withLock({ self.task }) {
+            await task.value
+            return
+        }
         let task: Task<Void, Never> = await withCheckedContinuation { continuation in
             let task = lock.withLock { () -> Task<Void, Never>? in
                 if let task = self.task {

@@ -165,7 +165,7 @@ impl<A: Actor> Envelope<LocalState<A>> for LocalEnvelope<A> {
     fn handle<'a>(self, actor: &'a mut LocalState<A>, context: ActorContext) -> Self::Future<'a> {
         let state = actor.0.clone();
         Box::pin(async move {
-            let task = super::super::spawn_local(async move {
+            let task = super::super::local::run_local_root(async move {
                 // The serial dispatcher transfers exclusive ownership for
                 // this request; no RefCell borrow survives an await. A panic
                 // drops the invalid body in this S02 root and stops the actor.
@@ -175,7 +175,7 @@ impl<A: Actor> Envelope<LocalState<A>> for LocalEnvelope<A> {
                 result
             })
             .map_err(ActorError::from)?;
-            task.wait().await.map_err(ActorError::from)?
+            task.await.map_err(ActorError::from)?
         })
     }
 }
@@ -257,14 +257,14 @@ impl<E: Payload> Driver<E> {
                     control: self.control.clone(),
                     request: request.clone(),
                 };
-                let mut handler = Box::pin(execute(actor, packet, context));
+                let mut handler = std::pin::pin!(execute(actor, packet, context));
                 loop {
                     self.maintain();
                     if self.control.cancelling.is_cancelled() {
                         request.token.cancel();
                     }
                     let control = self.control.clone();
-                    let mut changed = Box::pin(control.changed.notified());
+                    let mut changed = std::pin::pin!(control.changed.notified());
                     let event = poll_fn(|cx| {
                         if changed.as_mut().poll(cx).is_ready() {
                             return Poll::Ready(None);
@@ -287,7 +287,7 @@ impl<E: Payload> Driver<E> {
                 continue;
             }
             let control = self.control.clone();
-            let mut changed = Box::pin(control.changed.notified());
+            let mut changed = std::pin::pin!(control.changed.notified());
             // Poll receiver before testing for drain completion: a sender may
             // have committed a packet whose owner deque has not seen it yet.
             let end = poll_fn(|cx| {

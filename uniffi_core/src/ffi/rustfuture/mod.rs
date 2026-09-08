@@ -149,7 +149,8 @@ where
 ///
 /// # Safety
 ///
-/// The [Handle] must not previously have been passed to [rust_future_free]
+/// The [Handle] must not previously have been passed to [rust_future_free] or
+/// [rust_future_complete_and_free].
 pub unsafe fn rust_future_poll<FfiType>(
     handle: Handle,
     callback: extern "C" fn(callback_data: u64, RustFuturePoll),
@@ -171,7 +172,8 @@ pub unsafe fn rust_future_poll<FfiType>(
 ///
 /// # Safety
 ///
-/// The [Handle] must not previously have been passed to [rust_future_free]
+/// The [Handle] must not previously have been passed to [rust_future_free] or
+/// [rust_future_complete_and_free].
 pub unsafe fn rust_future_cancel<FfiType>(handle: Handle) {
     trace!("rust_future_cancel: {handle:?}");
     Handle::into_arc_borrowed::<RustFuture<FfiType>>(handle).cancel()
@@ -184,7 +186,8 @@ pub unsafe fn rust_future_cancel<FfiType>(handle: Handle) {
 ///
 /// # Safety
 ///
-/// - The [Handle] must not previously have been passed to [rust_future_free]
+/// - The [Handle] must not previously have been passed to [rust_future_free] or
+///   [rust_future_complete_and_free].
 /// - Polling must have reported [RustFuturePoll::Ready], including after cancellation.
 /// - The `T` param must correctly correspond to the [rust_future_new] call.  It must
 ///   be `<Output as LowerReturn<UT>>::ReturnType`
@@ -199,12 +202,41 @@ where
     Handle::into_arc_borrowed::<RustFuture<FfiType>>(handle).complete(out_status)
 }
 
+/// Complete a ready Rust future and consume its handle.
+///
+/// This performs [rust_future_complete] followed by [rust_future_free]. The returned value and
+/// any error buffer have independent ownership; the caller must lift or release them. Releasing
+/// the future retains the normal free operation's cleanup registration and scheduler handling,
+/// outside the completion operation's error handling.
+///
+/// # Safety
+///
+/// - The handle must refer to a live Rust future and must not already have been consumed.
+/// - Polling must have reported [RustFuturePoll::Ready], including after cancellation.
+/// - `FfiType` must match `<Output as LowerReturn<UT>>::ReturnType` for [rust_future_new].
+/// - The caller must prevent concurrent access to the handle and must not use it again, including
+///   passing it to [rust_future_free].
+pub unsafe fn rust_future_complete_and_free<FfiType>(
+    handle: Handle,
+    out_status: &mut RustCallStatus,
+) -> FfiType
+where
+    FfiType: FfiDefault,
+{
+    // SAFETY: The caller guarantees a ready, live handle with the matching return type.
+    let value = unsafe { rust_future_complete::<FfiType>(handle.clone(), out_status) };
+    // SAFETY: Completion borrows the handle. This consumes its unique ownership exactly once.
+    unsafe { rust_future_free::<FfiType>(handle) };
+    value
+}
+
 /// Free a Rust future, dropping the strong reference and releasing all references held by the
 /// future.
 ///
 /// # Safety
 ///
-/// The [Handle] must not previously have been passed to [rust_future_free]
+/// The [Handle] must not previously have been passed to [rust_future_free] or
+/// [rust_future_complete_and_free].
 pub unsafe fn rust_future_free<FfiType>(handle: Handle) {
     trace!("rust_future_free: {handle:?}");
     Handle::into_arc::<RustFuture<FfiType>>(handle).free()

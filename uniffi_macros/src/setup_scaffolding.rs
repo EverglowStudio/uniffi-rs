@@ -170,6 +170,8 @@ fn rust_future_scaffolding_fns(module_path: &str) -> TokenStream {
         let ffi_rust_future_poll = format_ident!("ffi_{module_path}_rust_future_poll_{fn_suffix}");
         let ffi_rust_future_cancel = format_ident!("ffi_{module_path}_rust_future_cancel_{fn_suffix}");
         let ffi_rust_future_complete = format_ident!("ffi_{module_path}_rust_future_complete_{fn_suffix}");
+        let ffi_rust_future_complete_and_free =
+            format_ident!("ffi_{module_path}_rust_future_complete_and_free_{fn_suffix}");
         let ffi_rust_future_free = format_ident!("ffi_{module_path}_rust_future_free_{fn_suffix}");
 
         quote! {
@@ -195,6 +197,16 @@ fn rust_future_scaffolding_fns(module_path: &str) -> TokenStream {
                 out_status: &mut ::uniffi::RustCallStatus
             ) -> #return_type {
                 ::uniffi::ffi::rust_future_complete::<#return_type>(handle, out_status)
+            }
+
+            #[allow(clippy::missing_safety_doc, missing_docs)]
+            #[doc(hidden)]
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn #ffi_rust_future_complete_and_free(
+                handle: ::uniffi::Handle,
+                out_status: &mut ::uniffi::RustCallStatus
+            ) -> #return_type {
+                ::uniffi::ffi::rust_future_complete_and_free::<#return_type>(handle, out_status)
             }
 
             #[allow(clippy::missing_safety_doc, missing_docs)]

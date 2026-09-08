@@ -35,7 +35,7 @@ pub fn main() -> anyhow::Result<()> {
             filter_type,
             filter_name,
         } => {
-            let initial_root = load_initial_root(&args)?;
+            let (initial_root, _) = load_initial_root(&args)?;
             let opts = PrintOptions {
                 pass,
                 no_diff,
@@ -48,7 +48,7 @@ pub fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_initial_root(args: &cli::StandardArgs) -> Result<pipeline::InitialRoot> {
+fn load_initial_root(args: &cli::StandardArgs) -> Result<(pipeline::InitialRoot, Option<String>)> {
     let mut paths = uniffi_bindgen::BindgenPaths::default();
     #[cfg(feature = "cargo-metadata")]
     paths.add_cargo_metadata_layer(uniffi_bindgen::CargoMetadataOptions {
@@ -67,9 +67,17 @@ fn load_initial_root(args: &cli::StandardArgs) -> Result<pipeline::InitialRoot> 
         GlobalConfig::default()
     };
 
+    let source_crate_name = args
+        .source
+        .as_str()
+        .strip_prefix("src:")
+        .and_then(|name| paths.get_library_name(name));
     let loader = BindgenLoader::new(paths, global_config).with_target(args.target.clone());
     let metadata = loader.load_metadata(&args.source)?;
-    loader.load_pipeline_initial_root(&args.source, metadata)
+    Ok((
+        loader.load_pipeline_initial_root(&args.source, metadata)?,
+        source_crate_name,
+    ))
 }
 
 pub fn generate_bindings(source: &str, out_dir: &Utf8Path) -> Result<()> {
@@ -81,7 +89,7 @@ pub fn generate_bindings(source: &str, out_dir: &Utf8Path) -> Result<()> {
 }
 
 pub fn generate_bindings_from_args(args: cli::StandardArgs, out_dir: &Utf8Path) -> Result<()> {
-    let initial_root = load_initial_root(&args)?;
+    let (initial_root, _) = load_initial_root(&args)?;
     bindings::generate(initial_root, out_dir, args.crate_filter.clone())
 }
 
@@ -109,6 +117,7 @@ fn _generate_scaffolding() -> Result<()> {
         config: None,
         metadata_no_deps: false,
     };
-    let initial_root = load_initial_root(&args)?;
-    scaffolding::generate(initial_root, pkg_name, &Utf8PathBuf::from(out_dir))
+    let (initial_root, crate_name) = load_initial_root(&args)?;
+    let crate_name = crate_name.context("Rust library target not found for JNI scaffolding")?;
+    scaffolding::generate(initial_root, crate_name, &Utf8PathBuf::from(out_dir))
 }

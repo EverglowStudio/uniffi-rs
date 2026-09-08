@@ -39,9 +39,9 @@ pub fn pipeline() -> Pipeline<initial::Root, Root> {
     general::pipeline("kotlin").pass::<Root, Context>(Context::default())
 }
 
-pub fn pipeline_for_scaffolding(pkg_name: String) -> Pipeline<initial::Root, Root> {
+pub fn pipeline_for_scaffolding(crate_name: String) -> Pipeline<initial::Root, Root> {
     let context = Context {
-        scaffolding_crate_name: Some(pkg_name.replace("-", "_")),
+        scaffolding_crate_name: Some(crate_name),
         ..Context::default()
     };
 

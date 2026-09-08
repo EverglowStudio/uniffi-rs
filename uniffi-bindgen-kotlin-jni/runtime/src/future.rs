@@ -92,11 +92,15 @@ where
 
 /// # Safety
 /// Handle must be a live result of `future_new::<T>`; one poll may be in flight.
+/// Returns true without invoking or retaining the callback when the entire Run
+/// is Ready. The caller then retains ownership of `data`. On false, ownership
+/// transfers to exactly one callback, which may run before this function returns.
+#[must_use]
 pub unsafe fn future_poll<T: Send + 'static>(
     handle: Handle,
     callback: extern "C" fn(u64, RustFuturePoll),
     data: u64,
-) {
+) -> bool {
     let future = unsafe { Handle::into_arc_borrowed::<JniFuture<T>>(handle) };
     let ready = {
         let mut state = future.state.lock().unwrap();
@@ -121,12 +125,10 @@ pub unsafe fn future_poll<T: Send + 'static>(
         }
     };
     // Never invoke JVM callbacks under the future's state lock.
-    let continuation = Continuation { callback, data };
-    if ready {
-        continuation.invoke(RustFuturePoll::Ready);
-    } else {
-        future.scheduler.store(continuation);
+    if !ready {
+        future.scheduler.store(Continuation { callback, data });
     }
+    ready
 }
 
 /// # Safety
@@ -215,12 +217,12 @@ mod tests {
         let data = std::ptr::from_ref(&status).expose_provenance() as u64;
         // SAFETY: one typed poll at a time, no access after free.
         unsafe {
-            future_poll::<u32>(handle.clone(), notify, data);
+            assert!(!future_poll::<u32>(handle.clone(), notify, data));
             assert_eq!(status.load(Ordering::SeqCst), 0);
             future_cancel::<u32>(handle.clone());
             assert_eq!(status.load(Ordering::SeqCst), 1);
             status.store(0, Ordering::SeqCst);
-            future_poll::<u32>(handle.clone(), notify, data);
+            assert!(!future_poll::<u32>(handle.clone(), notify, data));
             assert!(dropped.load(Ordering::SeqCst));
             assert!(!cleaned.load(Ordering::SeqCst));
             assert_ne!(status.load(Ordering::SeqCst), 2);
@@ -240,13 +242,67 @@ mod tests {
         let status = AtomicUsize::new(0);
         let data = std::ptr::from_ref(&status).expose_provenance() as u64;
         unsafe {
-            future_poll::<Option<u32>>(handle.clone(), notify, data);
-            assert_eq!(status.load(Ordering::SeqCst), 2);
+            assert!(future_poll::<Option<u32>>(handle.clone(), notify, data));
+            assert_eq!(status.load(Ordering::SeqCst), 0);
             assert_eq!(
                 future_complete::<Option<u32>>(handle.clone()).unwrap(),
                 None
             );
             future_free::<Option<u32>>(handle);
+        }
+    }
+
+    #[test]
+    fn wake_during_pending_poll_is_delivered_once_before_return() {
+        let mut first = true;
+        let handle = future_new(std::future::poll_fn(move |cx| {
+            if std::mem::take(&mut first) {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(7u32))
+            }
+        }));
+        let status = AtomicUsize::new(0);
+        let data = std::ptr::from_ref(&status).expose_provenance() as u64;
+        // SAFETY: serialized typed polls; callback storage outlives the handle.
+        unsafe {
+            assert!(!future_poll::<u32>(handle.clone(), notify, data));
+            assert_eq!(status.load(Ordering::SeqCst), 1);
+            status.store(0, Ordering::SeqCst);
+            assert!(future_poll::<u32>(handle.clone(), notify, data));
+            assert_eq!(status.load(Ordering::SeqCst), 0);
+            assert_eq!(future_complete::<u32>(handle.clone()).unwrap(), 7);
+            future_free::<u32>(handle);
+        }
+    }
+
+    #[test]
+    fn wake_after_pending_registration_does_not_notify_on_ready() {
+        let wake = Arc::new(Mutex::new(None::<Waker>));
+        let sender = wake.clone();
+        let mut first = true;
+        let handle = future_new(std::future::poll_fn(move |cx| {
+            if std::mem::take(&mut first) {
+                *sender.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }));
+        let status = AtomicUsize::new(0);
+        let data = std::ptr::from_ref(&status).expose_provenance() as u64;
+        // SAFETY: wake and callback complete before the next poll and final free.
+        unsafe {
+            assert!(!future_poll::<()>(handle.clone(), notify, data));
+            assert_eq!(status.load(Ordering::SeqCst), 0);
+            wake.lock().unwrap().take().unwrap().wake();
+            assert_eq!(status.load(Ordering::SeqCst), 1);
+            status.store(0, Ordering::SeqCst);
+            assert!(future_poll::<()>(handle.clone(), notify, data));
+            assert_eq!(status.load(Ordering::SeqCst), 0);
+            future_complete::<()>(handle.clone()).unwrap();
+            future_free::<()>(handle);
         }
     }
 
@@ -267,7 +323,11 @@ mod tests {
                 2 => break,
                 1 => {
                     status.store(0, Ordering::SeqCst);
-                    unsafe { future_poll::<T>(handle.clone(), notify, data) };
+                    if unsafe { future_poll::<T>(handle.clone(), notify, data) } {
+                        // Synchronous Ready must not also invoke the callback.
+                        assert_eq!(status.load(Ordering::SeqCst), 0);
+                        break;
+                    }
                 }
                 _ => std::thread::yield_now(),
             }
@@ -335,13 +395,13 @@ mod tests {
         // SAFETY: typed, serialized polling, callback data outlives completion;
         // finish_polling drains Ready and frees exactly once.
         unsafe {
-            future_poll::<u32>(handle.clone(), notify, data);
+            assert!(!future_poll::<u32>(handle.clone(), notify, data));
             if cancel {
                 assert!(!dropped.load(Ordering::SeqCst));
                 future_cancel::<u32>(handle.clone());
                 assert_eq!(status.load(Ordering::SeqCst), 1);
                 status.store(0, Ordering::SeqCst);
-                future_poll::<u32>(handle.clone(), notify, data);
+                assert!(!future_poll::<u32>(handle.clone(), notify, data));
             }
             assert!(dropped.load(Ordering::SeqCst));
             assert!(!cleaned.load(Ordering::SeqCst));

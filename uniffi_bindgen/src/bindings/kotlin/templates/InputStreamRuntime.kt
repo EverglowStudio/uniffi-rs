@@ -80,22 +80,33 @@ private class UniffiFlowInputStream<T>(
     private val rustConsumer = Any()
     private var consumer: Any? = null
     private var pending = false
-    private val nextCompletions = mutableSetOf<CompletableDeferred<Unit>>()
+    // Protected by the stream lock. Most next frames finish without a closer;
+    // only a close that actually waits needs a coroutine completion object.
+    private class NextCompletion {
+        var finished = false
+        var waiter: CompletableDeferred<Unit>? = null
+    }
+    private val nextCompletions = mutableSetOf<NextCompletion>()
     private var done = false
     private var cancelled = false
 
-    private fun reserveLocked(owner: Any): CompletableDeferred<Unit> {
+    private fun reserveLocked(owner: Any): NextCompletion {
         if (consumer == null) consumer = owner
         if (consumer !== owner) throw InternalException("UniFFI input streams may only be consumed once")
         if (pending) throw InternalException("UniFFI input stream received a concurrent next() request")
         pending = true
-        return CompletableDeferred<Unit>().also { nextCompletions.add(it) }
+        return NextCompletion().also { nextCompletions.add(it) }
     }
 
-    private fun release(completion: CompletableDeferred<Unit>) {
-        synchronized(lock) { nextCompletions.remove(completion) }
+    private fun release(completion: NextCompletion) {
+        val waiter = synchronized(lock) {
+            check(!completion.finished)
+            completion.finished = true
+            nextCompletions.remove(completion)
+            completion.waiter
+        }
         // Resuming an Unconfined waiter can synchronously reenter foreign code.
-        completion.complete(Unit)
+        waiter?.complete(Unit)
     }
 
     override fun next(
@@ -104,7 +115,7 @@ private class UniffiFlowInputStream<T>(
         droppedCallback: UniffiForeignFutureDroppedCallbackStruct,
     ) {
         val job: Job
-        val completion: CompletableDeferred<Unit>
+        val completion: NextCompletion
         val nextJobHandle: Long
         var result: Result<UniffiInputStreamNext<T>>? = null
         try {
@@ -191,7 +202,13 @@ private class UniffiFlowInputStream<T>(
             this@UniffiFlowInputStream.cancel()
             scopeJob.join()
             val completions = synchronized(lock) { nextCompletions.toList() }
-            for (completion in completions) completion.await()
+            for (completion in completions) {
+                val waiter = synchronized(lock) {
+                    if (completion.finished) null
+                    else completion.waiter ?: CompletableDeferred<Unit>().also { completion.waiter = it }
+                }
+                waiter?.await()
+            }
             synchronized(lock) { producerJob = null }
             closeSource?.invoke()
         }
@@ -322,7 +339,10 @@ private object uniffiInputStreamCloseCallbackImpl: UniffiInputStreamCloseCallbac
             ))
             return
         }
-        CoroutineScope(Dispatchers.Default).launch {
+        // The cancellation handle is already published and no stream lock is
+        // held. Begin cleanup here; after a real suspension it resumes on the
+        // existing dispatcher. All joins and the final acknowledgement remain.
+        CoroutineScope(Dispatchers.Default).launch(start = CoroutineStart.UNDISPATCHED) {
             val status = try {
                 stream.close()
                 try {

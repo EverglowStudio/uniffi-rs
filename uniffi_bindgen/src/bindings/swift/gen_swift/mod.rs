@@ -1613,7 +1613,7 @@ mod tests {
         assert!(!swift.contains("AsyncThrowingStream<StreamEvent, Error>"));
         assert!(swift.contains("let __streamHandle: UInt64 ="));
         assert!(swift.contains("return UniFfiStream("));
-        assert!(swift.contains("handle: __streamHandle"));
+        assert!(swift.contains("rustSubscriptionHandle: __streamHandle"));
         assert!(swift.contains("uniffi_stream_core_fn_func_count_events("));
         assert!(
             swift.contains("uniffi_stream_core_fn_func_count_events_stream_next(__streamHandle)")
@@ -1623,6 +1623,10 @@ mod tests {
         );
         assert!(swift.contains("try await uniffiRustCallAsync("));
         assert!(swift.contains("cancelFunc: ffi_stream_core_rust_future_cancel_rust_buffer"));
+        for suffix in ["rust_buffer", "void"] {
+            assert!(swift.contains(&format!("completeAndFreeFunc: ffi_stream_core_rust_future_complete_and_free_{suffix}")));
+        }
+        assert!(!swift.contains("completeFunc:"));
         assert!(swift.contains("liftFunc: { try __uniffiLiftStreamNext("));
         assert!(swift.contains("readItem: { reader in"));
         assert!(swift.contains("readError: { reader in"));
@@ -1665,6 +1669,7 @@ mod tests {
         assert!(!bindings
             .library
             .contains("public struct UniFfiStream<Element: Sendable>: AsyncSequence"));
+        assert!(bindings.library.contains("completeAndFreeFunc: ffi_async_core_rust_future_complete_and_free_u32"));
     }
 
     #[test]
@@ -1851,9 +1856,10 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../bindgen-tests/swift/tests/support/s04/run-gate.py");
+            .join("src/bindings/swift/gen_swift/stream_completion_test.py");
         let output = Command::new("python3")
             .arg(runner)
+            .arg("--runtime")
             .arg("--output")
             .arg(tmp.path())
             .output()
@@ -1864,6 +1870,26 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn swift_native_next_completion_protocol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/bindings/swift/gen_swift/stream_completion_test.py");
+        let output = Command::new("python3")
+            .arg(runner)
+            .arg("--output")
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        print!("{}", String::from_utf8_lossy(&output.stdout));
     }
 
     #[test]

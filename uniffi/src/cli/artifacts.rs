@@ -2808,7 +2808,7 @@ fn apple_package_manifest_source(meta: &CargoPackageMetadata, args: &BuildArgs) 
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20path: \"Sources/{package_name}\"\n\
          \x20\x20\x20\x20\x20\x20\x20\x20),\n\
          \x20\x20\x20\x20],\n\
-         \x20\x20\x20\x20swiftLanguageModes: [.v5]\n\
+         \x20\x20\x20\x20swiftLanguageModes: [.v6]\n\
          )\n"
     ))
 }

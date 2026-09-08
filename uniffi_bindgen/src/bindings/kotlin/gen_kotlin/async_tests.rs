@@ -198,3 +198,77 @@ fn kotlin_async_stream_declarations_compile() {
         );
     }
 }
+
+#[test]
+fn kotlin_async_completion_preserves_cleanup_errors() {
+    use std::process::Command;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bindings_file = temp.path().join("AsyncContract.kt");
+    let test_file = temp.path().join("CompletionTest.kt");
+    let jar = temp.path().join("completion.jar");
+    std::fs::write(&bindings_file, bindings(false)).unwrap();
+    std::fs::write(&test_file, format!("{}\n{}", include_str!("async_completion_test.kt"), include_str!("c_abi_terminal_mock.kt"))).unwrap();
+    let classpath = std::env::var("CLASSPATH")
+        .expect("Kotlin completion gate requires JNA/coroutines CLASSPATH");
+    let output = Command::new("kotlinc")
+        .arg("-Werror")
+        .args([&bindings_file, &test_file])
+        .arg("-classpath")
+        .arg(&classpath)
+        .arg("-d")
+        .arg(&jar)
+        .output()
+        .expect("Kotlin completion gate requires kotlinc");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let output = Command::new("kotlin")
+        .arg("-J-ea")
+        .arg("-classpath")
+        .arg(format!("{}:{classpath}", jar.display()))
+        .arg("uniffi.kotlin_async_contract.CompletionTestKt")
+        .output()
+        .expect("Kotlin completion gate requires kotlin");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
+#[test]
+fn kotlin_input_close_completion_protocol() {
+    let temp = tempfile::tempdir().unwrap();
+    let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/bindings/kotlin/gen_kotlin/stream_close_test.py");
+    let output = std::process::Command::new("python3")
+        .arg(runner)
+        .arg("--output")
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
+#[test]
+fn kotlin_generated_calls_use_consuming_terminal_carriers() {
+    let source = bindings(false);
+    for suffix in ["u64", "rust_buffer", "void"] {
+        assert!(source.contains(&format!("-> UniffiLib.ffi_{MODULE}_rust_future_complete_and_free_{suffix}(future,")));
+        assert!(!source.contains(&format!("-> UniffiLib.ffi_{MODULE}_rust_future_complete_{suffix}(future,")));
+    }
+    assert!(source.contains("terminalOwnsHandle = true"));
+    assert!(source.contains("discardResult = { it.close() }"));
+}

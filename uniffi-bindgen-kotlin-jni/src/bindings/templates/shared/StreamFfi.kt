@@ -5,8 +5,8 @@ fun {{ stream.self_type.lift_fn_kt() }}(handle: Long): kotlinx.coroutines.flow.F
     pull = {
         val completion = StreamComplete{{ id }}()
         uniffiAwaitRustFuture(
-            Scaffolding.streamNext{{ id }}(handle),
-            Scaffolding::streamNextPoll{{ id }}, Scaffolding::streamNextCancel{{ id }},
+            { Scaffolding.streamNext{{ id }}(handle) },
+            { future, continuation -> uniffiPollRustFuture(future, continuation, Scaffolding::streamNextPoll{{ id }}) }, Scaffolding::streamNextCancel{{ id }},
             { future ->
                 if (Scaffolding.streamNextComplete{{ id }}(future, completion) == UNIFFI_RUST_FUTURE_CANCELLED) {
                     throw kotlin.coroutines.cancellation.CancellationException()
@@ -19,8 +19,8 @@ fun {{ stream.self_type.lift_fn_kt() }}(handle: Long): kotlinx.coroutines.flow.F
     discard = { Scaffolding.streamDiscard{{ id }}(handle) },
     release = {
         uniffiAwaitRustFuture(
-            Scaffolding.streamClose{{ id }}(handle),
-            Scaffolding::streamClosePoll{{ id }}, Scaffolding::streamCloseCancel{{ id }},
+            { Scaffolding.streamClose{{ id }}(handle) },
+            { future, continuation -> uniffiPollRustFuture(future, continuation, Scaffolding::streamClosePoll{{ id }}) }, Scaffolding::streamCloseCancel{{ id }},
             Scaffolding::streamCloseComplete{{ id }}, Scaffolding::streamCloseFree{{ id }},
         )
     },

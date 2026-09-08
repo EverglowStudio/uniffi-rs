@@ -533,6 +533,7 @@ fn render_host_crate(
                  wasm-bindgen = \"=0.2.126\"\n\
                  wasm-bindgen-futures = \"=0.4.76\"\n\
                  js-sys = \"=0.3.103\"\n\
+                 web-sys = {{ version = \"=0.3.103\", default-features = false }}\n\
                  wasm-bindgen-uniffi-engine = {{ git = \"https://github.com/EverglowStudio/wasm-bindgen.git\", rev = \"{WASM_REV}\" }}\n"
             ),
             String::new(),

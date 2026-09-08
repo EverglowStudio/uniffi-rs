@@ -1,4 +1,5 @@
 object Scaffolding {
+    @JvmStatic external fun futureNotificationTake(wait: Boolean): Long
     @JvmStatic external fun kotlinCallbackReleased(handle: Long)
     @JvmStatic external fun ffiBufferCheckSupport()
     @JvmStatic external fun ffiBufferAlloc(capacity: kotlin.Int): java.nio.ByteBuffer
@@ -66,8 +67,8 @@ object Scaffolding {
     {%- for rust_result in root.rust_async_callable_results() %}
     @JvmStatic external fun {{ rust_result.async_poll_fn() }}(
         rustFuture: kotlin.Long,
-        continuation: kotlin.coroutines.Continuation<kotlin.Boolean>,
-    )
+        notificationId: kotlin.Long,
+    ): kotlin.Boolean
     @JvmStatic external fun {{ rust_result.async_complete_fn() }}(
         rustFuture: kotlin.Long,
         {%- if rust_result.return_type.is_some() %}
@@ -107,7 +108,7 @@ object Scaffolding {
     @JvmStatic external fun streamNext{{ id }}(handle: Long): Long
     @JvmStatic external fun streamClose{{ id }}(handle: Long): Long
     {% for suffix in ["Next", "Close"] %}
-    @JvmStatic external fun stream{{ suffix }}Poll{{ id }}(handle: Long, continuation: kotlin.coroutines.Continuation<Boolean>)
+    @JvmStatic external fun stream{{ suffix }}Poll{{ id }}(handle: Long, notificationId: Long): Boolean
     @JvmStatic external fun stream{{ suffix }}Cancel{{ id }}(handle: Long)
     @JvmStatic external fun stream{{ suffix }}Free{{ id }}(handle: Long)
     {% endfor %}
