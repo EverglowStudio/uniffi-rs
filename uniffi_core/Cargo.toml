@@ -20,9 +20,10 @@ futures-core = "0.3"
 futures-util = { version = "0.3" }
 futures-channel = { version = "0.3", optional = true }
 once_cell = "1.10.0"
+parking_lot = { version = "0.12.5", optional = true }
 pin-project-lite = "0.2.13"
 static_assertions = "1.1.0"
-tokio = { version = "1", features = ["sync"], optional = true }
+tokio = { version = "1", features = ["sync", "parking_lot"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["rt", "time"], optional = true }
@@ -39,7 +40,7 @@ futures = "0.3"
 default = []
 
 # Shared task/time/cancellation APIs; existing FFI polling remains independent.
-async-runtime = ["dep:futures-channel", "dep:tokio", "dep:wasm-bindgen-futures", "dep:gloo-timers", "dep:web-time"]
+async-runtime = ["dep:futures-channel", "dep:parking_lot", "dep:tokio", "dep:wasm-bindgen-futures", "dep:gloo-timers", "dep:web-time"]
 
 # Printout tracing information on FFI calls.  Useful for debugging issues with the bindings code.
 ffi-trace = []

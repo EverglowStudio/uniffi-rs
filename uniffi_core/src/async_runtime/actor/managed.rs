@@ -7,19 +7,17 @@ use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
 /// use this context's token to cancel I/O without dropping the whole handler.
 #[derive(Clone)]
 pub struct ActorContext {
-    pub(super) token: CancellationToken,
-    pub(super) control: Arc<Control>,
     pub(super) request: Arc<mailbox::Request>,
 }
 impl ActorContext {
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.token.clone()
+        self.request.token().clone()
     }
     pub async fn cancelled(&self) {
-        self.token.cancelled().await
+        self.request.token().cancelled().await
     }
     pub fn is_cancelled(&self) -> bool {
-        self.token.is_cancelled()
+        self.request.is_cancelled()
     }
     /// Spawn necessary work for this accepted handler. Work must own its inputs,
     /// cooperate with its token, and send results via ManagedContext::send.
@@ -28,7 +26,7 @@ impl ActorContext {
         F: FnOnce(ManagedContext) -> Fut + SendOutsideWasm + 'static,
         Fut: Future<Output = Result<(), ActorError>> + SendOutsideWasm + 'static,
     {
-        let (context, finished) = register(self.control.clone(), false)?;
+        let (context, finished) = register(self.request.control.clone(), false)?;
         drop(super::super::spawn(async move {
             finished.finish(managed_run(context, factory).await);
         }));
@@ -40,7 +38,7 @@ impl ActorContext {
         F: FnOnce(ManagedContext) -> Fut + 'static,
         Fut: Future<Output = Result<(), ActorError>> + 'static,
     {
-        let (context, finished) = register(self.control.clone(), false)?;
+        let (context, finished) = register(self.request.control.clone(), false)?;
         let task =
             super::super::spawn_local(managed_run(context, factory)).map_err(ActorError::from)?;
         drop(
@@ -53,7 +51,7 @@ impl ActorContext {
     }
     /// Explicit run-level failure. Business Result replies should use Handler.
     pub fn fail(&self, error: ActorError) {
-        self.control.fail(error);
+        self.request.control.fail(error);
     }
 }
 /// Owned task context. Necessary result messages may finish during drain, and
@@ -74,7 +72,7 @@ impl ManagedContext {
     pub fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
     }
-    pub async fn send<A: Actor, E: Envelope<A> + Wrap<A, M>, M: Message>(
+    pub async fn send<A: Actor, E: Payload + Wrap<A, M>, M: Message>(
         &self,
         address: &ActorRef<A, E>,
         message: M,
@@ -90,8 +88,9 @@ fn register(control: Arc<Control>, timer: bool) -> Result<(ManagedContext, Finis
     let token = CancellationToken::new();
     let (finished, signal) = completion();
     {
-        let mut state = control.state.lock().unwrap();
-        if state.mode == Mode::Closing || (timer && state.mode != Mode::Running) {
+        let mut state = control.state.lock();
+        let status = control.status();
+        if status.mode == Mode::Closing || (timer && status.mode != Mode::Running) {
             return Err(ActorError::Closed);
         }
         state.managed.push(Managed {
@@ -138,7 +137,7 @@ where
     control.changed.notify_one();
     result
 }
-impl<A: Actor, E: Envelope<A>> ActorRef<A, E> {
+impl<A: Actor, E: Payload> ActorRef<A, E> {
     /// One-shot timer. Drain and close cancel it, including capacity waiting.
     pub fn notify_after<M: Message>(&self, delay: Duration, message: M) -> Result<(), ActorError>
     where
