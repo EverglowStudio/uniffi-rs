@@ -1,6 +1,119 @@
 #![cfg(all(feature = "async-runtime", not(target_arch = "wasm32")))]
 use std::{cell::Cell, rc::Rc};
 use uniffi_core::async_runtime::{actor::*, BoxFuture, LocalBoxFuture, LocalExecutor};
+
+#[test]
+fn ready_admission_yields_cooperatively_with_mailbox_capacity_remaining() {
+    runtime().block_on(async {
+        let (owner, address, _) = test_actor(512);
+        let admitted = Cell::new(0);
+        let mut batch = std::pin::pin!(async {
+            for _ in 0..256 {
+                address.tell(add(1)).await.unwrap();
+                admitted.set(admitted.get() + 1);
+            }
+        });
+        assert!(poll!(&mut batch).is_pending());
+        assert!(admitted.get() > 0 && admitted.get() < 256);
+        assert!(!address.is_closed());
+        assert!(address.try_send(add(1)).is_ok());
+        batch.await;
+        assert_eq!(admitted.get(), 256);
+        assert_eq!(address.ask(add(0)).await, Ok(Ok(257)));
+        owner.drain_and_close().await.unwrap();
+    });
+}
+
+#[test]
+fn managed_token_alone_cancels_cross_actor_admission_and_waits_payload_cleanup() {
+    struct Cleanup(Option<oneshot::Sender<()>>, Option<oneshot::Receiver<()>>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let started = self.0.take().unwrap();
+            let gate = self.1.take().unwrap();
+            current_context()
+                .unwrap()
+                .defer_cleanup(async move {
+                    started.send(()).unwrap();
+                    gate.await.unwrap();
+                })
+                .unwrap();
+        }
+    }
+    runtime().block_on(async {
+        for cancel_before_poll in [false, true] {
+            let (source_owner, source, _) = test_actor(1);
+            let (target_owner, target, _) = test_actor(1);
+            let (started, active_ready) = oneshot::channel();
+            let (release_active, active_gate) = oneshot::channel();
+            let mut active = target.ask(command(move |_, _| {
+                Box::pin(async move {
+                    started.send(()).unwrap();
+                    active_gate.await.unwrap();
+                    Ok(0)
+                })
+            }));
+            assert!(poll!(&mut active).is_pending());
+            active_ready.await.unwrap();
+            target.tell(add(1)).await.unwrap();
+
+            let (token_ready, token) = oneshot::channel();
+            let (proceed, start_send) = oneshot::channel();
+            let (waiting, at_send) = oneshot::channel();
+            let (report, mut result) = oneshot::channel();
+            let (clean_started, cleaning) = oneshot::channel();
+            let (release_cleanup, cleanup_gate) = oneshot::channel();
+            let destination = target.clone();
+            let payload = Cleanup(Some(clean_started), Some(cleanup_gate));
+            source
+                .ask(command(move |_, context| {
+                    Box::pin(async move {
+                        context
+                            .spawn(move |task| async move {
+                                token_ready.send(task.cancellation_token()).unwrap();
+                                start_send.await.unwrap();
+                                let message = command(move |_, _| {
+                                    drop(payload);
+                                    panic!("cancelled cross-actor message must not execute")
+                                });
+                                let mut send = Box::pin(task.send(&destination, message));
+                                assert!(poll!(&mut send).is_pending());
+                                waiting.send(()).unwrap();
+                                let outcome = send.await;
+                                report.send(outcome).unwrap();
+                                outcome
+                            })
+                            .unwrap();
+                        Ok(0)
+                    })
+                }))
+                .await
+                .unwrap()
+                .unwrap();
+            let token = token.await.unwrap();
+            if cancel_before_poll {
+                token.cancel();
+            }
+            proceed.send(()).unwrap();
+            at_send.await.unwrap();
+            if !cancel_before_poll {
+                token.cancel();
+            }
+            cleaning.await.unwrap();
+            assert!(!source.is_closed() && !target.is_closed());
+            assert!(poll!(&mut result).is_pending());
+            release_cleanup.send(()).unwrap();
+            assert_eq!(result.await.unwrap(), Err(ActorError::Cancelled));
+
+            release_active.send(()).unwrap();
+            assert_eq!(active.await, Ok(Ok(0)));
+            assert_eq!(target.ask(add(1)).await, Ok(Ok(2)));
+            source_owner.close().await.unwrap();
+            target_owner.close().await.unwrap();
+        }
+    });
+}
+
 struct Read;
 impl Message for Read {
     type Reply = usize;

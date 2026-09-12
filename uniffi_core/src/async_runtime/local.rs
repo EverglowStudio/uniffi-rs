@@ -96,6 +96,9 @@ impl Completion {
             .await
             .unwrap_or(Err(LocalError::ExecutorStopped))
     }
+    fn succeeded(&self) -> bool {
+        matches!(self.signal.peek(), Some(Ok(Ok(()))))
+    }
 }
 struct Control {
     // Recover the current executor for owner-only storage, without a strong cycle.
@@ -110,12 +113,16 @@ struct ExecutorHandle {
 }
 impl Drop for ExecutorHandle {
     fn drop(&mut self) {
+        if self.control.done.succeeded() {
+            return;
+        }
         self.control.stop.cancel();
         self.control.changed.notify_one();
     }
 }
-/// A reusable owner. Native creates one current-thread Tokio runtime and LocalSet;
-/// WASM uses the current JavaScript instance's event loop.
+/// A reusable owner. Native uses a dedicated thread and LocalSet, with either
+/// its own Tokio runtime or an explicitly supplied runtime handle. WASM uses
+/// the current JavaScript instance's event loop.
 #[derive(Clone)]
 pub struct LocalExecutor {
     handle: Arc<ExecutorHandle>,
@@ -246,7 +253,7 @@ struct Entry {
     control: Arc<ObjectControl>,
 }
 struct Active {
-    token: CancellationToken,
+    context: super::context::WeakCallContext,
     object: Option<u64>,
 }
 struct Owner {
@@ -256,6 +263,7 @@ struct Owner {
     objects: RefCell<HashMap<u64, Entry>>,
     active: RefCell<HashMap<u64, Active>>,
     releases: RefCell<HashMap<u64, Releases>>,
+    reusable_release: RefCell<Option<Releases>>,
     pending: RefCell<Vec<LocalBoxFuture<'static, ()>>>,
 }
 thread_local! { static CURRENT: RefCell<Option<Rc<Owner>>> = const { RefCell::new(None) }; }
@@ -370,33 +378,47 @@ impl<F: Future> Drop for InOwner<F> {
 
 // Only Copy status values may use this path. Resource-bearing public spawn
 // results retain Owner::start's independent delivery context and confirmation.
-pub(super) fn run_local_root<F>(future: F) -> Result<LocalRootCall<F::Output>, LocalError>
+pub(super) struct RootStartError<F> {
+    pub(super) error: LocalError,
+    pub(super) future: F,
+}
+impl<F> fmt::Debug for RootStartError<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("RootStartError").field(&self.error).finish()
+    }
+}
+pub(super) fn run_local_root<F>(future: F) -> Result<LocalRootCall<F::Output>, RootStartError<F>>
 where
     F: Future + 'static,
     F::Output: Copy + 'static,
 {
-    let owner = CURRENT
-        .with(|slot| slot.borrow().clone())
-        .ok_or(LocalError::NoOwner)?;
+    let Some(owner) = CURRENT.with(|slot| slot.borrow().clone()) else {
+        return Err(RootStartError {
+            error: LocalError::NoOwner,
+            future,
+        });
+    };
     if !owner.accepts_root_handoff.get() {
-        return Err(LocalError::ExecutorStopped);
+        return Err(RootStartError {
+            error: LocalError::ExecutorStopped,
+            future,
+        });
     }
     if owner.control.stop.is_cancelled() {
-        return Err(LocalError::Closed);
+        return Err(RootStartError {
+            error: LocalError::Closed,
+            future,
+        });
     }
-    let token = CancellationToken::new();
-    let context = CallContext::new(token.clone());
+    let context = CallContext::fresh();
     let run = context.run(future);
     let id = owner.id();
-    let releases = Rc::new(ReleaseRoot {
-        id,
-        pending: RefCell::new(Vec::new()),
-    });
+    let releases = owner.release_root(id);
     owner.releases.borrow_mut().insert(id, releases.clone());
     owner.active.borrow_mut().insert(
         id,
         Active {
-            token,
+            context: context.downgrade(),
             object: None,
         },
     );
@@ -404,14 +426,22 @@ where
     let task_releases = releases.clone();
     let work = async move {
         let result = AssertUnwindSafe(run).catch_unwind().await;
-        let cleanup = context.wait_closed().await;
-        let result = match (result, cleanup) {
-            (Ok(Ok(value)), Ok(())) => Ok(value),
-            (Ok(Err(_)), Ok(())) => Err(TaskError::Cancelled),
-            _ => Err(TaskError::Panicked),
+        // Normal Run completion includes cleanup; the root's release batches
+        // below remain a separate confirmation and must still be awaited.
+        let result = match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err(TaskError::Cancelled),
+            Err(_panic) => {
+                let _ = context.wait_closed().await;
+                Err(TaskError::Panicked)
+            }
         };
         task_owner.active.borrow_mut().remove(&id);
-        task_owner.control.changed.notify_one();
+        // This root has no object occupancy. Object release and queued work
+        // notify independently; only shutdown needs this active-set update.
+        if task_owner.control.stop.is_cancelled() {
+            task_owner.control.changed.notify_one();
+        }
         // This await owns any batch already taken from the root. The entire
         // pinned work frame, including that batch, survives waiter Drop.
         if wait_releases(&task_releases).await.is_err() {
@@ -439,55 +469,81 @@ impl<T: Copy + 'static> LocalRootFrame<T> {
     }
     fn abandon(&mut self) {
         let dropped = std::panic::catch_unwind(AssertUnwindSafe(|| drop(self.future.take())));
-        self.retire(Err(LocalError::ExecutorStopped));
+        drop(self.retire(Err(LocalError::ExecutorStopped)));
         if !std::thread::panicking() {
             if let Err(error) = dropped {
                 std::panic::resume_unwind(error);
             }
         }
     }
-    fn retire(&mut self, result: Result<(), LocalError>) {
-        if let Some(releases) = self.releases.take() {
-            self.owner.active.borrow_mut().remove(&releases.id);
-            self.owner.releases.borrow_mut().remove(&releases.id);
-            if let Some(done) = &self.done {
-                done.finish(result);
-            }
+    fn retire(&mut self, result: Result<(), LocalError>) -> Option<Releases> {
+        let releases = self.releases.take()?;
+        self.owner.active.borrow_mut().remove(&releases.id);
+        self.owner.releases.borrow_mut().remove(&releases.id);
+        if let Some(done) = &self.done {
+            done.finish(result);
+        }
+        if self.owner.control.stop.is_cancelled() {
             self.owner.control.changed.notify_one();
         }
+        Some(releases)
     }
 }
 impl<T: Copy + 'static> Future for LocalRootFrame<T> {
     type Output = Result<T, TaskError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let _owner = Scope::enter(&this.owner);
-        let _root = ReleaseScope::enter(&this.releases);
-        super::context::without_current(|| {
-            if !this.owner.accepts_root_handoff.get() {
-                this.abandon();
-                return Poll::Ready(Err(TaskError::ExecutorStopped));
+        let (result, retired) = {
+            let _owner = Scope::enter(&this.owner);
+            let _root = ReleaseScope::enter(&this.releases);
+            super::context::without_current(|| {
+                if !this.owner.accepts_root_handoff.get() {
+                    this.abandon();
+                    return (Poll::Ready(Err(TaskError::ExecutorStopped)), None);
+                }
+                let result = this
+                    .future
+                    .as_mut()
+                    .expect("root polled after completion")
+                    .as_mut()
+                    .poll(cx);
+                let mut retired = None;
+                if let Poll::Ready(result) = result {
+                    drop(this.future.take());
+                    let releases = this.retire(if matches!(result, Err(TaskError::Panicked)) {
+                        Err(LocalError::Panicked)
+                    } else {
+                        Ok(())
+                    });
+                    if result.is_ok()
+                        && this.done.is_none()
+                        && releases
+                            .as_ref()
+                            .is_some_and(|r| r.pending.borrow().is_empty())
+                    {
+                        retired = releases;
+                    }
+                    // Nonempty, handed-off and failed roots drop in their original scope.
+                }
+                (result, retired)
+            })
+        };
+        // The TLS scopes no longer retain this root. Never cache a shared root:
+        // a surviving child/cleanup could append another release after retirement.
+        if let Some(mut releases) = retired {
+            if Rc::get_mut(&mut releases).is_some_and(|root| root.pending.get_mut().is_empty()) {
+                *this.owner.reusable_release.borrow_mut() = Some(releases);
             }
-            let result = this
-                .future
-                .as_mut()
-                .expect("root polled after completion")
-                .as_mut()
-                .poll(cx);
-            if let Poll::Ready(result) = result {
-                drop(this.future.take());
-                this.retire(if matches!(result, Err(TaskError::Panicked)) {
-                    Err(LocalError::Panicked)
-                } else {
-                    Ok(())
-                });
-            }
-            result
-        })
+        }
+        result
     }
 }
 impl<T: Copy + 'static> Drop for LocalRootFrame<T> {
     fn drop(&mut self) {
+        // A retired frame has no work or release root left to destroy in scope.
+        if self.future.is_none() && self.releases.is_none() {
+            return;
+        }
         let _owner = Scope::enter(&self.owner);
         let _root = ReleaseScope::enter(&self.releases);
         super::context::without_current(|| {
@@ -525,7 +581,130 @@ impl<T: Copy + 'static> Drop for LocalRootCall<T> {
         }
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod release_root_reuse_tests {
+    use super::*;
+    use futures_util::poll;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        thread,
+        time::Duration,
+    };
+
+    struct LocalResource {
+        owner: thread::ThreadId,
+        local: Rc<Cell<usize>>,
+        started: Option<oneshot::Sender<()>>,
+        gate: Option<oneshot::Receiver<()>>,
+        dropped: Arc<AtomicUsize>,
+        cleaned: Arc<AtomicUsize>,
+    }
+    impl Drop for LocalResource {
+        fn drop(&mut self) {
+            assert_eq!(thread::current().id(), self.owner);
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+            let owner = self.owner;
+            let local = self.local.clone();
+            let started = self.started.take().unwrap();
+            let gate = self.gate.take().unwrap();
+            let cleaned = self.cleaned.clone();
+            defer_local_cleanup(async move {
+                assert_eq!(thread::current().id(), owner);
+                started.send(()).unwrap();
+                gate.await.unwrap();
+                local.set(local.get() + 1);
+                cleaned.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn consecutive_ready_roots_then_last_proxy_cleanup_hold_reply_and_close() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    for cancel in [false, true] {
+                        let executor = LocalExecutor::new(4).unwrap();
+                        let address = executor.clone();
+                        let (started, cleaning) = oneshot::channel();
+                        let (release, gate) = oneshot::channel();
+                        let dropped = Arc::new(AtomicUsize::new(0));
+                        let cleaned = Arc::new(AtomicUsize::new(0));
+                        let seen_drop = dropped.clone();
+                        let seen_cleanup = cleaned.clone();
+                        let task = executor
+                            .spawn(move || async move {
+                                for _ in 0..32 {
+                                    run_local_root(async {}).unwrap().await.unwrap();
+                                }
+                                let proxy = address
+                                    .create(move || async move {
+                                        LocalResource {
+                                            owner: thread::current().id(),
+                                            local: Rc::new(Cell::new(0)),
+                                            started: Some(started),
+                                            gate: Some(gate),
+                                            dropped: seen_drop,
+                                            cleaned: seen_cleanup,
+                                        }
+                                    })
+                                    .await
+                                    .unwrap();
+                                run_local_root(async move { drop(proxy) })
+                                    .unwrap()
+                                    .await
+                                    .unwrap();
+                            })
+                            .await
+                            .unwrap();
+                        let mut waited = std::pin::pin!(task.wait());
+                        cleaning.await.unwrap();
+                        assert!(poll!(&mut waited).is_pending());
+                        let mut closed = std::pin::pin!(executor.close());
+                        if cancel {
+                            assert!(poll!(&mut closed).is_pending());
+                        }
+                        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+                        assert_eq!(cleaned.load(Ordering::SeqCst), 0);
+                        release.send(()).unwrap();
+                        assert_eq!(
+                            waited.await,
+                            if cancel {
+                                Err(TaskError::Cancelled)
+                            } else {
+                                Ok(())
+                            }
+                        );
+                        closed.await.unwrap();
+                        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+                    }
+                })
+                .await
+                .expect("root cleanup and owner close must make progress");
+            });
+    }
+}
+
 impl Owner {
+    fn release_root(&self, id: u64) -> Releases {
+        if let Some(mut releases) = self.reusable_release.borrow_mut().take() {
+            if let Some(root) = Rc::get_mut(&mut releases) {
+                if root.pending.get_mut().is_empty() {
+                    root.id = id;
+                    return releases;
+                }
+            }
+        }
+        Rc::new(ReleaseRoot {
+            id,
+            pending: RefCell::new(Vec::new()),
+        })
+    }
     fn id(&self) -> u64 {
         let id = self.next.get();
         self.next
@@ -570,7 +749,7 @@ impl Owner {
         self.active.borrow_mut().insert(
             id,
             Active {
-                token: token.clone(),
+                context: context.downgrade(),
                 object,
             },
         );
@@ -670,8 +849,60 @@ impl Owner {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+enum NativeRuntime {
+    Owned(tokio::runtime::Runtime),
+    Borrowed(tokio::runtime::Handle),
+}
+
 impl LocalExecutor {
+    /// Start a fixed owner with its own native Tokio runtime, or on the current
+    /// WASM event loop.
     pub fn new(capacity: usize) -> Result<Self, LocalError> {
+        let (executor, receiver) = Self::channel(capacity)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| LocalError::StartFailed)?;
+            executor.start_worker(receiver, NativeRuntime::Owned(runtime))?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let control = executor.handle.control.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = AssertUnwindSafe(drive(control.clone(), receiver))
+                    .catch_unwind()
+                    .await;
+                control
+                    .done
+                    .finish(result.map_err(|_| LocalError::ExecutorStopped));
+            });
+        }
+        Ok(executor)
+    }
+
+    /// Start a dedicated owner thread using an existing Tokio runtime for I/O
+    /// and timers. Business futures and local cleanup remain on the owner.
+    ///
+    /// The caller must keep the runtime alive and driving until this executor
+    /// closes. In particular, a current-thread runtime needs another thread
+    /// running `Runtime::block_on`; a Handle alone does not drive its I/O.
+    /// Closing this executor waits for its work and local resources to finish,
+    /// and does not shut down the supplied runtime. Use [`Self::new`] when the
+    /// owner must run independently of another runtime's lifetime.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_runtime(
+        capacity: usize,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, LocalError> {
+        let (executor, receiver) = Self::channel(capacity)?;
+        executor.start_worker(receiver, NativeRuntime::Borrowed(runtime))?;
+        Ok(executor)
+    }
+
+    fn channel(capacity: usize) -> Result<(Self, mpsc::Receiver<Packet>), LocalError> {
         if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(LocalError::InvalidCapacity);
         }
@@ -682,40 +913,41 @@ impl LocalExecutor {
             changed: Notify::new(),
             done: Completion::new(),
         });
-        let worker_control = control.clone();
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| LocalError::StartFailed)?;
-            std::thread::Builder::new()
-                .name("uniffi-local".into())
-                .spawn(move || {
-                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        let local = tokio::task::LocalSet::new();
-                        local.block_on(&runtime, drive(worker_control.clone(), receiver));
-                        drop(local);
-                        drop(runtime);
-                    }));
-                    worker_control
-                        .done
-                        .finish(result.map_err(|_| LocalError::ExecutorStopped));
-                })
-                .map_err(|_| LocalError::StartFailed)?;
-        }
-        #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(async move {
-            let result = AssertUnwindSafe(drive(worker_control.clone(), receiver))
-                .catch_unwind()
-                .await;
-            worker_control
-                .done
-                .finish(result.map_err(|_| LocalError::ExecutorStopped));
-        });
         let handle = Arc::new(ExecutorHandle { sender, control });
         *handle.control.executor.lock().unwrap() = Arc::downgrade(&handle);
-        Ok(Self { handle })
+        Ok((Self { handle }, receiver))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_worker(
+        &self,
+        receiver: mpsc::Receiver<Packet>,
+        runtime: NativeRuntime,
+    ) -> Result<(), LocalError> {
+        let control = self.handle.control.clone();
+        std::thread::Builder::new()
+            .name("uniffi-local".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    let local = tokio::task::LocalSet::new();
+                    match runtime {
+                        NativeRuntime::Owned(runtime) => {
+                            local.block_on(&runtime, drive(control.clone(), receiver));
+                            drop(local);
+                            drop(runtime);
+                        }
+                        NativeRuntime::Borrowed(runtime) => {
+                            runtime.block_on(local.run_until(drive(control.clone(), receiver)));
+                            drop(local);
+                        }
+                    }
+                }));
+                control
+                    .done
+                    .finish(result.map_err(|_| LocalError::ExecutorStopped));
+            })
+            .map_err(|_| LocalError::StartFailed)?;
+        Ok(())
     }
     /// Request shutdown independently of queue capacity.
     pub fn cancel(&self) {
@@ -727,8 +959,14 @@ impl LocalExecutor {
     /// owned task: that task is itself part of the shutdown being awaited.
     /// Dropping a started waiter transfers confirmation to the current call's cleanup.
     pub async fn close(&self) -> Result<(), LocalError> {
+        if self.closed_successfully() {
+            return Ok(());
+        }
         self.cancel();
         self.handle.control.done.wait_owned().await
+    }
+    pub(super) fn closed_successfully(&self) -> bool {
+        self.handle.control.done.succeeded()
     }
     async fn submit(&self, packet: Packet, token: &CancellationToken) -> Result<(), LocalError> {
         let control = &self.handle.control;
@@ -1029,6 +1267,7 @@ async fn drive(control: Arc<Control>, mut receiver: mpsc::Receiver<Packet>) {
         objects: RefCell::new(HashMap::new()),
         active: RefCell::new(HashMap::new()),
         releases: RefCell::new(HashMap::new()),
+        reusable_release: RefCell::new(None),
         pending: RefCell::new(Vec::new()),
     });
     let state = owner.clone();
@@ -1047,7 +1286,7 @@ async fn drive(control: Arc<Control>, mut receiver: mpsc::Receiver<Packet>) {
                     entry.control.stop.cancel();
                 }
                 for active in state.active.borrow().values() {
-                    active.token.cancel();
+                    active.context.cancel();
                 }
             }
             for active in state.active.borrow().values() {
@@ -1058,7 +1297,7 @@ async fn drive(control: Arc<Control>, mut receiver: mpsc::Receiver<Packet>) {
                         .get(&id)
                         .is_some_and(|entry| entry.control.stop.is_cancelled())
                 }) {
-                    active.token.cancel();
+                    active.context.cancel();
                 }
             }
             state.close_objects();
@@ -1068,7 +1307,7 @@ async fn drive(control: Arc<Control>, mut receiver: mpsc::Receiver<Packet>) {
             if stopped && running.is_empty() && state.objects.borrow().is_empty() {
                 break;
             }
-            let mut changed = Box::pin(control.changed.notified());
+            let mut changed = std::pin::pin!(control.changed.notified());
             poll_fn(|cx| {
                 if changed.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(());

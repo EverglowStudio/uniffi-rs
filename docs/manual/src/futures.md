@@ -111,6 +111,16 @@ await points and reenter through another proxy. Keep the executor alive until
 all local objects and their streams have closed. Use an actor when a handler
 must hold exclusive state across awaits.
 
+On native targets, `LocalExecutor::new` owns a Tokio runtime. An application
+that already runs Tokio can instead call
+`LocalExecutor::with_runtime(8, tokio::runtime::Handle::current())?` to reuse
+its I/O and timer driver. The local state still lives on a dedicated owner
+thread. Keep the supplied runtime alive and driving until `executor.close()`
+finishes; a handle alone does not drive a current-thread runtime, so that
+runtime must be running `Runtime::block_on` on another thread. Closing the
+executor does not shut down the supplied runtime. WASM uses its current
+JavaScript event loop.
+
 For bindings, mark the body with `#[uniffi(local)]` on a derived Object and
 its methods with `#[uniffi::export(local)]`. Methods become asynchronous owner
 calls, including methods whose Rust body is synchronous. The generated `close`
@@ -187,6 +197,14 @@ For native `!Send` state, use `actor::start_local(&executor, factory, capacity)`
 construct that state inside the factory, retain the `LocalExecutor`, await actor
 close, and only then call `executor.close().await`. Native Send actors and their
 handler futures require `Send`, not `Sync`.
+
+When one actor owns the entire executor lifetime, pass the executor by value to
+`actor::start_owned_local(executor, factory, capacity)`. Its existing observer
+requests executor shutdown after actor cleanup completes. The returned owner's
+`close`, `drain_and_close` and `wait` include executor cleanup; executor clones do
+not keep it running after the actor stops. Dropping a pending close waiter or the
+last owner transfers both completion boundaries to the current `CallContext`.
+Wait from outside that executor, since its closure includes its own tasks.
 
 ## Calling the same Rust API from each binding
 

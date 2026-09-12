@@ -2,6 +2,12 @@
 
 use uniffi_core::async_runtime::*;
 
+#[test]
+fn cancellation_token_keeps_send_and_sync_on_all_targets() {
+    fn require_send_sync<T: Send + Sync>() {}
+    require_send_sync::<CancellationToken>();
+}
+
 // These compile on the real wasm32 target, where Rc/RefCell futures are local.
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)]

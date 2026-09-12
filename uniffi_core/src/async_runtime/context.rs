@@ -3,6 +3,7 @@ use futures_channel::oneshot;
 use futures_util::{
     future::Shared, stream::FuturesUnordered, task::AtomicWaker, FutureExt, StreamExt,
 };
+use parking_lot::Mutex;
 use std::{
     any::Any,
     cell::RefCell,
@@ -12,7 +13,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, OnceLock,
     },
     task::{Context, Poll},
 };
@@ -28,12 +29,6 @@ type CancellationSignal = BoxFuture<'static, ()>;
 type Cleanup = Shared<BoxFuture<'static, Result<(), CleanupFailed>>>;
 type Panic = Box<dyn Any + Send>;
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// A cancellation request. Cancellation is not proof that a call has closed.
 #[derive(Clone)]
 pub struct CancellationToken {
@@ -42,6 +37,8 @@ pub struct CancellationToken {
 struct TokenState {
     cancelled: AtomicBool,
     notification: Notify,
+    #[cfg(not(target_arch = "wasm32"))]
+    context: Weak<Inner>,
 }
 struct Notification {
     sender: Option<oneshot::Sender<()>>,
@@ -63,10 +60,15 @@ impl Default for CancellationToken {
 }
 impl CancellationToken {
     pub fn new() -> Self {
+        Self::with_context(Weak::new())
+    }
+    fn with_context(_context: Weak<Inner>) -> Self {
         Self {
             state: Arc::new(TokenState {
                 cancelled: AtomicBool::new(false),
                 notification: Notify::new(),
+                #[cfg(not(target_arch = "wasm32"))]
+                context: _context,
             }),
         }
     }
@@ -76,6 +78,10 @@ impl CancellationToken {
             return;
         }
         self.state.notification.notify_waiters();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(context) = self.state.context.upgrade() {
+            context.cleanup_waker.wake();
+        }
     }
     pub fn is_cancelled(&self) -> bool {
         self.state.cancelled.load(Ordering::Acquire)
@@ -132,8 +138,17 @@ error!(CleanupFailed, "a registered cleanup panicked");
 pub struct CallContext {
     inner: ContextRef<Inner>,
 }
+// Owner cancellation must not retain a finished call or its cleanup captures.
+pub(super) struct WeakCallContext(Weak<Inner>);
+impl WeakCallContext {
+    pub(super) fn cancel(&self) {
+        if let Some(inner) = self.0.upgrade() {
+            CallContext { inner }.cancel();
+        }
+    }
+}
 struct Inner {
-    token: CancellationToken,
+    token: OnceLock<CancellationToken>,
     // The single-run gate does not publish cleanup or closed state; those stay
     // protected by state. Competing run callers only need an atomic winner.
     started: AtomicBool,
@@ -174,7 +189,18 @@ impl Drop for Scope {
 }
 
 impl CallContext {
+    pub(super) fn downgrade(&self) -> WeakCallContext {
+        WeakCallContext(ContextRef::downgrade(&self.inner))
+    }
     pub fn new(token: CancellationToken) -> Self {
+        Self::with_token(token.into())
+    }
+    // Internal scopes have no external token until it is requested. They retain
+    // the same cancellation path when exposed through current_context.
+    pub(super) fn fresh() -> Self {
+        Self::with_token(OnceLock::new())
+    }
+    fn with_token(token: OnceLock<CancellationToken>) -> Self {
         Self {
             inner: ContextRef::new(Inner {
                 token,
@@ -191,10 +217,30 @@ impl CallContext {
     }
     /// Request cancellation; await the call or wait_closed for release confirmation.
     pub fn cancel(&self) {
-        self.inner.token.cancel();
+        self.token().cancel();
     }
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.inner.token.clone()
+        self.token().clone()
+    }
+    fn token(&self) -> &CancellationToken {
+        // Merely exposing a token does not wake the business future. Its weak
+        // link forwards an actual cancellation to a still-fresh pending Run.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.inner
+                .token
+                .get_or_init(|| CancellationToken::with_context(ContextRef::downgrade(&self.inner)))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.inner.token.get_or_init(CancellationToken::new)
+        }
+    }
+    fn is_cancelled(&self) -> bool {
+        self.inner
+            .token
+            .get()
+            .is_some_and(CancellationToken::is_cancelled)
     }
     /// Register asynchronous release confirmation, including from a destructor.
     ///
@@ -206,7 +252,7 @@ impl CallContext {
         F: Future<Output = ()> + SendOutsideWasm + 'static,
     {
         {
-            let mut state = lock(&self.inner.state);
+            let mut state = self.inner.state.lock();
             if state.closed.is_some() {
                 return Err(CleanupClosed);
             }
@@ -226,6 +272,7 @@ impl CallContext {
             context: self.clone(),
             future: Some(future),
             cancellation: None,
+            business_waker_registered: false,
             result: None,
             panic: None,
             cleanup: None,
@@ -241,7 +288,7 @@ impl CallContext {
     pub async fn wait_closed(&self) -> Result<(), CleanupFailed> {
         loop {
             let (cleanup, notification) = {
-                let mut state = lock(&self.inner.state);
+                let mut state = self.inner.state.lock();
                 if let Some(result) = state.closed {
                     return result;
                 }
@@ -268,7 +315,7 @@ impl CallContext {
     }
     fn begin_close(&self) -> Option<Cleanup> {
         let (cleanup, sender) = {
-            let mut state = lock(&self.inner.state);
+            let mut state = self.inner.state.lock();
             if state.closed.is_some() {
                 return None;
             }
@@ -308,7 +355,125 @@ impl CallContext {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod retention_tests {
     use super::*;
-    use std::sync::{atomic::AtomicUsize, Barrier};
+    use std::sync::{atomic::AtomicUsize, Barrier, Mutex, MutexGuard};
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn fresh_context_first_pending_cancel_shares_token_and_waits_for_cleanup() {
+        let context = CallContext::fresh();
+        let start = Arc::new(Barrier::new(9));
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let context = context.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let token = context.cancellation_token();
+                    if index == 0 {
+                        token.cancel();
+                    }
+                    token
+                })
+            })
+            .collect();
+        let (started, mut cleaning) = oneshot::channel();
+        let (release, gate) = oneshot::channel();
+        context
+            .defer_cleanup(async move {
+                started.send(()).unwrap();
+                gate.await.unwrap();
+            })
+            .unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let mut call = Box::pin(context.run(futures::future::poll_fn(move |_| {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                start.wait();
+            }
+            Poll::<u32>::Pending
+        })));
+        futures::executor::block_on(futures::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            Pin::new(&mut cleaning).poll(cx)
+        }))
+        .unwrap();
+        for worker in workers {
+            assert!(worker.join().unwrap().is_cancelled());
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        futures::executor::block_on(async {
+            let closed = context.wait_closed();
+            futures::pin_mut!(closed);
+            assert!(futures::poll!(&mut closed).is_pending());
+            assert!(futures::poll!(&mut call).is_pending());
+            release.send(()).unwrap();
+            assert_eq!(call.await, Err(Cancelled));
+            assert_eq!(closed.await, Ok(()));
+        });
+    }
+
+    #[test]
+    fn fresh_context_ready_cancel_drops_value_in_scope_before_ack() {
+        struct Value {
+            gate: Option<oneshot::Receiver<()>>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Value {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                let gate = self.gate.take().unwrap();
+                current_context()
+                    .unwrap()
+                    .defer_cleanup(async move { gate.await.unwrap() })
+                    .unwrap();
+            }
+        }
+        let context = CallContext::fresh();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = oneshot::channel();
+        let value = Value {
+            gate: Some(gate),
+            drops: drops.clone(),
+        };
+        futures::executor::block_on(async {
+            let call = context.run(async {
+                current_context().unwrap().cancel();
+                value
+            });
+            futures::pin_mut!(call);
+            assert!(futures::poll!(&mut call).is_pending());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            let closed = context.wait_closed();
+            futures::pin_mut!(closed);
+            assert!(futures::poll!(&mut closed).is_pending());
+            release.send(()).unwrap();
+            assert!(matches!(call.await, Err(Cancelled)));
+            assert_eq!(closed.await, Ok(()));
+        });
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fresh_context_pre_cancel_and_late_cancel_preserve_outcomes() {
+        let early = CallContext::fresh();
+        early.cancel();
+        assert_eq!(
+            futures::executor::block_on(
+                early.run(async { panic!("pre-cancelled business must not be polled") })
+            ),
+            Err::<(), _>(Cancelled)
+        );
+        let late = CallContext::fresh();
+        assert_eq!(futures::executor::block_on(late.run(async { 42 })), Ok(42));
+        late.cancellation_token().cancel();
+        assert_eq!(futures::executor::block_on(late.wait_closed()), Ok(()));
+        assert!(late.cancellation_token().is_cancelled());
+    }
 
     #[test]
     fn concurrent_run_has_one_winner_and_preserves_cleanup() {
@@ -484,14 +649,14 @@ mod retention_tests {
         let context = CallContext::new(token.clone());
         let mut call = Box::pin(context.run(async { 42 }));
         assert!(call.cancellation.is_none());
-        assert!(lock(&context.inner.state).notification.is_none());
+        assert!(context.inner.state.lock().notification.is_none());
         assert_eq!(futures::executor::block_on(&mut call), Ok(42));
         assert!(call.cancellation.is_none());
         futures::executor::block_on(async {
             let (one, two) = futures::join!(context.wait_closed(), context.wait_closed());
             assert_eq!((one, two), (Ok(()), Ok(())));
         });
-        let state = lock(&context.inner.state);
+        let state = context.inner.state.lock();
         assert_eq!(state.closed, Some(Ok(())));
         assert!(state.notification.is_none());
         assert!(state.closing.is_none());
@@ -513,7 +678,7 @@ mod retention_tests {
             drop(call);
             assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
             assert_eq!(Arc::strong_count(&token.state), 2);
-            let state = lock(&context.inner.state);
+            let state = context.inner.state.lock();
             assert!(state.notification.is_none());
             assert!(state.closing.is_none());
         }
@@ -528,11 +693,11 @@ mod retention_tests {
         let mut cx = Context::from_waker(&waker);
         assert!(one.as_mut().poll(&mut cx).is_pending());
         assert!(two.as_mut().poll(&mut cx).is_pending());
-        assert!(lock(&context.inner.state).notification.is_some());
+        assert!(context.inner.state.lock().notification.is_some());
         drop(one);
         assert_eq!(futures::executor::block_on(context.run(async { 7 })), Ok(7));
         assert_eq!(futures::executor::block_on(two), Ok(()));
-        assert!(lock(&context.inner.state).closing.is_none());
+        assert!(context.inner.state.lock().closing.is_none());
     }
 
     #[test]
@@ -824,6 +989,295 @@ mod retention_tests {
     }
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lazy_pending_cancel_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Wake, Waker};
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn fresh_pending_external_first_cancel_wakes_and_waits_for_real_cleanup() {
+        for direct_cancel in [false, true] {
+            let context = CallContext::fresh();
+            let (started, mut cleaning) = oneshot::channel();
+            let (release, gate) = oneshot::channel();
+            context
+                .defer_cleanup(async move {
+                    started.send(()).unwrap();
+                    gate.await.unwrap();
+                })
+                .unwrap();
+            let polls = AtomicUsize::new(0);
+            let mut call = Box::pin(context.run(futures::future::poll_fn(|_| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                Poll::<()>::Pending
+            })));
+            let count = Arc::new(WakeCount::default());
+            let waker = Waker::from(count.clone());
+            assert!(call
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            assert_eq!(count.0.load(Ordering::SeqCst), 0);
+            let external = context.clone();
+            std::thread::spawn(move || {
+                if direct_cancel {
+                    external.cancel();
+                } else {
+                    external.cancellation_token().cancel();
+                }
+            })
+            .join()
+            .unwrap();
+            assert_eq!(count.0.load(Ordering::SeqCst), 1);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(call.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(cleaning.try_recv(), Ok(Some(())));
+            let mut closed = Box::pin(context.wait_closed());
+            assert!(closed.as_mut().poll(&mut cx).is_pending());
+            release.send(()).unwrap();
+            assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Err(Cancelled)));
+            assert_eq!(closed.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        }
+    }
+
+    #[test]
+    fn first_token_exposure_is_quiet_then_cancel_uses_the_repolled_signal() {
+        let context = CallContext::fresh();
+        let mut call = Box::pin(context.run(futures::future::pending::<()>()));
+        let first = Arc::new(WakeCount::default());
+        let first_waker = Waker::from(first.clone());
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(&first_waker))
+            .is_pending());
+        let external = context.clone();
+        let token = std::thread::spawn(move || external.cancellation_token())
+            .join()
+            .unwrap();
+        assert!(!token.is_cancelled());
+        assert_eq!(first.0.load(Ordering::SeqCst), 0);
+        let latest = Arc::new(WakeCount::default());
+        let latest_waker = Waker::from(latest.clone());
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(&latest_waker))
+            .is_pending());
+        drop(context.cancellation_token());
+        assert_eq!(first.0.load(Ordering::SeqCst), 0);
+        assert_eq!(latest.0.load(Ordering::SeqCst), 0);
+        std::thread::spawn(move || token.cancel()).join().unwrap();
+        assert_eq!(first.0.load(Ordering::SeqCst), 0);
+        assert_eq!(latest.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(Cancelled))
+        );
+    }
+
+    #[test]
+    fn external_token_publication_before_business_pending_preserves_cancel() {
+        for cancel_before_pending in [false, true] {
+            let context = CallContext::fresh();
+            let external = context.clone();
+            let (entered, observed) = std::sync::mpsc::sync_channel(0);
+            let (published, publication) = std::sync::mpsc::sync_channel(0);
+            let worker = std::thread::spawn(move || {
+                observed.recv().unwrap();
+                let token = external.cancellation_token();
+                if cancel_before_pending {
+                    token.cancel();
+                }
+                published.send(()).unwrap();
+                token
+            });
+            let mut first_poll = true;
+            let mut call = Box::pin(context.run(futures::future::poll_fn(|_| {
+                if first_poll {
+                    first_poll = false;
+                    entered.send(()).unwrap();
+                    publication.recv().unwrap();
+                }
+                Poll::<()>::Pending
+            })));
+            let count = Arc::new(WakeCount::default());
+            let waker = Waker::from(count.clone());
+            let result = call.as_mut().poll(&mut Context::from_waker(&waker));
+            let token = worker.join().unwrap();
+            if cancel_before_pending {
+                assert_eq!(result, Poll::Ready(Err(Cancelled)));
+            } else {
+                assert!(result.is_pending());
+                assert_eq!(count.0.load(Ordering::SeqCst), 0);
+                std::thread::spawn(move || token.cancel()).join().unwrap();
+                assert_eq!(count.0.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(Cancelled))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_business_waker_is_released_on_ready_cancel_drop_and_panic() {
+        // Keep the context alive past each terminal path and observe only the
+        // executor's Wake allocation, not the Run's private registration flag.
+        for mode in 0..4 {
+            let context = CallContext::fresh();
+            let finish = AtomicBool::new(false);
+            let mut call = Box::pin(context.run(futures::future::poll_fn(|_| {
+                if !finish.load(Ordering::SeqCst) {
+                    Poll::Pending
+                } else if mode == 3 {
+                    panic!("fresh business poll panic");
+                } else {
+                    Poll::Ready(42)
+                }
+            })));
+            let count = Arc::new(WakeCount::default());
+            let weak = Arc::downgrade(&count);
+            let waker = Waker::from(count);
+            assert!(call
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            drop(waker);
+            assert!(weak.upgrade().is_some());
+            let mut cx = Context::from_waker(Waker::noop());
+            match mode {
+                0 => {
+                    finish.store(true, Ordering::SeqCst);
+                    assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Ok(42)));
+                    assert!(weak.upgrade().is_none());
+                    drop(call);
+                }
+                1 => {
+                    context.cancel();
+                    assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Err(Cancelled)));
+                    assert!(weak.upgrade().is_none());
+                    drop(call);
+                }
+                2 => drop(call),
+                _ => {
+                    finish.store(true, Ordering::SeqCst);
+                    assert!(
+                        catch_unwind(AssertUnwindSafe(|| { call.as_mut().poll(&mut cx) })).is_err()
+                    );
+                    assert!(weak.upgrade().is_none());
+                    drop(call);
+                }
+            }
+            assert!(weak.upgrade().is_none());
+            assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
+            assert!(weak.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn fresh_pending_replaces_business_waker_and_ready_never_retains_one() {
+        let context = CallContext::fresh();
+        let mut call = Box::pin(context.run(futures::future::pending::<()>()));
+        let old = Arc::new(WakeCount::default());
+        let weak_old = Arc::downgrade(&old);
+        let old_waker = Waker::from(old);
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(&old_waker))
+            .is_pending());
+        drop(old_waker);
+        assert!(weak_old.upgrade().is_some());
+        let latest = Arc::new(WakeCount::default());
+        let latest_waker = Waker::from(latest.clone());
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(&latest_waker))
+            .is_pending());
+        assert!(weak_old.upgrade().is_none());
+        drop(context.cancellation_token());
+        assert_eq!(latest.0.load(Ordering::SeqCst), 0);
+        context.cancel();
+        assert_eq!(latest.0.load(Ordering::SeqCst), 1);
+        drop(call);
+
+        let ready_context = CallContext::fresh();
+        let mut ready = Box::pin(ready_context.run(futures::future::ready(42)));
+        let count = Arc::new(WakeCount::default());
+        let weak = Arc::downgrade(&count);
+        let waker = Waker::from(count);
+        assert_eq!(
+            ready.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Ok(42))
+        );
+        drop(waker);
+        assert!(weak.upgrade().is_none());
+        drop(ready);
+        assert_eq!(
+            futures::executor::block_on(ready_context.wait_closed()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn dropping_run_after_close_preserves_the_cleanup_registration() {
+        let context = CallContext::fresh();
+        let (release, gate) = oneshot::channel();
+        context
+            .defer_cleanup(async move { gate.await.unwrap() })
+            .unwrap();
+        let finish = AtomicBool::new(false);
+        let mut call = Box::pin(context.run(futures::future::poll_fn(|_| {
+            if finish.load(Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })));
+        let business = Arc::new(WakeCount::default());
+        let weak_business = Arc::downgrade(&business);
+        let business_waker = Waker::from(business);
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(&business_waker))
+            .is_pending());
+        drop(business_waker);
+        assert!(weak_business.upgrade().is_some());
+        finish.store(true, Ordering::SeqCst);
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert!(weak_business.upgrade().is_none());
+        let cleanup = Arc::new(WakeCount::default());
+        let weak_cleanup = Arc::downgrade(&cleanup);
+        let cleanup_waker = Waker::from(cleanup.clone());
+        let mut cx = Context::from_waker(&cleanup_waker);
+        let mut closed = Box::pin(context.wait_closed());
+        assert!(closed.as_mut().poll(&mut cx).is_pending());
+        drop(call);
+        let before = cleanup.0.load(Ordering::SeqCst);
+        context.defer_cleanup(async {}).unwrap();
+        assert!(cleanup.0.load(Ordering::SeqCst) > before);
+        assert!(closed.as_mut().poll(&mut cx).is_pending());
+        release.send(()).unwrap();
+        assert_eq!(closed.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(closed);
+        drop(cleanup_waker);
+        drop(cleanup);
+        assert!(weak_cleanup.upgrade().is_none());
+        assert_eq!(futures::executor::block_on(context.wait_closed()), Ok(()));
+    }
+}
+
 struct CleanupDriver {
     inner: Weak<Inner>,
     pending: FuturesUnordered<BoxFuture<'static, bool>>,
@@ -839,7 +1293,7 @@ impl Future for CleanupDriver {
         let _scope = Scope::enter(&context);
         context.inner.cleanup_waker.register(cx.waker());
         loop {
-            let queued = std::mem::take(&mut lock(&context.inner.state).cleanup);
+            let queued = std::mem::take(&mut context.inner.state.lock().cleanup);
             for future in queued {
                 // Catch poll and destructor panics independently, so one cleanup
                 // cannot prevent other registered releases from completing.
@@ -857,12 +1311,12 @@ impl Future for CleanupDriver {
             match self.pending.poll_next_unpin(cx) {
                 Poll::Ready(Some(failed)) => self.failed |= failed,
                 Poll::Pending => {
-                    if lock(&context.inner.state).cleanup.is_empty() {
+                    if context.inner.state.lock().cleanup.is_empty() {
                         return Poll::Pending;
                     }
                 }
                 Poll::Ready(None) => {
-                    let mut state = lock(&context.inner.state);
+                    let mut state = context.inner.state.lock();
                     if !state.cleanup.is_empty() {
                         continue;
                     }
@@ -890,6 +1344,7 @@ pin_project_lite::pin_project! {
         #[pin]
         future: Option<F>,
         cancellation: Option<CancellationSignal>,
+        business_waker_registered: bool,
         result: Option<Result<F::Output, Cancelled>>,
         panic: Option<Panic>,
         cleanup: Option<Cleanup>,
@@ -926,6 +1381,11 @@ impl<F: Future> RunProjection<'_, F> {
     // Both callers (poll through close, and Drop) already hold this context's
     // scope for the entire business/result destruction and panic handling.
     fn drop_business_in_scope(&mut self) {
+        // Business and CleanupDriver never register concurrently. Release our
+        // executor before begin_close hands this slot to the cleanup driver.
+        if std::mem::take(self.business_waker_registered) {
+            self.context.inner.cleanup_waker.take();
+        }
         // Assignment installs None even when the old destructor unwinds, so
         // catching that panic cannot leave a future to poll or destroy again.
         if let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.future.set(None))) {
@@ -946,18 +1406,37 @@ impl<F: Future> Future for Run<F> {
         assert!(!*this.done, "a completed call cannot be polled again");
         let _scope = Scope::enter(this.context);
         if this.future.is_some() {
-            if this.context.inner.token.is_cancelled() {
+            if this.context.is_cancelled() {
                 *this.result = Some(Err(Cancelled));
             } else {
                 match catch_unwind(AssertUnwindSafe(|| {
                     this.future.as_mut().as_pin_mut().unwrap().poll(cx)
                 })) {
                     Ok(Poll::Pending) => {
+                        // Native can link a Send/Sync context weakly. WASM
+                        // contexts are local Rc values; keep tokens transferable
+                        // there by retaining their original Notify signal path.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if this.context.inner.token.get().is_none() {
+                            *this.business_waker_registered = true;
+                            this.context.inner.cleanup_waker.register(cx.waker());
+                            // Publication before registration is covered by this
+                            // recheck. Later cancellation reaches this slot via
+                            // the token's weak context link.
+                            if this.context.inner.token.get().is_none() {
+                                return Poll::Pending;
+                            }
+                        }
+                        // A materialized token uses the original signal; retire
+                        // the fresh registration before installing its waiter.
+                        if std::mem::take(this.business_waker_registered) {
+                            this.context.inner.cleanup_waker.take();
+                        }
                         // Ready calls never allocate a cancellation waiter. A
                         // Pending call must register before returning to its
                         // executor, with a recheck to cover cancel during poll.
                         if this.cancellation.is_none() {
-                            *this.cancellation = this.context.inner.token.signal();
+                            *this.cancellation = this.context.token().signal();
                         }
                         if let Some(signal) = this.cancellation.as_mut() {
                             if Pin::new(signal).poll(cx).is_pending() {
@@ -970,7 +1449,7 @@ impl<F: Future> Future for Run<F> {
                         // This acquire load linearizes result commitment against
                         // cancel's atomic swap. Later cancellation cannot replace
                         // a result already committed before cleanup.
-                        let cancelled = this.context.inner.token.is_cancelled();
+                        let cancelled = this.context.is_cancelled();
                         if cancelled {
                             if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
                                 *this.panic = Some(panic);

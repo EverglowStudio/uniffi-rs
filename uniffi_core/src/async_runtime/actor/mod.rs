@@ -5,17 +5,17 @@
 //! finish restoring state before returning. Never await this actor's next message
 //! from a handler; use a managed task and a completion message instead.
 
-use super::{
-    BoxFuture, CallContext, CancellationToken, LocalBoxFuture, LocalExecutor, SendOutsideWasm,
-};
-use std::sync::Arc;
+use super::local::{run_local_root, LocalBoxFuture, LocalRootCall, RootStartError};
+use super::{BoxFuture, CallContext, CancellationToken, LocalExecutor, SendOutsideWasm};
+use futures_util::FutureExt;
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 use tokio::sync::mpsc;
 mod control;
 mod driver;
 mod mailbox;
 mod managed;
 use control::*;
-pub use driver::{start, start_local, ActorOwner};
+pub use driver::{start, start_local, start_owned_local, ActorOwner};
 use mailbox::{discard, Packet};
 pub use mailbox::{Ask, TrySendError};
 pub use managed::{ActorContext, ManagedContext};
@@ -80,6 +80,8 @@ pub trait Payload: SendOutsideWasm + 'static {
     fn release(self) -> BoxFuture<'static, Result<(), ActorError>>;
 }
 #[doc(hidden)]
+/// The built-in execution futures confirm business destruction and their cleanup
+/// before returning. The driver then arbitrates commitment and delivers replies.
 pub trait Envelope<A: Actor>: Payload {
     type Future<'a>: Future<Output = Result<(), ActorError>> + 'a
     where
@@ -87,7 +89,7 @@ pub trait Envelope<A: Actor>: Payload {
     fn handle<'a>(self, actor: &'a mut A, context: ActorContext) -> Self::Future<'a>;
 }
 #[doc(hidden)]
-pub trait Wrap<A: Actor, M: Message>: Envelope<A> {
+pub trait Wrap<A: Actor, M: Message>: Payload {
     fn wrap(message: M, reply: oneshot::Sender<M::Reply>) -> Self;
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -99,12 +101,24 @@ type SendAction<A> =
     Box<dyn for<'a> FnOnce(&'a mut A, ActorContext) -> BoxFuture<'a, Result<(), ActorError>>>;
 #[cfg(not(target_arch = "wasm32"))]
 type LocalAction<A> = Box<
-    dyn for<'a> FnOnce(&'a mut A, ActorContext) -> LocalBoxFuture<'a, Result<(), ActorError>>
-        + Send,
+    dyn FnOnce(
+            Rc<RefCell<Option<A>>>,
+            ActorContext,
+        ) -> Result<
+            LocalRootCall<Result<(), ActorError>>,
+            LocalBoxFuture<'static, Result<(), ActorError>>,
+        > + Send,
 >;
 #[cfg(target_arch = "wasm32")]
-type LocalAction<A> =
-    Box<dyn for<'a> FnOnce(&'a mut A, ActorContext) -> LocalBoxFuture<'a, Result<(), ActorError>>>;
+type LocalAction<A> = Box<
+    dyn FnOnce(
+        Rc<RefCell<Option<A>>>,
+        ActorContext,
+    ) -> Result<
+        LocalRootCall<Result<(), ActorError>>,
+        LocalBoxFuture<'static, Result<(), ActorError>>,
+    >,
+>;
 #[doc(hidden)]
 pub struct SendEnvelope<A: Actor>(SendAction<A>);
 #[doc(hidden)]
@@ -134,10 +148,26 @@ impl<A: Actor> Envelope<A> for SendEnvelope<A> {
         (self.0)(actor, context)
     }
 }
-impl<A: Actor> Envelope<A> for LocalEnvelope<A> {
-    type Future<'a> = LocalBoxFuture<'a, Result<(), ActorError>>;
-    fn handle<'a>(self, actor: &'a mut A, context: ActorContext) -> Self::Future<'a> {
-        (self.0)(actor, context)
+// Construct Run before returning the future: even an unpolled drop must destroy
+// its captures in this scope. Only Send execution and rejected local roots need E.
+fn message_scope<F>(future: F) -> impl Future<Output = Result<(), ActorError>>
+where
+    F: Future<Output = Result<(), ActorError>>,
+{
+    use std::panic::AssertUnwindSafe;
+
+    let scope = CallContext::fresh();
+    let call = scope.run(future);
+    async move {
+        let result = AssertUnwindSafe(call).catch_unwind().await;
+        match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ActorError::Panicked),
+            Err(_panic) => {
+                let _ = scope.wait_closed().await;
+                Err(ActorError::Panicked)
+            }
+        }
     }
 }
 impl<A, M> Wrap<A, M> for SendEnvelope<A>
@@ -148,24 +178,42 @@ where
 {
     fn wrap(message: M, reply: oneshot::Sender<M::Reply>) -> Self {
         Self(Box::new(move |actor, context| {
-            Box::pin(async move {
+            Box::pin(message_scope(async move {
                 let request = context.request.clone();
                 let output = actor.handle(message, context).await;
                 request.hold_reply(output, reply, false);
                 Ok(())
-            })
+            }))
         }))
     }
 }
 impl<A: Handler<M>, M: Message> Wrap<A, M> for LocalEnvelope<A> {
     fn wrap(message: M, reply: oneshot::Sender<M::Reply>) -> Self {
-        Self(Box::new(move |actor, context| {
-            Box::pin(async move {
-                let request = context.request.clone();
-                let output = actor.handle(message, context).await;
-                request.hold_reply(output, reply, true);
-                Ok(())
+        Self(Box::new(move |state, context| {
+            run_local_root(async move {
+                // Take and construct the handler only on the first H poll.
+                // No RefCell borrow survives the typed body's await.
+                let mut actor = state.borrow_mut().take().expect("serial actor state");
+                // Keep the body's locals and future scoped before restoring A.
+                // The existing H work box pins this typed future.
+                let result = async {
+                    let request = context.request.clone();
+                    let output = actor.handle(message, context).await;
+                    request.hold_reply(output, reply, true);
+                    Ok(())
+                }
+                .await;
+                state.borrow_mut().replace(actor);
+                result
             })
+            .map_err(
+                |RootStartError { error, future }| -> LocalBoxFuture<'static, _> {
+                    Box::pin(message_scope(async move {
+                        drop(future);
+                        Err(ActorError::from(error))
+                    }))
+                },
+            )
         }))
     }
 }
