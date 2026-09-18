@@ -1003,16 +1003,24 @@ fn resolve_uniffi_dependency(
                     || node_dep.name == dependency.name)
         })
         .filter_map(|node_dep| metadata.packages.iter().find(|pkg| pkg.id == node_dep.pkg))
-        .next();
-    let package_name = resolved
-        .map(|pkg| pkg.name.to_string())
-        .unwrap_or_else(|| dependency.name.clone());
-    let (git, rev) = dependency
+        .next()
+        .context("Cargo metadata did not resolve the normal UniFFI dependency")?;
+    let package_name = resolved.name.to_string();
+    // Package sources include the exact resolved commit. Dependency declarations
+    // may contain only a branch/tag/rev query and may be replaced by a root patch.
+    let (git, rev) = match resolved.source.as_ref() {
+        Some(source) if source.repr.starts_with("git+") => {
+            let (git, rev) = parse_git_source(&source.repr)
+                .context("resolved UniFFI Git source is missing its exact commit")?;
+            (Some(git), Some(rev))
+        }
+        _ => (None, None),
+    };
+    let path = resolved
         .source
-        .as_ref()
-        .and_then(|source| parse_git_source(&source.repr))
-        .map(|(git, rev)| (Some(git), rev))
-        .unwrap_or((None, None));
+        .is_none()
+        .then(|| package_dir(resolved))
+        .transpose()?;
     let base_dir = package
         .manifest_path
         .parent()
@@ -1021,7 +1029,7 @@ fn resolve_uniffi_dependency(
     Ok(Some(UniffiDependency {
         base_dir,
         version: (!dependency.req.to_string().is_empty()).then(|| dependency.req.to_string()),
-        path: dependency.path.clone(),
+        path,
         git,
         branch: None,
         tag: None,
@@ -1033,13 +1041,14 @@ fn resolve_uniffi_dependency(
     }))
 }
 
-fn parse_git_source(source: &str) -> Option<(String, Option<String>)> {
+fn parse_git_source(source: &str) -> Option<(String, String)> {
     let source = source.strip_prefix("git+")?;
-    let (url, revision) = source.split_once('#').unwrap_or((source, ""));
-    Some((
-        url.to_owned(),
-        (!revision.is_empty()).then(|| revision.to_owned()),
-    ))
+    let (source, revision) = source.split_once('#')?;
+    let url = source.split_once('?').map_or(source, |(url, _)| url);
+    if url.is_empty() || revision.is_empty() {
+        return None;
+    }
+    Some((url.to_owned(), revision.to_owned()))
 }
 
 fn render_uniffi_dependency(
@@ -1118,6 +1127,51 @@ fn toml_string_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_git_dependency_uses_resolved_commit_without_cargo_query() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        for query in [
+            "",
+            "?rev=declared-revision",
+            "?branch=feature%2Fhost",
+            "?tag=v0.32",
+        ] {
+            let (git, rev) = parse_git_source(&format!(
+                "git+https://example.com/platform.git{query}#{commit}"
+            ))
+            .unwrap();
+            let dependency = UniffiDependency {
+                base_dir: Utf8PathBuf::from("/work/demo"),
+                version: Some("*".into()),
+                path: None,
+                git: Some(git),
+                branch: None,
+                tag: None,
+                rev: Some(rev),
+                package: Some("uniffi".into()),
+                default_features: Some(false),
+                features: vec!["async-runtime".into()],
+                rename: None,
+            };
+            let rendered =
+                render_uniffi_dependency(Some(&dependency), Utf8Path::new("/work/host")).unwrap();
+            let manifest: toml::Table = toml::from_str(&rendered).unwrap();
+            assert_eq!(
+                manifest["uniffi"]["git"].as_str(),
+                Some("https://example.com/platform.git")
+            );
+            assert_eq!(manifest["uniffi"]["rev"].as_str(), Some(commit));
+            assert!(!rendered.contains('?'));
+        }
+        for source in [
+            "git+https://example.com/platform.git?rev=declared",
+            "git+https://example.com/platform.git#",
+            "registry+https://example.com/index",
+        ] {
+            assert!(parse_git_source(source).is_none());
+        }
+    }
 
     #[test]
     fn rendered_host_carries_workspace_patch_through_staging() {
