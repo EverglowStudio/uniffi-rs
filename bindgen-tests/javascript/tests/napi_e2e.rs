@@ -672,6 +672,7 @@ exports.__state = state;
     std::fs::write(
         &driver,
         r#"
+import { deepStrictEqual } from "node:assert/strict";
 import * as root from "./node/index.js";
 const {
     returnTimestamp,
@@ -740,6 +741,14 @@ if (bundleRound.checkpoints.length !== 1 || bundleRound.checkpoints[0].getTime()
 const eventRound = roundtripEvent({ tag: "Point", when: ts });
 if (eventRound.tag !== "Point" || !(eventRound.when instanceof Date) || eventRound.when.getTime() !== ts.getTime()) {
     throw new Error(`enum payload round-trip failed: ${JSON.stringify(eventRound)}`);
+}
+
+// Both optional payload types must preserve explicit null through the native addon.
+for (const label of [null, "checkpoint"]) {
+    for (const marker of [null, { when: ts }]) {
+        const result = roundtripEvent({ tag: "Optional", label, marker });
+        deepStrictEqual(result, { tag: "Optional", label, marker }, "nullable enum payload round-trip");
+    }
 }
 
 let threw = false;

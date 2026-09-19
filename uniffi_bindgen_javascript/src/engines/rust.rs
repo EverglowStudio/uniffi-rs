@@ -1702,7 +1702,7 @@ fn render_named_type_helpers_for(
                 }) {
                     quote!(#[napi(string_enum)])
                 } else {
-                    quote!(#[napi(discriminant = "tag")])
+                    quote!(#[napi(discriminant = "tag", use_nullable = true)])
                 };
                 let bridge_variants = variants
                     .iter()

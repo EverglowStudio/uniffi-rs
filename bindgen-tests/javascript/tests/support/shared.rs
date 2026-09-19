@@ -1784,6 +1784,11 @@ pub fn write_temporal_core_crate(root: &std::path::Path) -> (Utf8PathBuf, Utf8Pa
          pub enum TimeEvent {\n\
          \x20   Point { when: SystemTime },\n\
          \x20   Gap { gap: Duration },\n\
+         \x20   Optional { label: Option<String>, marker: Option<TimeMarker> },\n\
+         }\n\n\
+         #[derive(Clone)]\n\
+         pub struct TimeMarker {\n\
+         \x20   pub when: SystemTime,\n\
          }\n\n\
          #[derive(Clone)]\n\
          pub struct TimeBundle {\n\
@@ -1856,6 +1861,10 @@ enum ChronologicalError {
   "TimeDiffError",
 };
 
+dictionary TimeMarker {
+  timestamp when;
+};
+
 dictionary TimeBundle {
   timestamp start;
   duration gap;
@@ -1869,6 +1878,7 @@ dictionary TimeBundle {
 interface TimeEvent {
   Point(timestamp when);
   Gap(duration gap);
+  Optional(string? label, TimeMarker? marker);
 };
 
 namespace napi_temporal_core {
