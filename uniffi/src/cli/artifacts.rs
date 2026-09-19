@@ -1932,6 +1932,9 @@ fn build_apple(args: &BuildArgs) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--target apple requires --apple-xcframework-out <path>"))?;
     let targets = apple_targets(args);
+    for target in &targets {
+        apple_slice_name(target)?;
+    }
     let meta = cargo_package_metadata(&args.manifest_path)?;
     let profile = if args.release { "release" } else { "debug" };
     let framework_name = apple_binary_target_name(&meta);
@@ -2349,13 +2352,14 @@ fn apple_slice_name(target: &str) -> Result<&'static str> {
         "aarch64-apple-darwin" => Ok("macos-arm64"),
         "aarch64-apple-ios" => Ok("ios-arm64"),
         "aarch64-apple-ios-sim" => Ok("ios-arm64-simulator"),
+        "aarch64-apple-ios-macabi" => Ok("ios-arm64-maccatalyst"),
         _ => bail!("unsupported Apple target `{target}`"),
     }
 }
 
 fn apple_sdk_name(target: &str) -> Result<&'static str> {
     match target {
-        "aarch64-apple-darwin" => Ok("macosx"),
+        "aarch64-apple-darwin" | "aarch64-apple-ios-macabi" => Ok("macosx"),
         "aarch64-apple-ios" => Ok("iphoneos"),
         "aarch64-apple-ios-sim" => Ok("iphonesimulator"),
         _ => bail!("unsupported Apple target `{target}`"),
@@ -2368,7 +2372,7 @@ fn apple_sdk_platform_name(target: &str) -> Result<&'static str> {
 
 fn apple_supported_platform_name(target: &str) -> Result<&'static str> {
     match target {
-        "aarch64-apple-darwin" => Ok("MacOSX"),
+        "aarch64-apple-darwin" | "aarch64-apple-ios-macabi" => Ok("MacOSX"),
         "aarch64-apple-ios" => Ok("iPhoneOS"),
         "aarch64-apple-ios-sim" => Ok("iPhoneSimulator"),
         _ => bail!("unsupported Apple target `{target}`"),
@@ -2377,7 +2381,7 @@ fn apple_supported_platform_name(target: &str) -> Result<&'static str> {
 
 fn apple_min_os(target: &str) -> Result<String> {
     Ok(match target {
-        "aarch64-apple-darwin" => {
+        "aarch64-apple-darwin" | "aarch64-apple-ios-macabi" => {
             std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "15.0".to_string())
         }
         "aarch64-apple-ios" | "aarch64-apple-ios-sim" => {
@@ -2409,7 +2413,7 @@ fn create_apple_framework_layout(
     framework_name: &str,
 ) -> Result<(Utf8PathBuf, Utf8PathBuf, Option<Utf8PathBuf>)> {
     let framework_binary = framework_dir.join(framework_name);
-    if target == "aarch64-apple-darwin" {
+    if matches!(target, "aarch64-apple-darwin" | "aarch64-apple-ios-macabi") {
         let versions_dir = framework_dir.join("Versions");
         let current_dir = versions_dir.join("Current");
         let version_a_dir = versions_dir.join("A");
@@ -2540,7 +2544,7 @@ fn rewrite_apple_framework_install_name(
     framework_name: &str,
     framework_bin: &Utf8Path,
 ) -> Result<()> {
-    let install_name = if target == "aarch64-apple-darwin" {
+    let install_name = if matches!(target, "aarch64-apple-darwin" | "aarch64-apple-ios-macabi") {
         format!("@rpath/{framework_name}.framework/Versions/A/{framework_name}")
     } else {
         format!("@rpath/{framework_name}.framework/{framework_name}")
@@ -2586,7 +2590,7 @@ fn write_apple_framework_info_plist(
         command_stdout("sw_vers", &["-buildVersion"], "sw_vers").context("reading host build")?;
     let xcode_numeric = apple_xcode_numeric_version(&xcode_marketing)?;
     let extra_keys = match target {
-        "aarch64-apple-darwin" => format!(
+        "aarch64-apple-darwin" | "aarch64-apple-ios-macabi" => format!(
             "  <key>LSMinimumSystemVersion</key>\n  <string>{min_os}</string>\n"
         ),
         "aarch64-apple-ios" => format!(
@@ -2816,11 +2820,24 @@ fn apple_package_manifest_source(meta: &CargoPackageMetadata, args: &BuildArgs) 
 fn apple_package_platform_lines(args: &BuildArgs) -> String {
     let targets = apple_targets(args);
     let mut lines = Vec::new();
-    if targets.iter().any(|target| target.contains("apple-ios")) {
+    if targets.iter().any(|target| {
+        matches!(
+            target.as_str(),
+            "aarch64-apple-ios" | "aarch64-apple-ios-sim"
+        )
+    }) {
         let deployment = std::env::var("IPHONEOS_DEPLOYMENT_TARGET")
             .or_else(|_| std::env::var("IPHONESIMULATOR_DEPLOYMENT_TARGET"))
             .unwrap_or_else(|_| "16.0".to_string());
         lines.push(format!("        .iOS(\"{deployment}\"),"));
+    }
+    if targets
+        .iter()
+        .any(|target| target == "aarch64-apple-ios-macabi")
+    {
+        let deployment =
+            std::env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "16.0".to_string());
+        lines.push(format!("        .macCatalyst(\"{deployment}\"),"));
     }
     if targets
         .iter()

@@ -765,6 +765,41 @@ fn computes_apple_cdylib_path() {
 }
 
 #[test]
+fn catalyst_has_distinct_slice_and_native_sdk() {
+    let target = "aarch64-apple-ios-macabi";
+    assert_eq!(apple_slice_name(target).unwrap(), "ios-arm64-maccatalyst");
+    assert_ne!(
+        apple_slice_name(target).unwrap(),
+        apple_slice_name("aarch64-apple-ios-sim").unwrap()
+    );
+    assert_eq!(apple_sdk_name(target).unwrap(), "macosx");
+    assert_eq!(apple_supported_platform_name(target).unwrap(), "MacOSX");
+    let mut args = empty_build_args();
+    args.apple_target = vec![target.to_owned()];
+    let platforms = apple_package_platform_lines(&args);
+    assert!(platforms.contains(".macCatalyst("));
+    assert!(!platforms.contains(".iOS("));
+    assert!(!platforms.contains(".macOS("));
+}
+
+#[cfg(unix)]
+#[test]
+fn catalyst_framework_uses_versioned_macos_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let framework = Utf8PathBuf::from_path_buf(directory.path().join("Probe.framework")).unwrap();
+    let (binary, info, _) =
+        create_apple_framework_layout("aarch64-apple-ios-macabi", &framework, "Probe").unwrap();
+    assert_eq!(binary, framework.join("Versions/A/Probe"));
+    assert_eq!(info, framework.join("Versions/A/Resources/Info.plist"));
+    assert_eq!(
+        std::fs::read_link(framework.join("Versions/Current")).unwrap(),
+        std::path::PathBuf::from("A")
+    );
+    assert!(framework.join("Headers").is_dir());
+    assert!(framework.join("Modules").is_dir());
+}
+
+#[test]
 fn renders_xcodebuild_create_xcframework_args() {
     let args = xcodebuild_create_xcframework_args(
         &[
