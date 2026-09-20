@@ -129,12 +129,13 @@ example, a field declared `error: MediaError | null` accepts
 native carrier string `"Io"` as its public value. The runtime validates the
 declared error name, variant and required payload fields.
 
-At the native boundary, an error whose variants all have no fields remains a
-variant string. An error with any payload variant remains a tagged object,
-including `{ tag: "Empty" }` for its fieldless variants. Payload fields are
-converted recursively. Lifting either carrier restores the generated class;
-its `variant` is the discriminant and its `data` is the variant string for a
-fieldless variant or the lifted tagged payload for a variant with fields.
+Lowering an error whose variants all have no fields produces a variant string
+for both native hosts. N-API lifts such an error as a string; the WASM host lifts
+it as a tag-only object such as `{ tag: "Io" }`. An error with any payload
+variant remains a tagged object, including `{ tag: "Empty" }` for its fieldless
+variants. Payload fields are converted recursively. Lifting restores the
+generated class; its `variant` is the discriminant and its `data` is the variant
+string for a fieldless variant or the lifted tagged payload for a variant with fields.
 Ordinary values transport only the declared variant and fields, without an
 exception message or stack; their lifted message is the variant name.
 
@@ -151,9 +152,11 @@ node uniffi_runtime_javascript/tests/error-field-repro.mjs
 ```
 
 An optional runtime-source path selects the file to check. Running it against
-the runtime from `6fdea3150898d1ac94be68abd22627ffbadbe5ef` should fail both
-assertions: lowering rejects the class with `UniffiEnumType`, and lifting
-returns a string. This is a conversion reproducer, not native/WASM execution.
+the runtime from `6fdea3150898d1ac94be68abd22627ffbadbe5ef` should fail all three
+assertions: lowering rejects the class with `UniffiEnumType`, N-API lifting
+returns a string, and WASM lifting rejects the tag-only object. The runtime
+from `28eefb977329e1308bee93292d3d83652a4a7593` fails only the WASM case. This
+is a conversion reproducer, not native/WASM execution.
 
 The existing JavaScript regression entry can also run without Cargo:
 
@@ -170,7 +173,11 @@ Its Cargo entry is `cargo test -p uniffi_runtime_javascript
 node_runtime_regressions`. The generator's
 `cargo test -p uniffi_js_facade generated_ecmascript_executes_with_operation_id_mock`
 checks actual emitted declarations/classes and DTO round trips through an
-explicit operation-ID mock. Real native/WASM consumer contracts are separate.
+explicit operation-ID mock.
+`cargo test -p uniffi_bindgen_javascript wasm_ordinary_unit_errors_keep_native_carriers`
+checks the production Rust renderer's unit-error lower/lift helpers and their
+use in ordinary DTO fields, while preserving ordinary enum carriers. Neither
+generator contract replaces real native/WASM consumer execution.
 
 ## Functions, callbacks, and async operations
 

@@ -1766,6 +1766,11 @@ function liftEnumCarrier(value, descriptor, named, session, context, operation) 
 }
 
 function liftErrorValue(value, descriptor, named, session, context, operation) {
+  // N-API lifts a unit error as a string; the generated WASM helper lifts it
+  // as a tag-only object (also used by its exception boundary). Normalize
+  // only declared error values, leaving ordinary unit enums string-only.
+  if (named.unit && isObject(value) && !Array.isArray(value)
+      && own(value, "tag") && Object.keys(value).length === 1) value = value.tag;
   const carrier = liftEnumCarrier(value, descriptor, named, session, context, operation);
   const variant = named.unit ? carrier : carrier.tag;
   if (!own(named.variants || {}, variant)) {

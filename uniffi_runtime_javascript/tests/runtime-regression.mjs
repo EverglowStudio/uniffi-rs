@@ -1408,14 +1408,18 @@ for (const crossCancel of [false, true]) {
   assert.equal(lowerValue(failure, error, context), "Io");
   assert.deepEqual(lowerValue({tag: "Failed", error: failure}, report, context), {tag: "Failed", error: "Io"});
   assert.deepEqual(lowerValue({tag: "Closed", error: null}, report, context), {tag: "Closed", error: null});
-  const lifted = liftValue({error: "Io", history: ["Worker"]}, state, null, context);
-  assert.ok(lifted.error instanceof ValueError);
-  assert.equal(lifted.error.variant, "Io");
-  assert.equal(lifted.error.data, "Io");
-  assert.equal(lifted.error.message, "Io", "ordinary carriers do not transport exception messages");
-  assert.equal(lifted.error.descriptor, context.types[1]);
-  assert.ok(lifted.history[0] instanceof ValueError);
-  assert.deepEqual(lowerValue(lifted, state, context), {error: "Io", history: ["Worker"]});
+  // The generated N-API and WASM hosts use different lift carriers for unit
+  // errors. Both still lower to the native variant string.
+  for (const raw of [{error: "Io", history: ["Worker"]}, {error: {tag: "Io"}, history: [{tag: "Worker"}]}]) {
+    const lifted = liftValue(raw, state, null, context);
+    assert.ok(lifted.error instanceof ValueError);
+    assert.equal(lifted.error.variant, "Io");
+    assert.equal(lifted.error.data, "Io");
+    assert.equal(lifted.error.message, "Io", "ordinary carriers do not transport exception messages");
+    assert.equal(lifted.error.descriptor, context.types[1]);
+    assert.ok(lifted.history[0] instanceof ValueError);
+    assert.deepEqual(lowerValue(lifted, state, context), {error: "Io", history: ["Worker"]});
+  }
   assert.equal(liftValue(null, optional, null, context), null);
   const carrier = {tag: "Failed", code: 7n, cause: "Io"};
   assert.deepEqual(lowerValue(new PayloadError("ignored", "Failed", {code: "7", cause: failure}), payload, context), carrier);
@@ -1425,6 +1429,9 @@ for (const crossCancel of [false, true]) {
   assert.equal(payloadValue.data.code, 7n);
   assert.ok(payloadValue.data.cause instanceof ValueError);
   assert.deepEqual(lowerValue(payloadValue, payload, context), carrier);
+  const wasmPayloadValue = liftValue({...carrier, cause: {tag: "Io"}}, payload, null, context);
+  assert.ok(wasmPayloadValue.data.cause instanceof ValueError);
+  assert.deepEqual(lowerValue(wasmPayloadValue, payload, context), carrier);
   assert.deepEqual(lowerValue(new PayloadError("", "Empty"), payload, context), {tag: "Empty"});
   assert.equal(liftValue({tag: "Empty"}, payload, null, context).data, "Empty");
   for (const invalid of ["Io", {tag: "Io"}, new Error("Io"), new PayloadError("", "Io")]) {
@@ -1434,13 +1441,16 @@ for (const crossCancel of [false, true]) {
   expectError(() => lowerValue(new PayloadError("", "Failed", {code: 7n}), payload, context), "UniffiErrorType");
   expectError(() => lowerValue(new PayloadError("", "Failed", {code: -1n, cause: null}), payload, context), "UniffiNumericError");
   expectError(() => liftValue("Unknown", error, null, context), "UniffiEnumVariant");
-  expectError(() => liftValue({tag: "Io"}, error, null, context), "UniffiEnumVariant");
+  for (const invalid of [{tag: "Unknown"}, {tag: "Io", extra: 1}, {tag: 1}, ["Io"], Object.create({tag: "Io"})]) {
+    expectError(() => liftValue(invalid, error, null, context), "UniffiEnumVariant");
+  }
   expectError(() => liftValue({tag: "Failed", code: 7n}, payload, null, context), "UniffiEnumVariant");
   expectError(() => liftValue("Io", error, null, {types: context.types}), "UniffiErrorProtocol");
   const ordinary = named("Ordinary", 5);
   assert.equal(lowerValue("Io", ordinary, context), "Io");
   assert.equal(liftValue("Io", ordinary, null, context), "Io");
   expectError(() => lowerValue(failure, ordinary, context), "UniffiEnumType");
+  expectError(() => liftValue({tag: "Io"}, ordinary, null, context), "UniffiEnumVariant");
 
   // Preserve the exception envelope and callback rejection paths.
   const session = makeSession({invokeSync() {
