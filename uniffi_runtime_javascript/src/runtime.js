@@ -1668,7 +1668,8 @@ function lowerInputStreamError(raw, descriptor, context, session, operation, pat
     }
     carrier[name] = source[name];
   }
-  return lowerValue(carrier, errorType, context, session, operation, streamPath);
+  // This is already a native error carrier, not an ordinary public Error value.
+  return lowerEnumCarrier(carrier, errorType, named, context, session, operation, streamPath);
 }
 
 function createBackendInputStream(session, handle, resource, context, operation) {
@@ -1712,6 +1713,74 @@ function createBackendInputStream(session, handle, resource, context, operation)
     async return() { await marker.cancel(); return { done: true, value: undefined }; },
   };
   return marker;
+}
+
+function lowerEnumCarrier(value, descriptor, named, context, session, operation, path) {
+  if (named.unit) {
+    if (typeof value !== "string" || !named.variants?.[value]) throw new UniffiError({ errorName: "UniffiEnumType", message: `expected unit ${descriptor.name} variant` });
+    return value;
+  }
+  if (!isObject(value) || typeof value.tag !== "string") throw new UniffiError({ errorName: "UniffiEnumType", message: `expected tagged ${descriptor.name}` });
+  const variant = named.variants?.[value.tag];
+  if (!variant) throw new UniffiError({ errorName: "UniffiEnumVariant", message: `unknown ${descriptor.name} variant ${value.tag}` });
+  const result = { tag: value.tag };
+  for (const [name, field] of Object.entries(variant.fields || {})) result[name] = lowerValue(value[name], field, context, session, operation, appendValuePath(appendValuePath(path, `variant[${value.tag}]`), `field[${name}]`));
+  return result;
+}
+
+function lowerErrorValue(value, descriptor, named, context, session, operation, path) {
+  // Components can emit separate constructors for the same imported error.
+  // Validate the shared Error base and declared name, not constructor identity.
+  if (!(value instanceof UniffiError) || value.errorName !== descriptor.name) {
+    throw new UniffiError({ errorName: "UniffiErrorType", message: `expected declared ${descriptor.name} error value` });
+  }
+  const variant = value.variant;
+  if (typeof variant !== "string" || !own(named.variants || {}, variant)) {
+    throw new UniffiError({ errorName: "UniffiEnumVariant", message: `unknown ${descriptor.name} error variant ${String(variant)}` });
+  }
+  if (named.unit) return variant;
+  const carrier = { tag: variant };
+  for (const name of Object.keys(named.variants[variant].fields || {})) {
+    if (!isObject(value.data) || Array.isArray(value.data) || !own(value.data, name)) {
+      throw new UniffiError({ errorName: "UniffiErrorType", message: `error variant ${variant} is missing payload field ${name}` });
+    }
+    carrier[name] = value.data[name];
+  }
+  return lowerEnumCarrier(carrier, descriptor, named, context, session, operation, path);
+}
+
+function liftEnumCarrier(value, descriptor, named, session, context, operation) {
+  if (named.unit) {
+    if (typeof value !== "string" || !named.variants?.[value]) throw new UniffiError({ errorName: "UniffiEnumVariant", message: `unknown backend ${descriptor.name} unit variant ${String(value)}` });
+    return value;
+  }
+  if (!isObject(value) || Array.isArray(value) || typeof value.tag !== "string") throw new UniffiError({ errorName: "UniffiEnumType", message: `backend enum ${descriptor.name} must be tagged` });
+  const variant = named.variants?.[value.tag];
+  if (!variant) throw new UniffiError({ errorName: "UniffiEnumVariant", message: `unknown backend ${descriptor.name} variant ${value.tag}` });
+  const result = { tag: value.tag };
+  for (const [name, field] of Object.entries(variant.fields || {})) {
+    if (!own(value, name)) throw new UniffiError({ errorName: "UniffiEnumVariant", message: `backend enum ${descriptor.name} variant ${value.tag} is missing field ${name}` });
+    result[name] = liftValue(value[name], field, session, context, operation);
+  }
+  return result;
+}
+
+function liftErrorValue(value, descriptor, named, session, context, operation) {
+  const carrier = liftEnumCarrier(value, descriptor, named, session, context, operation);
+  const variant = named.unit ? carrier : carrier.tag;
+  if (!own(named.variants || {}, variant)) {
+    throw new UniffiError({ errorName: "UniffiEnumVariant", message: `unknown backend ${descriptor.name} error variant ${String(variant)}` });
+  }
+  const ErrorClass = context?.errorClasses?.[descriptor.typeId];
+  if (typeof ErrorClass !== "function") {
+    throw new UniffiError({ errorName: "UniffiErrorProtocol", message: `missing generated error class ${String(descriptor.typeId)}` });
+  }
+  // Ordinary values have no exception envelope or transported message/stack.
+  // Match declared errors' data shape: unit variant string or tagged payload.
+  const data = Object.keys(named.variants[variant].fields || {}).length ? carrier : variant;
+  const result = new ErrorClass(variant, variant, data);
+  result.descriptor = named;
+  return result;
 }
 
 export function lowerValue(value, descriptor, context = null, session = null, operation = null, path = null) {
@@ -1789,16 +1858,9 @@ export function lowerValue(value, descriptor, context = null, session = null, op
         return result;
       }
       if (named.kind === "enum") {
-        if (named.unit) {
-          if (typeof value !== "string" || !named.variants?.[value]) throw new UniffiError({ errorName: "UniffiEnumType", message: `expected unit ${descriptor.name} variant` });
-          return value;
-        }
-        if (!isObject(value) || typeof value.tag !== "string") throw new UniffiError({ errorName: "UniffiEnumType", message: `expected tagged ${descriptor.name}` });
-        const variant = named.variants?.[value.tag];
-        if (!variant) throw new UniffiError({ errorName: "UniffiEnumVariant", message: `unknown ${descriptor.name} variant ${value.tag}` });
-        const result = { tag: value.tag };
-        for (const [name, field] of Object.entries(variant.fields || {})) result[name] = lowerValue(value[name], field, context, session, operation, appendValuePath(appendValuePath(path, `variant[${value.tag}]`), `field[${name}]`));
-        return result;
+        return named.error
+          ? lowerErrorValue(value, descriptor, named, context, session, operation, path)
+          : lowerEnumCarrier(value, descriptor, named, context, session, operation, path);
       }
       return value;
     }
@@ -1882,19 +1944,9 @@ export function liftValue(value, descriptor, session = null, context = null, ope
         return result;
       }
       if (named.kind === "enum") {
-        if (named.unit) {
-          if (typeof value !== "string" || !named.variants?.[value]) throw new UniffiError({ errorName: "UniffiEnumVariant", message: `unknown backend ${descriptor.name} unit variant ${String(value)}` });
-          return value;
-        }
-        if (!isObject(value) || Array.isArray(value) || typeof value.tag !== "string") throw new UniffiError({ errorName: "UniffiEnumType", message: `backend enum ${descriptor.name} must be tagged` });
-        const variant = named.variants?.[value.tag];
-        if (!variant) throw new UniffiError({ errorName: "UniffiEnumVariant", message: `unknown backend ${descriptor.name} variant ${value.tag}` });
-        const result = { tag: value.tag };
-        for (const [name, field] of Object.entries(variant.fields || {})) {
-          if (!own(value, name)) throw new UniffiError({ errorName: "UniffiEnumVariant", message: `backend enum ${descriptor.name} variant ${value.tag} is missing field ${name}` });
-          result[name] = liftValue(value[name], field, session, context, operation);
-        }
-        return result;
+        return named.error
+          ? liftErrorValue(value, descriptor, named, session, context, operation)
+          : liftEnumCarrier(value, descriptor, named, session, context, operation);
       }
       return value;
     }
