@@ -1,5 +1,5 @@
 // No Cargo, generated artifact or npm dependency is needed. An optional path
-// selects an older runtime for the same two assertions (expected to fail).
+// selects an older runtime for the same assertions (expected to fail).
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -22,10 +22,18 @@ for (const [name, check] of [
   ["ordinary error field lowers to the native unit carrier", () => {
     assert.deepEqual(lowerValue({error: new MediaError("read failed", "Io")}, close, context), {error: "Io"});
   }],
-  ["ordinary error field lifts to the declared class", () => {
+  ["N-API ordinary error field lifts to the declared class", () => {
     const value = liftValue({error: "Io"}, close, null, context);
     assert.ok(value.error instanceof MediaError);
     assert.equal(value.error.variant, "Io");
+  }],
+  ["WASM tag-only ordinary error field lifts to the declared class", () => {
+    // Actual wasm.rs::__uniffi_lift_type_* emits this shape for unit errors.
+    const value = liftValue({error: {tag: "Io"}}, close, null, context);
+    assert.ok(value.error instanceof MediaError);
+    assert.equal(value.error.variant, "Io");
+    assert.equal(value.error.data, "Io");
+    assert.deepEqual(lowerValue(value, close, context), {error: "Io"});
   }],
 ]) {
   try { check(); console.log(`PASS: ${name}`); }

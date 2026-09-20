@@ -3483,6 +3483,76 @@ namespace async_results {
             .collect()
     }
 
+    #[test]
+    fn wasm_ordinary_unit_errors_keep_native_carriers() {
+        let ci = ComponentInterface::from_webidl(
+            r#"
+[Error] enum Failure { "Io" };
+enum Phase { "Ready" };
+dictionary State { Failure? error; sequence<Failure> history; Phase phase; };
+namespace error_values {
+    State round_trip(State value);
+    [Throws=Failure] void fail();
+};
+"#,
+            "error_values",
+        )
+        .unwrap();
+        let mut component = Component {
+            ci,
+            config: JsConfig::default(),
+        };
+        component.ci.derive_ffi_funcs().unwrap();
+        let package = normalize(BindingInput::new(&[component])).unwrap();
+        let error = package
+            .rust
+            .named_types()
+            .iter()
+            .find(|named| matches!(named.kind, RustNamedTypeKind::Error { .. }))
+            .unwrap();
+        let phase = package
+            .rust
+            .named_types()
+            .iter()
+            .find(|named| matches!(named.kind, RustNamedTypeKind::Enum { .. }))
+            .unwrap();
+        let state = package
+            .rust
+            .named_types()
+            .iter()
+            .find(|named| matches!(named.kind, RustNamedTypeKind::Record { .. }))
+            .unwrap();
+        let helpers = syn::parse_file(&render_named_helpers(&package).unwrap()).unwrap();
+        let helper = |direction: &str, id: TypeId| {
+            let name = format!("__uniffi_{direction}_type_{}", id.index());
+            let function = helpers
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    syn::Item::Fn(function) if function.sig.ident == name => Some(function),
+                    _ => None,
+                })
+                .unwrap();
+            compact(function)
+        };
+        // Exercise the production Rust renderer, not a JS mock's guessed
+        // carrier. WASM shares this lift helper with its exception boundary.
+        let lift_error = helper("lift", error.id);
+        assert!(lift_error.contains("letobject=js_sys::Object::new()"));
+        assert!(lift_error.contains(
+            "js_sys::Reflect::set(&object,&JsValue::from_str(\"tag\"),&JsValue::from_str(\"Io\"))?"
+        ));
+        assert!(helper("lower", error.id).contains("value.as_string()"));
+        assert!(
+            helper("lift", state.id).contains(&format!("__uniffi_lift_type_{}", error.id.index()))
+        );
+        assert!(helper("lower", state.id)
+            .contains(&format!("__uniffi_lower_type_{}", error.id.index())));
+        // Ordinary unit enums retain their string carrier in both directions.
+        assert!(helper("lift", phase.id).contains("Ok(JsValue::from_str(\"Ready\"))"));
+        assert!(helper("lower", phase.id).contains("value.as_string()"));
+    }
+
     // Inspect the business future independently of the surrounding host scope
     // and result conversion. A handle inside this future cannot be rolled back
     // by Run dropping its result when cancellation wins the Ready poll.
