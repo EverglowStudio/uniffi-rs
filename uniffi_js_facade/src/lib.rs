@@ -5031,8 +5031,105 @@ const watchdog = setTimeout(() => { throw Error("ArkTS protocol test did not com
 
     #[test]
     fn generated_ecmascript_executes_with_operation_id_mock() {
-        let ast = corpus_ast();
+        let mut ast = corpus_ast();
+        let component_key = ComponentKey::new("corpus").unwrap();
+        let unit_failure = key(&component_key, "UnitFailure");
+        let error_event = key(&component_key, "ErrorEvent");
+        let error_state = key(&component_key, "ErrorState");
+        let optional_error = ValueType::Optional(Box::new(ValueType::Named(unit_failure.clone())));
+        ast.types.extend([
+            AstType {
+                id: TypeId::new(7),
+                source_key: unit_failure.clone(),
+                name: "UnitFailure".into(),
+                kind: AstTypeKind::Error {
+                    variants: vec![AstVariant {
+                        name: "Io".into(),
+                        fields: vec![],
+                    }],
+                },
+            },
+            AstType {
+                id: TypeId::new(8),
+                source_key: error_event.clone(),
+                name: "ErrorEvent".into(),
+                kind: AstTypeKind::Enum {
+                    variants: vec![
+                        AstVariant {
+                            name: "Failed".into(),
+                            fields: vec![AstField {
+                                name: "error".into(),
+                                ty: ValueType::Named(unit_failure),
+                                default: None,
+                            }],
+                        },
+                        AstVariant {
+                            name: "Closed".into(),
+                            fields: vec![AstField {
+                                name: "error".into(),
+                                ty: optional_error.clone(),
+                                default: None,
+                            }],
+                        },
+                    ],
+                },
+            },
+            AstType {
+                id: TypeId::new(9),
+                source_key: error_state.clone(),
+                name: "ErrorState".into(),
+                kind: AstTypeKind::Record {
+                    fields: vec![
+                        AstField {
+                            name: "error".into(),
+                            ty: optional_error,
+                            default: None,
+                        },
+                        AstField {
+                            name: "detail".into(),
+                            ty: ValueType::Named(key(&component_key, "Failure")),
+                            default: None,
+                        },
+                        AstField {
+                            name: "reports".into(),
+                            ty: ValueType::Sequence(Box::new(ValueType::Named(error_event))),
+                            default: None,
+                        },
+                    ],
+                },
+            },
+        ]);
+        ast.operations.push(AstOperation {
+            id: OperationId::new(16),
+            source_key: operation_key(
+                &component_key,
+                OperationOwner::Namespace,
+                OperationKind::Function,
+                "echo_error_state",
+            ),
+            component_id: ComponentId::new(0),
+            name: "echoErrorState".into(),
+            debug_name: "echoErrorState".into(),
+            kind: OperationKind::Function,
+            arguments: vec![AstArgument {
+                name: "value".into(),
+                ty: ValueType::Named(error_state.clone()),
+                default: None,
+            }],
+            return_type: Some(ValueType::Named(error_state)),
+            async_kind: AsyncKind::Sync,
+            throws: None,
+            receiver_type: None,
+            callback_method_id: None,
+            stream_slots: vec![],
+            stream_resources: vec![],
+        });
         let component = &ast.components[0];
+        let declaration = render_component_declaration(&ast, component).unwrap();
+        assert!(declaration.contains("export declare class UnitFailure extends UniffiError"));
+        assert!(declaration.contains("error: UnitFailure | null"));
+        assert!(declaration.contains("detail: Failure"));
+        assert!(declaration.contains("echoErrorState(value: ErrorState): ErrorState"));
         let implementation = render_component_implementation(&ast, component, "js").unwrap();
         let root = std::env::temp_dir().join(format!(
             "uniffi-js-facade-{}",
@@ -5047,6 +5144,7 @@ const watchdog = setTimeout(() => { throw Error("ArkTS protocol test did not com
         fs::write(root.join("shared/uniffi_runtime.js"), RUNTIME_SOURCE).unwrap();
         fs::write(root.join("components/corpus/index.js"), implementation).unwrap();
         let script = r#"
+import assert from "node:assert/strict";
 import { createNamespace } from "./components/corpus/index.js";
 import { BackendSession, Host, ObjectLease, createFacade } from "./shared/uniffi_runtime.js";
 function makeSession(backend, host = new Host()) {
@@ -5074,6 +5172,10 @@ const engine = {
     if (id === 13) return {kind:"value", value: "object-collision"};
     if (id === 14) return {kind:"value", value: 42};
     if (id === 15) return {kind:"value", value: "accepted"};
+    if (id === 16) {
+      assert.deepEqual(args[0], {error:"Io", detail:{tag:"Rejected",message:"payload"}, reports:[{tag:"Failed",error:"Io"},{tag:"Closed",error:null}]});
+      return {kind:"value",value:args[0]};
+    }
     if (id === 10) return {kind:"error", error:{errorName:"Failure", variant:"Rejected", data:{message:"no"}, message:"no"}};
     return {kind:"value", value:null};
   },
@@ -5083,6 +5185,19 @@ const engine = {
 const session = makeSession(engine, new Host());
 const api = createNamespace(session);
 let starts = 0;
+const errorState = api.echoErrorState({
+  error:new api.UnitFailure("host message", "Io"),
+  detail:new api.Failure("host message", "Rejected", {message:"payload"}),
+  reports:[{tag:"Failed",error:new api.UnitFailure("host message", "Io")},{tag:"Closed",error:null}],
+});
+assert.ok(errorState.error instanceof api.UnitFailure);
+assert.equal(errorState.error.variant,"Io");
+assert.equal(errorState.error.data,"Io");
+assert.ok(errorState.detail instanceof api.Failure);
+assert.deepEqual(errorState.detail.data,{tag:"Rejected",message:"payload"});
+assert.ok(errorState.reports[0].error instanceof api.UnitFailure);
+assert.equal(errorState.reports[1].error,null);
+api.echoErrorState(errorState);
 const messageEvent = api.Event.Message({message:"hello"});
 if (messageEvent.tag !== "Message" || messageEvent.message !== "hello") throw Error("enum variant surface");
 if (api.Color.Red !== "Red" || api.Color.Blue !== "Blue") throw Error("unit enum surface");

@@ -1383,4 +1383,103 @@ for (const crossCancel of [false, true]) {
   await assert.rejects(session.close(), error => error === failure);
 }
 
-console.log("S01 runtime protocol: 22 scenarios passed; legacy callback/conversion/stream assertions passed; S08 immediate-entry, input lifecycle, raw-next reentry, single-guard, lazy input-frame and scalar completion checks passed; shared-state late delivery and release reentry 6 checks passed; call-frame collection lifecycle 4 checks passed");
+// M05: declared errors used as ordinary DTO values match their generated classes.
+{
+  class ValueError extends UniffiError {
+    constructor(message = "", variant = null, data = null) { super({errorName: "ValueError", message, variant, data}); }
+  }
+  class PayloadError extends UniffiError {
+    constructor(message = "", variant = null, data = null) { super({errorName: "PayloadError", message, variant, data}); }
+  }
+  const named = (name, typeId) => ({kind: "named", name, typeId});
+  const error = named("ValueError", 1), payload = named("PayloadError", 2);
+  const optional = {kind: "optional", inner: error};
+  const context = {types: {
+    1: {kind: "enum", error: true, unit: true, variants: {Io: {fields: {}}, Worker: {fields: {}}}},
+    2: {kind: "enum", error: true, unit: false, variants: {
+      Empty: {fields: {}}, Failed: {fields: {code: scalar("U64"), cause: optional}},
+    }},
+    3: {kind: "record", fields: {error: optional, history: {kind: "sequence", inner: error}}},
+    4: {kind: "enum", unit: false, variants: {Failed: {fields: {error}}, Closed: {fields: {error: optional}}}},
+    5: {kind: "enum", unit: true, variants: {Io: {fields: {}}}},
+  }, errorClasses: {1: ValueError, 2: PayloadError}};
+  const failure = new ValueError("host-only message", "Io");
+  const report = named("Report", 4), state = named("State", 3);
+  assert.equal(lowerValue(failure, error, context), "Io");
+  assert.deepEqual(lowerValue({tag: "Failed", error: failure}, report, context), {tag: "Failed", error: "Io"});
+  assert.deepEqual(lowerValue({tag: "Closed", error: null}, report, context), {tag: "Closed", error: null});
+  const lifted = liftValue({error: "Io", history: ["Worker"]}, state, null, context);
+  assert.ok(lifted.error instanceof ValueError);
+  assert.equal(lifted.error.variant, "Io");
+  assert.equal(lifted.error.data, "Io");
+  assert.equal(lifted.error.message, "Io", "ordinary carriers do not transport exception messages");
+  assert.equal(lifted.error.descriptor, context.types[1]);
+  assert.ok(lifted.history[0] instanceof ValueError);
+  assert.deepEqual(lowerValue(lifted, state, context), {error: "Io", history: ["Worker"]});
+  assert.equal(liftValue(null, optional, null, context), null);
+  const carrier = {tag: "Failed", code: 7n, cause: "Io"};
+  assert.deepEqual(lowerValue(new PayloadError("ignored", "Failed", {code: "7", cause: failure}), payload, context), carrier);
+  const payloadValue = liftValue(carrier, payload, null, context);
+  assert.ok(payloadValue instanceof PayloadError);
+  assert.equal(payloadValue.variant, "Failed");
+  assert.equal(payloadValue.data.code, 7n);
+  assert.ok(payloadValue.data.cause instanceof ValueError);
+  assert.deepEqual(lowerValue(payloadValue, payload, context), carrier);
+  assert.deepEqual(lowerValue(new PayloadError("", "Empty"), payload, context), {tag: "Empty"});
+  assert.equal(liftValue({tag: "Empty"}, payload, null, context).data, "Empty");
+  for (const invalid of ["Io", {tag: "Io"}, new Error("Io"), new PayloadError("", "Io")]) {
+    expectError(() => lowerValue(invalid, error, context), "UniffiErrorType");
+  }
+  expectError(() => lowerValue(new ValueError("", "Unknown"), error, context), "UniffiEnumVariant");
+  expectError(() => lowerValue(new PayloadError("", "Failed", {code: 7n}), payload, context), "UniffiErrorType");
+  expectError(() => lowerValue(new PayloadError("", "Failed", {code: -1n, cause: null}), payload, context), "UniffiNumericError");
+  expectError(() => liftValue("Unknown", error, null, context), "UniffiEnumVariant");
+  expectError(() => liftValue({tag: "Io"}, error, null, context), "UniffiEnumVariant");
+  expectError(() => liftValue({tag: "Failed", code: 7n}, payload, null, context), "UniffiEnumVariant");
+  expectError(() => liftValue("Io", error, null, {types: context.types}), "UniffiErrorProtocol");
+  const ordinary = named("Ordinary", 5);
+  assert.equal(lowerValue("Io", ordinary, context), "Io");
+  assert.equal(liftValue("Io", ordinary, null, context), "Io");
+  expectError(() => lowerValue(failure, ordinary, context), "UniffiEnumType");
+
+  // Preserve the exception envelope and callback rejection paths.
+  const session = makeSession({invokeSync() {
+    return {kind: "error", error: {variant: "Io", data: null, message: "operation failed"}};
+  }, close() {}});
+  const throws = {name: "ValueError", typeId: 1};
+  assert.throws(() => invokeOperation(session, {name: "fail", id: 0, args: [], returnType: null, async: false, throws, context}),
+    value => value instanceof ValueError && value.variant === "Io" && value.message === "operation failed");
+  const callback = session.registerCallback(6, () => { throw new PayloadError("callback failed", "Failed", {code: "7", cause: failure}); }, {
+    methods: {0: {name: null, throws: {name: "PayloadError", typeId: 2}}}, context,
+  });
+  assert.throws(() => session.invokeCallbackSync(6, callback, 0, []), value => value instanceof PayloadError
+    && value.message === "callback failed" && value.data.code === 7n && value.data.cause === "Io");
+  await session.close();
+
+  // Stream rejection adapters already own a native carrier; do not treat it
+  // as a public field value or lower its payload twice.
+  for (const [type, rejection, expected] of [[error, failure, "Io"], [payload, payloadValue, carrier]]) {
+    let lowerError;
+    lowerValue({}, {kind: "inputStream", inner: scalar("I32")}, context, {
+      createInputStream(_source, conversions) { lowerError = conversions.lowerError; return {handle: 9}; },
+    }, {streamResources: [{direction: "Input", path: "argument[0]", error: type}]}, "argument[0]");
+    assert.deepEqual(lowerError(rejection), expected);
+
+    const outputSession = makeSession({
+      invokeSync: () => ({kind: "value", value: 9}),
+      invokeAsync: async id => ({kind: "value", value: id === 8 ? {kind: "error", error: expected} : null}),
+      close() {},
+    });
+    const output = invokeOperation(outputSession, {name: "errors", id: 0, args: [], async: false, context,
+      returnType: {kind: "outputStream", inner: scalar("I32")},
+      streamResources: [{direction: "Output", path: "return", error: type,
+        slots: {OutputStreamNext: 8, OutputStreamCancel: 9}}],
+    });
+    await assert.rejects(output.next(), value => value instanceof context.errorClasses[type.typeId]
+      && value.variant === rejection.variant);
+    await output.cancel();
+    await outputSession.close();
+  }
+}
+
+console.log("S01 runtime protocol: 22 scenarios passed; legacy callback/conversion/stream assertions passed; S08 immediate-entry, input lifecycle, raw-next reentry, single-guard, lazy input-frame and scalar completion checks passed; shared-state late delivery and release reentry 6 checks passed; call-frame collection lifecycle 4 checks passed; M05 ordinary error field conversions and exception boundaries passed");
