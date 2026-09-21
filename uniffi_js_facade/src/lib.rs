@@ -2186,6 +2186,8 @@ pub fn runtime_source() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    mod recursive;
+
     use super::*;
     use std::fs;
     use std::process::Command;
