@@ -1371,7 +1371,8 @@ fn resolve_callback_value_path(
     types: &BTreeMap<TypeSourceKey, &IdentifiedType>,
     visiting: &mut BTreeSet<TypeSourceKey>,
 ) -> Option<TypeId> {
-    if segments.is_empty() {
+    // Optional does not consume a path segment, including at a callback leaf.
+    if segments.is_empty() && !matches!(value, ValueType::Optional(_)) {
         let ValueType::Named(key) = value else {
             return None;
         };
@@ -1741,7 +1742,6 @@ fn validate_callback_method_contract(
             callback_type,
             use_site: callback.path.to_string(),
         });
-        return;
     }
 }
 
@@ -3342,6 +3342,38 @@ mod tests {
         assert!(
             report.contains(|error| matches!(error, ValidationError::CallbackTypeMismatch { .. }))
         );
+    }
+
+    #[test]
+    fn optional_callback_terminal_requires_a_callback_type() {
+        let input = corpus_input();
+        let callback = &input.callbacks[0];
+        let mut operation = input
+            .operations
+            .iter()
+            .find(|planned| planned.operation.id == callback.operation_id)
+            .unwrap()
+            .operation
+            .clone();
+        let path = ValuePath::argument(1);
+        let callback_value = operation.definition.signature.arguments[1].ty.clone();
+        operation.definition.signature.arguments[1].ty = ValueType::optional(callback_value);
+        assert_eq!(
+            callback_type_for_path(&operation, &path, &input.types),
+            Some(callback.callback_type)
+        );
+
+        for non_callback in [
+            ValueType::Scalar(ScalarType::String),
+            operation.definition.signature.arguments[0].ty.clone(),
+            operation.definition.signature.return_type.clone().unwrap(),
+        ] {
+            operation.definition.signature.arguments[1].ty = ValueType::optional(non_callback);
+            assert_eq!(
+                callback_type_for_path(&operation, &path, &input.types),
+                None
+            );
+        }
     }
 
     #[test]

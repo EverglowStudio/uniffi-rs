@@ -5,6 +5,9 @@
 //! single package-root implementation/declaration pair.  There is no
 //! intermediate JavaScript source and no descriptor interpreter in the output:
 //! conversion helpers are generated for each operation/type use site.
+//! Named helpers are reserved before their bodies and reused within the same
+//! operation and remaining resource-path context. Recursive data types thus
+//! produce finite code without borrowing callback contracts from another path.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -209,6 +212,47 @@ impl<'a> Model<'a> {
         })
     }
 
+    fn named_helper_key(
+        &self,
+        ty: &ValueType,
+        path: &str,
+        operation_id: Option<uniffi_js_abi::OperationId>,
+    ) -> Option<NamedHelperKey> {
+        let ValueType::Named(type_key) = ty else {
+            return None;
+        };
+        // Only the remaining resource paths affect conversion at this point.
+        // Keeping the full value path would create a new key on every recursive
+        // edge; keeping only the type would mix distinct callback contracts.
+        let relative_path = |resource_path: &str| {
+            let suffix = resource_path.strip_prefix(path)?;
+            (suffix.is_empty() || suffix.starts_with('.')).then(|| suffix.to_owned())
+        };
+        let callbacks = self
+            .ast
+            .callbacks
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| Some(site.operation_id) == operation_id)
+            .filter_map(|(index, site)| {
+                relative_path(&site.path.to_string()).map(|suffix| (index, suffix))
+            })
+            .collect();
+        let streams = self
+            .ast
+            .streams
+            .iter()
+            .filter(|site| Some(site.operation_id) == operation_id)
+            .filter_map(|site| relative_path(&site.path).map(|suffix| (site.id, suffix)))
+            .collect();
+        Some(NamedHelperKey {
+            type_key: type_key.clone(),
+            operation_id,
+            callbacks,
+            streams,
+        })
+    }
+
     fn stream_resource<'b>(
         &self,
         operation: &'b AstOperation,
@@ -232,10 +276,20 @@ impl<'a> Model<'a> {
     }
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct NamedHelperKey {
+    type_key: TypeSourceKey,
+    operation_id: Option<uniffi_js_abi::OperationId>,
+    callbacks: Vec<(usize, String)>,
+    streams: Vec<(uniffi_js_abi::StreamUseSiteId, String)>,
+}
+
 #[derive(Default)]
 struct Helpers {
     lower: Vec<String>,
     lift: Vec<String>,
+    named_lower: BTreeMap<NamedHelperKey, String>,
+    named_lift: BTreeMap<NamedHelperKey, String>,
     callback: Vec<String>,
     counter: usize,
 }
@@ -2520,22 +2574,20 @@ fn render_operation_helpers(
             resolved_return,
             propagate_error
         ));
+    } else if operation.return_type.is_some() {
+        out.push_str(&format!(
+            "  try {{ const __value: ArkValue = session.invokeSync({}, __args); const __result: {} = {}(__value, session); __endSync(); return __result; }} catch (error) {{ __endSync(); {} }}\n",
+            operation.id.index(),
+            return_type,
+            lift_name.as_deref().unwrap_or("__arkLiftVoid"),
+            propagate_error
+        ));
     } else {
-        if operation.return_type.is_some() {
-            out.push_str(&format!(
-                "  try {{ const __value: ArkValue = session.invokeSync({}, __args); const __result: {} = {}(__value, session); __endSync(); return __result; }} catch (error) {{ __endSync(); {} }}\n",
-                operation.id.index(),
-                return_type,
-                lift_name.as_deref().unwrap_or("__arkLiftVoid"),
-                propagate_error
-            ));
-        } else {
-            out.push_str(&format!(
-                "  try {{ session.invokeSync({}, __args); __endSync(); return; }} catch (error) {{ __endSync(); {} }}\n",
-                operation.id.index(),
-                propagate_error
-            ));
-        }
+        out.push_str(&format!(
+            "  try {{ session.invokeSync({}, __args); __endSync(); return; }} catch (error) {{ __endSync(); {} }}\n",
+            operation.id.index(),
+            propagate_error
+        ));
     }
     out.push_str("}\n");
     Ok(out)
@@ -2553,7 +2605,34 @@ fn lower_helper(
     path: &str,
     operation_id: Option<uniffi_js_abi::OperationId>,
 ) -> String {
-    let helper_name = helpers.next(&format!("lower_{}", safe_ident(label)));
+    lower_conversion_helper(
+        model,
+        helpers,
+        &format!("lower_{}", safe_ident(label)),
+        ty,
+        path,
+        operation_id,
+    )
+}
+
+fn lower_conversion_helper(
+    model: &Model<'_>,
+    helpers: &mut Helpers,
+    prefix: &str,
+    ty: &ValueType,
+    path: &str,
+    operation_id: Option<uniffi_js_abi::OperationId>,
+) -> String {
+    let key = model.named_helper_key(ty, path, operation_id);
+    if let Some(name) = key.as_ref().and_then(|key| helpers.named_lower.get(key)) {
+        return name.clone();
+    }
+    let helper_name = helpers.next(prefix);
+    if let Some(key) = key {
+        // Reserve before traversing fields so self/mutual references call the
+        // same function. Emitted functions recurse over finite values only.
+        helpers.named_lower.insert(key, helper_name.clone());
+    }
     let parameter_type = render_type_name(model, ty);
     let body = lower_body(model, helpers, ty, "value", path, operation_id);
     helpers.lower.push(format!(
@@ -2713,11 +2792,12 @@ fn lower_body(
                     for field in fields {
                         let field_type = render_type_name(model, &field.ty);
                         let field_path = format!("{path}.field[{}]", field.name);
+                        let field_name = format!("fieldValue_{}", safe_ident(&field.name));
                         let field_call = lower_nested_call(
                             model,
                             helpers,
                             &field.ty,
-                            &format!("fieldValue_{}", safe_ident(&field.name)),
+                            &field_name,
                             &field_path,
                             operation_id,
                         );
@@ -2729,7 +2809,6 @@ fn lower_body(
                             if matches!(default, DefaultValue::Unspecified) {
                                 body.push_str(&format!(
                                     "if ({field_name} !== undefined) result.{field} = {field_call};\n",
-                                    field_name = format!("fieldValue_{}", safe_ident(&field.name)),
                                     field = escape_string(&field.name),
                                     field_call = field_call
                                 ));
@@ -2737,7 +2816,6 @@ fn lower_body(
                                 let literal = render_default_for_type(default, &field.ty);
                                 body.push_str(&format!(
                                     "if ({field_name} === undefined) result.{field} = {lower_default}; else result.{field} = {field_call};\n",
-                                    field_name = format!("fieldValue_{}", safe_ident(&field.name)),
                                     field = escape_string(&field.name),
                                     lower_default = lower_nested_call(model, helpers, &field.ty, &literal, &field_path, operation_id)
                                 ));
@@ -2745,7 +2823,6 @@ fn lower_body(
                         } else {
                             body.push_str(&format!(
                                 "if ({field_name} === undefined) throw new UniffiError(\"UniffiRecordField\", \"missing record field {field}\"); result.{field} = {field_call};\n",
-                                field_name = format!("fieldValue_{}", safe_ident(&field.name)),
                                 field = escape_string(&field.name)
                             ));
                         }
@@ -2854,12 +2931,15 @@ fn lower_nested_call(
     path: &str,
     operation_id: Option<uniffi_js_abi::OperationId>,
 ) -> String {
-    let label = helpers.next(&format!("nested_lower_{}", safe_ident(path)));
+    let label = lower_conversion_helper(
+        model,
+        helpers,
+        &format!("nested_lower_{}", safe_ident(path)),
+        ty,
+        path,
+        operation_id,
+    );
     let parameter_type = render_type_name(model, ty);
-    let body = lower_body(model, helpers, ty, "value", path, operation_id);
-    helpers.lower.push(format!(
-        "function {label}(value: {parameter_type}, session: BackendSession): ArkValue {{\n{body}\n}}"
-    ));
     format!("{label}({expression} as {parameter_type}, session)")
 }
 
@@ -2871,7 +2951,32 @@ fn lift_helper(
     path: &str,
     operation_id: Option<uniffi_js_abi::OperationId>,
 ) -> String {
-    let helper_name = helpers.next(&format!("lift_{}", safe_ident(label)));
+    lift_conversion_helper(
+        model,
+        helpers,
+        &format!("lift_{}", safe_ident(label)),
+        ty,
+        path,
+        operation_id,
+    )
+}
+
+fn lift_conversion_helper(
+    model: &Model<'_>,
+    helpers: &mut Helpers,
+    prefix: &str,
+    ty: &ValueType,
+    path: &str,
+    operation_id: Option<uniffi_js_abi::OperationId>,
+) -> String {
+    let key = model.named_helper_key(ty, path, operation_id);
+    if let Some(name) = key.as_ref().and_then(|key| helpers.named_lift.get(key)) {
+        return name.clone();
+    }
+    let helper_name = helpers.next(prefix);
+    if let Some(key) = key {
+        helpers.named_lift.insert(key, helper_name.clone());
+    }
     let return_type = render_type_name(model, ty);
     let body = lift_body(model, helpers, ty, "value", path, operation_id);
     helpers.lift.push(format!(
@@ -3140,12 +3245,8 @@ fn lift_nested_call(
     path: &str,
     operation_id: Option<uniffi_js_abi::OperationId>,
 ) -> String {
-    let label = helpers.next(&format!("nested_lift_{}", helpers.counter));
-    let parameter_type = render_type_name(model, ty);
-    let body = lift_body(model, helpers, ty, "value", path, operation_id);
-    helpers.lift.push(format!(
-        "function {label}(value: ArkValue, session: BackendSession): {parameter_type} {{\n{body}\n}}"
-    ));
+    let prefix = format!("nested_lift_{}", helpers.counter);
+    let label = lift_conversion_helper(model, helpers, &prefix, ty, path, operation_id);
     format!("{label}({expression} as ArkValue, session)")
 }
 
