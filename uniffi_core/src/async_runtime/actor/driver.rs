@@ -278,9 +278,9 @@ struct LocalState<A: Actor>(Rc<RefCell<Option<A>>>);
 impl<A: Actor> Actor for LocalState<A> {}
 // The root already owns pinned work that can outlive this waiter. Keep only
 // its status adapter inline; dropping it still uses LocalRootCall's handoff.
-struct LocalHandler(
-    Result<LocalRootCall<Result<(), ActorError>>, LocalBoxFuture<'static, Result<(), ActorError>>>,
-);
+type LocalHandlerStart =
+    Result<LocalRootCall<Result<(), ActorError>>, LocalBoxFuture<'static, Result<(), ActorError>>>;
+struct LocalHandler(LocalHandlerStart);
 impl Future for LocalHandler {
     type Output = Result<(), ActorError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
