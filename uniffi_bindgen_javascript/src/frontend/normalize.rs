@@ -1046,7 +1046,7 @@ fn operation_definition(
     let argument_ownership = callable_arguments
         .iter()
         .map(|argument| {
-            if argument.by_ref() {
+            if argument.is_borrowed() {
                 Ownership::Borrowed
             } else {
                 Ownership::Owned
@@ -1060,7 +1060,7 @@ fn operation_definition(
             let definition = ArgumentDefinition::new(
                 argument.name().to_lower_camel_case(),
                 convert_type(&argument.as_type(), crate_owners)?,
-                if argument.by_ref() {
+                if argument.is_borrowed() {
                     Ownership::Borrowed
                 } else {
                     Ownership::Owned
@@ -3973,6 +3973,50 @@ mod tests {
             consume.arguments[0].conversion,
             ConversionRecipe::Callback(_)
         ));
+    }
+
+    #[test]
+    fn argument_borrows_survive_upstream_pass_by_metadata() {
+        let component = component(
+            "argument_borrows",
+            "argument_borrows",
+            "void classify(bytes owned, [ByRef] bytes shared, [ByMutRef] bytes mutable_data);",
+        );
+        let package = normalize(BindingInput::new(&[component])).unwrap();
+        let expected = [Ownership::Owned, Ownership::Borrowed, Ownership::Borrowed];
+        let operation = package
+            .bridge
+            .operations()
+            .iter()
+            .find(|operation| operation.operation.definition.source_key.name() == "classify")
+            .expect("canonical operation");
+        assert_eq!(
+            operation
+                .operation
+                .definition
+                .signature
+                .arguments
+                .iter()
+                .map(|argument| argument.ownership)
+                .collect::<Vec<_>>(),
+            expected,
+        );
+        for (engine, plan) in &package.rust.engines {
+            let operation = plan
+                .operations
+                .iter()
+                .find(|operation| operation.source_key.name() == "classify")
+                .expect("engine operation");
+            assert_eq!(
+                operation
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.ownership)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{engine:?} must retain both borrow kinds without borrowing owned bytes",
+            );
+        }
     }
 
     #[test]

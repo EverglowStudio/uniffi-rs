@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi-bindgen-tests-javascript"
-version = "0.32.0"
+version = "0.32.1"
 dependencies = [
  "anyhow",
  "camino",
@@ -2891,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi_bindgen_javascript"
-version = "0.32.0"
+version = "0.32.1"
 dependencies = [
  "anyhow",
  "camino",
@@ -2958,18 +2958,18 @@ dependencies = [
 
 [[package]]
 name = "uniffi_js_abi"
-version = "0.32.0"
+version = "0.32.1"
 
 [[package]]
 name = "uniffi_js_engine_schema"
-version = "0.32.0"
+version = "0.32.1"
 dependencies = [
  "uniffi_js_abi",
 ]
 
 [[package]]
 name = "uniffi_js_facade"
-version = "0.32.0"
+version = "0.32.1"
 dependencies = [
  "uniffi_bindgen",
  "uniffi_bindgen_javascript",
@@ -3038,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi_runtime_javascript"
-version = "0.32.0"
+version = "0.32.1"
 
 [[package]]
 name = "uniffi_testing"
