@@ -2729,7 +2729,7 @@ fn lower_body(
                             if matches!(default, DefaultValue::Unspecified) {
                                 body.push_str(&format!(
                                     "if ({field_name} !== undefined) result.{field} = {field_call};\n",
-                                    field_name = format!("fieldValue_{}", safe_ident(&field.name)),
+                                    field_name = format_args!("fieldValue_{}", safe_ident(&field.name)),
                                     field = escape_string(&field.name),
                                     field_call = field_call
                                 ));
@@ -2737,7 +2737,7 @@ fn lower_body(
                                 let literal = render_default_for_type(default, &field.ty);
                                 body.push_str(&format!(
                                     "if ({field_name} === undefined) result.{field} = {lower_default}; else result.{field} = {field_call};\n",
-                                    field_name = format!("fieldValue_{}", safe_ident(&field.name)),
+                                    field_name = format_args!("fieldValue_{}", safe_ident(&field.name)),
                                     field = escape_string(&field.name),
                                     lower_default = lower_nested_call(model, helpers, &field.ty, &literal, &field_path, operation_id)
                                 ));
@@ -2745,7 +2745,7 @@ fn lower_body(
                         } else {
                             body.push_str(&format!(
                                 "if ({field_name} === undefined) throw new UniffiError(\"UniffiRecordField\", \"missing record field {field}\"); result.{field} = {field_call};\n",
-                                field_name = format!("fieldValue_{}", safe_ident(&field.name)),
+                                field_name = format_args!("fieldValue_{}", safe_ident(&field.name)),
                                 field = escape_string(&field.name)
                             ));
                         }

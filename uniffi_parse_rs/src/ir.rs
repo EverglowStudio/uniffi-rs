@@ -226,7 +226,7 @@ impl Ir {
                 if let Some(attrs) =
                     FunctionAttributes::parse(self, cache, module_path, env, &func.attrs)?
                 {
-                    Some(Item::Fn(Function::parse(attrs, func.clone())?))
+                    Some(Item::Fn(Box::new(Function::parse(attrs, func.clone())?)))
                 } else {
                     None
                 }

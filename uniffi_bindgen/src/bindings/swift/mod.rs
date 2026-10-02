@@ -163,9 +163,7 @@ fn stream_runtime_emitter_index(
 ) -> Option<usize> {
     components.iter().position(|component| {
         (component.ci.has_stream_fns() || component.ci.has_input_stream_fns())
-            && crate_filter.map_or(true, |crate_filter| {
-                component.ci.crate_name() == crate_filter
-            })
+            && crate_filter.is_none_or(|crate_filter| component.ci.crate_name() == crate_filter)
     })
 }
 

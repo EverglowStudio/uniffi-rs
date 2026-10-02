@@ -1741,7 +1741,6 @@ fn validate_callback_method_contract(
             callback_type,
             use_site: callback.path.to_string(),
         });
-        return;
     }
 }
 

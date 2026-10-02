@@ -80,7 +80,10 @@ pub fn canonical_name(t: &Type) -> String {
         } => format!(
             "Stream{}{}",
             canonical_name(item_type).to_upper_camel_case(),
-            error_type.as_ref().map(|error| canonical_name(error).to_upper_camel_case()).unwrap_or_else(|| "Infallible".into())
+            error_type
+                .as_ref()
+                .map(|error| canonical_name(error).to_upper_camel_case())
+                .unwrap_or_else(|| "Infallible".into())
         ),
         Type::InputStream {
             item_type,
@@ -89,7 +92,10 @@ pub fn canonical_name(t: &Type) -> String {
         } => format!(
             "InputStream{}{}",
             canonical_name(item_type).to_upper_camel_case(),
-            error_type.as_ref().map(|error| canonical_name(error).to_upper_camel_case()).unwrap_or_else(|| "Infallible".into())
+            error_type
+                .as_ref()
+                .map(|error| canonical_name(error).to_upper_camel_case())
+                .unwrap_or_else(|| "Infallible".into())
         ),
         Type::Custom { name, .. } => format!("Type{name}"),
         Type::Box { inner_type } => canonical_name(inner_type),

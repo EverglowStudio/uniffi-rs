@@ -1624,7 +1624,9 @@ mod tests {
         assert!(swift.contains("try await uniffiRustCallAsync("));
         assert!(swift.contains("cancelFunc: ffi_stream_core_rust_future_cancel_rust_buffer"));
         for suffix in ["rust_buffer", "void"] {
-            assert!(swift.contains(&format!("completeAndFreeFunc: ffi_stream_core_rust_future_complete_and_free_{suffix}")));
+            assert!(swift.contains(&format!(
+                "completeAndFreeFunc: ffi_stream_core_rust_future_complete_and_free_{suffix}"
+            )));
         }
         assert!(!swift.contains("completeFunc:"));
         assert!(swift.contains("liftFunc: { try __uniffiLiftStreamNext("));
@@ -1669,7 +1671,9 @@ mod tests {
         assert!(!bindings
             .library
             .contains("public struct UniFfiStream<Element: Sendable>: AsyncSequence"));
-        assert!(bindings.library.contains("completeAndFreeFunc: ffi_async_core_rust_future_complete_and_free_u32"));
+        assert!(bindings
+            .library
+            .contains("completeAndFreeFunc: ffi_async_core_rust_future_complete_and_free_u32"));
     }
 
     #[test]

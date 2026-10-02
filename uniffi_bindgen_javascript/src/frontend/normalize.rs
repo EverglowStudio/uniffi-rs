@@ -524,7 +524,7 @@ fn collect_type_definitions(
                 .collect::<Result<Vec<_>, _>>()?;
             let bridge_variants = variants
                 .iter()
-                .map(|variant| convert_bridge_variant(variant))
+                .map(convert_bridge_variant)
                 .collect::<Result<Vec<_>, _>>()?;
             let kind = if component.ci.is_name_used_as_error(enum_.name()) {
                 NamedTypeKind::Error {
@@ -1022,6 +1022,10 @@ fn collect_operation_definitions(
     Ok((definitions, extras))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Projects one callable with its source, receiver, callback and Rust target metadata"
+)]
 fn operation_definition(
     ci: &ComponentInterface,
     component_key: &ComponentKey,
@@ -1054,7 +1058,6 @@ fn operation_definition(
         })
         .collect::<Vec<_>>();
     let arguments = callable_arguments
-        .into_iter()
         .into_iter()
         .map(|argument| {
             let definition = ArgumentDefinition::new(
@@ -2696,7 +2699,7 @@ fn convert_variant(
 }
 
 fn convert_bridge_variant(variant: &SourceVariant) -> Result<EnumVariant, FrontendError> {
-    Ok(EnumVariant::new(
+    EnumVariant::new(
         variant.public_name.clone(),
         variant
             .fields
@@ -2707,7 +2710,7 @@ fn convert_bridge_variant(variant: &SourceVariant) -> Result<EnumVariant, Fronte
             })
             .collect::<Result<Vec<_>, _>>()?,
     )
-    .map_err(|error| FrontendError::Contract(error.to_string()))?)
+    .map_err(|error| FrontendError::Contract(error.to_string()))
 }
 
 fn convert_default(value: &DefaultValue) -> JsDefaultValue {

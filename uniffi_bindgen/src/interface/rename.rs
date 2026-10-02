@@ -318,6 +318,7 @@ mod tests {
             module_path: "test_crate".to_string(),
             name: "Leaf".to_string(),
             orig_name: None,
+            rust_path: None,
             remote: false,
             fields: vec![],
             docstring: None,
@@ -329,6 +330,7 @@ mod tests {
             module_path: "test_crate".to_string(),
             name: "Holder".to_string(),
             orig_name: None,
+            rust_path: None,
             remote: false,
             fields: vec![
                 FieldMetadata {

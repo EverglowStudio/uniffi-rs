@@ -466,7 +466,7 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
             | ConversionRecipe::Timestamp
             | ConversionRecipe::Duration
             | ConversionRecipe::BigInt
-            | ConversionRecipe::Bytes => from_rust_type(rust_type, types),
+            | ConversionRecipe::Bytes => from_rust_type(rust_type),
             ConversionRecipe::Optional(inner) => Some(ValueType::Optional(Box::new(
                 from_conversion(inner, rust_type_inner(rust_type), types)?,
             ))),
@@ -548,32 +548,30 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
         }
     }
 
-    fn from_rust_type(rust_type: &RustType, types: &[JsType]) -> Option<ValueType> {
+    fn from_rust_type(rust_type: &RustType) -> Option<ValueType> {
         match rust_type {
             RustType::Scalar(scalar) => Some(ValueType::Scalar(*scalar)),
             RustType::Timestamp => Some(ValueType::Timestamp),
             RustType::Duration => Some(ValueType::Duration),
-            RustType::Option(inner) => {
-                Some(ValueType::Optional(Box::new(from_rust_type(inner, types)?)))
-            }
+            RustType::Option(inner) => Some(ValueType::Optional(Box::new(from_rust_type(inner)?))),
             RustType::Sequence(inner) => {
-                Some(ValueType::Sequence(Box::new(from_rust_type(inner, types)?)))
+                Some(ValueType::Sequence(Box::new(from_rust_type(inner)?)))
             }
             RustType::Map(key, value) => Some(ValueType::Map(
-                Box::new(from_rust_type(key, types)?),
-                Box::new(from_rust_type(value, types)?),
+                Box::new(from_rust_type(key)?),
+                Box::new(from_rust_type(value)?),
             )),
-            RustType::Set(inner) => Some(ValueType::Set(Box::new(from_rust_type(inner, types)?))),
+            RustType::Set(inner) => Some(ValueType::Set(Box::new(from_rust_type(inner)?))),
             RustType::Stream {
                 item,
                 error,
                 is_send,
             } => Some(ValueType::OutputStream {
-                item: Box::new(from_rust_type(item, types)?),
+                item: Box::new(from_rust_type(item)?),
                 error: if is_infallible_rust_type(error) {
                     None
                 } else {
-                    Some(Box::new(from_rust_type(error, types)?))
+                    Some(Box::new(from_rust_type(error)?))
                 },
                 is_send: *is_send,
             }),
@@ -582,15 +580,15 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
                 error,
                 is_send,
             } => Some(ValueType::InputStream {
-                item: Box::new(from_rust_type(item, types)?),
+                item: Box::new(from_rust_type(item)?),
                 error: if is_infallible_rust_type(error) {
                     None
                 } else {
-                    Some(Box::new(from_rust_type(error, types)?))
+                    Some(Box::new(from_rust_type(error)?))
                 },
                 is_send: *is_send,
             }),
-            RustType::Custom(inner) => from_rust_type(inner, types),
+            RustType::Custom(inner) => from_rust_type(inner),
             RustType::Unit | RustType::Path(_) | RustType::StreamStep { .. } => None,
         }
     }
@@ -958,7 +956,7 @@ fn render_component_implementation(
     for import in runtime_imports {
         out.push_str(&import);
     }
-    out.push_str("\n");
+    out.push('\n');
     out.push_str("const __objectClasses = Object.create(null);\n");
     out.push_str("const __errorClasses = Object.create(null);\n");
     out.push_str("const __descriptors = ");
@@ -967,7 +965,7 @@ fn render_component_implementation(
     out.push_str("__descriptors.classes = __objectClasses;\n");
     out.push_str("__descriptors.errorClasses = __errorClasses;\n");
     out.push_str("\nexport function createNamespace(session) { return createFacade(session, __descriptors); }\n");
-    out.push_str("\n");
+    out.push('\n');
 
     for ty in ast.types.iter() {
         if let AstTypeKind::Object { .. } = ty.kind {

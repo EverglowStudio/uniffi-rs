@@ -285,6 +285,9 @@ impl Drop for InputCloseOnDrop {
     }
 }
 
+// Keep the covariant, non-owning function-pointer marker and its Send/Sync semantics.
+type InputStreamCallbackMarker<T, E, UT> = PhantomData<fn() -> (T, E, UT)>;
+
 struct ForeignInputStreamCallbackOps<T, E, UT>
 where
     Result<Option<T>, E>: LiftReturn<UT>,
@@ -292,7 +295,7 @@ where
     next: ForeignInputStreamNextCallback<<Result<Option<T>, E> as LiftReturn<UT>>::ReturnType>,
     cancel: ForeignInputStreamCancelCallback,
     close: ForeignInputStreamCloseCallback,
-    _phantom: PhantomData<fn() -> (T, E, UT)>,
+    _phantom: InputStreamCallbackMarker<T, E, UT>,
 }
 
 impl<T, E, UT> ForeignInputStreamOps<T, E> for ForeignInputStreamCallbackOps<T, E, UT>
@@ -379,9 +382,11 @@ mod input_stream_tests {
         task::{Poll, Wake},
     };
 
+    type InputValueQueue = Arc<Mutex<VecDeque<Result<Option<u32>, String>>>>;
+
     #[derive(Clone)]
     struct FakeOps {
-        values: Arc<Mutex<VecDeque<Result<Option<u32>, String>>>>,
+        values: InputValueQueue,
         cancels: Arc<AtomicUsize>,
     }
 

@@ -19,7 +19,7 @@ pub enum Item {
     Record(Record),
     Enum(Enum),
     Object(Object),
-    Fn(Function),
+    Fn(Box<Function>),
     Impl(Impl),
     Trait(Trait),
     Type(ItemType),

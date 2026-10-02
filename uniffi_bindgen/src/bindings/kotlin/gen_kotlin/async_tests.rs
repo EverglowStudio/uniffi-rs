@@ -5,7 +5,7 @@
 use super::*;
 use uniffi_meta::{
     CallbackInterfaceMetadata, FnMetadata, FnParamMetadata, MetadataGroup, MethodMetadata,
-    NamespaceMetadata, ObjectMetadata, TraitKind, TraitMethodMetadata,
+    NamespaceMetadata, ObjectMetadata, PassBy, TraitKind, TraitMethodMetadata,
 };
 
 const MODULE: &str = "kotlin_async_contract";
@@ -30,7 +30,7 @@ fn input(is_send: bool) -> FnParamMetadata {
             error_type: None,
             is_send,
         },
-        by_ref: false,
+        pass_by: PassBy::Value,
         optional: false,
         default: None,
     }
@@ -208,7 +208,15 @@ fn kotlin_async_completion_preserves_cleanup_errors() {
     let test_file = temp.path().join("CompletionTest.kt");
     let jar = temp.path().join("completion.jar");
     std::fs::write(&bindings_file, bindings(false)).unwrap();
-    std::fs::write(&test_file, format!("{}\n{}", include_str!("async_completion_test.kt"), include_str!("c_abi_terminal_mock.kt"))).unwrap();
+    std::fs::write(
+        &test_file,
+        format!(
+            "{}\n{}",
+            include_str!("async_completion_test.kt"),
+            include_str!("c_abi_terminal_mock.kt")
+        ),
+    )
+    .unwrap();
     let classpath = std::env::var("CLASSPATH")
         .expect("Kotlin completion gate requires JNA/coroutines CLASSPATH");
     let output = Command::new("kotlinc")
@@ -266,8 +274,12 @@ fn kotlin_input_close_completion_protocol() {
 fn kotlin_generated_calls_use_consuming_terminal_carriers() {
     let source = bindings(false);
     for suffix in ["u64", "rust_buffer", "void"] {
-        assert!(source.contains(&format!("-> UniffiLib.ffi_{MODULE}_rust_future_complete_and_free_{suffix}(future,")));
-        assert!(!source.contains(&format!("-> UniffiLib.ffi_{MODULE}_rust_future_complete_{suffix}(future,")));
+        assert!(source.contains(&format!(
+            "-> UniffiLib.ffi_{MODULE}_rust_future_complete_and_free_{suffix}(future,"
+        )));
+        assert!(!source.contains(&format!(
+            "-> UniffiLib.ffi_{MODULE}_rust_future_complete_{suffix}(future,"
+        )));
     }
     assert!(source.contains("terminalOwnsHandle = true"));
     assert!(source.contains("discardResult = { it.close() }"));

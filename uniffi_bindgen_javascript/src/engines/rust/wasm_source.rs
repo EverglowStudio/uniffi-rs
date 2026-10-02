@@ -527,6 +527,10 @@ fn object_coerce_method_name() -> Ident {
     Ident::new("__uniffi_into_arc", Span::call_site())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Paired lower/lift arms share the existing enum payload and direction inputs"
+)]
 fn render_payload_variant(
     package: &NormalizedPackage,
     core: &syn::Path,
@@ -560,7 +564,7 @@ fn render_payload_variant(
             } else {
                 value_ident.clone()
             };
-            let lifted = lift_js_expr(package, binding, quote!(#lift_ident))?;
+            let lifted = lift_js_expr(binding, quote!(#lift_ident))?;
             lift_fields.push(quote! {
                 js_sys::Reflect::set(&object, &JsValue::from_str(#js_name), &(#lifted)?)?;
             });
@@ -738,7 +742,7 @@ fn render_callback_method(
         let ty = core_type(package, &binding)?;
         let ident = rust_ident(&format!("arg{index}"));
         args.push(quote!(#ident: #ty));
-        let js = lift_js_expr(package, &binding, quote!(#ident))?;
+        let js = lift_js_expr(&binding, quote!(#ident))?;
         lifts.push(quote! {
             let lifted = (|| -> Result<JsValue, JsValue> { #js })()
                 .unwrap_or_else(|error| panic!("callback argument lifting failed: {:?}", error));
@@ -1364,7 +1368,7 @@ fn render_named_helpers(package: &NormalizedPackage) -> Result<String> {
                         let rust_name = rust_ident(&field.rust_name);
                         let js_name = &field.public_name;
                         let field_binding = &field.binding;
-                        let lifted = lift_js_expr(package, field_binding, quote!(#rust_name))?;
+                        let lifted = lift_js_expr(field_binding, quote!(#rust_name))?;
                         lift_fields.push(quote! {
                             js_sys::Reflect::set(&object, &JsValue::from_str(#js_name), &(#lifted)?)?;
                         });
@@ -1407,13 +1411,7 @@ fn render_named_helpers(package: &NormalizedPackage) -> Result<String> {
                     match &variant.payload {
                         RustVariantPayload::Unit => {
                             if render_lower {
-                                if all_unit {
-                                    lower_arms.push(quote!(#public => Ok(#core::#rust_variant)));
-                                } else {
-                                    lower_arms.push(quote! {
-                                        #public => Ok(#core::#rust_variant)
-                                    });
-                                }
+                                lower_arms.push(quote!(#public => Ok(#core::#rust_variant)));
                             }
                             if render_lift {
                                 if is_error {
@@ -1504,7 +1502,7 @@ fn render_named_helpers(package: &NormalizedPackage) -> Result<String> {
                                       let field_value = js_sys::Reflect::get(&object, &JsValue::from_str(#js_name))?;
                                       let #binding = #lowered?;
                                   });
-                                  let lifted = lift_expr(package, &field.binding, quote!(#binding))?;
+                                  let lifted = lift_expr(&field.binding, quote!(#binding))?;
                                   lift_fields.push(quote! {
                                       js_sys::Reflect::set(&object, &JsValue::from_str(#js_name), &(#lifted)?)?;
                                   });
@@ -1598,7 +1596,7 @@ fn render_named_helpers(package: &NormalizedPackage) -> Result<String> {
                     });
                 }
                 if render_lift {
-                    let lift_inner = lift_js_expr(package, inner, quote!(value))?;
+                    let lift_inner = lift_js_expr(inner, quote!(value))?;
                     let custom_lift = quote! {
                         let ffi = <#core as ::uniffi::Lower<#tag>>::lower(value);
                         let value: #inner_core = <#inner_core as ::uniffi::Lift<#tag>>::try_lift(ffi).map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -1814,11 +1812,7 @@ fn lower_js_expr(
 /// arguments and stream envelopes.  Public ABI return values use
 /// [`lift_expr`] instead because wasm-bindgen already owns their primitive
 /// carrier conversion.
-fn lift_js_expr(
-    package: &NormalizedPackage,
-    binding: &RustValueBinding,
-    expression: TokenStream,
-) -> Result<TokenStream> {
+fn lift_js_expr(binding: &RustValueBinding, expression: TokenStream) -> Result<TokenStream> {
     if super::is_infallible(&binding.rust_type) {
         return Ok(quote!(Ok::<JsValue, JsValue>(match #expression {})));
     }
@@ -1865,7 +1859,7 @@ fn lift_js_expr(
         }
         ConversionRecipe::Optional(inner) => {
             let nested = nested_binding(binding, inner, RustType::Unit);
-            let inner_expr = lift_js_expr(package, &nested, quote!(inner_value))?;
+            let inner_expr = lift_js_expr(&nested, quote!(inner_value))?;
             quote! {
                 match #expression {
                     Some(inner_value) => #inner_expr,
@@ -1875,7 +1869,7 @@ fn lift_js_expr(
         }
         ConversionRecipe::Sequence(inner) | ConversionRecipe::Set(inner) => {
             let nested = nested_binding(binding, inner, RustType::Unit);
-            let inner_expr = lift_js_expr(package, &nested, quote!(item_value))?;
+            let inner_expr = lift_js_expr(&nested, quote!(item_value))?;
             quote! {
                 {
                     let array = js_sys::Array::new();
@@ -1888,8 +1882,8 @@ fn lift_js_expr(
         }
         ConversionRecipe::Map(key, value) => {
             let (key_binding, value_binding) = map_bindings(binding, key, value);
-            let key_expr = lift_js_expr(package, &key_binding, quote!(key_value))?;
-            let value_expr = lift_js_expr(package, &value_binding, quote!(value_value))?;
+            let key_expr = lift_js_expr(&key_binding, quote!(key_value))?;
+            let value_expr = lift_js_expr(&value_binding, quote!(value_value))?;
             quote! {
                 {
                     let map = js_sys::Map::new();
@@ -1916,8 +1910,8 @@ fn lift_js_expr(
         ConversionRecipe::StreamStep { item, error } => {
             let item_binding = nested_binding(binding, item, RustType::Unit);
             let error_binding = nested_binding(binding, error, RustType::Unit);
-            let item_expr = lift_js_expr(package, &item_binding, quote!(value))?;
-            let error_expr = lift_js_expr(package, &error_binding, quote!(error))?;
+            let item_expr = lift_js_expr(&item_binding, quote!(value))?;
+            let error_expr = lift_js_expr(&error_binding, quote!(error))?;
             quote! {
                 match #expression {
                     ::uniffi::UniFfiStreamStep::Item(value) => {
@@ -2060,11 +2054,7 @@ fn lower_expr(
     Ok(output)
 }
 
-fn lift_expr(
-    package: &NormalizedPackage,
-    binding: &RustValueBinding,
-    expression: TokenStream,
-) -> Result<TokenStream> {
+fn lift_expr(binding: &RustValueBinding, expression: TokenStream) -> Result<TokenStream> {
     if super::is_infallible(&binding.rust_type) {
         return Ok(quote!(Ok::<JsValue, JsValue>(match #expression {})));
     }
@@ -2085,7 +2075,7 @@ fn lift_expr(
         }
         ConversionRecipe::Optional(inner) => {
             let nested = nested_binding(binding, inner, RustType::Unit);
-            let inner_expr = lift_js_expr(package, &nested, quote!(inner_value))?;
+            let inner_expr = lift_js_expr(&nested, quote!(inner_value))?;
             quote! {
                 {
                     match #expression {
@@ -2100,7 +2090,7 @@ fn lift_expr(
         }
         ConversionRecipe::Sequence(inner) => {
             let nested = nested_binding(binding, inner, RustType::Unit);
-            let inner_expr = lift_js_expr(package, &nested, quote!(item_value))?;
+            let inner_expr = lift_js_expr(&nested, quote!(item_value))?;
             quote! {
                 {
                     let array = js_sys::Array::new();
@@ -2113,7 +2103,7 @@ fn lift_expr(
         }
         ConversionRecipe::Set(inner) => {
             let nested = nested_binding(binding, inner, RustType::Unit);
-            let inner_expr = lift_js_expr(package, &nested, quote!(item_value))?;
+            let inner_expr = lift_js_expr(&nested, quote!(item_value))?;
             quote! {
                 {
                     let array = js_sys::Array::new();
@@ -2126,8 +2116,8 @@ fn lift_expr(
         }
         ConversionRecipe::Map(key, value) => {
             let (key_binding, value_binding) = map_bindings(binding, key, value);
-            let key_expr = lift_js_expr(package, &key_binding, quote!(key_value))?;
-            let value_expr = lift_js_expr(package, &value_binding, quote!(value_value))?;
+            let key_expr = lift_js_expr(&key_binding, quote!(key_value))?;
+            let value_expr = lift_js_expr(&value_binding, quote!(value_value))?;
             quote! {
                 {
                     let map = js_sys::Map::new();
@@ -2959,7 +2949,7 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
         let declared_error_lift = match operation.throws {
             Some(error_id) => {
                 let binding = declared_error_binding(package, error_id)?;
-                Some(lift_js_expr(package, &binding, quote!(error))?)
+                Some(lift_js_expr(&binding, quote!(error))?)
             }
             None => None,
         };
@@ -3031,7 +3021,7 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
             quote!(#call;)
         };
         let lifted = if let Some(binding) = &return_binding {
-            let expression = lift_expr(package, binding, quote!(result))?;
+            let expression = lift_expr(binding, quote!(result))?;
             let expression = quote!((|| -> Result<#return_ty, JsValue> { #expression })());
             if fallible {
                 quote!(#expression)
@@ -3169,7 +3159,7 @@ fn render_output_stream_start(
     let declared_error_lift = match operation.throws {
         Some(error_id) => {
             let binding = declared_error_binding(package, error_id)?;
-            Some(lift_js_expr(package, &binding, quote!(error))?)
+            Some(lift_js_expr(&binding, quote!(error))?)
         }
         None => None,
     };
@@ -3289,8 +3279,8 @@ fn render_stream_hook_operation(
             let error_binding = &group.error;
             let item = core_type(package, item_binding)?;
             let error = core_type(package, error_binding)?;
-            let item_lift = lift_js_expr(package, item_binding, quote!(value))?;
-            let error_lift = lift_js_expr(package, error_binding, quote!(error))?;
+            let item_lift = lift_js_expr(item_binding, quote!(value))?;
+            let error_lift = lift_js_expr(error_binding, quote!(error))?;
             let error_arm = if super::is_infallible(&error_binding.rust_type) {
                 quote!(match error {})
             } else {

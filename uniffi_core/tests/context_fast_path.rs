@@ -61,6 +61,10 @@ fn measure(path: &str, batch: usize, mut call: impl FnMut() -> u64) {
 
 #[test]
 #[ignore = "manual release microbench; prints JSON timings, no performance threshold"]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "This ignored release-only microbench must still compile in debug test builds"
+)]
 fn context_fast_path() {
     assert!(
         !cfg!(debug_assertions),

@@ -225,12 +225,15 @@ use crate::async_runtime::{
     current_context, BoxFuture, CallContext, CancellationToken, CleanupFailed, Run, TaskError,
 };
 
+#[cfg(feature = "async-runtime")]
+type StreamSlot<T, E> = Arc<Mutex<Poll<Option<Result<T, E>>>>>;
+
 // Run establishes the subscription context on every business poll and destructor.
 // It is only polled by an actual next request. The slot contains at most one item.
 #[cfg(feature = "async-runtime")]
 struct StreamDriver<T, E> {
     stream: UniFfiStream<T, E>,
-    slot: Arc<Mutex<Poll<Option<Result<T, E>>>>>,
+    slot: StreamSlot<T, E>,
 }
 #[cfg(feature = "async-runtime")]
 impl<T, E> Future for StreamDriver<T, E> {
@@ -276,7 +279,7 @@ impl Drop for StreamScope {
 struct ScopedStream<T, E> {
     key: u64,
     run: Option<Run<StreamDriver<T, E>>>,
-    slot: Arc<Mutex<Poll<Option<Result<T, E>>>>>,
+    slot: StreamSlot<T, E>,
     failure: Arc<Mutex<Option<TaskError>>>,
 }
 #[cfg(feature = "async-runtime")]
@@ -961,12 +964,13 @@ mod tests {
     }
 
     struct ProbeRegistryOnWake {
+        registry: &'static RustStreamRegistry<u32, String>,
         available: Arc<AtomicUsize>,
     }
 
     impl Wake for ProbeRegistryOnWake {
         fn wake(self: Arc<Self>) {
-            let available = PENDING_REGISTRY.try_lock().is_ok();
+            let available = self.registry.try_lock().is_ok();
             self.available
                 .store(if available { 1 } else { 2 }, AtomicOrdering::SeqCst);
         }
@@ -997,8 +1001,10 @@ mod tests {
         }
     }
 
+    type ReentrantStreamOwner = Arc<Mutex<Option<Weak<RustStream<u32, String>>>>>;
+
     struct ReentrantPollAndDropStream {
-        owner: Arc<Mutex<Option<Weak<RustStream<u32, String>>>>>,
+        owner: ReentrantStreamOwner,
         poll_calls: Arc<AtomicUsize>,
         drop_calls: Arc<AtomicUsize>,
     }
@@ -1213,15 +1219,18 @@ mod tests {
 
     #[test]
     fn cancel_wakes_after_releasing_registry_mutex() {
-        let handle = rust_stream_new(&PENDING_REGISTRY, Box::pin(AlwaysPending));
-        let mut next = Box::pin(rust_stream_next_async(&PENDING_REGISTRY, handle.clone()));
+        // Other parallel tests must not hold the mutex that this waker probes.
+        static REGISTRY: RustStreamRegistry<u32, String> = Lazy::new(|| Mutex::new(HashMap::new()));
+        let handle = rust_stream_new(&REGISTRY, Box::pin(AlwaysPending));
+        let mut next = Box::pin(rust_stream_next_async(&REGISTRY, handle.clone()));
         let available = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(ProbeRegistryOnWake {
+            registry: &REGISTRY,
             available: available.clone(),
         }));
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(next.as_mut().poll(&mut cx), Poll::Pending));
-        rust_stream_cancel(&PENDING_REGISTRY, handle);
+        rust_stream_cancel(&REGISTRY, handle);
         assert_eq!(available.load(AtomicOrdering::SeqCst), 1);
         assert!(matches!(
             next.as_mut().poll(&mut cx),

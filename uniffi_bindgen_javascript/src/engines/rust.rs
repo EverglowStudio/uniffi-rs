@@ -927,7 +927,6 @@ fn operation_result_resource_paths(
     let mut visiting = std::collections::BTreeSet::new();
     fn walk(
         package: &NormalizedPackage,
-        operation_id: u32,
         path: Vec<ResourcePathSegment>,
         ty: &RustType,
         conversion: &ConversionRecipe,
@@ -966,14 +965,7 @@ fn operation_result_resource_paths(
                     .chain([ResourcePathSegment::Optional])
                     .collect();
                 walk(
-                    package,
-                    operation_id,
-                    path,
-                    inner_ty,
-                    inner,
-                    ownership,
-                    resources,
-                    visiting,
+                    package, path, inner_ty, inner, ownership, resources, visiting,
                 )?;
             }
             ConversionRecipe::Sequence(inner) => {
@@ -983,7 +975,6 @@ fn operation_result_resource_paths(
                 };
                 walk(
                     package,
-                    operation_id,
                     path.into_iter()
                         .chain([ResourcePathSegment::SequenceItem])
                         .collect(),
@@ -1001,7 +992,6 @@ fn operation_result_resource_paths(
                 };
                 walk(
                     package,
-                    operation_id,
                     path.into_iter()
                         .chain([ResourcePathSegment::SetItem])
                         .collect(),
@@ -1019,7 +1009,6 @@ fn operation_result_resource_paths(
                 };
                 walk(
                     package,
-                    operation_id,
                     path.iter()
                         .cloned()
                         .chain([ResourcePathSegment::MapKey])
@@ -1032,7 +1021,6 @@ fn operation_result_resource_paths(
                 )?;
                 walk(
                     package,
-                    operation_id,
                     path.into_iter()
                         .chain([ResourcePathSegment::MapValue])
                         .collect(),
@@ -1043,16 +1031,9 @@ fn operation_result_resource_paths(
                     visiting,
                 )?;
             }
-            ConversionRecipe::Custom(_, inner) => walk(
-                package,
-                operation_id,
-                path,
-                ty,
-                inner,
-                ownership,
-                resources,
-                visiting,
-            )?,
+            ConversionRecipe::Custom(_, inner) => {
+                walk(package, path, ty, inner, ownership, resources, visiting)?
+            }
             ConversionRecipe::StreamStep { item, error } => {
                 let (item_ty, error_ty) = match ty {
                     RustType::StreamStep { item, error } => (item.as_ref(), error.as_ref()),
@@ -1060,7 +1041,6 @@ fn operation_result_resource_paths(
                 };
                 walk(
                     package,
-                    operation_id,
                     path.iter()
                         .cloned()
                         .chain([ResourcePathSegment::StreamItem])
@@ -1073,7 +1053,6 @@ fn operation_result_resource_paths(
                 )?;
                 walk(
                     package,
-                    operation_id,
                     path.into_iter()
                         .chain([ResourcePathSegment::StreamError])
                         .collect(),
@@ -1100,7 +1079,6 @@ fn operation_result_resource_paths(
                     for field in fields {
                         walk(
                             package,
-                            operation_id,
                             path.iter()
                                 .cloned()
                                 .chain([ResourcePathSegment::Field(field.public_name.clone())])
@@ -1154,7 +1132,6 @@ fn operation_result_resource_paths(
                                 for field in fields {
                                     walk(
                                         package,
-                                        operation_id,
                                         variant_path
                                             .iter()
                                             .cloned()
@@ -1174,7 +1151,6 @@ fn operation_result_resource_paths(
                                 for field in fields {
                                     walk(
                                         package,
-                                        operation_id,
                                         variant_path
                                             .iter()
                                             .cloned()
@@ -1209,7 +1185,6 @@ fn operation_result_resource_paths(
     }
     walk(
         package,
-        operation.operation_id.index(),
         root,
         &result.rust_type,
         &result.conversion,
@@ -1286,9 +1261,11 @@ fn family_operations(
                 } else {
                     Vec::new()
                 },
-                callbacks: native
-                    .then(|| callbacks_for(bridge, operation.operation_id.index()))
-                    .unwrap_or_default(),
+                callbacks: if native {
+                    callbacks_for(bridge, operation.operation_id.index())
+                } else {
+                    Vec::new()
+                },
                 streams: if native {
                     streams_for(bridge, operation)
                 } else {
@@ -5643,12 +5620,15 @@ pub(crate) fn napi_source(package: &NormalizedPackage) -> Result<String> {
     let callback_helpers =
         render_callback_proxy_helpers(package, NativeFlavor::Node, EngineKind::Napi)?;
     let registry = render_resource_registry(NativeFlavor::Node);
-    let local_errors = package.rust.engines[&EngineKind::Napi]
+    let local_errors = if package.rust.engines[&EngineKind::Napi]
         .operations
         .iter()
         .any(async_calls::local_method)
-        .then(|| async_calls::local_error_helper(Some(NativeFlavor::Node)))
-        .unwrap_or_default();
+    {
+        async_calls::local_error_helper(Some(NativeFlavor::Node))
+    } else {
+        Default::default()
+    };
     let wrappers = format!(
         "{local_errors}\n{}",
         render_native_operation_wrappers(package, EngineKind::Napi)?
@@ -6053,12 +6033,15 @@ pub(crate) fn ohos_source(package: &NormalizedPackage) -> Result<String> {
     let callback_helpers =
         render_callback_proxy_helpers(package, NativeFlavor::Ohos, EngineKind::OhosNapi)?;
     let registry = render_resource_registry(NativeFlavor::Ohos);
-    let local_errors = package.rust.engines[&EngineKind::OhosNapi]
+    let local_errors = if package.rust.engines[&EngineKind::OhosNapi]
         .operations
         .iter()
         .any(async_calls::local_method)
-        .then(|| async_calls::local_error_helper(Some(NativeFlavor::Ohos)))
-        .unwrap_or_default();
+    {
+        async_calls::local_error_helper(Some(NativeFlavor::Ohos))
+    } else {
+        Default::default()
+    };
     let wrappers = format!(
         "{local_errors}\n{}",
         render_native_operation_wrappers(package, EngineKind::OhosNapi)?

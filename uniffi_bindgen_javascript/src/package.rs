@@ -91,7 +91,7 @@ impl GeneratedPackage {
             .unwrap_or(options.out_dir.as_path());
         let selected_target_vec = selected_targets.iter().copied().collect::<Vec<_>>();
         let rendered_hosts = crate::host_crates::render_host_package(
-            &normalized,
+            normalized,
             host_options,
             &selected_target_vec,
             &options.package_root,
@@ -135,7 +135,7 @@ impl GeneratedPackage {
             }
             if selected_targets.contains(&PublicTarget::NodeNapi) {
                 let node = render_node_entrypoint(
-                    &normalized,
+                    normalized,
                     host_plan
                         .flavor(PublicTarget::NodeNapi)
                         .context("N-API host plan missing for Node entrypoint")?,
@@ -146,7 +146,7 @@ impl GeneratedPackage {
             }
             if wants_electron {
                 let electron = render_electron_entrypoint(
-                    &normalized,
+                    normalized,
                     host_plan
                         .flavor(PublicTarget::NodeNapi)
                         .context("N-API host plan missing for Electron entrypoint")?,
@@ -158,7 +158,7 @@ impl GeneratedPackage {
             }
             if selected_targets.contains(&PublicTarget::BrowserWasm) {
                 let browser = render_browser_entrypoint(
-                    &normalized,
+                    normalized,
                     host_plan
                         .flavor(PublicTarget::BrowserWasm)
                         .context("Wasm host plan missing for browser entrypoint")?,
@@ -209,7 +209,7 @@ impl GeneratedPackage {
                     .flavor(PublicTarget::OhosNapi)
                     .context("OHOS host plan missing for Harmony entrypoint")?;
                 let (native_import, suffix) =
-                    render_harmony_binding(&normalized, flavor, &source_prefix);
+                    render_harmony_binding(normalized, flavor, &source_prefix);
                 let mut composed = native_import.into_bytes();
                 composed.extend_from_slice(&index.bytes);
                 index.bytes = composed;
@@ -218,7 +218,7 @@ impl GeneratedPackage {
             if let Some(declarations) = files.iter_mut().find(|file| file.path == "Index.d.ets") {
                 declarations
                     .bytes
-                    .extend_from_slice(render_harmony_declarations(&normalized).as_bytes());
+                    .extend_from_slice(render_harmony_declarations(normalized).as_bytes());
             }
         }
 
@@ -238,7 +238,7 @@ impl GeneratedPackage {
             .map_err(|error| anyhow!("building the explicit Wasm expansion context: {error:?}"))?;
             files.push(PackageFile {
                 path: "native/wasm.rs".into(),
-                bytes: engines::wasm_source(&normalized, expansion_context)
+                bytes: engines::wasm_source(normalized, expansion_context)
                     .context("rendering the Wasm engine adapter")?
                     .into_bytes(),
                 role: PackageFileRole::NativeHost,
@@ -251,7 +251,7 @@ impl GeneratedPackage {
         if selected_targets.contains(&PublicTarget::NodeNapi) {
             files.push(PackageFile {
                 path: "native/node.rs".into(),
-                bytes: engines::napi_source(&normalized)
+                bytes: engines::napi_source(normalized)
                     .context("rendering the N-API engine adapter")?
                     .into_bytes(),
                 role: PackageFileRole::NativeHost,
@@ -259,7 +259,7 @@ impl GeneratedPackage {
         }
         if selected_targets.contains(&PublicTarget::OhosNapi) {
             let source =
-                engines::ohos_source(&normalized).context("rendering the OHOS engine adapter")?;
+                engines::ohos_source(normalized).context("rendering the OHOS engine adapter")?;
             files.push(PackageFile {
                 path: "native/ohos.rs".into(),
                 bytes: source.into_bytes(),
