@@ -23,6 +23,8 @@ import uniffi.uniffi_output_streams.pendingStream
 import uniffi.uniffi_output_streams.probeSnapshot
 import uniffi.uniffi_output_streams.resetProbe
 import uniffi.uniffi_output_streams.typedErrorStream
+import uniffi.uniffi_output_streams.StreamOwner
+import uniffi.uniffi_output_streams.StreamOwnerInterface
 
 sealed class ErrorMessageCompileProbe : kotlin.Exception() {
     class StringMessage(
@@ -97,12 +99,13 @@ suspend fun requireSingleUseFailure(block: suspend () -> Unit) {
 }
 
 runBlocking {
-    val probeId = "kotlin-lazy-and-repeated"
+    val probeId = "kotlin-no-prefetch-and-repeated"
     resetProbe(probeId)
 
     val stream: UniFfiStream<UInt> = countingStream(probeId, 2U)
     val flow: Flow<UInt> = stream
-    check(probeSnapshot(probeId).streamStarts == 0UL)
+    check(probeSnapshot(probeId).streamStarts == 1UL)
+    check(probeSnapshot(probeId).streamNextPolls == 0UL)
 
     check(flow.toList() == listOf(0U, 1U))
     val done = probeSnapshot(probeId)
@@ -114,6 +117,8 @@ runBlocking {
     requireStableProbe(probeId, done)
 
     requireSingleUseFailure { stream.toList() }
+    stream.close()
+    stream.close()
     check(probeSnapshot(probeId) == done)
 }
 
@@ -121,7 +126,7 @@ runBlocking {
     val probeId = "kotlin-concurrent-and-pending-cancel"
     resetProbe(probeId)
     val stream = pendingStream(probeId)
-    check(probeSnapshot(probeId).streamStarts == 0UL)
+    check(probeSnapshot(probeId).streamStarts == 1UL)
 
     val collecting: Job = launch {
         stream.collect { error("pending stream unexpectedly emitted $it") }
@@ -136,6 +141,9 @@ runBlocking {
     check(probeSnapshot(probeId).streamNextPolls == 1UL)
 
     collecting.cancelAndJoin()
+    check(probeSnapshot(probeId).streamDrops == 1UL)
+    stream.close()
+    stream.close()
     val cancelled = awaitProbe(probeId) { it.streamDrops == 1UL }
     check(cancelled.streamStarts == 1UL)
     check(cancelled.streamNextPolls == 1UL)
@@ -218,6 +226,8 @@ runBlocking {
     check(failed.streamDrops == 1UL)
     requireStableProbe(probeId, failed)
     requireSingleUseFailure { stream.collect {} }
+    stream.close()
+    stream.close()
     check(probeSnapshot(probeId) == failed)
 }
 
@@ -234,3 +244,58 @@ runBlocking {
     check(cancelled.streamDrops == 1UL)
     requireStableProbe(probeId, cancelled)
 }
+
+runBlocking {
+    val probeId = "kotlin-object-public-interface"
+    resetProbe(probeId)
+    val owner = StreamOwner(probeId)
+    val api: StreamOwnerInterface = owner
+    val stream = api.values(3U)
+    val flow: Flow<UInt> = stream
+    check(probeSnapshot(probeId).streamStarts == 1UL)
+    val values = mutableListOf<UInt>()
+    flow.collect {
+        values.add(it)
+        if (it == 0U) owner.destroy()
+    }
+    check(values == listOf(0U, 1U, 2U))
+    stream.close() // Must compile on the public Interface's inferred return type.
+    stream.close()
+    val done = probeSnapshot(probeId)
+    check(done.objectDrops == 1UL && done.streamDrops == 1UL)
+    check(done.streamNextPolls == 4UL && done.streamTerminalDrops == 1UL)
+    requireStableProbe(probeId, done)
+
+    val pendingId = "kotlin-object-async-interface"
+    resetProbe(pendingId)
+    val pendingOwner = StreamOwner(pendingId)
+    val pendingApi: StreamOwnerInterface = pendingOwner
+    val pending = pendingApi.pending()
+    check(probeSnapshot(pendingId).streamNextPolls == 0UL)
+    val collecting = launch { pending.collect { error("unexpected item") } }
+    awaitProbe(pendingId) { it.streamNextPolls == 1UL }
+    pending.close()
+    pending.close()
+    collecting.join()
+    pendingOwner.destroy()
+    val closed = probeSnapshot(pendingId)
+    check(closed.streamDrops == 1UL && closed.streamCancelledDrops == 1UL)
+    check(closed.objectDrops == 1UL)
+    requireStableProbe(pendingId, closed)
+
+    val idleId = "kotlin-object-idle-close"
+    resetProbe(idleId)
+    val idleOwner = StreamOwner(idleId)
+    val idleApi: StreamOwnerInterface = idleOwner
+    val idle = idleApi.values(1U)
+    idle.close()
+    idle.close()
+    idleOwner.destroy()
+    check(probeSnapshot(idleId).streamStarts == 1UL)
+    check(probeSnapshot(idleId).streamNextPolls == 0UL)
+    check(probeSnapshot(idleId).streamDrops == 1UL)
+    check(probeSnapshot(idleId).streamCancelledDrops == 1UL)
+    check(probeSnapshot(idleId).objectDrops == 1UL)
+}
+
+println("OUTPUT_STREAMS_KOTLIN_OK")

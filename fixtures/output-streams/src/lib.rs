@@ -4,7 +4,8 @@
 
 //! A real Rust cdylib fixture for foreign-language stream lifecycle tests.
 //!
-//! The exported factories increment `stream_starts` when foreign code enters Rust.
+//! `stream_starts` counts entry to the producer factory body. Host wrapper
+//! creation and each item poll are distinct events, checked by each consumer.
 //! Each returned stream records its own polls and classifies its one Drop as either
 //! terminal or cancelled. Input-stream probes provide a gate-controlled
 //! rendezvous/backpressure check, while `pending_operation` covers ordinary async
@@ -33,6 +34,7 @@ pub enum OutputStreamError {
 /// A consistent snapshot of one lifecycle probe's counters.
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct ProbeSnapshot {
+    pub object_drops: u64,
     pub stream_starts: u64,
     pub stream_next_polls: u64,
     pub stream_terminal_drops: u64,
@@ -336,6 +338,80 @@ pub fn pending_stream(probe_id: String) -> uniffi::UniFfiStream<u32, OutputStrea
         probe_id,
         dropped: false,
     })
+}
+
+/// An ordinary Rust object whose streams own their probe id, not the object.
+#[derive(uniffi::Object)]
+pub struct StreamOwner {
+    probe_id: String,
+}
+
+#[uniffi::export]
+impl StreamOwner {
+    #[uniffi::constructor]
+    pub fn new(probe_id: String) -> Self {
+        Self { probe_id }
+    }
+
+    pub fn values(&self, count: u32) -> uniffi::UniFfiStream<u32, OutputStreamError> {
+        counting_stream(self.probe_id.clone(), count)
+    }
+
+    pub async fn pending(&self) -> uniffi::UniFfiStream<u32, OutputStreamError> {
+        pending_stream(self.probe_id.clone())
+    }
+}
+
+impl Drop for StreamOwner {
+    fn drop(&mut self) {
+        with_probe(&self.probe_id, |probe| increment(&mut probe.object_drops));
+    }
+}
+
+// Host implementations return their idiomatic Flow; only ordinary Rust object
+// interfaces promise the generated UniFfiStream handle and its explicit close.
+#[uniffi::export(rust, foreign)]
+pub trait ForeignStreamSource: Send + Sync {
+    fn values(&self) -> uniffi::UniFfiStream<u32, OutputStreamError>;
+}
+
+#[uniffi::export(foreign)]
+pub trait CallbackStreamSource: Send + Sync {
+    fn values(&self) -> uniffi::UniFfiStream<u32, OutputStreamError>;
+}
+
+async fn sum_output(
+    mut stream: uniffi::UniFfiStream<u32, OutputStreamError>,
+) -> Result<u32, OutputStreamError> {
+    let mut sum = 0;
+    while let Some(item) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+        sum += item?;
+    }
+    Ok(sum)
+}
+
+#[uniffi::export(callback(
+    path = "argument[0]",
+    retention = "retained",
+    threading = "may_cross_thread",
+    reentrancy = "allowed"
+))]
+pub async fn sum_foreign_source(
+    source: Arc<dyn ForeignStreamSource>,
+) -> Result<u32, OutputStreamError> {
+    sum_output(source.values()).await
+}
+
+#[uniffi::export(callback(
+    path = "argument[0]",
+    retention = "retained",
+    threading = "may_cross_thread",
+    reentrancy = "allowed"
+))]
+pub async fn sum_callback_source(
+    source: Arc<dyn CallbackStreamSource>,
+) -> Result<u32, OutputStreamError> {
+    sum_output(source.values()).await
 }
 
 async fn next_input_stream_item(

@@ -75,13 +75,29 @@ Rust types while exposing only successful values to the host. An object method
 can move its input producer into a returned stream; that subscription then
 keeps the producer alive until it ends or closes.
 
-Each subscription has one consumer and allows at most one pending `next()`.
+Use one consumption loop per subscription, with at most one pending `next()`.
 There is no prefetch or unbounded bridge queue. Closing requests cancellation
 and waits for stream destruction and registered asynchronous cleanup. An
 interrupted pending pull reports framework cancellation; it is not a business
 error or a normally produced end marker. In JavaScript, await `stream.cancel()`
 to confirm closure, or call `return()` on the iterator obtained from
 `stream[Symbol.asyncIterator]()`. Creating a stream does not start polling it.
+
+The exported call, the host wrapper, the Rust producer body, and each producer
+poll are separate events. In `fixtures/output-streams`, Swift/JNA synchronous
+calls enter the factory immediately (starts=1, polls=0); the JS synchronous
+wrapper defers the call until its first pull (starts=0, polls=0). An awaited
+asynchronous factory can already have run its body without polling any items.
+This does not promise that SDK business objects
+or state are initialized lazily. UniFFI delivers the producer's actual items,
+Done, and Error; it does not insert a Ready event or an initial snapshot.
+
+Releasing an FFI object reference (`destroy` in Kotlin, `dispose` in JS, or ARC
+release in Swift) is distinct from closing a subscription or invoking an SDK's
+business `close` method. Whether a stream retains its originating object depends
+on the Rust implementation. Object release does not imply that all its streams
+close. The output-stream fixture, for example, returns a stream that owns a
+copied probe id and can outlive the object.
 
 ### Local objects
 
@@ -247,6 +263,9 @@ try await values.close()
 Task cancellation reaches Rust. `values.cancel()` only requests cancellation;
 `try await values.close()` waits for the pending pull and producer cleanup.
 Explicitly close on early exit instead of relying on iterator destruction.
+A second iterator is rejected on its first `next()`; iterator copies share one
+subscription and cannot overlap pulls. Destruction requests cancellation but
+cannot synchronously acknowledge cleanup.
 
 ### Kotlin JNA and JNI
 
@@ -271,6 +290,27 @@ JNI declares `Flow<UInt>` and supplies `uniffi.close` for generated Rust flows;
 this extension is not a close operation for arbitrary application flows.
 Cancelling the calling Job requests Rust cancellation, and its join waits for
 registered cleanup. Flow collection also closes on completion or interruption.
+
+For JNA, ordinary Rust object public interfaces also retain `UniFfiStream` for
+both synchronous and suspend stream-returning methods. For example, the
+`fixtures/output-streams` generated API supports this without a cast:
+
+```kotlin
+val api: StreamOwnerInterface = StreamOwner("example")
+val values = api.values(3u)
+try {
+    values.take(1).collect { println(it) }
+} finally {
+    values.close()
+}
+// Release the owned StreamOwner reference separately when it is no longer needed.
+```
+
+Each generated JNA subscription permits one `collect` only, including after a
+terminal error. Its `finally` waits for cleanup in a non-cancellable context;
+`take(1)` therefore returns after native stream release. Host callback interfaces
+and foreign-implementable traits still accept application-produced `Flow` return
+values; they do not require applications to construct a native stream handle.
 
 The JNI cancellation bridge uses `kotlinx.coroutines`' internal cancelling-handler
 API, with the opt-in contained in the generated runtime. It is validated with
@@ -302,6 +342,15 @@ renderer bridge are described in the [JavaScript contract](javascript/contract.m
 `stream.next()`. `for await` early exit calls the iterator's `return()`; explicit
 `cancel()` is also awaitable and idempotent. The stream declaration does not
 expose a direct `return()` or `throw()` method.
+The ECMAScript stream returns itself from `Symbol.asyncIterator`: repeated calls
+share its cursor, and overlapping `next()` calls reject with
+`UniffiStreamConcurrentNext`. It is not a multicast or replayable source. After
+a terminal item error, subsequent pulls are Done without polling Rust again.
+A second traversal after Done or Error is empty and does not restart the
+producer; unlike Swift/Kotlin, JS does not reject merely obtaining the same
+iterator again. Use only one consumption loop for that shared cursor.
+When cancelling a manual pending `next()`, observe its rejection as well as
+awaiting `cancel()`; the interrupted pull reports `UniffiCancelled`.
 
 ### ArkTS / Harmony
 

@@ -116,6 +116,20 @@ tests cannot consume another fixture's output. These directories are caches,
 not prebuilt test inputs; deleting them is optional and is never part of the
 test workflow.
 
+## Output stream lifecycle probe
+
+`cargo test -p uniffi-bindgen-tests-javascript --test output_streams -- --nocapture`
+compiles the same Rust probe source used by `fixtures/output-streams` for a real
+WASM package and checks its public declarations with the required TypeScript
+compiler. It retains the package and logs under `target/u2/output-streams-probe`.
+The consumer covers demand, optional items, terminal typed errors, overlapping
+pulls, cancellation/return, loop break, repeated cleanup, and native drop counts.
+Swift/JNA consumers run with `cargo test -p uniffi-fixture-output-streams`;
+see the [stream contract](../../docs/manual/src/futures.md#streams-and-factories)
+for the differences between factory entry, first poll, and each host's iterator
+and cleanup semantics. These runs are macOS/JVM/Node WASM tests, not mobile
+device or browser UI tests.
+
 ## Opt-in JavaScript Benchmarks
 
 The benchmark harness is intentionally opt-in. It builds a synthetic UniFFI

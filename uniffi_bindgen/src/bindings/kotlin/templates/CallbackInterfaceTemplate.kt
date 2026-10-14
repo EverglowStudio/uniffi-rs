@@ -3,6 +3,7 @@
 {%- let interface_name = cbi|type_name(ci) %}
 {%- let interface_docstring = cbi.docstring() %}
 {%- let methods = cbi.methods() %}
+{%- let is_callback_interface = true %}
 {%- let vtable = cbi.vtable() %}
 {%- let vtable_methods = cbi.vtable_methods() %}
 

@@ -98,6 +98,7 @@
 {%- let interface_name = self::object_interface_name(ci, obj) %}
 {%- let impl_class_name = self::object_impl_name(ci, obj) %}
 {%- let methods = obj.methods() %}
+{%- let is_callback_interface = obj.has_callback_interface() %}
 {%- let uniffi_trait_methods = obj.uniffi_trait_methods() %}
 {%- let interface_docstring = obj.docstring() %}
 {%- let is_error = ci.is_name_used_as_error(name) %}

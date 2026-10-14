@@ -15,6 +15,10 @@ import uniffi.uniffi_output_streams.releaseInputStreamConsumer
 import uniffi.uniffi_output_streams.rendezvousInputStreamSum
 import uniffi.uniffi_output_streams.resetProbe
 import uniffi.uniffi_output_streams.uniffiInputStreamHandleCountUniffiOutputStreams
+import uniffi.uniffi_output_streams.CallbackStreamSource
+import uniffi.uniffi_output_streams.ForeignStreamSource
+import uniffi.uniffi_output_streams.sumCallbackSource
+import uniffi.uniffi_output_streams.sumForeignSource
 
 suspend fun awaitInputProbe(
     probeId: String,
@@ -69,7 +73,6 @@ runBlocking {
     }
 
     releaseFirstItem.complete(Unit)
-    withTimeout(10_000L) { secondEmitEntered.await() }
     val firstItem = awaitInputProbe(probeId) { it.inputStreamItems == 1UL }
     check(firstItem.inputStreamNextRequests == 1UL)
     check(firstItem.inputStreamTerminalCompletions == 0UL)
@@ -82,12 +85,14 @@ runBlocking {
             "Rust prefetched a second input item while its consumer gate was suspended"
         }
         check(blockedConsumer.inputStreamItems == 1UL)
-        check(!secondEmitReturned.isCompleted) {
-            "Kotlin emitted a second item without a matching Rust pull"
+        check(!secondEmitEntered.isCompleted) {
+            "Kotlin advanced past its first emit without another Rust pull"
         }
+        check(!secondEmitReturned.isCompleted)
     }
 
     releaseInputStreamConsumer(probeId)
+    withTimeout(10_000L) { secondEmitEntered.await() }
     withTimeout(10_000L) { secondEmitReturned.await() }
     check(withTimeout(10_000L) { consuming.await() } == 3UL)
 
@@ -98,3 +103,22 @@ runBlocking {
     check(completed.inputStreamTerminalCompletions == 1UL)
     check(uniffiInputStreamHandleCountUniffiOutputStreams() == 0)
 }
+
+runBlocking {
+    var finalizers = 0
+    fun hostValues(): Flow<UInt> = flow {
+        try { emit(2U); emit(3U) } finally { finalizers++ }
+    }
+    val callback = object : CallbackStreamSource {
+        override fun values(): Flow<UInt> = hostValues()
+    }
+    val foreign = object : ForeignStreamSource {
+        override fun values(): Flow<UInt> = hostValues()
+    }
+    check(sumCallbackSource(callback) == 5U)
+    check(sumForeignSource(foreign) == 5U)
+    check(finalizers == 2)
+    check(uniffiInputStreamHandleCountUniffiOutputStreams() == 0)
+}
+
+println("INPUT_STREAMS_KOTLIN_OK")

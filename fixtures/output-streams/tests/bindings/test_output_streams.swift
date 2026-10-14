@@ -14,16 +14,16 @@ private func waitUntil(
     fatalError("timed out waiting for \(description)")
 }
 
-private func testCountingStreamIsLazyAndPullBased() async throws {
-    let probeId = "swift-counting-lazy-pull"
+private func testCountingStreamIsPullBased() async throws {
+    let probeId = "swift-counting-pull"
     resetProbe(probeId: probeId)
 
     let stream: UniFfiStream<UInt32> = countingStream(probeId: probeId, count: 2)
-    assert(probeSnapshot(probeId: probeId).streamStarts == 0)
+    assert(probeSnapshot(probeId: probeId).streamStarts == 1)
     assert(probeSnapshot(probeId: probeId).streamNextPolls == 0)
 
     var iterator = stream.makeAsyncIterator()
-    assert(probeSnapshot(probeId: probeId).streamStarts == 0)
+    assert(probeSnapshot(probeId: probeId).streamStarts == 1)
     await Task.yield()
     assert(probeSnapshot(probeId: probeId).streamNextPolls == 0)
 
@@ -46,6 +46,8 @@ private func testCountingStreamIsLazyAndPullBased() async throws {
 
     let doneAgain = try await iterator.next()
     assert(doneAgain == nil)
+    try await stream.close()
+    try await stream.close()
     assert(probeSnapshot(probeId: probeId).streamNextPolls == 3)
 }
 
@@ -93,6 +95,8 @@ private func testOptionalAndTypedErrorStreamSteps() async throws {
     }
     let errorDone = try await errorIterator.next()
     assert(errorDone == nil)
+    try await errorStream.close()
+    try await errorStream.close()
     let errorTerminal = probeSnapshot(probeId: errorProbeId)
     assert(errorTerminal.streamStarts == 1)
     assert(errorTerminal.streamNextPolls == 2)
@@ -118,17 +122,19 @@ private func testSingleUseAndIdleCleanup() async throws {
             fatalError("unexpected second iterator error: \(error)")
         }
     }
-    assert(probeSnapshot(probeId: probeId).streamStarts == 0)
+    assert(probeSnapshot(probeId: probeId).streamStarts == 1)
     assert(probeSnapshot(probeId: probeId).streamNextPolls == 0)
 
     stream.cancel()
     stream.cancel()
+    try await stream.close()
+    try await stream.close()
     let idleDone = try await accepted.next()
     assert(idleDone == nil)
     let idleCancelled = probeSnapshot(probeId: probeId)
-    assert(idleCancelled.streamStarts == 0)
+    assert(idleCancelled.streamStarts == 1)
     assert(idleCancelled.streamNextPolls == 0)
-    assert(idleCancelled.streamDrops == 0)
+    assert(idleCancelled.streamDrops == 1)
 
     let dropProbeId = "swift-idle-drop"
     resetProbe(probeId: dropProbeId)
@@ -136,11 +142,13 @@ private func testSingleUseAndIdleCleanup() async throws {
         let idle: UniFfiStream<UInt32> = countingStream(probeId: dropProbeId, count: 1)
         withExtendedLifetime(idle) {}
     }
-    await Task.yield()
+    await waitUntil("idle stream drop") {
+        probeSnapshot(probeId: dropProbeId).streamDrops == 1
+    }
     let idleDrop = probeSnapshot(probeId: dropProbeId)
-    assert(idleDrop.streamStarts == 0)
+    assert(idleDrop.streamStarts == 1)
     assert(idleDrop.streamNextPolls == 0)
-    assert(idleDrop.streamDrops == 0)
+    assert(idleDrop.streamDrops == 1)
 }
 
 private func consumeOneThenDrop(probeId: String) async throws {
@@ -198,6 +206,8 @@ private func testActiveCleanupAndPendingCancellation() async throws {
     }
     pending.cancel()
     pending.cancel()
+    try await pending.close()
+    try await pending.close()
     await waitUntil("pending stream cancellation drop") {
         probeSnapshot(probeId: pendingProbeId).streamDrops == 1
     }
@@ -214,9 +224,10 @@ private func testActiveCleanupAndPendingCancellation() async throws {
     let explicitProbeId = "swift-explicit-active-cancel"
     resetProbe(probeId: explicitProbeId)
     let explicit: UniFfiStream<UInt32> = pendingStream(probeId: explicitProbeId)
-    var explicitIterator = explicit.makeAsyncIterator()
+    let explicitIterator = explicit.makeAsyncIterator()
     let explicitNext = Task { () throws -> UInt32? in
-        try await explicitIterator.next()
+        var iterator = explicitIterator
+        return try await iterator.next()
     }
     await waitUntil("explicit stream first poll") {
         let snapshot = probeSnapshot(probeId: explicitProbeId)
@@ -224,11 +235,13 @@ private func testActiveCleanupAndPendingCancellation() async throws {
     }
     explicit.cancel()
     explicit.cancel()
+    try await explicit.close()
+    try await explicit.close()
     do {
-        let explicitResult = try await explicitNext.value
-        assert(explicitResult == nil)
-    } catch {
-        fatalError("unexpected explicitly cancelled stream error: \(error)")
+        _ = try await explicitNext.value
+        fatalError("cancelled in-flight next unexpectedly succeeded")
+    } catch is CancellationError {
+        // Cancellation interrupts an in-flight pull; later pulls are Done.
     }
     await waitUntil("explicit stream cancellation drop") {
         probeSnapshot(probeId: explicitProbeId).streamDrops == 1
@@ -239,9 +252,34 @@ private func testActiveCleanupAndPendingCancellation() async throws {
     assert(explicitlyCancelled.streamDrops == 1)
     assert(explicitlyCancelled.streamTerminalDrops == 0)
     assert(explicitlyCancelled.streamCancelledDrops == 1)
-    let explicitDone = try await explicitIterator.next()
+    var afterCloseIterator = explicitIterator
+    let explicitDone = try await afterCloseIterator.next()
     assert(explicitDone == nil)
     assert(probeSnapshot(probeId: explicitProbeId).streamNextPolls == 1)
+}
+
+private func testLoopBreakAndObjectRelease() async throws {
+    let probeId = "swift-object-loop-break"
+    resetProbe(probeId: probeId)
+    var owner: StreamOwner? = StreamOwner(probeId: probeId)
+    let stream = owner!.values(count: 3)
+    assert(probeSnapshot(probeId: probeId).streamStarts == 1)
+    for try await value in stream {
+        assert(value == 0)
+        owner = nil
+        break
+    }
+    // Iterator destruction only requests cancellation. close is the ack.
+    try await stream.close()
+    try await stream.close()
+    let closed = probeSnapshot(probeId: probeId)
+    assert(closed.streamStarts == 1 && closed.streamNextPolls == 1)
+    assert(closed.streamDrops == 1 && closed.streamCancelledDrops == 1)
+    assert(closed.objectDrops == 1)
+    for _ in 0..<16 {
+        await Task.yield()
+        assert(probeSnapshot(probeId: probeId) == closed)
+    }
 }
 
 private func testOrdinaryFutureCancellation() async throws {
@@ -275,16 +313,19 @@ private func testOrdinaryFutureCancellation() async throws {
 
 let completion = DispatchGroup()
 completion.enter()
-Task {
+// The script blocks its main thread below, so do not inherit MainActor here.
+Task.detached {
     do {
-        try await testCountingStreamIsLazyAndPullBased()
+        try await testCountingStreamIsPullBased()
         try await testOptionalAndTypedErrorStreamSteps()
         try await testSingleUseAndIdleCleanup()
         try await testActiveCleanupAndPendingCancellation()
         try await testOrdinaryFutureCancellation()
+        try await testLoopBreakAndObjectRelease()
+        print("OUTPUT_STREAMS_SWIFT_OK")
         completion.leave()
     } catch {
         fatalError("Swift output-stream lifecycle fixture failed: \(error)")
     }
 }
-completion.wait()
+assert(completion.wait(timeout: .now() + 30) == .success, "stream fixture timed out")

@@ -5,10 +5,9 @@ public interface {{ interface_name }} {
     {% if meth.is_async() -%}suspend {% endif -%}
     fun {{ meth.name()|fn_name }}({% call kt::arg_list(meth, true) %}{% endcall %})
     {%- match meth.return_type() -%}
-    {%- when Some(return_type) %}: {{ return_type|callback_type_name(ci) -}}
+    {%- when Some(return_type) %}: {% if is_callback_interface %}{{ return_type|callback_type_name(ci) }}{% else %}{{ return_type|type_name(ci) }}{% endif -%}
     {%- else -%}
     {%- endmatch %}
     {% endfor %}
     companion object
 }
-
