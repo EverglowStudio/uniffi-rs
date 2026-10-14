@@ -1933,11 +1933,58 @@ fn render_type_declaration(
             }
             out.push_str("};\n");
         }
-        AstTypeKind::Error { .. } => {
+        AstTypeKind::Error { variants } => {
+            // A class with union-valued properties loses the relationship between
+            // variant and data. Keep the real JS constructor in the value namespace,
+            // and use a discriminated union for its instances (including instanceof).
             out.push_str(&format!(
-                "export declare class {} extends UniffiError {{\n  constructor(message?: string, variant?: string | null, data?: unknown);\n  readonly errorName: \"{}\";\n  readonly variant: string | null;\n  readonly data: unknown;\n}}\n",
+                "export type {} = UniffiError & {{ readonly errorName: \"{}\" }} & (\n",
                 ty.name, ty.name
             ));
+            let payloads: Vec<_> = variants
+                .iter()
+                .map(|variant| {
+                    if variant.fields.is_empty() {
+                        format!("\"{}\"", variant.name)
+                    } else {
+                        let fields = variant
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                format!(
+                                    "readonly {}: {}",
+                                    field.name,
+                                    render_public_type(ast, &field.ty)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        // Rust-lifted payloads include tag; manually constructed
+                        // errors only need the variant argument and declared fields.
+                        format!("{{ readonly tag?: \"{}\"; {} }}", variant.name, fields)
+                    }
+                })
+                .collect();
+            for (index, (variant, payload)) in variants.iter().zip(&payloads).enumerate() {
+                out.push_str(&format!(
+                    "  {}{{ readonly variant: \"{}\"; readonly data: {} }}\n",
+                    if index == 0 { "" } else { "| " },
+                    variant.name,
+                    payload
+                ));
+            }
+            out.push_str(");\n");
+            out.push_str(&format!(
+                "export declare const {}: {{\n  readonly prototype: {};\n",
+                ty.name, ty.name
+            ));
+            for (variant, payload) in variants.iter().zip(&payloads) {
+                out.push_str(&format!(
+                    "  new(message: string | undefined, variant: \"{}\", data: {}): {} & {{ readonly variant: \"{}\" }};\n",
+                    variant.name, payload, ty.name, variant.name
+                ));
+            }
+            out.push_str("};\n");
         }
         AstTypeKind::Custom { builtin, config } => {
             let public_type = if custom_type_uses_import_alias(ty, config) {
@@ -5126,7 +5173,7 @@ const watchdog = setTimeout(() => { throw Error("ArkTS protocol test did not com
         });
         let component = &ast.components[0];
         let declaration = render_component_declaration(&ast, component).unwrap();
-        assert!(declaration.contains("export declare class UnitFailure extends UniffiError"));
+        assert!(declaration.contains("export type UnitFailure = UniffiError &"));
         assert!(declaration.contains("error: UnitFailure | null"));
         assert!(declaration.contains("detail: Failure"));
         assert!(declaration.contains("echoErrorState(value: ErrorState): ErrorState"));

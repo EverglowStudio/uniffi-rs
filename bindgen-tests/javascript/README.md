@@ -24,6 +24,7 @@ UNIFFI_TEST_TYPESCRIPT_COMPILER=/path/to/tsc \
   cargo test -p uniffi-bindgen-tests-javascript --test contracts
 cargo test -p uniffi-bindgen-tests-javascript --test wasm_e2e -- --nocapture --test-threads=1
 cargo test -p uniffi-bindgen-tests-javascript --test napi_e2e -- --nocapture --test-threads=1
+cargo test -p uniffi-bindgen-tests-javascript --test errors_defaults -- --nocapture
 cargo test -p uniffi-bindgen-tests-javascript --test host_crates -- --nocapture --test-threads=1
 cargo test -p uniffi-bindgen-tests-javascript --test cli_build -- --nocapture --test-threads=1
 cargo test -p uniffi-bindgen-tests-javascript --test cli_build_napi -- --nocapture --test-threads=1
@@ -50,6 +51,30 @@ Recommended layers are:
 The Wasm E2E tests use the pinned in-process wasm-bindgen library. A globally
 installed `wasm-bindgen` executable is not a test prerequisite and is neither
 looked up nor invoked.
+
+## Typed errors and defaults across languages
+
+`errors_defaults` uses one real Rust proc-macro fixture to generate and execute
+WASM and N-API bindings. It requires TypeScript 5.9.3 (the same compiler override
+as `contracts`) and a Rust toolchain with `wasm32-unknown-unknown` installed.
+Its strict consumers cover `instanceof` plus variant narrowing, rejected field
+misuse, constructor payloads, errors in records, and Rust roundtrips. Nonempty
+optional defaults distinguish omission from explicit null for both record fields
+and function arguments. These defaults use existing UniFFI annotations.
+
+The test retains its generated package, Swift/Kotlin bindings, native library and
+logs in `target/u1/errors-defaults`. On macOS, consume those untouched native
+bindings with:
+
+```sh
+# Set JAVA_HOME to an installed JDK, JNA_JAR and COROUTINES_JAR to existing JARs.
+# Requires Swift 6 and kotlinc on PATH (or set KOTLINC).
+python3 bindgen-tests/javascript/tests/support/errors_defaults/verify_native.py
+```
+
+The native runner compiles with warnings as errors, runs both consumers, checks
+that required fields/parameters cannot be omitted, and records hashes and commands
+under the same target directory. This covers macOS and JVM, not mobile devices.
 
 ## Consumer-owned JavaScript support sources
 

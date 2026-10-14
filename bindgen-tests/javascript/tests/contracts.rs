@@ -109,14 +109,20 @@ fn napi_accepts_async_callback_return_callbacks() {
     std::fs::create_dir_all(&src_dir).unwrap();
     std::fs::write(
         crate_dir.join("Cargo.toml"),
-        r#"[package]
+        format!(
+            r#"[package]
 name = "async-callback-return"
 version = "0.0.0"
 edition = "2021"
 
 [lib]
 crate-type = ["lib", "cdylib"]
+[dependencies]
+uniffi = {{ path = {:?}, default-features = false }}
+[workspace]
 "#,
+            workspace_root().join("uniffi").as_str()
+        ),
     )
     .unwrap();
     std::fs::write(src_dir.join("lib.rs"), "// placeholder\n").unwrap();
@@ -228,14 +234,19 @@ namespace blockers {
     .unwrap();
     std::fs::write(
         biz.join("Cargo.toml"),
-        r#"[package]
+        format!(
+            r#"[package]
 name = "blockers"
 version = "0.0.0"
 edition = "2021"
 [lib]
 crate-type = ["lib", "cdylib"]
 [dependencies]
+uniffi = {{ path = {:?}, default-features = false }}
+[workspace]
 "#,
+            workspace_root().join("uniffi").as_str()
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -921,7 +932,10 @@ const operation = (error) => ({
   streamResources: [{ path: "argument[0]", direction: "Input", item: { kind: "scalar", name: "U32" }, error, slots: { InputStreamPull: 1, InputStreamCancel: 2 } }],
 });
 
-const session = new BackendSession({});
+// This test exercises local stream lowering; no backend operations are invoked.
+const session = new BackendSession({}, undefined, {
+  callControl: { create: 0, cancel: 1, release: 2, operations: [] },
+});
 async function pull(source, descriptor, op) {
   const handle = lowerValue(source, descriptor, context, session, op, "argument[0]");
   return session.host.pullInputStream(handle);

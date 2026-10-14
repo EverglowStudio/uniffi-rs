@@ -94,7 +94,7 @@ const session = createBackendSession(() => ({
   },
   async invokeAsync() { throw new Error("unexpected async operation"); },
   close() {},
-}));
+}), undefined, { callControl: { create: 4, cancel: 5, release: 6, operations: [] } });
 
 const api = createNamespace(session);
 if (api.add(2n, 3n) !== 5n) throw new Error("add failed");

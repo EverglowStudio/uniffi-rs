@@ -1951,6 +1951,8 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 uniffi = {{ path = {:?}, default-features = false }}
+
+[workspace]
 "#,
             uniffi_path.as_str()
         ),
