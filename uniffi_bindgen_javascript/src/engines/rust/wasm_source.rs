@@ -2077,14 +2077,12 @@ fn lift_expr(binding: &RustValueBinding, expression: TokenStream) -> Result<Toke
             let nested = nested_binding(binding, inner, RustType::Unit);
             let inner_expr = lift_js_expr(&nested, quote!(inner_value))?;
             quote! {
-                {
-                    match #expression {
-                        Some(inner_value) => {
-                            let value = (#inner_expr)?;
-                            Ok(value)
-                        }
-                        None => Ok::<JsValue, JsValue>(JsValue::NULL),
+                match #expression {
+                    Some(inner_value) => {
+                        let value = (#inner_expr)?;
+                        Ok(value)
                     }
+                    None => Ok::<JsValue, JsValue>(JsValue::NULL),
                 }
             }
         }
