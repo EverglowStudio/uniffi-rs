@@ -8031,6 +8031,7 @@ namespace resource_paths {
         tail.split_once("fn ").map_or(tail, |(body, _)| body)
     }
 
+    #[cfg(feature = "ohos")]
     #[test]
     fn ohos_cross_thread_fallible_void_callback_preserves_declared_error() {
         let ci = ComponentInterface::from_webidl(
