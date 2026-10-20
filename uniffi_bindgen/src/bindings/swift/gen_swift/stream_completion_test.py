@@ -34,9 +34,23 @@ f = a.output / 'gate.swift'; f.write_text(source)
 commands = [['swiftc','-swift-version','6','-strict-concurrency=complete','-warnings-as-errors','-parse-as-library',str(f),'-o',str(a.output/'gate')],[str(a.output/'gate')]]
 records = []
 for i, command in enumerate(commands):
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-    (a.output/f'raw-{i}.log').write_text(result.stdout)
-    records.append({'command':command,'exit':result.returncode})
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+    except subprocess.TimeoutExpired as error:
+        stdout, stderr = (
+            stream.decode('utf-8', errors='replace') if isinstance(stream, bytes) else stream or ''
+            for stream in (error.stdout, error.stderr)
+        )
+        output = stdout + stderr + f'\nCommand timed out after {error.timeout} seconds: {command!r}\n'
+        exit_code = 124
+        record = {'command':command, 'exit':exit_code, 'timeout':error.timeout,
+                  'returncode':None, 'stdout':stdout, 'stderr':stderr}
+    else:
+        output = result.stdout
+        exit_code = result.returncode
+        record = {'command':command,'exit':exit_code}
+    (a.output/f'raw-{i}.log').write_text(output)
+    records.append(record)
     (a.output/'result.json').write_text(json.dumps({'sha256':hashlib.sha256(source.encode()).hexdigest(),'commands':records},indent=2)+'\n')
-    print(result.stdout, end='', flush=True)
-    if result.returncode: raise SystemExit(result.returncode)
+    print(output, end='', flush=True)
+    if exit_code: raise SystemExit(exit_code)

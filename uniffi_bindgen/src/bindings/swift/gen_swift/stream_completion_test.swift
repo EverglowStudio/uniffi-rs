@@ -260,7 +260,7 @@ fileprivate func mergedItemCases() async throws {
         print("PASS opt7 Task cancelled before item decision disposes before close")
     }
     do {
-        let entered = Signal(), handlerEntered = Signal(), closed = Signal()
+        let entered = Signal(), handlerEntered = Signal(), cancellerReturned = Signal(), closed = Signal()
         let release = DispatchSemaphore(value: 0)
         let stream = UniFfiStream<Int>(rustSubscriptionHandle: 54,
             next: { _ in .done }, cancel: { _ in }, close: { _ in closed.fire() })
@@ -278,12 +278,14 @@ fileprivate func mergedItemCases() async throws {
             } onCancel: { handlerEntered.fire(); stream.cancel() }
         }
         await entered.wait()
-        let canceller = Task.detached { worker.cancel() }
+        // Cancellation deliberately blocks on stateLock. Use an OS thread so
+        // a two-core cooperative pool can still run this test's release signal.
+        Thread.detachNewThread { worker.cancel(); cancellerReturned.fire() }
         await handlerEntered.wait()
         precondition(worker.isCancelled)
         release.signal()
         let observed = await worker.value
-        await canceller.value
+        await cancellerReturned.wait()
         try await stream.close()
         precondition(observed && closed.isSet)
         print("PASS opt7 Swift getter reads cancellation under state lock while handler waits")
