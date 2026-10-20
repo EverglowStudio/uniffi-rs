@@ -2940,6 +2940,7 @@ dependencies = [
  "cargo_metadata 0.23.1",
  "fs-err",
  "heck",
+ "napi-ohos",
  "napi-ohos-uniffi-engine",
  "napi-uniffi-engine",
  "prettyplease",
