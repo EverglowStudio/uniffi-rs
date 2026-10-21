@@ -1055,6 +1055,33 @@ fn safe_join(root: &Utf8Path, relative: &str) -> Result<Utf8PathBuf> {
 mod tests {
     use super::*;
 
+    fn run_node_script(script: &str) -> std::process::Output {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("node")
+            .args(["--input-type=commonjs", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn Node for test script");
+        // Drop stdin after writing so Node receives EOF before we wait.
+        let input_result = child.stdin.take().unwrap().write_all(script.as_bytes());
+        let output = child
+            .wait_with_output()
+            .expect("failed to collect Node test output");
+        if let Err(error) = input_result {
+            panic!(
+                "failed to write Node test script: {error}\nstatus: {}\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        output
+    }
+
     #[test]
     fn browser_business_entry_initializes_lazily_and_keeps_platform_private() {
         use crate::frontend::{normalize, BindingInput};
@@ -1562,10 +1589,7 @@ assert.equal(owned.value.value[0], 3);
 assert.equal(owned.items[0][0], 3);
 "#,
         );
-        let output = std::process::Command::new("node")
-            .args(["-e", &script])
-            .output()
-            .unwrap();
+        let output = run_node_script(&script);
         assert!(
             output.status.success(),
             "{}",
@@ -1642,10 +1666,7 @@ assert.equal(direct.invokeAsync, direct.invokeAsync, 'operation wrappers are sta
   assert.deepEqual(maps.map(map => map.size), [0,0]);
 })().catch(error=>{console.error(error);process.exitCode=1;});
 "#);
-        let output = std::process::Command::new("node")
-            .args(["-e", &script])
-            .output()
-            .unwrap();
+        let output = run_node_script(&script);
         assert!(
             output.status.success(),
             "{}",
@@ -1751,10 +1772,7 @@ const tick = () => new Promise(resolve=>setImmediate(resolve));
   }
 })().catch(error=>{console.error(error);process.exitCode=1;});
 "#);
-        let output = std::process::Command::new("node")
-            .args(["-e", &script])
-            .output()
-            .unwrap();
+        let output = run_node_script(&script);
         assert!(
             output.status.success(),
             "{}",
@@ -1864,10 +1882,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
   await checkOwnedStreamClose();
 })().catch(error=>{console.error(error);process.exitCode=1;});
 "#);
-        let output = std::process::Command::new("node")
-            .args(["-e", &script])
-            .output()
-            .unwrap();
+        let output = run_node_script(&script);
         assert!(
             output.status.success(),
             "{}",
