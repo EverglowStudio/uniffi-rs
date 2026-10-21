@@ -25,7 +25,92 @@ suspend fun nativeCase(name: String, body: suspend CoroutineScope.() -> Unit) {
     println("PASS JNA $name")
 }
 
+suspend fun lifecycleContract() = withTimeout(15_000) {
+    val tracker = UnifiedTracker()
+    val cleanup = UnifiedGate()
+    val resource = UnifiedLifecycle(tracker, cleanup, false)
+    assertEquals(5u, resource.syncPing())
+    assertEquals(3u, resource.plainPing())
+    val otherTracker = UnifiedTracker()
+    val otherCleanup = UnifiedGate().also { it.open() }
+    val other = UnifiedLifecycle(otherTracker, otherCleanup, false)
+    try {
+        val first = launch { resource.close() }
+        eventually { tracker.counts().started == 1u }
+        val second = launch(start = CoroutineStart.UNDISPATCHED) { resource.close() }
+        first.cancel()
+        assertFalse(first.isCompleted)
+        assertFalse(second.isCompleted)
+        assertFailsWith<IllegalStateException> { resource.ping() }
+        assertFailsWith<IllegalStateException> { resource.syncPing() }
+        assertEquals(7u, other.ping())
+        cleanup.open()
+        joinAll(first, second)
+        resource.close()
+        assertEquals(1u, tracker.counts().started)
+        assertEquals(1u, tracker.counts().cleaned)
+        assertEquals(1u, tracker.counts().dropped) // wrapper is still strongly held
+        assertTrue(resource.uniffiIsDestroyed)
+        assertEquals(0u, otherTracker.counts().dropped)
+        other.close()
+        assertEquals(1u, otherTracker.counts().dropped)
+    } finally { cleanup.open(); resource.close(); other.close() }
+
+    val liveTracker = UnifiedTracker()
+    val openGate = UnifiedGate().also { it.open() }
+    val live = UnifiedLifecycle(liveTracker, openGate, false)
+    val body = UnifiedGate()
+    try {
+        val pending = async { live.pending(body) }
+        eventually { liveTracker.counts().polls == 1u }
+        live.close()
+        assertEquals(0u, liveTracker.counts().dropped) // in-flight FFI clone remains valid
+        body.open()
+        assertEquals(9u, pending.await())
+        assertEquals(1u, liveTracker.counts().dropped)
+    } finally { body.open(); live.close() }
+
+    val failedTracker = UnifiedTracker()
+    val failed = UnifiedLifecycle(failedTracker, openGate, true)
+    val one = async { runCatching { failed.close() }.exceptionOrNull() }
+    val two = async { runCatching { failed.close() }.exceptionOrNull() }
+    val firstError = assertIs<UnifiedException.Closed>(one.await())
+    assertEquals(firstError.message, assertIs<UnifiedException.Closed>(two.await()).message)
+    assertEquals(firstError.message, assertIs<UnifiedException.Closed>(runCatching { failed.close() }.exceptionOrNull()).message)
+    assertEquals(1u, failedTracker.counts().started)
+    assertEquals(1u, failedTracker.counts().dropped)
+
+    val scopeTracker = UnifiedTracker()
+    val scoped = UnifiedLifecycle(scopeTracker, openGate, true)
+    val bodyError = IllegalArgumentException("scope body failed")
+    val observed = runCatching { scoped.use<Unit> { throw bodyError } }.exceptionOrNull()
+    assertSame(bodyError, observed)
+    assertIs<UnifiedException.Closed>(bodyError.suppressedExceptions.single())
+    assertEquals(1u, scopeTracker.counts().dropped)
+    val firstTracker = UnifiedTracker()
+    val firstCleanup = UnifiedGate()
+    val secondTracker = UnifiedTracker()
+    val secondCleanup = UnifiedGate().also { it.open() }
+    val firstStream = unifiedValues(3u, false, firstTracker, firstCleanup)
+    val secondStream = unifiedValues(2u, false, secondTracker, secondCleanup)
+    val collecting = launch { firstStream.take(1).collect() }
+    try {
+        eventually { firstTracker.counts().dropped == 1u }
+        collecting.cancel()
+        assertFalse(collecting.isCompleted)
+        assertEquals(listOf(null, 1u), secondStream.toList())
+        assertEquals(1u, secondTracker.counts().cleaned)
+        assertEquals(0u, firstTracker.counts().cleaned)
+        firstCleanup.open()
+        collecting.join()
+        assertEquals(1u, firstTracker.counts().cleaned)
+    } finally { firstCleanup.open() }
+    println("PASS two subscriptions clean up independently")
+    println("PASS native resource close: release, concurrent/cancelled waiters, isolation, in-flight calls, failure, use")
+}
+
 runBlocking {
+    lifecycleContract()
     nativeCase("default runtime success waits cleanup gate and Tokio cleanup timer") {
         val tracker = UnifiedTracker()
         val cleanup = UnifiedGate()

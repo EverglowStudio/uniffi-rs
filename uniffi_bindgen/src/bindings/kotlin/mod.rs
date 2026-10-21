@@ -91,6 +91,8 @@ fn parse_config(
         Some(v) => v.clone().try_into()?,
         None => Default::default(),
     };
+    config.lifecycle_closes =
+        crate::LifecycleConfig::from_root_toml(&root_toml)?.close_ffi_functions(ci)?;
     config
         .package_name
         .get_or_insert_with(|| format!("uniffi.{}", ci.namespace()));

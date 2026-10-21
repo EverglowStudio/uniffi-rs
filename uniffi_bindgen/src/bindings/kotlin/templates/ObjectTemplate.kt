@@ -103,14 +103,15 @@
 {%- let interface_docstring = obj.docstring() %}
 {%- let is_error = ci.is_name_used_as_error(name) %}
 {%- let ffi_converter_name = obj|ffi_converter_name %}
+{%- let has_lifecycle = config.has_lifecycle(obj) %}
 
 {%- include "Interface.kt" %}
 
 {%- call kt::docstring(obj, 0) %}{% endcall %}
 {% if (is_error) %}
-open class {{ impl_class_name }} : kotlin.Exception, Disposable, {% if !(obj|has_close_method) %}AutoCloseable, {% endif %}{{ interface_name }} {
+open class {{ impl_class_name }} : kotlin.Exception, Disposable, {% if !has_lifecycle && !(obj|has_close_method) %}AutoCloseable, {% endif %}{{ interface_name }} {
 {% else -%}
-open class {{ impl_class_name }}: Disposable, {% if !(obj|has_close_method) %}AutoCloseable, {% endif %}{{ interface_name }}
+open class {{ impl_class_name }}: Disposable, {% if !has_lifecycle && !(obj|has_close_method) %}AutoCloseable, {% endif %}{{ interface_name }}
 {%- for t in obj.trait_impls() %}
 , {{ self::trait_interface_name(ci, t.trait_ty)? }}
 {% endfor %}
@@ -153,6 +154,10 @@ open class {{ impl_class_name }}: Disposable, {% if !(obj|has_close_method) %}Au
 
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
+    {%- if has_lifecycle %}
+    private val uniffiCloseLock = Any()
+    private var uniffiCloseResult: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+    {%- endif %}
 
     /**
      * Whether the current object has been destroyed and its reference is gone in the Rust side.
@@ -160,6 +165,13 @@ open class {{ impl_class_name }}: Disposable, {% if !(obj|has_close_method) %}Au
     val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
 
     override fun destroy() {
+        {%- if has_lifecycle %}
+        val cleanNow = synchronized(uniffiCloseLock) {
+            wasDestroyed.compareAndSet(false, true) && callCounter.decrementAndGet() == 0L
+        }
+        // Drop can invoke user code, so release outside the admission lock.
+        if (cleanNow) cleanable?.clean()
+        {%- else %}
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
         if (this.wasDestroyed.compareAndSet(false, true)) {
@@ -168,9 +180,10 @@ open class {{ impl_class_name }}: Disposable, {% if !(obj|has_close_method) %}Au
                 cleanable?.clean()
             }
         }
+        {%- endif %}
     }
 
-    {%- if !(obj|has_close_method) %}
+    {%- if !has_lifecycle && !(obj|has_close_method) %}
     @Synchronized
     override fun close() {
         this.destroy()
@@ -218,6 +231,15 @@ open class {{ impl_class_name }}: Disposable, {% if !(obj|has_close_method) %}Au
      * @suppress
      */
     fun uniffiCloneHandle(): Long {
+        {%- if has_lifecycle %}
+        return synchronized(uniffiCloseLock) {
+            check(uniffiCloseResult == null && !wasDestroyed.get()) { "{{ impl_class_name }} is closing or closed" }
+            uniffiCloneHandleUnchecked()
+        }
+    }
+
+    private fun uniffiCloneHandleUnchecked(): Long {
+        {%- endif %}
         if (handle == 0.toLong()) {
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
@@ -227,7 +249,11 @@ open class {{ impl_class_name }}: Disposable, {% if !(obj|has_close_method) %}Au
     }
 
     {% for meth in methods -%}
+    {%- if config.is_lifecycle_close(meth.ffi_func().name()) %}
+    {%- include "LifecycleClose.kt" %}
+    {%- else %}
     {%- call kt::func_decl("override", meth, 4) %}{% endcall %}
+    {%- endif %}
     {% endfor %}
 
     {% call kt::uniffi_trait_impls(uniffi_trait_methods) %}{% endcall %}

@@ -125,7 +125,7 @@
     )
 {%- endmacro %}
 
-{%- macro call_async(callable) -%}
+{%- macro call_async(callable, close_handle=false) -%}
     uniffiRustCallAsync(
 
         {%- if !callable.input_stream_arguments().is_empty() %}
@@ -134,6 +134,9 @@
         {%- endif %}
         {%- match callable.self_type() %}
         {%- when Some(Type::Object { .. }) %}
+        {%- if close_handle %}
+        UniffiLib.{{ callable.ffi_func().name() }}(uniffiCloseHandle)
+        {%- else %}
         callWithHandle { uniffiHandle ->
             {% call transfer_input_arguments(callable) %}{% endcall %}
             UniffiLib.{{ callable.ffi_func().name() }}(
@@ -141,6 +144,7 @@
                 {% call prepared_arg_list(callable) %}{% endcall %}
             )
         }
+        {%- endif %}
         {%- when Some(t) %}
         {% call transfer_input_arguments(callable) %}{% endcall %}
         UniffiLib.{{ callable.ffi_func().name() }}(

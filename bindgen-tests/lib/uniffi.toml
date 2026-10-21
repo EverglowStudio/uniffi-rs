@@ -2,6 +2,10 @@
 # disable_java_cleaner = true
 # android_cleaner = true
 
+# The native test crates enable unified-async and consume this shared contract.
+[bindings.lifecycle]
+close_methods = { UnifiedLifecycle = "close", UnifiedOwner = "close" }
+
 #
 # Custom type configuration
 #

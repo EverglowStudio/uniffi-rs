@@ -266,6 +266,19 @@ fn parse_config(ci: &ComponentInterface, root_toml: toml::Value) -> Result<Confi
         Some(v) => v.clone().try_into()?,
         None => Default::default(),
     };
+    let lifecycle = crate::LifecycleConfig::from_root_toml(&root_toml)?;
+    config.lifecycle_closes = lifecycle.close_ffi_functions(ci)?;
+    config.lifecycle_methods = ci
+        .object_definitions()
+        .iter()
+        .filter(|object| lifecycle.close_method(object.name()).is_some())
+        .flat_map(|object| {
+            object
+                .methods()
+                .into_iter()
+                .map(|method| method.ffi_func().name().to_owned())
+        })
+        .collect();
     config
         .module_name
         .get_or_insert_with(|| ci.namespace().into());
@@ -313,6 +326,35 @@ fn apply_renames(components: &mut Vec<Component<Config>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lifecycle_close_survives_language_renames() {
+        let ci = ComponentInterface::from_webidl(
+            "namespace lifecycle_rename {}; interface Client { [Async] void close(); };",
+            "lifecycle_rename",
+        )
+        .unwrap();
+        let root = toml::from_str(
+            r#"
+            [bindings.lifecycle]
+            close_methods = { Client = "close" }
+            [bindings.swift.rename]
+            Client = "RenamedClient"
+            "Client.close" = "finish"
+        "#,
+        )
+        .unwrap();
+        let config = parse_config(&ci, root).unwrap();
+        let mut components = vec![Component { ci, config }];
+        apply_renames(&mut components);
+        let component = &mut components[0];
+        component.ci.derive_ffi_funcs().unwrap();
+        let source = gen_swift::generate_bindings(&component.config, &component.ci)
+            .unwrap()
+            .library;
+        assert!(source.contains("open func finish() async throws"));
+        assert!(source.contains("uniffiCloseTask = task"));
+    }
+
     use super::*;
     use camino::Utf8PathBuf;
     use std::{collections::BTreeSet, process::Command};

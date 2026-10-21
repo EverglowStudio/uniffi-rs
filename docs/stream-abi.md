@@ -109,16 +109,21 @@ only source of the iterator's `nil` EOF.
 Cancelling a pending stream `next()` cancels both the Rust future and stream
 handle through the Rust cancellation path. Ordinary generated async calls use
 the same task-cancellation integration and surface Rust cancellation as
-`CancellationError`. The generated stream has no public `Sendable`
-conformance.
+`CancellationError` only after cleanup acknowledgement. The generated stream is
+`Sendable` when its element is `Sendable`. A bare loop `break` releases its iterator
+and requests cancellation, but cannot await it. Await `stream.close()` to confirm
+cleanup before proceeding; repeated and concurrent closes join the same result,
+independently of the cancellation state of an individual waiter.
 
 ### Kotlin
 
 Output functions return `UniFfiStream<T> : Flow<T>`, not a bare `Flow<T>`.
 The first `collect` starts the native stream; an `AtomicBoolean` claim makes a
 sequential or concurrent second collection fail before another start. The
-collector's `finally` performs the once-only native cancellation path for
-completion, failure, and coroutine cancellation.
+collector's `finally` awaits the once-only native close in `NonCancellable` for
+completion, failure, early `take`, and coroutine cancellation. An explicit
+`stream.close()` also waits for cleanup. Closing one subscription does not affect
+another subscription or its owning client.
 
 This does not change the foreign input-stream API: an input stream argument is
 still a producer `Flow<T>` lowered into Rust, not an output `UniFfiStream<T>`.

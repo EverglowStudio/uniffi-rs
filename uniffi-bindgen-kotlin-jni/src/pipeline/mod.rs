@@ -36,7 +36,7 @@ pub use initial::Root as InitialRoot;
 pub use nodes::*;
 
 pub fn pipeline() -> Pipeline<initial::Root, Root> {
-    general::pipeline("kotlin").pass::<Root, Context>(Context::default())
+    lifecycle_pipeline().pass::<Root, Context>(Context::default())
 }
 
 pub fn pipeline_for_scaffolding(crate_name: String) -> Pipeline<initial::Root, Root> {
@@ -45,5 +45,25 @@ pub fn pipeline_for_scaffolding(crate_name: String) -> Pipeline<initial::Root, R
         ..Context::default()
     };
 
-    general::pipeline("kotlin").pass::<Root, Context>(context)
+    lifecycle_pipeline().pass::<Root, Context>(context)
+}
+
+struct ValidateLifecycle;
+
+impl MapNode<initial::Root, ValidateLifecycle> for initial::Root {
+    fn map_node(self, _: &ValidateLifecycle) -> Result<Self> {
+        for namespace in self.namespaces.values() {
+            if let Some(config) = &namespace.config_toml {
+                uniffi_bindgen::LifecycleConfig::from_root_toml(&toml::from_str(config)?)?
+                    .validate_initial(namespace)?;
+            }
+        }
+        Ok(self)
+    }
+}
+
+fn lifecycle_pipeline() -> Pipeline<initial::Root, general::Root> {
+    uniffi_pipeline::new_pipeline()
+        .pass::<initial::Root, _>(ValidateLifecycle)
+        .pass::<general::Root, _>(general::Context::new("kotlin"))
 }

@@ -24,6 +24,8 @@ use uniffi::{
     UniFfiInputStream, UniFfiStream,
 };
 
+pub mod lifecycle;
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum UnifiedError {
     #[error("factory failed")]

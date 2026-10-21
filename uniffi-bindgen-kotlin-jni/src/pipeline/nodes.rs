@@ -95,6 +95,7 @@ pub struct Enum {
 #[map_node(from(general::Interface))]
 #[map_node(interfaces::map_class)]
 pub struct Class {
+    pub lifecycle_close: Option<String>,
     pub name: String,
     pub orig_name: String,
     pub uniffi_trait_methods: UniffiTraitMethods,

@@ -10,6 +10,34 @@ use uniffi_meta::{
 
 const MODULE: &str = "kotlin_async_contract";
 
+#[test]
+fn lifecycle_close_survives_language_renames() {
+    let ci = ComponentInterface::from_webidl(
+        "namespace lifecycle_rename {}; interface Client { [Async] void close(); };",
+        "lifecycle_rename",
+    )
+    .unwrap();
+    let root = toml::from_str(
+        r#"
+        [bindings.lifecycle]
+        close_methods = { Client = "close" }
+        [bindings.kotlin.rename]
+        Client = "RenamedClient"
+        "Client.close" = "finish"
+    "#,
+    )
+    .unwrap();
+    let config = super::super::parse_config(&ci, root, None).unwrap();
+    let mut components = vec![crate::Component { ci, config }];
+    super::super::apply_renames(&mut components);
+    let component = &mut components[0];
+    component.ci.derive_ffi_funcs().unwrap();
+    let source = generate_bindings(&component.config, &component.ci).unwrap();
+    assert!(source.contains("override suspend fun `finish`()"));
+    assert!(source.contains("uniffiCloseResult"));
+    assert!(!source.contains("AutoCloseable"));
+}
+
 fn stream(is_send: bool) -> Type {
     Type::Stream {
         item_type: Box::new(Type::Optional {

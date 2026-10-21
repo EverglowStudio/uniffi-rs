@@ -110,7 +110,7 @@ fileprivate final class UniffiRustFutureHandle: @unchecked Sendable {
 }
 
 fileprivate func uniffiRustCallAsync<F, T: Sendable>(
-    rustFutureFunc: @Sendable () -> UInt64,
+    rustFutureFunc: @Sendable () throws -> UInt64,
     pollFunc: @Sendable (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
     cancelFunc: @escaping @Sendable (UInt64) -> (),
     completeAndFreeFunc: @Sendable (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
@@ -121,7 +121,7 @@ fileprivate func uniffiRustCallAsync<F, T: Sendable>(
     // Make sure to call the ensure init function since future creation doesn't have a
     // RustCallStatus param, so doesn't use makeRustCall()
     {{ ensure_init_fn_name }}()
-    let rustFuture = rustFutureFunc()
+    let rustFuture = try rustFutureFunc()
     let rustFutureHandle = UniffiRustFutureHandle(
         handle: rustFuture,
         cancelFunc: cancelFunc,

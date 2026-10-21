@@ -105,6 +105,7 @@ mod bindgen_paths;
 pub mod bindings;
 mod global_config;
 pub mod interface;
+pub mod lifecycle;
 mod loader;
 pub mod macro_metadata;
 pub mod pipeline;
@@ -125,6 +126,7 @@ pub use bindgen_paths::CargoMetadataOptions;
 pub use bindgen_paths::{BindgenPaths, BindgenPathsLayer};
 pub use global_config::{CrateRootsLayer, GlobalConfig};
 pub use interface::ComponentInterface;
+pub use lifecycle::LifecycleConfig;
 use scaffolding::RustScaffolding;
 use uniffi_meta::Type;
 

@@ -4,12 +4,21 @@
 {%- let protocol_docstring = obj.docstring() %}
 
 {%- let is_error = ci.is_name_used_as_error(name) %}
+{%- let has_lifecycle = config.has_lifecycle(obj) %}
 
 {% include "Protocol.swift" %}
 
 {%- call swift::docstring(obj, 0) %}{% endcall %}
 open class {{ impl_class_name }}: {{ protocol_name }}, {{ config.conformance_list_for_object(obj, is_error) }} {
+    {%- if has_lifecycle %}
+    // Cloning and releasing the owner's handle share a lock. Each admitted FFI
+    // call owns its clone, so close never invalidates an in-flight call.
+    private let uniffiLifecycleLock = NSLock()
+    private var uniffiCloseTask: Task<Void, Swift.Error>?
+    fileprivate var handle: UInt64
+    {%- else %}
     fileprivate let handle: UInt64
+    {%- endif %}
 
     /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
 #if swift(>=5.8)
@@ -45,7 +54,37 @@ open class {{ impl_class_name }}: {{ protocol_name }}, {{ config.conformance_lis
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
+        {%- if has_lifecycle %}
+        // Nonthrowing synchronous APIs keep their nonthrowing signature.
+        return try! uniffiCloneHandleForCall()
+    }
+
+    private func uniffiCloneHandleForCall() throws -> UInt64 {
+        return try uniffiLifecycleLock.withLock {
+            guard uniffiCloseTask == nil && handle != 0 else {
+                throw UniffiInternalError.objectClosed
+            }
+            return try rustCall { {{ obj.ffi_object_clone().name() }}(self.handle, $0) }
+        }
+    }
+
+    private func uniffiReleaseHandle() {
+        let released = uniffiLifecycleLock.withLock {
+            let released = handle
+            handle = 0
+            return released
+        }
+        if released != 0 {
+            try! rustCall { {{ obj.ffi_object_free().name() }}(released, $0) }
+        }
+    }
+
+    private func uniffiCallWithHandle<T>(_ body: (UInt64) throws -> T) throws -> T {
+        // The FFI call consumes this clone independently of the wrapper owner.
+        return try body(uniffiCloneHandleForCall())
+        {%- else %}
         return try! rustCall { {{ obj.ffi_object_clone().name() }}(self.handle, $0) }
+        {%- endif %}
     }
 
     {%- match obj.primary_constructor() %}
@@ -69,7 +108,11 @@ open class {{ impl_class_name }}: {{ protocol_name }}, {{ config.conformance_lis
     {% endfor %}
 
     {% for meth in obj.methods() -%}
+    {%- if config.is_lifecycle_close(meth.ffi_func().name()) %}
+    {%- include "LifecycleClose.swift" %}
+    {%- else %}
     {%- call swift::func_decl("open func", meth, 4) %}{% endcall %}
+    {%- endif %}
     {% endfor %}
 
     {% call swift::uniffi_trait_impls(obj.uniffi_trait_methods()) %}{% endcall %}

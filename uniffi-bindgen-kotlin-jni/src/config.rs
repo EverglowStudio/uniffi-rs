@@ -10,6 +10,8 @@ use uniffi_pipeline::Node;
 // config options to customize the generated Kotlin.
 #[derive(Debug, Default, Clone, Node, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub lifecycle_closes: IndexMap<String, String>,
     pub(super) package_name: Option<String>,
     pub(super) cdylib_name: Option<String>,
     pub generate_immutable_records: Option<bool>,
@@ -50,7 +52,13 @@ impl Config {
             kotlin: Config,
         }
         let top_level: ToplevelConfig = toml::from_str(config_toml)?;
-        Ok(top_level.bindings.kotlin)
+        let mut config = top_level.bindings.kotlin;
+        config.lifecycle_closes =
+            uniffi_bindgen::LifecycleConfig::from_root_toml(&toml::from_str(config_toml)?)?
+                .close_methods
+                .into_iter()
+                .collect();
+        Ok(config)
     }
 
     pub fn record_is_immutable(&self, name: &str) -> bool {

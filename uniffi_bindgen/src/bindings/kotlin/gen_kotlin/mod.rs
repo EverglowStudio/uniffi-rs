@@ -70,6 +70,8 @@ trait CodeType: Debug {
 // config options to customize the generated Kotlin.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub(super) lifecycle_closes: BTreeSet<String>,
     pub(super) package_name: Option<String>,
     pub(super) cdylib_name: Option<String>,
     generate_immutable_records: Option<bool>,
@@ -96,6 +98,17 @@ pub struct Config {
 }
 
 impl Config {
+    fn has_lifecycle(&self, object: &Object) -> bool {
+        object
+            .methods()
+            .iter()
+            .any(|method| self.is_lifecycle_close(method.ffi_func().name()))
+    }
+
+    fn is_lifecycle_close(&self, ffi_name: &str) -> bool {
+        self.lifecycle_closes.contains(ffi_name)
+    }
+
     pub(crate) fn android_cleaner(&self) -> bool {
         self.android_cleaner.unwrap_or(self.android)
     }

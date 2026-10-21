@@ -130,6 +130,7 @@ pub fn map_callable(
                 },
                 true,
                 &mut allocator,
+                context,
             ),
             index: allocator.next_arg_index(),
             name: "".into(),
@@ -144,7 +145,7 @@ pub fn map_callable(
         } => Some(Argument {
             ty: self_type.clone(),
             by_ref: !takes_self_by_arc,
-            ffi: argument_ffi(self_type, PassBy::Ref, true, &mut allocator),
+            ffi: argument_ffi(self_type, PassBy::Ref, true, &mut allocator, context),
             index: allocator.next_arg_index(),
             name: "".into(),
             orig_name: "".into(),
@@ -202,6 +203,7 @@ fn map_arguments(
                     if is_async { PassBy::Value } else { arg.pass_by },
                     false,
                     allocator,
+                    context,
                 ),
                 ty,
                 by_ref: arg.pass_by.is_borrowed(),
@@ -216,7 +218,24 @@ fn argument_ffi(
     pass_by: PassBy,
     receiver: bool,
     allocator: &mut ArgAllocator,
+    context: &Context,
 ) -> ArgumentFfi {
+    // Explicitly closed resources must acquire a checked clone, including for
+    // synchronous borrows. A raw borrowed handle can race with close releasing it.
+    let pass_by = match &ty.ty {
+        Type::Interface {
+            namespace,
+            orig_name,
+            ..
+        } if context
+            .config_map
+            .get(namespace)
+            .is_some_and(|config| config.lifecycle_closes.contains_key(orig_name)) =>
+        {
+            PassBy::Value
+        }
+        _ => pass_by,
+    };
     let id = ty.id;
     match (&ty.ty, pass_by.is_borrowed()) {
         (Type::Interface { imp, .. }, true) if !imp.has_callback_interface() => {

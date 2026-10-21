@@ -6,6 +6,10 @@
 
 {%- macro to_ffi_call(func) -%}
     {%- call is_try(func) %}{% endcall -%}
+    {%- if config.is_lifecycle_method(func.ffi_func().name()) %}
+    self.uniffiCallWithHandle { uniffiHandle in
+    {{ "try " }}
+    {%- endif %}
     {%- if let(Some(e)) = func.throws_type() -%}
         rustCallWithError({{ e|ffi_error_converter_name }}_lift) {
     {%- else -%}
@@ -28,7 +32,11 @@
     {{ func.ffi_func().name() }}(
         {%- match func.self_type() %}
         {%-     when Some(Type::Object { .. }) %}
+            {%- if config.is_lifecycle_method(func.ffi_func().name()) %}
+            uniffiHandle,
+            {%- else %}
             self.uniffiCloneHandle(),
+            {%- endif %}
         {%-     when Some(t) %}
             {{ t|lower_fn }}(self),
         {%-     when None %}
@@ -43,6 +51,9 @@
     {%-     endif %}
     {%- endfor %}
 }
+    {%- if config.is_lifecycle_method(func.ffi_func().name()) %}
+    }
+    {%- endif %}
 {%- endmacro -%}
 
 // eg, `public func foo_bar() { body }`
@@ -145,13 +156,19 @@ public convenience init{{ callable|input_stream_generics }}(
 
 {%- endmacro %}
 
-{%- macro call_async(callable, stream_handle=false) %}
+{%- macro call_async(callable, stream_handle=false, close_handle=false) %}
         try await uniffiRustCallAsync(
             rustFutureFunc: {
                 {{ callable.ffi_func().name() }}(
                     {%- match callable.self_type() %}
                     {%-     when Some(Type::Object { .. }) %}
+                        {%- if close_handle %}
+                        uniffiCloseHandle
+                        {%- else if config.is_lifecycle_method(callable.ffi_func().name()) %}
+                        try self.uniffiCloneHandleForCall(){% if !callable.arguments().is_empty() %},{% endif %}
+                        {%- else %}
                         self.uniffiCloneHandle(){% if !callable.arguments().is_empty() %},{% endif %}
+                        {%- endif %}
                     {%-     when Some(t) %}
                         {{ t|lower_fn }}(self){% if !callable.arguments().is_empty() %},{% endif %}
                     {%-     when None %}

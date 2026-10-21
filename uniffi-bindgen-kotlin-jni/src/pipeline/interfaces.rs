@@ -5,8 +5,21 @@
 use super::*;
 
 pub fn map_class(int: general::Interface, context: &Context) -> Result<Class> {
+    let lifecycle_close = context
+        .config()?
+        .lifecycle_closes
+        .get(&int.orig_name)
+        .and_then(|name| {
+            int.methods
+                .iter()
+                .find(|method| method.callable.orig_name == *name)
+        })
+        .map(|method| method.callable.name.clone());
     let mut base_classes = vec![interface_name(&int), "uniffi.Disposable".to_string()];
-    if !int.imp.is_local() && !int.methods.iter().any(|m| m.callable.name == "close") {
+    if lifecycle_close.is_none()
+        && !int.imp.is_local()
+        && !int.methods.iter().any(|m| m.callable.name == "close")
+    {
         base_classes.push("AutoCloseable".into());
     }
     let callback_interface = int
@@ -25,6 +38,7 @@ pub fn map_class(int: general::Interface, context: &Context) -> Result<Class> {
     }
 
     Ok(Class {
+        lifecycle_close,
         self_type,
         base_classes,
         package_name: context.current_package_name()?.to_string(),
@@ -64,6 +78,10 @@ impl Interface {
 }
 
 impl Class {
+    pub fn is_lifecycle_close(&self, method: &Method) -> bool {
+        self.lifecycle_close.as_deref() == Some(method.callable.name.as_str())
+    }
+
     pub fn name_kt(&self) -> String {
         if self.imp.has_callback_interface() {
             format!("{}Impl", self.name.to_upper_camel_case())

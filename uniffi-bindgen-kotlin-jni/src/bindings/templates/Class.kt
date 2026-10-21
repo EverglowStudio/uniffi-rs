@@ -133,6 +133,10 @@ open class {{ cls.name_kt() }} : {{ cls.base_classes|join(", ") }} {
 
     private val wasDestroyed = java.util.concurrent.atomic.AtomicBoolean(false)
     private val callCounter = java.util.concurrent.atomic.AtomicLong(1)
+    {%- if cls.lifecycle_close.is_some() %}
+    private val uniffiCloseLock = Any()
+    private var uniffiCloseResult: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+    {%- endif %}
 
     /**
      * Whether the current object has been destroyed and its reference is gone in the Rust side.
@@ -140,6 +144,12 @@ open class {{ cls.name_kt() }} : {{ cls.base_classes|join(", ") }} {
     val uniffiIsDestroyed: kotlin.Boolean get() = wasDestroyed.get()
 
     override fun destroy() {
+        {%- if cls.lifecycle_close.is_some() %}
+        val cleanNow = synchronized(uniffiCloseLock) {
+            wasDestroyed.compareAndSet(false, true) && callCounter.decrementAndGet() == 0L
+        }
+        if (cleanNow) uniffiCleanable?.clean()
+        {%- else %}
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
         if (this.wasDestroyed.compareAndSet(false, true)) {
@@ -148,9 +158,10 @@ open class {{ cls.name_kt() }} : {{ cls.base_classes|join(", ") }} {
                 uniffiCleanable?.clean()
             }
         }
+        {%- endif %}
     }
 
-    {%- if !cls.imp.is_local() && !cls.has_close_method() %}
+    {%- if cls.lifecycle_close.is_none() && !cls.imp.is_local() && !cls.has_close_method() %}
     @Synchronized
     override fun close() {
         this.destroy()
@@ -173,6 +184,15 @@ open class {{ cls.name_kt() }} : {{ cls.base_classes|join(", ") }} {
      * @suppress
      */
     fun uniffiCloneHandle(): kotlin.Long {
+        {%- if cls.lifecycle_close.is_some() %}
+        return synchronized(uniffiCloseLock) {
+            check(uniffiCloseResult == null && !wasDestroyed.get()) { "{{ cls.name }} is closing or closed" }
+            uniffiCloneHandleUnchecked()
+        }
+    }
+
+    private fun uniffiCloneHandleUnchecked(): kotlin.Long {
+        {%- endif %}
         if (uniffiHandle == 0.toLong()) {
             throw uniffi.InternalException("uniffiCloneHandle() called on NoHandle object");
         }
@@ -180,11 +200,15 @@ open class {{ cls.name_kt() }} : {{ cls.base_classes|join(", ") }} {
     }
 
     {% for meth in cls.methods -%}
+    {%- if cls.is_lifecycle_close(meth) %}
+    {%- include "LifecycleClose.kt" %}
+    {%- else %}
     override public {% if meth.callable.is_async %}suspend {% endif %}fun {{ meth.callable.name_kt() }}({{ meth.callable.arg_list_no_defaults_kt() }}): {{ meth.callable.return_type_kt() }} {
         {%- let jni_method_name = meth.jni_method_name %}
         {%- let callable = meth.callable %}
         {% filter indent(4) %}{%- include "CallableBody.kt" %}{% endfilter %}
     }
+    {%- endif %}
     {% endfor %}
 
     {%- let uniffi_trait_methods = cls.uniffi_trait_methods %}

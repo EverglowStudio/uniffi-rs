@@ -165,6 +165,10 @@ pub fn quote_arg_keyword(nm: String) -> String {
 /// since the details of the underlying component are entirely determined by the `ComponentInterface`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub(super) lifecycle_closes: BTreeSet<String>,
+    #[serde(skip)]
+    pub(super) lifecycle_methods: BTreeSet<String>,
     pub(super) module_name: Option<String>,
     ffi_module_name: Option<String>,
     ffi_module_filename: Option<String>,
@@ -220,6 +224,21 @@ impl CustomTypeConfig {
 }
 
 impl Config {
+    fn has_lifecycle(&self, object: &Object) -> bool {
+        object
+            .methods()
+            .iter()
+            .any(|method| self.is_lifecycle_close(method.ffi_func().name()))
+    }
+
+    fn is_lifecycle_close(&self, ffi_name: &str) -> bool {
+        self.lifecycle_closes.contains(ffi_name)
+    }
+
+    fn is_lifecycle_method(&self, ffi_name: &str) -> bool {
+        self.lifecycle_methods.contains(ffi_name)
+    }
+
     /// The name of the Swift module containing the high-level foreign-language bindings.
     /// Panics if the module name hasn't been configured.
     pub fn module_name(&self) -> String {

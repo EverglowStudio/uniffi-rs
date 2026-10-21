@@ -765,11 +765,95 @@ func testLocalCancellation() async throws {
     print("PASS local Task cancellation and owner.close wait !Send method/stream cleanup gates")
 }
 
+func testResourceLifecycle() async throws {
+    let tracker = UnifiedTracker()
+    let cleanup = UnifiedGate()
+    let resource = UnifiedLifecycle(tracker: tracker, cleanup: cleanup, fail: false)
+    equal(try resource.syncPing(), 5)
+    equal(resource.plainPing(), 3)
+    let otherTracker = UnifiedTracker()
+    let openGate = UnifiedGate()
+    openGate.open()
+    let other = UnifiedLifecycle(tracker: otherTracker, cleanup: openGate, fail: false)
+    let firstFinished = TestLocked(false)
+    let first = Task {
+        defer { firstFinished.update { $0 = true } }
+        try await resource.close()
+    }
+    try await eventually("resource close did not start") { tracker.counts().started == 1 }
+    let second = Task { try await resource.close() }
+    first.cancel()
+    try await staysPending(firstFinished)
+    do {
+        _ = try await resource.ping()
+        preconditionFailure("new operation admitted after close started")
+    } catch {}
+    do {
+        _ = try resource.syncPing()
+        preconditionFailure("new synchronous operation admitted after close started")
+    } catch {}
+    equal(try await other.ping(), 7)
+    cleanup.open()
+    try await first.value
+    try await second.value
+    try await resource.close()
+    withExtendedLifetime(resource) { counts(tracker, 1, 0, 1, 1) }
+    equal(otherTracker.counts().dropped, 0)
+    try await other.close()
+    equal(otherTracker.counts().dropped, 1)
+
+    let liveTracker = UnifiedTracker()
+    let live = UnifiedLifecycle(tracker: liveTracker, cleanup: openGate, fail: false)
+    let body = UnifiedGate()
+    let pending = Task { try await live.pending(body: body) }
+    try await eventually("in-flight call did not start") { liveTracker.counts().polls == 1 }
+    try await live.close()
+    equal(liveTracker.counts().dropped, 0)
+    body.open()
+    equal(try await pending.value, 9)
+    equal(liveTracker.counts().dropped, 1)
+
+    let failedTracker = UnifiedTracker()
+    let failed = UnifiedLifecycle(tracker: failedTracker, cleanup: openGate, fail: true)
+    let failedOne = Task { try await failed.close() }
+    let failedTwo = Task { try await failed.close() }
+    for task in [failedOne, failedTwo] {
+        do { try await task.value; preconditionFailure("expected close failure") }
+        catch UnifiedError.Closed {}
+    }
+    do { try await failed.close(); preconditionFailure("expected cached close failure") }
+    catch UnifiedError.Closed {}
+    withExtendedLifetime(failed) { counts(failedTracker, 1, 0, 1, 1) }
+
+    let firstTracker = UnifiedTracker()
+    let firstCleanup = UnifiedGate()
+    let secondTracker = UnifiedTracker()
+    let firstStream = unifiedValues(count: 3, fail: false, tracker: firstTracker, cleanup: firstCleanup)
+    let secondStream = unifiedValues(count: 2, fail: false, tracker: secondTracker, cleanup: openGate)
+    // Early break only requests cancellation; close is the acknowledgement.
+    for try await _ in firstStream { break }
+    let streamFinished = TestLocked(false)
+    let streamClose = Task {
+        defer { streamFinished.update { $0 = true } }
+        try await firstStream.close()
+    }
+    try await eventually("first subscription did not drop") { firstTracker.counts().dropped == 1 }
+    try await staysPending(streamFinished)
+    equal(try await drain(secondStream), [nil, 1])
+    equal(secondTracker.counts().cleaned, 1)
+    equal(firstTracker.counts().cleaned, 0)
+    firstCleanup.open()
+    try await streamClose.value
+    equal(firstTracker.counts().cleaned, 1)
+    print("PASS resource close releases retained wrapper; concurrent/cancelled waiters, failure and client isolation")
+}
+
 let completion = DispatchGroup()
 completion.enter()
 Task.detached {
     defer { completion.leave() }
     do {
+        try await testResourceLifecycle()
         try await testFutures()
         try await testDefaultRuntime()
         try await testTokioFutures()
@@ -787,7 +871,7 @@ Task.detached {
         try await testLocalCancellation()
         equal(uniffiInputStreamHandleCountUniffiBindgenTests(), 0)
         equal(uniffiForeignFutureHandleCountUniffiBindgenTests(), 0)
-        print("S04 Swift shared fixture: 15 groups passed")
+        print("S04 Swift shared fixture: 16 groups passed")
     } catch {
         preconditionFailure("S04 Swift shared fixture failed: \(error)")
     }

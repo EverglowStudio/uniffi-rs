@@ -25,6 +25,33 @@ Concepts from the UDL file map into Swift as follows:
     * If this happens inside a non-throwing Swift function, it will be converted
       into a fatal Swift error that cannot be caught.
 
+## Resource cleanup and cancellation
+
+Ordinary object wrappers release their Rust reference through ARC. A resource
+with an asynchronous business close method can opt into deterministic cleanup:
+
+```toml
+[bindings.lifecycle]
+close_methods = { Client = "close" }
+```
+
+Use source names, before Swift renames. The method must be asynchronous, accept
+no arguments, and return `()` or `Result<(), E>`. `try await client.close()` runs
+business cleanup and releases the wrapper's Rust reference even when the wrapper
+remains in a property. No second disposal call is needed. Concurrent and repeated
+closes await the same task and observe its result, including failure. Cancelling a
+waiter does not cancel that shared task. New operations are rejected once close
+starts; an already admitted FFI call retains its own reference. Calling a closed
+resource through a nonthrowing synchronous API is a programming error, as with
+other unexpected errors in nonthrowing Swift APIs.
+
+Ordinary async call cancellation still cancels the Rust operation. Await the
+cancelled `Task.value` to confirm that Rust and callback cleanup has completed.
+For output streams, iterator destruction after a bare `break` requests cancellation;
+it cannot await cleanup. Call `try await stream.close()` after the loop, and on
+its error path, when the next operation depends on completed cleanup. A stream's
+close is also shared, repeatable and independent of other subscriptions.
+
 ## Generated files
 
 UniFFI generates several kinds of files for Swift bindings:

@@ -1,27 +1,50 @@
 # Kotlin Lifetimes
 
-All interfaces exposed via Kotlin expose a public API for freeing
-the Kotlin wrapper object in lieu of reliable finalizers. This is done
-by making the "base class" for all such generated objects implement the
-`Disposable` and `AutoCloseable` interfaces.
+Ordinary Kotlin object wrappers register a Cleaner for their Rust reference.
+Temporary service wrappers therefore do not require a chain of manual releases.
+For deterministic release of an ordinary wrapper, `destroy()` remains available;
+objects without a business `close` method also implement `AutoCloseable`.
 
-As such, these wrappers all implement a `close()` method, which must be
-explicitly called to ensure the associated Rust resources are reclaimed.
+## Asynchronous resources
 
-The best way to arrange for this to be called at the right time is beyond
-the scope of this document; you should consult the official documentation for
-`AutoClosable`, but one common pattern is the Kotlin
-[use function](https://kotlinlang.org/api/latest/jvm/stdlib/kotlin/use.html).
+Declare a business close method once, using source names before Kotlin renames:
 
-## Nested objects
+```toml
+[bindings.lifecycle]
+close_methods = { Client = "close" }
+```
 
-We also need to consider what happens when objects are contained in other objects.
-The current situation is:
+The method must be asynchronous, take no arguments, and return `()` or
+`Result<(), E>`. In JNA and JNI bindings, `client.close()` awaits business cleanup
+and releases the wrapper's Rust reference. A subsequent `destroy()` is unnecessary.
+The wrapper can remain in an application property without retaining that reference.
+Concurrent and repeated closes share the same result, including failure. New
+operations fail once close starts; operations already admitted to Rust own their
+references and remain safe.
 
-* Dictionaries that contain interfaces implement `AutoClosable` with their close() method closing
-  any contained interfaces.
+The close runs in `NonCancellable`, so cancellation of a waiting coroutine cannot
+interrupt cleanup. This suspending method does not implement synchronous
+`AutoCloseable`. A generated member `use` supplies a suspending resource scope:
 
-* Enums can't currently contain interfaces.
+```kotlin
+client.use { resource ->
+    resource.load()
+} // waits for close on success, error, or cancellation
+```
 
-* Lists/Maps don't implement `AutoClosable`; if you have a list/map of interfaces
-  you need to close each one individually.
+When both the block and close fail, the block's error is rethrown and the close
+error is attached as a suppressed exception. The low-level `Disposable` extension
+`use` remains a reference-release helper for ordinary wrappers; a resource's
+member `use` performs its business close as well.
+
+## Cancellation and streams
+
+Ordinary suspending calls retain their existing cancellation behavior. Use
+`cancelAndJoin()` (or cancel then join) to confirm Rust and callback cleanup.
+Output streams implement `Flow`. Collector completion, failure, `take`, and
+coroutine cancellation execute an awaited, noncancellable close in `finally`.
+An explicit stream `close()` also waits for cleanup. Each subscription and resource
+has independent close state; ending one does not close another client or stream.
+
+Lists and maps do not acquire ownership of resource cleanup. Close resources at
+their application scope; ordinary contained wrappers continue to use the Cleaner.

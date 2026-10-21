@@ -12,6 +12,7 @@ fileprivate enum UniffiInternalError: LocalizedError {
     case unexpectedStaleHandle
     case streamConsumed
     case concurrentStreamNext
+    case objectClosed
     case rustPanic(_ message: String)
 
     public var errorDescription: String? {
@@ -27,6 +28,7 @@ fileprivate enum UniffiInternalError: LocalizedError {
         case .unexpectedStaleHandle: return "The object in the handle map has been dropped already"
         case .streamConsumed: return "UniFFI output streams may only be consumed once"
         case .concurrentStreamNext: return "UniFFI output stream received a concurrent next() call"
+        case .objectClosed: return "UniFFI resource is closing or closed"
         case let .rustPanic(message): return message
         }
     }

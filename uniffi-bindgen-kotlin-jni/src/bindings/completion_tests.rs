@@ -2,6 +2,58 @@
 //! Include supported custom aliases whose nullability is not exposed by that IR.
 use super::*;
 
+#[test]
+fn lifecycle_close_validates_before_language_renames() {
+    let dir = std::env::temp_dir().join(format!("uniffi-jni-lifecycle-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"lifecycle_rename\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let udl = Utf8PathBuf::from_path_buf(dir.join("src/lifecycle_rename.udl")).unwrap();
+    std::fs::write(
+        &udl,
+        "namespace lifecycle_rename {}; interface Client { [Async] void close(); };",
+    )
+    .unwrap();
+    let loader = uniffi_bindgen::BindgenLoader::new(
+        uniffi_bindgen::BindgenPaths::default(),
+        uniffi_bindgen::GlobalConfig::default(),
+    );
+    let metadata = loader.load_metadata(&udl).unwrap();
+    let mut initial = loader.load_pipeline_initial_root(&udl, metadata).unwrap();
+    let config = r#"
+        [bindings.lifecycle]
+        close_methods = { Client = "close" }
+        [bindings.kotlin]
+        cdylib_name = "lifecycle_rename"
+        [bindings.kotlin.rename]
+        Client = "RenamedClient"
+        "Client.close" = "finish"
+    "#;
+    initial
+        .namespaces
+        .get_mut("lifecycle_rename")
+        .unwrap()
+        .config_toml = Some(config.into());
+    let root = pipeline().execute(initial.clone()).unwrap();
+    let rendered = BindingsPackage {
+        package: root.packages[0].clone(),
+    }
+    .render()
+    .unwrap();
+    assert!(rendered.contains("override suspend fun `finish`()"));
+    assert!(rendered.contains("uniffiCloseResult"));
+    assert!(!rendered.contains("AutoCloseable"));
+    initial
+        .namespaces
+        .get_mut("lifecycle_rename")
+        .unwrap()
+        .config_toml = Some(config.replace("Client = \"close\"", "Client = \"finish\""));
+    assert!(pipeline().execute(initial).is_err());
+}
+
 struct CompletionRoot(Vec<CallableResult>);
 impl CompletionRoot {
     fn rust_async_callable_results(&self) -> impl Iterator<Item = &CallableResult> {
@@ -120,7 +172,13 @@ fn nullable_custom_completion_uses_real_udl_and_config() {
         });
     std::fs::create_dir_all(&output).unwrap();
     let output = Utf8PathBuf::from_path_buf(output).unwrap();
-    let udl = output.join("nullable_custom.udl");
+    std::fs::create_dir_all(output.join("src")).unwrap();
+    std::fs::write(
+        output.join("Cargo.toml"),
+        "[package]\nname = \"nullable_custom\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    let udl = output.join("src/nullable_custom.udl");
     std::fs::write(
         &udl,
         "[Custom] typedef string CustomText;\nnamespace nullable_custom {\n    [Async] CustomText fetch_custom();\n};\n",
@@ -134,13 +192,12 @@ lift = "{}.takeIf { it.isNotEmpty() }"
 lower = '{} ?: ""'
 "#;
     std::fs::write(output.join("uniffi.toml"), config).unwrap();
-    let mut initial = InitialRoot::from_udl(
-        &uniffi_bindgen::BindgenPaths::default(),
-        &uniffi_bindgen::GlobalConfig::default(),
-        &udl,
-        Some("nullable_custom".into()),
-    )
-    .unwrap();
+    let loader = uniffi_bindgen::BindgenLoader::new(
+        uniffi_bindgen::BindgenPaths::default(),
+        uniffi_bindgen::GlobalConfig::default(),
+    );
+    let metadata = loader.load_metadata(&udl).unwrap();
+    let mut initial = loader.load_pipeline_initial_root(&udl, metadata).unwrap();
     initial
         .namespaces
         .get_mut("nullable_custom")
