@@ -502,6 +502,20 @@ fn render_type_name(model: &Model<'_>, ty: &ValueType) -> String {
 
 fn render_type_definitions(model: &Model<'_>, declaration: bool) -> String {
     let mut out = String::new();
+    // Error payloads contain lifted domain values. Keep their finite union
+    // separate from ArkValue, which is used only at the backend boundary.
+    let mut error_payloads = vec!["ArkValue".to_owned()];
+    for ty in &model.types {
+        if let AstTypeKind::Error { variants } = &ty.kind {
+            for variant in variants.iter().filter(|variant| !variant.fields.is_empty()) {
+                error_payloads.push(error_payload_name(model, ty, variant));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "export type ArkErrorData = {};\n",
+        error_payloads.join(" | ")
+    ));
     for ty in &model.types {
         let name = model.type_name(&ty.source_key);
         match &ty.kind {
@@ -520,14 +534,30 @@ fn render_type_definitions(model: &Model<'_>, declaration: bool) -> String {
             AstTypeKind::Enum { variants } => {
                 render_enum_definition(model, &mut out, ty, name, variants, declaration)
             }
-            AstTypeKind::Error { .. } => {
+            AstTypeKind::Error { variants } => {
+                let mut payloads = Vec::new();
+                for variant in variants.iter().filter(|variant| !variant.fields.is_empty()) {
+                    let payload = error_payload_name(model, ty, variant);
+                    out.push_str(&format!("export interface {payload} {{\n"));
+                    for field in &variant.fields {
+                        out.push_str(&format!(
+                            "  readonly {}: {};\n",
+                            field.name,
+                            render_type_name(model, &field.ty)
+                        ));
+                    }
+                    out.push_str("}\n");
+                    payloads.push(payload);
+                }
+                payloads.push("null".to_owned());
+                let data_type = payloads.join(" | ");
                 if declaration {
                     out.push_str(&format!(
-                        "export declare class {name} extends UniffiError {{\n  constructor(message?: string, variant?: string | null, data?: ArkValue | null);\n}}\n"
+                        "export declare class {name} extends UniffiError {{\n  readonly data: {data_type};\n  constructor(message?: string, variant?: string | null, data?: {data_type});\n}}\n"
                     ));
                 } else {
                     out.push_str(&format!(
-                        "export class {name} extends UniffiError {{\n  constructor(message: string = \"\", variant: string | null = null, data: ArkValue | null = null) {{ super(\"{}\", message, variant, data); }}\n}}\n",
+                        "export class {name} extends UniffiError {{\n  readonly data: {data_type};\n  constructor(message: string = \"\", variant: string | null = null, data: {data_type} = null) {{ super(\"{}\", message, variant, data); this.data = data; }}\n}}\n",
                         name
                     ));
                 }
@@ -582,6 +612,14 @@ fn render_type_definitions(model: &Model<'_>, declaration: bool) -> String {
         out.push_str(&render_record_field_readers(model));
     }
     out
+}
+
+fn error_payload_name(model: &Model<'_>, ty: &AstType, variant: &AstVariant) -> String {
+    format!(
+        "{}_{}Data",
+        model.type_name(&ty.source_key),
+        safe_ident(&variant.name)
+    )
 }
 
 /// Return the private reader name for a tagged value carrier.  The reader is
@@ -1211,8 +1249,8 @@ export interface ArkBackend {
 export class UniffiError extends Error {
   readonly errorName: string;
   readonly variant: string | null;
-  readonly data: ArkValue | null;
-  constructor(errorName: string = "UniffiUnknownError", message: string = "", variant: string | null = null, data: ArkValue | null = null) {
+  readonly data: ArkErrorData | null;
+  constructor(errorName: string = "UniffiUnknownError", message: string = "", variant: string | null = null, data: ArkErrorData | null = null) {
     super(message);
     this.name = "UniffiError";
     this.errorName = errorName;
@@ -1220,7 +1258,14 @@ export class UniffiError extends Error {
     this.data = data;
   }
   static fromFailure(failure: ArkFailure): UniffiError {
-    return new UniffiError(failure.errorName, failure.message, failure.variant, failure.data);
+    return new __ArkWireError(failure.errorName, failure.message, failure.variant, failure.data);
+  }
+}
+class __ArkWireError extends UniffiError {
+  readonly data: ArkValue | null;
+  constructor(errorName: string, message: string, variant: string | null, data: ArkValue | null) {
+    super(errorName, message, variant, data);
+    this.data = data;
   }
 }
 function __arkInfallibleInputError(_error: ArkValue | UniffiError): never { throw new UniffiError("UniffiInputStreamError", "infallible input stream failed"); }
@@ -1431,16 +1476,14 @@ export class Host {
   releaseInputStream(handle: ArkValue): Promise<void> { return this.inputRegistry === null ? Promise.resolve() : this.inputRegistry.release(handle); }
 }
 function __arkCallbackFailure(error: Error): ArkFailure {
+  if (error instanceof __ArkWireError) return { errorName: error.errorName, message: error.message, variant: error.variant, data: error.data };
   const candidate: UniffiError | null = __arkAsUniffiError(error);
-  if (candidate !== null) return { errorName: candidate.errorName, message: candidate.message, variant: candidate.variant, data: candidate.data };
+  if (candidate !== null) return { errorName: candidate.errorName, message: candidate.message, variant: null, data: null };
   return { errorName: error.name, message: error.message, variant: null, data: null };
 }
-interface __ArkCallbackErrorCarrier { tag?: ArkValue; }
 function __arkCallbackErrorCarrier(failure: ArkFailure): ArkValue | null {
   if (failure.variant === null) return null;
   if (failure.data === null) return failure.variant;
-  const carrier: __ArkCallbackErrorCarrier = failure.data as __ArkCallbackErrorCarrier;
-  carrier.tag = failure.variant;
   return failure.data;
 }
 interface ArkInputSlot { readonly pull: () => Promise<ArkHostStreamStep>; readonly close: () => Promise<void>; readonly detach: () => void; }
@@ -2011,7 +2054,7 @@ export declare class ArkValueResult { readonly kind: "value"; readonly value: Ar
 export declare class ArkErrorResult { readonly kind: "error"; readonly error: ArkFailure; constructor(error: ArkFailure); }
 export type ArkCallResult = ArkValueResult | ArkErrorResult;
 export interface ArkBackend { invokeSync(operationId: number, args: Array<ArkValue>): ArkCallResult; invokeAsync(operationId: number, args: Array<ArkValue>): Promise<ArkCallResult>; releaseObject(handle: ArkValue): void; releaseOutputStream(handle: ArkValue): void; close?(): Promise<void> | void; }
-export declare class UniffiError extends Error { readonly errorName: string; readonly variant: string | null; readonly data: ArkValue | null; constructor(errorName?: string, message?: string, variant?: string | null, data?: ArkValue | null); }
+export declare class UniffiError extends Error { readonly errorName: string; readonly variant: string | null; readonly data: ArkErrorData | null; constructor(errorName?: string, message?: string, variant?: string | null, data?: ArkErrorData | null); static fromFailure(failure: ArkFailure): UniffiError; }
 export declare class ArkItemStep<T> { readonly kind: "item"; readonly value: T; constructor(value: T); }
 export declare class ArkDoneStep { readonly kind: "done"; }
 export declare class ArkErrorStep { readonly kind: "error"; readonly error: UniffiError; constructor(error: UniffiError); }
@@ -2235,64 +2278,19 @@ fn render_callback_error_helper(
         );
     };
     let error_name = model.type_name(error_key);
-    let mut out = format!(
-        "function __arkLowerCallbackError{}(error: Error, session: BackendSession): UniffiError {{\n  if (!(error instanceof {})) {{ const candidate: UniffiError = error as UniffiError; if (candidate.errorName === \"{}\") return new {}(candidate.message, candidate.variant, candidate.data); return new UniffiError(\"{}\", \"callback failed\"); }}\n  const declared: {} = error as {};\n  const variant: string | null = declared.variant;\n",
-        operation.id.index(),
-        error_name,
-        escape_string(&error_name),
-        error_name,
-        escape_string(&error_name),
-        error_name,
-        error_name
+    let lower = lower_helper(
+        model,
+        helpers,
+        &format!("callback_error_{}", operation.id.index()),
+        &ValueType::Named(error_type.source_key.clone()),
+        "callback.error",
+        Some(operation.id),
     );
-    if let AstTypeKind::Error { variants } = &error_type.kind {
-        for variant in variants {
-            if variant.fields.is_empty() {
-                out.push_str(&format!(
-                    "  if (variant === \"{}\") return new {}(declared.message, variant, null);\n",
-                    variant.name, error_name
-                ));
-                continue;
-            }
-            out.push_str(&format!(
-                "  if (variant === \"{}\") {{ if (declared.data === null) throw new UniffiError(\"UniffiCallbackProtocol\", \"callback error payload is missing\"); const payloadValue: ArkValue = declared.data; const data: __ArkRecordCarrier{} = {{}};\n",
-                variant.name,
-                error_type.id.index()
-            ));
-            for field in &variant.fields {
-                let lower = lower_helper(
-                    model,
-                    helpers,
-                    &format!(
-                        "callback_error_{}_{}_{}",
-                        operation.id.index(),
-                        safe_ident(&variant.name),
-                        safe_ident(&field.name)
-                    ),
-                    &field.ty,
-                    &format!(
-                        "callback.error.variant[{}].field[{}]",
-                        variant.name, field.name
-                    ),
-                    Some(operation.id),
-                );
-                out.push_str(&format!(
-                    "    data.{} = {}(__arkRecordField{}(payloadValue, \"{}\") as {}, session);\n",
-                    field.name,
-                    lower,
-                    error_type.id.index(),
-                    escape_string(&field.name),
-                    render_type_name(model, &field.ty)
-                ));
-            }
-            out.push_str(&format!(
-                "    return new {}(declared.message, variant, data as ArkValue); }}\n",
-                error_name
-            ));
-        }
-    }
-    out.push_str("  return new UniffiError(\"UniffiCallbackProtocol\", \"unrecognized callback error variant\");\n}\n");
-    out
+    format!(
+        "function __arkLowerCallbackError{}(error: Error, session: BackendSession): UniffiError {{\n  if (!(error instanceof {error_name})) return new UniffiError(\"UniffiCallbackError\", \"callback error is not declared\");\n  const declared: {error_name} = error as {error_name};\n  return new __ArkWireError(\"{}\", declared.message, declared.variant, {lower}(declared, session));\n}}\n",
+        operation.id.index(),
+        escape_string(&error_name),
+    )
 }
 
 fn render_operation_helpers(
@@ -2388,9 +2386,17 @@ fn render_operation_helpers(
         .and_then(|key| model.ty_for(key))
         .map(|ty| {
             let error_name = model.type_name(&ty.source_key);
+            let lift = lift_helper(
+                model,
+                helpers,
+                &format!("operation_{}_error", operation.id.index()),
+                &ValueType::Named(ty.source_key.clone()),
+                "error",
+                Some(operation.id),
+            );
             format!(
-                "if (__uniffiError !== null && __uniffiError.errorName === \"{}\") throw new {}(__uniffiError.message, __uniffiError.variant, __uniffiError.data); ",
-                escape_string(&error_name), error_name
+                "if (__uniffiError instanceof __ArkWireError && __uniffiError.errorName === \"{}\") {{ const lifted: {error_name} = {lift}(__uniffiError.data === null ? __uniffiError.variant : __uniffiError.data, session); throw new {error_name}(__uniffiError.message, lifted.variant, lifted.data); }} ",
+                escape_string(&error_name)
             )
         })
         .unwrap_or_default();
@@ -2892,9 +2898,11 @@ fn lower_body(
                             body.push_str("return result as ArkValue; }\n");
                             continue;
                         }
-                        body.push_str(
-                            "if (declared.data === null) throw new UniffiError(\"UniffiErrorPayload\", \"error payload is missing\"); const payloadValue: ArkValue = declared.data;\n",
-                        );
+                        body.push_str(&format!(
+                            "if (declared.data === null) throw new UniffiError(\"UniffiErrorPayload\", \"error payload is missing\"); const payload: {} = declared.data as {};\n",
+                            error_payload_name(model, named, variant),
+                            error_payload_name(model, named, variant),
+                        ));
                         for field in &variant.fields {
                             let field_path =
                                 format!("{path}.variant[{}].field[{}]", variant.name, field.name);
@@ -2902,12 +2910,7 @@ fn lower_body(
                                 model,
                                 helpers,
                                 &field.ty,
-                                &format!(
-                                    "{}(payloadValue, \"{}\") as {}",
-                                    record_field_reader_name(named.id.index()),
-                                    escape_string(&field.name),
-                                    render_type_name(model, &field.ty)
-                                ),
+                                &format!("payload.{}", field.name),
                                 &field_path,
                                 operation_id,
                             );
@@ -3208,8 +3211,9 @@ fn lift_body(
                             continue;
                         }
                         body.push_str(&format!(
-                            "if (tag === \"{}\") {{ const data: ArkRecord = new ArkRecord();\n",
-                            variant.name
+                            "if (tag === \"{}\") {{ const data: {} = {{\n",
+                            variant.name,
+                            error_payload_name(model, named, variant),
                         ));
                         for field in &variant.fields {
                             let nested = lift_nested_call(
@@ -3225,9 +3229,12 @@ fn lift_body(
                                 &format!("{path}.variant[{}].field[{}]", variant.name, field.name),
                                 operation_id,
                             );
-                            body.push_str(&format!("data.set(\"{}\", {});\n", field.name, nested));
+                            body.push_str(&format!("  {}: {},\n", field.name, nested));
                         }
-                        body.push_str(&format!("return new {}(\"\", tag, data); }}\n", error_name));
+                        body.push_str(&format!(
+                            "}}; return new {}(\"\", tag, data); }}\n",
+                            error_name
+                        ));
                     }
                     body.push_str("throw new UniffiError(\"UniffiErrorVariant\", \"unrecognized error variant from backend\");");
                     body

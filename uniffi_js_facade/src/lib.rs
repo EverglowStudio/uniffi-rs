@@ -3056,7 +3056,7 @@ api.echo(business, business);
                 ));
                 assert!(text.contains("readonly error?: ArkValue"));
                 assert!(text.contains("function __arkCallbackErrorCarrier(failure: ArkFailure)"));
-                assert!(text.contains("carrier.tag = failure.variant"));
+                assert!(text.contains("if (error instanceof __ArkWireError)"));
                 assert!(text.contains("const candidate: UniffiError = error as UniffiError"));
                 assert!(!text.contains("error as ArkValue"));
                 assert!(!text.contains(".catch((error: ArkValue)"));
@@ -3258,7 +3258,7 @@ api.echo(business, business);
     }
 
     #[test]
-    fn ark_callback_error_payload_lowers_through_ark_record() {
+    fn ark_callback_error_payload_lowers_through_typed_fields() {
         let mut ast = corpus_ast();
         let component = ComponentKey::new("corpus").unwrap();
         let failure = key(&component, "Failure");
@@ -3276,15 +3276,139 @@ api.echo(business, business);
                 .bytes,
         )
         .unwrap();
-        assert!(source.contains("const payloadValue: ArkValue = declared.data"));
-        assert!(source.contains("const data: __ArkRecordCarrier2 = {}"));
-        assert!(source.contains("data.message = "));
-        assert!(source.contains("__arkRecordField2(payloadValue, \"message\") as string"));
-        assert!(!source.contains("payloadValue instanceof ArkRecord"));
-        assert!(!source.contains("const payload: ArkRecord = payloadValue"));
-        assert!(!source.contains("payload.get(\"message\") as string"));
+        assert!(source.contains("const payload: Failure_RejectedData = declared.data"));
+        assert!(source.contains("const result: __ArkRecordCarrier2 = {}"));
+        assert!(source.contains("result.message = "));
+        assert!(source.contains("payload.message as string"));
+        assert!(source.contains("return new __ArkWireError(\"Failure\", declared.message"));
+        assert!(!source.contains("const payloadValue: ArkValue = declared.data"));
+        assert!(!source.contains("__arkRecordField2(payloadValue"));
         assert!(!source.contains("Failure_RejectedInput"));
-        assert!(!source.contains("payload.message"));
+    }
+
+    fn ark_error_payload_ast() -> PublicAst {
+        let mut ast = corpus_ast();
+        let component = ComponentKey::new("corpus").unwrap();
+        let failure = ValueType::Named(key(&component, "Failure"));
+        let profile = ValueType::Named(key(&component, "Profile"));
+        let color = ValueType::Named(key(&component, "Color"));
+        let field = |name: &str, ty: ValueType| AstField {
+            name: name.into(),
+            ty,
+            default: None,
+        };
+        if let AstTypeKind::Record { fields } = &mut ast.types[0].kind {
+            fields.push(field("code", color.clone()));
+        }
+        ast.types[2].kind = AstTypeKind::Error {
+            variants: vec![
+                AstVariant {
+                    name: "Rejected".into(),
+                    fields: vec![field("code", color), field("context", profile)],
+                },
+                AstVariant {
+                    name: "Closed".into(),
+                    fields: vec![],
+                },
+            ],
+        };
+        ast.operations[0].arguments[0].ty = failure.clone();
+        ast.operations[0].return_type = Some(failure.clone());
+        for operation in &mut ast.operations {
+            if [3, 5, 11].contains(&operation.id.index()) {
+                operation.throws = Some(key(&component, "Failure"));
+            }
+            if operation.id.index() == 11 {
+                operation.async_kind = AsyncKind::Async;
+            }
+            if operation.id.index() == 7 {
+                if let Some(ValueType::OutputStream { error, .. }) = &mut operation.return_type {
+                    *error = Some(Box::new(failure.clone()));
+                }
+                operation.stream_resources[0].error = Some(failure.clone());
+            }
+            if operation.id.index() == 15 {
+                operation.arguments = vec![
+                    AstArgument {
+                        name: "observer".into(),
+                        ty: ValueType::Named(key(&component, "Observer")),
+                        default: None,
+                    },
+                    AstArgument {
+                        name: "source".into(),
+                        ty: ValueType::InputStream {
+                            item: Box::new(ValueType::Scalar(ScalarType::String)),
+                            error: Some(Box::new(failure.clone())),
+                            is_send: false,
+                        },
+                        default: None,
+                    },
+                ];
+                operation.async_kind = AsyncKind::Async;
+            }
+        }
+        ast.callbacks.push(AstCallbackUseSite {
+            operation_id: OperationId::new(15),
+            callback_type: TypeId::new(4),
+            path: ValuePath::argument(0),
+            contract: CallbackContract {
+                retention: CallbackRetention::Scoped,
+                threading: CallbackThreading::CallingThread,
+                reentrancy: CallbackReentrancy::Allowed,
+            },
+        });
+        ast
+    }
+
+    #[test]
+    fn ark_error_payloads_keep_domain_types_separate_from_wire_values() {
+        for file in render_ark_inventory(&ark_error_payload_ast()).unwrap() {
+            let source = String::from_utf8(file.bytes).unwrap();
+            assert!(source.contains("export interface Failure_RejectedData"));
+            assert!(source.contains("readonly code: Color;"));
+            assert!(source.contains("readonly context: Profile;"));
+            assert!(source.contains("readonly data: Failure_RejectedData | null;"));
+            assert!(source.contains("export type ArkValue = ArkPrimitive | Uint8Array | Date | ArkRecord | Array<ArkValue> | Map<ArkValue, ArkValue> | Set<ArkValue> | null;"));
+            assert!(!source.contains("data.set(\"code\""));
+            assert!(!source.contains("const payloadValue: ArkValue = declared.data"));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires UNIFFI_ARK_TYPESCRIPT pointing to the DevEco SDK TypeScript module"]
+    fn ark_error_payloads_compile_and_round_trip() {
+        let compiler = std::env::var("UNIFFI_ARK_TYPESCRIPT").expect("ArkTS compiler module path");
+        let root = std::env::temp_dir().join(format!(
+            "uniffi-ark-errors-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for file in render_ark_inventory(&ark_error_payload_ast()).unwrap() {
+            fs::write(root.join(file.path), file.bytes).unwrap();
+        }
+        fs::write(
+            root.join("check.cjs"),
+            include_str!("../tests/ark_error_payloads.cjs"),
+        )
+        .unwrap();
+        let output = Command::new("node")
+            .arg("check.cjs")
+            .env("UNIFFI_ARK_TYPESCRIPT", compiler)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ArkTS error payload regression failed in {}: {}\n{}",
+            root.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
