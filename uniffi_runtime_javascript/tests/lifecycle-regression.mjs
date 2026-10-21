@@ -27,7 +27,7 @@ class Client {
   subscribe() { return invokeObjectOperation(this, operations[5]); }
   view() { return invokeObjectOperation(this, operations[8]); }
   events() { return invokeObjectOperation(this, operations[10]); }
-  lateEvents() { return invokeObjectOperation(this, operations[13]); }
+  lateEvents(...args) { return invokeObjectOperation(this, operations[13], args); }
   [Symbol.asyncDispose]() { return this.close(); }
 }
 class Service {
@@ -156,10 +156,17 @@ for (const scenario of [
   {name:'owner-joins-pull', rawLast:true},
   {name:'explicit-cancel', stop:'cancel'},
   {name:'explicit-return', stop:'return'},
+  {name:'explicit-cancel-before-owner', stop:'cancel', thenOwner:true},
+  {name:'owner-before-explicit-cancel', thenCancel:true},
   {name:'owner-cleanup-failure', cleanupError:'CleanupProbe'},
   {name:'owner-transport-failure', pullError:'TransportProbe'},
-  {name:'owner-call-cancelled', pullError:'UniffiCancelled'},
+  // Stream next is not a managed call. Native owner cancellation rejects it
+  // with StreamCancelled/UniffiCancelled; this is the normal EOF path.
+  {name:'owner-native-interruption', pullError:'UniffiCancelled', interruption:true},
+  {name:'owner-interruption-cleanup-failure', pullError:'UniffiCancelled', interruption:true, cleanupError:'CleanupProbe'},
+  {name:'owner-protocol-failure', pullError:'UniffiStreamProtocol'},
   {name:'owner-error-step', stepError:'StreamProbe'},
+  {name:'owner-cancelled-error-step', stepError:'UniffiCancelled'},
 ]) {
   let handle=1, siblingHandle;
   const raw=deferred(), cleanup=deferred(), native=deferred();
@@ -184,10 +191,12 @@ for (const scenario of [
   const stream=child ? invokeObjectOperation(child,{...operations[10],receiverTypeId:2}) : owner.events();
   if(!scenario.stage) await stream.next();
   let reading=scenario.stage==='idle' ? null : stream.next().then(value=>({value}),error=>({error}));
-  const stopping=scenario.stop ? stream[scenario.stop]() : owner.close();
+  let stopping=scenario.stop ? stream[scenario.stop]() : owner.close();
+  if(scenario.thenOwner) stopping=Promise.all([stopping,owner.close()]);
   let settled=false; stopping.then(()=>{settled=true;},()=>{settled=true;});
   if(!reading) reading=stream.next().then(value=>({value}),error=>({error}));
   await tick();
+  if(scenario.thenCancel) assert.equal(stream.cancel(),stream.cancel(),'owner close keeps its first terminal request');
   assert.equal(settled,false,`${scenario.name}: close must await cleanup`);
   if(scenario.rawLast) {
     cleanup.resolve(); native.resolve(); await tick();
@@ -195,7 +204,7 @@ for (const scenario of [
     assert.equal(released.length,0);
   }
   if(scenario.pullError) raw.reject(Object.assign(Error('pull failed'),{errorName:scenario.pullError}));
-  else raw.resolve(scenario.stepError ? {kind:'error',error:{errorName:scenario.stepError,message:'stream failed'}} : scenario.rawLast ? {kind:'item',value:99} : {kind:'done'});
+  else raw.resolve({kind:'value',value:scenario.stepError ? {kind:'error',error:{errorName:scenario.stepError,message:'stream failed'}} : scenario.rawLast ? {kind:'item',value:99} : {kind:'done'}});
   native.resolve(); await tick();
   if(!scenario.stage && !scenario.rawLast) assert.equal(settled,false,'raw completion cannot substitute for cleanup ACK');
   if(scenario.cleanupError) cleanup.reject(Object.assign(Error('cleanup failed'),{errorName:scenario.cleanupError}));
@@ -203,7 +212,7 @@ for (const scenario of [
   if(scenario.cleanupError) await assert.rejects(stopping,{errorName:scenario.cleanupError});
   else await stopping;
   const outcome=await reading;
-  const errorName=scenario.cleanupError || scenario.pullError || scenario.stepError || (scenario.stop && 'UniffiCancelled');
+  const errorName=scenario.cleanupError || (!scenario.interruption && scenario.pullError) || scenario.stepError || (scenario.stop && 'UniffiCancelled');
   if(errorName) assert.equal(outcome.error?.errorName,errorName,scenario.name);
   else assert.deepEqual(outcome,{value:{done:true,value:undefined}},scenario.name);
   if(scenario.cleanupError) await assert.rejects(stream.next(),{errorName:scenario.cleanupError});
@@ -223,5 +232,30 @@ for (const scenario of [
   assert.equal(testSession.outputStreams.size,0);
   assert.equal(new Set(objects).size,objects.length);
   await testSession.close();
+}
+// A factory CallSignal cancels the managed call before a stream exists. Owner
+// close must join that call's cleanup without turning its failure into EOF.
+{
+  const cleanup=deferred();
+  let cancelled=false,settled=false,closed=false;
+  const probe=new BackendSession({
+    invokeSync(id) {if(id===90)return 1;if(id===91)cancelled=true;return null;},
+    invokeAsync(id) {
+      if(id===0)return Promise.resolve(1);
+      if(id===3)return Promise.resolve();
+      assert.equal(id,13);
+      return cleanup.promise.then(()=>{assert.ok(cancelled);return {kind:'error',error:{domain:'internal',errorName:'UniffiCancelled',message:'factory cancelled'}};});
+    },
+    releaseObject() {},close() {},
+  },new Host(),{callControl:{create:90,cancel:91,release:92,operations:[13]}});
+  const owner=await createFacade(probe,descriptors).Client.create();
+  const controller=new AbortController();
+  const factory=assert.rejects(owner.lateEvents({signal:controller.signal}),{errorName:'UniffiCancelled'}).then(()=>{settled=true;});
+  controller.abort();
+  const closing=owner.close().then(()=>{closed=true;});
+  await tick();assert.equal(settled,false);assert.equal(closed,false,'owner joins factory cleanup');
+  cleanup.resolve();await factory;await closing;
+  assert.equal(probe.outputStreams.size,0);assert.equal(probe.objects.size,0);
+  await probe.close();
 }
 console.log('lifecycle regressions passed');

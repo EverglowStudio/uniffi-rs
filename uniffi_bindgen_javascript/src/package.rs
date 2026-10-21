@@ -1781,10 +1781,12 @@ const tick = () => new Promise(resolve=>setImmediate(resolve));
             operations.len() as u32 + 3,
         ];
         let mut script = format!(
-            "const [factory, pull, cancel, ack] = {}; const source = {};\n",
+            "const [factory, pull, cancel, ack] = {}; const source = {}; const runtimeSource = {};\n",
             serde_json::to_string(&ids).unwrap(),
-            serde_json::to_string(&render_stream_close_wrapper(&package)).unwrap()
+            serde_json::to_string(&render_stream_close_wrapper(&package)).unwrap(),
+            serde_json::to_string(uniffi_js_facade::RUNTIME_SOURCE).unwrap()
         );
+        script.push_str(include_str!("../tests/stream-owner-close.cjs"));
         script.push_str(r#"
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
@@ -1859,6 +1861,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
     for (const result of results) { assert.equal(result.status,'rejected'); assert.equal(result.reason,failure); }
     assert.deepEqual([attempts,released,closed],[1,0,0]);
   }
+  await checkOwnedStreamClose();
 })().catch(error=>{console.error(error);process.exitCode=1;});
 "#);
         let output = std::process::Command::new("node")

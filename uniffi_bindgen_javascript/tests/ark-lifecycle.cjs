@@ -104,10 +104,15 @@ const session = new platform.BackendSession(backend, undefined, {callControl:fix
     {name:'owner-unpulled',stage:'idle'},
     {name:'owner-joins-pull',rawLast:true},
     {name:'explicit-cancel',explicit:true},
+    {name:'explicit-cancel-before-owner',explicit:true,thenOwner:true},
+    {name:'owner-before-explicit-cancel',thenCancel:true},
     {name:'owner-cleanup-failure',cleanupError:'CleanupProbe'},
     {name:'owner-transport-failure',pullError:'TransportProbe'},
-    {name:'owner-call-cancelled',pullError:'UniffiCancelled'},
+    {name:'owner-native-interruption',pullError:'UniffiCancelled',interruption:true},
+    {name:'owner-interruption-cleanup-failure',pullError:'UniffiCancelled',interruption:true,cleanupError:'CleanupProbe'},
+    {name:'owner-protocol-failure',pullError:'UniffiStreamProtocol'},
     {name:'owner-error-step',stepError:'StreamProbe'},
+    {name:'owner-cancelled-error-step',stepError:'UniffiCancelled'},
   ]) {
     let handle=1, siblingHandle;
     const raw=deferred(), cleanup=deferred(), native=deferred(), ack=deferred();
@@ -142,10 +147,12 @@ const session = new platform.BackendSession(backend, undefined, {callControl:fix
     // Active Ark next enters through a microtask; let the raw pull actually
     // enter before testing its join. Starting/unpulled remain separate cases.
     if(!scenario.stage) await tick();
-    const stopping=scenario.explicit ? stream.cancel() : owner.close();
+    let stopping=scenario.explicit ? stream.cancel() : owner.close();
+    if(scenario.thenOwner) stopping=Promise.all([stopping,owner.close()]);
     let settled=false; stopping.then(()=>{settled=true;},()=>{settled=true;});
     if(!reading) reading=stream.next().then(value=>({value}),error=>({error}));
     await tick(); assert.equal(settled,false,scenario.name);
+    if(scenario.thenCancel) assert.equal(stream.cancel(),stream.cancel(),'owner close keeps its first terminal request');
     if(scenario.rawLast) {
       cleanup.resolve(); native.resolve(); ack.resolve(); await tick();
       assert.equal(settled,false,'owner close joins the raw pull'); assert.equal(released.length,0);
@@ -164,7 +171,7 @@ const session = new platform.BackendSession(backend, undefined, {callControl:fix
     if(scenario.cleanupError) await assert.rejects(stopping,{errorName:scenario.cleanupError});
     else await stopping;
     const outcome=await reading;
-    const errorName=scenario.cleanupError || scenario.pullError || scenario.stepError || (scenario.explicit && 'UniffiCancelled');
+    const errorName=scenario.cleanupError || (!scenario.interruption && scenario.pullError) || scenario.stepError || (scenario.explicit && 'UniffiCancelled');
     if(errorName) assert.equal((outcome.error || outcome.value?.error)?.errorName,errorName,scenario.name);
     else assert.equal(outcome.value?.kind,'done',scenario.name);
     if(scenario.cleanupError) await assert.rejects(stream.next(),{errorName:scenario.cleanupError});
@@ -177,6 +184,34 @@ const session = new platform.BackendSession(backend, undefined, {callControl:fix
     await other.close();
     assert.equal(probe.objects.size,0); assert.equal(probe.streams.length,0);
     assert.equal(new Set(objects).size,objects.length); assert.equal(new Set(released).size,released.length);
+    await probe.close();
+  }
+  {
+    const cleanup=deferred(),cancelled=new Set();
+    let block=1,settled=false,closed=false;
+    const probe=new platform.BackendSession({
+      invokeSync(id,args) {
+        if(id===fixture.callControl.create){const value=block;block+=4096;return new platform.ArkValueResult(value);}
+        if(id===fixture.callControl.cancel)cancelled.add(args[0]);
+        return new platform.ArkValueResult(null);
+      },
+      async invokeAsync(id,args) {
+        if(id===fixture.construct)return new platform.ArkValueResult(1);
+        if(id===ids['Client.close'])return new platform.ArkValueResult(null);
+        assert.equal(id,streams.lateEvents.start);
+        await cleanup.promise;assert.ok(cancelled.has(args.at(-1)));
+        return new platform.ArkErrorResult({errorName:'UniffiCancelled',message:'factory cancelled',variant:null,data:null});
+      },
+      releaseObject() {},releaseOutputStream() {},close() {},
+    },undefined,{callControl:fixture.callControl});
+    const owner=await platform.createNamespace(probe).lifecycle.Client[fixture.constructor]();
+    const controller=new platform.CallController();
+    const factory=assert.rejects(owner.lateEvents({signal:controller.signal}),{errorName:'UniffiCancelled'}).then(()=>{settled=true;});
+    controller.abort();
+    const closing=owner.close().then(()=>{closed=true;});
+    await tick();assert.equal(settled,false);assert.equal(closed,false,'owner joins factory cleanup');
+    cleanup.resolve();await factory;await closing;
+    assert.equal(probe.streams.length,0);assert.equal(probe.objects.size,0);
     await probe.close();
   }
   console.log('generated Ark lifecycle regressions passed');

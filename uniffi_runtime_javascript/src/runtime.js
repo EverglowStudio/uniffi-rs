@@ -1201,7 +1201,16 @@ export class BackendSession {
             }
           }
           catch (error) { next.reject(error); }
-          const raw = await nextPromise;
+          let raw;
+          try { raw = await nextPromise; }
+          catch (error) {
+            // Owner close interrupts the native pull with StreamCancelled.
+            // Only that raw interruption becomes EOF, after cleanup succeeds;
+            // factory, protocol, business-step and cleanup errors still escape.
+            if (phase !== "closed" || error?.errorName !== "UniffiCancelled") throw error;
+            await closePromise;
+            return terminal();
+          }
           if (raw === DETACHED || detached) throw environmentDestroyedError();
           if (phase !== "active") await closePromise;
           if (phase === "cancelled") throw cancelledError();

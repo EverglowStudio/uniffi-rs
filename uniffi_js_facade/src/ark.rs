@@ -1697,7 +1697,16 @@ class ArkOutputStream<T> implements UniFfiStream<T> {
       if (this.phase !== "active") { await this.closePromise; return this.closed() ? new ArkDoneStep() : new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled")); }
       const handle: ArkValue = this.handle as ArkValue;
       this.nextPromise = Promise.resolve().then((): Promise<ArkCallResult> => this.spec.next(handle));
-      const raw: ArkCallResult | __ArkDetachedMarker = await this.session.guardPromise(this.nextPromise);
+      let raw: ArkCallResult | __ArkDetachedMarker;
+      try { raw = await this.session.guardPromise(this.nextPromise); }
+      catch (error) {
+        // Owner close interrupts the raw native pull. Factory, business-step
+        // and cleanup failures are outside this cancellation boundary.
+        const reason: UniffiError | null = __arkAsUniffiError(error);
+        if (!this.closed() || reason === null || reason.errorName !== "UniffiCancelled") throw error;
+        await this.closePromise;
+        return new ArkDoneStep();
+      }
       if (raw === __DETACHED || this.detached) throw __environmentDestroyed();
       if (this.phase !== "active") await this.closePromise;
       if (this.cancelled()) return new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled"));
