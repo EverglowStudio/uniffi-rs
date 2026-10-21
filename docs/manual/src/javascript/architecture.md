@@ -18,16 +18,25 @@ these deterministic paths:
   shared/uniffi_runtime.d.ts
   components/<namespace>/index.js
   components/<namespace>/index.d.ts
-  browser/backend.js
+  components/<namespace>/internal.js
+  components/<namespace>/internal.d.ts
   browser/index.js
   browser/index.d.ts
+  browser/platform.js
+  browser/platform.d.ts
   node/index.js
   node/index.d.ts
+  node/platform.js
+  node/platform.d.ts
   electron/preload.cjs
   electron/index.js
   electron/index.d.ts
+  electron/platform.js
+  electron/platform.d.ts
   Index.ets
   Index.d.ets
+  platform.ets
+  platform.d.ets
   native/index.d.ts
   native/wasm.rs
   native/node.rs
@@ -38,7 +47,8 @@ these deterministic paths:
 
 Only files for selected targets are emitted. Node and browser share the same
 component implementation files and the same runtime source. Harmony uses the
-package-root `Index.ets`/`Index.d.ets` pair instead of a per-component ArkTS
+package-root business `Index.ets`/`Index.d.ets` and host
+`platform.ets`/`platform.d.ets` pairs instead of a per-component ArkTS
 directory. Generated runtime code is JavaScript (`.js`); generated type
 declarations use `.d.ts`, while Harmony declarations use `.d.ets`.
 
@@ -56,8 +66,9 @@ The package boundary has one producer and a small set of explicit readers:
 
 1. `uniffi_js_facade` consumes the normalized public AST and returns two
    inventories. The shared inventory contains `shared/uniffi_runtime.js`, its
-   declaration, and one `components/<namespace>/index.js` plus `.d.ts` pair
-   per component. The ArkTS inventory contains `Index.ets` and `Index.d.ets`.
+   declaration, and business `components/<namespace>/index.js` plus `.d.ts`
+   and host `internal.js` plus `.d.ts` pairs per component. The ArkTS inventory
+   contains the business `Index.ets` and host `platform.ets` pairs.
 2. `package.rs` adds the platform wrappers and native adapter sources, then
    asks `host_crates.rs` to render `native/hosts/{wasm,napi,ohos}` from the
    same host plan. These bytes stay in memory until `GeneratedPackage::write_to`.
@@ -75,25 +86,40 @@ format change, remove the directory and generate it again.
 
 Every platform binds all selected component namespaces to one
 `BackendSession`/`Host` pair and one composite native host for that target.
-The component module exports `createNamespace(session)` and a `Namespace`
-declaration. Platform roots call that factory once per namespace and expose
-the resulting values; they do not flatten a component into a second root.
+The component's `internal.js` exports `createNamespace(session)`;
+`index.d.ts` declares the business `Namespace`. Platform modules call that
+factory once per namespace and expose the resulting values. Ordinary
+Node/browser/Electron `index.js` entrypoints re-export only the namespaces and
+`UniffiError`, with `CallOptions` in declarations. Hosts use `platform.js` for
+`session`, `close`, and `releaseReference`. Component business entries do not
+export the factory or a session, and roots do not flatten the namespaces.
 
 The shared ECMAScript runtime owns conversion, object leases, callback
 registration, error normalization, and stream lifecycle for Node, Electron,
 and browser Wasm. The ArkTS printer emits the same planned semantics into
-`Index.ets` for Harmony. Platform adapters only supply the backend transport:
+`platform.ets` for Harmony, with business re-exports in `Index.ets`.
+Platform adapters only supply the backend transport:
 
-- Node loads one composite N-API addon and creates a session synchronously.
-- Electron loads that addon in `electron/preload.cjs`; `electron/index.js`
+- Node loads one composite N-API addon in `node/platform.js` and creates a
+  session synchronously.
+- Electron loads that addon in `electron/preload.cjs`; `electron/platform.js`
   talks to the preload bridge and keeps the native handle in the preload
   process.
 - Browser Wasm initializes one in-process wasm-bindgen glue module through
-  `browser/backend.js` and `browser/index.js`.
-- Harmony imports one composite OHOS native module from `Index.ets`.
+  `browser/platform.js` on the first asynchronous business call or explicit
+  `initialize`/`initializeWithGlue` call.
+- Harmony imports one composite OHOS native module from `platform.ets`.
 
 The public API and stream semantics are target-neutral. Only the transport,
 native artifact format, and initialization timing differ.
+
+Shared `[bindings.lifecycle]` configuration is validated before language
+renaming and carried through the normalized model into both facade printers.
+Configured resource close awaits cleanup and releases owned service references;
+it does not close the shared platform session. Ordinary references use weak
+wrapper state and finalization, with explicit owner-scoped caching only for
+configured synchronous, argument-free accessors. See the
+[resource and service contract](contract.md#resource-and-service-lifetimes).
 
 ## Wasm
 
@@ -104,24 +130,32 @@ writes the loader/wasm pair below the planned `browser/pkg` path. An external
 `wasm-bindgen` executable, CLI installation, or source checkout is neither a
 generation input nor a test prerequisite.
 
-`browser/backend.js` is inert until `initWithGlue` is called. The stable
-`browser/index.js` imports the planned glue once, exposes `ready`, and returns
-the same initialization promise from `init`. This prevents a second Wasm
-instance while preserving an explicit initialization path for applications
-that supply their own glue.
+`browser/platform.js` is lazy: asynchronous business calls await the same
+initialization promise as `initialize` or `initializeWithGlue`. Synchronous
+calls before initialization throw `UniffiNotInitialized`. Initialization failure
+reaches the awaiting caller. The ordinary `browser/index.js` exports only the
+business surface. After initialization, the platform's `getWasmExports()` returns
+the real glue module. `[bindings.javascript].wasmPlatformExports` selects raw
+platform exports during post-link and enables their generated declarations;
+these exports and the business backend use the same Wasm instance. See the
+[browser contract](contract.md#browser-wasm) for configuration and validation.
 
 ## Node, Electron, and Harmony
 
-`node/index.js` uses `createRequire` to load the planned composite `.node`
+`node/platform.js` uses `createRequire` to load the planned composite `.node`
 artifact, checks `__uniffi_backend_factory`, creates the host/session, and
-exports `session`, `close`, and each namespace. `electron/preload.cjs` keeps
+exports `session`, `close`, `releaseReference`, and each namespace.
+`node/index.js` re-exports the business surface. `electron/preload.cjs` keeps
 the native object private and exposes only the checked `__uniffiBackend`
-bridge; `electron/index.js` creates the renderer-side session over that bridge.
+bridge; `electron/platform.js` creates the renderer-side session over that
+bridge, and `electron/index.js` re-exports the business surface.
 
-`Index.ets` imports `lib<host-stem>.so`, creates the same backend/session pair,
-and exports the namespace values. `Index.d.ets` is the public Harmony
-declaration. `native/index.d.ts` is only the declaration consumed by the OHOS
-native package reader; it is not a second public API. HAR/HSP packaging reads
+`platform.ets` imports `lib<host-stem>.so`, creates the same backend/session pair,
+and supplies host facilities including `close`, `releaseReference`, and
+`CallController`. `Index.ets` and `Index.d.ets` re-export the business surface;
+`platform.d.ets` declares the host surface. `native/index.d.ts` is only the
+declaration consumed by the OHOS native package reader; it is not a second
+public API. HAR/HSP packaging reads
 these package-root files and the compiled libraries produced from the same
 host plan.
 

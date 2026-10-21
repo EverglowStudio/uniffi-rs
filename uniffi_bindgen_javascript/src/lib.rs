@@ -164,11 +164,15 @@ pub fn generate_package(
 
 /// Per-component config loaded from `uniffi.toml`.
 ///
-/// Empty for now; add fields here only when they are part of the
-/// supported long-term JavaScript target configuration surface.
+/// Platform exports refer to raw wasm-bindgen module names, independently of
+/// the business namespace and shared lifecycle declarations.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JsConfig {
+    #[serde(skip)]
+    pub lifecycle: uniffi_bindgen::LifecycleConfig,
+    #[serde(default)]
+    pub wasm_platform_exports: Vec<String>,
     #[serde(default)]
     pub custom_types: BTreeMap<String, CustomTypeConfig>,
 }
@@ -201,7 +205,9 @@ struct BindingsConfig {
 
 impl JsConfig {
     fn from_root_toml(toml: toml::Value) -> Result<Self> {
-        let root: RootConfig = toml.try_into()?;
+        let lifecycle = uniffi_bindgen::LifecycleConfig::from_root_toml(&toml)?;
+        let mut root: RootConfig = toml.try_into()?;
+        root.bindings.javascript.lifecycle = lifecycle;
         Ok(root.bindings.javascript)
     }
 
@@ -264,6 +270,24 @@ mod config_tests {
 
     fn parse(input: &str) -> anyhow::Result<JsConfig> {
         JsConfig::from_root_toml(toml::from_str(input)?)
+    }
+
+    #[test]
+    fn platform_exports_are_separate_from_shared_lifecycle() {
+        let config = parse(
+            r#"
+            [bindings.lifecycle]
+            close_methods = { Client = "close" }
+            owned_methods = ["Client.service"]
+            cached_methods = ["Client.service"]
+            [bindings.javascript]
+            wasmPlatformExports = ["PlatformStorage"]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.wasm_platform_exports, ["PlatformStorage"]);
+        assert_eq!(config.lifecycle.close_method("Client"), Some("close"));
+        assert!(config.lifecycle.is_cached("Client", "service"));
     }
 
     #[test]

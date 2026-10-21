@@ -174,6 +174,11 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
     let mut component_keys = BTreeMap::<String, ComponentKey>::new();
     let mut crate_owners = BTreeMap::<String, ComponentKey>::new();
     for component in &components {
+        component
+            .config
+            .lifecycle
+            .validate(&component.ci)
+            .map_err(|error| FrontendError::Contract(error.to_string()))?;
         let source_key = ComponentKey::new(component.ci.namespace().to_owned())
             .map_err(|error| FrontendError::Contract(error.to_string()))?;
         if component_keys
@@ -341,7 +346,36 @@ pub fn normalize(input: BindingInput<'_>) -> Result<NormalizedPackage, FrontendE
             "requested build target is outside the fixed JavaScript target universe".to_owned(),
         ));
     }
-    let resolved_config = resolve_config(&components, &crate_owners, &type_id_by_key);
+    let mut resolved_config = resolve_config(&components, &crate_owners, &type_id_by_key);
+    for operation in &js_operations {
+        let OperationOwner::Object(owner) = operation.source_key.owner() else {
+            continue;
+        };
+        if operation.kind != OperationKind::Method {
+            continue;
+        }
+        let component = components
+            .iter()
+            .find(|component| component.ci.namespace() == owner.component().namespace())
+            .expect("operation component");
+        let config = &component.config.lifecycle;
+        let method = operation.source_key.name();
+        if config.close_method(owner.name()) == Some(method) {
+            resolved_config
+                .lifecycle
+                .close_methods
+                .insert(type_id_by_key[owner], operation.id);
+        }
+        if config.is_owned(owner.name(), method) {
+            resolved_config.lifecycle.owned_methods.insert(operation.id);
+        }
+        if config.is_cached(owner.name(), method) {
+            resolved_config
+                .lifecycle
+                .cached_methods
+                .insert(operation.id);
+        }
+    }
     let api = JsApiIr {
         target_universe,
         resolved_config,
@@ -2620,7 +2654,14 @@ fn resolve_config(
             );
         }
     }
-    ResolvedJsConfig { custom_types }
+    ResolvedJsConfig {
+        custom_types,
+        lifecycle: Default::default(),
+        wasm_platform_exports: components
+            .iter()
+            .flat_map(|component| component.config.wasm_platform_exports.iter().cloned())
+            .collect(),
+    }
 }
 
 fn custom_type_config(config: Option<&CustomTypeConfig>, fallback: &str) -> JsCustomTypeConfig {
@@ -3363,6 +3404,8 @@ mod tests {
         let component = Component {
             ci: ComponentInterface::from_metadata(group).unwrap(),
             config: JsConfig {
+                lifecycle: Default::default(),
+                wasm_platform_exports: Default::default(),
                 custom_types: std::collections::BTreeMap::from([(
                     "r#type".to_owned(),
                     CustomTypeConfig {

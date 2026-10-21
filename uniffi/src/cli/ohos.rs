@@ -3721,6 +3721,11 @@ fn stage_package(
         .with_context(|| format!("OHOS package entry is not UTF-8: {index_path}"))?;
     std::fs::write(package_dir.join("Index.ets"), index_source)
         .with_context(|| format!("writing OHOS package Index.ets in {package_dir}"))?;
+    for name in ["platform.ets", "platform.d.ets"] {
+        let bytes = read_verified_regular_file(&package_dist_dir.join(name))?;
+        std::fs::write(package_dir.join(name), &bytes)?;
+        std::fs::write(package_dir.join("src/main/ets").join(name), &bytes)?;
+    }
     let declarations_destination = package_dir.join("Index.d.ets");
     let mut declarations_output = OpenOptions::new()
         .create_new(true)
@@ -5357,7 +5362,7 @@ fn require_generated_ark_files(
     generated_source_root: &Utf8Path,
     generated_package_root: &Utf8Path,
 ) -> Result<()> {
-    for name in ["Index.ets", "Index.d.ets"] {
+    for name in ["Index.ets", "Index.d.ets", "platform.ets", "platform.d.ets"] {
         require_regular_source_file(&generated_source_root.join(name))?;
     }
     require_regular_source_file(&generated_package_root.join("native/index.d.ts"))?;
@@ -5401,6 +5406,11 @@ fn emit_index_d_ts(
     let native_declarations = std::fs::read(&native_declarations_source).with_context(|| {
         format!("reading generated Harmony native declarations {native_declarations_source}")
     })?;
+    for name in ["platform.ets", "platform.d.ets"] {
+        let source = generated_source_root.join(name);
+        require_regular_source_file(&source)?;
+        std::fs::copy(&source, dist_dir.join(name))?;
+    }
     std::fs::write(dist_dir.join("Index.ets"), &index)
         .context("writing generated Harmony package source")?;
     std::fs::write(dist_dir.join("Index.d.ets"), &declarations)

@@ -620,7 +620,17 @@ pub enum DefaultValue {
 /// value: it carries no parser or renderer implementation details.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedJsConfig {
+    pub lifecycle: JsLifecycleConfig,
+    pub wasm_platform_exports: BTreeSet<String>,
     pub custom_types: BTreeMap<TypeSourceKey, JsCustomTypeConfig>,
+}
+
+/// Validated lifecycle declarations resolved to canonical IDs; no metadata ABI changes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct JsLifecycleConfig {
+    pub close_methods: BTreeMap<TypeId, OperationId>,
+    pub owned_methods: BTreeSet<OperationId>,
+    pub cached_methods: BTreeSet<OperationId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

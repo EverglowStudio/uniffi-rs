@@ -68,7 +68,16 @@ mod tests {
         )
         .expect("write node regression script");
 
+        fs::write(
+            root.join("lifecycle.mjs"),
+            include_str!("../tests/lifecycle-regression.mjs"),
+        )
+        .expect("write lifecycle regression script");
+        let mut script = fs::read_to_string(root.join("check.mjs")).unwrap();
+        script.push_str("\nawait import('./lifecycle.mjs');\n");
+        fs::write(root.join("check.mjs"), script).unwrap();
         let output = Command::new("node")
+            .arg("--expose-gc")
             .arg("check.mjs")
             .current_dir(&root)
             .output()

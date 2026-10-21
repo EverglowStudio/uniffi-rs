@@ -21,15 +21,19 @@ at package-root paths.
 | --- | --- | --- |
 | `shared/uniffi_runtime.js` | `uniffi_js_facade` ECMAScript runtime inventory | Component modules and Node/Web/Electron wrappers |
 | `shared/uniffi_runtime.d.ts` | Runtime declaration printer | TypeScript tooling only |
-| `components/<namespace>/index.js` | Shared facade printer | Platform wrappers call `createNamespace(session)` |
+| `components/<namespace>/index.js` | Shared facade printer | Consumer imports of business classes, enums, and errors |
 | `components/<namespace>/index.d.ts` | Shared facade declaration printer | TypeScript tooling and platform declaration imports |
+| `components/<namespace>/internal.js` and `.d.ts` | Shared facade printer | Platform hosts and tests call `createNamespace(session)` |
 | `support/**` | `artifacts build --javascript-support-dir <dir>` | Consumer-owned custom-type modules imported by generated facades |
-| `browser/backend.js` | `package.rs` browser renderer | `browser/index.js` supplies the glue and calls `initWithGlue` |
-| `browser/index.js` and `.d.ts` | `package.rs` browser entrypoint | Web or Mini Program package consumers |
-| `node/index.js` and `.d.ts` | `package.rs` Node entrypoint | Node ESM import; it loads the composite `.node` addon |
+| `browser/index.js` and `.d.ts` | `package.rs` browser entrypoint | Web business API consumers |
+| `browser/platform.js` and `.d.ts` | `package.rs` browser renderer | Hosts initialize Wasm, access platform exports, and close the session |
+| `node/index.js` and `.d.ts` | `package.rs` Node entrypoint | Node ESM business API consumers |
+| `node/platform.js` and `.d.ts` | `package.rs` Node renderer | Hosts load the composite `.node` addon and manage its session |
 | `electron/preload.cjs` | `package.rs` Electron preload | Electron preload process; it owns the native backend |
-| `electron/index.js` and `.d.ts` | `package.rs` Electron renderer entrypoint | Electron renderer; it calls the preload bridge |
-| `Index.ets` and `Index.d.ets` | `uniffi_js_facade::ark` plus the Harmony suffix | Harmony/OpenHarmony package root and ArkTS compiler |
+| `electron/index.js` and `.d.ts` | `package.rs` Electron renderer entrypoint | Electron renderer business API consumers |
+| `electron/platform.js` and `.d.ts` | `package.rs` Electron renderer | Hosts bind the preload bridge and manage its session |
+| `Index.ets` and `Index.d.ets` | `uniffi_js_facade::ark` business re-exports | Harmony/OpenHarmony business API consumers and ArkTS compiler |
+| `platform.ets` and `platform.d.ets` | `uniffi_js_facade::ark` plus the Harmony suffix | Harmony hosts use the runtime, native binding, and session lifecycle |
 | `native/index.d.ts` | `package.rs` | OHOS native package reader, not the public API |
 | `native/{wasm,node,ohos}.rs` | `package.rs` engine renderers | The matching generated host Cargo project |
 | `native/hosts/{wasm,napi,ohos}/` | `host_crates.rs` | Cargo; builds the composite native host |
@@ -60,7 +64,7 @@ example `type { EmailAddress } from "../../support/email.js"` in a
 `customTypes` entry. Generated shared modules retain that
 `components/<namespace>/`-relative spelling. The ArkTS printer resolves the
 same file and emits the package-root spelling
-`./support/email.js` in `Index.ets`, so Harmony receives the same support tree
+`./support/email.js` in `platform.ets`, so Harmony receives the same support tree
 when its package is staged. A support source and its generated destination may
 not overlap.
 
@@ -73,11 +77,10 @@ owner marker only protects the package root itself.
 
 ## Session and namespace surface
 
-Every component implementation exports:
-
-```ts
-export function createNamespace(session: BackendSession): Namespace;
-```
+Every `components/<namespace>/internal.js` exports `createNamespace(session)`
+for platform hosts and tests; browser hosts can supply a lazy session provider.
+The component's ordinary `index.js` and `index.d.ts` expose business values and
+types, without that factory or a bound session.
 
 The accompanying `Namespace` declaration contains that component's operations,
 records, enums, errors, object classes, and callback types. A platform entry
@@ -86,13 +89,18 @@ calls `createNamespace` once per component, and exports those values by their
 namespace names. A single component is still namespace-scoped; generated
 roots never flatten it into the platform module.
 
+Ordinary Node, browser, and Electron `index.js` entrypoints export only those
+business namespaces and `UniffiError`; their declarations also export
+`CallOptions`. Hosts import `session`, `close`, and `releaseReference` from the
+corresponding `platform.js` entrypoint.
+
 For ECMAScript targets, `shared/uniffi_runtime.js` supplies `BackendSession`,
 `Host`, conversion helpers, object leases, callback registries,
-`UniffiError`, and the controlled stream helpers. Harmony's `Index.ets` is
+`UniffiError`, and the controlled stream helpers. Harmony's `platform.ets` is
 printed from the same public AST with its ArkTS runtime definitions included;
-it does not import the ECMAScript runtime file. No generated runtime
-implementation is stored as a `.ts` file; `.d.ts` files contain declarations
-only.
+`Index.ets` re-exports the business surface. Neither imports the ECMAScript
+runtime file. No generated runtime implementation is stored as a `.ts` file;
+`.d.ts` files contain declarations only.
 
 ## Names and values
 
@@ -111,14 +119,54 @@ only.
 - Strict ArkTS exposes each declared error class directly from `Index.ets`.
   It does not re-export class constructors as component-object fields because
   ArkTS forbids constructor signatures and constructor type queries; callback
-  error payloads use the public `ArkRecord` carrier.
+  error payloads use the platform's `ArkRecord` carrier.
   Payload enums use `{ tag: "Variant", ... }` values and constructors on the
   companion value.
-- UniFFI interfaces become opaque classes. Native handles are kept by the
-  session; `dispose()` is idempotent and explicit disposal is preferred over
-  finalization.
+- UniFFI interfaces become opaque classes. Native handles and lease state stay
+  internal; business classes expose neither `ObjectLease` nor low-level
+  `dispose()`. Resource and service lifetimes follow the configuration below.
 - Declared errors are normalized as `UniffiError` with `errorName`, `variant`,
   `data`, `message`, and backend stack information when available.
+
+### Resource and service lifetimes
+
+Declare lifecycle roles explicitly in the shared `uniffi.toml` section, using
+Rust source type and method names before language renaming:
+
+```toml
+[bindings.lifecycle]
+close_methods = { ChatClient = "close", Subscription = "close" }
+owned_methods = ["ChatClient.auth", "ChatClient.conversation"]
+cached_methods = ["ChatClient.auth"]
+```
+
+Every named method must exist. A close method must be async, take no business
+arguments, and return unit or `Result<unit, E>`. An owned method must return an
+object directly; its receiver owns that reference. A cached method must also
+be owned, synchronous, and take no arguments. Invalid declarations are rejected
+before rendering. Parameterized services are not strongly cached, and roles
+are not inferred from names.
+
+For a configured resource, await its business close method, for example
+`await client.close()`. ECMAScript also maps `[Symbol.asyncDispose]` to that
+method when the runtime supports it; there is no synchronous disposal protocol.
+Repeated or concurrent closes share one promise, including failure. A caller's
+`CallOptions.signal` cannot cancel this shared cleanup. Close waits for native
+cleanup, owned streams, and in-flight calls, then releases the resource and its
+owned references. Other methods on a closing or closed resource, or its owned
+services, fail with `UniffiObjectClosed`. Closing one client does not close the
+shared platform session or another client.
+
+Ordinary service references are automatically reclaimed through weak wrapper
+state and finalization; they need no per-call disposal. A cached accessor reuses
+its service for that owner, and owner close releases owned references even if
+wrappers remain reachable. Finalization is best effort and does not close
+configured resources. Hosts or fixtures needing deterministic release of a
+non-resource reference use `releaseReference(object)` from `platform.js`; it
+defers release until in-flight calls finish and rejects configured resources
+with `UniffiResourceCloseRequired`. Subsequent use of a released ordinary
+reference fails with `UniffiUseAfterDispose`. ArkTS uses the same explicit close
+and automatic-reference rules, without the `Symbol.asyncDispose` protocol.
 
 ### Declared errors as ordinary ECMAScript values
 
@@ -221,9 +269,9 @@ explicitly when starting another independent call.
 
 A returned stream has its own subscription lifetime. After a stream factory has
 completed, close the stream itself rather than aborting the completed factory's
-signal. `await close()` on the generated platform root closes its session,
-rejects new work and waits for active calls, callbacks and stream cleanup.
-Application service shutdown methods remain separate business operations.
+signal. `await close()` imported from the generated `platform.js` entry closes
+its session, rejects new work and waits for active calls, callbacks and stream cleanup.
+Application resource close methods remain separate business operations.
 Close before destroying a Window, Worker or embedding environment; hard
 environment destruction is a failure boundary, not successful cleanup.
 
@@ -282,17 +330,19 @@ remains blocked forever. Use the explicit tagged pull interfaces in ArkTS.
 
 ### Node and Electron
 
-`node/index.js` synchronously imports `shared/uniffi_runtime.js`, loads the
+`node/platform.js` synchronously imports `shared/uniffi_runtime.js`, loads the
 planned composite addon with `createRequire`, checks
 `__uniffi_backend_factory`, creates a `Host` and `BackendSession`, and exports
-`session`, `close`, and the component namespaces. The addon path is the fixed,
+`session`, `close`, `releaseReference`, and the component namespaces.
+`node/index.js` re-exports the business surface. The addon path is the fixed,
 module-relative path planned with the composite host; there is no alternate
 generated loader or environment-selected package layout.
 
 `electron/preload.cjs` loads the same composite addon and exposes only
-`window.__uniffiBackend`. `electron/index.js` creates a renderer `Host`, binds
-it once to that bridge, and exposes the same namespace API. The native addon
-and its native resources remain owned by the preload/backend. The context bridge
+`window.__uniffiBackend`. `electron/platform.js` creates a renderer `Host`, binds
+it once to that bridge, and provides the host lifecycle API; `electron/index.js`
+re-exports the business surface. The native addon and its native resources
+remain owned by the preload/backend. The context bridge
 copies lease carriers across realms; the generated preload retains the original
 carrier and restores its identity on calls and release. Consumers use generated
 renderer objects and streams, rather than copying or reconstructing native lease
@@ -301,35 +351,63 @@ to the renderer.
 
 ### Browser Wasm
 
-`browser/backend.js` is inert until initialization. `browser/index.js` imports
-the one planned in-process wasm-bindgen glue module and exposes:
+`browser/index.js` exposes the business namespaces immediately. The first
+asynchronous operation, including an async constructor, waits for automatic
+initialization in `browser/platform.js`. Synchronous calls before initialization
+throw `UniffiError` with `errorName: "UniffiNotInitialized"`; initialization
+failure rejects the awaiting business call without a background unhandled
+rejection. Hosts can initialize explicitly through `browser/platform.js`:
 
 ```ts
-export const ready: Promise<ReadyApi>;
-export function init(input?: unknown): Promise<ReadyApi>;
+export function initialize(input?: unknown): Promise<void>;
+export function initializeWithGlue(glue: unknown, input?: unknown): Promise<void>;
 ```
 
-`ready` and `init` share one one-shot promise and one `BackendSession`. The
-public loader starts that promise with the deterministic module-relative URL
-created as `new URL(<planned wasm path>, import.meta.url)`; argument-free
-`init()` joins the same promise. The private `initWithGlue`
-coordinator remains in `browser/backend.js` and is not re-exported as a second
-public initialization API. The CLI uses the Rust
-`wasm-bindgen-cli-support` engine in process; an external `wasm-bindgen`
+Both functions and automatic initialization share one one-shot promise and one
+`BackendSession`. `initialize()` lazily imports the planned wasm-bindgen glue
+and defaults to `new URL(<planned wasm path>, import.meta.url)`.
+`initializeWithGlue` accepts a glue module, its promise, or a loader function;
+the first initialization selects the glue and input. The ordinary business
+entry exports no initialization `ready`, `init`, session, or module-level close.
+
+After initialization, `getWasmExports()` from `browser/platform.js` returns the
+actual glue module sharing that Wasm instance; earlier access throws
+`UniffiNotInitialized`. Select raw platform exports separately from lifecycle:
+
+```toml
+[bindings.javascript]
+wasmPlatformExports = ["BrowserStorage"]
+```
+
+Names refer to top-level wasm-bindgen JS exports; selecting a class includes
+its generated constructor and methods. Invalid names and collisions with the
+backend factory, registered operations, or resource hooks are rejected. Post-link
+also rejects missing, private, namespace, or import-only re-exports. Unlisted raw
+exports stay hidden. A nonempty list enables the real glue `.d.ts`, respecting
+wasm-bindgen TypeScript settings, and types `getWasmExports()` as
+`typeof import(<planned glue path>)`. An empty list exposes no selected raw
+platform API and types the result as `Record<string, unknown>`.
+
+The CLI uses the Rust `wasm-bindgen-cli-support` engine in process; an external `wasm-bindgen`
 executable, CLI installation, or source checkout is not a prerequisite.
 
 The Mini Program entrypoint is another Wasm consumption form. Managed layout
 emits `src/index.mini-program.js` and
-`src/ffi/browser/index.mini-program.js`; the latter reuses the browser backend
-and replaces browser loading with `WXWebAssembly.instantiate`. The generated
-Mini Program glue does not use `fetch`, `import.meta.url`, DOM globals, or
+`src/ffi/browser/index.mini-program.js`; the latter exposes business namespaces
+whose asynchronous calls initialize through `WXWebAssembly.instantiate`.
+Hosts use `browser/platform.mini-program.js` for `initialize`,
+`initializeWithGlue`, `setMiniProgramWebRuntime`, `getWasmExports`, `session`,
+`close`, and `releaseReference`; it shares the browser platform session. The
+generated Mini Program glue does not use `fetch`, `import.meta.url`, DOM globals, or
 Node-only module APIs.
 
 ### Harmony / OpenHarmony
 
-`Index.ets` imports `lib<host-stem>.so`, creates the OHOS `Host` and
-`BackendSession`, and exports the component namespaces. `Index.d.ets` is the
-public declaration consumed by ArkTS and by the final HAR/HSP package. The
+`platform.ets` imports `lib<host-stem>.so`, creates the OHOS `Host` and
+`BackendSession`, and provides the host runtime and lifecycle exports, with
+`platform.d.ets` declarations. `Index.ets` re-exports business types, component
+namespaces, `UniffiError`, and call/stream types. `Index.d.ets` is the business
+declaration consumed by ArkTS; HAR/HSP packages carry both entrypoint pairs. The
 native declaration at `native/index.d.ts` is consumed only by the OHOS native
 package reader. Streams remain pull-based and preserve typed errors. ArkTS uses a distinct
 public pull shape instead of ECMAScript `AsyncIterable`:
@@ -344,8 +422,9 @@ export interface UniFfiStream<T> {
 
 `ArkStreamStep<T>` has `kind: "item"` with a value, `kind: "done"`, or
 `kind: "error"` with an `UniffiError`. For async call cancellation, import the
-generated `CallController` and pass `{ signal: controller.signal }` as the final
-`CallOptions`; `controller.abort()` requests cancellation. No DOM globals are
+generated `CallController` from `platform.ets` and pass
+`{ signal: controller.signal }` as the final `CallOptions`;
+`controller.abort()` requests cancellation. No DOM globals are
 required. Await `stream.cancel()` to close a subscription. See the
 [multi-language examples](../futures.md#calling-the-same-rust-api-from-each-binding).
 

@@ -3206,7 +3206,7 @@ dependencies = [
 [[package]]
 name = "wasm-bindgen-cli-support"
 version = "0.2.126"
-source = "git+https://github.com/EverglowStudio/wasm-bindgen.git?rev=95e28e3037d04d318de157d2af2f37fa9a7363e4#95e28e3037d04d318de157d2af2f37fa9a7363e4"
+source = "git+https://github.com/EverglowStudio/wasm-bindgen.git?rev=a5fa47c46c1a6e77558e37e0e0ab3a5339e712cc#a5fa47c46c1a6e77558e37e0e0ab3a5339e712cc"
 dependencies = [
  "anyhow",
  "base64",
@@ -3258,7 +3258,7 @@ dependencies = [
 [[package]]
 name = "wasm-bindgen-macro-support"
 version = "0.2.126"
-source = "git+https://github.com/EverglowStudio/wasm-bindgen.git?rev=95e28e3037d04d318de157d2af2f37fa9a7363e4#95e28e3037d04d318de157d2af2f37fa9a7363e4"
+source = "git+https://github.com/EverglowStudio/wasm-bindgen.git?rev=a5fa47c46c1a6e77558e37e0e0ab3a5339e712cc#a5fa47c46c1a6e77558e37e0e0ab3a5339e712cc"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -3279,12 +3279,12 @@ dependencies = [
 [[package]]
 name = "wasm-bindgen-uniffi-engine"
 version = "0.2.126"
-source = "git+https://github.com/EverglowStudio/wasm-bindgen.git?rev=95e28e3037d04d318de157d2af2f37fa9a7363e4#95e28e3037d04d318de157d2af2f37fa9a7363e4"
+source = "git+https://github.com/EverglowStudio/wasm-bindgen.git?rev=a5fa47c46c1a6e77558e37e0e0ab3a5339e712cc#a5fa47c46c1a6e77558e37e0e0ab3a5339e712cc"
 dependencies = [
  "proc-macro2",
  "quote",
  "wasm-bindgen-cli-support",
- "wasm-bindgen-macro-support 0.2.126 (git+https://github.com/EverglowStudio/wasm-bindgen.git?rev=95e28e3037d04d318de157d2af2f37fa9a7363e4)",
+ "wasm-bindgen-macro-support 0.2.126 (git+https://github.com/EverglowStudio/wasm-bindgen.git?rev=a5fa47c46c1a6e77558e37e0e0ab3a5339e712cc)",
 ]
 
 [[package]]

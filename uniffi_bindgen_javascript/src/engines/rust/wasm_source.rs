@@ -111,6 +111,8 @@ pub(crate) fn post_link(
 ) -> Result<wasm_bindgen_uniffi_engine::PostLinkOutput> {
     let plan = engine_plan(package)?;
     plan.post_link(wasm_path, module_name, target)
+        .with_platform_exports(package.api.resolved_config.wasm_platform_exports.clone())
+        .map_err(|error| anyhow!("wasm platform exports: {error}"))?
         .run()
         .map_err(|error| anyhow!("wasm post-link: {error}"))
 }

@@ -971,13 +971,14 @@ export class BackendSession {
       frame.cleanup = Promise.allSettled(pending).then((results) => {
         const failure = results.find((result) => result.status === "rejected");
         if (failure) throw failure.reason;
-      });
+      }).finally(() => finishObjectFrame(frame));
       this.frameCleanups.add(frame.cleanup);
       frame.cleanup.then(() => this.frameCleanups.delete(frame.cleanup), (error) => {
         this.frameCleanups.delete(frame.cleanup);
         this.cleanupErrors.push(error);
       });
     }
+    if (!pending) finishObjectFrame(frame);
     return frame.cleanup;
   }
   retainCallback(callbackType, callbackId) { return this.callbacks.retain(callbackType, callbackId); }
@@ -1261,7 +1262,7 @@ export class BackendSession {
     await this._awaitIdle();
     while (this.frameCleanups.size) await Promise.allSettled([...this.frameCleanups]);
     if (this.detached) throw environmentDestroyedError();
-    for (const lease of [...this.objects]) { try { lease.dispose(); } catch (error) { errors.push(error); } }
+    for (const lease of [...this.objects]) { try { releaseObjectState(lease); } catch (error) { errors.push(error); } }
     this.callbacks.drain();
     // Engine destruction follows Rust and host-resource cleanup confirmation.
     if (typeof this.backend.close === "function") {
@@ -1328,59 +1329,171 @@ export function createBackendSession(backend, host, options) {
 
 const OBJECT_LEASE_STATE = new WeakMap();
 const OBJECT_CLASS_REGISTRY = new Map();
+// These maps are keyed by wrappers: the session's lease records never root a
+// wrapper, its owner, or its cached services.
+const OBJECT_OWNERS = new WeakMap();
+const OBJECT_SERVICE_CACHE = new WeakMap();
+const OBJECT_FINALIZER = new FinalizationRegistry((state) => releaseObjectState(state));
 
-export class ObjectLease {
-  constructor() {
-    throw new UniffiError({
-      errorName: "UniffiObjectConstructor",
-      message: "object wrappers are created by the generated facade",
-    });
-  }
-  dispose() {
-    const state = OBJECT_LEASE_STATE.get(this);
-    if (!state || state.disposed) return;
-    state.disposed = true;
-    const handle = state.handle;
-    state.handle = null;
-    try {
-      if (state.session) {
-        state.session.objects?.delete(this);
-        state.session.releaseObject(handle);
-      }
-    } catch (_) {}
-  }
+function releaseObjectState(state) {
+  if (state.disposed) return;
+  state.releaseRequested = true;
+  if (state.active !== 0) return;
+  state.disposed = true;
+  OBJECT_FINALIZER.unregister(state);
+  for (const child of [...state.children]) releaseObjectState(child);
+  state.children.clear();
+  state.owner?.children.delete(state);
+  state.session.objects?.delete(state);
+  const handle = state.handle;
+  state.handle = null;
+  state.session.releaseObject(handle);
 }
 
-function createObjectWrapper(PublicClass, session, typeId, handle) {
-  if (typeof PublicClass !== "function") {
-    throw new UniffiError({ errorName: "UniffiTypeDescriptor", message: "object class descriptor is not constructible" });
-  }
-  if (!session || typeof session !== "object") {
-    throw new UniffiError({ errorName: "UniffiObjectSession", message: "object wrapper requires a backend session" });
-  }
+// Internal host/test escape hatch. Generated business classes do not expose it.
+export function disposeObject(object) {
+  const state = OBJECT_LEASE_STATE.get(object);
+  if (state?.resource) throw new UniffiError({ errorName: "UniffiResourceCloseRequired", message: "await the resource close method before releasing its reference" });
+  if (state) releaseObjectState(state);
+}
+
+function createObjectWrapper(PublicClass, session, typeId, handle, resource = false) {
+  if (typeof PublicClass !== "function") throw new UniffiError({ errorName: "UniffiTypeDescriptor", message: "object class descriptor is not constructible" });
+  if (!session || typeof session !== "object") throw new UniffiError({ errorName: "UniffiObjectSession", message: "object wrapper requires a backend session" });
   const object = Object.create(PublicClass.prototype);
-  OBJECT_LEASE_STATE.set(object, { handle, session, typeId, disposed: false });
-  session.objects?.add(object);
+  const state = { handle, session, typeId, disposed: false, releaseRequested: false,
+    resource, streams: new Set(), active: 0, idle: new Set(), children: new Set(), owner: null, closing: false, closePromise: null };
+  OBJECT_LEASE_STATE.set(object, state);
+  session.objects?.add(state);
+  // GC releases references only. External resources require an awaited close.
+  if (!resource) OBJECT_FINALIZER.register(object, state, state);
   return object;
 }
 
 function objectState(value, expectedSession = null, expectedTypeId = null) {
   const state = OBJECT_LEASE_STATE.get(value);
-  if (!state || state.disposed) throw new UniffiError({ errorName: "UniffiUseAfterDispose", message: "object lease was disposed" });
+  if (!state) throw new UniffiError({ errorName: "UniffiUseAfterDispose", message: "object lease was disposed" });
+  for (let owner = state; owner; owner = owner.owner) {
+    if (owner.closing) throw new UniffiError({ errorName: "UniffiObjectClosed", message: "object owner is closing or closed" });
+  }
+  if (state.disposed || state.releaseRequested) throw new UniffiError({ errorName: "UniffiUseAfterDispose", message: "object lease was disposed" });
   if (expectedSession && state.session !== expectedSession) throw new UniffiError({ errorName: "UniffiObjectSession", message: "object lease belongs to another backend session" });
   if (expectedTypeId !== null && expectedTypeId !== undefined && state.typeId !== expectedTypeId) {
     throw new UniffiError({ errorName: "UniffiObjectType", message: "object lease belongs to another object type" });
+  }
+  for (let owner = state; owner; owner = owner.owner) {
+    if (owner.closing || owner.disposed || owner.releaseRequested) throw new UniffiError({ errorName: "UniffiObjectClosed", message: "object owner is closing or closed" });
   }
   return state;
 }
 
 function objectHandle(value, expectedSession = null, expectedTypeId = null) {
-  return objectState(value, expectedSession, expectedTypeId).handle;
+  const state = objectState(value, expectedSession, expectedTypeId);
+  const frames = SESSION_FRAME_STATE.get(state.session)?.active;
+  const frame = frames?.[frames.length - 1];
+  if (frame) {
+    // Retain each wrapper through argument conversion, the native call, and
+    // asynchronous frame cleanup. Explicit disposal cannot release it early.
+    frame.objects ??= new Map();
+    if (!frame.objects.has(state)) { state.active += 1; frame.objects.set(state, value); }
+  }
+  return state.handle;
+}
+
+function finishObjectFrame(frame) {
+  if (!frame.objects) return;
+  for (const state of frame.objects.keys()) releaseObjectCall(state);
+  frame.objects.clear();
+}
+
+function releaseObjectCall(state) {
+  state.active -= 1;
+  if (state.active === 0) {
+    for (const resolve of state.idle) resolve();
+    state.idle.clear();
+    if (state.releaseRequested) releaseObjectState(state);
+  }
+}
+
+function cancelObjectStreams(state) {
+  return [...state.streams].map((stream) => stream.cancel()).concat([...state.children].flatMap(cancelObjectStreams));
+}
+
+async function awaitObjectIdle(state) {
+  await Promise.all([...state.children].map(awaitObjectIdle));
+  if (state.active !== 0) await new Promise((resolve) => state.idle.add(resolve));
+}
+
+function inheritObjectClose(state, completion) {
+  for (const child of state.children) {
+    if (child.resource && !child.closePromise) {
+      child.closing = true;
+      child.closePromise = completion;
+    }
+    inheritObjectClose(child, completion);
+  }
+}
+
+function closeObject(lease, descriptor, args) {
+  const state = OBJECT_LEASE_STATE.get(lease);
+  if (state?.closePromise) return state.closePromise;
+  objectState(lease, null, descriptor.receiverTypeId);
+  if (args.length > 1) throw new UniffiError({ errorName: "UniffiArgumentCount", message: "close takes only optional CallOptions" });
+  callSignal(args[0] === undefined ? EMPTY_CALL_OPTIONS : args[0]);
+  state.closing = true;
+  state.active += 1;
+  // Publish before native reentry. Caller cancellation never interrupts shared
+  // resource cleanup: every caller observes its actual completion or failure.
+  state.closePromise = Promise.resolve().then(async () => {
+    try {
+      const cleanup = makeOperation(state.session, descriptor)(state.handle);
+      const results = await Promise.allSettled([cleanup, ...cancelObjectStreams(state)]);
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+    }
+    finally {
+      releaseObjectCall(state);
+      await awaitObjectIdle(state);
+      releaseObjectState(state);
+      OBJECT_SERVICE_CACHE.delete(lease);
+    }
+  });
+  // Owned resource cleanup belongs to its owner. A subsequent child.close()
+  // observes that same completion, including failure, even after its release.
+  inheritObjectClose(state, state.closePromise);
+  state.closePromise.catch(() => {});
+  return state.closePromise;
 }
 
 export function invokeObjectOperation(lease, descriptor, args = []) {
+  if (descriptor.resourceClose) return closeObject(lease, descriptor, args);
   const state = objectState(lease, null, descriptor?.receiverTypeId);
-  return makeOperation(state.session, descriptor)(lease, ...args);
+  let cache;
+  if (descriptor.cached) {
+    if (args.length) throw new UniffiError({ errorName: "UniffiArgumentCount", message: "cached service accessor takes no arguments" });
+    cache = OBJECT_SERVICE_CACHE.get(lease);
+    if (!cache) { cache = new Map(); OBJECT_SERVICE_CACHE.set(lease, cache); }
+    const cached = cache.get(descriptor.id);
+    const cachedState = cached && OBJECT_LEASE_STATE.get(cached);
+    if (cachedState && !cachedState.disposed && !cachedState.releaseRequested) return cached;
+  }
+  const attach = (value) => {
+    if (descriptor.owned) {
+      const child = OBJECT_LEASE_STATE.get(value);
+      if (!child) throw new UniffiError({ errorName: "UniffiObjectType", message: "owned method must return an object wrapper" });
+      if (state.closing || state.disposed || state.releaseRequested) {
+        releaseObjectState(child);
+        throw new UniffiError({ errorName: "UniffiObjectClosed", message: "object owner closed during service creation" });
+      }
+      child.owner = state;
+      state.children.add(child);
+      OBJECT_OWNERS.set(value, lease);
+      cache?.set(descriptor.id, value);
+    }
+    return value;
+  };
+  const result = makeOperation(state.session, descriptor)(lease, ...args);
+  return descriptor.async ? result.then(attach) : attach(result);
 }
 
 function normalizeOperationError(raw, descriptor, session) {
@@ -1831,10 +1944,10 @@ export function lowerValue(value, descriptor, context = null, session = null, op
             const contract = { ...canonical, methods: named.methods || {}, context };
             return session && session.registerCallback ? session.registerCallback(callbackTypeId, value, contract) : value;
           }
-          if (!named.callbackOnly && value instanceof ObjectLease) return objectHandle(value, session, descriptor.typeId);
+          if (!named.callbackOnly && OBJECT_LEASE_STATE.has(value)) return objectHandle(value, session, descriptor.typeId);
           throw new UniffiError({ errorName: "UniffiCallbackContract", message: `missing canonical callback contract at ${path || "unknown path"}` });
         }
-        if (!(value instanceof ObjectLease)) throw new UniffiError({ errorName: "UniffiObjectType", message: `expected object wrapper ${descriptor.name}` });
+        if (!OBJECT_LEASE_STATE.has(value)) throw new UniffiError({ errorName: "UniffiObjectType", message: `expected object wrapper ${descriptor.name}` });
         return objectHandle(value, session, descriptor.typeId);
       }
       if (named.kind === "callback") {
@@ -1936,7 +2049,7 @@ export function liftValue(value, descriptor, session = null, context = null, ope
         const classEntry = context?.classes?.[descriptor.typeId];
         if (!classEntry) throw new UniffiError({ errorName: "UniffiTypeDescriptor", message: `missing object class descriptor ${String(descriptor.typeId)}` });
         if (typeof classEntry.construct === "function") return classEntry.construct(session, value);
-        if (typeof classEntry.publicClass === "function") return createObjectWrapper(classEntry.publicClass, session, descriptor.typeId, value);
+        if (typeof classEntry.publicClass === "function") return createObjectWrapper(classEntry.publicClass, session, descriptor.typeId, value, classEntry.resource === true);
         throw new UniffiError({ errorName: "UniffiTypeDescriptor", message: `invalid object class descriptor ${String(descriptor.typeId)}` });
       }
       if (named.kind === "record") {
@@ -1967,6 +2080,11 @@ function isImmediateScalar(descriptor) {
 }
 
 function makeOperation(session, descriptor) {
+  if (typeof session === "function") {
+    return (...args) => descriptor.async
+      ? Promise.resolve().then(session).then((readySession) => makeOperation(readySession, descriptor)(...args))
+      : makeOperation(session.sync(), descriptor)(...args);
+  }
   const businessCount = descriptor.args.length + (descriptor.receiver || descriptor.valueSelf ? 1 : 0);
   const scalarCompletion = descriptor.async && !descriptor.throws
     && !descriptor.valueSelf && descriptor.ownerSurface !== "value"
@@ -2006,7 +2124,7 @@ function makeOperation(session, descriptor) {
       nativeReceiver = descriptor.receiver
         ? descriptor.ownerSurface === "value"
           ? lowerValue(receiver, { kind: "named", name: descriptor.receiverType, typeId: descriptor.receiverTypeId }, descriptor.context || descriptor, session, descriptor, "receiver")
-          : (receiver instanceof ObjectLease ? objectHandle(receiver, session, descriptor.receiverTypeId) : receiver)
+          : (OBJECT_LEASE_STATE.has(receiver) ? objectHandle(receiver, session, descriptor.receiverTypeId) : receiver)
         : receiver;
       nativeArgs = descriptor.receiver || descriptor.valueSelf ? [nativeReceiver, ...lowered] : lowered;
       // Reserve omitted RustDefault slots so the control ID stays after every
@@ -2026,27 +2144,37 @@ function makeOperation(session, descriptor) {
       const resource = streamResourceAt(descriptor, "return", "Output");
       const nextId = streamSlot(resource, "OutputStreamNext");
       const cancelId = streamSlot(resource, "OutputStreamCancel");
+      const ownerState = OBJECT_LEASE_STATE.get(receiver);
+      let stream;
+      const rememberStream = (result) => { stream = result; ownerState?.streams.add(result); return result; };
       const streamOptions = {
         _nextOperation: nextId,
         cancel: (handle) => session._invokeCleanupAsync(cancelId, [handle]),
         liftItem: (item) => liftValue(item, descriptor.returnType.inner, session, descriptor.context || descriptor, descriptor),
         liftError: streamErrorLifter(resource, descriptor.context || descriptor, session, descriptor),
-        onClose: finishFrame,
+        onClose: () => { ownerState?.streams.delete(stream); return finishFrame(); },
       };
       if (descriptor.async) {
         return track(session.invokeAsync(descriptor.id, nativeArgs, options).then(async (handle) => {
-          if (session.phase !== "open") {
-            try { await session._invokeCleanupAsync(cancelId, [handle]); }
-            finally { await session.releaseOutputStream(handle); await finishFrame(); }
-            throw closedError();
+          let unavailable = session.phase !== "open" ? closedError() : null;
+          if (!unavailable && ownerState) {
+            try { objectState(receiver); } catch (error) { unavailable = error; }
           }
-          return session.createOutputStream({ ...streamOptions, handle });
+          if (unavailable) {
+            try { await session._invokeCleanupAsync(cancelId, [handle]); }
+            finally {
+              try { await session.releaseOutputStream(handle); }
+              finally { await finishFrame(); }
+            }
+            throw unavailable;
+          }
+          return rememberStream(session.createOutputStream({ ...streamOptions, handle }));
         }, async (error) => { await finishFrame(); throw normalizeOperationError(error, descriptor, session); }));
       }
-      return session.createOutputStream({ ...streamOptions, start: () => {
+      return rememberStream(session.createOutputStream({ ...streamOptions, start: () => {
         try { return session.invokeSync(descriptor.id, nativeArgs); }
         catch (error) { throw normalizeOperationError(error, descriptor, session); }
-      } });
+      } }));
     }
     const lift = (value) => descriptor.returnType == null
       ? undefined
@@ -2101,7 +2229,7 @@ function enumVariantConstructor(variantName, variantDescriptor) {
 /** Construct a namespace facade from descriptors emitted by the Rust AST
  * printer.  Every call goes through the session's dense operation ID. */
 export function createFacade(session, descriptors = {}) {
-  if (!session || typeof session.invokeSync !== "function" || typeof session.invokeAsync !== "function") throw new UniffiError({ errorName: "UniffiSessionType", message: "createFacade requires a BackendSession" });
+  if (typeof session !== "function" && (!session || typeof session.invokeSync !== "function" || typeof session.invokeAsync !== "function")) throw new UniffiError({ errorName: "UniffiSessionType", message: "createFacade requires a BackendSession" });
   const namespace = {};
   // Keep the shared base error constructor available on every component
   // namespace.  Generated component modules export it as well, and exposing
@@ -2136,7 +2264,7 @@ export function createFacade(session, descriptors = {}) {
     if (typeof PublicClass !== "function") continue;
     const canonicalEntry = {
       ...canonical,
-      construct: (ownerSession, handle) => createObjectWrapper(PublicClass, ownerSession, Number(typeId), handle),
+      construct: (ownerSession, handle) => createObjectWrapper(PublicClass, ownerSession, Number(typeId), handle, canonical.resource === true),
     };
     descriptors.classes[typeId] = canonicalEntry;
     const BoundClass = function BoundObjectConstructor() {

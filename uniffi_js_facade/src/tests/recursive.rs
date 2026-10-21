@@ -258,7 +258,7 @@ fn recursive_metadata_builds_both_facades_for_node() {
             .iter()
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>(),
-        ["Index.ets", "Index.d.ets"]
+        ["platform.ets", "platform.d.ets", "Index.ets", "Index.d.ets"]
     );
     assert_eq!(
         render_ark_inventory(&facade.ast).unwrap(),
@@ -391,15 +391,15 @@ const ts = require(process.env.UNIFFI_ARK_TYPESCRIPT);
 const options = {target:ts.ScriptTarget.ES2021, module:ts.ModuleKind.CommonJS, strict:true,
   useUnknownInCatchVariables:false, lib:['lib.es2021.d.ts'], outDir:'out', allowNonTsExtensions:true};
 const host = ts.createIncrementalCompilerHost(options);
-const builder = ts.createIncrementalProgram({rootNames:[path.resolve('Index.ets')], options, host});
+const builder = ts.createIncrementalProgram({rootNames:[path.resolve('platform.ets')], options, host});
 const program = builder.getProgram();
 const diagnostics = ts.getPreEmitDiagnostics(program)
   .concat(ts.ArkTSLinter_1_1.runArkTSLinter(builder, undefined, undefined, 'ArkTS_1_1'))
-  .concat(ts.getPreEmitDiagnostics(ts.createProgram([path.resolve('Index.d.ets')], options)));
+  .concat(ts.getPreEmitDiagnostics(ts.createProgram([path.resolve('platform.d.ets')], options)));
 for (const diagnostic of diagnostics) console.log(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
 assert.equal(diagnostics.filter(d => d.category === ts.DiagnosticCategory.Error).length, 0, 'strict ArkTS/declaration errors');
 assert.equal(program.emit().emitSkipped, false);
-const ark = require('./out/Index.js');
+const ark = require('./out/platform.js');
 const hostApi = new ark.Host();
 let backendCalls = 0;
 let returned;
