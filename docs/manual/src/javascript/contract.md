@@ -156,6 +156,9 @@ cleanup, owned streams, and in-flight calls, then releases the resource and its
 owned references. Other methods on a closing or closed resource, or its owned
 services, fail with `UniffiObjectClosed`. Closing one client does not close the
 shared platform session or another client.
+Normal owner shutdown ends its owned streams with `done: true`, including a
+pending pull after cleanup. Concurrent stream or cleanup errors remain visible.
+Explicit stream `cancel()` or `return()` retains its cancellation semantics.
 
 Ordinary service references are automatically reclaimed through weak wrapper
 state and finalization; they need no per-call disposal. A cached accessor reuses

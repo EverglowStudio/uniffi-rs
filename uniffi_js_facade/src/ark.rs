@@ -1644,7 +1644,7 @@ export interface ArkOutputSpec<T> {
 class ArkOutputStream<T> implements UniFfiStream<T> {
   private readonly session: BackendSession;
   private readonly spec: ArkOutputSpec<T>;
-  private phase: "idle" | "starting" | "active" | "done" | "cancelled" = "idle";
+  private phase: "idle" | "starting" | "active" | "done" | "cancelled" | "closed" = "idle";
   private handle: ArkValue | null = null;
   private pending: boolean = false;
   private detached: boolean = false;
@@ -1654,6 +1654,7 @@ class ArkOutputStream<T> implements UniFfiStream<T> {
   private releasePromise: Promise<void> | null = null;
   constructor(session: BackendSession, spec: ArkOutputSpec<T>) { this.session = session; this.spec = spec; if (spec.handle !== undefined) this.handle = spec.handle; }
   private cancelled(): boolean { return this.phase === "cancelled"; }
+  private closed(): boolean { return this.phase === "closed"; }
   private finish(): Promise<void> {
     if (this.releasePromise !== null) return this.releasePromise;
     this.releasePromise = Promise.resolve().then(async (): Promise<void> => {
@@ -1689,35 +1690,42 @@ class ArkOutputStream<T> implements UniFfiStream<T> {
   }
   private async nextInner(): Promise<ArkStreamStep<T>> {
     if (this.detached) throw __environmentDestroyed();
-    if (this.phase === "done" || this.phase === "cancelled") { if (this.closePromise !== null) await this.closePromise; return new ArkDoneStep(); }
+    if (this.phase === "done" || this.phase === "cancelled" || this.phase === "closed") { if (this.closePromise !== null) await this.closePromise; return new ArkDoneStep(); }
     this.pending = true;
     try {
       await this.ensureStarted();
-      if (this.phase !== "active") { await this.closePromise; return new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled")); }
+      if (this.phase !== "active") { await this.closePromise; return this.closed() ? new ArkDoneStep() : new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled")); }
       const handle: ArkValue = this.handle as ArkValue;
       this.nextPromise = Promise.resolve().then((): Promise<ArkCallResult> => this.spec.next(handle));
       const raw: ArkCallResult | __ArkDetachedMarker = await this.session.guardPromise(this.nextPromise);
       if (raw === __DETACHED || this.detached) throw __environmentDestroyed();
-      if (this.phase !== "active") { await this.closePromise; return new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled")); }
+      if (this.phase !== "active") await this.closePromise;
+      if (this.cancelled()) return new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled"));
       const value: ArkValue = __decodeResult(raw as ArkCallResult);
       const kind: ArkValue = __arkStreamStepField(value, "kind");
-      if (kind === "item") return new ArkItemStep<T>(this.spec.lift(__arkStreamStepField(value, "value")));
-      if (kind !== "done" && kind !== "error") throw new UniffiError("UniffiStreamProtocol", "invalid stream step tag");
-      this.phase = "done";
-      await this.finish();
-      return kind === "done" ? new ArkDoneStep() : new ArkErrorStep(this.spec.error(__arkStreamStepField(value, "error")));
+      if (kind !== "item" && kind !== "done" && kind !== "error") throw new UniffiError("UniffiStreamProtocol", "invalid stream step tag");
+      if (this.phase === "active") {
+        if (kind === "item") return new ArkItemStep<T>(this.spec.lift(__arkStreamStepField(value, "value")));
+        this.phase = "done";
+        await this.finish();
+      }
+      return kind === "error" ? new ArkErrorStep(this.spec.error(__arkStreamStepField(value, "error"))) : new ArkDoneStep();
     } catch (error) {
       if (this.detached) throw __environmentDestroyed();
       if (this.cancelled()) { await this.closePromise; return new ArkErrorStep(new UniffiError("UniffiCancelled", "stream cancelled")); }
-      if (this.phase !== "done") await this.cancel();
+      if (this.closed()) await this.closePromise;
+      else if (this.phase !== "done") await this.cancel();
       const reason: UniffiError | null = __arkAsUniffiError(error);
       return new ArkErrorStep(reason === null ? new UniffiError("UniffiStreamError", error.message) : reason);
     } finally { this.pending = false; this.nextPromise = null; }
   }
-  cancel(): Promise<void> {
+  cancel(): Promise<void> { return this.close("cancelled"); }
+  // Internal concrete stream method; UniFfiStream keeps its public cancel API.
+  closeFromOwner(): Promise<void> { return this.close("closed"); }
+  private close(terminalPhase: "cancelled" | "closed"): Promise<void> {
     if (this.closePromise !== null) return this.closePromise;
     if (this.phase === "done") return this.finish();
-    this.phase = "cancelled";
+    this.phase = terminalPhase;
     this.closePromise = Promise.resolve().then(async (): Promise<void> => {
       const errors: Array<Error> = [];
       if (this.startPromise !== null) {
@@ -1849,7 +1857,7 @@ function __closeObject(value: Object, cleanup: (session: BackendSession, handle:
   state.closePromise = Promise.resolve().then(async (): Promise<void> => {
     try {
       const errors: Array<Error> = [];
-      const pending: Array<Promise<void>> = [cleanup(state.session, state.handle), __cancelObjectStreams(state)];
+      const pending: Array<Promise<void>> = [cleanup(state.session, state.handle), __closeObjectStreams(state)];
       await Promise.all(pending.map((promise: Promise<void>): Promise<void> => promise.catch((error: Error): void => { errors.push(error); })));
       if (errors.length > 0) throw errors[0];
     }
@@ -1861,10 +1869,10 @@ function __closeObject(value: Object, cleanup: (session: BackendSession, handle:
 }
 function __trackOwnedStream(value: Object, stream: UniFfiStream<ArkValue>): void { __objectState(value).streams.add(stream); }
 function __untrackOwnedStream(value: Object, stream: UniFfiStream<ArkValue>): void { __objectState(value).streams.delete(stream); }
-async function __cancelObjectStreams(state: ArkObjectState): Promise<void> {
+async function __closeObjectStreams(state: ArkObjectState): Promise<void> {
   const errors: Array<Error> = [];
-  const pending: Array<Promise<void>> = Array.from(state.streams).map((stream: UniFfiStream<ArkValue>): Promise<void> => stream.cancel());
-  for (const child of Array.from(state.children)) pending.push(__cancelObjectStreams(child));
+  const pending: Array<Promise<void>> = Array.from(state.streams).map((stream: UniFfiStream<ArkValue>): Promise<void> => (stream as ArkOutputStream<ArkValue>).closeFromOwner());
+  for (const child of Array.from(state.children)) pending.push(__closeObjectStreams(child));
   await Promise.all(pending.map((promise: Promise<void>): Promise<void> => promise.catch((error: Error): void => { errors.push(error); })));
   if (errors.length > 0) throw errors[0];
 }

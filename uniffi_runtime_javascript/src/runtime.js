@@ -688,6 +688,8 @@ class InputStreamHost extends Host {
 
 const SESSION_FRAME_STATE = new WeakMap();
 
+const OUTPUT_STREAM_OWNER_CLOSE = new WeakMap();
+
 export class BackendSession {
   constructor(backend, host, options) {
     if (!backend || typeof backend !== "object") throw new UniffiError({ errorName: "UniffiBackendType", message: "backend must be an object" });
@@ -1143,11 +1145,11 @@ export class BackendSession {
       startPromise.catch(() => {});
       return startPromise;
     };
-    const cancel = () => {
+    const close = (terminalPhase) => {
       if (closePromise) return closePromise;
       if (phase === "done") return release();
       const starting = phase === "starting" ? startPromise : null;
-      phase = "cancelled";
+      phase = terminalPhase;
       let resolve, reject;
       closePromise = new Promise((yes, no) => { resolve = yes; reject = no; });
       closePromise.catch(() => {});
@@ -1175,15 +1177,16 @@ export class BackendSession {
       })().then(resolve, reject);
       return closePromise;
     };
+    const cancel = () => close("cancelled");
     const stream = {
       async next() {
         if (detached) throw environmentDestroyedError();
         if (pending) throw new UniffiError({ errorName: "UniffiStreamConcurrentNext", message: "concurrent output stream pull" });
-        if (phase === "cancelled" || phase === "done") { if (closePromise) await closePromise; return terminal(); }
+        if (phase === "cancelled" || phase === "closed" || phase === "done") { if (closePromise) await closePromise; return terminal(); }
         pending = true;
         try {
           if (phase !== "active") await ensureStarted();
-          if (phase !== "active") { await closePromise; throw cancelledError(); }
+          if (phase !== "active") { await closePromise; if (phase === "closed") return terminal(); throw cancelledError(); }
           const operationId = options._nextOperation;
           if (operationId === undefined && typeof options.next !== "function") throw streamPlanError("output stream is missing canonical next operation");
           const next = session._createGuard(session.generation, operationId === undefined ? undefined : (raw) => raw === DETACHED ? raw : unwrapEnvelope(raw));
@@ -1200,17 +1203,21 @@ export class BackendSession {
           catch (error) { next.reject(error); }
           const raw = await nextPromise;
           if (raw === DETACHED || detached) throw environmentDestroyedError();
-          if (phase !== "active") { await closePromise; throw cancelledError(); }
+          if (phase !== "active") await closePromise;
+          if (phase === "cancelled") throw cancelledError();
           const step = validateStep(raw);
-          if (step.kind === "item") return { done: false, value: typeof options.liftItem === "function" ? options.liftItem(step.value) : step.value };
-          phase = "done";
-          await release();
+          if (phase === "active") {
+            if (step.kind === "item") return { done: false, value: typeof options.liftItem === "function" ? options.liftItem(step.value) : step.value };
+            phase = "done";
+            await release();
+          }
           if (step.kind === "error") throw (typeof options.liftError === "function" ? options.liftError(step.error) : asUniffiError(step.error));
           return terminal();
         } catch (error) {
           if (detached) throw environmentDestroyedError();
           if (phase === "cancelled") { await closePromise; throw cancelledError(); }
-          if (phase !== "done") await cancel();
+          if (phase === "closed") await closePromise;
+          else if (phase !== "done") await cancel();
           throw asUniffiError(error);
         } finally { pending = false; nextPromise = null; }
       },
@@ -1223,6 +1230,9 @@ export class BackendSession {
         session.outputStreams.delete(stream);
       },
     };
+    // Owner shutdown ends iteration normally without changing public cancel
+    // or return semantics. Both paths still join the same backend cleanup.
+    OUTPUT_STREAM_OWNER_CLOSE.set(stream, () => close("closed"));
     session.outputStreams.add(stream);
     return stream;
   }
@@ -1415,8 +1425,8 @@ function releaseObjectCall(state) {
   }
 }
 
-function cancelObjectStreams(state) {
-  return [...state.streams].map((stream) => stream.cancel()).concat([...state.children].flatMap(cancelObjectStreams));
+function closeObjectStreams(state) {
+  return [...state.streams].map((stream) => OUTPUT_STREAM_OWNER_CLOSE.get(stream)()).concat([...state.children].flatMap(closeObjectStreams));
 }
 
 async function awaitObjectIdle(state) {
@@ -1447,7 +1457,7 @@ function closeObject(lease, descriptor, args) {
   state.closePromise = Promise.resolve().then(async () => {
     try {
       const cleanup = makeOperation(state.session, descriptor)(state.handle);
-      const results = await Promise.allSettled([cleanup, ...cancelObjectStreams(state)]);
+      const results = await Promise.allSettled([cleanup, ...closeObjectStreams(state)]);
       const failed = results.find((result) => result.status === "rejected");
       if (failed) throw failed.reason;
     }

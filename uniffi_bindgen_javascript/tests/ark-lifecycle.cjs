@@ -5,7 +5,7 @@ const fixture = require('./fixture.json');
 const ids = fixture.operations;
 const streams = fixture.streams;
 const tick = () => new Promise(resolve => setImmediate(resolve));
-const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve}; };
+const deferred = () => { let resolve, reject; const promise = new Promise((done, fail) => { resolve = done; reject = fail; }); return {promise, resolve, reject}; };
 for (const name of ['BackendSession', 'Host', 'ObjectLease', 'CallbackRegistry', 'createNamespace', 'CallController']) {
   assert.equal(name in business, false, name);
 }
@@ -98,5 +98,86 @@ const session = new platform.BackendSession(backend, undefined, {callControl:fix
   assert.equal(session.objects.size, 0);
   assert.equal(new Set(releases).size, releases.length, 'all references release exactly once');
   await session.close(); assert.equal(closed, 1);
+  for (const scenario of [
+    {name:'owner-pending'},
+    {name:'owner-starting',stage:'starting'},
+    {name:'owner-unpulled',stage:'idle'},
+    {name:'owner-joins-pull',rawLast:true},
+    {name:'explicit-cancel',explicit:true},
+    {name:'owner-cleanup-failure',cleanupError:'CleanupProbe'},
+    {name:'owner-transport-failure',pullError:'TransportProbe'},
+    {name:'owner-call-cancelled',pullError:'UniffiCancelled'},
+    {name:'owner-error-step',stepError:'StreamProbe'},
+  ]) {
+    let handle=1, siblingHandle;
+    const raw=deferred(), cleanup=deferred(), native=deferred(), ack=deferred();
+    const pulls=new Map(), started=[], cancelled=[], released=[], objects=[];
+    const probe=new platform.BackendSession({
+      invokeSync(id) {
+        if(id===fixture.callControl.create) return new platform.ArkValueResult(handle++);
+        if(id===fixture.callControl.cancel || id===fixture.callControl.release) return new platform.ArkValueResult(null);
+        assert.equal(id,streams.events.start); const value=handle++; started.push(value); return new platform.ArkValueResult(value);
+      },
+      async invokeAsync(id,args) {
+        if(id===fixture.construct) return new platform.ArkValueResult(handle++);
+        if(id===ids['Client.close']) { await native.promise; return new platform.ArkValueResult(null); }
+        if(id===streams.events.next) {
+          const count=(pulls.get(args[0])??0)+1; pulls.set(args[0],count);
+          return new platform.ArkValueResult(count===1 ? new platform.ArkItemStep(7) : await raw.promise);
+        }
+        if(id===streams.events.cancel) { cancelled.push(args[0]); if(args[0]!==siblingHandle) await cleanup.promise; return new platform.ArkValueResult(null); }
+        if(id===fixture.callControl.create+3) { if(args[0]!==siblingHandle) await ack.promise; return new platform.ArkValueResult(1); }
+        throw Error(`unexpected owner stream operation ${id}`);
+      },
+      releaseObject(value) { objects.push(value); },
+      releaseOutputStream(value) { released.push(value); },
+      close() {},
+    },undefined,{callControl:fixture.callControl});
+    const ns=platform.createNamespace(probe).lifecycle;
+    const owner=await ns.Client[fixture.constructor](), other=await ns.Client[fixture.constructor]();
+    const siblingStream=other.events(); await siblingStream.next(); siblingHandle=started.at(-1);
+    const stream=owner.events();
+    if(!scenario.stage) await stream.next();
+    let reading=scenario.stage==='idle' ? null : stream.next().then(value=>({value}),error=>({error}));
+    // Active Ark next enters through a microtask; let the raw pull actually
+    // enter before testing its join. Starting/unpulled remain separate cases.
+    if(!scenario.stage) await tick();
+    const stopping=scenario.explicit ? stream.cancel() : owner.close();
+    let settled=false; stopping.then(()=>{settled=true;},()=>{settled=true;});
+    if(!reading) reading=stream.next().then(value=>({value}),error=>({error}));
+    await tick(); assert.equal(settled,false,scenario.name);
+    if(scenario.rawLast) {
+      cleanup.resolve(); native.resolve(); ack.resolve(); await tick();
+      assert.equal(settled,false,'owner close joins the raw pull'); assert.equal(released.length,0);
+    }
+    if(scenario.pullError) raw.reject(new platform.UniffiError(scenario.pullError,'pull failed'));
+    else raw.resolve(scenario.stepError ? new platform.ArkErrorStep(new platform.UniffiError(scenario.stepError,'stream failed')) : scenario.rawLast ? new platform.ArkItemStep(99) : new platform.ArkDoneStep());
+    native.resolve(); await tick();
+    if(!scenario.stage && !scenario.rawLast) assert.equal(settled,false,'raw completion is not cleanup ACK');
+    if(scenario.cleanupError) cleanup.reject(new platform.UniffiError(scenario.cleanupError,'cleanup failed'));
+    else cleanup.resolve();
+    await tick();
+    if(!scenario.stage && !scenario.rawLast) {
+      assert.equal(settled,false,'owner close awaits the host cleanup receipt'); assert.equal(released.length,0);
+    }
+    ack.resolve();
+    if(scenario.cleanupError) await assert.rejects(stopping,{errorName:scenario.cleanupError});
+    else await stopping;
+    const outcome=await reading;
+    const errorName=scenario.cleanupError || scenario.pullError || scenario.stepError || (scenario.explicit && 'UniffiCancelled');
+    if(errorName) assert.equal((outcome.error || outcome.value?.error)?.errorName,errorName,scenario.name);
+    else assert.equal(outcome.value?.kind,'done',scenario.name);
+    if(scenario.cleanupError) await assert.rejects(stream.next(),{errorName:scenario.cleanupError});
+    else for(let i=0;i<2;i++) assert.equal((await stream.next()).kind,'done');
+    assert.equal(cancelled.includes(siblingHandle),false); assert.equal(released.includes(siblingHandle),false);
+    assert.deepEqual(released,started.filter(value=>value!==siblingHandle));
+    pulls.set(siblingHandle,0); assert.equal((await siblingStream.next()).kind,'item');
+    await siblingStream.cancel();
+    if(scenario.explicit) await owner.close();
+    await other.close();
+    assert.equal(probe.objects.size,0); assert.equal(probe.streams.length,0);
+    assert.equal(new Set(objects).size,objects.length); assert.equal(new Set(released).size,released.length);
+    await probe.close();
+  }
   console.log('generated Ark lifecycle regressions passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

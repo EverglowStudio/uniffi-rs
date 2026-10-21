@@ -146,4 +146,82 @@ const construction=lazy.Client.create();
 initialization.reject(Object.assign(Error('bad wasm'),{errorName:'BootProbe'}));
 await assert.rejects(construction,{errorName:'BootProbe'});
 assert.equal(boots,1);
+
+// Exercise the generated facade's owner path, including lazy/active streams,
+// independently gated native cleanup, and another client in the same session.
+for (const scenario of [
+  {name:'owner-pending', child:true},
+  {name:'owner-starting', stage:'starting'},
+  {name:'owner-unpulled', stage:'idle'},
+  {name:'owner-joins-pull', rawLast:true},
+  {name:'explicit-cancel', stop:'cancel'},
+  {name:'explicit-return', stop:'return'},
+  {name:'owner-cleanup-failure', cleanupError:'CleanupProbe'},
+  {name:'owner-transport-failure', pullError:'TransportProbe'},
+  {name:'owner-call-cancelled', pullError:'UniffiCancelled'},
+  {name:'owner-error-step', stepError:'StreamProbe'},
+]) {
+  let handle=1, siblingHandle;
+  const raw=deferred(), cleanup=deferred(), native=deferred();
+  const pulls=new Map(), started=[], cancelled=[], released=[], objects=[];
+  const testSession=new BackendSession({
+    invokeSync(id) { assert.ok(id===8 || id===10); const value=handle++; if(id===10) started.push(value); return value; },
+    invokeAsync(id,args) {
+      if(id===0) return Promise.resolve(handle++);
+      if(id===3) return native.promise;
+      if(id===11) { const count=(pulls.get(args[0])??0)+1; pulls.set(args[0],count); return count===1 ? Promise.resolve({kind:'item',value:7}) : raw.promise; }
+      if(id===12) { cancelled.push(args[0]); return args[0]===siblingHandle ? Promise.resolve() : cleanup.promise; }
+      throw Error(`unexpected lifecycle operation ${id}`);
+    },
+    releaseObject(value) { objects.push(value); },
+    releaseOutputStream(value) { released.push(value); },
+    close() {},
+  },new Host(),{callControl:{create:90,cancel:91,release:92,operations:[]}});
+  const testApi=createFacade(testSession,descriptors);
+  const owner=await testApi.Client.create(), sibling=await testApi.Client.create();
+  const siblingStream=sibling.events(); await siblingStream.next(); siblingHandle=started.at(-1);
+  const child=scenario.child ? owner.view() : null;
+  const stream=child ? invokeObjectOperation(child,{...operations[10],receiverTypeId:2}) : owner.events();
+  if(!scenario.stage) await stream.next();
+  let reading=scenario.stage==='idle' ? null : stream.next().then(value=>({value}),error=>({error}));
+  const stopping=scenario.stop ? stream[scenario.stop]() : owner.close();
+  let settled=false; stopping.then(()=>{settled=true;},()=>{settled=true;});
+  if(!reading) reading=stream.next().then(value=>({value}),error=>({error}));
+  await tick();
+  assert.equal(settled,false,`${scenario.name}: close must await cleanup`);
+  if(scenario.rawLast) {
+    cleanup.resolve(); native.resolve(); await tick();
+    assert.equal(settled,false,'owner close must join the actual raw pull');
+    assert.equal(released.length,0);
+  }
+  if(scenario.pullError) raw.reject(Object.assign(Error('pull failed'),{errorName:scenario.pullError}));
+  else raw.resolve(scenario.stepError ? {kind:'error',error:{errorName:scenario.stepError,message:'stream failed'}} : scenario.rawLast ? {kind:'item',value:99} : {kind:'done'});
+  native.resolve(); await tick();
+  if(!scenario.stage && !scenario.rawLast) assert.equal(settled,false,'raw completion cannot substitute for cleanup ACK');
+  if(scenario.cleanupError) cleanup.reject(Object.assign(Error('cleanup failed'),{errorName:scenario.cleanupError}));
+  else cleanup.resolve();
+  if(scenario.cleanupError) await assert.rejects(stopping,{errorName:scenario.cleanupError});
+  else await stopping;
+  const outcome=await reading;
+  const errorName=scenario.cleanupError || scenario.pullError || scenario.stepError || (scenario.stop && 'UniffiCancelled');
+  if(errorName) assert.equal(outcome.error?.errorName,errorName,scenario.name);
+  else assert.deepEqual(outcome,{value:{done:true,value:undefined}},scenario.name);
+  if(scenario.cleanupError) await assert.rejects(stream.next(),{errorName:scenario.cleanupError});
+  else for(let i=0;i<2;i++) assert.deepEqual(await stream.next(),{done:true,value:undefined});
+  assert.equal(cancelled.includes(siblingHandle),false,'owner close must not cancel another client');
+  assert.equal(released.includes(siblingHandle),false,'owner close must not release another client');
+  assert.equal(testSession.outputStreams.size,1,'owned streams and frames are released');
+  assert.deepEqual(released,started.filter(value=>value!==siblingHandle));
+  assert.equal(new Set(released).size,released.length);
+  pulls.set(siblingHandle,0);
+  assert.equal(await siblingStream.next().then(step=>step.done),false,'the other client can still pull');
+  await siblingStream.cancel();
+  if(scenario.stop) await owner.close();
+  else if(child) assert.equal(child.close(),owner.close());
+  await sibling.close();
+  assert.equal(testSession.objects.size,0);
+  assert.equal(testSession.outputStreams.size,0);
+  assert.equal(new Set(objects).size,objects.length);
+  await testSession.close();
+}
 console.log('lifecycle regressions passed');
