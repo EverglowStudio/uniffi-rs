@@ -19,96 +19,6 @@ pub struct LifecycleConfig {
     pub cached_methods: BTreeSet<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn interface() -> ComponentInterface {
-        ComponentInterface::from_webidl(
-            r#"
-            namespace lifecycle_test {};
-            interface Service {};
-            [Error] enum CloseError { "Failed" };
-            interface Client {
-                [Async, Throws=CloseError] void close();
-                void sync_close();
-                [Async] void close_arg(u32 value);
-                [Async] u32 close_value();
-                Service service();
-                Service lookup(u32 value);
-                [Async] Service async_service();
-            };
-        "#,
-            "lifecycle_test",
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn parses_and_validates_shared_source_contract() {
-        let config = LifecycleConfig::from_root_toml(
-            &toml::from_str(
-                r#"
-            [bindings.lifecycle]
-            close_methods = { Client = "close" }
-            owned_methods = ["Client.service", "Client.lookup"]
-            cached_methods = ["Client.service"]
-        "#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let ci = interface();
-        config.validate(&ci).unwrap();
-        assert_eq!(config.close_method("Client"), Some("close"));
-        assert!(config.is_owned("Client", "lookup"));
-        assert!(config.is_cached("Client", "service"));
-        assert_eq!(config.close_ffi_functions(&ci).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn rejects_invalid_close_and_cached_contracts() {
-        let ci = interface();
-        for method in ["sync_close", "close_arg", "close_value", "missing"] {
-            let config = LifecycleConfig {
-                close_methods: [("Client".into(), method.into())].into(),
-                ..Default::default()
-            };
-            assert!(config.validate(&ci).is_err(), "{method}");
-        }
-        for method in ["lookup", "async_service"] {
-            let name = format!("Client.{method}");
-            let config = LifecycleConfig {
-                owned_methods: [name.clone()].into(),
-                cached_methods: [name].into(),
-                ..Default::default()
-            };
-            assert!(config.validate(&ci).is_err(), "{method}");
-        }
-        let unowned_cache = LifecycleConfig {
-            cached_methods: ["Client.service".into()].into(),
-            ..Default::default()
-        };
-        assert!(unowned_cache.validate(&ci).is_err());
-        let non_object = LifecycleConfig {
-            owned_methods: ["Client.close_value".into()].into(),
-            ..Default::default()
-        };
-        assert!(non_object.validate(&ci).is_err());
-    }
-
-    #[test]
-    fn absent_table_defaults_but_unknown_keys_fail() {
-        let empty = toml::Value::Table(Default::default());
-        assert!(LifecycleConfig::from_root_toml(&empty)
-            .unwrap()
-            .close_methods
-            .is_empty());
-        let typo = toml::from_str("[bindings.lifecycle]\nclose_method = {}\n").unwrap();
-        assert!(LifecycleConfig::from_root_toml(&typo).is_err());
-    }
-}
-
 impl LifecycleConfig {
     pub fn from_root_toml(root: &toml::Value) -> Result<Self> {
         match root
@@ -233,5 +143,95 @@ impl LifecycleConfig {
                     .to_owned())
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interface() -> ComponentInterface {
+        ComponentInterface::from_webidl(
+            r#"
+            namespace lifecycle_test {};
+            interface Service {};
+            [Error] enum CloseError { "Failed" };
+            interface Client {
+                [Async, Throws=CloseError] void close();
+                void sync_close();
+                [Async] void close_arg(u32 value);
+                [Async] u32 close_value();
+                Service service();
+                Service lookup(u32 value);
+                [Async] Service async_service();
+            };
+        "#,
+            "lifecycle_test",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_and_validates_shared_source_contract() {
+        let config = LifecycleConfig::from_root_toml(
+            &toml::from_str(
+                r#"
+            [bindings.lifecycle]
+            close_methods = { Client = "close" }
+            owned_methods = ["Client.service", "Client.lookup"]
+            cached_methods = ["Client.service"]
+        "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ci = interface();
+        config.validate(&ci).unwrap();
+        assert_eq!(config.close_method("Client"), Some("close"));
+        assert!(config.is_owned("Client", "lookup"));
+        assert!(config.is_cached("Client", "service"));
+        assert_eq!(config.close_ffi_functions(&ci).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_close_and_cached_contracts() {
+        let ci = interface();
+        for method in ["sync_close", "close_arg", "close_value", "missing"] {
+            let config = LifecycleConfig {
+                close_methods: [("Client".into(), method.into())].into(),
+                ..Default::default()
+            };
+            assert!(config.validate(&ci).is_err(), "{method}");
+        }
+        for method in ["lookup", "async_service"] {
+            let name = format!("Client.{method}");
+            let config = LifecycleConfig {
+                owned_methods: [name.clone()].into(),
+                cached_methods: [name].into(),
+                ..Default::default()
+            };
+            assert!(config.validate(&ci).is_err(), "{method}");
+        }
+        let unowned_cache = LifecycleConfig {
+            cached_methods: ["Client.service".into()].into(),
+            ..Default::default()
+        };
+        assert!(unowned_cache.validate(&ci).is_err());
+        let non_object = LifecycleConfig {
+            owned_methods: ["Client.close_value".into()].into(),
+            ..Default::default()
+        };
+        assert!(non_object.validate(&ci).is_err());
+    }
+
+    #[test]
+    fn absent_table_defaults_but_unknown_keys_fail() {
+        let empty = toml::Value::Table(Default::default());
+        assert!(LifecycleConfig::from_root_toml(&empty)
+            .unwrap()
+            .close_methods
+            .is_empty());
+        let typo = toml::from_str("[bindings.lifecycle]\nclose_method = {}\n").unwrap();
+        assert!(LifecycleConfig::from_root_toml(&typo).is_err());
     }
 }
