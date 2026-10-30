@@ -461,6 +461,9 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
         rust_type: &RustType,
         types: &[JsType],
     ) -> Option<ValueType> {
+        if let RustType::Boxed(inner) = rust_type {
+            return from_conversion(conversion, inner, types);
+        }
         match conversion {
             ConversionRecipe::Identity
             | ConversionRecipe::Timestamp
@@ -588,7 +591,7 @@ fn public_stream_value_type(binding: &RustValueBinding, types: &[JsType]) -> Opt
                 },
                 is_send: *is_send,
             }),
-            RustType::Custom(inner) => from_rust_type(inner),
+            RustType::Custom(inner) | RustType::Boxed(inner) => from_rust_type(inner),
             RustType::Unit | RustType::Path(_) | RustType::StreamStep { .. } => None,
         }
     }

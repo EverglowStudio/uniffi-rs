@@ -264,6 +264,8 @@ pub enum RustType {
     Timestamp,
     Duration,
     Path(RustPath),
+    /// Rust allocation indirection; the JavaScript value is unchanged.
+    Boxed(Box<Self>),
     Option(Box<Self>),
     Sequence(Box<Self>),
     Map(Box<Self>, Box<Self>),
@@ -377,6 +379,20 @@ pub struct RustValueBinding {
     pub rust_type: RustType,
     pub carrier: RustCarrier,
     pub conversion: ConversionRecipe,
+}
+
+impl RustValueBinding {
+    /// Remove one Rust allocation layer without changing the JS conversion.
+    pub fn unboxed(&self) -> Option<Self> {
+        let RustType::Boxed(inner) = &self.rust_type else {
+            return None;
+        };
+        Some(Self {
+            rust_type: (**inner).clone(),
+            carrier: self.carrier,
+            conversion: self.conversion.clone(),
+        })
+    }
 }
 
 /// A Rust record field as seen by an engine adapter.

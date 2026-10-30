@@ -414,6 +414,7 @@ struct SourceField {
     public_name: String,
     rust_name: String,
     ty: ValueType,
+    rust_type: Type,
     default: Option<JsDefaultValue>,
 }
 
@@ -445,6 +446,7 @@ enum SourceTypeKind {
     },
     Custom {
         builtin: ValueType,
+        rust_builtin: Type,
     },
     Object {
         kind: ObjectKind,
@@ -480,6 +482,7 @@ fn collect_type_definitions(
                         },
                         rust_name: field.rust_name().to_owned(),
                         ty: convert_type(&field.as_type(), crate_owners)?,
+                        rust_type: field.as_type(),
                         default: field.default_value().map(convert_default),
                     })
                 })
@@ -648,7 +651,10 @@ fn collect_type_definitions(
                         builtin: builtin.clone(),
                         config: config.clone(),
                     },
-                    source_kind: SourceTypeKind::Custom { builtin },
+                    source_kind: SourceTypeKind::Custom {
+                        builtin,
+                        rust_builtin: custom.builtin.clone(),
+                    },
                     rust_path,
                     tag_path: Some(tag_path),
                 },
@@ -759,6 +765,8 @@ struct OperationExtra {
     /// Source Rust item name used by the structured core call target.
     item_name: String,
     argument_rust_names: Vec<String>,
+    argument_types: Vec<Type>,
+    return_type: Option<Type>,
     argument_ownership: Vec<Ownership>,
     receiver_ownership: Option<Ownership>,
 }
@@ -1039,6 +1047,10 @@ fn operation_definition(
         OperationSourceKey::new(component_key.clone(), owner.clone(), kind, name.to_owned())
             .map_err(|error| FrontendError::Contract(error.to_string()))?;
     let callable_arguments = callable.arguments();
+    let argument_types = callable_arguments
+        .iter()
+        .map(|argument| argument.as_type())
+        .collect();
     let argument_rust_names = callable_arguments
         .iter()
         .map(|argument| argument.name().to_owned())
@@ -1124,6 +1136,8 @@ fn operation_definition(
             object_kind: type_target.map(|(_, kind)| kind),
             item_name: callable.rust_name().to_owned(),
             argument_rust_names,
+            argument_types,
+            return_type: callable.return_type().cloned(),
             argument_ownership,
             receiver_ownership,
         },
@@ -1577,6 +1591,7 @@ fn build_rust_bridge_plan(
             ))
         })?;
         if extra.argument_rust_names.len() != operation.arguments.len()
+            || extra.argument_types.len() != operation.arguments.len()
             || extra.argument_ownership.len() != operation.arguments.len()
         {
             return Err(FrontendError::Contract(format!(
@@ -1593,8 +1608,9 @@ fn build_rust_bridge_plan(
             .iter()
             .enumerate()
             .map(|(index, argument)| {
-                let (rust_type, carrier, conversion) =
+                let (mut rust_type, carrier, conversion) =
                     rust_binding_for_type(&argument.ty, api, type_ids, type_extras, callback_role)?;
+                preserve_rust_boxes(&extra.argument_types[index], &mut rust_type)?;
                 Ok(RustArgumentBinding {
                     public_name: argument.public_name.clone(),
                     rust_name: extra.argument_rust_names[index].clone(),
@@ -1609,8 +1625,12 @@ fn build_rust_bridge_plan(
             .return_type
             .as_ref()
             .map(|ty| {
-                let (rust_type, carrier, conversion) =
+                let (mut rust_type, carrier, conversion) =
                     rust_binding_for_type(ty, api, type_ids, type_extras, callback_role)?;
+                let source = extra.return_type.as_ref().ok_or_else(|| {
+                    FrontendError::Contract("missing Rust return type metadata".to_owned())
+                })?;
+                preserve_rust_boxes(source, &mut rust_type)?;
                 Ok(RustReturnBinding {
                     rust_type,
                     carrier,
@@ -1677,20 +1697,65 @@ fn build_rust_bridge_plan(
                     operation.source_key, stream.path
                 )));
             }
-            let item = rust_value_binding_for_value_type(
+            let mut item = rust_value_binding_for_value_type(
                 &item_type,
                 api,
                 type_ids,
                 type_extras,
                 callback_role,
             )?;
-            let error = rust_stream_error_binding(
+            let mut error = rust_stream_error_binding(
                 error_type.as_deref(),
                 api,
                 type_ids,
                 type_extras,
                 callback_role,
             )?;
+            let segments = stream.path.segments();
+            let root = match segments.first() {
+                Some(ValuePathSegment::Argument(index)) => {
+                    arguments
+                        .get(*index as usize)
+                        .map(|binding| RustValueBinding {
+                            rust_type: binding.rust_type.clone(),
+                            carrier: binding.carrier,
+                            conversion: binding.conversion.clone(),
+                        })
+                }
+                Some(ValuePathSegment::Return) => {
+                    return_value.as_ref().map(|binding| RustValueBinding {
+                        rust_type: binding.rust_type.clone(),
+                        carrier: binding.carrier,
+                        conversion: binding.conversion.clone(),
+                    })
+                }
+                _ => None,
+            };
+            let source_stream = root
+                .as_ref()
+                .and_then(|binding| rust_type_at_path(binding, &segments[1..], &named_types));
+            match source_stream {
+                Some(
+                    RustType::Stream {
+                        item: item_type,
+                        error: error_type,
+                        ..
+                    }
+                    | RustType::InputStream {
+                        item: item_type,
+                        error: error_type,
+                        ..
+                    },
+                ) => {
+                    item.rust_type = *item_type;
+                    error.rust_type = *error_type;
+                }
+                _ => {
+                    return Err(FrontendError::Contract(
+                        "stream Rust type path does not resolve".to_owned(),
+                    ))
+                }
+            }
             let hooks = match stream.contract.direction {
                 StreamDirection::Input => vec![
                     RustResourceHook::StartInputStream,
@@ -1954,7 +2019,7 @@ fn validate_custom_bindings_acyclic(
     type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
 ) -> Result<(), FrontendError> {
     for ty in &api.types {
-        let Some(SourceTypeKind::Custom { builtin }) = type_extras
+        let Some(SourceTypeKind::Custom { builtin, .. }) = type_extras
             .get(&ty.source_key)
             .map(|extra| &extra.source_kind)
         else {
@@ -1977,7 +2042,7 @@ fn validate_custom_value_acyclic(
             let Some(extra) = type_extras.get(key) else {
                 return Err(FrontendError::UnknownTypeOwner(key.to_string()));
             };
-            let SourceTypeKind::Custom { builtin } = &extra.source_kind else {
+            let SourceTypeKind::Custom { builtin, .. } = &extra.source_kind else {
                 return Ok(());
             };
             if !visiting.insert(key.clone()) {
@@ -2081,6 +2146,7 @@ fn validate_public_source_shape(ty: &JsType, extra: &TypeExtra) -> Result<(), Fr
             },
             SourceTypeKind::Custom {
                 builtin: source_builtin,
+                ..
             },
         ) if public_builtin == source_builtin && extra_builtin == source_builtin => {}
         (
@@ -2174,9 +2240,13 @@ fn build_named_type_kind(
                 &format!("error {}", ty.source_key),
             )?,
         }),
-        SourceTypeKind::Custom { builtin } => {
-            let inner =
+        SourceTypeKind::Custom {
+            builtin,
+            rust_builtin,
+        } => {
+            let mut inner =
                 rust_value_binding_for_value_type(builtin, api, type_ids, type_extras, false)?;
+            preserve_rust_boxes(rust_builtin, &mut inner.rust_type)?;
             let tag_path = extra.tag_path.clone().ok_or_else(|| {
                 FrontendError::Contract(format!(
                     "custom Rust type {} is missing its normalized UniFfiTag path",
@@ -2244,13 +2314,7 @@ fn build_named_fields(
                 public_name: field.public_name.clone(),
                 rust_name: field.rust_name.clone(),
                 declaration_order: order,
-                binding: rust_value_binding_for_value_type(
-                    &field.ty,
-                    api,
-                    type_ids,
-                    type_extras,
-                    false,
-                )?,
+                binding: rust_field_binding(field, api, type_ids, type_extras)?,
             })
         })
         .collect()
@@ -2330,13 +2394,7 @@ fn build_enum_variants(
                             Ok(RustTupleField {
                                 public_name: field.public_name.clone(),
                                 declaration_order,
-                                binding: rust_value_binding_for_value_type(
-                                    &field.ty,
-                                    api,
-                                    type_ids,
-                                    type_extras,
-                                    false,
-                                )?,
+                                binding: rust_field_binding(field, api, type_ids, type_extras)?,
                             })
                             })
                             .collect::<Result<Vec<_>, FrontendError>>()?,
@@ -2351,6 +2409,193 @@ fn build_enum_variants(
             })
         })
         .collect()
+}
+
+fn rust_type_at_path(
+    binding: &RustValueBinding,
+    path: &[ValuePathSegment],
+    named_types: &[RustNamedTypePlan],
+) -> Option<RustType> {
+    if let Some(inner) = binding.unboxed() {
+        return rust_type_at_path(&inner, path, named_types);
+    }
+    let descend = |ty: &RustType, conversion: &ConversionRecipe, rest: &[ValuePathSegment]| {
+        rust_type_at_path(
+            &RustValueBinding {
+                rust_type: ty.clone(),
+                carrier: binding.carrier,
+                conversion: conversion.clone(),
+            },
+            rest,
+            named_types,
+        )
+    };
+    if let (RustType::Option(inner), ConversionRecipe::Optional(conversion)) =
+        (&binding.rust_type, &binding.conversion)
+    {
+        return descend(inner, conversion, path);
+    }
+    if let ConversionRecipe::Custom(id, _) = &binding.conversion {
+        if let RustNamedTypeKind::Custom { inner, .. } = &named_types.get(id.index() as usize)?.kind
+        {
+            return rust_type_at_path(inner, path, named_types);
+        }
+    }
+    if path.is_empty() {
+        return Some(binding.rust_type.clone());
+    }
+    match (&binding.rust_type, &binding.conversion, &path[0]) {
+        (
+            RustType::Sequence(inner),
+            ConversionRecipe::Sequence(conversion),
+            ValuePathSegment::SequenceItem,
+        )
+        | (RustType::Set(inner), ConversionRecipe::Set(conversion), ValuePathSegment::SetItem) => {
+            descend(inner, conversion, &path[1..])
+        }
+        (RustType::Map(key, _), ConversionRecipe::Map(conversion, _), ValuePathSegment::MapKey) => {
+            descend(key, conversion, &path[1..])
+        }
+        (
+            RustType::Map(_, value),
+            ConversionRecipe::Map(_, conversion),
+            ValuePathSegment::MapValue,
+        ) => descend(value, conversion, &path[1..]),
+        (
+            RustType::Stream { item, .. },
+            ConversionRecipe::OutputStream {
+                item: conversion, ..
+            },
+            ValuePathSegment::SequenceItem,
+        )
+        | (
+            RustType::InputStream { item, .. },
+            ConversionRecipe::InputStream {
+                item: conversion, ..
+            },
+            ValuePathSegment::SequenceItem,
+        ) => descend(item, conversion, &path[1..]),
+        (_, ConversionRecipe::Record(id), ValuePathSegment::Field(name)) => {
+            let RustNamedTypeKind::Record { fields } = &named_types.get(id.index() as usize)?.kind
+            else {
+                return None;
+            };
+            let field = fields.iter().find(|field| field.public_name == *name)?;
+            rust_type_at_path(&field.binding, &path[1..], named_types)
+        }
+        (
+            _,
+            ConversionRecipe::Enum(id) | ConversionRecipe::Error(id),
+            ValuePathSegment::Variant(name),
+        ) => {
+            let (RustNamedTypeKind::Enum { variants } | RustNamedTypeKind::Error { variants }) =
+                &named_types.get(id.index() as usize)?.kind
+            else {
+                return None;
+            };
+            let variant = variants
+                .iter()
+                .find(|variant| variant.public_name == *name)?;
+            let ValuePathSegment::Field(field_name) = path.get(1)? else {
+                return None;
+            };
+            let field = match &variant.payload {
+                RustVariantPayload::Named(fields) => {
+                    &fields
+                        .iter()
+                        .find(|field| field.public_name == *field_name)?
+                        .binding
+                }
+                RustVariantPayload::Tuple(fields) => {
+                    &fields
+                        .iter()
+                        .find(|field| field.public_name == *field_name)?
+                        .binding
+                }
+                RustVariantPayload::Unit => return None,
+            };
+            rust_type_at_path(field, &path[2..], named_types)
+        }
+        _ => None,
+    }
+}
+
+fn rust_field_binding(
+    field: &SourceField,
+    api: &JsApiIr,
+    type_ids: &BTreeMap<TypeSourceKey, uniffi_js_abi::TypeId>,
+    type_extras: &BTreeMap<TypeSourceKey, TypeExtra>,
+) -> Result<RustValueBinding, FrontendError> {
+    let mut binding =
+        rust_value_binding_for_value_type(&field.ty, api, type_ids, type_extras, false)?;
+    preserve_rust_boxes(&field.rust_type, &mut binding.rust_type)?;
+    Ok(binding)
+}
+
+/// The public graph deliberately treats Box<T> as T. Reapply allocation
+/// layers from source metadata only to the typed Rust plan, before dropping
+/// the parser-facing input. This also preserves boxes inside containers.
+fn preserve_rust_boxes(source: &Type, rust: &mut RustType) -> Result<(), FrontendError> {
+    match (source, &mut *rust) {
+        (Type::Box { inner_type }, _) => {
+            preserve_rust_boxes(inner_type, rust)?;
+            *rust = RustType::Boxed(Box::new(std::mem::replace(rust, RustType::Unit)));
+        }
+        (Type::Optional { inner_type }, RustType::Option(inner))
+        | (Type::Sequence { inner_type }, RustType::Sequence(inner))
+        | (Type::Set { inner_type }, RustType::Set(inner)) => {
+            preserve_rust_boxes(inner_type, inner)?;
+        }
+        (
+            Type::Map {
+                key_type,
+                value_type,
+            },
+            RustType::Map(key, value),
+        ) => {
+            preserve_rust_boxes(key_type, key)?;
+            preserve_rust_boxes(value_type, value)?;
+        }
+        (
+            Type::Stream {
+                item_type,
+                error_type,
+                ..
+            },
+            RustType::Stream { item, error, .. },
+        )
+        | (
+            Type::InputStream {
+                item_type,
+                error_type,
+                ..
+            },
+            RustType::InputStream { item, error, .. },
+        ) => {
+            preserve_rust_boxes(item_type, item)?;
+            if let Some(source_error) = error_type {
+                preserve_rust_boxes(source_error, error)?;
+            }
+        }
+        // Vec<u8> is the canonical bytes scalar, not a sequence carrier.
+        (Type::Sequence { inner_type }, RustType::Scalar(uniffi_js_abi::ScalarType::Bytes))
+            if **inner_type == Type::UInt8 => {}
+        (
+            Type::Optional { .. }
+            | Type::Sequence { .. }
+            | Type::Map { .. }
+            | Type::Set { .. }
+            | Type::Stream { .. }
+            | Type::InputStream { .. },
+            _,
+        ) => {
+            return Err(FrontendError::Contract(
+                "Rust container does not match source metadata".to_owned(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn rust_value_binding_for_value_type(
@@ -2687,6 +2932,7 @@ fn convert_variant(
                     },
                     rust_name: field.rust_name().to_owned(),
                     ty: convert_type(&field.as_type(), crate_owners)?,
+                    rust_type: field.as_type(),
                     default: field.default_value().map(convert_default),
                 })
             })

@@ -207,6 +207,10 @@ pub(super) fn source_stream(
     binding: &RustValueBinding,
     value: TokenStream,
 ) -> TokenStream {
+    if let Some(inner) = binding.unboxed() {
+        let value = source_stream(operation, &inner, quote!(*(#value)));
+        return quote!(Box::new(#value));
+    }
     if matches!(&binding.rust_type, RustType::Stream { .. })
         && !operation.rust_stream_item_is_result
     {
@@ -264,13 +268,19 @@ pub(super) fn canonical_stream(operation: &RustOperationPlan, value: TokenStream
     let Some(binding) = operation.return_value.as_ref() else {
         return value;
     };
-    let RustType::Stream { .. } = &binding.rust_type else {
+    let mut rust_type = &binding.rust_type;
+    let mut stream = value.clone();
+    while let RustType::Boxed(inner) = rust_type {
+        stream = quote!(*(#stream));
+        rust_type = inner;
+    }
+    let RustType::Stream { .. } = rust_type else {
         return value;
     };
     let value = if !operation.rust_stream_item_is_result {
-        quote!(::uniffi::deps::futures_util::StreamExt::map(#value, Ok::<_, ::std::convert::Infallible>))
+        quote!(::uniffi::deps::futures_util::StreamExt::map(#stream, Ok::<_, ::std::convert::Infallible>))
     } else {
-        value
+        stream
     };
     quote!(Box::pin(#value) as ::uniffi::UniFfiStream<_, _>)
 }
@@ -297,6 +307,7 @@ fn syn_type(ty: &RustType, engine: &str) -> Result<Type> {
         RustType::Timestamp => "std::time::SystemTime".to_owned(),
         RustType::Duration => "std::time::Duration".to_owned(),
         RustType::Path(path) => path.segments.join("::"),
+        RustType::Boxed(inner) => format!("Box<{}>", syn_type(inner, engine)?.to_token_stream()),
         RustType::Option(inner) => {
             format!("Option<{}>", syn_type(inner, engine)?.to_token_stream())
         }
@@ -430,6 +441,10 @@ fn napi_carrier_type_for(
         named_types: &[uniffi_js_engine_schema::RustNamedTypePlan],
         flavor: NativeFlavor,
     ) -> Result<Type> {
+        if let RustType::Boxed(inner) = ty {
+            let inner = recurse(inner, conversion, named_types, flavor)?;
+            return Ok(syn::parse_quote!(__UniffiNapiBox<#inner>));
+        }
         if is_infallible(ty) {
             return Ok(syn::parse_quote!(String));
         }
@@ -633,6 +648,10 @@ fn core_type_for_binding(package: &NormalizedPackage, binding: &RustValueBinding
         ty: &RustType,
         conversion: &ConversionRecipe,
     ) -> Result<Type> {
+        if let RustType::Boxed(inner) = ty {
+            let inner = recurse(package, inner, conversion)?;
+            return Ok(syn::parse_quote!(Box<#inner>));
+        }
         match conversion {
             ConversionRecipe::Object(id) => object_core_type(package, *id),
             ConversionRecipe::Callback(id) => {
@@ -935,6 +954,18 @@ fn operation_result_resource_paths(
         resources: &mut Vec<ExpandedResourceUseSite>,
         visiting: &mut std::collections::BTreeSet<u32>,
     ) -> Result<()> {
+        if let RustType::Boxed(inner) = ty {
+            return walk(
+                package,
+                operation_id,
+                path,
+                inner,
+                conversion,
+                ownership,
+                resources,
+                visiting,
+            );
+        }
         let push = |kind: FamilyResourceKind, resources: &mut Vec<ExpandedResourceUseSite>| {
             resources.push(ExpandedResourceUseSite {
                 path: path.clone(),
@@ -1351,6 +1382,14 @@ fn lower_expr(
     expression: TokenStream,
     flavor: NativeFlavor,
 ) -> Result<TokenStream> {
+    if let Some(inner) = binding.unboxed() {
+        let value = lower_expr(&inner, quote!(__uniffi_unboxed), flavor)?;
+        return Ok(quote!({
+            let __uniffi_boxed = #expression;
+            let __uniffi_unboxed = *__uniffi_boxed.0;
+            Box::new(#value)
+        }));
+    }
     let engine_crate = engine_crate_path(flavor);
     let error_descriptor = flavor.error_descriptor();
     if is_infallible(&binding.rust_type) {
@@ -1502,6 +1541,14 @@ fn lift_expr(
     expression: TokenStream,
     flavor: NativeFlavor,
 ) -> Result<TokenStream> {
+    if let Some(inner) = binding.unboxed() {
+        let value = lift_expr(&inner, quote!(__uniffi_unboxed), flavor)?;
+        return Ok(quote!({
+            let __uniffi_boxed = #expression;
+            let __uniffi_unboxed = *__uniffi_boxed;
+            __UniffiNapiBox(Box::new(#value))
+        }));
+    }
     let napi = napi_crate_path(flavor);
     let error_descriptor = flavor.error_descriptor();
     if is_infallible(&binding.rust_type) {
@@ -2088,6 +2135,43 @@ fn render_temporal_helpers(flavor: NativeFlavor) -> Result<String> {
     let error_descriptor = flavor.error_descriptor();
     let source = quote! {
         use #napi::bindgen_prelude::*;
+
+        // Rust allocation indirection is transparent at the JS boundary.
+        // napi-rs does not implement these traits for Box<T>.
+        #[derive(Clone, Debug)]
+        pub struct __UniffiNapiBox<T>(Box<T>);
+
+        impl<T: TypeName> TypeName for __UniffiNapiBox<T> {
+            fn type_name() -> &'static str { T::type_name() }
+            fn value_type() -> ValueType { T::value_type() }
+        }
+
+        impl<T: ValidateNapiValue> ValidateNapiValue for __UniffiNapiBox<T> {
+            unsafe fn validate(env: #napi::sys::napi_env, value: #napi::sys::napi_value)
+                -> Result<#napi::sys::napi_value> {
+                // SAFETY: Forward the caller's live env/value unchanged; the
+                // wrapper accepts exactly the values accepted by T.
+                unsafe { T::validate(env, value) }
+            }
+        }
+
+        impl<T: FromNapiValue> FromNapiValue for __UniffiNapiBox<T> {
+            unsafe fn from_napi_value(env: #napi::sys::napi_env, value: #napi::sys::napi_value)
+                -> Result<Self> {
+                // SAFETY: Validation and the env/value preconditions are the
+                // same as T's. Only the returned owned Rust value is boxed.
+                unsafe { T::from_napi_value(env, value) }.map(|value| Self(Box::new(value)))
+            }
+        }
+
+        impl<T: ToNapiValue> ToNapiValue for __UniffiNapiBox<T> {
+            unsafe fn to_napi_value(env: #napi::sys::napi_env, value: Self)
+                -> Result<#napi::sys::napi_value> {
+                // SAFETY: Move T out of its Box exactly once and pass through
+                // the caller's live env. No foreign pointer is retained.
+                unsafe { T::to_napi_value(env, *value.0) }
+            }
+        }
 
         // Callback result carriers can cross to a Rust worker. Copy bytes on
         // the JS thread during FromNapiValue, before sending the carrier; a
@@ -3745,6 +3829,14 @@ fn declared_error_data_expr(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if let Some(inner) = binding.unboxed() {
+        let value = declared_error_data_expr(package, flavor, &inner, quote!(__uniffi_unboxed))?;
+        return Ok(quote!({
+            let __uniffi_boxed = #expression;
+            let __uniffi_unboxed = *__uniffi_boxed;
+            #value
+        }));
+    }
     let engine_crate = engine_crate_path(flavor);
     let error_data = quote!(#engine_crate::ErrorData);
     let recurse = |binding: &RustValueBinding, expression: TokenStream| {
@@ -4128,6 +4220,24 @@ fn render_operation_helpers_for(
                 });
             }
 
+            if matches!(binding.rust_type, RustType::Boxed(_))
+                && !conversion_requires_host(&binding.conversion)
+            {
+                let value = RustValueBinding {
+                    rust_type: binding.rust_type.clone(),
+                    carrier: binding.carrier,
+                    conversion: binding.conversion.clone(),
+                };
+                let core = core_type_for_binding(package, &value)?;
+                let carrier = napi_carrier_type_for(&value, package.rust.named_types(), flavor)?;
+                let expression = lower_expr(&value, quote!(value), flavor)?;
+                let name =
+                    ident_for_helper(operation.operation_id.index(), &index.to_string(), "lower");
+                source.extend(quote! {
+                    fn #name(value: #carrier) -> ::std::result::Result<#core, #error_descriptor> { Ok(#expression) }
+                });
+                continue;
+            }
             if let ConversionRecipe::Object(_) = binding.conversion {
                 let value_binding = RustValueBinding {
                     rust_type: binding.rust_type.clone(),
@@ -4291,6 +4401,23 @@ fn render_operation_helpers_for(
                             ::uniffi::UniFfiStreamStep::Error(value) => #error_arm,
                         }
                     }
+                });
+                continue;
+            }
+            if matches!(binding.rust_type, RustType::Boxed(_))
+                && !conversion_requires_host(&binding.conversion)
+            {
+                let value = RustValueBinding {
+                    rust_type: binding.rust_type.clone(),
+                    carrier: binding.carrier,
+                    conversion: binding.conversion.clone(),
+                };
+                let core = core_type_for_binding(package, &value)?;
+                let carrier = napi_carrier_type_for(&value, package.rust.named_types(), flavor)?;
+                let expression = lift_expr(&value, quote!(value), flavor)?;
+                let name = ident_for_helper(operation.operation_id.index(), "return", "lift");
+                source.extend(quote! {
+                    fn #name(value: #core) -> ::std::result::Result<#carrier, #error_descriptor> { Ok(#expression) }
                 });
                 continue;
             }
@@ -4617,6 +4744,21 @@ fn lower_host_expr(
     expression: TokenStream,
     path: &[ValuePathSegment],
 ) -> Result<TokenStream> {
+    if let Some(inner) = binding.unboxed() {
+        let value = lower_host_expr(
+            package,
+            flavor,
+            operation,
+            &inner,
+            quote!(__uniffi_unboxed),
+            path,
+        )?;
+        return Ok(quote!({
+            let __uniffi_boxed = #expression;
+            let __uniffi_unboxed = *__uniffi_boxed.0;
+            Box::new(#value)
+        }));
+    }
     let error_descriptor = flavor.error_descriptor();
     let child = |binding: &RustValueBinding, expression: TokenStream, path: &[ValuePathSegment]| {
         lower_host_expr(package, flavor, operation, binding, expression, path)
@@ -5209,6 +5351,17 @@ fn napi_argument(
             },
         });
     }
+    if matches!(binding.rust_type, RustType::Boxed(_))
+        && !conversion_requires_host(&binding.conversion)
+    {
+        return Ok(napi_uniffi_engine::RustArgumentPlan {
+            name,
+            binding: napi_uniffi_engine::ArgumentBinding::LowerWith {
+                carrier_type: syn,
+                lower: path_for_helper(operation.operation_id.index(), &index.to_string(), "lower"),
+            },
+        });
+    }
     let type_helper = match &binding.conversion {
         ConversionRecipe::Record(id)
         | ConversionRecipe::Enum(id)
@@ -5439,6 +5592,15 @@ fn napi_operation(
     } else {
         match operation.return_value.as_ref() {
             None => napi_uniffi_engine::ReturnBinding::Unit,
+            Some(binding)
+                if matches!(binding.rust_type, RustType::Boxed(_))
+                    && !conversion_requires_host(&binding.conversion) =>
+            {
+                napi_uniffi_engine::ReturnBinding::LiftWith {
+                    carrier_type: return_type.expect("boxed carrier type"),
+                    lift: path_for_helper(operation.operation_id.index(), "return", "lift"),
+                }
+            }
             Some(binding) if matches!(binding.conversion, ConversionRecipe::BigInt) => {
                 if matches!(
                     binding.rust_type,
@@ -5719,6 +5881,17 @@ fn ohos_argument(
             },
         });
     }
+    if matches!(binding.rust_type, RustType::Boxed(_))
+        && !conversion_requires_host(&binding.conversion)
+    {
+        return Ok(napi_ohos_uniffi_engine::OhosArgumentPlan {
+            name,
+            binding: napi_ohos_uniffi_engine::OhosArgumentBinding::LowerWith {
+                carrier_type: syn,
+                lower: path_for_helper(operation.operation_id.index(), &index.to_string(), "lower"),
+            },
+        });
+    }
     let type_helper = match &binding.conversion {
         ConversionRecipe::Record(id)
         | ConversionRecipe::Enum(id)
@@ -5934,6 +6107,15 @@ fn ohos_operation(
     } else {
         match operation.return_value.as_ref() {
             None => napi_ohos_uniffi_engine::OhosReturnBinding::Unit,
+            Some(binding)
+                if matches!(binding.rust_type, RustType::Boxed(_))
+                    && !conversion_requires_host(&binding.conversion) =>
+            {
+                napi_ohos_uniffi_engine::OhosReturnBinding::LiftWith {
+                    carrier_type: return_type.expect("boxed carrier type"),
+                    lift: path_for_helper(operation.operation_id.index(), "return", "lift"),
+                }
+            }
             Some(binding) if matches!(binding.conversion, ConversionRecipe::BigInt) => {
                 if matches!(
                     binding.rust_type,
@@ -6118,6 +6300,10 @@ fn wasm_type(ty: &RustType) -> Result<wasm_bindgen_uniffi_engine::WasmRustType> 
         RustType::Timestamp => W::Timestamp,
         RustType::Duration => W::Duration,
         RustType::Path(path) => W::Path(wasm_rust_path(path)?),
+        // This engine plan emits ABI descriptors from abi_carrier only.
+        // Box allocation remains in our canonical Rust plan and typed
+        // wasm_source adapters; it does not add a JavaScript ABI layer.
+        RustType::Boxed(inner) => wasm_type(inner)?,
         RustType::Option(inner) => W::Option(Box::new(wasm_type(inner)?)),
         RustType::Sequence(inner) => W::Sequence(Box::new(wasm_type(inner)?)),
         RustType::Map(key, value) => W::Map(Box::new(wasm_type(key)?), Box::new(wasm_type(value)?)),
@@ -6149,6 +6335,9 @@ fn wasm_type(ty: &RustType) -> Result<wasm_bindgen_uniffi_engine::WasmRustType> 
 }
 
 fn wasm_carrier(binding: &RustValueBinding) -> wasm_bindgen_uniffi_engine::WasmCarrier {
+    if let Some(inner) = binding.unboxed() {
+        return wasm_carrier(&inner);
+    }
     use wasm_bindgen_uniffi_engine::WasmCarrier as C;
     match binding.carrier {
         RustCarrier::BigInt => match binding.rust_type {
@@ -6246,6 +6435,9 @@ fn wasm_binding_contains_object(
         conversion: &ConversionRecipe,
         visiting: &mut BTreeSet<TypeId>,
     ) -> bool {
+        if let RustType::Boxed(inner) = rust_type {
+            return conversion_contains_object(package, inner, conversion, visiting);
+        }
         match conversion {
             ConversionRecipe::Object(_) => true,
             ConversionRecipe::Optional(inner)

@@ -477,8 +477,9 @@ pub fn generate_stream_tree(
 /// It deliberately combines the properties that are easy to accidentally
 /// validate only in generated text: a structured error, record/enum/object
 /// stream values, public names hostile to backend implementation identifiers,
-/// and Rust-side lifecycle counters.  Both runtimes build the exact same Rust
-/// source and execute the same TypeScript driver from this module.
+/// recursive boxed values, and Rust-side lifecycle counters. Both runtimes
+/// build the exact same Rust source and execute the same TypeScript driver
+/// from this module.
 pub struct RuntimeMatrixFixture {
     crate_dir: Utf8PathBuf,
     lib_path: Utf8PathBuf,
@@ -546,6 +547,42 @@ pub enum MatrixEnum {
     },
     #[uniffi(name = "Buffer")]
     Buffer,
+}
+
+// These recursive fields require real Rust indirection in generated hosts,
+// while Box must remain invisible in public JavaScript values.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum MatrixPredicate {
+    Value { value: bool },
+    Not { operand: Box<MatrixPredicate> },
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MatrixNode {
+    pub value: u32,
+    pub next: Option<Box<MatrixNode>>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MatrixBoxedContainers {
+    pub predicates: Vec<Box<MatrixPredicate>>,
+    pub nodes: HashMap<String, Option<Box<MatrixNode>>>,
+    pub values: Box<Vec<Option<Box<u32>>>>,
+}
+
+#[uniffi::export]
+pub fn roundtrip_boxed_predicate(value: Box<MatrixPredicate>) -> Box<MatrixPredicate> {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_boxed_node(value: Box<MatrixNode>) -> Box<MatrixNode> {
+    value
+}
+
+#[uniffi::export]
+pub fn roundtrip_boxed_containers(value: Box<MatrixBoxedContainers>) -> Box<MatrixBoxedContainers> {
+    value
 }
 
 #[derive(Debug, uniffi::Object)]
@@ -924,7 +961,7 @@ pub fn generate_runtime_matrix_tree(
 ) -> GeneratedPackage {
     let loader = BindgenLoader::new(BindgenPaths::default(), GlobalConfig::default());
     let host_crates_dir = host_crates.unwrap_or_else(|| out_dir.join("native/hosts"));
-    generate_package(
+    let package = generate_package(
         &loader,
         GenerateJsOptions {
             source: fixture.lib_path.clone(),
@@ -942,12 +979,33 @@ pub fn generate_runtime_matrix_tree(
             flavors,
         },
     )
-    .expect("generator should succeed for final JavaScript runtime matrix fixture")
+    .expect("generator should succeed for final JavaScript runtime matrix fixture");
+
+    let declarations =
+        std::fs::read_to_string(out_dir.join("components/runtime_matrix_core/index.d.ts"))
+            .expect("runtime matrix public declarations should exist");
+    for transparent_shape in [
+        "readonly tag: \"Not\"; readonly operand: MatrixPredicate }",
+        "next: MatrixNode | null;",
+        "predicates: Array<MatrixPredicate>;",
+        "nodes: Map<string, MatrixNode | null>;",
+        "values: Array<number | null>;",
+        "roundtripBoxedPredicate(value: MatrixPredicate): MatrixPredicate;",
+        "roundtripBoxedNode(value: MatrixNode): MatrixNode;",
+        "roundtripBoxedContainers(value: MatrixBoxedContainers): MatrixBoxedContainers;",
+    ] {
+        assert!(
+            declarations.contains(transparent_shape),
+            "Box must remain transparent in public declarations: missing {transparent_shape}\n{declarations}"
+        );
+    }
+    package
 }
 
 /// The N-API and Wasm runtime matrix differ only in how they supply their raw
 /// bridge. Keep the assertions in one driver so both paths prove the same
-/// tagged step, typed payload, hostile identifier, and native-drop contracts.
+/// tagged step, typed payload, boxed value, hostile identifier, and native-drop
+/// contracts.
 pub fn runtime_matrix_driver(
     public_import: &str,
     setup: &str,
@@ -957,6 +1015,7 @@ pub fn runtime_matrix_driver(
     non_send_assertions: &str,
 ) -> String {
     const TEMPLATE: &str = r#"
+import { deepStrictEqual } from "node:assert/strict";
 import { createRequire } from "node:module";
 import * as root from "__UNIFFI_RUNTIME_MATRIX_PUBLIC_IMPORT__";
 
@@ -983,6 +1042,32 @@ try {
   plainObjectMapRejected = true;
 }
 assert(plainObjectMapRejected, "public Map rejects plain object carriers");
+
+// The public shape has no Box wrapper or single-element-array indirection.
+const predicate = {
+  tag: "Not",
+  operand: { tag: "Not", operand: { tag: "Value", value: true } },
+};
+const leaf = { tag: "Value", value: false };
+for (const value of [leaf, predicate]) {
+  deepStrictEqual(api.roundtripBoxedPredicate(value), value,
+    "Box<recursive enum> input/output preserves nested Not operands");
+}
+const node = { value: 7, next: { value: 11, next: null } };
+for (const value of [{ value: 0, next: null }, node]) {
+  deepStrictEqual(api.roundtripBoxedNode(value), value,
+    "Box<recursive record> input/output preserves Option<Box<Node>> and null");
+}
+const containers = {
+  predicates: [predicate, leaf],
+  nodes: new Map([["present", node], ["absent", null]]),
+  values: [null, 0, 42],
+};
+deepStrictEqual(api.roundtripBoxedContainers(containers), containers,
+  "Box stays transparent inside Vec/Map/Option and around nested containers");
+const emptyContainers = { predicates: [], nodes: new Map(), values: [] };
+deepStrictEqual(api.roundtripBoxedContainers(emptyContainers), emptyContainers,
+  "boxed empty containers remain empty");
 
 const rawStart = raw["ffi_runtime_matrix_core_record_items"];
 const rawNext = raw["ffi_runtime_matrix_core_record_items_stream_next"];
@@ -1148,13 +1233,20 @@ assert(errorProbe.streamStarts === 1n && errorProbe.streamDrops === 1n
 
 api.resetProbe("cancel");
 const pending = api.pendingItems("cancel");
-const pendingNext = pending.next();
+const pendingNext = pending.next().then(
+  (value) => ({ ok: true, value }),
+  (error) => ({ ok: false, error }),
+);
 await pending.cancel();
 const pendingResult = await Promise.race([
   pendingNext,
   new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); }),
 ]);
-assert(pendingResult !== "timeout" && pendingResult.done === true, "pending native next settles after cancel");
+assert(pendingResult !== "timeout" && !pendingResult.ok
+  && pendingResult.error instanceof api.UniffiError
+  && pendingResult.error.errorName === "UniffiCancelled",
+  "interrupted native next rejects with typed cancellation after cleanup");
+assert((await pending.next()).done === true, "cancelled stream remains terminal");
 await pending.cancel();
 const cancelProbe = api.probeSnapshot("cancel");
 assert(cancelProbe.streamStarts === 1n && cancelProbe.streamDrops === 1n
@@ -1199,7 +1291,10 @@ root.session.backend = {
   close: lateBackend.close.bind(lateBackend),
 };
 const lateStream = api.bufferItems("object-late");
-const lateNext = lateStream.next();
+const lateNext = lateStream.next().then(
+  (value) => ({ ok: true, value }),
+  (error) => ({ ok: false, error }),
+);
 const lateReady = await Promise.race([
   lateRawReady,
   new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); }),
@@ -1221,8 +1316,10 @@ const lateResult = await Promise.race([
   lateNext,
   new Promise<string>((resolve): void => { setTimeout((): void => resolve("timeout"), 1000); }),
 ]);
-assert(lateResult !== "timeout" && lateResult.done === true,
-  "late object stream next settles after orderly close");
+assert(lateResult !== "timeout" && !lateResult.ok
+  && lateResult.error instanceof api.UniffiError
+  && lateResult.error.errorName === "UniffiCancelled",
+  "late object stream next rejects with typed cancellation after orderly close");
 const lateProbe = rawProbeSnapshot("object-late");
 const closeProbe = rawProbeSnapshot("object-close");
 assert(lateProbe.objectDrops === 1n,

@@ -313,6 +313,10 @@ fn __uniffi_lift_duration(value: std::time::Duration) -> Result<JsValue, JsValue
 }
 
 fn core_type(package: &NormalizedPackage, binding: &RustValueBinding) -> Result<syn::Type> {
+    if let Some(inner) = binding.unboxed() {
+        let ty = core_type(package, &inner)?;
+        return Ok(syn::parse_quote!(::std::boxed::Box<#ty>));
+    }
     match &binding.conversion {
         ConversionRecipe::Object(id) => super::object_core_type(package, *id),
         ConversionRecipe::Optional(inner) => {
@@ -914,6 +918,9 @@ fn render_callback_method(
 }
 
 fn as_input_stream_binding(binding: &RustValueBinding) -> RustValueBinding {
+    if let Some(inner) = binding.unboxed() {
+        return as_input_stream_binding(&inner);
+    }
     match (&binding.rust_type, &binding.conversion) {
         (
             RustType::Stream {
@@ -946,6 +953,10 @@ fn callback_source_type(
     operation: &RustOperationPlan,
     binding: &RustValueBinding,
 ) -> Result<syn::Type> {
+    if let Some(inner) = binding.unboxed() {
+        let ty = callback_source_type(package, operation, &inner)?;
+        return Ok(syn::parse_quote!(::std::boxed::Box<#ty>));
+    }
     if let RustType::Stream { .. } = &binding.rust_type {
         if !operation.rust_stream_item_is_result {
             let (item, _) = stream_child_bindings(binding).expect("stream children");
@@ -964,6 +975,10 @@ fn lower_callback_result(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if let Some(inner) = binding.unboxed() {
+        let lowered = lower_callback_result(package, operation, &inner, expression)?;
+        return Ok(quote!((#lowered).map(::std::boxed::Box::new)));
+    }
     if !matches!(binding.conversion, ConversionRecipe::OutputStream { .. }) {
         return lower_js_expr(package, binding, expression);
     }
@@ -1070,6 +1085,10 @@ fn mark_binding_helper_direction(
     directions: &mut NamedHelperDirections,
     visiting: &mut BTreeSet<(TypeId, bool)>,
 ) {
+    if let Some(inner) = binding.unboxed() {
+        mark_binding_helper_direction(package, &inner, direction, directions, visiting);
+        return;
+    }
     match &binding.conversion {
         ConversionRecipe::Record(id)
         | ConversionRecipe::Enum(id)
@@ -1640,6 +1659,10 @@ fn lower_js_expr(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if let Some(inner) = binding.unboxed() {
+        let lowered = lower_js_expr(package, &inner, expression)?;
+        return Ok(quote!((#lowered).map(::std::boxed::Box::new)));
+    }
     if super::is_infallible(&binding.rust_type) {
         return Ok(
             quote!({ let _ = #expression; Err::<::std::convert::Infallible, JsValue>(
@@ -1819,6 +1842,14 @@ fn lift_js_expr(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if let Some(inner) = binding.unboxed() {
+        let value = lift_js_expr(package, &inner, quote!(__uniffi_unboxed))?;
+        return Ok(quote!({
+            let __uniffi_boxed = #expression;
+            let __uniffi_unboxed = *__uniffi_boxed;
+            #value
+        }));
+    }
     if super::is_infallible(&binding.rust_type) {
         return Ok(quote!(Ok::<JsValue, JsValue>(match #expression {})));
     }
@@ -1949,6 +1980,10 @@ fn lower_expr(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if let Some(inner) = binding.unboxed() {
+        let lowered = lower_expr(package, &inner, expression)?;
+        return Ok(quote!((#lowered).map(::std::boxed::Box::new)));
+    }
     if super::is_infallible(&binding.rust_type) {
         return Ok(
             quote!({ let _ = #expression; Err::<::std::convert::Infallible, JsValue>(
@@ -2065,6 +2100,14 @@ fn lift_expr(
     binding: &RustValueBinding,
     expression: TokenStream,
 ) -> Result<TokenStream> {
+    if let Some(inner) = binding.unboxed() {
+        let value = lift_expr(package, &inner, quote!(__uniffi_unboxed))?;
+        return Ok(quote!({
+            let __uniffi_boxed = #expression;
+            let __uniffi_unboxed = *__uniffi_boxed;
+            #value
+        }));
+    }
     if super::is_infallible(&binding.rust_type) {
         return Ok(quote!(Ok::<JsValue, JsValue>(match #expression {})));
     }
@@ -2215,6 +2258,9 @@ fn nested_output_close_ident(binding: &RustValueBinding) -> Ident {
 fn stream_child_bindings(
     binding: &RustValueBinding,
 ) -> Option<(RustValueBinding, RustValueBinding)> {
+    if let Some(inner) = binding.unboxed() {
+        return stream_child_bindings(&inner);
+    }
     match (&binding.rust_type, &binding.conversion) {
         (
             RustType::InputStream { item, error, .. },
@@ -2256,6 +2302,9 @@ fn collect_stream_bindings(package: &NormalizedPackage) -> Result<Vec<RustValueB
         visiting: &mut BTreeSet<TypeId>,
         out: &mut BTreeMap<String, RustValueBinding>,
     ) -> Result<()> {
+        if let Some(inner) = binding.unboxed() {
+            return visit(package, &inner, visiting, out);
+        }
         match &binding.conversion {
             ConversionRecipe::InputStream { .. } | ConversionRecipe::OutputStream { .. } => {
                 out.entry(stream_adapter_suffix(binding))
@@ -2930,8 +2979,9 @@ fn render_operations(package: &NormalizedPackage) -> Result<String> {
             if let Some(group) = input_group {
                 let make =
                     input_stream_make_ident(operation.operation_id.index(), group.id.index());
+                let value = wrap_boxed_value(&binding.rust_type, quote!(#make(host.clone(), #arg)));
                 lowered_arguments.push(quote!(
-                    let #core_arg = #make(host.clone(), #arg);
+                    let #core_arg = #value;
                 ));
             } else {
                 let lowered = lower_default_argument(package, &binding, quote!(#arg), default)?;
@@ -3132,7 +3182,8 @@ fn render_output_stream_start(
         });
         if let Some(group) = input_group {
             let make = input_stream_make_ident(operation.operation_id.index(), group.id.index());
-            lowered.push(quote!(let #core = #make(host.clone(), #arg);));
+            let value = wrap_boxed_value(&binding.rust_type, quote!(#make(host.clone(), #arg)));
+            lowered.push(quote!(let #core = #value;));
         } else {
             let value = lower_operation_value(value, fallible, "argument");
             lowered.push(quote!(let #core = #value;));
@@ -3213,6 +3264,14 @@ fn render_output_stream_start(
             #call_body
         }
     })
+}
+
+fn wrap_boxed_value(mut ty: &RustType, mut value: TokenStream) -> TokenStream {
+    while let RustType::Boxed(inner) = ty {
+        value = quote!(::std::boxed::Box::new(#value));
+        ty = inner;
+    }
+    value
 }
 
 fn input_stream_make_ident(operation_id: u32, group_id: u32) -> Ident {
